@@ -35,6 +35,8 @@ from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention.encoder_only_attention import (
     EncoderOnlyAttention,
@@ -58,6 +60,13 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+
+logger = init_logger(__name__)
+
+if envs.VLLM_ROCM_TRITON_ALLREDUCE:
+    logger.info("VLLM_ROCM_TRITON_ALLREDUCE=1: using fused triton_allreduce path")
+else:
+    logger.info("VLLM_ROCM_TRITON_ALLREDUCE=0: using standard all-reduce path")
 
 from .adapters import as_embedding_model, as_seq_cls_model
 from .interfaces import (
@@ -134,6 +143,7 @@ class LlamaAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        max_m: int | None = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
@@ -186,6 +196,7 @@ class LlamaAttention(nn.Module):
             bias=bias_o_proj,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            max_m=max_m,
         )
 
         self._init_rotary_emb(config, quant_config=quant_config)
@@ -244,7 +255,9 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+        norm: RMSNorm | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -252,8 +265,18 @@ class LlamaAttention(nn.Module):
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
+        
+        if residual is not None and norm is not None:
+            # Fused path returns (output, bias, residual)
+            output, _, residual_out = self.o_proj(
+                attn_output,
+                residual=residual,
+                norm=norm,
+            )
+            return output, residual_out
+        else:
+            output, _ = self.o_proj(attn_output)
+            return output
 
     def _init_rotary_emb(
         self,
@@ -307,6 +330,9 @@ class LlamaDecoderLayer(nn.Module):
         else:
             attn_type = AttentionType.ENCODER_ONLY
 
+        # Get max_m for triton_allreduce buffer pre-allocation
+        max_m = vllm_config.scheduler_config.max_num_batched_tokens
+
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -321,6 +347,7 @@ class LlamaDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            max_m=max_m,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -347,10 +374,20 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        if envs.VLLM_ROCM_TRITON_ALLREDUCE:
+            # Fused path: o_proj all-reduce + residual add + post_attention_layernorm
+            hidden_states, residual = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                norm=self.post_attention_layernorm,
+            )
+        else:
+            # Standard path
+            hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 

@@ -18,6 +18,8 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.triton_allreduce import triton_allreduce
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -1341,6 +1343,7 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        max_m: int | None = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -1348,6 +1351,7 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
+        self.max_m = max_m
 
         super().__init__(
             input_size,
@@ -1443,7 +1447,11 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
-    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        residual: torch.Tensor | None = None,
+        norm: RMSNorm | None = None,
+    ) -> (torch.Tensor 
+          | tuple[torch.Tensor, Parameter | None] 
+          | tuple[torch.Tensor, Parameter | None, torch.Tensor]):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1459,15 +1467,32 @@ class RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
+        use_fused_rmsnorm = residual is not None and norm is not None
+        residual_out = None
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            if use_fused_rmsnorm:
+                assert self.max_m is not None, (
+                    "max_m must be set for fused triton_allreduce"
+                )
+                # Fused all-reduce + residual add + RMSNorm
+                output, residual_out = triton_allreduce(
+                    output_parallel,
+                    residual,
+                    norm,
+                    self.max_m,
+                )
+            else:
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
-        if not self.return_bias:
-            return output
         output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+
+        if use_fused_rmsnorm:
+            return output, output_bias, residual_out
+        if self.return_bias:
+            return output, output_bias
+        return output
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size_per_partition}"

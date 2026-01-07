@@ -778,6 +778,7 @@ def multi_process_parallel(
                 "shellcheck",
                 "dist",
                 "ep_kernels_workspace",
+                ".scripts",
             ],
         }
     )
