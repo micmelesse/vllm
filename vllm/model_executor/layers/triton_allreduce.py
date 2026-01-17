@@ -271,7 +271,7 @@ def _kernel_simple_allreduce(
     
     This is the simplest Iris all-reduce: each rank reads from ALL other ranks
     and sums locally. No ring protocol, no barriers needed in the kernel.
-    The host does iris.barrier() before and after the kernel call.
+    The host does shmem.barrier() before and after the kernel call.
     
     Pattern:
     1. Load local data from send_buffer
@@ -305,7 +305,7 @@ def _kernel_simple_allreduce(
         # Add residual
         r = tl.load(residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         res_out = acc + r
-        tl.store(residual_out_ptr + offsets, res_out.to(tl.float16), mask=mask)
+        tl.store(residual_out_ptr + offsets, res_out.to(send_buffer_ptr.dtype.element_ty), mask=mask)
     
     # ===== Phase 2: Compute Variance for RMSNorm =====
     var_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -332,7 +332,7 @@ def _kernel_simple_allreduce(
         w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
         out = res_out * rrms * w
-        tl.store(output_ptr + offsets, out.to(tl.float16), mask=mask)
+        tl.store(output_ptr + offsets, out.to(send_buffer_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.autotune(
@@ -661,8 +661,6 @@ def _triton_allreduce_impl(
     
     elif _IMPL == "simple_allreduce":
         # Simple all-reduce: each rank reads from all others
-        # NOTE: No barriers - this may produce incorrect results during graph capture
-        # because other ranks may not have written their data yet. But it will at least run.
         send_buffer, _flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
@@ -672,8 +670,10 @@ def _triton_allreduce_impl(
         # Copy input to send buffer (symmetric memory)
         send_buffer.copy_(input_)
         
-        # NOTE: No barriers - they cause deadlocks when some ranks are capturing and others aren't.
-        # The data may be stale during graph capture, but the kernel will still execute.
+        # Barrier to ensure all ranks have written to send_buffer before reading
+        # Skip during graph capture - barriers cause deadlocks
+        if not is_capturing:
+            _ctx.shmem.barrier()
         
         _kernel_simple_allreduce[grid](
             send_buffer,
@@ -688,6 +688,10 @@ def _triton_allreduce_impl(
             cur_rank=_ctx.cur_rank,
             world_size=_ctx.world_size,
         )
+        
+        # Barrier to ensure all ranks have finished before returning
+        if not is_capturing:
+            _ctx.shmem.barrier()
         
         logger.info(f"triton_allreduce [simple_allreduce]: rank={_ctx.cur_rank}, done")
     
