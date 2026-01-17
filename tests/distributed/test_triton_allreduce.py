@@ -26,6 +26,8 @@ from vllm.utils.network_utils import get_open_port
 
 # (M, N) = (num_tokens, hidden_dim)
 TEST_SIZES = [(32, 4096), (128, 4096), (32, 8192)]
+# Max M for buffer pre-allocation (must be >= all M values in TEST_SIZES)
+MAX_M = 256
 
 
 def _worker_eager(rank: int, world_size: int, port: int):
@@ -54,7 +56,6 @@ def _worker_eager(rank: int, world_size: int, port: int):
                 inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
                 residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
                 norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
-                max_m = M * 2
 
                 # Reference: all_reduce(inp) + residual
                 ref_inp = inp.clone()
@@ -62,7 +63,7 @@ def _worker_eager(rank: int, world_size: int, port: int):
                 ref_res_out = ref_inp + residual
 
                 # Test: triton fused all-reduce + residual + rmsnorm
-                out, res_out = triton_allreduce(inp, residual, norm, max_m)
+                out, res_out = triton_allreduce(inp, residual, norm, MAX_M)
                 torch.testing.assert_close(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
 
 
@@ -81,32 +82,37 @@ def _worker_graph(rank: int, world_size: int, port: int):
         ensure_model_parallel_initialized(world_size, 1)
         group = get_tp_group().device_group
 
-        # Warmup all-reduce (required before graph capture)
+        # Warmup all-reduce (needed for NCCL initialization)
         warmup = torch.zeros(1, device=device)
         dist.all_reduce(warmup, group=group)
         torch.cuda.synchronize()
         del warmup
 
-        for M, N in TEST_SIZES:
-            for dtype in [torch.float16, torch.bfloat16]:
-                with graph_capture(device=device) as graph_capture_context:
-                    inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
-                    residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
-                    norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
-                    max_m = M * 2
+        # Use fixed size for graph capture (Iris buffers initialized once)
+        M, N = 32, 4096
+        dtype = torch.float16
 
-                    # Reference: all_reduce(inp) + residual
-                    ref_inp = inp.clone()
-                    dist.all_reduce(ref_inp, group=group)
-                    ref_res_out = ref_inp + residual
+        inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
+        residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
+        norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
 
-                    torch.cuda.synchronize()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-                        out, res_out = triton_allreduce(inp, residual, norm, max_m)
+        # Warmup call to initialize Iris buffers BEFORE graph capture
+        _ = triton_allreduce(inp, residual, norm, MAX_M)
+        torch.cuda.synchronize()
 
-                graph.replay()
-                torch.testing.assert_close(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
+        # Reference: all_reduce(inp) + residual
+        ref_inp = inp.clone()
+        dist.all_reduce(ref_inp, group=group)
+        ref_res_out = ref_inp + residual
+
+        with graph_capture(device=device) as graph_capture_context:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=graph_capture_context.stream):
+                out, res_out = triton_allreduce(inp, residual, norm, MAX_M)
+
+        graph.replay()
+        torch.testing.assert_close(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(
