@@ -250,8 +250,8 @@ def _kernel_test(
 def _kernel_simple_allreduce(
     # Input pointers (input data is in send_buffer, pre-copied by host)
     send_buffer_ptr,
-    residual_ptr,
-    weight_ptr,
+    residual_ptr,  # Can be None if DO_RESIDUAL=False
+    weight_ptr,  # Can be None if DO_RMSNORM=False
     # Output pointers
     output_ptr,
     residual_out_ptr,
@@ -260,6 +260,9 @@ def _kernel_simple_allreduce(
     N: tl.constexpr,
     # RMSNorm params
     eps: tl.constexpr,
+    # Feature flags
+    DO_RESIDUAL: tl.constexpr,
+    DO_RMSNORM: tl.constexpr,
     # Iris params
     heap_bases,
     cur_rank: tl.constexpr,
@@ -267,16 +270,21 @@ def _kernel_simple_allreduce(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Simple all-reduce + residual add + RMS normalization.
+    Simple all-reduce with optional residual add and RMS normalization.
     
     This is the simplest Iris all-reduce: each rank reads from ALL other ranks
     and sums locally. No ring protocol, no barriers needed in the kernel.
     The host does shmem.barrier() before and after the kernel call.
     
+    Args:
+        DO_RESIDUAL: If True, add residual to all-reduced result
+        DO_RMSNORM: If True, apply RMSNorm to output
+    
     Pattern:
     1. Load local data from send_buffer
     2. For each remote rank, use iris.load to fetch their data and accumulate
-    3. Apply residual add + RMSNorm
+    3. Optionally add residual
+    4. Optionally apply RMSNorm
     """
     row_idx = tl.program_id(0)
     row_offset = row_idx * N
@@ -302,37 +310,52 @@ def _kernel_simple_allreduce(
                 ).to(tl.float32)
                 acc += remote_data
         
-        # Add residual
-        r = tl.load(residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        res_out = acc + r
+        # Optionally add residual
+        if DO_RESIDUAL:
+            r = tl.load(residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            res_out = acc + r
+        else:
+            res_out = acc
+        
         tl.store(residual_out_ptr + offsets, res_out.to(send_buffer_ptr.dtype.element_ty), mask=mask)
     
-    # ===== Phase 2: Compute Variance for RMSNorm =====
-    var_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    
-    for col_start in range(0, N, BLOCK_N):
-        col_offsets = col_start + tl.arange(0, BLOCK_N)
-        mask = col_offsets < N
-        offsets = row_offset + col_offsets
+    # ===== Phase 2 & 3: RMSNorm (optional) =====
+    if DO_RMSNORM:
+        # Compute Variance for RMSNorm
+        var_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
         
-        res_out = tl.load(residual_out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        var_acc += tl.where(mask, res_out * res_out, 0.0)
-    
-    # Compute RMS
-    variance = tl.sum(var_acc, axis=0) / N
-    rrms = 1.0 / tl.sqrt(variance + eps)
-    
-    # ===== Phase 3: Apply RMSNorm =====
-    for col_start in range(0, N, BLOCK_N):
-        col_offsets = col_start + tl.arange(0, BLOCK_N)
-        mask = col_offsets < N
-        offsets = row_offset + col_offsets
+        for col_start in range(0, N, BLOCK_N):
+            col_offsets = col_start + tl.arange(0, BLOCK_N)
+            mask = col_offsets < N
+            offsets = row_offset + col_offsets
+            
+            res_out = tl.load(residual_out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            var_acc += tl.where(mask, res_out * res_out, 0.0)
         
-        res_out = tl.load(residual_out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        # Compute RMS
+        variance = tl.sum(var_acc, axis=0) / N
+        rrms = 1.0 / tl.sqrt(variance + eps)
         
-        out = res_out * rrms * w
-        tl.store(output_ptr + offsets, out.to(send_buffer_ptr.dtype.element_ty), mask=mask)
+        # Apply RMSNorm
+        for col_start in range(0, N, BLOCK_N):
+            col_offsets = col_start + tl.arange(0, BLOCK_N)
+            mask = col_offsets < N
+            offsets = row_offset + col_offsets
+            
+            res_out = tl.load(residual_out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+            
+            out = res_out * rrms * w
+            tl.store(output_ptr + offsets, out.to(send_buffer_ptr.dtype.element_ty), mask=mask)
+    else:
+        # No RMSNorm - just copy residual_out to output
+        for col_start in range(0, N, BLOCK_N):
+            col_offsets = col_start + tl.arange(0, BLOCK_N)
+            mask = col_offsets < N
+            offsets = row_offset + col_offsets
+            
+            res_out = tl.load(residual_out_ptr + offsets, mask=mask, other=0.0)
+            tl.store(output_ptr + offsets, res_out, mask=mask)
 
 
 @triton.autotune(
@@ -602,13 +625,13 @@ def _kernel_ring_allreduce(
 
 def _triton_allreduce_impl(
     input_: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor | None,
     eps: float,
     max_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Internal implementation of fused all-reduce + residual add + RMS normalization.
+    Internal implementation of fused all-reduce with optional residual add and RMS normalization.
     
     Implementation selected via VLLM_TRITON_ALLREDUCE_IMPL env var:
     - "test": Test kernel - iris.load + iris.store, outputs zeros
@@ -617,18 +640,29 @@ def _triton_allreduce_impl(
     - "ring_allreduce": Ring-based Iris all-reduce + residual add + rmsnorm
     
     Args:
+        input_: Input tensor to all-reduce
+        residual: Optional residual tensor to add after all-reduce
+        weight: Optional RMSNorm weight (if None, skip RMSNorm)
+        eps: RMSNorm epsilon
         max_m: Max M (tokens) for Iris buffer pre-allocation.
     """
     assert input_.dim() == 2, f"Expected 2D input, got {input_.dim()}D"
-    assert residual.dim() == 2, f"Expected 2D residual, got {residual.dim()}D"
-    assert input_.shape == residual.shape, f"Shape mismatch: {input_.shape} vs {residual.shape}"
     
     M, N = input_.shape
     
-    assert weight.shape == (N,), f"Weight shape mismatch: {weight.shape} vs ({N},)"
+    # Feature flags based on what's provided
+    do_residual = residual is not None
+    do_rmsnorm = weight is not None
+    
+    if do_residual:
+        assert residual.dim() == 2, f"Expected 2D residual, got {residual.dim()}D"
+        assert input_.shape == residual.shape, f"Shape mismatch: {input_.shape} vs {residual.shape}"
+    
+    if do_rmsnorm:
+        assert weight.shape == (N,), f"Weight shape mismatch: {weight.shape} vs ({N},)"
     
     output = torch.empty_like(input_)
-    residual_out = torch.empty_like(residual)
+    residual_out = torch.empty_like(input_)
     
     grid = (M,)
     
@@ -677,13 +711,15 @@ def _triton_allreduce_impl(
         
         _kernel_simple_allreduce[grid](
             send_buffer,
-            residual,
-            weight,
+            residual,  # Can be None
+            weight,  # Can be None
             output,
             residual_out,
             M=M,
             N=N,
             eps=eps,
+            DO_RESIDUAL=do_residual,
+            DO_RMSNORM=do_rmsnorm,
             heap_bases=_ctx.heap_bases,
             cur_rank=_ctx.cur_rank,
             world_size=_ctx.world_size,
@@ -767,13 +803,13 @@ def _triton_allreduce_impl(
 
 def _triton_allreduce_fake(
     input_: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor | None,
     eps: float,
     max_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
-    return torch.empty_like(input_), torch.empty_like(residual)
+    return torch.empty_like(input_), torch.empty_like(input_)
 
 
 # Register as torch custom op for torch.compile compatibility
@@ -791,12 +827,12 @@ except Exception as e:
 
 def triton_allreduce(
     input_: torch.Tensor,
-    residual: torch.Tensor,
-    norm: RMSNorm,
     max_m: int,
+    residual: torch.Tensor | None = None,
+    norm: RMSNorm | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused all-reduce + residual add + RMS normalization.
+    All-reduce with optional fused residual add and RMS normalization.
     
     Implementation selected via VLLM_TRITON_ALLREDUCE_IMPL env var:
     - "test": Test kernel - iris.load + iris.store, outputs zeros (default)
@@ -807,21 +843,24 @@ def triton_allreduce(
     Args:
         input_: Input tensor from RowParallelLinear (pre-reduce partial sums)
                 Shape: (num_tokens, hidden_dim) e.g., (M, 8192)
-        residual: Residual tensor for skip connection
+        max_m: Max M (tokens) for Iris buffer pre-allocation.
+        residual: Optional residual tensor for skip connection
                   Shape: (num_tokens, hidden_dim) e.g., (M, 8192)
-        norm: RMSNorm layer with:
+        norm: Optional RMSNorm layer with:
               - norm.weight: (hidden_dim,) e.g., (8192,)
               - norm.variance_epsilon: scalar e.g., 1e-5
-        max_m: Max M (tokens) for Iris buffer pre-allocation.
         
     Returns:
-        output: Normalized output, shape (num_tokens, hidden_dim)
-        residual_out: Updated residual (all_reduce(input) + residual), shape (num_tokens, hidden_dim)
+        output: All-reduced (and optionally normalized) output, shape (num_tokens, hidden_dim)
+        residual_out: all_reduce(input) + residual if residual provided, else just all_reduce(input)
     """
+    weight = norm.weight if norm is not None else None
+    eps = norm.variance_epsilon if norm is not None else 1e-5
+    
     return torch.ops.vllm.triton_allreduce(
         input_,
         residual,
-        norm.weight,
-        norm.variance_epsilon,
+        weight,
+        eps,
         max_m,
     )
