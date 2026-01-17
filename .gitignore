@@ -233,7 +233,6 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-# amd
-.amd
+# misc
 .scripts
 gpucore*
