@@ -189,4 +189,3 @@ def test_triton_allreduce(tp_size: int, mode: str):
         nprocs=tp_size, 
         join=True
     )
-    )
