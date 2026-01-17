@@ -12,16 +12,8 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 
 Usage:
     Set VLLM_ROCM_TRITON_ALLREDUCE=1 to enable.
-    Set VLLM_TRITON_ALLREDUCE_IMPL=test|simple_allreduce|atomic_allreduce|ring_allreduce to select implementation.
-    
-Implementations:
-    - test: Minimal test - iris.load + iris.store, outputs zeros (for testing Iris works)
-    - simple_allreduce: Simple Iris all-reduce (each rank reads from all others, no sync)
-    - atomic_allreduce: All-reduce via atomic accumulation to rank 0's buffer
-    - ring_allreduce: Ring-based Iris all-reduce + residual add + RMSNorm
 """
 
-import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,9 +27,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 logger = init_logger(__name__)
 
-# Implementation selection
+# Implementation selection (internal detail)
 AllReduceImpl = Literal["test", "simple_allreduce", "atomic_allreduce", "ring_allreduce"]
-_IMPL: AllReduceImpl = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "simple_allreduce")  # type: ignore[assignment]
+_IMPL: AllReduceImpl = "simple_allreduce"
 
 
 # ============================================================================
@@ -636,12 +628,6 @@ def _triton_allreduce_impl(
     """
     Internal implementation of fused all-reduce with optional residual add and RMS normalization.
     
-    Implementation selected via VLLM_TRITON_ALLREDUCE_IMPL env var:
-    - "test": Test kernel - iris.load + iris.store, outputs zeros
-    - "simple_allreduce": Simple Iris all-reduce (each rank reads from all others)
-    - "atomic_allreduce": Atomic accumulation to rank 0's global buffer
-    - "ring_allreduce": Ring-based Iris all-reduce + residual add + rmsnorm
-    
     Args:
         input_: Input tensor to all-reduce
         residual: Optional residual tensor to add after all-reduce
@@ -799,7 +785,7 @@ def _triton_allreduce_impl(
         logger.debug(f"triton_allreduce [ring_allreduce]: rank={_ctx.cur_rank}, kernel returned")
         
     else:
-        raise ValueError(f"Unknown VLLM_TRITON_ALLREDUCE_IMPL: {_IMPL}. Must be 'test', 'simple_allreduce', 'atomic_allreduce', or 'ring_allreduce'.")
+        raise ValueError(f"Unknown impl: {_IMPL}")
     
     return output, residual_out
 
@@ -837,11 +823,7 @@ def triton_allreduce(
     """
     All-reduce with optional fused residual add and RMS normalization.
     
-    Implementation selected via VLLM_TRITON_ALLREDUCE_IMPL env var:
-    - "test": Test kernel - iris.load + iris.store, outputs zeros (default)
-    - "simple_allreduce": Simple Iris all-reduce (each rank reads from all others)
-    - "atomic_allreduce": Atomic accumulation to rank 0's global buffer
-    - "ring_allreduce": Ring-based Iris all-reduce + residual add + rmsnorm
+    Uses Iris symmetric memory for efficient inter-GPU communication on ROCm.
     
     Args:
         input_: Input tensor from RowParallelLinear (pre-reduce partial sums)

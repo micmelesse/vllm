@@ -60,31 +60,30 @@ def _worker_eager(rank: int, world_size: int, port: int,
             norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
             norm.weight.data.copy_(weight_cpu.to(device))
 
-        # Reference: all_reduce(inp) + residual (if provided)
+        # Reference: all_reduce(inp) + residual (if provided), then RMSNorm (if provided)
         ref_out = inp.clone()
         dist.all_reduce(ref_out, group=group)
         if residual is not None:
             ref_res_out = ref_out + residual
         else:
             ref_res_out = ref_out.clone()
+        
+        # Apply RMSNorm to reference if norm is provided
+        if norm is not None:
+            ref_res_out = norm(ref_res_out)
 
-        print(f"\n[Rank {rank}] Input: {inp}")
-        print(f"[Rank {rank}] Expected all_reduce(inp): {ref_out}")
+        print(f"\n[Rank {rank}] Eager mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
 
         # Test: triton all-reduce
         out, res_out = triton_allreduce(inp, max_m, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
-        print(f"[Rank {rank}] Actual out: {out}")
-        print(f"[Rank {rank}] Actual res_out: {res_out}")
-
         # Check res_out matches expected
         if torch.allclose(res_out, ref_res_out, rtol=1e-2, atol=1e-2):
-            print(f"[Rank {rank}] SUCCESS: res_out matches!")
+            print(f"[Rank {rank}] Eager mode SUCCESS!")
         else:
             diff = (res_out - ref_res_out).abs()
-            print(f"[Rank {rank}] FAILED: res_out mismatch!")
-            print(f"[Rank {rank}] Max diff: {diff.max()}, Mean diff: {diff.mean()}")
+            print(f"[Rank {rank}] Eager mode FAILED! Max diff: {diff.max()}, Mean diff: {diff.mean()}")
             torch.testing.assert_close(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
 
 
@@ -127,16 +126,19 @@ def _worker_graph(rank: int, world_size: int, port: int,
         _ = triton_allreduce(inp, max_m, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
-        # Reference: all_reduce(inp) + residual (if provided)
+        # Reference: all_reduce(inp) + residual (if provided), then RMSNorm (if provided)
         ref_out = inp.clone()
         dist.all_reduce(ref_out, group=group)
         if residual is not None:
             ref_res_out = ref_out + residual
         else:
             ref_res_out = ref_out.clone()
+        
+        # Apply RMSNorm to reference if norm is provided
+        if norm is not None:
+            ref_res_out = norm(ref_res_out)
 
-        print(f"\n[Rank {rank}] Graph mode - Input: {inp}")
-        print(f"[Rank {rank}] Graph mode - Expected: {ref_res_out}")
+        print(f"\n[Rank {rank}] Graph mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
 
         with graph_capture(device=device) as graph_capture_context:
             torch.cuda.synchronize()
@@ -146,8 +148,6 @@ def _worker_graph(rank: int, world_size: int, port: int,
 
         graph.replay()
         torch.cuda.synchronize()
-
-        print(f"[Rank {rank}] Graph mode - Actual res_out: {res_out}")
 
         if torch.allclose(res_out, ref_res_out, rtol=5e-2, atol=5e-2):
             print(f"[Rank {rank}] Graph mode SUCCESS!")
@@ -163,23 +163,31 @@ def _worker_graph(rank: int, world_size: int, port: int,
 )
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("mode", ["eager", "graph"])
-def test_triton_allreduce(tp_size: int, mode: str):
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("with_norm", [False, True])
+@pytest.mark.parametrize("M,N", [
+    (1, 128),      # Single token
+    (32, 128),     # Small batch
+    (128, 4096),   # Medium batch, larger hidden dim
+    (256, 8192),   # Larger batch, typical LLM hidden dim
+])
+def test_triton_allreduce(tp_size: int, mode: str, 
+                          with_residual: bool, with_norm: bool,
+                          M: int, N: int):
     if tp_size > torch.cuda.device_count():
         pytest.skip("Not enough GPUs")
 
     os.environ["VLLM_ROCM_TRITON_ALLREDUCE"] = "1"
-    os.environ["VLLM_TRITON_ALLREDUCE_IMPL"] = "simple_allreduce"
 
     # ===== Create test inputs on CPU (shared across all ranks) =====
-    # Debug case: small 2x4 tensor with all ones
-    # Expected: all_reduce(1) = 2 (for 2 ranks)
-    M, N = 2, 4
+    # Use random inputs with fixed seed for reproducibility
+    torch.manual_seed(42)
     dtype = torch.float16
-    max_m = 8
+    max_m = max(M * 2, 64)  # Ensure max_m > M with some headroom
     
-    inp_cpu = torch.ones((M, N), dtype=dtype)
-    residual_cpu = None  # No residual for debug
-    weight_cpu = None    # No RMSNorm for debug
+    inp_cpu = torch.randn((M, N), dtype=dtype)
+    residual_cpu = torch.randn((M, N), dtype=dtype) if with_residual else None
+    weight_cpu = torch.randn(N, dtype=dtype).abs() + 0.1 if with_norm else None  # Positive weights
 
     port = get_open_port()
     worker = _worker_eager if mode == "eager" else _worker_graph
