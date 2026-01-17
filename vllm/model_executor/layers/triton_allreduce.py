@@ -95,10 +95,13 @@ def _get_buffers(
         dtype_size = torch.tensor([], dtype=dtype).element_size()
         send_buffer_bytes = max_m * N * dtype_size
         
+        # Minimum heap size for Iris overhead (metadata, alignment, etc.)
+        MIN_HEAP_SIZE = 1 * 1024 * 1024  # 1 MB minimum
+        
         # Allocate buffers based on impl type
         if impl in ("test", "simple_allreduce"):
             # Just need send_buffer for send/recv
-            heap_size = int(send_buffer_bytes * 1.1)
+            heap_size = max(MIN_HEAP_SIZE, int(send_buffer_bytes * 1.1))
             shmem = iris.iris(heap_size)
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = None
@@ -106,7 +109,7 @@ def _get_buffers(
         elif impl == "atomic_allreduce":
             # Need send_buffer + global_output for atomic accumulation
             global_output_bytes = max_m * N * 4  # float32
-            heap_size = int((send_buffer_bytes + global_output_bytes) * 1.1)
+            heap_size = max(MIN_HEAP_SIZE, int((send_buffer_bytes + global_output_bytes) * 1.1))
             shmem = iris.iris(heap_size)
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = None
@@ -114,7 +117,7 @@ def _get_buffers(
         elif impl == "ring_allreduce":
             # Need send_buffer + flags for ring protocol
             flags_bytes = max_m * 4  # int32
-            heap_size = int((send_buffer_bytes + flags_bytes) * 1.1)
+            heap_size = max(MIN_HEAP_SIZE, int((send_buffer_bytes + flags_bytes) * 1.1))
             shmem = iris.iris(heap_size)
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = shmem.zeros((max_m,), dtype=torch.int32)
