@@ -40,7 +40,6 @@ gpucore*
 # LOCAL DEVELOPMENT ONLY
 # Remove before upstreaming to vllm/vllm
 # ======================================
-.git
 .triton
 .cache
 .huggingface
