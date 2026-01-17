@@ -28,8 +28,8 @@ from vllm.utils.network_utils import get_open_port
 TEST_SIZES = [(32, 4096), (128, 4096), (32, 8192)]
 
 
-def _init_worker(rank: int, world_size: int, port: int):
-    """Initialize vLLM distributed environment."""
+def _worker_eager(rank: int, world_size: int, port: int):
+    """Eager mode test."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
@@ -40,55 +40,17 @@ def _init_worker(rank: int, world_size: int, port: int):
             distributed_init_method=f"tcp://127.0.0.1:{port}",
             local_rank=rank,
         )
-        ensure_model_parallel_initialized(world_size, 1)  # tp_size, pp_size=1
+        ensure_model_parallel_initialized(world_size, 1)
+        group = get_tp_group().device_group
 
-    return device
+        # Warmup all-reduce (needed for NCCL initialization)
+        warmup = torch.zeros(1, device=device)
+        dist.all_reduce(warmup, group=group)
+        torch.cuda.synchronize()
+        del warmup
 
-
-def _worker_eager(rank: int, world_size: int, port: int):
-    """Eager mode test."""
-    device = _init_worker(rank, world_size, port)
-    group = get_tp_group().device_group
-
-    # Warmup all-reduce (needed for NCCL initialization)
-    warmup = torch.zeros(1, device=device)
-    dist.all_reduce(warmup, group=group)
-    torch.cuda.synchronize()
-    del warmup
-
-    for M, N in TEST_SIZES:
-        for dtype in [torch.float16, torch.bfloat16]:
-            # Use integers so result matches NCCL exactly
-            inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
-            residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
-            norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
-            max_m = M * 2
-
-            # Reference: all_reduce(inp) + residual
-            ref_inp = inp.clone()
-            dist.all_reduce(ref_inp, group=group)
-            ref_res_out = ref_inp + residual
-
-            # Test: triton fused all-reduce + residual + rmsnorm
-            out, res_out = triton_allreduce(inp, residual, norm, max_m)
-            torch.testing.assert_close(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
-
-
-def _worker_graph(rank: int, world_size: int, port: int):
-    """Graph capture mode test."""
-    device = _init_worker(rank, world_size, port)
-    group = get_tp_group().device_group
-
-    # Warmup all-reduce (required before graph capture)
-    warmup = torch.zeros(1, device=device)
-    dist.all_reduce(warmup, group=group)
-    torch.cuda.synchronize()
-    del warmup
-
-    for M, N in TEST_SIZES:
-        for dtype in [torch.float16, torch.bfloat16]:
-            with graph_capture(device=device) as graph_capture_context:
-                # Use integers so result matches NCCL exactly
+        for M, N in TEST_SIZES:
+            for dtype in [torch.float16, torch.bfloat16]:
                 inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
                 residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
                 norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
@@ -99,14 +61,52 @@ def _worker_graph(rank: int, world_size: int, port: int):
                 dist.all_reduce(ref_inp, group=group)
                 ref_res_out = ref_inp + residual
 
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-                    # Triton fused all-reduce + residual + rmsnorm
-                    out, res_out = triton_allreduce(inp, residual, norm, max_m)
+                # Test: triton fused all-reduce + residual + rmsnorm
+                out, res_out = triton_allreduce(inp, residual, norm, max_m)
+                torch.testing.assert_close(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
 
-            graph.replay()
-            torch.testing.assert_close(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
+
+def _worker_graph(rank: int, world_size: int, port: int):
+    """Graph capture mode test."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            local_rank=rank,
+        )
+        ensure_model_parallel_initialized(world_size, 1)
+        group = get_tp_group().device_group
+
+        # Warmup all-reduce (required before graph capture)
+        warmup = torch.zeros(1, device=device)
+        dist.all_reduce(warmup, group=group)
+        torch.cuda.synchronize()
+        del warmup
+
+        for M, N in TEST_SIZES:
+            for dtype in [torch.float16, torch.bfloat16]:
+                with graph_capture(device=device) as graph_capture_context:
+                    inp = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
+                    residual = torch.randint(1, 16, (M, N), dtype=dtype, device=device)
+                    norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
+                    max_m = M * 2
+
+                    # Reference: all_reduce(inp) + residual
+                    ref_inp = inp.clone()
+                    dist.all_reduce(ref_inp, group=group)
+                    ref_res_out = ref_inp + residual
+
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=graph_capture_context.stream):
+                        out, res_out = triton_allreduce(inp, residual, norm, max_m)
+
+                graph.replay()
+                torch.testing.assert_close(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(
