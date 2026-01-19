@@ -14,7 +14,6 @@ Usage:
     Set VLLM_ROCM_TRITON_ALLREDUCE=1 to enable.
 """
 
-import logging
 from typing import Literal
 
 import iris
@@ -54,6 +53,7 @@ class _Context:
         send_buffer: torch.Tensor,
         flags: torch.Tensor | None,
         global_output: torch.Tensor | None,
+        ccl_output: torch.Tensor | None,
         max_m: int,
         N: int,
     ):
@@ -64,6 +64,7 @@ class _Context:
         self.send_buffer = send_buffer
         self.flags = flags
         self.global_output = global_output
+        self.ccl_output = ccl_output
         self.max_m = max_m
         self.N = N
     
@@ -85,12 +86,13 @@ def _get_buffers(
     dtype: torch.dtype,
     max_m: int,
     impl: AllReduceImpl,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """
     Get buffers for allreduce based on implementation type.
     Initializes context on first call, then returns views of appropriate size.
     Only allocates buffers needed by the specified impl:
     - test/simple_allreduce: send_buffer only
+    - ccl_allreduce: send_buffer + ccl_output (for CCL all_reduce)
     - atomic_allreduce: send_buffer + global_output
     - ring_allreduce: send_buffer + flags
     
@@ -102,8 +104,8 @@ def _get_buffers(
         impl: Which implementation to allocate buffers for.
         
     Returns:
-        (send_buffer, flags, global_output) - views into pre-allocated buffers.
-        flags and global_output may be None if not needed by impl.
+        (send_buffer, flags, global_output, ccl_output) - views into pre-allocated buffers.
+        flags, global_output, and ccl_output may be None if not needed by impl.
     """
     global _ctx
     
@@ -123,6 +125,16 @@ def _get_buffers(
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = None
             global_output = None
+            ccl_output = None
+        elif impl == "ccl_allreduce":
+            # Need send_buffer + ccl_output for CCL all_reduce
+            # Both buffers must be pre-allocated so all ranks have same offsets
+            heap_size = max(MIN_HEAP_SIZE, int(send_buffer_bytes * 2.2))  # 2x for input+output
+            shmem = iris.iris(heap_size)
+            send_buffer = shmem.zeros((max_m, N), dtype=dtype)
+            ccl_output = shmem.zeros((max_m, N), dtype=dtype)  # Output buffer for CCL
+            flags = None
+            global_output = None
         elif impl == "atomic_allreduce":
             # Need send_buffer + global_output for atomic accumulation
             global_output_bytes = max_m * N * 4  # float32
@@ -131,6 +143,7 @@ def _get_buffers(
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = None
             global_output = shmem.zeros((max_m, N), dtype=torch.float32)
+            ccl_output = None
         elif impl == "ring_allreduce":
             # Need send_buffer + flags for ring protocol
             flags_bytes = max_m * 4  # int32
@@ -139,6 +152,7 @@ def _get_buffers(
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             flags = shmem.zeros((max_m,), dtype=torch.int32)
             global_output = None
+            ccl_output = None
         else:
             raise ValueError(f"Unknown impl: {impl}")
         
@@ -150,6 +164,7 @@ def _get_buffers(
             send_buffer=send_buffer,
             flags=flags,
             global_output=global_output,
+            ccl_output=ccl_output,
             max_m=max_m,
             N=N,
         )
@@ -170,11 +185,12 @@ def _get_buffers(
     send_view = _ctx.send_buffer[:M, :] if M < _ctx.max_m else _ctx.send_buffer
     flags_view = _ctx.flags[:M] if _ctx.flags is not None and M < _ctx.max_m else _ctx.flags
     global_output_view = _ctx.global_output[:M, :] if _ctx.global_output is not None and M < _ctx.max_m else _ctx.global_output
+    ccl_output_view = _ctx.ccl_output[:M, :] if _ctx.ccl_output is not None and M < _ctx.max_m else _ctx.ccl_output
     
     # NOTE: We do NOT zero flags/global_output here - they are zeroed in the impl function
     # right before the kernel, after we've copied input to send_buffer.
     
-    return send_view, flags_view, global_output_view
+    return send_view, flags_view, global_output_view, ccl_output_view
 
 
 def get_configs(autotune: bool = False):
@@ -693,7 +709,7 @@ def _triton_allreduce_impl(
     
     if _IMPL == "test":
         # Test kernel: exercises iris.load and iris.store, outputs zeros
-        send_buffer, _flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
+        send_buffer, _flags, _global_output, _ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
         
@@ -717,7 +733,7 @@ def _triton_allreduce_impl(
     
     elif _IMPL == "simple_allreduce":
         # Simple all-reduce: each rank reads from all others
-        send_buffer, _flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
+        send_buffer, _flags, _global_output, _ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
         
@@ -730,13 +746,12 @@ def _triton_allreduce_impl(
         torch.cuda.synchronize()
         
         # Debug: verify send_buffer contents match input
-        if logger.isEnabledFor(logging.DEBUG):
-            sb_sample = send_buffer[0, :5].tolist()
-            inp_sample = input_[0, :5].tolist()
-            logger.debug(f"rank={_ctx.cur_rank} send_buffer sample: {sb_sample}")
-            logger.debug(f"rank={_ctx.cur_rank} input_ sample: {inp_sample}")
-            if sb_sample != inp_sample:
-                logger.warning(f"rank={_ctx.cur_rank} send_buffer != input_!")
+        sb_sample = send_buffer[0, :5].tolist()
+        inp_sample = input_[0, :5].tolist()
+        logger.debug(f"rank={_ctx.cur_rank} send_buffer sample: {sb_sample}")
+        logger.debug(f"rank={_ctx.cur_rank} input_ sample: {inp_sample}")
+        if sb_sample != inp_sample:
+            logger.warning(f"rank={_ctx.cur_rank} send_buffer != input_!")
         
         # Barrier to ensure all ranks have written to send_buffer before reading
         # Skip during graph capture - barriers cause deadlocks
@@ -770,36 +785,37 @@ def _triton_allreduce_impl(
     elif _IMPL == "ccl_allreduce":
         # Use Iris CCL all_reduce which handles synchronization correctly
         # This is the simplest and most reliable implementation
-        send_buffer, _flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, "simple_allreduce")
+        # Use ccl_allreduce impl to get both send_buffer and ccl_output pre-allocated
+        send_buffer, _flags, _global_output, ccl_output = _get_buffers(M, N, input_.dtype, max_m, "ccl_allreduce")
         
         assert _ctx is not None  # for type checker
+        assert ccl_output is not None  # allocated for ccl_allreduce impl
         
         logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, M={M}, N={N}, capturing={is_capturing}")
         
         # Copy input to send buffer (on symmetric heap)
         send_buffer.copy_(input_)
         
-        # Allocate output buffer on symmetric heap for all_reduce result
-        # CCL all_reduce signature: all_reduce(output, input)
-        output_buffer = _ctx.shmem.zeros((M, N), dtype=input_.dtype)
+        # Zero the output buffer before all_reduce
+        ccl_output.zero_()
         
         # Use Iris CCL all_reduce - this handles barriers and sync internally
-        # Note: output_buffer receives the reduced sum from all ranks
-        _ctx.shmem.ccl.all_reduce(output_buffer, send_buffer)
+        # CCL all_reduce signature: all_reduce(output, input)
+        # Both buffers are pre-allocated on symmetric heap at same offsets on all ranks
+        _ctx.shmem.ccl.all_reduce(ccl_output, send_buffer)
         
         # Synchronize to ensure all_reduce is complete
         torch.cuda.synchronize()
         
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"rank={_ctx.cur_rank} output_buffer sample: {output_buffer[0, :5].tolist()}")
+        logger.debug(f"rank={_ctx.cur_rank} ccl_output sample: {ccl_output[0, :5].tolist()}")
         
-        # Now output_buffer contains the all-reduced result
+        # Now ccl_output contains the all-reduced result
         # Add residual and compute RMSNorm if needed
         if do_residual:
             assert residual is not None
-            result = output_buffer + residual
+            result = ccl_output + residual
         else:
-            result = output_buffer
+            result = ccl_output
         
         # Store to residual_out
         residual_out.copy_(result)
@@ -819,7 +835,7 @@ def _triton_allreduce_impl(
     elif _IMPL == "atomic_allreduce":
         # Atomic all-reduce: each rank atomically adds to rank 0's global buffer
         # Following Iris example 08_gemm_all_reduce_atomics pattern
-        send_buffer, _flags, global_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
+        send_buffer, _flags, global_output, _ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
         assert global_output is not None  # allocated for atomic_allreduce impl
@@ -850,7 +866,7 @@ def _triton_allreduce_impl(
         logger.info(f"triton_allreduce [atomic_allreduce]: rank={_ctx.cur_rank}, done")
     
     elif _IMPL == "ring_allreduce":
-        ring_buffer, flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
+        ring_buffer, flags, _global_output, _ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
         assert flags is not None  # allocated for ring_allreduce impl
