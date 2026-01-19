@@ -778,16 +778,27 @@ def _triton_allreduce_impl(
         # Copy input to send buffer (on symmetric heap)
         send_buffer.copy_(input_)
         
-        # Use Iris CCL all_reduce - this handles barriers and sync internally
-        _ctx.shmem.ccl.all_reduce(send_buffer, send_buffer)
+        # Allocate output buffer on symmetric heap for all_reduce result
+        # CCL all_reduce signature: all_reduce(output, input)
+        output_buffer = _ctx.shmem.zeros((M, N), dtype=input_.dtype)
         
-        # Now send_buffer contains the all-reduced result
+        # Use Iris CCL all_reduce - this handles barriers and sync internally
+        # Note: output_buffer receives the reduced sum from all ranks
+        _ctx.shmem.ccl.all_reduce(output_buffer, send_buffer)
+        
+        # Synchronize to ensure all_reduce is complete
+        torch.cuda.synchronize()
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"rank={_ctx.cur_rank} output_buffer sample: {output_buffer[0, :5].tolist()}")
+        
+        # Now output_buffer contains the all-reduced result
         # Add residual and compute RMSNorm if needed
         if do_residual:
             assert residual is not None
-            result = send_buffer + residual
+            result = output_buffer + residual
         else:
-            result = send_buffer
+            result = output_buffer
         
         # Store to residual_out
         residual_out.copy_(result)
