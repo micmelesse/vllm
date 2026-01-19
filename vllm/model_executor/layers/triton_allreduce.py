@@ -796,18 +796,30 @@ def _triton_allreduce_impl(
         # Copy input to send buffer (on symmetric heap)
         send_buffer.copy_(input_)
         
-        # Zero the output buffer before all_reduce
-        ccl_output.zero_()
-        
-        # Use Iris CCL all_reduce - this handles barriers and sync internally
-        # CCL all_reduce signature: all_reduce(output, input)
-        # Both buffers are pre-allocated on symmetric heap at same offsets on all ranks
-        _ctx.shmem.ccl.all_reduce(ccl_output, send_buffer)
-        
-        # Synchronize to ensure all_reduce is complete
+        # Ensure copy is complete before preamble
         torch.cuda.synchronize()
         
-        logger.debug(f"rank={_ctx.cur_rank} ccl_output sample: {ccl_output[0, :5].tolist()}")
+        # Barrier to ensure all ranks have written to send_buffer
+        if not is_capturing:
+            _ctx.shmem.barrier()
+        
+        # Following Iris CCL test pattern:
+        # 1. Call all_reduce_preamble to get workspace
+        # 2. Barrier to ensure all ranks complete preamble
+        # 3. Call all_reduce with workspace
+        workspace = _ctx.shmem.ccl.all_reduce_preamble(ccl_output, send_buffer)
+        
+        # Barrier to ensure all ranks have completed preamble before kernel
+        if not is_capturing:
+            _ctx.shmem.barrier()
+        
+        # Now call all_reduce with the prepared workspace
+        _ctx.shmem.ccl.all_reduce(ccl_output, send_buffer, workspace=workspace)
+        
+        # Synchronize to ensure all_reduce kernel is complete
+        torch.cuda.synchronize()
+        
+        logger.info(f"rank={_ctx.cur_rank} ccl_output sample: {ccl_output[0, :5].tolist()}")
         
         # Now ccl_output contains the all-reduced result
         # Add residual and compute RMSNorm if needed
