@@ -7,12 +7,14 @@ Tests triton_allreduce in both eager and graph capture modes.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from amd.utils import tensor_stats
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -85,11 +87,16 @@ def _worker_eager(rank: int, world_size: int, port: int,
         if DEBUG:
             print(f"\n[Rank {rank}] Eager mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
             print(f"[Rank {rank}] inp sample: {inp[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(inp, 'inp')}")
             print(f"[Rank {rank}] ref_allreduced sample: {ref_allreduced[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(ref_allreduced, 'ref_allreduced')} (expected: inp * {world_size})")
             if residual is not None:
                 print(f"[Rank {rank}] residual sample: {residual[0, :5].tolist()}")
+                print(f"[Rank {rank}] {tensor_stats(residual, 'residual')}")
             print(f"[Rank {rank}] ref_res_out sample: {ref_res_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(ref_res_out, 'ref_res_out')}")
             print(f"[Rank {rank}] ref_out sample: {ref_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(ref_out, 'ref_out')}")
 
         # Test: triton all-reduce
         # out = final output (after all-reduce + residual + RMSNorm if applicable)
@@ -99,7 +106,14 @@ def _worker_eager(rank: int, world_size: int, port: int,
 
         if DEBUG:
             print(f"[Rank {rank}] res_out sample: {res_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(res_out, 'res_out')}")
             print(f"[Rank {rank}] out sample: {out[0, :5].tolist()}")
+            print(f"[Rank {rank}] {tensor_stats(out, 'out')}")
+            # Print diff stats
+            diff_res = (res_out - ref_res_out).abs()
+            diff_out = (out - ref_out).abs()
+            print(f"[Rank {rank}] {tensor_stats(diff_res, 'diff(res_out-ref_res_out)')}")
+            print(f"[Rank {rank}] {tensor_stats(diff_out, 'diff(out-ref_out)')}")
 
         # Check for NaN first
         if torch.isnan(res_out).any():
@@ -233,25 +247,38 @@ def _worker_graph(rank: int, world_size: int, port: int,
 @pytest.mark.parametrize("mode", ["eager"])  # Start with eager only for debugging
 @pytest.mark.parametrize("with_residual", [False])  # Disable residual for now
 @pytest.mark.parametrize("with_norm", [False])  # Disable norm for now
-@pytest.mark.parametrize("M,N", [
-    # Test in isolation - run just the failing case first
-    (128, 4096),   # Medium batch, larger hidden dim - was failing
+@pytest.mark.parametrize("M,N,input_type", [
+    # Start with simplest case: ones, small size
+    (4, 16, "ones"),       # Tiny - easiest to debug
+    (4, 16, "arange"),     # Small with predictable pattern
+    (8, 64, "ones"),       # Slightly larger
+    (128, 4096, "ones"),   # Original failing size with ones
+    (128, 4096, "randn"),  # Original failing case with random
 ])
 def test_triton_allreduce(tp_size: int, mode: str,
                           with_residual: bool, with_norm: bool,
-                          M: int, N: int):
+                          M: int, N: int, input_type: str):
     if tp_size > torch.cuda.device_count():
         pytest.skip("Not enough GPUs")
 
     os.environ["VLLM_ROCM_TRITON_ALLREDUCE"] = "1"
 
     # ===== Create test inputs on CPU (shared across all ranks) =====
-    # Use random inputs with fixed seed for reproducibility
     torch.manual_seed(42)
     dtype = torch.float16
     max_m = max(M * 2, 64)  # Ensure max_m > M with some headroom
     
-    inp_cpu = torch.randn((M, N), dtype=dtype)
+    # Create input based on type for easier debugging
+    if input_type == "ones":
+        inp_cpu = torch.ones((M, N), dtype=dtype)
+    elif input_type == "arange":
+        # Create a predictable pattern: each row has values 0, 1, 2, ... N-1
+        inp_cpu = torch.arange(N, dtype=dtype).unsqueeze(0).expand(M, N).contiguous()
+    elif input_type == "randn":
+        inp_cpu = torch.randn((M, N), dtype=dtype)
+    else:
+        raise ValueError(f"Unknown input_type: {input_type}")
+    
     residual_cpu = torch.randn((M, N), dtype=dtype) if with_residual else None
     weight_cpu = torch.randn(N, dtype=dtype).abs() + 0.1 if with_norm else None  # Positive weights
 
