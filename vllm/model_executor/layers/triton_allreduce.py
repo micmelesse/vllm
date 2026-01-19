@@ -785,11 +785,19 @@ def _triton_allreduce_impl(
     elif _IMPL == "ccl_allreduce":
         # Use Iris CCL all_reduce which handles synchronization correctly
         # This is the simplest and most reliable implementation
-        # Use ccl_allreduce impl to get both send_buffer and ccl_output pre-allocated
-        send_buffer, _flags, _global_output, ccl_output = _get_buffers(M, N, input_.dtype, max_m, "ccl_allreduce")
+        # 
+        # NOTE: CCL may not handle PyTorch tensor views correctly.
+        # The Iris test allocates exact-sized tensors for each call.
+        # So we allocate fresh tensors here rather than using pre-allocated views.
+        
+        # Initialize context if needed (to get shmem instance)
+        _get_buffers(M, N, input_.dtype, max_m, "ccl_allreduce")
         
         assert _ctx is not None  # for type checker
-        assert ccl_output is not None  # allocated for ccl_allreduce impl
+        
+        # Allocate exact-sized tensors for this call (matching Iris test pattern)
+        send_buffer = _ctx.shmem.zeros((M, N), dtype=input_.dtype)
+        ccl_output = _ctx.shmem.zeros((M, N), dtype=input_.dtype)
         
         # Debug: Check buffer offsets from heap base
         heap_base = _ctx.heap_bases[_ctx.cur_rank].item()
