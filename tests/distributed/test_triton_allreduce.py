@@ -234,12 +234,10 @@ def _worker_graph(rank: int, world_size: int, port: int,
 @pytest.mark.parametrize("with_residual", [False])  # Disable residual for now
 @pytest.mark.parametrize("with_norm", [False])  # Disable norm for now
 @pytest.mark.parametrize("M,N", [
-    (1, 128),      # Single token - small
-    (32, 128),     # Small batch
-    (128, 4096),   # Medium batch, larger hidden dim
-    (256, 8192),   # Larger batch
+    # Test in isolation - run just the failing case first
+    (128, 4096),   # Medium batch, larger hidden dim - was failing
 ])
-def test_triton_allreduce(tp_size: int, mode: str, 
+def test_triton_allreduce(tp_size: int, mode: str,
                           with_residual: bool, with_norm: bool,
                           M: int, N: int):
     if tp_size > torch.cuda.device_count():

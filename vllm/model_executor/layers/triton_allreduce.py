@@ -14,7 +14,6 @@ Usage:
     Set VLLM_ROCM_TRITON_ALLREDUCE=1 to enable.
 """
 
-from dataclasses import dataclass
 from typing import Literal
 
 import iris
@@ -37,17 +36,43 @@ _IMPL: AllReduceImpl = "simple_allreduce"
 # ============================================================================
 
 
-@dataclass
 class _Context:
-    """AllReduce state. Initialized once at max size, reused for all calls."""
-    shmem: iris.Iris
-    heap_bases: torch.Tensor
-    cur_rank: int
-    world_size: int
-    send_buffer: torch.Tensor  # all impls - symmetric memory for input data
-    flags: torch.Tensor | None  # ring_allreduce only
-    global_output: torch.Tensor | None  # atomic_allreduce only
-    max_m: int
+    """
+    AllReduce state with automatic cleanup.
+    
+    Initialized once at max size, reused for all calls.
+    Automatically cleans up Iris shared memory when garbage collected.
+    """
+    
+    def __init__(
+        self,
+        shmem: iris.Iris,
+        heap_bases: torch.Tensor,
+        cur_rank: int,
+        world_size: int,
+        send_buffer: torch.Tensor,
+        flags: torch.Tensor | None,
+        global_output: torch.Tensor | None,
+        max_m: int,
+        N: int,
+    ):
+        self.shmem = shmem
+        self.heap_bases = heap_bases
+        self.cur_rank = cur_rank
+        self.world_size = world_size
+        self.send_buffer = send_buffer
+        self.flags = flags
+        self.global_output = global_output
+        self.max_m = max_m
+        self.N = N
+    
+    def __del__(self):
+        """Clean up Iris shared memory when context is destroyed."""
+        if hasattr(self, 'shmem') and self.shmem is not None:
+            try:
+                del self.shmem
+            except Exception:
+                pass  # Ignore errors during cleanup
 
 
 _ctx: _Context | None = None
@@ -62,7 +87,6 @@ def _get_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """
     Get buffers for allreduce based on implementation type.
-    
     Initializes context on first call, then returns views of appropriate size.
     Only allocates buffers needed by the specified impl:
     - test/simple_allreduce: send_buffer only
@@ -126,11 +150,19 @@ def _get_buffers(
             flags=flags,
             global_output=global_output,
             max_m=max_m,
+            N=N,
         )
         logger.info(
             f"Initialized triton_allreduce [{impl}]: rank={_ctx.cur_rank}, "
             f"world_size={_ctx.world_size}, heap={heap_size / 2**30:.2f}GB, "
             f"buffers=({max_m}, {N}) {dtype}"
+        )
+    
+    # Validate N matches allocated buffer
+    if N != _ctx.N:
+        raise ValueError(
+            f"N mismatch: called with N={N} but buffer was allocated with N={_ctx.N}. "
+            f"Triton allreduce requires consistent hidden dimension across calls."
         )
     
     # Get views for actual size
@@ -692,6 +724,9 @@ def _triton_allreduce_impl(
         
         # Copy input to send buffer (symmetric memory)
         send_buffer.copy_(input_)
+        
+        # Ensure copy is complete before barrier
+        torch.cuda.synchronize()
         
         # Barrier to ensure all ranks have written to send_buffer before reading
         # Skip during graph capture - barriers cause deadlocks
