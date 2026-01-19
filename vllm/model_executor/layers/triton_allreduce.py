@@ -784,16 +784,13 @@ def _triton_allreduce_impl(
     
     elif _IMPL == "ccl_allreduce":
         # Use Iris CCL all_reduce - following the exact pattern from Iris test
-        # Bypass _Context completely and just follow the example code exactly
+        from iris.ccl import Config
         
         cur_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
-        # Calculate heap size needed
-        dtype_size = torch.tensor([], dtype=input_.dtype).element_size()
-        buffer_bytes = M * N * dtype_size
-        MIN_HEAP_SIZE = 1 * 1024 * 1024  # 1 MB minimum
-        heap_size = max(MIN_HEAP_SIZE, int(buffer_bytes * 4))  # 4x for input + output + workspace
+        # Use large heap like Iris tests (8GB)
+        heap_size = 2**33  # 8GB
         
         # Create fresh Iris instance for this call (exactly like the test)
         shmem = iris.iris(heap_size)
@@ -812,22 +809,25 @@ def _triton_allreduce_impl(
         
         logger.info(f"rank={cur_rank} iris_input sample: {iris_input[0, :5].tolist()}")
         
-        # Following exact Iris test pattern:
-        # 1. all_reduce_preamble
-        workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input)
+        # Use Config with a specific variant (two_shot is the default and most tested)
+        config = Config(all_reduce_variant="two_shot")
         
-        # 2. barrier
+        # Following exact Iris test pattern:
+        # 1. all_reduce_preamble with config
+        workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
+        
+        # 2. barrier to ensure all ranks complete preamble
         shmem.barrier()
         
-        # 3. all_reduce with workspace
-        shmem.ccl.all_reduce(iris_output, iris_input, workspace=workspace)
+        # 3. all_reduce with config and workspace
+        shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
         
         # 4. synchronize
         torch.cuda.synchronize()
         
         logger.info(f"rank={cur_rank} iris_output sample: {iris_output[0, :5].tolist()}")
         
-        # Now iris_output contains the all-reduced result
+        # Now iris_output contains the all-reduced result on all ranks
         # Add residual and compute RMSNorm if needed
         if do_residual:
             assert residual is not None
