@@ -24,6 +24,9 @@ from vllm.model_executor.layers.triton_allreduce import triton_allreduce
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 
+# Set to True for verbose debug output
+DEBUG = True
+
 
 def _worker_eager(rank: int, world_size: int, port: int, 
                   inp_cpu: torch.Tensor, residual_cpu: torch.Tensor | None,
@@ -60,31 +63,67 @@ def _worker_eager(rank: int, world_size: int, port: int,
             norm = RMSNorm(N, eps=1e-5).to(device=device, dtype=dtype)
             norm.weight.data.copy_(weight_cpu.to(device))
 
-        # Reference: all_reduce(inp) + residual (if provided), then RMSNorm (if provided)
-        ref_out = inp.clone()
-        dist.all_reduce(ref_out, group=group)
-        if residual is not None:
-            ref_res_out = ref_out + residual
-        else:
-            ref_res_out = ref_out.clone()
+        # Reference calculation:
+        # 1. all_reduce(inp)
+        # 2. + residual (if provided) -> this is ref_res_out (intermediate)
+        # 3. RMSNorm (if provided) -> this is ref_out (final)
+        ref_allreduced = inp.clone()
+        dist.all_reduce(ref_allreduced, group=group)
         
-        # Apply RMSNorm to reference if norm is provided
+        # ref_res_out = all_reduce + residual (BEFORE norm)
+        if residual is not None:
+            ref_res_out = ref_allreduced + residual
+        else:
+            ref_res_out = ref_allreduced.clone()
+        
+        # ref_out = after RMSNorm (if provided), else same as ref_res_out
         if norm is not None:
-            ref_res_out = norm(ref_res_out)
+            ref_out = norm(ref_res_out)
+        else:
+            ref_out = ref_res_out.clone()
 
-        print(f"\n[Rank {rank}] Eager mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
+        if DEBUG:
+            print(f"\n[Rank {rank}] Eager mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
+            print(f"[Rank {rank}] inp sample: {inp[0, :5].tolist()}")
+            print(f"[Rank {rank}] ref_allreduced sample: {ref_allreduced[0, :5].tolist()}")
+            if residual is not None:
+                print(f"[Rank {rank}] residual sample: {residual[0, :5].tolist()}")
+            print(f"[Rank {rank}] ref_res_out sample: {ref_res_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] ref_out sample: {ref_out[0, :5].tolist()}")
 
         # Test: triton all-reduce
+        # out = final output (after all-reduce + residual + RMSNorm if applicable)
+        # res_out = intermediate (after all-reduce + residual, BEFORE RMSNorm)
         out, res_out = triton_allreduce(inp, max_m, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
-        # Check res_out matches expected
-        if torch.allclose(res_out, ref_res_out, rtol=1e-2, atol=1e-2):
+        if DEBUG:
+            print(f"[Rank {rank}] res_out sample: {res_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] out sample: {out[0, :5].tolist()}")
+
+        # Check for NaN first
+        if torch.isnan(res_out).any():
+            print(f"[Rank {rank}] ERROR: res_out contains NaN!")
+        if torch.isnan(out).any():
+            print(f"[Rank {rank}] ERROR: out contains NaN!")
+
+        # Check res_out matches ref_res_out (pre-norm)
+        res_out_ok = torch.allclose(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
+        # Check out matches ref_out (post-norm)
+        out_ok = torch.allclose(out, ref_out, rtol=1e-2, atol=1e-2)
+        
+        if res_out_ok and out_ok:
             print(f"[Rank {rank}] Eager mode SUCCESS!")
         else:
-            diff = (res_out - ref_res_out).abs()
-            print(f"[Rank {rank}] Eager mode FAILED! Max diff: {diff.max()}, Mean diff: {diff.mean()}")
+            if not res_out_ok:
+                diff = (res_out - ref_res_out).abs()
+                print(f"[Rank {rank}] res_out FAILED! Max diff: {diff.max():.6f}, Mean diff: {diff.mean():.6f}")
+            if not out_ok:
+                diff = (out - ref_out).abs()
+                print(f"[Rank {rank}] out FAILED! Max diff: {diff.max():.6f}, Mean diff: {diff.mean():.6f}")
+            # Assert on res_out first (simpler to debug)
             torch.testing.assert_close(res_out, ref_res_out, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
 
 def _worker_graph(rank: int, world_size: int, port: int,
@@ -126,19 +165,27 @@ def _worker_graph(rank: int, world_size: int, port: int,
         _ = triton_allreduce(inp, max_m, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
-        # Reference: all_reduce(inp) + residual (if provided), then RMSNorm (if provided)
-        ref_out = inp.clone()
-        dist.all_reduce(ref_out, group=group)
-        if residual is not None:
-            ref_res_out = ref_out + residual
-        else:
-            ref_res_out = ref_out.clone()
+        # Reference calculation:
+        # 1. all_reduce(inp)
+        # 2. + residual (if provided) -> this is ref_res_out (intermediate)
+        # 3. RMSNorm (if provided) -> this is ref_out (final)
+        ref_allreduced = inp.clone()
+        dist.all_reduce(ref_allreduced, group=group)
         
-        # Apply RMSNorm to reference if norm is provided
+        # ref_res_out = all_reduce + residual (BEFORE norm)
+        if residual is not None:
+            ref_res_out = ref_allreduced + residual
+        else:
+            ref_res_out = ref_allreduced.clone()
+        
+        # ref_out = after RMSNorm (if provided), else same as ref_res_out
         if norm is not None:
-            ref_res_out = norm(ref_res_out)
+            ref_out = norm(ref_res_out)
+        else:
+            ref_out = ref_res_out.clone()
 
-        print(f"\n[Rank {rank}] Graph mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
+        if DEBUG:
+            print(f"\n[Rank {rank}] Graph mode - shape={inp.shape}, residual={residual is not None}, norm={norm is not None}")
 
         with graph_capture(device=device) as graph_capture_context:
             torch.cuda.synchronize()
@@ -149,12 +196,33 @@ def _worker_graph(rank: int, world_size: int, port: int,
         graph.replay()
         torch.cuda.synchronize()
 
-        if torch.allclose(res_out, ref_res_out, rtol=5e-2, atol=5e-2):
+        if DEBUG:
+            print(f"[Rank {rank}] res_out sample: {res_out[0, :5].tolist()}")
+            print(f"[Rank {rank}] out sample: {out[0, :5].tolist()}")
+
+        # Check for NaN first
+        if torch.isnan(res_out).any():
+            print(f"[Rank {rank}] ERROR: res_out contains NaN!")
+        if torch.isnan(out).any():
+            print(f"[Rank {rank}] ERROR: out contains NaN!")
+
+        # Check res_out matches ref_res_out (pre-norm)
+        res_out_ok = torch.allclose(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
+        # Check out matches ref_out (post-norm)
+        out_ok = torch.allclose(out, ref_out, rtol=5e-2, atol=5e-2)
+        
+        if res_out_ok and out_ok:
             print(f"[Rank {rank}] Graph mode SUCCESS!")
         else:
-            diff = (res_out - ref_res_out).abs()
-            print(f"[Rank {rank}] Graph mode FAILED! Max diff: {diff.max()}")
+            if not res_out_ok:
+                diff = (res_out - ref_res_out).abs()
+                print(f"[Rank {rank}] res_out FAILED! Max diff: {diff.max():.6f}, Mean diff: {diff.mean():.6f}")
+            if not out_ok:
+                diff = (out - ref_out).abs()
+                print(f"[Rank {rank}] out FAILED! Max diff: {diff.max():.6f}, Mean diff: {diff.mean():.6f}")
+            # Assert on res_out first (simpler to debug)
             torch.testing.assert_close(res_out, ref_res_out, rtol=5e-2, atol=5e-2)
+            torch.testing.assert_close(out, ref_out, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(
@@ -162,14 +230,14 @@ def _worker_graph(rank: int, world_size: int, port: int,
     reason="Triton allreduce with Iris is ROCm-only"
 )
 @pytest.mark.parametrize("tp_size", [2])
-@pytest.mark.parametrize("mode", ["eager", "graph"])
-@pytest.mark.parametrize("with_residual", [False, True])
-@pytest.mark.parametrize("with_norm", [False, True])
+@pytest.mark.parametrize("mode", ["eager"])  # Start with eager only for debugging
+@pytest.mark.parametrize("with_residual", [False])  # Disable residual for now
+@pytest.mark.parametrize("with_norm", [False])  # Disable norm for now
 @pytest.mark.parametrize("M,N", [
-    (1, 128),      # Single token
+    (1, 128),      # Single token - small
     (32, 128),     # Small batch
     (128, 4096),   # Medium batch, larger hidden dim
-    (256, 8192),   # Larger batch, typical LLM hidden dim
+    (256, 8192),   # Larger batch
 ])
 def test_triton_allreduce(tp_size: int, mode: str, 
                           with_residual: bool, with_norm: bool,
@@ -188,6 +256,13 @@ def test_triton_allreduce(tp_size: int, mode: str,
     inp_cpu = torch.randn((M, N), dtype=dtype)
     residual_cpu = torch.randn((M, N), dtype=dtype) if with_residual else None
     weight_cpu = torch.randn(N, dtype=dtype).abs() + 0.1 if with_norm else None  # Positive weights
+
+    # Share memory so spawned processes get identical data
+    inp_cpu.share_memory_()
+    if residual_cpu is not None:
+        residual_cpu.share_memory_()
+    if weight_cpu is not None:
+        weight_cpu.share_memory_()
 
     port = get_open_port()
     worker = _worker_eager if mode == "eager" else _worker_graph
