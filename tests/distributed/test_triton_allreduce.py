@@ -6,6 +6,7 @@ Triton AllReduce tests.
 Tests triton_allreduce in both eager and graph capture modes.
 """
 
+import logging
 import os
 from pathlib import Path
 
@@ -28,6 +29,10 @@ from vllm.utils.network_utils import get_open_port
 
 # Set to True for verbose debug output
 DEBUG = True
+
+# Enable DEBUG logging for triton_allreduce module
+if DEBUG:
+    logging.getLogger("vllm.model_executor.layers.triton_allreduce").setLevel(logging.DEBUG)
 
 
 def _worker_eager(rank: int, world_size: int, port: int, 

@@ -27,8 +27,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 logger = init_logger(__name__)
 
 # Implementation selection (internal detail)
-AllReduceImpl = Literal["test", "simple_allreduce", "atomic_allreduce", "ring_allreduce"]
-_IMPL: AllReduceImpl = "simple_allreduce"
+AllReduceImpl = Literal["test", "simple_allreduce", "ccl_allreduce", "atomic_allreduce", "ring_allreduce"]
+_IMPL: AllReduceImpl = "ccl_allreduce"
 
 
 # ============================================================================
@@ -728,10 +728,21 @@ def _triton_allreduce_impl(
         # Ensure copy is complete before barrier
         torch.cuda.synchronize()
         
+        # Debug: verify send_buffer contents match input
+        if logger.isEnabledFor(logging.DEBUG):
+            sb_sample = send_buffer[0, :5].tolist()
+            inp_sample = input_[0, :5].tolist()
+            logger.debug(f"rank={_ctx.cur_rank} send_buffer sample: {sb_sample}")
+            logger.debug(f"rank={_ctx.cur_rank} input_ sample: {inp_sample}")
+            if sb_sample != inp_sample:
+                logger.warning(f"rank={_ctx.cur_rank} send_buffer != input_!")
+        
         # Barrier to ensure all ranks have written to send_buffer before reading
         # Skip during graph capture - barriers cause deadlocks
         if not is_capturing:
             _ctx.shmem.barrier()
+            # Extra sync after barrier to ensure barrier completion is visible
+            torch.cuda.synchronize()
         
         _kernel_simple_allreduce[grid](
             send_buffer,
@@ -754,6 +765,44 @@ def _triton_allreduce_impl(
             _ctx.shmem.barrier()
         
         logger.info(f"triton_allreduce [simple_allreduce]: rank={_ctx.cur_rank}, done")
+    
+    elif _IMPL == "ccl_allreduce":
+        # Use Iris CCL all_reduce which handles synchronization correctly
+        # This is the simplest and most reliable implementation
+        send_buffer, _flags, _global_output = _get_buffers(M, N, input_.dtype, max_m, "simple_allreduce")
+        
+        assert _ctx is not None  # for type checker
+        
+        logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, M={M}, N={N}, capturing={is_capturing}")
+        
+        # Copy input to send buffer (on symmetric heap)
+        send_buffer.copy_(input_)
+        
+        # Use Iris CCL all_reduce - this handles barriers and sync internally
+        _ctx.shmem.ccl.all_reduce(send_buffer, send_buffer)
+        
+        # Now send_buffer contains the all-reduced result
+        # Add residual and compute RMSNorm if needed
+        if do_residual:
+            assert residual is not None
+            result = send_buffer + residual
+        else:
+            result = send_buffer
+        
+        # Store to residual_out
+        residual_out.copy_(result)
+        
+        if do_rmsnorm:
+            assert weight is not None
+            # Simple RMSNorm: out = (x / sqrt(mean(x^2) + eps)) * weight
+            variance = (result.float() ** 2).mean(dim=-1, keepdim=True)
+            rrms = torch.rsqrt(variance + eps)
+            normed = (result.float() * rrms * weight.float()).to(input_.dtype)
+            output.copy_(normed)
+        else:
+            output.copy_(result)
+        
+        logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, done")
     
     elif _IMPL == "atomic_allreduce":
         # Atomic all-reduce: each rank atomically adds to rank 0's global buffer
