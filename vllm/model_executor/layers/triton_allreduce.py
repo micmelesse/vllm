@@ -14,6 +14,7 @@ Usage:
     Set VLLM_ROCM_TRITON_ALLREDUCE=1 to enable.
 """
 
+import logging
 from typing import Literal
 
 import iris
