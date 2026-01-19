@@ -791,13 +791,23 @@ def _triton_allreduce_impl(
         assert _ctx is not None  # for type checker
         assert ccl_output is not None  # allocated for ccl_allreduce impl
         
+        # Debug: Check buffer offsets from heap base
+        heap_base = _ctx.heap_bases[_ctx.cur_rank].item()
+        send_offset = send_buffer.data_ptr() - heap_base
+        ccl_offset = ccl_output.data_ptr() - heap_base
         logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, M={M}, N={N}, capturing={is_capturing}")
+        logger.info(f"rank={_ctx.cur_rank} heap_base={heap_base:#x}, send_offset={send_offset}, ccl_offset={ccl_offset}")
+        logger.info(f"rank={_ctx.cur_rank} send_buffer: shape={list(send_buffer.shape)}, stride={list(send_buffer.stride())}, ptr={send_buffer.data_ptr():#x}")
+        logger.info(f"rank={_ctx.cur_rank} ccl_output: shape={list(ccl_output.shape)}, stride={list(ccl_output.stride())}, ptr={ccl_output.data_ptr():#x}")
         
         # Copy input to send buffer (on symmetric heap)
         send_buffer.copy_(input_)
         
         # Ensure copy is complete before preamble
         torch.cuda.synchronize()
+        
+        # Debug: verify send_buffer has correct data
+        logger.info(f"rank={_ctx.cur_rank} send_buffer after copy: {send_buffer[0, :5].tolist()}")
         
         # Barrier to ensure all ranks have written to send_buffer
         if not is_capturing:
