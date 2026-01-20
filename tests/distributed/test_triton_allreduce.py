@@ -250,15 +250,15 @@ def _worker_graph(rank: int, world_size: int, port: int,
 )
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("mode", ["eager"])  # Start with eager only for debugging
-@pytest.mark.parametrize("with_residual", [False])  # Disable residual for now
-@pytest.mark.parametrize("with_norm", [False])  # Disable norm for now
+@pytest.mark.parametrize("with_residual", [False, True])  # Test with and without residual
+@pytest.mark.parametrize("with_norm", [False, True])  # Test with and without RMSNorm
 @pytest.mark.parametrize("M,N,input_type", [
     # Start with simplest case: ones, small size
     (4, 16, "ones"),       # Tiny - easiest to debug
-    # (4, 16, "arange"),     # Small with predictable pattern
-    # (8, 64, "ones"),       # Slightly larger
-    # (128, 4096, "ones"),   # Original failing size with ones
-    # (128, 4096, "randn"),  # Original failing case with random
+    (4, 16, "arange"),     # Small with predictable pattern
+    (8, 64, "ones"),       # Slightly larger
+    (128, 4096, "ones"),   # Original failing size with ones
+    (128, 4096, "randn"),  # Original failing case with random
 ])
 def test_triton_allreduce(tp_size: int, mode: str,
                           with_residual: bool, with_norm: bool,
