@@ -795,7 +795,7 @@ def _triton_allreduce_impl(
         # Create fresh Iris instance for this call (exactly like the test)
         shmem = iris.iris(heap_size)
         
-        logger.info(f"triton_allreduce [ccl_allreduce]: rank={cur_rank}, M={M}, N={N}, heap_size={heap_size}")
+        logger.info(f"triton_allreduce [ccl_allreduce]: rank={cur_rank}, M={M}, N={N}, capturing={is_capturing}")
         
         # Allocate input and output tensors on symmetric heap (exactly like test)
         iris_input = shmem.zeros((M, N), dtype=input_.dtype)
@@ -804,8 +804,9 @@ def _triton_allreduce_impl(
         # Copy input to symmetric heap tensor
         iris_input.copy_(input_)
         
-        # Barrier to ensure all ranks have copied input
-        shmem.barrier()
+        # Barrier to ensure all ranks have copied input (skip during graph capture)
+        if not is_capturing:
+            shmem.barrier()
         
         logger.info(f"rank={cur_rank} iris_input sample: {iris_input[0, :5].tolist()}")
         
@@ -816,8 +817,9 @@ def _triton_allreduce_impl(
         # 1. all_reduce_preamble with config
         workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
         
-        # 2. barrier to ensure all ranks complete preamble
-        shmem.barrier()
+        # 2. barrier to ensure all ranks complete preamble (skip during graph capture)
+        if not is_capturing:
+            shmem.barrier()
         
         # 3. all_reduce with config and workspace
         shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)

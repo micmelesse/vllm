@@ -248,12 +248,11 @@ def _worker_graph(rank: int, world_size: int, port: int,
     not current_platform.is_rocm(),
     reason="Triton allreduce with Iris is ROCm-only"
 )
-@pytest.mark.parametrize("tp_size", [2])
-@pytest.mark.parametrize("mode", ["eager"])  # Start with eager only for debugging
-@pytest.mark.parametrize("with_residual", [False, True])  # Test with and without residual
-@pytest.mark.parametrize("with_norm", [False, True])  # Test with and without RMSNorm
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("with_norm", [False, True])
 @pytest.mark.parametrize("M,N,input_type", [
-    # Start with simplest case: ones, small size
     (4, 16, "ones"),       # Tiny - easiest to debug
     (4, 16, "arange"),     # Small with predictable pattern
     (8, 64, "ones"),       # Slightly larger
