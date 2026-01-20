@@ -1465,7 +1465,6 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         use_fused_rmsnorm = residual is not None and norm is not None
         residual_out = None
@@ -1474,7 +1473,9 @@ class RowParallelLinear(LinearBase):
                 assert self.max_m is not None, (
                     "max_m must be set for fused triton_allreduce"
                 )
-                # Fused all-reduce + residual add + RMSNorm
+                # Fused path: GEMM → all-reduce + residual add + RMSNorm
+                # TODO: Future optimization could fuse GEMM + all-reduce + residual + RMSNorm + quant
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
                 output, residual_out = triton_allreduce(
                     output_parallel,
                     residual,
@@ -1482,8 +1483,10 @@ class RowParallelLinear(LinearBase):
                     self.max_m,
                 )
             else:
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
                 output = tensor_model_parallel_all_reduce(output_parallel)
         else:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
             output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None
