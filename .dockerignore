@@ -34,21 +34,3 @@ MANIFEST
 
 # misc
 .scripts
-gpucore*
-
-# ======================================
-# LOCAL DEVELOPMENT ONLY
-# Remove before upstreaming to vllm/vllm
-# ======================================
-.triton
-.cache
-.huggingface
-.deps
-hub/
-models/
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.onnx
-*.gguf
