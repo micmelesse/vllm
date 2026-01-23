@@ -32,5 +32,4 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# misc
 .scripts
