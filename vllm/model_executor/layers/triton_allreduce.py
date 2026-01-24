@@ -799,40 +799,42 @@ def _triton_allreduce_impl(
     
     elif _IMPL == "ccl_allreduce":
         # Use Iris CCL all_reduce with cached context (supports CUDA graph capture)
-        send_buffer, _flags, _global_output, ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
+        send_buffer_view, _flags, _global_output, ccl_output_view = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
         assert _ctx is not None  # for type checker
-        assert ccl_output is not None  # allocated for ccl_allreduce impl
+        assert ccl_output_view is not None  # allocated for ccl_allreduce impl
         assert _ctx.ccl_config is not None  # initialized in _get_buffers
         assert _ctx.ccl_workspace is not None  # initialized in _get_buffers
         
         logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, M={M}, N={N}, capturing={is_capturing}")
         
-        # Copy input to send buffer (pre-allocated symmetric memory)
-        send_buffer.copy_(input_)
+        # Copy input to send buffer view (only M rows needed)
+        send_buffer_view.copy_(input_)
         
         # Barrier to ensure all ranks have copied input (skip during graph capture)
         if not is_capturing:
             _ctx.shmem.barrier()
         
-        logger.info(f"rank={_ctx.cur_rank} iris_input sample: {send_buffer[0, :5].tolist()}")
+        logger.info(f"rank={_ctx.cur_rank} iris_input sample: {send_buffer_view[0, :5].tolist()}")
         
-        # Use cached config and workspace (created during initialization)
-        # all_reduce_preamble was already called in _get_buffers
-        _ctx.shmem.ccl.all_reduce(ccl_output, send_buffer, config=_ctx.ccl_config, workspace=_ctx.ccl_workspace)
+        # CRITICAL: Use the FULL buffers (_ctx.send_buffer, _ctx.ccl_output) for all_reduce,
+        # not the views! The workspace from all_reduce_preamble was computed with the full
+        # buffers and expects the same pointers/sizes.
+        _ctx.shmem.ccl.all_reduce(_ctx.ccl_output, _ctx.send_buffer, config=_ctx.ccl_config, workspace=_ctx.ccl_workspace)
         
         # Synchronize
         torch.cuda.synchronize()
         
-        logger.info(f"rank={_ctx.cur_rank} iris_output sample: {ccl_output[0, :5].tolist()}")
+        # Use the view for reading results (only M rows are valid)
+        logger.info(f"rank={_ctx.cur_rank} iris_output sample: {ccl_output_view[0, :5].tolist()}")
         
-        # Now ccl_output contains the all-reduced result on all ranks
+        # Now ccl_output_view contains the all-reduced result on all ranks
         # Add residual and compute RMSNorm if needed
         if do_residual:
             assert residual is not None
-            result = ccl_output + residual
+            result = ccl_output_view + residual
         else:
-            result = ccl_output
+            result = ccl_output_view
         
         # Store to residual_out
         residual_out.copy_(result)
