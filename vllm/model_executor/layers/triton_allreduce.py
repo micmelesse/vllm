@@ -14,7 +14,7 @@ Usage:
     Set VLLM_ROCM_TRITON_ALLREDUCE=1 to enable.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 import iris
 import torch
@@ -56,6 +56,8 @@ class _Context:
         ccl_output: torch.Tensor | None,
         max_m: int,
         N: int,
+        ccl_config: Any | None = None,
+        ccl_workspace: Any | None = None,
     ):
         self.shmem = shmem
         self.heap_bases = heap_bases
@@ -67,6 +69,8 @@ class _Context:
         self.ccl_output = ccl_output
         self.max_m = max_m
         self.N = N
+        self.ccl_config = ccl_config
+        self.ccl_workspace = ccl_workspace
     
     def __del__(self):
         """Clean up Iris shared memory when context is destroyed."""
@@ -118,6 +122,8 @@ def _get_buffers(
         MIN_HEAP_SIZE = 1 * 1024 * 1024  # 1 MB minimum
         
         # Allocate buffers based on impl type
+        ccl_config = None
+        ccl_workspace = None
         if impl in ("test", "simple_allreduce"):
             # Just need send_buffer for send/recv
             heap_size = max(MIN_HEAP_SIZE, int(send_buffer_bytes * 1.1))
@@ -129,12 +135,19 @@ def _get_buffers(
         elif impl == "ccl_allreduce":
             # Need send_buffer + ccl_output for CCL all_reduce
             # Both buffers must be pre-allocated so all ranks have same offsets
+            # Also need workspace from all_reduce_preamble (cached for graph capture)
+            from iris.ccl import Config
             heap_size = max(MIN_HEAP_SIZE, int(send_buffer_bytes * 2.2))  # 2x for input+output
             shmem = iris.iris(heap_size)
             send_buffer = shmem.zeros((max_m, N), dtype=dtype)
             ccl_output = shmem.zeros((max_m, N), dtype=dtype)  # Output buffer for CCL
             flags = None
             global_output = None
+            # Create config and workspace once (needed for CUDA graph capture)
+            ccl_config = Config(all_reduce_variant="two_shot")
+            ccl_workspace = shmem.ccl.all_reduce_preamble(ccl_output, send_buffer, config=ccl_config)
+            # Barrier to ensure all ranks complete preamble
+            shmem.barrier()
         elif impl == "atomic_allreduce":
             # Need send_buffer + global_output for atomic accumulation
             global_output_bytes = max_m * N * 4  # float32
@@ -167,6 +180,8 @@ def _get_buffers(
             ccl_output=ccl_output,
             max_m=max_m,
             N=N,
+            ccl_config=ccl_config,
+            ccl_workspace=ccl_workspace,
         )
         logger.info(
             f"Initialized triton_allreduce [{impl}]: rank={_ctx.cur_rank}, "
@@ -783,59 +798,41 @@ def _triton_allreduce_impl(
         logger.info(f"triton_allreduce [simple_allreduce]: rank={_ctx.cur_rank}, done")
     
     elif _IMPL == "ccl_allreduce":
-        # Use Iris CCL all_reduce - following the exact pattern from Iris test
-        from iris.ccl import Config
+        # Use Iris CCL all_reduce with cached context (supports CUDA graph capture)
+        send_buffer, _flags, _global_output, ccl_output = _get_buffers(M, N, input_.dtype, max_m, _IMPL)
         
-        cur_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        assert _ctx is not None  # for type checker
+        assert ccl_output is not None  # allocated for ccl_allreduce impl
+        assert _ctx.ccl_config is not None  # initialized in _get_buffers
+        assert _ctx.ccl_workspace is not None  # initialized in _get_buffers
         
-        # Use large heap like Iris tests (8GB)
-        heap_size = 2**33  # 8GB
+        logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, M={M}, N={N}, capturing={is_capturing}")
         
-        # Create fresh Iris instance for this call (exactly like the test)
-        shmem = iris.iris(heap_size)
-        
-        logger.info(f"triton_allreduce [ccl_allreduce]: rank={cur_rank}, M={M}, N={N}, capturing={is_capturing}")
-        
-        # Allocate input and output tensors on symmetric heap (exactly like test)
-        iris_input = shmem.zeros((M, N), dtype=input_.dtype)
-        iris_output = shmem.zeros((M, N), dtype=input_.dtype)
-        
-        # Copy input to symmetric heap tensor
-        iris_input.copy_(input_)
+        # Copy input to send buffer (pre-allocated symmetric memory)
+        send_buffer.copy_(input_)
         
         # Barrier to ensure all ranks have copied input (skip during graph capture)
         if not is_capturing:
-            shmem.barrier()
+            _ctx.shmem.barrier()
         
-        logger.info(f"rank={cur_rank} iris_input sample: {iris_input[0, :5].tolist()}")
+        logger.info(f"rank={_ctx.cur_rank} iris_input sample: {send_buffer[0, :5].tolist()}")
         
-        # Use Config with a specific variant (two_shot is the default and most tested)
-        config = Config(all_reduce_variant="two_shot")
+        # Use cached config and workspace (created during initialization)
+        # all_reduce_preamble was already called in _get_buffers
+        _ctx.shmem.ccl.all_reduce(ccl_output, send_buffer, config=_ctx.ccl_config, workspace=_ctx.ccl_workspace)
         
-        # Following exact Iris test pattern:
-        # 1. all_reduce_preamble with config
-        workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
-        
-        # 2. barrier to ensure all ranks complete preamble (skip during graph capture)
-        if not is_capturing:
-            shmem.barrier()
-        
-        # 3. all_reduce with config and workspace
-        shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
-        
-        # 4. synchronize
+        # Synchronize
         torch.cuda.synchronize()
         
-        logger.info(f"rank={cur_rank} iris_output sample: {iris_output[0, :5].tolist()}")
+        logger.info(f"rank={_ctx.cur_rank} iris_output sample: {ccl_output[0, :5].tolist()}")
         
-        # Now iris_output contains the all-reduced result on all ranks
+        # Now ccl_output contains the all-reduced result on all ranks
         # Add residual and compute RMSNorm if needed
         if do_residual:
             assert residual is not None
-            result = iris_output + residual
+            result = ccl_output + residual
         else:
-            result = iris_output
+            result = ccl_output
         
         # Store to residual_out
         residual_out.copy_(result)
@@ -850,7 +847,7 @@ def _triton_allreduce_impl(
         else:
             output.copy_(result)
         
-        logger.info(f"triton_allreduce [ccl_allreduce]: rank={cur_rank}, done")
+        logger.info(f"triton_allreduce [ccl_allreduce]: rank={_ctx.cur_rank}, done")
     
     elif _IMPL == "atomic_allreduce":
         # Atomic all-reduce: each rank atomically adds to rank 0's global buffer
