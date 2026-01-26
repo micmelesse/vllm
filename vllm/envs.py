@@ -205,7 +205,6 @@ if TYPE_CHECKING:
     ] = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
-    VLLM_ROCM_TRITON_ALLREDUCE: bool = False
     VLLM_NIXL_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MORIIO_CONNECTOR_READ_MODE: bool = False
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
@@ -1054,11 +1053,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # communication.
     "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
-    ),
-    # If set, use Triton fused all-reduce + RMSNorm in RowParallelLinear on ROCm.
-    # Fuses the all-reduce communication with the subsequent layernorm.
-    "VLLM_ROCM_TRITON_ALLREDUCE": lambda: (
-        os.getenv("VLLM_ROCM_TRITON_ALLREDUCE", "0").lower() in ("1", "true")
     ),
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT": lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),

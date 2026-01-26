@@ -18,8 +18,6 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.triton_allreduce import triton_allreduce
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -1445,11 +1443,7 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
-        residual: torch.Tensor | None = None,
-        norm: RMSNorm | None = None,
-    ) -> (torch.Tensor 
-          | tuple[torch.Tensor, Parameter | None] 
-          | tuple[torch.Tensor, Parameter | None, torch.Tensor]):
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1463,33 +1457,17 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
-        use_fused_rmsnorm = residual is not None and norm is not None
-        residual_out = None
         if self.reduce_results and self.tp_size > 1:
-            if use_fused_rmsnorm:
-                # Fused path: GEMM → all-reduce + residual add + RMSNorm
-                # TODO: Future optimization could fuse GEMM + all-reduce + residual + RMSNorm + quant
-                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-                output, residual_out = triton_allreduce(
-                    output_parallel,
-                    residual=residual,
-                    norm=norm,
-                )
-            else:
-                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-                output = tensor_model_parallel_all_reduce(output_parallel)
+            output = tensor_model_parallel_all_reduce(output_parallel)
         else:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
             output = output_parallel
 
+        if not self.return_bias:
+            return output
         output_bias = self.bias if self.skip_bias_add else None
-
-        if use_fused_rmsnorm:
-            return output, output_bias, residual_out
-        if self.return_bias:
-            return output, output_bias
-        return output
+        return output, output_bias
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size_per_partition}"
