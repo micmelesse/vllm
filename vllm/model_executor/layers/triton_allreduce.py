@@ -19,8 +19,6 @@ Implementations:
     - ccl_optimized: (TODO) Optimized version with pre-allocated buffers for CUDA graphs.
 """
 
-from typing import Literal
-
 import iris
 import torch
 from iris.ccl import Config
@@ -178,7 +176,7 @@ def _triton_allreduce_impl(
     weight: torch.Tensor | None,
     eps: float,
     max_m: int,
-    impl: Literal["ccl_baseline", "ccl_optimized"] = "ccl_baseline",
+    impl: str = "ccl_baseline",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Internal implementation of fused all-reduce with optional residual add and RMS normalization.
@@ -189,12 +187,16 @@ def _triton_allreduce_impl(
         weight: Optional RMSNorm weight (if None, skip RMSNorm)
         eps: RMSNorm epsilon
         max_m: Max M (tokens) for buffer pre-allocation (used by ccl_optimized)
-        impl: Which implementation to use (default: ccl_baseline)
+        impl: Which implementation to use: "ccl_baseline" or "ccl_optimized"
     
     Returns:
         output: All-reduced (and optionally normalized) output
         residual_out: all_reduce(input) + residual (or just all_reduce(input) if no residual)
     """
+    # Validate impl parameter
+    valid_impls = ("ccl_baseline", "ccl_optimized")
+    assert impl in valid_impls, f"impl must be one of {valid_impls}, got: {impl}"
+    
     assert input_.dim() == 2, f"Expected 2D input, got {input_.dim()}D"
     
     M, N = input_.shape
@@ -220,6 +222,7 @@ def _triton_allreduce_fake(
     weight: torch.Tensor | None,
     eps: float,
     max_m: int,
+    impl: str = "ccl_baseline",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
     return torch.empty_like(input_), torch.empty_like(input_)
