@@ -3,7 +3,10 @@
 """
 Triton AllReduce tests.
 
-Tests triton_allreduce in both eager and graph capture modes.
+Tests triton_allreduce in eager mode only. CUDA graph capture is NOT supported
+because Iris barriers are forbidden during graph capture.
+
+TODO: Integrate with vLLM fusion pass system to eliminate env var switching.
 """
 
 import logging
@@ -37,7 +40,7 @@ if DEBUG:
 
 def _worker_eager(rank: int, world_size: int, port: int, 
                   inp_cpu: torch.Tensor, residual_cpu: torch.Tensor | None,
-                  weight_cpu: torch.Tensor | None, max_m: int):
+                  weight_cpu: torch.Tensor | None):
     """Eager mode test worker."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -106,7 +109,7 @@ def _worker_eager(rank: int, world_size: int, port: int,
         # Test: triton all-reduce
         # out = final output (after all-reduce + residual + RMSNorm if applicable)
         # res_out = intermediate (after all-reduce + residual, BEFORE RMSNorm)
-        out, res_out = triton_allreduce(inp, max_m, residual=residual, norm=norm)
+        out, res_out = triton_allreduce(inp, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
         if DEBUG:
@@ -147,7 +150,7 @@ def _worker_eager(rank: int, world_size: int, port: int,
 
 def _worker_graph(rank: int, world_size: int, port: int,
                   inp_cpu: torch.Tensor, residual_cpu: torch.Tensor | None,
-                  weight_cpu: torch.Tensor | None, max_m: int):
+                  weight_cpu: torch.Tensor | None):
     """Graph capture mode test worker."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -181,7 +184,7 @@ def _worker_graph(rank: int, world_size: int, port: int,
             norm.weight.data.copy_(weight_cpu.to(device))
 
         # Warmup call to initialize Iris buffers BEFORE graph capture
-        _ = triton_allreduce(inp, max_m, residual=residual, norm=norm)
+        _ = triton_allreduce(inp, residual=residual, norm=norm)
         torch.cuda.synchronize()
 
         # Reference calculation:
@@ -210,7 +213,7 @@ def _worker_graph(rank: int, world_size: int, port: int,
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-                out, res_out = triton_allreduce(inp, max_m, residual=residual, norm=norm)
+                out, res_out = triton_allreduce(inp, residual=residual, norm=norm)
 
         graph.replay()
         torch.cuda.synchronize()
@@ -249,18 +252,18 @@ def _worker_graph(rank: int, world_size: int, port: int,
     reason="Triton allreduce with Iris is ROCm-only"
 )
 @pytest.mark.parametrize("tp_size", [2, 8])
-@pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("mode", ["eager"])  # graph mode not supported (Iris barriers forbidden during capture)
 @pytest.mark.parametrize("with_residual", [False, True])
 @pytest.mark.parametrize("with_norm", [False, True])
 @pytest.mark.parametrize("M,N", [
     (4, 16),
-    # (8, 64),
-    # (128, 4096),
+    (8, 64),
+    (128, 4096),
 ])
 @pytest.mark.parametrize("input_type", [
     "ones",       
-    # "arange",    
-    # "randn",      
+    "arange",    
+    "randn",      
 ])
 def test_triton_allreduce(tp_size: int, mode: str,
                           with_residual: bool, with_norm: bool,
@@ -273,7 +276,6 @@ def test_triton_allreduce(tp_size: int, mode: str,
     # ===== Create test inputs on CPU (shared across all ranks) =====
     torch.manual_seed(42)
     dtype = torch.float16
-    max_m = max(M * 2, 64)  # Ensure max_m > M with some headroom
     
     # Create input based on type for easier debugging
     if input_type == "ones":
@@ -300,7 +302,7 @@ def test_triton_allreduce(tp_size: int, mode: str,
     worker = _worker_eager if mode == "eager" else _worker_graph
     mp.spawn(
         worker, 
-        args=(tp_size, port, inp_cpu, residual_cpu, weight_cpu, max_m), 
+        args=(tp_size, port, inp_cpu, residual_cpu, weight_cpu), 
         nprocs=tp_size, 
         join=True
     )

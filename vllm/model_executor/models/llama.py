@@ -143,7 +143,6 @@ class LlamaAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
-        max_m: int | None = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
@@ -196,7 +195,6 @@ class LlamaAttention(nn.Module):
             bias=bias_o_proj,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            max_m=max_m,
         )
 
         self._init_rotary_emb(config, quant_config=quant_config)
@@ -330,9 +328,6 @@ class LlamaDecoderLayer(nn.Module):
         else:
             attn_type = AttentionType.ENCODER_ONLY
 
-        # Get max_m for triton_allreduce buffer pre-allocation
-        max_m = vllm_config.scheduler_config.max_num_batched_tokens
-
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -347,7 +342,6 @@ class LlamaDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
-            max_m=max_m,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,

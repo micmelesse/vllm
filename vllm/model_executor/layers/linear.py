@@ -1343,7 +1343,6 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
-        max_m: int | None = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -1351,7 +1350,6 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
-        self.max_m = max_m
 
         super().__init__(
             input_size,
@@ -1470,17 +1468,13 @@ class RowParallelLinear(LinearBase):
         residual_out = None
         if self.reduce_results and self.tp_size > 1:
             if use_fused_rmsnorm:
-                assert self.max_m is not None, (
-                    "max_m must be set for fused triton_allreduce"
-                )
                 # Fused path: GEMM → all-reduce + residual add + RMSNorm
                 # TODO: Future optimization could fuse GEMM + all-reduce + residual + RMSNorm + quant
                 output_parallel = self.quant_method.apply(self, input_parallel, bias_)
                 output, residual_out = triton_allreduce(
                     output_parallel,
-                    residual,
-                    norm,
-                    self.max_m,
+                    residual=residual,
+                    norm=norm,
                 )
             else:
                 output_parallel = self.quant_method.apply(self, input_parallel, bias_)
