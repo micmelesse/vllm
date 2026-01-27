@@ -27,10 +27,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    kFp8StaticTensorSym,
-)
-
 from .fusion import (
     FusedRMSQuantKey,
 )
@@ -45,6 +41,92 @@ from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+# ============================================================================
+# Custom Matchers for AllReduce Fusion (using positional args)
+# These match the FX graph structure which uses positional args.
+# We don't modify matcher_utils.py to avoid breaking other passes.
+# ============================================================================
+
+
+class MatcherRMSNormPositional:
+    """
+    Matcher for rocm_aiter_rms_norm using positional args.
+    
+    This matches how the op appears in the FX graph:
+        rocm_aiter_rms_norm.default(input, weight, epsilon)
+    """
+
+    def __init__(self, epsilon: float, device: str | None = None,
+                 dtype: torch.dtype | None = None) -> None:
+        self.epsilon = epsilon
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.RMSNORM_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        weight = torch.empty([16], device=self.device, dtype=self.dtype)
+        return [input, weight]
+
+    def __call__(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return self.RMSNORM_OP(input, weight, self.epsilon)
+
+
+class MatcherFusedAddRMSNormPositional:
+    """
+    Matcher for rocm_aiter_rmsnorm2d_fwd_with_add using positional args.
+    
+    This matches how the op appears in the FX graph:
+        rocm_aiter_rmsnorm2d_fwd_with_add.default(x, residual, weight, epsilon)
+    """
+
+    def __init__(self, epsilon: float, device: str | None = None,
+                 dtype: torch.dtype | None = None) -> None:
+        self.epsilon = epsilon
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.RMSNORM_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        weight = torch.empty([16], device=self.device, dtype=self.dtype)
+        residual = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        return [input, weight, residual]
+
+    def __call__(
+        self, input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Op signature: (x, residual, weight, epsilon)
+        return self.RMSNORM_ADD_OP(input, residual, weight, self.epsilon)
+
+
+class MatcherPerTensorQuantFP8:
+    """
+    Matcher for rocm_aiter_per_tensor_quant using positional args.
+    
+    This matches how the op appears in the FX graph:
+        rocm_aiter_per_tensor_quant.default(input, dtype, scale)
+    """
+
+    def __init__(self, device: str | None = None,
+                 dtype: torch.dtype | None = None) -> None:
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.quant_dtype = FP8_DTYPE
+        self.QUANT_OP = torch.ops.vllm.rocm_aiter_per_tensor_quant.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [input, scale]
+
+    def __call__(
+        self, input: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        result = self.QUANT_OP(input, self.quant_dtype, scale)
+        return result[0], result[1]
 
 
 class AiterRMSNormQuantPattern:
@@ -576,8 +658,8 @@ class RocmAiterAllReduceRMSNormQuantPattern:
         self.device = device
         self.quant_dtype = torch.float8_e4m3fn
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherRMSNorm(epsilon, match_rocm_aiter=True)
-        self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym, match_rocm_aiter=True)
+        self.rmsnorm_matcher = MatcherRMSNormPositional(epsilon, device, dtype)
+        self.quant_matcher = MatcherPerTensorQuantFP8(device, dtype)
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
@@ -644,8 +726,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
         self.device = device
         self.quant_dtype = torch.float8_e4m3fn
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon, match_rocm_aiter=True)
-        self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym, match_rocm_aiter=True)
+        self.rmsnorm_matcher = MatcherFusedAddRMSNormPositional(epsilon, device, dtype)
+        self.quant_matcher = MatcherPerTensorQuantFP8(device, dtype)
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
@@ -663,7 +745,7 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out, new_residual = self.rmsnorm_matcher(
-                allreduce_out, residual, weight
+                allreduce_out, weight, residual
             )
             quant_out, _ = self.quant_matcher(rms_out, scale)
             # Returns: quant_out, new_residual, allreduce_out
