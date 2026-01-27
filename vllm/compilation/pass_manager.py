@@ -32,6 +32,9 @@ if current_platform.is_cuda_alike():
 if current_platform.is_cuda():
     from .collective_fusion import AllReduceFusionPass, AsyncTPPass
 
+if current_platform.is_rocm():
+    from .triton_allreduce_fusion import TritonAllReduceFusionPass
+
 from .fix_functionalization import FixFunctionalizationPass
 from .inductor_pass import (
     CustomGraphPass,
@@ -118,6 +121,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
             if self.pass_config.fuse_allreduce_rms:
                 self.passes += [AllReduceFusionPass(config)]
+
+            if self.pass_config.fuse_allreduce_rms_triton:
+                self.passes += [TritonAllReduceFusionPass(config)]
 
             if self.pass_config.fuse_norm_quant:
                 self.passes += [RMSNormQuantFusionPass(config)]
