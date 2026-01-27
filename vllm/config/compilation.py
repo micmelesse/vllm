@@ -127,9 +127,9 @@ class PassConfig:
     fuse_gemm_comms: bool = Field(default=None)
     """Enable async TP."""
     fuse_allreduce_rms: bool = Field(default=None)
-    """Enable flashinfer allreduce fusion (CUDA only)."""
-    fuse_allreduce_rms_triton: bool = Field(default=None)
-    """Enable Triton-based allreduce fusion (ROCm only)."""
+    """Enable allreduce + rms norm + quant fusion.
+    On CUDA: Uses flashinfer (AllReduceFusionPass).
+    On ROCm: Uses AITER ops (RocmAiterAllReduceFusionPass)."""
 
     fi_allreduce_fusion_max_size_mb: float | None = None
     """The threshold of the communicated tensor sizes under which
