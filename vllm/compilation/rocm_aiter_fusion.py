@@ -27,6 +27,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
+
 from .fusion import (
     FusedRMSQuantKey,
 )
@@ -419,57 +423,6 @@ class RocmAiterSiluMulFp8GroupQuantFusionPass(VllmPatternMatcherPass):
 # And replaces them with a fused kernel.
 
 
-def _rocm_aiter_fused_allreduce_rms_quant_impl(
-    input: torch.Tensor,
-    rms_weight: torch.Tensor,
-    rms_eps: float,
-    quant_scale: torch.Tensor,
-    quant_dtype: torch.dtype,
-    group_name: str,
-    # Outputs (mutated)
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    quant_out: torch.Tensor,
-) -> None:
-    """
-    Fused AllReduce + RMSNorm + FP8 Quant implementation.
-
-    Currently just calls the 3 separate ops as a stub.
-    TODO: Replace with actual fused Triton/AITER kernel.
-    """
-    # Step 1: AllReduce
-    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
-    allreduce_out.copy_(allreduce_result)
-
-    # Step 2: RMSNorm
-    rms_result = torch.ops.vllm.rocm_aiter_rms_norm(
-        allreduce_out, rms_weight, rms_eps
-    )
-    rms_out.copy_(rms_result)
-
-    # Step 3: FP8 Quant
-    quant_result, _ = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-        rms_out, quant_dtype, quant_scale
-    )
-    quant_out.copy_(quant_result)
-
-
-def _rocm_aiter_fused_allreduce_rms_quant_fake(
-    input: torch.Tensor,
-    rms_weight: torch.Tensor,
-    rms_eps: float,
-    quant_scale: torch.Tensor,
-    quant_dtype: torch.dtype,
-    group_name: str,
-    # Outputs (mutated)
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    quant_out: torch.Tensor,
-) -> None:
-    """Fake implementation for torch.compile tracing."""
-    pass
-
-
 # ============================================================================
 # Fused AllReduce + RMSNorm + FP8 Quant (no residual)
 # ============================================================================
@@ -623,6 +576,8 @@ class RocmAiterAllReduceRMSNormQuantPattern:
         self.device = device
         self.quant_dtype = torch.float8_e4m3fn
         self.tp = get_tp_group()
+        self.rmsnorm_matcher = MatcherRMSNorm(epsilon, match_rocm_aiter=True)
+        self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym, match_rocm_aiter=True)
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
@@ -637,13 +592,9 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
-            rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
-                allreduce_out, weight, self.epsilon
-            )
-            quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-                rms_out, self.quant_dtype, scale
-            )
-            return quant_result[0], allreduce_out
+            rms_out = self.rmsnorm_matcher(allreduce_out, weight)
+            quant_out, _ = self.quant_matcher(rms_out, scale)
+            return quant_out, allreduce_out
 
         def replacement(
             input: torch.Tensor,
@@ -693,6 +644,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
         self.device = device
         self.quant_dtype = torch.float8_e4m3fn
         self.tp = get_tp_group()
+        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon, match_rocm_aiter=True)
+        self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym, match_rocm_aiter=True)
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
@@ -709,14 +662,12 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
-            rms_result = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-                allreduce_out, residual, weight, self.epsilon
+            rms_out, new_residual = self.rmsnorm_matcher(
+                allreduce_out, residual, weight
             )
-            quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-                rms_result[0], self.quant_dtype, scale
-            )
+            quant_out, _ = self.quant_matcher(rms_out, scale)
             # Returns: quant_out, new_residual, allreduce_out
-            return quant_result[0], rms_result[1], allreduce_out
+            return quant_out, new_residual, allreduce_out
 
         def replacement(
             input: torch.Tensor,
