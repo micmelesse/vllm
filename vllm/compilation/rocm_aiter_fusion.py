@@ -672,17 +672,18 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out = self.rmsnorm_matcher(allreduce_out, weight)
-            quant_out, _ = self.quant_matcher(rms_out, scale)
-            return quant_out, allreduce_out
+            # Extract both quant outputs to match graph (both are used by scaled_mm)
+            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
+            return quant_out, quant_scale, allreduce_out
 
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = torch.empty_like(input)
             rms_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
@@ -699,31 +700,31 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 rms_out=rms_out,
                 quant_out=quant_out,
             )
-            # Return quant_out and allreduce_out
-            return fused_result[9], fused_result[7]
+            # Return quant_out, quant_scale (pass-through), and allreduce_out
+            return fused_result[9], scale, fused_result[7]
 
         # Register pattern with both outputs
         pm.register_replacement(
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
-        # Also register pattern that only returns quant_out
+        # Also register pattern that only returns quant outputs
         # (for cases where allreduce result isn't used elsewhere)
         def pattern_single(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out = self.rmsnorm_matcher(allreduce_out, weight)
-            quant_out, _ = self.quant_matcher(rms_out, scale)
-            return quant_out
+            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
+            return quant_out, quant_scale
 
         def replacement_single(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             allreduce_out = torch.empty_like(input)
             rms_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
@@ -740,7 +741,7 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 rms_out=rms_out,
                 quant_out=quant_out,
             )
-            return fused_result[9]
+            return fused_result[9], scale
 
         pm.register_replacement(
             pattern_single, replacement_single, self.get_inputs(), pm.fwd_only, pm_pass
@@ -782,20 +783,64 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             residual: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out, new_residual = self.rmsnorm_matcher(
                 allreduce_out, weight, residual
             )
-            quant_out, _ = self.quant_matcher(rms_out, scale)
-            # Returns: quant_out, new_residual, allreduce_out
-            return quant_out, new_residual, allreduce_out
+            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
+            # Returns: quant_out, quant_scale, new_residual, allreduce_out
+            return quant_out, quant_scale, new_residual, allreduce_out
 
         def replacement(
             input: torch.Tensor,
             residual: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            allreduce_out = torch.empty_like(input)
+            rms_out = torch.empty_like(input)
+            residual_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
+
+            fused_result = auto_functionalized(
+                rocm_aiter_fused_allreduce_add_rms_quant,
+                input=input,
+                residual=residual,
+                rms_weight=weight,
+                rms_eps=self.epsilon,
+                quant_scale=scale,
+                quant_dtype=self.quant_dtype,
+                group_name=self.tp.unique_name,
+                allreduce_out=allreduce_out,
+                rms_out=rms_out,
+                residual_out=residual_out,
+                quant_out=quant_out,
+            )
+            # Return quant_out, quant_scale, residual_out, allreduce_out
+            return fused_result[11], scale, fused_result[10], fused_result[8]
+
+        # Single-output pattern variant: only return (quant_out, quant_scale, new_residual)
+        # This matches when allreduce_out is not returned/used downstream
+        def pattern_single(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            scale: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            allreduce_out = tensor_model_parallel_all_reduce(input)
+            rms_out, new_residual = self.rmsnorm_matcher(
+                allreduce_out, weight, residual
+            )
+            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
+            # Returns: quant_out, quant_scale, new_residual only
+            return quant_out, quant_scale, new_residual
+
+        def replacement_single(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = torch.empty_like(input)
             rms_out = torch.empty_like(input)
@@ -816,52 +861,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 residual_out=residual_out,
                 quant_out=quant_out,
             )
-            # Return quant_out, residual_out, allreduce_out
-            return fused_result[11], fused_result[10], fused_result[8]
-
-        # Single-output pattern variant: only return (quant_out, new_residual)
-        # This matches when allreduce_out is not returned/used downstream
-        def pattern_single(
-            input: torch.Tensor,
-            residual: torch.Tensor,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            allreduce_out = tensor_model_parallel_all_reduce(input)
-            rms_out, new_residual = self.rmsnorm_matcher(
-                allreduce_out, weight, residual
-            )
-            quant_out, _ = self.quant_matcher(rms_out, scale)
-            # Returns: quant_out, new_residual only
-            return quant_out, new_residual
-
-        def replacement_single(
-            input: torch.Tensor,
-            residual: torch.Tensor,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            allreduce_out = torch.empty_like(input)
-            rms_out = torch.empty_like(input)
-            residual_out = torch.empty_like(input)
-            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
-
-            fused_result = auto_functionalized(
-                rocm_aiter_fused_allreduce_add_rms_quant,
-                input=input,
-                residual=residual,
-                rms_weight=weight,
-                rms_eps=self.epsilon,
-                quant_scale=scale,
-                quant_dtype=self.quant_dtype,
-                group_name=self.tp.unique_name,
-                allreduce_out=allreduce_out,
-                rms_out=rms_out,
-                residual_out=residual_out,
-                quant_out=quant_out,
-            )
-            # Return quant_out, residual_out only
-            return fused_result[11], fused_result[10]
+            # Return quant_out, quant_scale, residual_out only
+            return fused_result[11], scale, fused_result[10]
 
         # Register both multi-output and single-output variants
         pm.register_replacement(
