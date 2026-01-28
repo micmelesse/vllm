@@ -299,10 +299,10 @@ class MatcherQuantFP8(MatcherCustomOp):
         self.match_rocm_aiter = match_rocm_aiter
 
         if match_rocm_aiter:
-            if quant_key.scale.group_shape.is_per_tensor():
-                # Per-tensor quant for ROCm AITER
-                self.QUANT_OP = torch.ops.vllm.rocm_aiter_per_tensor_quant.default
-            elif quant_key.scale.group_shape.is_per_token():
+            assert not quant_key.scale.group_shape.is_per_tensor(), (
+                "ROCm aiter fusion pass does not support per tensor quantization"
+            )
+            if quant_key.scale.group_shape.is_per_token():
                 self.QUANT_OP = rocm_aiter_ops.get_per_token_quant_op()
             else:
                 assert quant_key.scale.group_shape.col == 128, (
@@ -340,11 +340,7 @@ class MatcherQuantFP8(MatcherCustomOp):
         scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         quant_key_group_shape = self.quant_key.scale.group_shape
-        if quant_key_group_shape.is_per_tensor():
-            # Per-tensor quant: rocm_aiter_per_tensor_quant(input, dtype, scale)
-            result = self.QUANT_OP(input, self.quant_key.dtype, scale)
-            return result[0], result[1]
-        elif quant_key_group_shape == GroupShape.PER_TOKEN:
+        if quant_key_group_shape == GroupShape.PER_TOKEN:
             return self.QUANT_OP(  # type: ignore[no-any-return]
                 x=input,
                 quant_dtype=self.quant_key.dtype,
@@ -456,3 +452,98 @@ class MatcherSiluAndMul(MatcherCustomOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         return SiluAndMul.forward_native(x)
+
+
+# ============================================================================
+# Custom Matchers for AllReduce Fusion (using positional args)
+# These match the FX graph structure which uses positional args.
+# ============================================================================
+
+class MatcherRMSNormPositional:
+    """
+    Matcher for rocm_aiter_rms_norm using positional args.
+
+    This matches how the op appears in the FX graph:
+        rocm_aiter_rms_norm.default(input, weight, epsilon)
+    """
+
+    def __init__(
+        self,
+        epsilon: float,
+        device: str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.epsilon = epsilon
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.RMSNORM_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        weight = torch.empty([16], device=self.device, dtype=self.dtype)
+        return [input, weight]
+
+    def __call__(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return self.RMSNORM_OP(input, weight, self.epsilon)
+
+
+class MatcherFusedAddRMSNormPositional:
+    """
+    Matcher for rocm_aiter_rmsnorm2d_fwd_with_add using positional args.
+
+    This matches how the op appears in the FX graph:
+        rocm_aiter_rmsnorm2d_fwd_with_add.default(x, residual, weight, epsilon)
+    """
+
+    def __init__(
+        self,
+        epsilon: float,
+        device: str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.epsilon = epsilon
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.RMSNORM_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        weight = torch.empty([16], device=self.device, dtype=self.dtype)
+        residual = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        return [input, weight, residual]
+
+    def __call__(
+        self, input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Op signature: (x, residual, weight, epsilon)
+        return self.RMSNORM_ADD_OP(input, residual, weight, self.epsilon)
+
+
+class MatcherPerTensorQuantFP8:
+    """
+    Matcher for rocm_aiter_per_tensor_quant using positional args.
+
+    This matches how the op appears in the FX graph:
+        rocm_aiter_per_tensor_quant.default(input, dtype, scale)
+    """
+
+    def __init__(
+        self,
+        device: str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.device = device
+        self.dtype = dtype or torch.bfloat16
+        self.quant_dtype = current_platform.fp8_dtype()
+        self.QUANT_OP = torch.ops.vllm.rocm_aiter_per_tensor_quant.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([16, 16], device=self.device, dtype=self.dtype)
+        scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [input, scale]
+
+    def __call__(
+        self, input: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        result = self.QUANT_OP(input, self.quant_dtype, scale)
+        return result[0], result[1]

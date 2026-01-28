@@ -26,7 +26,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.triton_allreduce import triton_allreduce
+from vllm.triton_allreduce import triton_allreduce
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 
@@ -271,7 +271,7 @@ def test_triton_allreduce(tp_size: int, mode: str,
     if tp_size > torch.cuda.device_count():
         pytest.skip("Not enough GPUs")
 
-    os.environ["VLLM_ROCM_TRITON_ALLREDUCE"] = "1"
+    os.environ["VLLM_ROCM_ALLREDUCE"] = "1"
 
     # ===== Create test inputs on CPU (shared across all ranks) =====
     torch.manual_seed(42)

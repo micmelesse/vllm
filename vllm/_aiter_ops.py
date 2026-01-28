@@ -760,6 +760,167 @@ def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
     return x_fp8, out_bs
 
 
+# ============================================================================
+# Fused AllReduce + RMSNorm + FP8 Quant ops
+# ============================================================================
+# These ops are used by RocmAiterAllReduceFusionPass to replace the pattern:
+#     all_reduce → rms_norm → per_tensor_quant
+# Currently implements "graph fusion" (3 separate kernel calls wrapped in one op).
+# TODO: Replace with true kernel fusion using AITER's all_reduce_rmsnorm_quant().
+
+
+def _fused_allreduce_rms_quant_core(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+) -> None:
+    """
+    Core implementation for fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
+    """
+    # Step 1: All-reduce
+    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
+    allreduce_out.copy_(allreduce_result)
+
+    # Step 2: RMSNorm (with or without residual add)
+    if residual is not None and residual_out is not None:
+        rms_result = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            allreduce_result, residual, rms_weight, rms_eps
+        )
+        rms_out.copy_(rms_result[0])
+        residual_out.copy_(rms_result[1])
+        rms_for_quant = rms_result[0]
+    else:
+        rms_result = torch.ops.vllm.rocm_aiter_rms_norm(
+            allreduce_result, rms_weight, rms_eps
+        )
+        rms_out.copy_(rms_result)
+        rms_for_quant = rms_result
+
+    # Step 3: FP8 Quant
+    quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+        rms_for_quant, quant_dtype, quant_scale
+    )
+    quant_out.copy_(quant_result[0])
+    quant_scale_out.copy_(quant_result[1])
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_impl(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+) -> None:
+    """Fused AllReduce + RMSNorm + FP8 Quant (no residual)."""
+    _fused_allreduce_rms_quant_core(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        allreduce_out=allreduce_out,
+        rms_out=rms_out,
+        quant_out=quant_out,
+        quant_scale_out=quant_scale_out,
+    )
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_fake(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="rocm_aiter_fused_allreduce_rms_quant",
+    op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
+    mutates_args=["allreduce_out", "rms_out", "quant_out", "quant_scale_out"],
+    fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
+)
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+) -> None:
+    """Fused AllReduce + RMSNorm with Add + FP8 Quant (with residual)."""
+    _fused_allreduce_rms_quant_core(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        allreduce_out=allreduce_out,
+        rms_out=rms_out,
+        quant_out=quant_out,
+        quant_scale_out=quant_scale_out,
+        residual=residual,
+        residual_out=residual_out,
+    )
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="rocm_aiter_fused_allreduce_add_rms_quant",
+    op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
+    mutates_args=[
+        "allreduce_out", "rms_out", "residual_out", "quant_out", "quant_scale_out"
+    ],
+    fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
+)
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -845,6 +1006,7 @@ class rocm_aiter_ops:
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _ALLREDUCE_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_ALLREDUCE_FUSION
 
     @classmethod
     def refresh_env_variables(cls):
@@ -869,6 +1031,7 @@ class rocm_aiter_ops:
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._ALLREDUCE_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_ALLREDUCE_FUSION
 
     @classmethod
     @if_aiter_supported
@@ -1128,6 +1291,21 @@ class rocm_aiter_ops:
     @staticmethod
     def get_act_mul_fused_fp8_group_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant.default
+
+    @staticmethod
+    def get_fused_allreduce_rms_quant_op() -> OpOverload:
+        """Get the fused AllReduce + RMSNorm + FP8 Quant op (no residual)."""
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default
+
+    @staticmethod
+    def get_fused_allreduce_add_rms_quant_op() -> OpOverload:
+        """Get the fused AllReduce + RMSNorm + FP8 Quant op (with residual)."""
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default
+
+    @classmethod
+    def is_allreduce_fusion_enabled(cls) -> bool:
+        """Check if AllReduce fusion is enabled."""
+        return cls._ALLREDUCE_FUSION_ENABLED
 
     @staticmethod
     def rms_norm(

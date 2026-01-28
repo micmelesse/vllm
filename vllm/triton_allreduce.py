@@ -13,7 +13,7 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 Current status:
     - Reference implementation (ccl_baseline) using Iris CCL works in eager mode
     - CUDA graph capture is NOT supported (Iris barriers forbidden during capture)
-    - This is currently enabled via VLLM_ROCM_TRITON_ALLREDUCE=1 env var
+    - This is currently enabled via VLLM_ROCM_ALLREDUCE=1 env var
     
 TODO: Integrate with vLLM's fusion pass system instead of env var switching.
       See AllReduceFusionPass in vllm/compilation/collective_fusion.py for reference.
