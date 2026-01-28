@@ -506,6 +506,75 @@ class RocmAiterSiluMulFp8GroupQuantFusionPass(VllmPatternMatcherPass):
 
 
 # ============================================================================
+# Shared implementation for AllReduce + RMSNorm + FP8 Quant fusion
+# ============================================================================
+
+
+def _fused_allreduce_rms_quant_core(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    allreduce_out: torch.Tensor,
+    rms_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+) -> None:
+    """
+    Core implementation for fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
+
+    This is the shared logic used by both the with-residual and without-residual
+    variants. Currently calls separate ops sequentially (graph fusion), but will
+    be replaced with a true fused kernel.
+
+    Args:
+        input: Input tensor to all-reduce
+        rms_weight: RMSNorm weight
+        rms_eps: RMSNorm epsilon
+        quant_scale: Input scale hint for quantization (may be ignored)
+        quant_dtype: FP8 dtype for quantization output
+        group_name: Tensor parallel group name
+        allreduce_out: Output buffer for all-reduce result
+        rms_out: Output buffer for RMSNorm result
+        quant_out: Output buffer for quantized tensor
+        quant_scale_out: Output buffer for computed scale
+        residual: Optional residual tensor (for layers after first)
+        residual_out: Optional output buffer for updated residual
+    """
+    # Step 1: All-reduce
+    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
+    allreduce_out.copy_(allreduce_result)
+
+    # Step 2: RMSNorm (with or without residual add)
+    if residual is not None and residual_out is not None:
+        # With residual: rmsnorm2d_fwd_with_add returns (normed, updated_residual)
+        rms_result = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            allreduce_result, residual, rms_weight, rms_eps
+        )
+        rms_out.copy_(rms_result[0])
+        residual_out.copy_(rms_result[1])
+        rms_for_quant = rms_result[0]
+    else:
+        # Without residual: simple rms_norm
+        rms_result = torch.ops.vllm.rocm_aiter_rms_norm(
+            allreduce_result, rms_weight, rms_eps
+        )
+        rms_out.copy_(rms_result)
+        rms_for_quant = rms_result
+
+    # Step 3: FP8 Quant - returns (quantized_tensor, computed_scale)
+    quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+        rms_for_quant, quant_dtype, quant_scale
+    )
+    quant_out.copy_(quant_result[0])
+    quant_scale_out.copy_(quant_result[1])
+
+
+# ============================================================================
 # Fused AllReduce + RMSNorm + FP8 Quant (no residual)
 # ============================================================================
 
@@ -522,28 +591,21 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     quant_out: torch.Tensor,
     quant_scale_out: torch.Tensor,
 ) -> None:
-    """
-    Fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
-
-    For first layer (no residual):
-        all_reduce → rms_norm → per_tensor_quant
-    """
-    # All-reduce
-    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
-    allreduce_out.copy_(allreduce_result)
-
-    # RMSNorm
-    rms_result = torch.ops.vllm.rocm_aiter_rms_norm(
-        allreduce_result, rms_weight, rms_eps
+    """Fused AllReduce + RMSNorm + FP8 Quant (first layer, no residual)."""
+    _fused_allreduce_rms_quant_core(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        allreduce_out=allreduce_out,
+        rms_out=rms_out,
+        quant_out=quant_out,
+        quant_scale_out=quant_scale_out,
+        residual=None,
+        residual_out=None,
     )
-    rms_out.copy_(rms_result)
-
-    # FP8 Quant - returns (quantized_tensor, computed_scale)
-    quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-        rms_result, quant_dtype, quant_scale
-    )
-    quant_out.copy_(quant_result[0])
-    quant_scale_out.copy_(quant_result[1])
 
 
 def _rocm_aiter_fused_allreduce_rms_quant_fake(
@@ -592,29 +654,21 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     quant_out: torch.Tensor,
     quant_scale_out: torch.Tensor,
 ) -> None:
-    """
-    Fused AllReduce + RMSNorm with Add + FP8 Per-Tensor Quant.
-
-    For layers after first (with residual):
-        all_reduce → rmsnorm2d_fwd_with_add(result, residual) → per_tensor_quant
-    """
-    # All-reduce
-    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
-    allreduce_out.copy_(allreduce_result)
-
-    # RMSNorm with residual add
-    rms_result = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-        allreduce_result, residual, rms_weight, rms_eps
+    """Fused AllReduce + RMSNorm with Add + FP8 Quant (layers after first)."""
+    _fused_allreduce_rms_quant_core(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        allreduce_out=allreduce_out,
+        rms_out=rms_out,
+        quant_out=quant_out,
+        quant_scale_out=quant_scale_out,
+        residual=residual,
+        residual_out=residual_out,
     )
-    rms_out.copy_(rms_result[0])
-    residual_out.copy_(rms_result[1])
-
-    # FP8 Quant - returns (quantized_tensor, computed_scale)
-    quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-        rms_result[0], quant_dtype, quant_scale
-    )
-    quant_out.copy_(quant_result[0])
-    quant_scale_out.copy_(quant_result[1])
 
 
 def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
