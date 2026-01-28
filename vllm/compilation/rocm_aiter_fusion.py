@@ -520,6 +520,7 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     allreduce_out: torch.Tensor,
     rms_out: torch.Tensor,
     quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
 ) -> None:
     """
     Fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
@@ -537,11 +538,12 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     )
     rms_out.copy_(rms_result)
 
-    # FP8 Quant
+    # FP8 Quant - returns (quantized_tensor, computed_scale)
     quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
         rms_result, quant_dtype, quant_scale
     )
     quant_out.copy_(quant_result[0])
+    quant_scale_out.copy_(quant_result[1])
 
 
 def _rocm_aiter_fused_allreduce_rms_quant_fake(
@@ -554,6 +556,7 @@ def _rocm_aiter_fused_allreduce_rms_quant_fake(
     allreduce_out: torch.Tensor,
     rms_out: torch.Tensor,
     quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
 ) -> None:
     pass
 
@@ -562,7 +565,7 @@ def _rocm_aiter_fused_allreduce_rms_quant_fake(
 direct_register_custom_op(
     op_name="rocm_aiter_fused_allreduce_rms_quant",
     op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
-    mutates_args=["allreduce_out", "rms_out", "quant_out"],
+    mutates_args=["allreduce_out", "rms_out", "quant_out", "quant_scale_out"],
     fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
 )
 rocm_aiter_fused_allreduce_rms_quant = (
@@ -587,6 +590,7 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     rms_out: torch.Tensor,
     residual_out: torch.Tensor,
     quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
 ) -> None:
     """
     Fused AllReduce + RMSNorm with Add + FP8 Per-Tensor Quant.
@@ -605,11 +609,12 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     rms_out.copy_(rms_result[0])
     residual_out.copy_(rms_result[1])
 
-    # FP8 Quant
+    # FP8 Quant - returns (quantized_tensor, computed_scale)
     quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
         rms_result[0], quant_dtype, quant_scale
     )
     quant_out.copy_(quant_result[0])
+    quant_scale_out.copy_(quant_result[1])
 
 
 def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
@@ -624,6 +629,7 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
     rms_out: torch.Tensor,
     residual_out: torch.Tensor,
     quant_out: torch.Tensor,
+    quant_scale_out: torch.Tensor,
 ) -> None:
     pass
 
@@ -632,7 +638,7 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
 direct_register_custom_op(
     op_name="rocm_aiter_fused_allreduce_add_rms_quant",
     op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
-    mutates_args=["allreduce_out", "rms_out", "residual_out", "quant_out"],
+    mutates_args=["allreduce_out", "rms_out", "residual_out", "quant_out", "quant_scale_out"],
     fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
 )
 rocm_aiter_fused_allreduce_add_rms_quant = (
@@ -675,7 +681,6 @@ class RocmAiterAllReduceRMSNormQuantPattern:
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out = self.rmsnorm_matcher(allreduce_out, weight)
-            # Extract both quant outputs to match graph (both are used by scaled_mm)
             quant_out, quant_scale = self.quant_matcher(rms_out, scale)
             return quant_out, quant_scale, allreduce_out
 
@@ -687,6 +692,7 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             allreduce_out = torch.empty_like(input)
             rms_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
+            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
 
             fused_result = auto_functionalized(
                 rocm_aiter_fused_allreduce_rms_quant,
@@ -699,17 +705,18 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 allreduce_out=allreduce_out,
                 rms_out=rms_out,
                 quant_out=quant_out,
+                quant_scale_out=quant_scale_out,
             )
-            # Return quant_out, quant_scale (pass-through), and allreduce_out
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out
-            return fused_result[3], scale, fused_result[1]
+            # Return quant_out, quant_scale_out, and allreduce_out
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out, [4]=quant_scale_out
+            return fused_result[3], fused_result[4], fused_result[1]
 
         # Register pattern with both outputs
         pm.register_replacement(
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
-        # Also register pattern that only returns quant outputs
+        # Also register pattern that only returns quant_out, quant_scale
         # (for cases where allreduce result isn't used elsewhere)
         def pattern_single(
             input: torch.Tensor,
@@ -729,6 +736,7 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             allreduce_out = torch.empty_like(input)
             rms_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
+            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
 
             fused_result = auto_functionalized(
                 rocm_aiter_fused_allreduce_rms_quant,
@@ -741,10 +749,11 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 allreduce_out=allreduce_out,
                 rms_out=rms_out,
                 quant_out=quant_out,
+                quant_scale_out=quant_scale_out,
             )
-            # Return quant_out, quant_scale (pass-through)
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out
-            return fused_result[3], scale
+            # Return quant_out and quant_scale_out
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out, [4]=quant_scale_out
+            return fused_result[3], fused_result[4]
 
         pm.register_replacement(
             pattern_single, replacement_single, self.get_inputs(), pm.fwd_only, pm_pass
@@ -805,6 +814,7 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             rms_out = torch.empty_like(input)
             residual_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
+            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
 
             fused_result = auto_functionalized(
                 rocm_aiter_fused_allreduce_add_rms_quant,
@@ -819,10 +829,11 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 rms_out=rms_out,
                 residual_out=residual_out,
                 quant_out=quant_out,
+                quant_scale_out=quant_scale_out,
             )
-            # Return quant_out, quant_scale, residual_out, allreduce_out
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out
-            return fused_result[4], scale, fused_result[3], fused_result[1]
+            # Return quant_out, quant_scale_out, residual_out, allreduce_out
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out, [5]=quant_scale_out
+            return fused_result[4], fused_result[5], fused_result[3], fused_result[1]
 
         # Single-output pattern variant: only return (quant_out, quant_scale, new_residual)
         # This matches when allreduce_out is not returned/used downstream
@@ -850,6 +861,7 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             rms_out = torch.empty_like(input)
             residual_out = torch.empty_like(input)
             quant_out = torch.empty_like(input, dtype=self.quant_dtype)
+            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
 
             fused_result = auto_functionalized(
                 rocm_aiter_fused_allreduce_add_rms_quant,
@@ -864,10 +876,11 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 rms_out=rms_out,
                 residual_out=residual_out,
                 quant_out=quant_out,
+                quant_scale_out=quant_scale_out,
             )
-            # Return quant_out, quant_scale, residual_out only
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out
-            return fused_result[4], scale, fused_result[3]
+            # Return quant_out, quant_scale_out, residual_out only
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out, [5]=quant_scale_out
+            return fused_result[4], fused_result[5], fused_result[3]
 
         # Register both multi-output and single-output variants
         pm.register_replacement(
