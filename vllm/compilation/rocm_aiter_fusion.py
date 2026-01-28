@@ -701,7 +701,8 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 quant_out=quant_out,
             )
             # Return quant_out, quant_scale (pass-through), and allreduce_out
-            return fused_result[9], scale, fused_result[7]
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out
+            return fused_result[3], scale, fused_result[1]
 
         # Register pattern with both outputs
         pm.register_replacement(
@@ -741,7 +742,9 @@ class RocmAiterAllReduceRMSNormQuantPattern:
                 rms_out=rms_out,
                 quant_out=quant_out,
             )
-            return fused_result[9], scale
+            # Return quant_out, quant_scale (pass-through)
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out
+            return fused_result[3], scale
 
         pm.register_replacement(
             pattern_single, replacement_single, self.get_inputs(), pm.fwd_only, pm_pass
@@ -818,7 +821,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 quant_out=quant_out,
             )
             # Return quant_out, quant_scale, residual_out, allreduce_out
-            return fused_result[11], scale, fused_result[10], fused_result[8]
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out
+            return fused_result[4], scale, fused_result[3], fused_result[1]
 
         # Single-output pattern variant: only return (quant_out, quant_scale, new_residual)
         # This matches when allreduce_out is not returned/used downstream
@@ -862,7 +866,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 quant_out=quant_out,
             )
             # Return quant_out, quant_scale, residual_out only
-            return fused_result[11], scale, fused_result[10]
+            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out
+            return fused_result[4], scale, fused_result[3]
 
         # Register both multi-output and single-output variants
         pm.register_replacement(
