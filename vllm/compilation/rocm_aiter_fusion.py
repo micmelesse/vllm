@@ -4,7 +4,6 @@
 import torch
 import torch._inductor.pattern_matcher as pm
 from torch import fx
-from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._ops import OpOverload
 
@@ -465,27 +464,17 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            allreduce_out = torch.empty_like(input)
-            rms_out = torch.empty_like(input)
-            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
-            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
-
-            fused_result = auto_functionalized(
-                self.FUSED_OP,
+            # Call fused op directly - returns (allreduce_out, rms_out, quant_out, quant_scale_out)
+            fused_result = self.FUSED_OP(
                 input=input,
                 rms_weight=weight,
                 rms_eps=self.epsilon,
                 quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
-                allreduce_out=allreduce_out,
-                rms_out=rms_out,
-                quant_out=quant_out,
-                quant_scale_out=quant_scale_out,
             )
             # Return quant_out, quant_scale_out, and allreduce_out
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out, [4]=quant_scale_out
-            return fused_result[3], fused_result[4], fused_result[1]
+            return fused_result[2], fused_result[3], fused_result[0]
 
         # Register pattern with both outputs
         pm.register_replacement(
@@ -509,27 +498,17 @@ class RocmAiterAllReduceRMSNormQuantPattern:
             weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            allreduce_out = torch.empty_like(input)
-            rms_out = torch.empty_like(input)
-            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
-            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
-
-            fused_result = auto_functionalized(
-                self.FUSED_OP,
+            # Call fused op directly - returns (allreduce_out, rms_out, quant_out, quant_scale_out)
+            fused_result = self.FUSED_OP(
                 input=input,
                 rms_weight=weight,
                 rms_eps=self.epsilon,
                 quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
-                allreduce_out=allreduce_out,
-                rms_out=rms_out,
-                quant_out=quant_out,
-                quant_scale_out=quant_scale_out,
             )
             # Return quant_out and quant_scale_out
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=quant_out, [4]=quant_scale_out
-            return fused_result[3], fused_result[4]
+            return fused_result[2], fused_result[3]
 
         pm.register_replacement(
             pattern_single, replacement_single, self.get_inputs(), pm.fwd_only, pm_pass
@@ -588,14 +567,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            allreduce_out = torch.empty_like(input)
-            rms_out = torch.empty_like(input)
-            residual_out = torch.empty_like(input)
-            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
-            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
-
-            fused_result = auto_functionalized(
-                self.FUSED_OP,
+            # Call fused op directly - returns (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+            fused_result = self.FUSED_OP(
                 input=input,
                 residual=residual,
                 rms_weight=weight,
@@ -603,15 +576,9 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
-                allreduce_out=allreduce_out,
-                rms_out=rms_out,
-                residual_out=residual_out,
-                quant_out=quant_out,
-                quant_scale_out=quant_scale_out,
             )
             # Return quant_out, quant_scale_out, residual_out, allreduce_out
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out, [5]=quant_scale_out
-            return fused_result[4], fused_result[5], fused_result[3], fused_result[1]
+            return fused_result[3], fused_result[4], fused_result[2], fused_result[0]
 
         # Single-output pattern variant: only return (quant_out, quant_scale, new_residual)
         # This matches when allreduce_out is not returned/used downstream
@@ -635,14 +602,8 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
             weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            allreduce_out = torch.empty_like(input)
-            rms_out = torch.empty_like(input)
-            residual_out = torch.empty_like(input)
-            quant_out = torch.empty_like(input, dtype=self.quant_dtype)
-            quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
-
-            fused_result = auto_functionalized(
-                self.FUSED_OP,
+            # Call fused op directly - returns (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+            fused_result = self.FUSED_OP(
                 input=input,
                 residual=residual,
                 rms_weight=weight,
@@ -650,15 +611,9 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
                 quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
-                allreduce_out=allreduce_out,
-                rms_out=rms_out,
-                residual_out=residual_out,
-                quant_out=quant_out,
-                quant_scale_out=quant_scale_out,
             )
             # Return quant_out, quant_scale_out, residual_out only
-            # auto_functionalized returns: [0]=token, [1]=allreduce_out, [2]=rms_out, [3]=residual_out, [4]=quant_out, [5]=quant_scale_out
-            return fused_result[4], fused_result[5], fused_result[3]
+            return fused_result[3], fused_result[4], fused_result[2]
 
         # Register both multi-output and single-output variants
         pm.register_replacement(

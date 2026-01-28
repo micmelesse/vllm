@@ -776,41 +776,43 @@ def _fused_allreduce_rms_quant_core(
     quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    quant_out: torch.Tensor,
-    quant_scale_out: torch.Tensor,
     residual: torch.Tensor | None = None,
-    residual_out: torch.Tensor | None = None,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """
     Core implementation for fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
+    
+    Args:
+        input: Input tensor to all-reduce
+        rms_weight: RMSNorm weight
+        rms_eps: RMSNorm epsilon
+        quant_scale: Quantization scale (can be None for dynamic)
+        quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
+        group_name: TP group name for all-reduce
+        residual: Optional residual tensor for fused add
+        
+    Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+             residual_out is None if residual is None
     """
     # Step 1: All-reduce
-    allreduce_result = torch.ops.vllm.all_reduce(input, group_name=group_name)
-    allreduce_out.copy_(allreduce_result)
+    allreduce_out = torch.ops.vllm.all_reduce(input, group_name=group_name)
 
     # Step 2: RMSNorm (with or without residual add)
-    if residual is not None and residual_out is not None:
-        rms_result = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            allreduce_result, residual, rms_weight, rms_eps
+    if residual is not None:
+        rms_out, residual_out = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            allreduce_out, residual, rms_weight, rms_eps
         )
-        rms_out.copy_(rms_result[0])
-        residual_out.copy_(rms_result[1])
-        rms_for_quant = rms_result[0]
     else:
-        rms_result = torch.ops.vllm.rocm_aiter_rms_norm(
-            allreduce_result, rms_weight, rms_eps
+        rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
+            allreduce_out, rms_weight, rms_eps
         )
-        rms_out.copy_(rms_result)
-        rms_for_quant = rms_result
+        residual_out = None
 
     # Step 3: FP8 Quant
-    quant_result = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-        rms_for_quant, quant_dtype, quant_scale
+    quant_out, quant_scale_out = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+        rms_out, quant_dtype, quant_scale
     )
-    quant_out.copy_(quant_result[0])
-    quant_scale_out.copy_(quant_result[1])
+
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
 
 
 def _rocm_aiter_fused_allreduce_rms_quant_impl(
@@ -820,24 +822,21 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    quant_out: torch.Tensor,
-    quant_scale_out: torch.Tensor,
-) -> None:
-    """Fused AllReduce + RMSNorm + FP8 Quant (no residual)."""
-    _fused_allreduce_rms_quant_core(
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused AllReduce + RMSNorm + FP8 Quant (no residual).
+    
+    Returns: (allreduce_out, rms_out, quant_out, quant_scale_out)
+    """
+    allreduce_out, rms_out, _, quant_out, quant_scale_out = _fused_allreduce_rms_quant_core(
         input=input,
         rms_weight=rms_weight,
         rms_eps=rms_eps,
         quant_scale=quant_scale,
         quant_dtype=quant_dtype,
         group_name=group_name,
-        allreduce_out=allreduce_out,
-        rms_out=rms_out,
-        quant_out=quant_out,
-        quant_scale_out=quant_scale_out,
+        residual=None,
     )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
 
 
 def _rocm_aiter_fused_allreduce_rms_quant_fake(
@@ -847,18 +846,19 @@ def _rocm_aiter_fused_allreduce_rms_quant_fake(
     quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    quant_out: torch.Tensor,
-    quant_scale_out: torch.Tensor,
-) -> None:
-    pass
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
+    return allreduce_out, rms_out, quant_out, quant_scale_out
 
 
 direct_register_custom_op(
     op_name="rocm_aiter_fused_allreduce_rms_quant",
     op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
-    mutates_args=["allreduce_out", "rms_out", "quant_out", "quant_scale_out"],
+    mutates_args=[],
     fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
 )
 
@@ -871,27 +871,23 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    residual_out: torch.Tensor,
-    quant_out: torch.Tensor,
-    quant_scale_out: torch.Tensor,
-) -> None:
-    """Fused AllReduce + RMSNorm with Add + FP8 Quant (with residual)."""
-    _fused_allreduce_rms_quant_core(
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused AllReduce + RMSNorm with Add + FP8 Quant (with residual).
+    
+    Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+    """
+    allreduce_out, rms_out, residual_out, quant_out, quant_scale_out = _fused_allreduce_rms_quant_core(
         input=input,
         rms_weight=rms_weight,
         rms_eps=rms_eps,
         quant_scale=quant_scale,
         quant_dtype=quant_dtype,
         group_name=group_name,
-        allreduce_out=allreduce_out,
-        rms_out=rms_out,
-        quant_out=quant_out,
-        quant_scale_out=quant_scale_out,
         residual=residual,
-        residual_out=residual_out,
     )
+    # residual_out is guaranteed to be non-None when residual is provided
+    assert residual_out is not None
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
 
 
 def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
@@ -902,21 +898,20 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
     quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-    allreduce_out: torch.Tensor,
-    rms_out: torch.Tensor,
-    residual_out: torch.Tensor,
-    quant_out: torch.Tensor,
-    quant_scale_out: torch.Tensor,
-) -> None:
-    pass
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    residual_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
 
 
 direct_register_custom_op(
     op_name="rocm_aiter_fused_allreduce_add_rms_quant",
     op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
-    mutates_args=[
-        "allreduce_out", "rms_out", "residual_out", "quant_out", "quant_scale_out"
-    ],
+    mutates_args=[],
     fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
 )
 
