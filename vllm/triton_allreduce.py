@@ -1,36 +1,174 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Fused AllReduce + RMSNorm for ROCm using Iris.
+Fused AllReduce + RMSNorm + Quantization for ROCm.
 
-This module provides a fused operation that combines:
-1. All-reduce across tensor parallel GPUs (via Iris symmetric memory)
-2. Residual addition
+This module provides fused operations that combine:
+1. All-reduce across tensor parallel GPUs
+2. Optional residual addition
 3. RMS normalization
+4. FP8 per-tensor quantization
 
 The fusion reduces memory bandwidth by avoiding intermediate writes.
 
-Current status:
-    - Reference implementation (ccl_baseline) using Iris CCL works in eager mode
-    - CUDA graph capture is NOT supported (Iris barriers forbidden during capture)
-    - This is currently enabled via VLLM_ROCM_ALLREDUCE=1 env var
-    
-TODO: Integrate with vLLM's fusion pass system instead of env var switching.
-      See AllReduceFusionPass in vllm/compilation/collective_fusion.py for reference.
+Two implementations are provided:
+1. `fused_allreduce_rms_quant` - Graph-level fusion using existing vLLM ops
+   (used by RocmAiterAllReduceFusionPass)
+2. `triton_allreduce` - Iris-based kernel fusion (experimental)
 """
 
-import iris
 import torch
-from iris.ccl import Config
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 
 logger = init_logger(__name__)
 
 
 # ============================================================================
-# CCL Baseline Implementation
+# Fused AllReduce + RMSNorm + FP8 Quant (Graph-level fusion)
+# ============================================================================
+# These functions are used by RocmAiterAllReduceFusionPass to replace the pattern:
+#     all_reduce → rms_norm → per_tensor_quant
+# Currently implements "graph fusion" (3 separate kernel calls wrapped in one op).
+# TODO: Replace with true kernel fusion using AITER's all_reduce_rmsnorm_quant().
+
+
+def fused_allreduce_rms_quant(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    residual: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """
+    Fused AllReduce + RMSNorm + FP8 Per-Tensor Quant.
+    
+    Args:
+        input: Input tensor to all-reduce
+        rms_weight: RMSNorm weight
+        rms_eps: RMSNorm epsilon
+        quant_scale: Quantization scale (can be None for dynamic)
+        quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
+        group_name: TP group name for all-reduce
+        residual: Optional residual tensor for fused add
+        
+    Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+             residual_out is None if residual is None
+    """
+    # Step 1: All-reduce
+    allreduce_out = torch.ops.vllm.all_reduce(input, group_name=group_name)
+
+    # Step 2: RMSNorm (with or without residual add)
+    if residual is not None:
+        rms_out, residual_out = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            allreduce_out, residual, rms_weight, rms_eps
+        )
+    else:
+        rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
+            allreduce_out, rms_weight, rms_eps
+        )
+        residual_out = None
+
+    # Step 3: FP8 Quant
+    quant_out, quant_scale_out = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+        rms_out, quant_dtype, quant_scale
+    )
+
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
+# Wrapper implementations for torch custom op registration
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_impl(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused AllReduce + RMSNorm + FP8 Quant (no residual).
+    
+    Returns: (allreduce_out, rms_out, quant_out, quant_scale_out)
+    """
+    allreduce_out, rms_out, _, quant_out, quant_scale_out = fused_allreduce_rms_quant(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        residual=None,
+    )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_fake(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused AllReduce + RMSNorm with Add + FP8 Quant (with residual).
+    
+    Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
+    """
+    allreduce_out, rms_out, residual_out, quant_out, quant_scale_out = fused_allreduce_rms_quant(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_scale=quant_scale,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        residual=residual,
+    )
+    # residual_out is guaranteed to be non-None when residual is provided
+    assert residual_out is not None
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    residual_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(1, device=input.device, dtype=torch.float32)
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
+# ============================================================================
+# Iris CCL Baseline Implementation (Experimental)
 # ============================================================================
 # This follows the exact pattern from the Iris CCL example:
 # https://github.com/micmelesse/iris/blob/main/iris/ccl/all_reduce.py
@@ -40,6 +178,14 @@ logger = init_logger(__name__)
 # - Calls all_reduce_preamble() and all_reduce() with same exact buffers
 # - Works correctly for any M, N size
 # - Not optimized for CUDA graph capture (but works for eager mode)
+
+try:
+    import iris
+    from iris.ccl import Config
+    IRIS_AVAILABLE = True
+except ImportError:
+    IRIS_AVAILABLE = False
+    logger.debug("Iris not available, triton_allreduce will not work")
 
 
 def _ccl_baseline(
@@ -53,6 +199,9 @@ def _ccl_baseline(
     
     This is the reference implementation that always works correctly.
     """
+    if not IRIS_AVAILABLE:
+        raise RuntimeError("Iris not available for triton_allreduce")
+    
     M, N = input_.shape
     cur_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     
@@ -134,7 +283,7 @@ def _ccl_baseline(
 
 
 # ============================================================================
-# Main Implementation Dispatch
+# Iris-based triton_allreduce Implementation
 # ============================================================================
 
 
@@ -190,6 +339,20 @@ try:
         mutates_args=[],
         fake_impl=_triton_allreduce_fake,
     )
+    
+    # Register the fused allreduce ops (used by RocmAiterAllReduceFusionPass)
+    direct_register_custom_op(
+        op_name="rocm_aiter_fused_allreduce_rms_quant",
+        op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
+    )
+    direct_register_custom_op(
+        op_name="rocm_aiter_fused_allreduce_add_rms_quant",
+        op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
+    )
 except Exception as e:
     logger.warning(f"Failed to register triton_allreduce custom op: {e}")
 
@@ -202,7 +365,7 @@ except Exception as e:
 def triton_allreduce(
     input_: torch.Tensor,
     residual: torch.Tensor | None = None,
-    norm: RMSNorm | None = None,
+    norm: "RMSNorm | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     All-reduce with optional fused residual add and RMS normalization.
