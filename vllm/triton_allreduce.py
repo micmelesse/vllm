@@ -110,13 +110,14 @@ def _fused_allreduce_add_rms_quant_iris(
         rms_out = (allreduce_out.float() * rrms * rms_weight.float()).to(input.dtype)
     
     # FP8 Quant - simple per-tensor quantization
-    abs_max = rms_out.abs().max()
+    # Note: scale must be float32 for torch._scaled_mm
+    abs_max = rms_out.float().abs().max()
     if quant_dtype == torch.float8_e4m3fn:
         fp8_max = 448.0  # max value for e4m3
     else:
         fp8_max = 57344.0  # max value for e5m2
-    quant_scale_out = abs_max / fp8_max
-    quant_out = (rms_out / quant_scale_out).to(quant_dtype)
+    quant_scale_out = (abs_max / fp8_max).to(torch.float32)
+    quant_out = (rms_out.float() / quant_scale_out).to(quant_dtype)
     quant_scale_out = quant_scale_out.view(1)
     
     return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
