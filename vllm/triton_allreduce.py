@@ -176,7 +176,7 @@ def fused_allreduce_add_rms_quant(
     quant_dtype: torch.dtype,
     group_name: str,
     residual: Optional[torch.Tensor] = None,
-    impl: str = "baseline",
+    impl: str = "iris",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     Fused AllReduce + (optional) Add + RMSNorm + FP8 Per-Tensor Quant.
