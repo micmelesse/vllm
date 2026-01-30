@@ -132,12 +132,9 @@ class IrisManager:
         iris_output = shmem.zeros((M, N), dtype=dtype)
         
         # Pre-compute workspace (preamble)
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if not is_capturing:
-            shmem.barrier()
+        shmem.barrier()
         workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
-        if not is_capturing:
-            shmem.barrier()
+        shmem.barrier()
         
         # Cache for reuse
         self._buffer_cache[cache_key] = (iris_input, iris_output, workspace)
@@ -160,11 +157,16 @@ class IrisManager:
         Returns:
             All-reduced tensor (M, N)
         """
+        # Iris CCL is not compatible with CUDA graph capture
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Iris CCL requires --enforce-eager"
+            )
+        
         shmem = self.shmem
         config = self.config
         
         M, N = input_tensor.shape
-        is_capturing = torch.cuda.is_current_stream_capturing()
         
         # Get or create cached buffers
         iris_input, iris_output, workspace = self._get_or_create_buffers(M, N, input_tensor.dtype)
@@ -172,9 +174,8 @@ class IrisManager:
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
         
-        # Barrier before all-reduce (skip during graph capture)
-        if not is_capturing:
-            shmem.barrier()
+        # Barrier before all-reduce
+        shmem.barrier()
         
         # All-reduce (reuse pre-computed workspace)
         shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
@@ -318,7 +319,7 @@ def fused_allreduce_add_rms_quant(
     quant_dtype: torch.dtype,
     group_name: str,
     residual: Optional[torch.Tensor] = None,
-    impl: str = "iris",
+    impl: str = "baseline",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     Fused AllReduce + (optional) Add + RMSNorm + FP8 Per-Tensor Quant.
@@ -331,7 +332,8 @@ def fused_allreduce_add_rms_quant(
         quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
-        impl: Implementation to use - "baseline" (default) or "iris"
+        impl: Implementation to use - "baseline" (default, CUDA graph compatible)
+              or "iris" (experimental, NOT compatible with CUDA graph capture)
         
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
