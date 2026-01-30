@@ -47,7 +47,7 @@ except ImportError:
 # We initialize once and reuse to avoid OOM from repeated allocations.
 
 class IrisManager:
-    """Singleton manager for Iris symmetric heap."""
+    """Singleton manager for Iris symmetric heap with buffer caching."""
     
     _instance: Optional["IrisManager"] = None
     _initialized: bool = False
@@ -65,6 +65,10 @@ class IrisManager:
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
         self._config: Any = None
+        
+        # Buffer cache: (M, N, dtype) -> (iris_input, iris_output, workspace)
+        self._buffer_cache: dict[tuple[int, int, torch.dtype], tuple[Any, Any, Any]] = {}
+        self._max_cached_shapes: int = 16  # Limit cache size
     
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
@@ -100,6 +104,49 @@ class IrisManager:
             self.initialize()
         return self._config
     
+    def _get_or_create_buffers(
+        self,
+        M: int,
+        N: int,
+        dtype: torch.dtype,
+    ) -> tuple[Any, Any, Any]:
+        """Get cached buffers or create new ones."""
+        cache_key = (M, N, dtype)
+        
+        if cache_key in self._buffer_cache:
+            return self._buffer_cache[cache_key]
+        
+        # If cache is full, clear it (simple eviction strategy)
+        if len(self._buffer_cache) >= self._max_cached_shapes:
+            logger.info(f"Iris buffer cache full ({len(self._buffer_cache)} shapes), clearing")
+            self._buffer_cache.clear()
+            # Note: Iris doesn't have explicit free, but we stop holding references
+            # The old buffers are still in heap - this is a limitation
+            # For production, we'd need Iris to support buffer pooling/free
+        
+        shmem = self.shmem
+        config = self.config
+        
+        # Allocate new buffers
+        iris_input = shmem.zeros((M, N), dtype=dtype)
+        iris_output = shmem.zeros((M, N), dtype=dtype)
+        
+        # Pre-compute workspace (preamble)
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if not is_capturing:
+            shmem.barrier()
+        workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
+        if not is_capturing:
+            shmem.barrier()
+        
+        # Cache for reuse
+        self._buffer_cache[cache_key] = (iris_input, iris_output, workspace)
+        
+        cur_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(f"Iris: created buffers for shape ({M}, {N}), dtype={dtype}, rank={cur_rank}")
+        
+        return iris_input, iris_output, workspace
+    
     def all_reduce(
         self,
         input_tensor: torch.Tensor,
@@ -119,9 +166,8 @@ class IrisManager:
         M, N = input_tensor.shape
         is_capturing = torch.cuda.is_current_stream_capturing()
         
-        # Allocate buffers on symmetric heap
-        iris_input = shmem.zeros((M, N), dtype=input_tensor.dtype)
-        iris_output = shmem.zeros((M, N), dtype=input_tensor.dtype)
+        # Get or create cached buffers
+        iris_input, iris_output, workspace = self._get_or_create_buffers(M, N, input_tensor.dtype)
         
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
@@ -130,10 +176,7 @@ class IrisManager:
         if not is_capturing:
             shmem.barrier()
         
-        # All-reduce
-        workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
-        if not is_capturing:
-            shmem.barrier()
+        # All-reduce (reuse pre-computed workspace)
         shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
         
         torch.cuda.synchronize()
