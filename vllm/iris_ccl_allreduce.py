@@ -13,21 +13,13 @@ Not compatible with CUDA graph capture. Requires --enforce-eager.
 
 from typing import Any, Optional, Tuple
 
+import iris
 import torch
+from iris.ccl import Config
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-try:
-    import iris
-    from iris.ccl import Config
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    iris = None  # type: ignore
-    Config = None  # type: ignore
-    logger.debug("Iris not available")
 
 
 class IrisManager:
@@ -63,9 +55,6 @@ class IrisManager:
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
-        if not IRIS_AVAILABLE:
-            raise RuntimeError("Iris not available")
-
         if self._shmem is not None:
             logger.debug("Iris already initialized, skipping")
             return
@@ -223,9 +212,6 @@ def fused_allreduce_add_rms_quant_iris(
     Uses shared Iris symmetric memory for all-reduce, then applies
     RMSNorm and quantization.
     """
-    if not IRIS_AVAILABLE:
-        raise RuntimeError("Iris not available for 'iris' impl")
-
     iris_mgr = get_iris_manager()
 
     # Step 1: All-reduce using Iris

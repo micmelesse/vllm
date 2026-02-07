@@ -1472,12 +1472,12 @@ class rocm_aiter_ops:
     
     @staticmethod
     def get_fused_allreduce_rms_quant_op() -> OpOverload:
-        import vllm.triton_allreduce  # noqa: F401
+        import vllm.fused_allreduce_add_rms_quant  # noqa: F401
         return torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default
 
     @staticmethod
     def get_fused_allreduce_add_rms_quant_op() -> OpOverload:
-        import vllm.triton_allreduce  # noqa: F401
+        import vllm.fused_allreduce_add_rms_quant  # noqa: F401
         return torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default
 
     @staticmethod

@@ -211,8 +211,8 @@ def _run_fusion_pass_test(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Import triton_allreduce to register fused custom ops
-    import vllm.triton_allreduce  # noqa: F401
+    # Import to register fused custom ops
+    import vllm.fused_allreduce_add_rms_quant  # noqa: F401
 
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
