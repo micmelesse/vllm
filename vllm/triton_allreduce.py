@@ -16,6 +16,7 @@ Two implementations are available via the `impl` parameter:
 2. "iris" - Iris CCL-based implementation (experimental)
 """
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -23,6 +24,9 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "baseline")
+logger.info(f"AllReduce impl: {ALLREDUCE_IMPL}")
 
 
 # ============================================================================
@@ -319,7 +323,7 @@ def fused_allreduce_add_rms_quant(
     quant_dtype: torch.dtype,
     group_name: str,
     residual: Optional[torch.Tensor] = None,
-    impl: str = "baseline",
+    impl: str = ALLREDUCE_IMPL,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     Fused AllReduce + (optional) Add + RMSNorm + FP8 Per-Tensor Quant.
