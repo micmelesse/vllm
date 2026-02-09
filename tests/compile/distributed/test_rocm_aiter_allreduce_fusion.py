@@ -11,7 +11,6 @@ with the fused op, and that the fused output matches the unfused output.
 import pytest
 import torch
 
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.fix_functionalization import FixFunctionalizationPass
 from vllm.compilation.noop_elimination import NoOpEliminationPass
@@ -488,8 +487,8 @@ def _run_torch_reference_test(
 @pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
-    envs.VLLM_TARGET_DEVICE not in ["rocm"],
-    reason="ROCm AITER fusion pass only runs on ROCm",
+    not (torch.cuda.is_available() and torch.version.hip),
+    reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
 def test_rocm_aiter_allreduce_fusion_pass(
     test_model: type,
@@ -524,8 +523,8 @@ def test_rocm_aiter_allreduce_fusion_pass(
 @pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
-    envs.VLLM_TARGET_DEVICE not in ["rocm"],
-    reason="ROCm AITER fusion pass only runs on ROCm",
+    not (torch.cuda.is_available() and torch.version.hip),
+    reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
 def test_rocm_aiter_allreduce_fusion_correctness(
     test_model: type,
@@ -555,8 +554,8 @@ def test_rocm_aiter_allreduce_fusion_correctness(
 @pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
-    envs.VLLM_TARGET_DEVICE not in ["rocm"],
-    reason="ROCm AITER fusion pass only runs on ROCm",
+    not (torch.cuda.is_available() and torch.version.hip),
+    reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
 def test_rocm_aiter_allreduce_torch_reference(
     hidden_size: int,
