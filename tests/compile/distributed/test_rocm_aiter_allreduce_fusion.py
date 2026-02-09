@@ -27,9 +27,12 @@ from vllm.config import (
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
@@ -210,8 +213,6 @@ def _run_fusion_pass_test(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Import to register fused custom ops
-    import vllm.fused_allreduce_add_rms_quant  # noqa: F401
 
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
@@ -290,8 +291,6 @@ def _run_fusion_correctness_test(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Import to register fused custom ops
-    import vllm.fused_allreduce_add_rms_quant  # noqa: F401
 
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
@@ -365,21 +364,38 @@ def _run_fusion_correctness_test(
         backend_fused.check_after_ops(model.ops_in_model_after())
 
 
-def _run_torch_reference_test(
+def _reference_allreduce_rms_quant(input, rms_weight, rms_eps, quant_scale,
+                                   quant_dtype, group_name, residual=None):
+    """Reference: call the individual unfused ops directly.
+
+    This is the exact sequence that exists in the model graph before
+    the fusion pass runs.
+    """
+    ar_out = torch.ops.vllm.all_reduce(input, group_name=group_name)
+
+    if residual is not None:
+        rms_out, res_out = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            ar_out, residual, rms_weight, rms_eps)
+    else:
+        rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
+            ar_out, rms_weight, rms_eps)
+        res_out = None
+
+    q_out, qs_out = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+        rms_out, quant_dtype, quant_scale)
+
+    return ar_out, rms_out, res_out, q_out, qs_out
+
+
+def _run_impl_correctness_test(
     local_rank: int,
     world_size: int,
+    impl: str,
+    num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
 ) -> None:
-    """Direct op-level test: compare vllm impl against pure torch reference."""
-    from vllm.distributed.parallel_state import (
-        cleanup_dist_env_and_memory,
-        get_tp_group,
-    )
-    from vllm.fused_allreduce_add_rms_quant import (
-        fused_allreduce_add_rms_quant,
-    )
-
+    """Compare a single impl against the unfused individual ops as baseline."""
     set_random_seed(0)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -405,72 +421,68 @@ def _run_torch_reference_test(
         rms_eps = 1e-5
         quant_scale = torch.rand(1, dtype=torch.float32, device=device)
 
+        if dtype == torch.float16:
+            ATOL, RTOL = (2e-3, 2e-3)
+        else:
+            ATOL, RTOL = (1e-2, 1e-2)
+
         for use_residual in [False, True]:
-            # Create identical inputs for both impls
-            input_vllm = torch.randn(
-                (16, hidden_size), dtype=dtype, device=device
+            input_base = torch.randn(
+                (num_tokens, hidden_size), dtype=dtype, device=device
             )
-            input_torch = input_vllm.clone()
+            residual_base = (
+                torch.randn((num_tokens, hidden_size), dtype=dtype,
+                             device=device)
+                if use_residual else None
+            )
+
+            # Run reference: individual unfused ops
+            (ar_ref, rms_ref, res_ref, q_ref, qs_ref) = (
+                _reference_allreduce_rms_quant(
+                    input_base.clone(), rms_weight, rms_eps, quant_scale,
+                    quant_dtype, group_name,
+                    residual_base.clone() if residual_base is not None
+                    else None,
+                )
+            )
+
+            # Run impl under test
+            tag = f"impl={impl}, residual={use_residual}"
+
+            (ar_impl, rms_impl, res_impl, q_impl, qs_impl) = (
+                fused_allreduce_add_rms_quant(
+                    input_base.clone(), rms_weight, rms_eps,
+                    quant_scale, quant_dtype, group_name,
+                    residual_base.clone() if residual_base is not None
+                    else None,
+                    impl=impl,
+                )
+            )
+
+            torch.testing.assert_close(
+                ar_impl, ar_ref, atol=ATOL, rtol=RTOL,
+                msg=f"allreduce_out mismatch ({tag})",
+            )
+            torch.testing.assert_close(
+                rms_impl, rms_ref, atol=ATOL, rtol=RTOL,
+                msg=f"rms_out mismatch ({tag})",
+            )
 
             if use_residual:
-                residual_vllm = torch.randn(
-                    (16, hidden_size), dtype=dtype, device=device
-                )
-                residual_torch = residual_vllm.clone()
-            else:
-                residual_vllm = None
-                residual_torch = None
-
-            # Run vllm impl
-            (ar_vllm, rms_vllm, res_vllm, q_vllm, qs_vllm) = (
-                fused_allreduce_add_rms_quant(
-                    input_vllm, rms_weight, rms_eps, quant_scale,
-                    quant_dtype, group_name, residual_vllm, impl="vllm",
-                )
-            )
-
-            # Run torch reference impl
-            (ar_torch, rms_torch, res_torch, q_torch, qs_torch) = (
-                fused_allreduce_add_rms_quant(
-                    input_torch, rms_weight, rms_eps, quant_scale,
-                    quant_dtype, group_name, residual_torch, impl="torch",
-                )
-            )
-
-            if dtype == torch.float16:
-                ATOL, RTOL = (2e-3, 2e-3)
-            else:
-                ATOL, RTOL = (1e-2, 1e-2)
-
-            # Compare allreduce outputs
-            torch.testing.assert_close(
-                ar_vllm, ar_torch, atol=ATOL, rtol=RTOL,
-                msg=f"allreduce_out mismatch (residual={use_residual})",
-            )
-
-            # Compare RMSNorm outputs
-            torch.testing.assert_close(
-                rms_vllm, rms_torch, atol=ATOL, rtol=RTOL,
-                msg=f"rms_out mismatch (residual={use_residual})",
-            )
-
-            # Compare residual outputs
-            if use_residual:
-                assert res_vllm is not None and res_torch is not None
+                assert res_impl is not None and res_ref is not None
                 torch.testing.assert_close(
-                    res_vllm, res_torch, atol=ATOL, rtol=RTOL,
-                    msg="residual_out mismatch",
+                    res_impl, res_ref, atol=ATOL, rtol=RTOL,
+                    msg=f"residual_out mismatch ({tag})",
                 )
             else:
-                assert res_vllm is None and res_torch is None
+                assert res_impl is None and res_ref is None
 
             # Compare dequantized quant outputs
-            q_vllm_deq = q_vllm.to(torch.float32) * qs_vllm
-            q_torch_deq = q_torch.to(torch.float32) * qs_torch
+            q_impl_deq = q_impl.to(torch.float32) * qs_impl
+            q_ref_deq = q_ref.to(torch.float32) * qs_ref
             torch.testing.assert_close(
-                q_vllm_deq, q_torch_deq, atol=ATOL, rtol=RTOL,
-                msg=f"quant_out dequantized mismatch "
-                    f"(residual={use_residual})",
+                q_impl_deq, q_ref_deq, atol=ATOL, rtol=RTOL,
+                msg=f"quant_out dequantized mismatch ({tag})",
             )
 
     finally:
@@ -551,23 +563,33 @@ def test_rocm_aiter_allreduce_fusion_correctness(
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("hidden_size", [64])
+@pytest.mark.parametrize("impl", ["vllm", "torch", "iris", "iris_opt"])
+@pytest.mark.parametrize("num_tokens,hidden_size", [
+    (1, 2048),       # single token, Llama 1B
+    (16, 4096),      # small batch, Llama 8B
+    (17, 7168),      # odd token count, DeepSeek V3
+    (32, 8192),      # larger batch, Llama 70B
+])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
-def test_rocm_aiter_allreduce_torch_reference(
+def test_rocm_aiter_allreduce_impl_correctness(
+    impl: str,
+    num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
 ):
-    """Compare vllm impl against pure torch reference at the op level."""
+    """Compare impl against the unfused individual ops."""
     num_processes = 2
 
     torch.multiprocessing.spawn(
-        _run_torch_reference_test,
+        _run_impl_correctness_test,
         args=(
             num_processes,
+            impl,
+            num_tokens,
             hidden_size,
             dtype,
         ),
