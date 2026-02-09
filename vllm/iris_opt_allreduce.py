@@ -11,8 +11,10 @@ extensions (iris.load, iris.store).
 
 One-shot: every CTA gathers all remote tiles via iris.load, reduces
 locally, and writes the result with a single tl.store. No broadcast
-phase. This keeps the reduced data in registers, which is the
-foundation for fusing RMSNorm + FP8 Quant into the store phase.
+phase. RMSNorm and FP8 quant are separate torch ops after the kernel.
+
+See iris_opt2_allreduce.py for the fully-fused single-kernel version
+that fuses all-reduce + RMSNorm + quant into one kernel launch.
 
 Not compatible with CUDA graph capture. Requires --enforce-eager.
 """
@@ -432,9 +434,10 @@ def fused_allreduce_add_rms_quant_iris_opt(
 ]:
     """Iris optimized AllReduce + Add + RMSNorm + FP8 Quant.
 
-    Calls the inlined one-shot kernel directly. RMSNorm and quant are
-    still separate ops for now. The next step is to fuse them into the
-    kernel's store phase.
+    Uses the inlined one-shot all-reduce kernel, with RMSNorm and
+    per-tensor FP8 quant as separate torch ops after the kernel.
+
+    See iris_opt2_allreduce.py for the fully-fused single-kernel version.
     """
     iris_mgr = get_iris_opt_manager()
 
@@ -457,7 +460,7 @@ def fused_allreduce_add_rms_quant_iris_opt(
             input.dtype
         )
 
-    # Step 3: FP8 Quant - simple per-tensor quantization
+    # Step 3: FP8 Quant - per-tensor quantization
     abs_max = rms_out.float().abs().max()
     if quant_dtype == torch.float8_e4m3fn:
         fp8_max = 448.0

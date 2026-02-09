@@ -11,11 +11,12 @@ This module provides fused operations that combine:
 
 The fusion reduces memory bandwidth by avoiding intermediate writes.
 
-Four implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
+Five implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
 1. "vllm" (default) - Pure torch math with dist.all_reduce (see vllm_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
-3. "iris_opt" - Iris with inlined one-shot kernel (see iris_opt_allreduce.py)
-4. "torch" - Pure torch reference implementation (see torch_allreduce.py)
+3. "iris_opt" - Iris inlined one-shot + separate RMSNorm/quant (see iris_opt_allreduce.py)
+4. "iris_opt2" - Iris fused single-kernel, per-token quant (see iris_opt2_allreduce.py)
+5. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 """
 
 import os
@@ -70,7 +71,8 @@ def fused_allreduce_add_rms_quant(
         residual: Optional residual tensor for fused add
         impl: Implementation to use - "vllm" (default, CUDA graph compatible),
               "iris" (Iris CCL, experimental), "iris_opt" (Iris inlined
-              one-shot), or "torch" (pure torch reference)
+              one-shot), "iris_opt2" (Iris fused single-kernel, per-token
+              quant), or "torch" (pure torch reference)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
@@ -100,6 +102,15 @@ def fused_allreduce_add_rms_quant(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
         )
+    elif impl == "iris_opt2":
+        from vllm.iris_opt2_allreduce import (
+            fused_allreduce_add_rms_quant_iris_opt2,
+        )
+
+        return fused_allreduce_add_rms_quant_iris_opt2(
+            input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
+            residual,
+        )
     elif impl == "torch":
         from vllm.torch_allreduce import (
             fused_allreduce_add_rms_quant_torch,
@@ -113,7 +124,7 @@ def fused_allreduce_add_rms_quant(
     else:
         raise ValueError(
             f"Unknown impl '{impl}', expected 'vllm', 'iris', 'iris_opt',"
-            f" or 'torch'"
+            f" 'iris_opt2', or 'torch'"
         )
 
 
