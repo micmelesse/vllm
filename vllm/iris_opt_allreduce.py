@@ -3,14 +3,16 @@
 """
 Iris optimized all-reduce implementation.
 
-Inlines the Iris two-shot all-reduce Triton kernel and all supporting
+Inlines the Iris one-shot all-reduce Triton kernel and all supporting
 code (config, workspace, group info, chiplet transform) directly in
 this file. No imports from iris.ccl. Only depends on the iris runtime
 for symmetric heap allocation (iris.iris) and the iris Triton language
 extensions (iris.load, iris.store).
 
-This gives us full control over the kernel for future fusion of
-RMSNorm + FP8 Quant into the all-reduce's store phase.
+One-shot: every CTA gathers all remote tiles via iris.load, reduces
+locally, and writes the result with a single tl.store. No broadcast
+phase. This keeps the reduced data in registers, which is the
+foundation for fusing RMSNorm + FP8 Quant into the store phase.
 
 Not compatible with CUDA graph capture. Requires --enforce-eager.
 """
@@ -73,13 +75,13 @@ def extract_group_info(
 
 
 # ============================================================================
-# Inlined from iris.ccl.config (two-shot relevant fields only)
+# Inlined from iris.ccl.config (one-shot relevant fields only)
 # ============================================================================
 
 
 @dataclass
-class TwoShotConfig:
-    """Config for the two-shot all-reduce kernel."""
+class OneShotConfig:
+    """Config for the one-shot all-reduce kernel."""
 
     block_size_m: int = 32
     block_size_n: int = 64
@@ -87,7 +89,6 @@ class TwoShotConfig:
     comm_sms: int = 64
     num_xcds: Optional[int] = None
     chunk_size: Optional[int] = None
-    all_reduce_distribution: int = 1
 
     def __post_init__(self) -> None:
         if self.num_xcds is None:
@@ -100,12 +101,12 @@ class TwoShotConfig:
 
 
 # ============================================================================
-# Inlined from iris.ccl.all_reduce (two-shot kernel only)
+# Inlined from iris.ccl.all_reduce (one-shot kernel)
 # ============================================================================
 
 
 @triton.jit
-def persistent_all_reduce_two_shot(
+def persistent_all_reduce_one_shot(
     input_ptr,
     output_ptr,
     M,
@@ -126,16 +127,18 @@ def persistent_all_reduce_two_shot(
     COMM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
-    DISTRIBUTION: tl.constexpr,
 ):
-    """Two-shot all-reduce: reduce assigned tiles, broadcast to all peers.
+    """One-shot all-reduce: every CTA gathers all tiles from all ranks.
 
-    Phase 1 (reduce): Each rank reads its assigned tiles from all ranks
-    via iris.load and sums them locally.
-    Phase 2 (broadcast): Each rank writes the reduced result to all
-    other ranks via iris.store.
+    Each CTA reads its assigned tiles from every rank via iris.load,
+    accumulates locally, and writes the reduced result once via tl.store.
+    No broadcast phase — all ranks do all tiles (duplicated work, but
+    no remote stores needed).
     """
     pid = tl.program_id(0)
+
+    if NUM_XCDS != 1:
+        pid = chiplet_transform_chunked(pid, COMM_SMS, NUM_XCDS, CHUNK_SIZE)
 
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -147,23 +150,7 @@ def persistent_all_reduce_two_shot(
         else tl.int32
     )
 
-    tiles_per_rank = tl.cdiv(total_tiles, world_size)
-    if DISTRIBUTION == 0:
-        start_tile = group_rank
-        stride = world_size
-        remaining = total_tiles - start_tile
-        remaining = tl.maximum(remaining, 0)
-        max_tile_offset = tl.cdiv(remaining, stride)
-    else:
-        start_tile = group_rank * tiles_per_rank
-        stride = 1
-        remaining = total_tiles - start_tile
-        remaining = tl.maximum(remaining, 0)
-        max_tile_offset = tl.minimum(tiles_per_rank, remaining)
-
-    for tile_offset in range(pid, max_tile_offset, COMM_SMS):
-        tile_id = start_tile + tile_offset * stride
-
+    for tile_id in range(pid, total_tiles, COMM_SMS):
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         group_id = tile_id // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
@@ -173,22 +160,20 @@ def persistent_all_reduce_two_shot(
         )
         pid_n = (tile_id % num_pid_in_group) // group_size_m
 
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
         rm_base = pid_m * BLOCK_SIZE_M
         rn_base = pid_n * BLOCK_SIZE_N
-
-        is_full = (rm_base + BLOCK_SIZE_M <= M) & (
-            rn_base + BLOCK_SIZE_N <= N
-        )
-
         rm = rm_base + tl.arange(0, BLOCK_SIZE_M)
         rn = rn_base + tl.arange(0, BLOCK_SIZE_N)
-
         rm = tl.max_contiguous(
             tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M
         )
         rn = tl.max_contiguous(
             tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N
         )
+        mask = (rm[:, None] < M) & (rn[None, :] < N)
 
         input_offset = (
             rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
@@ -197,79 +182,24 @@ def persistent_all_reduce_two_shot(
             rm[:, None] * stride_out_m + rn[None, :] * stride_out_n
         )
 
-        base_ptr = input_ptr + input_offset
-        out_ptr = output_ptr + output_offset
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        # Fast path: full tiles (no masking needed)
-        if is_full:
-            mask = (rm[:, None] < M) & (rn[None, :] < N)
-
-            start_rank_idx = pid % world_size
-            start_rank_global = rank_start + start_rank_idx * rank_stride
-            acc = iris.load(
-                base_ptr, iris_rank, start_rank_global, heap_bases
-            ).to(acc_dtype)
-            for i in tl.static_range(1, world_size):
-                remote_rank_idx = (start_rank_idx + i) % world_size
-                remote_rank = rank_start + remote_rank_idx * rank_stride
-                acc += iris.load(
-                    base_ptr, iris_rank, remote_rank, heap_bases
-                ).to(acc_dtype)
-
-            reduced = acc.to(output_ptr.type.element_ty)
-            tl.store(out_ptr, reduced, cache_modifier=".wt")
-
-            for i in tl.static_range(0, world_size):
-                remote_rank_idx = (start_rank_idx + i) % world_size
-                remote_rank = rank_start + remote_rank_idx * rank_stride
-                if remote_rank_idx != group_rank:
-                    iris.store(
-                        out_ptr,
-                        reduced,
-                        iris_rank,
-                        remote_rank,
-                        heap_bases,
-                    )
-
-        # Slow path: boundary tiles (masked)
-        else:
-            mask = (rm[:, None] < M) & (rn[None, :] < N)
-
-            start_rank_idx = pid % world_size
-            start_rank_global = rank_start + start_rank_idx * rank_stride
-            acc = iris.load(
-                base_ptr,
+        for i in range(world_size):
+            remote_rank = rank_start + i * rank_stride
+            partial = iris.load(
+                input_ptr + input_offset,
                 iris_rank,
-                start_rank_global,
+                remote_rank,
                 heap_bases,
                 mask=mask,
-            ).to(acc_dtype)
-            for i in tl.static_range(1, world_size):
-                remote_rank_idx = (start_rank_idx + i) % world_size
-                remote_rank = rank_start + remote_rank_idx * rank_stride
-                acc += iris.load(
-                    base_ptr,
-                    iris_rank,
-                    remote_rank,
-                    heap_bases,
-                    mask=mask,
-                ).to(acc_dtype)
+            )
+            acc += partial.to(acc_dtype)
 
-            reduced = acc.to(output_ptr.type.element_ty)
-            tl.store(out_ptr, reduced, mask=mask, cache_modifier=".wt")
-
-            for i in tl.static_range(0, world_size):
-                remote_rank_idx = (start_rank_idx + i) % world_size
-                remote_rank = rank_start + remote_rank_idx * rank_stride
-                if remote_rank_idx != group_rank:
-                    iris.store(
-                        out_ptr,
-                        reduced,
-                        iris_rank,
-                        remote_rank,
-                        heap_bases,
-                        mask=mask,
-                    )
+        tl.store(
+            output_ptr + output_offset,
+            acc.to(output_ptr.type.element_ty),
+            mask=mask,
+        )
 
 
 # ============================================================================
@@ -278,9 +208,9 @@ def persistent_all_reduce_two_shot(
 
 
 class IrisOptManager:
-    """Singleton manager for Iris with inlined two-shot all-reduce.
+    """Singleton manager for Iris with inlined one-shot all-reduce.
 
-    Calls the two-shot Triton kernel directly instead of going through
+    Calls the one-shot Triton kernel directly instead of going through
     shmem.ccl.all_reduce(). This gives us control over the kernel for
     future fusion.
     """
@@ -300,7 +230,7 @@ class IrisOptManager:
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
-        self._config: Optional[TwoShotConfig] = None
+        self._config: Optional[OneShotConfig] = None
 
         # Buffer cache: (M, N, dtype) -> (iris_input, iris_output)
         self._buffer_cache: dict[
@@ -328,7 +258,7 @@ class IrisOptManager:
         )
 
         self._shmem = iris.iris(self._heap_size)
-        self._config = TwoShotConfig()
+        self._config = OneShotConfig()
 
         logger.info(f"Iris (opt) initialized successfully on rank {cur_rank}")
 
@@ -340,8 +270,8 @@ class IrisOptManager:
         return self._shmem
 
     @property
-    def config(self) -> TwoShotConfig:
-        """Get the two-shot config."""
+    def config(self) -> OneShotConfig:
+        """Get the one-shot config."""
         if self._config is None:
             self.initialize()
         assert self._config is not None
@@ -371,7 +301,6 @@ class IrisOptManager:
         iris_input = shmem.zeros((M, N), dtype=dtype)
         iris_output = shmem.zeros((M, N), dtype=dtype)
 
-        # Two-shot preamble is a no-op (no workspace needed)
         shmem.barrier()
 
         self._buffer_cache[cache_key] = (iris_input, iris_output)
@@ -389,7 +318,7 @@ class IrisOptManager:
         return iris_input, iris_output
 
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        """Perform all-reduce using the inlined two-shot kernel.
+        """Perform all-reduce using the inlined one-shot kernel.
 
         Args:
             input_tensor: Input tensor (M, N) on GPU
@@ -428,8 +357,8 @@ class IrisOptManager:
             iris_output.stride(1),
         )
 
-        # Launch the two-shot kernel directly
-        persistent_all_reduce_two_shot[(config.comm_sms,)](
+        # Launch the one-shot kernel directly
+        persistent_all_reduce_one_shot[(config.comm_sms,)](
             iris_input,
             iris_output,
             M,
@@ -450,7 +379,6 @@ class IrisOptManager:
             config.comm_sms,
             config.num_xcds,
             config.chunk_size,
-            config.all_reduce_distribution,
             num_warps=8,
             num_stages=1,
             waves_per_eu=1,
@@ -504,13 +432,13 @@ def fused_allreduce_add_rms_quant_iris_opt(
 ]:
     """Iris optimized AllReduce + Add + RMSNorm + FP8 Quant.
 
-    Calls the inlined two-shot kernel directly. RMSNorm and quant are
+    Calls the inlined one-shot kernel directly. RMSNorm and quant are
     still separate ops for now. The next step is to fuse them into the
     kernel's store phase.
     """
     iris_mgr = get_iris_opt_manager()
 
-    # Step 1: All-reduce using inlined two-shot kernel
+    # Step 1: All-reduce using inlined one-shot kernel
     allreduce_out = iris_mgr.all_reduce(input)
 
     # Step 2: RMSNorm (with or without residual add)

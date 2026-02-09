@@ -14,7 +14,7 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 Four implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
 1. "vllm" (default) - Pure torch math with dist.all_reduce (see vllm_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
-3. "iris_opt" - Iris with inlined two-shot kernel (see iris_opt_allreduce.py)
+3. "iris_opt" - Iris with inlined one-shot kernel (see iris_opt_allreduce.py)
 4. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 """
 
@@ -70,7 +70,7 @@ def fused_allreduce_add_rms_quant(
         residual: Optional residual tensor for fused add
         impl: Implementation to use - "vllm" (default, CUDA graph compatible),
               "iris" (Iris CCL, experimental), "iris_opt" (Iris inlined
-              two-shot), or "torch" (pure torch reference)
+              one-shot), or "torch" (pure torch reference)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
