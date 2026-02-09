@@ -11,10 +11,11 @@ This module provides fused operations that combine:
 
 The fusion reduces memory bandwidth by avoiding intermediate writes.
 
-Three implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
-1. "vllm" (default) - Graph-level fusion using existing vLLM ops (see vllm_allreduce.py)
+Four implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
+1. "vllm" (default) - Pure torch math with dist.all_reduce (see vllm_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
 3. "iris_opt" - Iris with inlined two-shot kernel (see iris_opt_allreduce.py)
+4. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 """
 
 import os
@@ -23,12 +24,17 @@ from typing import Optional, Tuple
 import torch
 
 from vllm.logger import init_logger
-from vllm.vllm_allreduce import fused_allreduce_add_rms_quant_vllm
 
 logger = init_logger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "vllm")
 logger.info(f"AllReduce impl: {ALLREDUCE_IMPL}")
+
+
+def _get_tp_process_group():
+    """Resolve the TP group name to a torch.distributed ProcessGroup."""
+    from vllm.distributed.parallel_state import get_tp_group
+    return get_tp_group().device_group
 
 
 # ============================================================================
@@ -63,12 +69,15 @@ def fused_allreduce_add_rms_quant(
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
         impl: Implementation to use - "vllm" (default, CUDA graph compatible),
-              "iris" (Iris CCL, experimental), or "iris_opt" (Iris inlined two-shot)
+              "iris" (Iris CCL, experimental), "iris_opt" (Iris inlined
+              two-shot), or "torch" (pure torch reference)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
     """
     if impl == "vllm":
+        from vllm.vllm_allreduce import fused_allreduce_add_rms_quant_vllm
+
         return fused_allreduce_add_rms_quant_vllm(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
@@ -91,9 +100,20 @@ def fused_allreduce_add_rms_quant(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
         )
+    elif impl == "torch":
+        from vllm.torch_allreduce import (
+            fused_allreduce_add_rms_quant_torch,
+        )
+
+        group = _get_tp_process_group()
+        return fused_allreduce_add_rms_quant_torch(
+            input, rms_weight, rms_eps, quant_scale, quant_dtype, group,
+            residual,
+        )
     else:
         raise ValueError(
-            f"Unknown impl '{impl}', expected 'vllm', 'iris', or 'iris_opt'"
+            f"Unknown impl '{impl}', expected 'vllm', 'iris', 'iris_opt',"
+            f" or 'torch'"
         )
 
 

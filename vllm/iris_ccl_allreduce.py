@@ -17,9 +17,9 @@ import iris
 import torch
 from iris.ccl import Config
 
-from vllm.logger import init_logger
+import logging
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class IrisManager:

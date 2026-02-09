@@ -23,9 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm.logger import init_logger
+import logging
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
