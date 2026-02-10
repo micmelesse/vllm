@@ -329,7 +329,7 @@ class IrisOptManager:
             All-reduced tensor (M, N)
         """
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Iris requires --enforce-eager")
+            logger.warning("Iris (inline): running during CUDA graph capture")
 
         shmem = self.shmem
         config = self.config

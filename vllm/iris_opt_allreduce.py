@@ -362,7 +362,7 @@ class IrisOptManager:
             scale_out is per-token: shape (M, 1).
         """
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Iris requires --enforce-eager")
+            logger.warning("Iris (opt): running during CUDA graph capture")
 
         shmem = self.shmem
         config = self.config
