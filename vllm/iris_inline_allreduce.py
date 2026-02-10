@@ -13,7 +13,7 @@ One-shot: every CTA gathers all remote tiles via iris.load, reduces
 locally, and writes the result with a single tl.store. No broadcast
 phase. RMSNorm and FP8 quant are separate torch ops after the kernel.
 
-See iris_opt2_allreduce.py for the fully-fused single-kernel version
+See iris_opt_allreduce.py for the fully-fused single-kernel version
 that fuses all-reduce + RMSNorm + quant into one kernel launch.
 
 Not compatible with CUDA graph capture. Requires --enforce-eager.
@@ -395,18 +395,18 @@ class IrisOptManager:
         return output
 
 
-_iris_opt_manager: Optional[IrisOptManager] = None
+_iris_inline_manager: Optional[IrisOptManager] = None
 
 
-def get_iris_opt_manager() -> IrisOptManager:
+def get_iris_inline_manager() -> IrisOptManager:
     """Get the global Iris opt manager instance."""
-    global _iris_opt_manager
-    if _iris_opt_manager is None:
-        _iris_opt_manager = IrisOptManager()
-    return _iris_opt_manager
+    global _iris_inline_manager
+    if _iris_inline_manager is None:
+        _iris_inline_manager = IrisOptManager()
+    return _iris_inline_manager
 
 
-def initialize_iris_opt(heap_size: Optional[int] = None) -> None:
+def initialize_iris_inline(heap_size: Optional[int] = None) -> None:
     """Initialize Iris for optimized all-reduce operations.
 
     Call this once at model load time before any forward passes.
@@ -414,10 +414,10 @@ def initialize_iris_opt(heap_size: Optional[int] = None) -> None:
     Args:
         heap_size: Size of symmetric heap in bytes (default: 8GB)
     """
-    get_iris_opt_manager().initialize(heap_size)
+    get_iris_inline_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_quant_iris_opt(
+def fused_allreduce_add_rms_quant_iris_inline(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
@@ -437,9 +437,9 @@ def fused_allreduce_add_rms_quant_iris_opt(
     Uses the inlined one-shot all-reduce kernel, with RMSNorm and
     per-tensor FP8 quant as separate torch ops after the kernel.
 
-    See iris_opt2_allreduce.py for the fully-fused single-kernel version.
+    See iris_opt_allreduce.py for the fully-fused single-kernel version.
     """
-    iris_mgr = get_iris_opt_manager()
+    iris_mgr = get_iris_inline_manager()
 
     # Step 1: All-reduce using inlined one-shot kernel
     allreduce_out = iris_mgr.all_reduce(input)

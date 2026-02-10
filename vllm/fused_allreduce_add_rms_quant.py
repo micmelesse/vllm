@@ -14,8 +14,8 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 Five implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
 1. "vllm" (default) - Pure torch math with dist.all_reduce (see vllm_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
-3. "iris_opt" - Iris inlined one-shot + separate RMSNorm/quant (see iris_opt_allreduce.py)
-4. "iris_opt2" - Iris fused single-kernel, per-token quant (see iris_opt2_allreduce.py)
+3. "iris_inline" - Iris inlined one-shot + separate RMSNorm/quant (see iris_inline_allreduce.py)
+4. "iris_opt" - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_opt_allreduce.py)
 5. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 """
 
@@ -70,9 +70,9 @@ def fused_allreduce_add_rms_quant(
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
         impl: Implementation to use - "vllm" (default, CUDA graph compatible),
-              "iris" (Iris CCL, experimental), "iris_opt" (Iris inlined
-              one-shot), "iris_opt2" (Iris fused single-kernel, per-token
-              quant), or "torch" (pure torch reference)
+              "iris" (Iris CCL, experimental), "iris_inline" (Iris inlined
+              one-shot), "iris_opt" (Iris fused single-kernel),
+              or "torch" (pure torch reference)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
@@ -93,21 +93,21 @@ def fused_allreduce_add_rms_quant(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
         )
+    elif impl == "iris_inline":
+        from vllm.iris_inline_allreduce import (
+            fused_allreduce_add_rms_quant_iris_inline,
+        )
+
+        return fused_allreduce_add_rms_quant_iris_inline(
+            input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
+            residual,
+        )
     elif impl == "iris_opt":
-        from vllm.iris_opt_allreduce import (
+        from vllm_micmelesse.vllm.iris_opt2_allreduce import (
             fused_allreduce_add_rms_quant_iris_opt,
         )
 
         return fused_allreduce_add_rms_quant_iris_opt(
-            input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
-            residual,
-        )
-    elif impl == "iris_opt2":
-        from vllm.iris_opt2_allreduce import (
-            fused_allreduce_add_rms_quant_iris_opt2,
-        )
-
-        return fused_allreduce_add_rms_quant_iris_opt2(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
         )
@@ -123,8 +123,8 @@ def fused_allreduce_add_rms_quant(
         )
     else:
         raise ValueError(
-            f"Unknown impl '{impl}', expected 'vllm', 'iris', 'iris_opt',"
-            f" 'iris_opt2', or 'torch'"
+            f"Unknown impl '{impl}', expected 'vllm', 'iris', 'iris_inline',"
+            f" 'iris_opt', or 'torch'"
         )
 
 
