@@ -156,6 +156,15 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
             residual=None,
         )
     )
+    # Validate output shapes match what the fake impl promises to torch.compile.
+    assert allreduce_out.shape == input.shape, \
+        f"allreduce_out shape {allreduce_out.shape} != input {input.shape}"
+    assert rms_out.shape == input.shape, \
+        f"rms_out shape {rms_out.shape} != input {input.shape}"
+    assert quant_out.shape == input.shape, \
+        f"quant_out shape {quant_out.shape} != input {input.shape}"
+    assert quant_scale_out.shape == (1,), \
+        f"quant_scale_out shape {quant_scale_out.shape} must be (1,)"
     return allreduce_out, rms_out, quant_out, quant_scale_out
 
 
@@ -167,7 +176,10 @@ def _rocm_aiter_fused_allreduce_rms_quant_fake(
     quant_dtype: torch.dtype,
     group_name: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    """Fake impl for torch.compile - returns empty tensors with correct shapes.
+
+    Scale shape is always (1,) to match the unfused per_tensor_quant output.
+    """
     allreduce_out = torch.empty_like(input)
     rms_out = torch.empty_like(input)
     quant_out = torch.empty_like(input, dtype=quant_dtype)
@@ -204,6 +216,17 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
         )
     )
     assert residual_out is not None
+    # Validate output shapes match what the fake impl promises to torch.compile.
+    assert allreduce_out.shape == input.shape, \
+        f"allreduce_out shape {allreduce_out.shape} != input {input.shape}"
+    assert rms_out.shape == input.shape, \
+        f"rms_out shape {rms_out.shape} != input {input.shape}"
+    assert residual_out.shape == input.shape, \
+        f"residual_out shape {residual_out.shape} != input {input.shape}"
+    assert quant_out.shape == input.shape, \
+        f"quant_out shape {quant_out.shape} != input {input.shape}"
+    assert quant_scale_out.shape == (1,), \
+        f"quant_scale_out shape {quant_scale_out.shape} must be (1,)"
     return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
 
 
@@ -218,7 +241,10 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Fake impl for torch.compile - returns empty tensors with correct shapes."""
+    """Fake impl for torch.compile - returns empty tensors with correct shapes.
+
+    Scale shape is always (1,) to match the unfused per_tensor_quant output.
+    """
     allreduce_out = torch.empty_like(input)
     rms_out = torch.empty_like(input)
     residual_out = torch.empty_like(input)

@@ -437,10 +437,17 @@ class IrisOpt2Manager:
 
         shmem.barrier()
 
-        # Reshape scale for broadcasting: (M,) -> (M, 1)
-        scale_out = scale_out.unsqueeze(1)
+        # The kernel computes per-token scales (M,) but the fused op contract
+        # requires per-tensor scale (1,) to match the unfused graph output.
+        # Take the max per-token scale as the per-tensor scale, then
+        # re-quantize rms_out with the per-tensor scale.
+        per_tensor_scale = scale_out.max().reshape(1)
+        fp8_max_val = torch.finfo(quant_dtype).max
+        quant_out = (rms_out.float() / per_tensor_scale).clamp(
+            -fp8_max_val, fp8_max_val
+        ).to(quant_dtype)
 
-        return allreduce_out, rms_out, residual_out, quant_out, scale_out
+        return allreduce_out, rms_out, residual_out, quant_out, per_tensor_scale
 
 
 _iris_opt2_manager: Optional[IrisOpt2Manager] = None
