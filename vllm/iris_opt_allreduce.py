@@ -229,21 +229,21 @@ def fused_allreduce_rmsnorm_quant_kernel(
 # ============================================================================
 
 
-class IrisOpt2Manager:
+class IrisOptManager:
     """Singleton manager for fused one-shot AllReduce+RMSNorm+Quant."""
 
-    _instance: Optional["IrisOpt2Manager"] = None
+    _instance: Optional["IrisOptManager"] = None
     _initialized: bool = False
 
-    def __new__(cls) -> "IrisOpt2Manager":
+    def __new__(cls) -> "IrisOptManager":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self) -> None:
-        if IrisOpt2Manager._initialized:
+        if IrisOptManager._initialized:
             return
-        IrisOpt2Manager._initialized = True
+        IrisOptManager._initialized = True
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
@@ -258,7 +258,7 @@ class IrisOpt2Manager:
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
         if self._shmem is not None:
-            logger.debug("Iris (opt2) already initialized, skipping")
+            logger.debug("Iris (opt) already initialized, skipping")
             return
 
         if heap_size is not None:
@@ -270,7 +270,7 @@ class IrisOpt2Manager:
             else 0
         )
         logger.info(
-            "Initializing Iris (opt2) symmetric heap: "
+            "Initializing Iris (opt) symmetric heap: "
             f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
         )
 
@@ -278,7 +278,7 @@ class IrisOpt2Manager:
         self._config = FusedOneShotConfig()
 
         logger.info(
-            f"Iris (opt2) initialized successfully on rank {cur_rank}"
+            f"Iris (opt) initialized successfully on rank {cur_rank}"
         )
 
     @property
@@ -310,7 +310,7 @@ class IrisOpt2Manager:
 
         if len(self._buffer_cache) >= self._max_cached_shapes:
             logger.info(
-                f"Iris (opt2) buffer cache full "
+                f"Iris (opt) buffer cache full "
                 f"({len(self._buffer_cache)} shapes), clearing"
             )
             self._buffer_cache.clear()
@@ -327,7 +327,7 @@ class IrisOpt2Manager:
             else 0
         )
         logger.info(
-            f"Iris (opt2): created input buffer for shape ({M}, {N}), "
+            f"Iris (opt): created input buffer for shape ({M}, {N}), "
             f"dtype={dtype}, rank={cur_rank}"
         )
 
@@ -450,18 +450,18 @@ class IrisOpt2Manager:
         return allreduce_out, rms_out, residual_out, quant_out, per_tensor_scale
 
 
-_iris_opt2_manager: Optional[IrisOpt2Manager] = None
+_iris_opt_manager: Optional[IrisOptManager] = None
 
 
-def get_iris_opt2_manager() -> IrisOpt2Manager:
-    """Get the global Iris opt2 manager instance."""
-    global _iris_opt2_manager
-    if _iris_opt2_manager is None:
-        _iris_opt2_manager = IrisOpt2Manager()
-    return _iris_opt2_manager
+def get_iris_opt_manager() -> IrisOptManager:
+    """Get the global Iris opt manager instance."""
+    global _iris_opt_manager
+    if _iris_opt_manager is None:
+        _iris_opt_manager = IrisOptManager()
+    return _iris_opt_manager
 
 
-def initialize_iris_opt2(heap_size: Optional[int] = None) -> None:
+def initialize_iris_opt(heap_size: Optional[int] = None) -> None:
     """Initialize Iris for fused all-reduce operations.
 
     Call this once at model load time before any forward passes.
@@ -469,10 +469,10 @@ def initialize_iris_opt2(heap_size: Optional[int] = None) -> None:
     Args:
         heap_size: Size of symmetric heap in bytes (default: 8GB)
     """
-    get_iris_opt2_manager().initialize(heap_size)
+    get_iris_opt_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_quant_iris_opt2(
+def fused_allreduce_add_rms_quant_iris_opt(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
@@ -496,7 +496,7 @@ def fused_allreduce_add_rms_quant_iris_opt2(
     Note: Uses per-token quantization (one scale per row) instead of
     per-tensor quantization. scale_out shape is (M, 1).
     """
-    iris_mgr = get_iris_opt2_manager()
+    iris_mgr = get_iris_opt_manager()
     return iris_mgr.fused_allreduce_rmsnorm_quant(
         input, rms_weight, rms_eps, quant_dtype, residual,
     )

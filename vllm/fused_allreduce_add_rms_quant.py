@@ -103,7 +103,7 @@ def fused_allreduce_add_rms_quant(
             residual,
         )
     elif impl == "iris_opt":
-        from vllm_micmelesse.vllm.iris_opt2_allreduce import (
+        from vllm_micmelesse.vllm.iris_opt_allreduce import (
             fused_allreduce_add_rms_quant_iris_opt,
         )
 
