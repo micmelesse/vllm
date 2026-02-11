@@ -157,7 +157,7 @@ def main():
         "--num-tokens",
         type=int,
         nargs="+",
-        default=[1, 16, 128, 512, 1024, 2048],
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
         help="Token counts to benchmark",
     )
     parser.add_argument(
