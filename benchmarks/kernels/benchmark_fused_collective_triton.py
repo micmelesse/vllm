@@ -38,7 +38,7 @@ logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-ALL_IMPLS = ["vllm", "torch", "iris", "iris_inline", "iris_opt"]
+ALL_IMPLS = ["torch", "iris", "iris_inline", "iris_opt"]
 
 
 # ── Benchmark variant ───────────────────────────────────────────────────────
