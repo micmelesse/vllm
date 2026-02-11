@@ -4,9 +4,8 @@
 """
 Benchmark: fused_allreduce_add_rms_quant across all implementations.
 
-Compares all impls (vllm, torch, iris, iris_inline, iris_opt) through the
-same fused_allreduce_add_rms_quant dispatcher, with residual and FP8
-per-tensor quant.
+Compares unfused baseline (3 separate kernel launches) against fused impls
+(torch, iris, iris_inline, iris_opt), with residual and FP8 per-tensor quant.
 
 Eager mode only (no CUDA graph capture) to avoid ROCm
 hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
@@ -14,7 +13,7 @@ hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
 Usage:
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py \
-        --impls vllm iris_opt --num-tokens 1 4 1024
+        --impls unfused iris_opt --num-tokens 1 4 1024
 """
 
 import argparse
@@ -33,12 +32,14 @@ from vllm.distributed.parallel_state import (
 from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
 
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-ALL_IMPLS = ["torch", "iris", "iris_inline", "iris_opt"]
+FUSED_IMPLS = ["torch", "iris", "iris_inline", "iris_opt"]
+ALL_IMPLS = ["unfused"] + FUSED_IMPLS
 
 
 # ── Benchmark variant ───────────────────────────────────────────────────────
@@ -58,7 +59,11 @@ class BenchVariant:
 
 
 def _make_impl_variant(impl: str):
-    """Return a factory that creates a run_fn for a given impl."""
+    """Return a factory that creates a run_fn for a given impl.
+
+    Routes "unfused" to unfused_allreduce_add_rms_quant directly,
+    all other impls go through the fused dispatcher.
+    """
 
     def make_fn(
         num_tokens: int,
@@ -74,13 +79,22 @@ def _make_impl_variant(impl: str):
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
         scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
-        def run():
-            inp = input_tensor.clone()
-            res = residual.clone()
-            fused_allreduce_add_rms_quant(
-                inp, rms_weight, 1e-6, scale, FP8_DTYPE,
-                group_name, residual=res, impl=impl,
-            )
+        if impl == "unfused":
+            def run():
+                inp = input_tensor.clone()
+                res = residual.clone()
+                unfused_allreduce_add_rms_quant(
+                    inp, rms_weight, 1e-6, scale, FP8_DTYPE,
+                    group_name, residual=res,
+                )
+        else:
+            def run():
+                inp = input_tensor.clone()
+                res = residual.clone()
+                fused_allreduce_add_rms_quant(
+                    inp, rms_weight, 1e-6, scale, FP8_DTYPE,
+                    group_name, residual=res, impl=impl,
+                )
 
         return run
 

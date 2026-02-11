@@ -34,6 +34,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
 from vllm.platforms import current_platform
+from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
@@ -364,29 +365,6 @@ def _run_fusion_correctness_test(
         backend_fused.check_after_ops(model.ops_in_model_after())
 
 
-def _reference_allreduce_rms_quant(input, rms_weight, rms_eps, quant_scale,
-                                   quant_dtype, group_name, residual=None):
-    """Reference: call the individual unfused ops directly.
-
-    This is the exact sequence that exists in the model graph before
-    the fusion pass runs.
-    """
-    ar_out = torch.ops.vllm.all_reduce(input, group_name=group_name)
-
-    if residual is not None:
-        rms_out, res_out = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            ar_out, residual, rms_weight, rms_eps)
-    else:
-        rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar_out, rms_weight, rms_eps)
-        res_out = None
-
-    q_out, qs_out = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-        rms_out, quant_dtype, quant_scale)
-
-    return ar_out, rms_out, res_out, q_out, qs_out
-
-
 def _run_impl_correctness_test(
     local_rank: int,
     world_size: int,
@@ -438,7 +416,7 @@ def _run_impl_correctness_test(
 
             # Run reference: individual unfused ops
             (ar_ref, rms_ref, res_ref, q_ref, qs_ref) = (
-                _reference_allreduce_rms_quant(
+                unfused_allreduce_add_rms_quant(
                     input_base.clone(), rms_weight, rms_eps, quant_scale,
                     quant_dtype, group_name,
                     residual_base.clone() if residual_base is not None
@@ -563,7 +541,8 @@ def test_rocm_aiter_allreduce_fusion_correctness(
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("impl", ["torch", "iris", "iris_inline", "iris_opt"])
+@pytest.mark.parametrize("impl", ["torch", "iris", "iris_inline",
+                                   "iris_opt"])
 @pytest.mark.parametrize("num_tokens,hidden_size", [
     (1, 2048),       # single token, Llama 1B
     (16, 4096),      # small batch, Llama 8B

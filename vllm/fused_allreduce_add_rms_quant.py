@@ -11,11 +11,14 @@ This module provides fused operations that combine:
 
 The fusion reduces memory bandwidth by avoiding intermediate writes.
 
-Four implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
-1. "torch" (default) - Pure torch reference implementation (see torch_allreduce.py)
+Four fused implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
+1. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
 3. "iris_inline" - Iris inlined one-shot + separate RMSNorm/quant (see iris_inline_allreduce.py)
-4. "iris_opt" - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_opt_allreduce.py)
+4. "iris_opt" (default) - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_opt_allreduce.py)
+
+The unfused baseline (3 separate kernel launches) is in
+unfused_allreduce_add_rms_quant.py and is not routed through this dispatcher.
 """
 
 import os
@@ -29,7 +32,7 @@ __all__ = ["fused_allreduce_add_rms_quant"]
 
 logger = init_logger(__name__)
 
-ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "torch")
+ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "iris_opt")
 logger.info(f"AllReduce impl: {ALLREDUCE_IMPL}")
 
 
@@ -70,9 +73,9 @@ def fused_allreduce_add_rms_quant(
         quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
-        impl: Implementation to use - "torch" (default, pure torch reference),
-              "iris" (Iris CCL, experimental), "iris_inline" (Iris inlined
-              one-shot), or "iris_opt" (Iris fused single-kernel)
+        impl: Implementation to use - "torch" (pure torch reference),
+              "iris" (Iris CCL), "iris_inline" (Iris inlined one-shot),
+              or "iris_opt" (Iris fused single-kernel, default)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
@@ -116,8 +119,8 @@ def fused_allreduce_add_rms_quant(
         )
     else:
         raise ValueError(
-            f"Unknown impl '{impl}', expected 'torch', 'iris',"
-            f" 'iris_inline', or 'iris_opt'"
+            f"Unknown impl '{impl}', expected 'torch',"
+            f" 'iris', 'iris_inline', or 'iris_opt'"
         )
 
 
