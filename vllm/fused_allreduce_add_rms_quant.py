@@ -11,7 +11,7 @@ This module provides fused operations that combine:
 
 The fusion reduces memory bandwidth by avoiding intermediate writes.
 
-Four fused implementations are available via VLLM_TRITON_ALLREDUCE_IMPL:
+Four fused implementations are available via VLLM_ROCM_FUSED_ALLREDUCE:
 1. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
 3. "iris_inline" - Iris inlined one-shot + separate RMSNorm/quant (see iris_inline_allreduce.py)
@@ -32,7 +32,7 @@ __all__ = ["fused_allreduce_add_rms_quant"]
 
 logger = init_logger(__name__)
 
-ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "iris_opt")
+ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE", "iris_opt")
 logger.info(f"AllReduce impl: {ALLREDUCE_IMPL}")
 
 
