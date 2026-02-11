@@ -61,6 +61,19 @@ except ImportError:
     flashinfer_comm = None
     logger.warning("FlashInfer not found, only benchmarking standard operations")
 
+# Try to import iris_opt
+_iris_opt_available = False
+try:
+    from vllm.iris_opt_allreduce import (
+        fused_allreduce_add_rms_quant_iris_opt,
+        initialize_iris_opt,
+    )
+
+    _iris_opt_available = True
+except ImportError:
+    _iris_opt_available = False
+    logger.warning("iris_opt not found, skipping iris_opt benchmarks")
+
 # Constants
 FP8_DTYPE = current_platform.fp8_dtype()
 MiB = 1024 * 1024
@@ -403,6 +416,35 @@ def benchmark_operation(
     return avg_time_ms
 
 
+def benchmark_operation_eager(
+    operation_func, *args, warmup: int = 5, trials: int = 20, **kwargs
+):
+    """Benchmark a single operation using eager mode with CUDA events.
+
+    Used for operations that cannot be captured in CUDA graphs (e.g. iris_opt
+    which uses host-side shmem.barrier()).
+    """
+    # Warmup
+    for _ in range(warmup):
+        operation_func(*args, **kwargs)
+    torch.cuda.synchronize()
+
+    # Benchmark with CUDA events for GPU-side timing
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    times_ms = []
+    for _ in range(trials):
+        start_event.record()
+        operation_func(*args, **kwargs)
+        end_event.record()
+        torch.cuda.synchronize()
+        times_ms.append(start_event.elapsed_time(end_event))
+
+    avg_time_ms = sum(times_ms) / len(times_ms)
+    return avg_time_ms
+
+
 def run_benchmarks(
     num_tokens: int,
     hidden_dim: int,
@@ -411,6 +453,7 @@ def run_benchmarks(
     allreduce_params: FlashInferFusedAllReduceParams | None,
     quant_modes: set[str],
     no_oneshot: bool,
+    iris_opt_enabled: bool = False,
 ):
     """Run all benchmarks for given configuration.
 
@@ -589,6 +632,28 @@ def run_benchmarks(
                         float("inf")
                     )
 
+        # iris_opt Fused AllReduce + RMSNorm + FP8 Quant (eager mode)
+        if iris_opt_enabled and _iris_opt_available:
+            try:
+                time_ms = benchmark_operation_eager(
+                    fused_allreduce_add_rms_quant_iris_opt,
+                    input_tensor,
+                    rms_gamma,
+                    rms_eps,
+                    scale_fp8,
+                    FP8_DTYPE,
+                    "benchmark",
+                    residual=residual,
+                )
+                results["iris_opt_fused_allreduce_rmsnorm_fp8_quant"] = time_ms
+            except Exception as e:
+                logger.error(
+                    "iris_opt Fused AllReduce+RMSNorm+FP8 failed: %s", e
+                )
+                results["iris_opt_fused_allreduce_rmsnorm_fp8_quant"] = float(
+                    "inf"
+                )
+
     if "fp4" in quant_modes and current_platform.has_device_capability(100):
         # Standard AllReduce + RMSNorm + FP4 Quant
         for rms_norm_custom_op in ["-rms_norm", "+rms_norm"]:
@@ -749,6 +814,7 @@ def prepare_results_with_speedups(results_dict):
     for op_name in results_dict:
         if (
             op_name.startswith("flashinfer_")
+            or op_name.startswith("iris_opt_")
             or op_name.startswith("standard_")
             and not op_name.endswith("_native_compiled")
         ):
@@ -974,6 +1040,19 @@ def main():
         help="Skip oneshot benchmarks",
     )
 
+    parser.add_argument(
+        "--backend",
+        type=str,
+        nargs="*",
+        default=[],
+        choices=["iris_opt"],
+        help=(
+            "Additional allreduce backends to benchmark. "
+            "Choices: iris_opt (allocates 8GB symmetric heap). "
+            "Standard NCCL and FlashInfer run by default."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Check if running with torchrun (required for collective operations)
@@ -1060,6 +1139,21 @@ def main():
                 max_token_num=max_num_token,
             )
 
+    # Setup additional backends
+    backends = set(args.backend)
+    iris_opt_enabled = "iris_opt" in backends
+    if iris_opt_enabled:
+        if _iris_opt_available:
+            initialize_iris_opt()
+            if rank == 0:
+                logger.info("iris_opt initialized for fused allreduce benchmarks")
+        else:
+            iris_opt_enabled = False
+            if rank == 0:
+                logger.warning(
+                    "--backend iris_opt was set but iris_opt is not available"
+                )
+
     # Collect all results for markdown export
     all_results = []
 
@@ -1083,6 +1177,7 @@ def main():
                 allreduce_params,
                 quant_modes=quant_modes,
                 no_oneshot=args.no_oneshot,
+                iris_opt_enabled=iris_opt_enabled,
             )
 
             # Store results for markdown export
