@@ -15,7 +15,11 @@ eliminating intermediate global memory traffic.
 Row-based processing: BLOCK_SIZE_N >= hidden_size so each iteration
 handles complete rows. Uses persistent CTAs that iterate over rows.
 
-Not compatible with CUDA graph capture. Requires --enforce-eager.
+Buffer pre-allocation strategy for CUDA graph compatibility:
+The first forward pass (warmup) sees the largest M (max_num_batched_tokens).
+We allocate iris input and output buffers at that size, then return views
+for smaller M values during CUDA graph capture. This ensures fixed GPU
+memory addresses across graph capture and replay.
 """
 
 from dataclasses import dataclass
@@ -249,11 +253,19 @@ class IrisOptManager:
         self._heap_size: int = 2**33  # 8GB default
         self._config: Optional[FusedOneShotConfig] = None
 
-        # Buffer cache: (M, N, dtype) -> iris_input
-        self._buffer_cache: dict[
-            tuple[int, int, torch.dtype], Any
-        ] = {}
-        self._max_cached_shapes: int = 16
+        # Pre-allocated input buffer (iris symmetric heap)
+        self._input_buf: Any = None
+        self._input_M: int = 0
+        self._input_N: int = 0
+        self._input_dtype: Optional[torch.dtype] = None
+
+        # Pre-allocated output buffers (regular GPU memory)
+        self._out_allreduce: Optional[torch.Tensor] = None
+        self._out_rms: Optional[torch.Tensor] = None
+        self._out_quant: Optional[torch.Tensor] = None
+        self._out_scale: Optional[torch.Tensor] = None
+        self._out_residual: Optional[torch.Tensor] = None
+        self._out_quant_dtype: Optional[torch.dtype] = None
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
@@ -296,30 +308,39 @@ class IrisOptManager:
         assert self._config is not None
         return self._config
 
-    def _get_or_create_input_buffer(
+    def _get_input_buffer(
         self,
         M: int,
         N: int,
         dtype: torch.dtype,
     ) -> Any:
-        """Get cached symmetric heap input buffer or create a new one."""
-        cache_key = (M, N, dtype)
+        """Get a view into the pre-allocated iris input buffer.
 
-        if cache_key in self._buffer_cache:
-            return self._buffer_cache[cache_key]
+        On the first call (warmup), allocates for (M, N). Subsequent calls
+        with smaller M return a view into the same allocation. This avoids
+        shmem.zeros() and shmem.barrier() during CUDA graph capture.
+        """
+        # Return view if existing buffer is large enough
+        if (self._input_buf is not None
+                and M <= self._input_M
+                and N == self._input_N
+                and dtype == self._input_dtype):
+            return self._input_buf[:M]
 
-        if len(self._buffer_cache) >= self._max_cached_shapes:
-            logger.info(
-                f"Iris (opt) buffer cache full "
-                f"({len(self._buffer_cache)} shapes), clearing"
+        # Need a (larger) buffer. Not safe during CUDA graph capture.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"Iris (opt): input buffer too small for M={M} "
+                f"(allocated {self._input_M}). Cannot allocate during "
+                f"CUDA graph capture."
             )
-            self._buffer_cache.clear()
 
         shmem = self.shmem
-        iris_input = shmem.zeros((M, N), dtype=dtype)
+        self._input_buf = shmem.zeros((M, N), dtype=dtype)
         shmem.barrier()
-
-        self._buffer_cache[cache_key] = iris_input
+        self._input_M = M
+        self._input_N = N
+        self._input_dtype = dtype
 
         cur_rank = (
             torch.distributed.get_rank()
@@ -327,11 +348,78 @@ class IrisOptManager:
             else 0
         )
         logger.info(
-            f"Iris (opt): created input buffer for shape ({M}, {N}), "
+            f"Iris (opt): allocated input buffer ({M}, {N}), "
             f"dtype={dtype}, rank={cur_rank}"
         )
 
-        return iris_input
+        return self._input_buf
+
+    def _get_output_buffers(
+        self,
+        M: int,
+        N: int,
+        dtype: torch.dtype,
+        quant_dtype: torch.dtype,
+        device: torch.device,
+        has_residual: bool,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Get views into pre-allocated output buffers.
+
+        On the first call (warmup), allocates for (M, N). Subsequent calls
+        with smaller M return views into the same allocation.
+        """
+        need_alloc = (
+            self._out_allreduce is None
+            or M > self._out_allreduce.shape[0]
+            or N != self._out_allreduce.shape[1]
+            or quant_dtype != self._out_quant_dtype
+        )
+
+        if need_alloc:
+            if torch.cuda.is_current_stream_capturing():
+                existing = self._out_allreduce.shape[0] if self._out_allreduce is not None else 0
+                raise RuntimeError(
+                    f"Iris (opt): output buffers too small for M={M} "
+                    f"(allocated {existing}). Cannot allocate during "
+                    f"CUDA graph capture."
+                )
+
+            self._out_allreduce = torch.empty((M, N), dtype=dtype, device=device)
+            self._out_rms = torch.empty((M, N), dtype=dtype, device=device)
+            self._out_quant = torch.empty((M, N), dtype=quant_dtype, device=device)
+            self._out_scale = torch.empty(M, dtype=torch.float32, device=device)
+            self._out_residual = torch.empty((M, N), dtype=dtype, device=device)
+            self._out_quant_dtype = quant_dtype
+
+            cur_rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                f"Iris (opt): allocated output buffers ({M}, {N}), "
+                f"dtype={dtype}, rank={cur_rank}"
+            )
+
+        assert self._out_allreduce is not None
+        assert self._out_rms is not None
+        assert self._out_quant is not None
+        assert self._out_scale is not None
+        assert self._out_residual is not None
+
+        return (
+            self._out_allreduce[:M],
+            self._out_rms[:M],
+            self._out_residual[:M] if has_residual else None,
+            self._out_quant[:M],
+            self._out_scale[:M],
+        )
 
     def fused_allreduce_rmsnorm_quant(
         self,
@@ -361,35 +449,23 @@ class IrisOptManager:
             residual_out is None when residual is None.
             scale_out is per-token: shape (M, 1).
         """
-        if torch.cuda.is_current_stream_capturing():
-            logger.warning("Iris (opt): running during CUDA graph capture")
-
         shmem = self.shmem
         config = self.config
         M, N = input_tensor.shape
         device = input_tensor.device
 
-        # Get symmetric heap buffer for input
-        iris_input = self._get_or_create_input_buffer(
-            M, N, input_tensor.dtype
+        # Get pre-allocated buffers (views into max-size allocations)
+        iris_input = self._get_input_buffer(M, N, input_tensor.dtype)
+        allreduce_out, rms_out, residual_out, quant_out, scale_out = (
+            self._get_output_buffers(
+                M, N, input_tensor.dtype, quant_dtype, device,
+                has_residual=residual is not None,
+            )
         )
 
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
         shmem.barrier()
-
-        # Allocate output tensors (regular GPU memory)
-        allreduce_out = torch.empty_like(input_tensor)
-        rms_out = torch.empty_like(input_tensor)
-        quant_out = torch.empty(
-            (M, N), dtype=quant_dtype, device=device
-        )
-        scale_out = torch.empty(M, dtype=torch.float32, device=device)
-
-        if residual is not None:
-            residual_out = torch.empty_like(input_tensor)
-        else:
-            residual_out = None
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
