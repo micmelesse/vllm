@@ -480,7 +480,8 @@ def run_benchmarks(
 
     rms_eps = 1e-6
     results = {}
-    vllm_fused_allreduce = VllmFusedAllreduce(hidden_dim, dtype)
+    with set_current_vllm_config(VllmConfig()):
+        vllm_fused_allreduce = VllmFusedAllreduce(hidden_dim, dtype)
     use_oneshot_options = [False] if no_oneshot else [True, False]
 
     # Create RMSNorm and QuantFP8 layers once for native benchmarks
