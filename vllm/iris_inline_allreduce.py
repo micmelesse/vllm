@@ -29,6 +29,8 @@ import triton.language as tl
 
 import logging
 
+__all__ = ["fused_allreduce_add_rms_quant_iris_inline"]
+
 logger = logging.getLogger(__name__)
 
 

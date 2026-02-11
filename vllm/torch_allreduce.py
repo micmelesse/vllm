@@ -13,6 +13,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+__all__ = ["fused_allreduce_add_rms_quant_torch"]
+
 
 def fused_allreduce_add_rms_quant_torch(
     input: torch.Tensor,

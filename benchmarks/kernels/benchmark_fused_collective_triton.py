@@ -2,19 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Benchmark: Unfused vLLM ops vs iris_opt fused Triton kernel.
+Benchmark: fused_allreduce_add_rms_quant across all implementations.
 
-Compares two paths (with residual, FP8 per-tensor quant):
-  Unfused:  tensor_model_parallel_all_reduce -> RMSNorm (fused_add) -> QuantFP8 (static per-tensor)
-  Fused:    fused_allreduce_add_rms_quant_iris_opt  (single Triton kernel)
+Compares all impls (vllm, torch, iris, iris_inline, iris_opt) through the
+same fused_allreduce_add_rms_quant dispatcher, with residual and FP8
+per-tensor quant.
 
-Eager mode only (no CUDA graph capture) to avoid ROCm hipErrorStreamCaptureUnsupported.
-Uses CUDA events for GPU-side timing.
+Eager mode only (no CUDA graph capture) to avoid ROCm
+hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
 
 Usage:
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py \
-        --num-tokens 1 16 128 512 1024 2048
+        --impls vllm iris_opt --num-tokens 1 4 1024
 """
 
 import argparse
@@ -25,38 +25,29 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-from vllm.config.vllm import VllmConfig, set_current_vllm_config
-from vllm.distributed import (
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
-)
+from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
-
-from vllm.iris_opt_allreduce import (
-    fused_allreduce_add_rms_quant_iris_opt,
-    initialize_iris_opt,
-)
 
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
+ALL_IMPLS = ["vllm", "torch", "iris", "iris_inline", "iris_opt"]
 
-# ── Benchmark variant definition ────────────────────────────────────────────
+
+# ── Benchmark variant ───────────────────────────────────────────────────────
 
 @dataclass
 class BenchVariant:
     """A self-contained benchmark variant.
 
-    Each variant owns its tensors and callable — no shared state between
+    Each variant owns its tensors and callable. No shared state between
     variants.
     """
     name: str
@@ -64,63 +55,36 @@ class BenchVariant:
         [int, int, torch.dtype, torch.device, str],
         Callable[[], None],
     ]
-    """Factory: (num_tokens, hidden_dim, dtype, device, group_name) -> run_fn"""
 
 
-def _make_unfused(
-    num_tokens: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    group_name: str,
-) -> Callable[[], None]:
-    """Build an unfused run_fn with its own tensors and layers."""
-    with set_current_vllm_config(VllmConfig()):
-        rms_norm = RMSNorm(hidden_dim, eps=1e-6, dtype=dtype)
-        fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
+def _make_impl_variant(impl: str):
+    """Return a factory that creates a run_fn for a given impl."""
 
-    input_tensor = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-    residual = torch.randn_like(input_tensor)
-    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-
-    def run():
-        inp = input_tensor.clone()
-        res = residual.clone()
-        ar_out = tensor_model_parallel_all_reduce(inp)
-        rms_out, _residual_out = rms_norm(ar_out, res)
-        fp8_quant(rms_out, scale)
-
-    return run
-
-
-def _make_iris_opt(
-    num_tokens: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    group_name: str,
-) -> Callable[[], None]:
-    """Build an iris_opt run_fn with its own tensors."""
-    input_tensor = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-    residual = torch.randn_like(input_tensor)
-    rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
-    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-
-    def run():
-        inp = input_tensor.clone()
-        res = residual.clone()
-        fused_allreduce_add_rms_quant_iris_opt(
-            inp, rms_weight, 1e-6, scale, FP8_DTYPE,
-            group_name, residual=res,
+    def make_fn(
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        group_name: str,
+    ) -> Callable[[], None]:
+        input_tensor = torch.randn(
+            num_tokens, hidden_dim, dtype=dtype, device=device,
         )
+        residual = torch.randn_like(input_tensor)
+        rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
+        scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
-    return run
+        def run():
+            inp = input_tensor.clone()
+            res = residual.clone()
+            fused_allreduce_add_rms_quant(
+                inp, rms_weight, 1e-6, scale, FP8_DTYPE,
+                group_name, residual=res, impl=impl,
+            )
 
+        return run
 
-VARIANTS = [
-    BenchVariant(name="unfused_vllm", make_fn=_make_unfused),
-    BenchVariant(name="iris_opt",     make_fn=_make_iris_opt),
-]
+    return make_fn
 
 
 # ── Benchmark helpers ────────────────────────────────────────────────────────
@@ -151,7 +115,15 @@ def benchmark_eager(fn: Callable[[], None], warmup: int, trials: int) -> float:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark unfused vLLM ops vs iris_opt fused Triton kernel"
+        description="Benchmark fused_allreduce_add_rms_quant across impls"
+    )
+    parser.add_argument(
+        "--impls",
+        type=str,
+        nargs="+",
+        default=ALL_IMPLS,
+        choices=ALL_IMPLS,
+        help="Implementations to benchmark (default: all)",
     )
     parser.add_argument(
         "--num-tokens",
@@ -201,25 +173,28 @@ def main():
             f"Got world_size={world_size}."
         )
 
-    # ── iris_opt init ────────────────────────────────────────────────────
-    initialize_iris_opt()
     if rank == 0:
         logger.info(
-            "iris_opt initialized. world_size=%d, hidden_dim=%d",
-            world_size, args.hidden_dim,
+            "Benchmarking impls=%s  world_size=%d  hidden_dim=%d",
+            args.impls, world_size, args.hidden_dim,
         )
 
     group_name = get_tp_group().unique_name
 
+    # ── Build variants ───────────────────────────────────────────────────
+    variants = [
+        BenchVariant(name=impl, make_fn=_make_impl_variant(impl))
+        for impl in args.impls
+    ]
+
     # ── Run benchmarks ───────────────────────────────────────────────────
     dtype = torch.bfloat16
-    # {num_tokens: {variant_name: time_ms}}
     all_results: dict[int, dict[str, float]] = {}
 
     for num_tokens in args.num_tokens:
         timings: dict[str, float] = {}
 
-        for variant in VARIANTS:
+        for variant in variants:
             run_fn = variant.make_fn(
                 num_tokens, args.hidden_dim, dtype, device, group_name,
             )
@@ -230,9 +205,9 @@ def main():
         all_results[num_tokens] = timings
 
         if rank == 0:
-            baseline = timings[VARIANTS[0].name]
+            baseline = timings[variants[0].name]
             parts = [f"tokens={num_tokens:>5d}"]
-            for v in VARIANTS:
+            for v in variants:
                 t = timings[v.name]
                 speedup = baseline / t if t > 0 else float("inf")
                 parts.append(f"{v.name}={t:.3f} ms ({speedup:.2f}x)")
@@ -240,8 +215,8 @@ def main():
 
     # ── Print summary table (rank 0) ─────────────────────────────────────
     if rank == 0:
-        baseline_name = VARIANTS[0].name
-        variant_names = [v.name for v in VARIANTS]
+        baseline_name = variants[0].name
+        variant_names = [v.name for v in variants]
 
         hdr = (
             f"\n{'='*70}\n"
@@ -253,7 +228,6 @@ def main():
         )
         print(hdr)
 
-        # Header row
         col_headers = ["Tokens"]
         for name in variant_names:
             col_headers.append(f"{name} (ms)")
@@ -276,8 +250,8 @@ def main():
 
     # ── Save markdown (rank 0) ───────────────────────────────────────────
     if args.output_file and rank == 0:
-        baseline_name = VARIANTS[0].name
-        variant_names = [v.name for v in VARIANTS]
+        baseline_name = variants[0].name
+        variant_names = [v.name for v in variants]
 
         lines = [
             f"# Benchmark: {' vs '.join(variant_names)}",
@@ -291,7 +265,6 @@ def main():
             "",
         ]
 
-        # Build markdown table header
         md_cols = ["Tokens"]
         for name in variant_names:
             md_cols.append(f"{name} (ms)")

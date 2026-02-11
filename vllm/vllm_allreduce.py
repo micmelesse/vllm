@@ -14,6 +14,8 @@ from typing import Optional, Tuple
 
 import torch
 
+__all__ = ["fused_allreduce_add_rms_quant_vllm"]
+
 
 def fused_allreduce_add_rms_quant_vllm(
     input: torch.Tensor,

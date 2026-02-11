@@ -26,6 +26,8 @@ import torch
 
 from vllm.logger import init_logger
 
+__all__ = ["fused_allreduce_add_rms_quant"]
+
 logger = init_logger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get("VLLM_TRITON_ALLREDUCE_IMPL", "vllm")

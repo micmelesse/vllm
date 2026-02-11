@@ -19,6 +19,8 @@ from iris.ccl import Config
 
 import logging
 
+__all__ = ["fused_allreduce_add_rms_quant_iris"]
+
 logger = logging.getLogger(__name__)
 
 
