@@ -24,6 +24,7 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
+from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401 (registers torch.ops.vllm.* ops)
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
