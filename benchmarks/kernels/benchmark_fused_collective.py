@@ -38,15 +38,19 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8  # 
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape  # noqa
 from vllm.platforms import current_platform  # noqa
 
+logger = init_logger(__name__)
+
 RMS_NORM_OP = torch.ops._C.rms_norm
 FUSED_ADD_RMS_NORM_OP = torch.ops._C.fused_add_rms_norm
 RMS_NORM_STATIC_FP8_QUANT_OP = torch.ops._C.rms_norm_static_fp8_quant
 FUSED_ADD_RMS_NORM_STATIC_FP8_QUANT_OP = (
     torch.ops._C.fused_add_rms_norm_static_fp8_quant
 )
-SCALED_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant
-
-logger = init_logger(__name__)
+try:
+    SCALED_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant
+except AttributeError:
+    SCALED_FP4_QUANT_OP = None
+    logger.warning("scaled_fp4_quant op not available, FP4 benchmarks will be skipped")
 
 # Try to import FlashInfer
 try:
@@ -332,6 +336,8 @@ class VllmFusedAllreduce:
         quant_out: torch.Tensor,
         output_scale: torch.Tensor,
     ):
+        if SCALED_FP4_QUANT_OP is None:
+            raise RuntimeError("scaled_fp4_quant op not available in this build")
         allreduce_out = tensor_model_parallel_all_reduce(input_tensor)
         rms_out = self.rms_norm(allreduce_out, residual)
         if residual is None:
