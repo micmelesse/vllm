@@ -541,7 +541,7 @@ def test_rocm_aiter_allreduce_fusion_correctness(
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("impl", ["torch", "iris", "iris_inline",
+@pytest.mark.parametrize("impl", ["torch", "iris_ccl", "iris_inline",
                                    "iris_opt"])
 @pytest.mark.parametrize("num_tokens,hidden_size", [
     (1, 2048),       # single token, Llama 1B

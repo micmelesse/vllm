@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-FUSED_IMPLS = ["torch", "iris", "iris_inline", "iris_opt"]
+FUSED_IMPLS = ["torch", "iris_ccl", "iris_inline", "iris_opt"]
 ALL_IMPLS = ["unfused"] + FUSED_IMPLS
 
 

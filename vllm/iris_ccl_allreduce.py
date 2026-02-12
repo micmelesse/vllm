@@ -75,7 +75,7 @@ class IrisManager:
         )
 
         self._shmem = iris.iris(self._heap_size)
-        self._config = Config(all_reduce_variant="two_shot")
+        self._config = Config(all_reduce_variant="one_shot")
 
         logger.info(f"Iris initialized successfully on rank {cur_rank}")
 

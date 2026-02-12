@@ -13,7 +13,7 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 
 Four fused implementations are available via VLLM_ROCM_FUSED_ALLREDUCE:
 1. "torch" - Pure torch reference implementation (see torch_allreduce.py)
-2. "iris" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
+2. "iris_ccl" - Iris CCL-based implementation (see iris_ccl_allreduce.py)
 3. "iris_inline" - Iris inlined one-shot + separate RMSNorm/quant (see iris_inline_allreduce.py)
 4. "iris_opt" (default) - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_opt_allreduce.py)
 
@@ -74,13 +74,13 @@ def fused_allreduce_add_rms_quant(
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
         impl: Implementation to use - "torch" (pure torch reference),
-              "iris" (Iris CCL), "iris_inline" (Iris inlined one-shot),
+              "iris_ccl" (Iris CCL), "iris_inline" (Iris inlined one-shot),
               or "iris_opt" (Iris fused single-kernel, default)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
     """
-    if impl == "iris":
+    if impl == "iris_ccl":
         from vllm.iris_ccl_allreduce import (
             fused_allreduce_add_rms_quant_iris,
         )
@@ -120,7 +120,7 @@ def fused_allreduce_add_rms_quant(
     else:
         raise ValueError(
             f"Unknown impl '{impl}', expected 'torch',"
-            f" 'iris', 'iris_inline', or 'iris_opt'"
+            f" 'iris_ccl', 'iris_inline', or 'iris_opt'"
         )
 
 
