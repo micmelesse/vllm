@@ -8,7 +8,7 @@ GPU-to-GPU reads. This module manages the Iris lifecycle and provides
 an all-reduce operation that can be used as a drop-in replacement for
 torch.distributed.all_reduce.
 
-Not compatible with CUDA graph capture. Requires --enforce-eager.
+Uses shmem.device_barrier() (device-side atomics) for CUDA graph compatibility.
 """
 
 from typing import Any, Optional, Tuple
@@ -118,11 +118,11 @@ class IrisManager:
         iris_input = shmem.zeros((M, N), dtype=dtype)
         iris_output = shmem.zeros((M, N), dtype=dtype)
 
-        shmem.barrier()
+        shmem.device_barrier()
         workspace = shmem.ccl.all_reduce_preamble(
             iris_output, iris_input, config=config
         )
-        shmem.barrier()
+        shmem.device_barrier()
 
         self._buffer_cache[cache_key] = (iris_input, iris_output, workspace)
 
@@ -147,9 +147,6 @@ class IrisManager:
         Returns:
             All-reduced tensor (M, N)
         """
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Iris CCL requires --enforce-eager")
-
         shmem = self.shmem
         config = self.config
 
@@ -160,7 +157,7 @@ class IrisManager:
         )
 
         iris_input.copy_(input_tensor)
-        shmem.barrier()
+        shmem.device_barrier()
         shmem.ccl.all_reduce(
             iris_output, iris_input, config=config, workspace=workspace
         )

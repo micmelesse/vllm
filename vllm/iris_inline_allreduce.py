@@ -16,7 +16,7 @@ phase. RMSNorm and FP8 quant are separate torch ops after the kernel.
 See iris_opt_allreduce.py for the fully-fused single-kernel version
 that fuses all-reduce + RMSNorm + quant into one kernel launch.
 
-Not compatible with CUDA graph capture. Requires --enforce-eager.
+Uses shmem.device_barrier() (device-side atomics) for CUDA graph compatibility.
 """
 
 from dataclasses import dataclass
@@ -305,7 +305,7 @@ class IrisOptManager:
         iris_input = shmem.zeros((M, N), dtype=dtype)
         iris_output = shmem.zeros((M, N), dtype=dtype)
 
-        shmem.barrier()
+        shmem.device_barrier()
 
         self._buffer_cache[cache_key] = (iris_input, iris_output)
 
@@ -330,9 +330,6 @@ class IrisOptManager:
         Returns:
             All-reduced tensor (M, N)
         """
-        if torch.cuda.is_current_stream_capturing():
-            logger.warning("Iris (inline): running during CUDA graph capture")
-
         shmem = self.shmem
         config = self.config
 
@@ -344,7 +341,7 @@ class IrisOptManager:
 
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
-        shmem.barrier()
+        shmem.device_barrier()
 
         # Extract group info
         rank_in_group, rank_global, world_size, rank_start, rank_stride = (
@@ -388,7 +385,7 @@ class IrisOptManager:
             waves_per_eu=1,
         )
 
-        shmem.barrier()
+        shmem.device_barrier()
 
         # Copy result back from symmetric heap
         output = torch.empty_like(input_tensor)

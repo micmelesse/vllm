@@ -15,11 +15,14 @@ eliminating intermediate global memory traffic.
 Row-based processing: BLOCK_SIZE_N >= hidden_size so each iteration
 handles complete rows. Uses persistent CTAs that iterate over rows.
 
-Buffer pre-allocation strategy for CUDA graph compatibility:
-The first forward pass (warmup) sees the largest M (max_num_batched_tokens).
-We allocate iris input and output buffers at that size, then return views
-for smaller M values during CUDA graph capture. This ensures fixed GPU
-memory addresses across graph capture and replay.
+CUDA graph compatibility:
+- Buffer pre-allocation: The first forward pass (warmup) sees the largest M
+  (max_num_batched_tokens). We allocate iris input and output buffers at that
+  size, then return views for smaller M values during CUDA graph capture.
+  This ensures fixed GPU memory addresses across graph capture and replay.
+- Device barriers: All barriers use shmem.device_barrier() (Triton device-side
+  atomics) instead of shmem.barrier() (host-side NCCL). This avoids
+  hipErrorStreamCaptureUnsupported on ROCm during CUDA graph capture.
 """
 
 from dataclasses import dataclass
@@ -339,7 +342,7 @@ class IrisOptManager:
 
         shmem = self.shmem
         self._input_buf = shmem.zeros((M, N), dtype=dtype)
-        shmem.barrier()
+        shmem.device_barrier()
         self._input_M = M
         self._input_N = N
         self._input_dtype = dtype
@@ -467,7 +470,7 @@ class IrisOptManager:
 
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
-        shmem.barrier()
+        shmem.device_barrier()
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -513,7 +516,7 @@ class IrisOptManager:
             waves_per_eu=1,
         )
 
-        shmem.barrier()
+        shmem.device_barrier()
 
         # The kernel computes per-token scales (M,) but the fused op contract
         # requires per-tensor scale (1,) to match the unfused graph output.
