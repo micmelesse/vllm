@@ -365,6 +365,39 @@ def _run_fusion_correctness_test(
         backend_fused.check_after_ops(model.ops_in_model_after())
 
 
+def _assert_impl_outputs(
+    ar_impl, rms_impl, res_impl, q_impl, qs_impl,
+    ar_ref, rms_ref, res_ref, q_ref, qs_ref,
+    use_residual, tag, atol, rtol,
+):
+    """Assert that impl outputs match reference outputs."""
+    torch.testing.assert_close(
+        ar_impl, ar_ref, atol=atol, rtol=rtol,
+        msg=f"allreduce_out mismatch ({tag})",
+    )
+    torch.testing.assert_close(
+        rms_impl, rms_ref, atol=atol, rtol=rtol,
+        msg=f"rms_out mismatch ({tag})",
+    )
+
+    if use_residual:
+        assert res_impl is not None and res_ref is not None
+        torch.testing.assert_close(
+            res_impl, res_ref, atol=atol, rtol=rtol,
+            msg=f"residual_out mismatch ({tag})",
+        )
+    else:
+        assert res_impl is None and res_ref is None
+
+    # Compare dequantized quant outputs
+    q_impl_deq = q_impl.to(torch.float32) * qs_impl
+    q_ref_deq = q_ref.to(torch.float32) * qs_ref
+    torch.testing.assert_close(
+        q_impl_deq, q_ref_deq, atol=atol, rtol=rtol,
+        msg=f"quant_out dequantized mismatch ({tag})",
+    )
+
+
 def _run_impl_correctness_test(
     local_rank: int,
     world_size: int,
@@ -372,8 +405,16 @@ def _run_impl_correctness_test(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
+    mode: str = "eager",
 ) -> None:
-    """Compare a single impl against the unfused individual ops as baseline."""
+    """Compare a single impl against the unfused individual ops as baseline.
+
+    Args:
+        mode: "eager" for direct execution, "graph" for CUDA graph
+              capture/replay. Graph mode does a warmup pass (eager), then
+              captures with torch.cuda.CUDAGraph, then replays with fresh
+              data and verifies correctness.
+    """
     set_random_seed(0)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -424,44 +465,103 @@ def _run_impl_correctness_test(
                 )
             )
 
-            # Run impl under test
-            tag = f"impl={impl}, residual={use_residual}"
+            tag = f"impl={impl}, residual={use_residual}, mode={mode}"
 
-            (ar_impl, rms_impl, res_impl, q_impl, qs_impl) = (
-                fused_allreduce_add_rms_quant(
-                    input_base.clone(), rms_weight, rms_eps,
-                    quant_scale, quant_dtype, group_name,
+            if mode == "eager":
+                (ar_impl, rms_impl, res_impl, q_impl, qs_impl) = (
+                    fused_allreduce_add_rms_quant(
+                        input_base.clone(), rms_weight, rms_eps,
+                        quant_scale, quant_dtype, group_name,
+                        residual_base.clone() if residual_base is not None
+                        else None,
+                        impl=impl,
+                    )
+                )
+
+                _assert_impl_outputs(
+                    ar_impl, rms_impl, res_impl, q_impl, qs_impl,
+                    ar_ref, rms_ref, res_ref, q_ref, qs_ref,
+                    use_residual, tag, ATOL, RTOL,
+                )
+
+            elif mode == "graph":
+                # --- Warmup pass (eager) ---
+                # This allocates buffers, JITs Triton kernels, and
+                # initializes device_barrier flag tensors.
+                input_warmup = input_base.clone()
+                residual_warmup = (
                     residual_base.clone() if residual_base is not None
-                    else None,
-                    impl=impl,
+                    else None
                 )
-            )
-
-            torch.testing.assert_close(
-                ar_impl, ar_ref, atol=ATOL, rtol=RTOL,
-                msg=f"allreduce_out mismatch ({tag})",
-            )
-            torch.testing.assert_close(
-                rms_impl, rms_ref, atol=ATOL, rtol=RTOL,
-                msg=f"rms_out mismatch ({tag})",
-            )
-
-            if use_residual:
-                assert res_impl is not None and res_ref is not None
-                torch.testing.assert_close(
-                    res_impl, res_ref, atol=ATOL, rtol=RTOL,
-                    msg=f"residual_out mismatch ({tag})",
+                fused_allreduce_add_rms_quant(
+                    input_warmup, rms_weight, rms_eps,
+                    quant_scale, quant_dtype, group_name,
+                    residual_warmup, impl=impl,
                 )
-            else:
-                assert res_impl is None and res_ref is None
+                torch.cuda.synchronize()
 
-            # Compare dequantized quant outputs
-            q_impl_deq = q_impl.to(torch.float32) * qs_impl
-            q_ref_deq = q_ref.to(torch.float32) * qs_ref
-            torch.testing.assert_close(
-                q_impl_deq, q_ref_deq, atol=ATOL, rtol=RTOL,
-                msg=f"quant_out dequantized mismatch ({tag})",
-            )
+                # --- Capture ---
+                # Use fixed input/residual tensors for capture. The graph
+                # records the kernel launches with these GPU addresses.
+                input_capture = input_base.clone()
+                residual_capture = (
+                    residual_base.clone() if residual_base is not None
+                    else None
+                )
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    (ar_cap, rms_cap, res_cap, q_cap, qs_cap) = (
+                        fused_allreduce_add_rms_quant(
+                            input_capture, rms_weight, rms_eps,
+                            quant_scale, quant_dtype, group_name,
+                            residual_capture, impl=impl,
+                        )
+                    )
+
+                # --- Replay with capture data ---
+                # First replay uses the same data as capture.
+                graph.replay()
+                torch.cuda.synchronize()
+
+                _assert_impl_outputs(
+                    ar_cap, rms_cap, res_cap, q_cap, qs_cap,
+                    ar_ref, rms_ref, res_ref, q_ref, qs_ref,
+                    use_residual, tag + " (replay 1)", ATOL, RTOL,
+                )
+
+                # --- Replay with fresh data ---
+                # Copy new data into the captured input tensors and replay.
+                input_fresh = torch.randn(
+                    (num_tokens, hidden_size), dtype=dtype, device=device
+                )
+                input_capture.copy_(input_fresh)
+                if residual_base is not None:
+                    residual_fresh = torch.randn(
+                        (num_tokens, hidden_size), dtype=dtype, device=device
+                    )
+                    residual_capture.copy_(residual_fresh)
+                else:
+                    residual_fresh = None
+
+                # Compute fresh reference
+                (ar_ref2, rms_ref2, res_ref2, q_ref2, qs_ref2) = (
+                    unfused_allreduce_add_rms_quant(
+                        input_fresh.clone(), rms_weight, rms_eps,
+                        quant_scale, quant_dtype, group_name,
+                        residual_fresh.clone() if residual_fresh is not None
+                        else None,
+                    )
+                )
+
+                graph.replay()
+                torch.cuda.synchronize()
+
+                _assert_impl_outputs(
+                    ar_cap, rms_cap, res_cap, q_cap, qs_cap,
+                    ar_ref2, rms_ref2, res_ref2, q_ref2, qs_ref2,
+                    use_residual, tag + " (replay 2)", ATOL, RTOL,
+                )
 
     finally:
         cleanup_dist_env_and_memory()
@@ -550,6 +650,7 @@ def test_rocm_aiter_allreduce_fusion_correctness(
     (32, 8192),      # larger batch, Llama 70B
 ])
 @pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
@@ -559,8 +660,16 @@ def test_rocm_aiter_allreduce_impl_correctness(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
+    mode: str,
 ):
-    """Compare impl against the unfused individual ops."""
+    """Compare impl against the unfused individual ops.
+
+    Runs in both eager mode (direct execution) and graph mode (CUDA graph
+    capture/replay). iris_ccl uses host barriers and is not graph-capturable.
+    """
+    if mode == "graph" and impl == "iris_ccl":
+        pytest.skip("iris_ccl uses host barriers, not graph-capturable")
+
     num_processes = 2
 
     torch.multiprocessing.spawn(
@@ -571,6 +680,7 @@ def test_rocm_aiter_allreduce_impl_correctness(
             num_tokens,
             hidden_size,
             dtype,
+            mode,
         ),
         nprocs=num_processes,
     )
