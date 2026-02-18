@@ -42,7 +42,7 @@ from ...utils import multi_gpu_test
 from ..backend import TestBackend
 
 
-class TestAllReduceRMSNormPerTensorQuantModel(torch.nn.Module):
+class AllReduceRMSNormPerTensorQuantModel(torch.nn.Module):
     """Model with all_reduce -> RMSNorm -> per_tensor_quant (no residual).
 
     Mimics the first transformer block pattern.
@@ -114,7 +114,7 @@ class TestAllReduceRMSNormPerTensorQuantModel(torch.nn.Module):
         ]
 
 
-class TestAllReduceAddRMSNormPerTensorQuantModel(torch.nn.Module):
+class AllReduceAddRMSNormPerTensorQuantModel(torch.nn.Module):
     """Model with all_reduce -> fused_add_rms_norm -> per_tensor_quant.
 
     Mimics transformer blocks after the first (with residual connections).
@@ -569,8 +569,8 @@ def _run_impl_correctness_test(
 
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("test_model", [
-    TestAllReduceRMSNormPerTensorQuantModel,
-    TestAllReduceAddRMSNormPerTensorQuantModel,
+    AllReduceRMSNormPerTensorQuantModel,
+    AllReduceAddRMSNormPerTensorQuantModel,
 ])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("seq_len", [8])
@@ -605,8 +605,8 @@ def test_rocm_aiter_allreduce_fusion_pass(
 
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("test_model", [
-    TestAllReduceRMSNormPerTensorQuantModel,
-    TestAllReduceAddRMSNormPerTensorQuantModel,
+    AllReduceRMSNormPerTensorQuantModel,
+    AllReduceAddRMSNormPerTensorQuantModel,
 ])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("seq_len", [8])
