@@ -28,6 +28,7 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     get_tp_group,
+    graph_capture as vllm_graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -356,44 +357,52 @@ def _run_impl_correctness_test(
                     else None
                 )
 
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    cap = fused_allreduce_add_rms_quant(
-                        input_capture, rms_weight, rms_eps,
+                # Use vLLM's graph_capture() to match production behavior.
+                # This activates the NCCL watchdog and custom allreduce
+                # capture context, which exposes host barrier issues that
+                # raw torch.cuda.CUDAGraph() misses.
+                with vllm_graph_capture(device=device) as ctx:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=ctx.stream):
+                        cap = fused_allreduce_add_rms_quant(
+                            input_capture, rms_weight, rms_eps,
+                            quant_scale, quant_dtype, group_name,
+                            residual_capture, impl=impl,
+                        )
+
+                    # Replay 1: same data as capture
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    checks.append((cap,
+                                    (ar_ref, rms_ref, res_ref, q_ref,
+                                     qs_ref),
+                                    tag + " (replay 1)"))
+
+                    # Replay 2: copy fresh data into captured tensors
+                    input_fresh = torch.randn(
+                        (num_tokens, hidden_size), dtype=dtype,
+                        device=device,
+                    )
+                    input_capture.copy_(input_fresh)
+                    if residual_base is not None:
+                        residual_fresh = torch.randn(
+                            (num_tokens, hidden_size), dtype=dtype,
+                            device=device,
+                        )
+                        residual_capture.copy_(residual_fresh)
+                    else:
+                        residual_fresh = None
+
+                    ref2 = unfused_allreduce_add_rms_quant(
+                        input_fresh.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
-                        residual_capture, impl=impl,
+                        residual_fresh.clone()
+                        if residual_fresh is not None else None,
                     )
 
-                # Replay 1: same data as capture
-                graph.replay()
-                torch.cuda.synchronize()
-                checks.append((cap,
-                                (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
-                                tag + " (replay 1)"))
-
-                # Replay 2: copy fresh data into captured tensors
-                input_fresh = torch.randn(
-                    (num_tokens, hidden_size), dtype=dtype, device=device
-                )
-                input_capture.copy_(input_fresh)
-                if residual_base is not None:
-                    residual_fresh = torch.randn(
-                        (num_tokens, hidden_size), dtype=dtype, device=device
-                    )
-                    residual_capture.copy_(residual_fresh)
-                else:
-                    residual_fresh = None
-
-                ref2 = unfused_allreduce_add_rms_quant(
-                    input_fresh.clone(), rms_weight, rms_eps,
-                    quant_scale, quant_dtype, group_name,
-                    residual_fresh.clone() if residual_fresh is not None
-                    else None,
-                )
-
-                graph.replay()
-                torch.cuda.synchronize()
-                checks.append((cap, ref2, tag + " (replay 2)"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    checks.append((cap, ref2, tag + " (replay 2)"))
 
             # Epilogue: compare impl outputs against reference
             for (ar_out, rms_out, res_out, q_out, qs_out), \
@@ -469,7 +478,7 @@ def test_rocm_aiter_allreduce_fusion_compile(
     )
 
 
-@multi_gpu_test(num_gpus=2)
+@multi_gpu_test(num_gpus=8)
 @pytest.mark.parametrize("impl", ["torch", "iris_ccl", "iris_inline",
                                    "iris_opt"])
 @pytest.mark.parametrize("num_tokens,hidden_size", [
@@ -490,12 +499,13 @@ def test_rocm_aiter_allreduce_impl_correctness(
     hidden_size: int,
     dtype: torch.dtype,
     mode: str,
-    num_processes: int = 2
+    num_processes: int = 8
 ):
     """Compare impl against the unfused individual ops.
 
     Runs in both eager mode (direct execution) and graph mode (CUDA graph
-    capture/replay). iris_ccl uses host barriers and is not graph-capturable.
+    capture/replay) using vLLM's graph_capture() context to match production
+    behavior. iris_ccl uses host barriers and is not graph-capturable.
     """
     torch.multiprocessing.spawn(
         _run_impl_correctness_test,
