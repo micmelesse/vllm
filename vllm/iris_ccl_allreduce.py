@@ -148,7 +148,11 @@ class IrisManager:
             All-reduced tensor (M, N)
         """
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Iris CCL requires --enforce-eager")
+            logger.warning(
+                "Iris CCL uses host barriers (shmem.barrier) which are not "
+                "capturable in CUDA graphs. Use --enforce-eager or switch to "
+                "iris_opt which uses device_barrier."
+            )
 
         shmem = self.shmem
         config = self.config
