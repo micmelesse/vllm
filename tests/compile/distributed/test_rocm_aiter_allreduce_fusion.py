@@ -41,17 +41,25 @@ from ...utils import multi_gpu_test
 from ..backend import TestBackend
 
 
-class AllReduceRMSNormPerTensorQuantModel(torch.nn.Module):
-    """Model with all_reduce -> RMSNorm -> per_tensor_quant (no residual).
+class AllReduceFusionModel(torch.nn.Module):
+    """Model with all_reduce -> RMSNorm -> per_tensor_quant blocks.
 
-    Mimics the first transformer block pattern.
+    Mimics a transformer with 4 blocks. Block 1 always uses plain rms_norm
+    (no residual). With use_residual=True, blocks 2-4 use
+    fused_add_rms_norm with a residual connection, matching real transformer
+    layers after the first.
+
+    Args:
+        use_residual: If True, blocks 2-4 use rocm_aiter_rmsnorm2d_fwd_with_add.
+            If False, all blocks use rocm_aiter_rms_norm.
     """
 
     def __init__(self, hidden_size: int = 16, token_num: int = 16,
-                 eps: float = 1e-5):
+                 eps: float = 1e-5, use_residual: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
+        self.use_residual = use_residual
         self.w = [torch.rand(hidden_size, hidden_size) for _ in range(4)]
         self.rms_weight = [
             torch.rand(hidden_size, dtype=torch.float16) for _ in range(4)
@@ -61,157 +69,113 @@ class AllReduceRMSNormPerTensorQuantModel(torch.nn.Module):
         ]
         self.quant_dtype = current_platform.fp8_dtype()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = torch.relu(x)
+    def _block_no_residual(
+        self, x: torch.Tensor, idx: int,
+    ) -> tuple[torch.Tensor, None]:
+        ar = tensor_model_parallel_all_reduce(x)
+        rms = torch.ops.vllm.rocm_aiter_rms_norm(
+            ar, self.rms_weight[idx], self.eps)
+        q, s = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+            rms, self.quant_dtype, self.scale[idx])
+        return q, None
 
-        # Block 1: all_reduce -> rms_norm -> per_tensor_quant -> mm
-        ar1 = tensor_model_parallel_all_reduce(z)
-        rms1 = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar1, self.rms_weight[0], self.eps)
-        q1, s1 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms1, self.quant_dtype, self.scale[0])
-
-        z2 = torch.mm(q1.to(x.dtype), self.w[0])
-
-        # Block 2
-        ar2 = tensor_model_parallel_all_reduce(z2)
-        rms2 = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar2, self.rms_weight[1], self.eps)
-        q2, s2 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms2, self.quant_dtype, self.scale[1])
-
-        z3 = torch.mm(q2.to(x.dtype), self.w[1])
-
-        # Block 3
-        ar3 = tensor_model_parallel_all_reduce(z3)
-        rms3 = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar3, self.rms_weight[2], self.eps)
-        q3, s3 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms3, self.quant_dtype, self.scale[2])
-
-        z4 = torch.mm(q3.to(x.dtype), self.w[2])
-
-        # Block 4
-        ar4 = tensor_model_parallel_all_reduce(z4)
-        rms4 = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar4, self.rms_weight[3], self.eps)
-        q4, s4 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms4, self.quant_dtype, self.scale[3])
-
-        return q4.to(x.dtype)
-
-    def ops_in_model_before(self) -> list:
-        return [
-            torch.ops.vllm.all_reduce.default,
-            torch.ops.vllm.rocm_aiter_rms_norm.default,
-            torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
-        ]
-
-    def ops_in_model_after(self) -> list:
-        return [
-            torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default,
-        ]
-
-
-class AllReduceAddRMSNormPerTensorQuantModel(torch.nn.Module):
-    """Model with all_reduce -> fused_add_rms_norm -> per_tensor_quant.
-
-    Mimics transformer blocks after the first (with residual connections).
-    """
-
-    def __init__(self, hidden_size: int = 16, token_num: int = 16,
-                 eps: float = 1e-5):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.w = [torch.rand(hidden_size, hidden_size) for _ in range(4)]
-        self.rms_weight = [
-            torch.rand(hidden_size, dtype=torch.float16) for _ in range(4)
-        ]
-        self.scale = [
-            torch.rand(1, dtype=torch.float32) for _ in range(4)
-        ]
-        self.quant_dtype = current_platform.fp8_dtype()
+    def _block_residual(
+        self, x: torch.Tensor, resid: torch.Tensor, idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ar = tensor_model_parallel_all_reduce(x)
+        rms, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
+            ar, resid, self.rms_weight[idx], self.eps)
+        q, s = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+            rms, self.quant_dtype, self.scale[idx])
+        return q, resid
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = torch.relu(x)
 
-        # Block 1: all_reduce (creates initial residual)
-        ar1 = tensor_model_parallel_all_reduce(z)
-        resid = ar1
-        rms1 = torch.ops.vllm.rocm_aiter_rms_norm(
-            ar1, self.rms_weight[0], self.eps)
-        q1, s1 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms1, self.quant_dtype, self.scale[0])
+        if self.use_residual:
+            # Block 1: plain rms_norm (creates initial residual from ar output)
+            ar1 = tensor_model_parallel_all_reduce(z)
+            resid = ar1
+            rms1 = torch.ops.vllm.rocm_aiter_rms_norm(
+                ar1, self.rms_weight[0], self.eps)
+            q1, _ = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+                rms1, self.quant_dtype, self.scale[0])
+            z2 = torch.mm(q1.to(x.dtype), self.w[0])
 
-        z2 = torch.mm(q1.to(x.dtype), self.w[0])
-
-        # Block 2: all_reduce -> fused_add_rms_norm (with residual)
-        ar2 = tensor_model_parallel_all_reduce(z2)
-        rms2, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            ar2, resid, self.rms_weight[1], self.eps)
-        q2, s2 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms2, self.quant_dtype, self.scale[1])
-
-        z3 = torch.mm(q2.to(x.dtype), self.w[1])
-
-        # Block 3
-        ar3 = tensor_model_parallel_all_reduce(z3)
-        rms3, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            ar3, resid, self.rms_weight[2], self.eps)
-        q3, s3 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms3, self.quant_dtype, self.scale[2])
-
-        z4 = torch.mm(q3.to(x.dtype), self.w[2])
-
-        # Block 4
-        ar4 = tensor_model_parallel_all_reduce(z4)
-        rms4, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            ar4, resid, self.rms_weight[3], self.eps)
-        q4, s4 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
-            rms4, self.quant_dtype, self.scale[3])
+            # Blocks 2-4: fused_add_rms_norm with residual
+            q2, resid = self._block_residual(z2, resid, 1)
+            z3 = torch.mm(q2.to(x.dtype), self.w[1])
+            q3, resid = self._block_residual(z3, resid, 2)
+            z4 = torch.mm(q3.to(x.dtype), self.w[2])
+            q4, resid = self._block_residual(z4, resid, 3)
+        else:
+            # All blocks: all_reduce -> rms_norm -> quant -> mm
+            q1, _ = self._block_no_residual(z, 0)
+            z2 = torch.mm(q1.to(x.dtype), self.w[0])
+            q2, _ = self._block_no_residual(z2, 1)
+            z3 = torch.mm(q2.to(x.dtype), self.w[1])
+            q3, _ = self._block_no_residual(z3, 2)
+            z4 = torch.mm(q3.to(x.dtype), self.w[2])
+            q4, _ = self._block_no_residual(z4, 3)
 
         return q4.to(x.dtype)
 
     def ops_in_model_before(self) -> list:
-        return [
-            torch.ops.vllm.all_reduce.default,
-            torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default,
-            torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
-        ]
+        if self.use_residual:
+            return [
+                torch.ops.vllm.all_reduce.default,
+                torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default,
+                torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
+            ]
+        else:
+            return [
+                torch.ops.vllm.all_reduce.default,
+                torch.ops.vllm.rocm_aiter_rms_norm.default,
+                torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
+            ]
 
     def ops_in_model_after(self) -> list:
-        return [
-            torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default,
-        ]
+        if self.use_residual:
+            return [
+                torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default,
+            ]
+        else:
+            return [
+                torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default,
+            ]
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("test_model", [
-    AllReduceRMSNormPerTensorQuantModel,
-    AllReduceAddRMSNormPerTensorQuantModel,
+@pytest.mark.parametrize("use_residual", [False, True])
+@pytest.mark.parametrize("num_tokens,hidden_size", [
+    (1, 2048),       # single token decode, Llama 1B
+    (16, 4096),      # small batch, Llama 8B
+    (17, 7168),      # odd token count, DeepSeek V3
+    (32, 8192),      # larger batch, Llama 70B
 ])
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("seq_len", [8])
-@pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
-def test_rocm_aiter_allreduce_fusion_pass(
-    test_model: type,
-    batch_size: int,
-    seq_len: int,
+def test_rocm_aiter_allreduce_fusion_compile(
+    use_residual: bool,
+    num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
     num_processes: int = 2
 ):
-    def _run_fusion_pass_test(
+    """Verify the fusion pass matches patterns and produces correct output.
+
+    Compiles the model with and without the fusion pass, checks that:
+    1. The pass matched and replaced the expected ops
+    2. Fused output matches unfused output
+    """
+
+    def _run_fusion_compile_test(
         local_rank: int,
         world_size: int,
-        test_model_cls: type,
-        batch_size: int,
-        seq_len: int,
+        use_residual: bool,
+        num_tokens: int,
         hidden_size: int,
         dtype: torch.dtype,
     ) -> None:
@@ -233,204 +197,80 @@ def test_rocm_aiter_allreduce_fusion_pass(
         init_distributed_environment()
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-
-        vllm_config = VllmConfig(
-            compilation_config=CompilationConfig(
-                mode=CompilationMode.VLLM_COMPILE,
-                custom_ops=["+rms_norm"],
+        try:
+            vllm_config = VllmConfig(
+                compilation_config=CompilationConfig(
+                    mode=CompilationMode.VLLM_COMPILE,
+                    custom_ops=["+rms_norm"],
+                )
             )
-        )
-        vllm_config.compilation_config.pass_config = PassConfig(
-            eliminate_noops=True,
-        )
-        vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
-        vllm_config.parallel_config.rank = local_rank
+            vllm_config.compilation_config.pass_config = PassConfig(
+                eliminate_noops=True,
+            )
+            vllm_config.device_config = DeviceConfig(
+                device=torch.device("cuda"))
+            vllm_config.parallel_config.rank = local_rank
 
-        model_name = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
-        vllm_config.model_config = ModelConfig(
-            model=model_name, trust_remote_code=True, dtype=dtype, seed=42
-        )
-
-        with set_current_vllm_config(vllm_config):
-            allreduce_fusion_pass = RocmAiterAllReduceFusionPass(vllm_config)
-            noop_pass = NoOpEliminationPass(vllm_config)
-            func_pass = FixFunctionalizationPass(vllm_config)
-            cleanup_pass = PostCleanupPass(vllm_config)
-
-            backend = TestBackend(
-                noop_pass, allreduce_fusion_pass, func_pass, cleanup_pass
+            model_name = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
+            vllm_config.model_config = ModelConfig(
+                model=model_name, trust_remote_code=True, dtype=dtype, seed=42
             )
 
-            token_num = batch_size * seq_len
-            model = test_model_cls(hidden_size, token_num)
+            with set_current_vllm_config(vllm_config):
+                allreduce_fusion_pass = RocmAiterAllReduceFusionPass(
+                    vllm_config)
+                noop_pass = NoOpEliminationPass(vllm_config)
+                func_pass = FixFunctionalizationPass(vllm_config)
+                cleanup_pass = PostCleanupPass(vllm_config)
 
-            hidden_states = torch.randn(
-                (token_num, hidden_size), requires_grad=False
-            )
+                backend_fused = TestBackend(
+                    noop_pass, allreduce_fusion_pass, func_pass, cleanup_pass
+                )
+                backend_unfused = TestBackend(
+                    noop_pass, func_pass, cleanup_pass
+                )
 
-            compiled_model = torch.compile(model, backend=backend)
-            compiled_model(hidden_states)
+                model = AllReduceFusionModel(
+                    hidden_size, num_tokens, use_residual=use_residual)
 
-            # Verify pattern matching occurred
-            assert allreduce_fusion_pass.matched_count > 0, (
-                f"Expected fusion matches, got {allreduce_fusion_pass.matched_count}"
-            )
+                hidden_states = torch.randn(
+                    (num_tokens, hidden_size), requires_grad=False
+                )
 
-            # Verify unfused ops existed before and fused ops exist after
-            backend.check_before_ops(
-                model.ops_in_model_before(), fully_replaced=False
-            )
-            backend.check_after_ops(model.ops_in_model_after())
+                # Compile and run with fusion
+                model_fused = torch.compile(model, backend=backend_fused)
+                result_fused = model_fused(hidden_states)
 
-    # launch n instance
+                # Verify pattern matching and op replacement
+                assert allreduce_fusion_pass.matched_count > 0, (
+                    f"Expected fusion matches, got "
+                    f"{allreduce_fusion_pass.matched_count}"
+                )
+                backend_fused.check_before_ops(
+                    model.ops_in_model_before(), fully_replaced=False
+                )
+                backend_fused.check_after_ops(model.ops_in_model_after())
+
+                # Compile and run without fusion, compare outputs
+                torch._dynamo.reset()
+                model_unfused = torch.compile(model, backend=backend_unfused)
+                result_unfused = model_unfused(hidden_states)
+
+                if dtype == torch.float16:
+                    ATOL, RTOL = (2e-3, 2e-3)
+                else:
+                    ATOL, RTOL = (1e-2, 1e-2)
+
+                torch.testing.assert_close(
+                    result_fused, result_unfused, atol=ATOL, rtol=RTOL
+                )
+
+        finally:
+            cleanup_dist_env_and_memory()
+
     torch.multiprocessing.spawn(
-        _run_fusion_pass_test,
-        args=(
-            num_processes,
-            test_model,
-            batch_size,
-            seq_len,
-            hidden_size,
-            dtype,
-        ),
-        nprocs=num_processes,
-    )
-
-
-@multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("test_model", [
-    AllReduceRMSNormPerTensorQuantModel,
-    AllReduceAddRMSNormPerTensorQuantModel,
-])
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("seq_len", [8])
-@pytest.mark.parametrize("hidden_size", [64])
-@pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.version.hip),
-    reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
-)
-def test_rocm_aiter_allreduce_fusion_correctness(
-    test_model: type,
-    batch_size: int,
-    seq_len: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    num_processes: int = 2
-):
-    """Verify fused ops produce same output as unfused sequence."""
-
-    def _run_fusion_correctness_test(
-        local_rank: int,
-        world_size: int,
-        test_model_cls: type,
-        batch_size: int,
-        seq_len: int,
-        hidden_size: int,
-        dtype: torch.dtype,
-    ) -> None:
-        """Dual-backend test: compile with and without fusion, compare outputs."""
-        set_random_seed(0)
-
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-        torch.set_default_device(device)
-        torch.set_default_dtype(dtype)
-
-        update_environment_variables({
-            "RANK": str(local_rank),
-            "LOCAL_RANK": str(local_rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12346",
-        })
-
-        init_distributed_environment()
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
-
-
-        vllm_config = VllmConfig(
-            compilation_config=CompilationConfig(
-                mode=CompilationMode.VLLM_COMPILE,
-                custom_ops=["+rms_norm"],
-            )
-        )
-        vllm_config.compilation_config.pass_config = PassConfig(
-            eliminate_noops=True,
-        )
-        vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
-        vllm_config.parallel_config.rank = local_rank
-
-        model_name = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
-        vllm_config.model_config = ModelConfig(
-            model=model_name, trust_remote_code=True, dtype=dtype, seed=42
-        )
-
-        with set_current_vllm_config(vllm_config):
-            allreduce_fusion_pass = RocmAiterAllReduceFusionPass(vllm_config)
-            noop_pass = NoOpEliminationPass(vllm_config)
-            func_pass = FixFunctionalizationPass(vllm_config)
-            cleanup_pass = PostCleanupPass(vllm_config)
-
-            # Backend WITH fusion pass
-            backend_fused = TestBackend(
-                noop_pass, allreduce_fusion_pass, func_pass, cleanup_pass
-            )
-            # Backend WITHOUT fusion pass
-            backend_unfused = TestBackend(
-                noop_pass, func_pass, cleanup_pass
-            )
-
-            token_num = batch_size * seq_len
-            model = test_model_cls(hidden_size, token_num)
-
-            hidden_states = torch.randn(
-                (token_num, hidden_size), requires_grad=False
-            )
-
-            # Run fused model
-            model_fused = torch.compile(model, backend=backend_fused)
-            result_fused = model_fused(hidden_states)
-
-            # Reset dynamo between compilations
-            torch._dynamo.reset()
-
-            # Run unfused model with the same input
-            model_unfused = torch.compile(model, backend=backend_unfused)
-            result_unfused = model_unfused(hidden_states)
-
-            # Compare outputs
-            if dtype == torch.float16:
-                ATOL, RTOL = (2e-3, 2e-3)
-            else:
-                ATOL, RTOL = (1e-2, 1e-2)
-
-            torch.testing.assert_close(
-                result_fused, result_unfused, atol=ATOL, rtol=RTOL
-            )
-
-            # Also verify pattern matching occurred
-            assert allreduce_fusion_pass.matched_count > 0, (
-                f"Expected fusion matches, got "
-                f"{allreduce_fusion_pass.matched_count}"
-            )
-
-            backend_fused.check_before_ops(
-                model.ops_in_model_before(), fully_replaced=False
-            )
-            backend_fused.check_after_ops(model.ops_in_model_after())
-
-    # launch n processes
-    torch.multiprocessing.spawn(
-        _run_fusion_correctness_test,
-        args=(
-            num_processes,
-            test_model,
-            batch_size,
-            seq_len,
-            hidden_size,
-            dtype,
-        ),
+        _run_fusion_compile_test,
+        args=(num_processes, use_residual, num_tokens, hidden_size, dtype),
         nprocs=num_processes,
     )
 
