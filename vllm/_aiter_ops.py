@@ -760,6 +760,100 @@ def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
     return x_fp8, out_bs
 
 
+def _rocm_aiter_fused_allreduce_rms_quant_impl(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+        fused_allreduce_add_rms_quant,
+    )
+
+    allreduce_out, rms_out, _, quant_out, quant_scale_out = (
+        fused_allreduce_add_rms_quant(
+            input=input,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            quant_scale=quant_scale,
+            quant_dtype=quant_dtype,
+            group_name=group_name,
+            residual=None,
+        )
+    )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_fake(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(
+        1, device=input.device, dtype=torch.float32
+    )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+        fused_allreduce_add_rms_quant,
+    )
+
+    allreduce_out, rms_out, residual_out, quant_out, quant_scale_out = (
+        fused_allreduce_add_rms_quant(
+            input=input,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            quant_scale=quant_scale,
+            quant_dtype=quant_dtype,
+            group_name=group_name,
+            residual=residual,
+        )
+    )
+    assert residual_out is not None
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    residual_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(
+        1, device=input.device, dtype=torch.float32
+    )
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -1095,6 +1189,20 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_per_token_quant_impl,
                 fake_impl=_rocm_aiter_per_token_quant_fake,
                 dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_add_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
             )
 
             _OPS_REGISTERED = True
@@ -1472,12 +1580,10 @@ class rocm_aiter_ops:
     
     @staticmethod
     def get_fused_allreduce_rms_quant_op() -> OpOverload:
-        import vllm.fused_allreduce_add_rms_quant  # noqa: F401
         return torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default
 
     @staticmethod
     def get_fused_allreduce_add_rms_quant_op() -> OpOverload:
-        import vllm.fused_allreduce_add_rms_quant  # noqa: F401
         return torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default
 
     @staticmethod
