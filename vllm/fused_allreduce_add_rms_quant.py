@@ -32,8 +32,8 @@ __all__ = ["fused_allreduce_add_rms_quant"]
 
 logger = init_logger(__name__)
 
-ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE", "iris_opt")
-logger.info(f"AllReduce impl: {ALLREDUCE_IMPL}")
+ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE")
+logger.info("Fused AllReduce impl: %s", ALLREDUCE_IMPL)
 
 
 def _get_tp_process_group():
