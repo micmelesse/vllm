@@ -32,7 +32,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
+from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401 (registers ops)
 from vllm.platforms import current_platform
 from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
 from vllm.utils.system_utils import update_environment_variables
@@ -250,24 +250,21 @@ def _run_fusion_compile_test(
         cleanup_dist_env_and_memory()
 
 
-def _run_impl_correctness_test(
+def _run_fused_op_correctness_test(
     local_rank: int,
     world_size: int,
-    impl: str,
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
     mode: str = "eager",
 ) -> None:
-    """Worker for test_rocm_aiter_allreduce_impl_correctness.
+    """Worker for test_rocm_aiter_fused_op_correctness.
 
-    Compares a single impl against the unfused individual ops as baseline.
+    Compares the registered torch ops against unfused individual ops.
 
     Args:
         mode: "eager" for direct execution, "graph" for CUDA graph
-            capture/replay. Graph mode does a warmup pass (eager), then
-            captures with torch.cuda.CUDAGraph, then replays with fresh
-            data and verifies correctness.
+            capture/replay.
     """
     set_random_seed(0)
 
@@ -319,66 +316,91 @@ def _run_impl_correctness_test(
                 )
             )
 
-            tag = f"impl={impl}, residual={use_residual}, mode={mode}"
+            tag = f"residual={use_residual}, mode={mode}"
 
-            # Each branch builds a list of (impl_result, ref_result, tag)
-            # to check in the epilogue.
             checks = []
 
             if mode == "eager":
-                result = fused_allreduce_add_rms_quant(
-                    input_base.clone(), rms_weight, rms_eps,
-                    quant_scale, quant_dtype, group_name,
-                    residual_base.clone() if residual_base is not None
-                    else None,
-                    impl=impl,
-                )
-                checks.append((result,
-                                (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
-                                tag))
+                if use_residual:
+                    result = (
+                        torch.ops.vllm
+                        .rocm_aiter_fused_allreduce_add_rms_quant(
+                            input_base.clone(), residual_base.clone(),
+                            rms_weight, rms_eps, quant_scale, quant_dtype,
+                            group_name,
+                        )
+                    )
+                    ar_out, rms_out, res_out, q_out, qs_out = result
+                else:
+                    result = (
+                        torch.ops.vllm
+                        .rocm_aiter_fused_allreduce_rms_quant(
+                            input_base.clone(), rms_weight, rms_eps,
+                            quant_scale, quant_dtype, group_name,
+                        )
+                    )
+                    ar_out, rms_out, q_out, qs_out = result
+                    res_out = None
+                checks.append(
+                    ((ar_out, rms_out, res_out, q_out, qs_out),
+                     (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
+                     tag))
 
             elif mode == "graph":
-                # Warmup pass (eager) to allocate buffers, JIT Triton
-                # kernels, and initialize device_barrier flag tensors.
-                fused_allreduce_add_rms_quant(
-                    input_base.clone(), rms_weight, rms_eps,
-                    quant_scale, quant_dtype, group_name,
-                    residual_base.clone() if residual_base is not None
-                    else None,
-                    impl=impl,
-                )
+                # Warmup pass (eager)
+                if use_residual:
+                    torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant(
+                        input_base.clone(), residual_base.clone(),
+                        rms_weight, rms_eps, quant_scale, quant_dtype,
+                        group_name,
+                    )
+                else:
+                    torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant(
+                        input_base.clone(), rms_weight, rms_eps,
+                        quant_scale, quant_dtype, group_name,
+                    )
                 torch.cuda.synchronize()
 
-                # Capture: fixed input tensors, graph records kernel
-                # launches with these GPU addresses.
+                # Capture
                 input_capture = input_base.clone()
                 residual_capture = (
                     residual_base.clone() if residual_base is not None
                     else None
                 )
 
-                # Use vLLM's graph_capture() to match production behavior.
-                # This activates the NCCL watchdog and custom allreduce
-                # capture context, which exposes host barrier issues that
-                # raw torch.cuda.CUDAGraph() misses.
                 with vllm_graph_capture(device=device) as ctx:
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=ctx.stream):
-                        cap = fused_allreduce_add_rms_quant(
-                            input_capture, rms_weight, rms_eps,
-                            quant_scale, quant_dtype, group_name,
-                            residual_capture, impl=impl,
-                        )
+                        if use_residual:
+                            cap = (
+                                torch.ops.vllm
+                                .rocm_aiter_fused_allreduce_add_rms_quant(
+                                    input_capture, residual_capture,
+                                    rms_weight, rms_eps, quant_scale,
+                                    quant_dtype, group_name,
+                                )
+                            )
+                            cap_ar, cap_rms, cap_res, cap_q, cap_qs = cap
+                        else:
+                            cap = (
+                                torch.ops.vllm
+                                .rocm_aiter_fused_allreduce_rms_quant(
+                                    input_capture, rms_weight, rms_eps,
+                                    quant_scale, quant_dtype, group_name,
+                                )
+                            )
+                            cap_ar, cap_rms, cap_q, cap_qs = cap
+                            cap_res = None
 
                     # Replay 1: same data as capture
                     graph.replay()
                     torch.cuda.synchronize()
-                    checks.append((cap,
-                                    (ar_ref, rms_ref, res_ref, q_ref,
-                                     qs_ref),
-                                    tag + " (replay 1)"))
+                    checks.append(
+                        ((cap_ar, cap_rms, cap_res, cap_q, cap_qs),
+                         (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
+                         tag + " (replay 1)"))
 
-                    # Replay 2: copy fresh data into captured tensors
+                    # Replay 2: fresh data
                     input_fresh = torch.randn(
                         (num_tokens, hidden_size), dtype=dtype,
                         device=device,
@@ -402,9 +424,11 @@ def _run_impl_correctness_test(
 
                     graph.replay()
                     torch.cuda.synchronize()
-                    checks.append((cap, ref2, tag + " (replay 2)"))
+                    checks.append(
+                        ((cap_ar, cap_rms, cap_res, cap_q, cap_qs),
+                         ref2, tag + " (replay 2)"))
 
-            # Epilogue: compare impl outputs against reference
+            # Epilogue: compare outputs against reference
             for (ar_out, rms_out, res_out, q_out, qs_out), \
                 (ar_ref_, rms_ref_, res_ref_, q_ref_, qs_ref_), \
                     check_tag in checks:
@@ -479,8 +503,6 @@ def test_rocm_aiter_allreduce_fusion_compile(
 
 
 @multi_gpu_test(num_gpus=8)
-@pytest.mark.parametrize("impl", ["torch", "iris_ccl", "iris_inline",
-                                   "iris_opt"])
 @pytest.mark.parametrize("num_tokens,hidden_size", [
     (1, 2048),       # single token, Llama 1B
     (16, 4096),      # small batch, Llama 8B
@@ -493,25 +515,23 @@ def test_rocm_aiter_allreduce_fusion_compile(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
-def test_rocm_aiter_allreduce_impl_correctness(
-    impl: str,
+def test_rocm_aiter_fused_op_correctness(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
     mode: str,
     num_processes: int = 8
 ):
-    """Compare impl against the unfused individual ops.
+    """Compare fused torch ops against unfused individual ops.
 
-    Runs in both eager mode (direct execution) and graph mode (CUDA graph
-    capture/replay) using vLLM's graph_capture() context to match production
-    behavior. iris_ccl uses host barriers and is not graph-capturable.
+    Tests both rocm_aiter_fused_allreduce_rms_quant (no residual) and
+    rocm_aiter_fused_allreduce_add_rms_quant (with residual) in eager
+    and CUDA graph modes.
     """
     torch.multiprocessing.spawn(
-        _run_impl_correctness_test,
+        _run_fused_op_correctness_test,
         args=(
             num_processes,
-            impl,
             num_tokens,
             hidden_size,
             dtype,

@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Benchmark: fused_allreduce_add_rms_quant across all implementations.
+Benchmark: fused allreduce+rmsnorm+quant vs unfused baseline.
 
-Compares unfused baseline (3 separate kernel launches) against fused impls
-(torch, iris, iris_inline, iris_opt), with residual and FP8 per-tensor quant.
+Compares unfused baseline (3 separate kernel launches) against the fused
+torch op (rocm_aiter_fused_allreduce_add_rms_quant), with residual and
+FP8 per-tensor quant.
 
 Eager mode only (no CUDA graph capture) to avoid ROCm
 hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
@@ -13,7 +14,7 @@ hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
 Usage:
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py \
-        --impls unfused iris_opt --num-tokens 1 4 1024
+        --num-tokens 1 4 1024
 """
 
 import argparse
@@ -30,7 +31,6 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.fused_allreduce_add_rms_quant import fused_allreduce_add_rms_quant
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
@@ -38,9 +38,6 @@ from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
-
-FUSED_IMPLS = ["torch", "iris_ccl", "iris_inline", "iris_opt"]
-ALL_IMPLS = ["unfused"] + FUSED_IMPLS
 
 
 # ── Benchmark variant ───────────────────────────────────────────────────────
@@ -59,12 +56,8 @@ class BenchVariant:
     ]
 
 
-def _make_impl_variant(impl: str):
-    """Return a factory that creates a run_fn for a given impl.
-
-    Routes "unfused" to unfused_allreduce_add_rms_quant directly,
-    all other impls go through the fused dispatcher.
-    """
+def _make_unfused_variant():
+    """Return a factory that creates a run_fn for unfused baseline."""
 
     def make_fn(
         num_tokens: int,
@@ -80,22 +73,42 @@ def _make_impl_variant(impl: str):
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
         scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
-        if impl == "unfused":
-            def run():
-                inp = input_tensor.clone()
-                res = residual.clone()
-                unfused_allreduce_add_rms_quant(
-                    inp, rms_weight, 1e-6, scale, FP8_DTYPE,
-                    group_name, residual=res,
-                )
-        else:
-            def run():
-                inp = input_tensor.clone()
-                res = residual.clone()
-                fused_allreduce_add_rms_quant(
-                    inp, rms_weight, 1e-6, scale, FP8_DTYPE,
-                    group_name, residual=res, impl=impl,
-                )
+        def run():
+            inp = input_tensor.clone()
+            res = residual.clone()
+            unfused_allreduce_add_rms_quant(
+                inp, rms_weight, 1e-6, scale, FP8_DTYPE,
+                group_name, residual=res,
+            )
+
+        return run
+
+    return make_fn
+
+
+def _make_fused_variant():
+    """Return a factory that creates a run_fn for fused torch op."""
+
+    def make_fn(
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        group_name: str,
+    ) -> Callable[[], None]:
+        input_tensor = torch.randn(
+            num_tokens, hidden_dim, dtype=dtype, device=device,
+        )
+        residual = torch.randn_like(input_tensor)
+        rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
+        scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+        def run():
+            inp = input_tensor.clone()
+            res = residual.clone()
+            torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant(
+                inp, res, rms_weight, 1e-6, scale, FP8_DTYPE, group_name,
+            )
 
         return run
 
@@ -130,15 +143,7 @@ def benchmark_eager(fn: Callable[[], None], warmup: int, trials: int) -> float:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark fused_allreduce_add_rms_quant across impls"
-    )
-    parser.add_argument(
-        "--impls",
-        type=str,
-        nargs="+",
-        default=ALL_IMPLS,
-        choices=ALL_IMPLS,
-        help="Implementations to benchmark (default: all)",
+        description="Benchmark fused allreduce+rmsnorm+quant vs unfused"
     )
     parser.add_argument(
         "--num-tokens",
@@ -190,16 +195,16 @@ def main():
 
     if rank == 0:
         logger.info(
-            "Benchmarking impls=%s  world_size=%d  hidden_dim=%d",
-            args.impls, world_size, args.hidden_dim,
+            "Benchmarking unfused vs fused  world_size=%d  hidden_dim=%d",
+            world_size, args.hidden_dim,
         )
 
     group_name = get_tp_group().unique_name
 
     # ── Build variants ───────────────────────────────────────────────────
     variants = [
-        BenchVariant(name=impl, make_fn=_make_impl_variant(impl))
-        for impl in args.impls
+        BenchVariant(name="unfused", make_fn=_make_unfused_variant()),
+        BenchVariant(name="fused", make_fn=_make_fused_variant()),
     ]
 
     # ── Run benchmarks ───────────────────────────────────────────────────
@@ -220,7 +225,7 @@ def main():
         all_results[num_tokens] = timings
 
         if rank == 0:
-            baseline = timings[variants[0].name]
+            baseline = timings["unfused"]
             parts = [f"tokens={num_tokens:>5d}"]
             for v in variants:
                 t = timings[v.name]
@@ -230,15 +235,14 @@ def main():
 
     # ── Print summary table (rank 0) ─────────────────────────────────────
     if rank == 0:
-        baseline_name = variants[0].name
         variant_names = [v.name for v in variants]
 
         hdr = (
             f"\n{'='*70}\n"
-            f"Benchmark: {' vs '.join(variant_names)}\n"
+            f"Benchmark: unfused vs fused\n"
             f"world_size={world_size}  hidden_dim={args.hidden_dim}  "
             f"dtype={dtype}  warmup={args.warmup}  trials={args.trials}\n"
-            f"baseline={baseline_name}\n"
+            f"baseline=unfused\n"
             f"{'='*70}"
         )
         print(hdr)
@@ -246,18 +250,18 @@ def main():
         col_headers = ["Tokens"]
         for name in variant_names:
             col_headers.append(f"{name} (ms)")
-            if name != baseline_name:
+            if name != "unfused":
                 col_headers.append("Speedup")
         print("  ".join(f"{h:>15s}" for h in col_headers))
         print("-" * (17 * len(col_headers)))
 
         for num_tokens, timings in all_results.items():
             cols = [f"{num_tokens:>15d}"]
-            baseline_ms = timings[baseline_name]
+            baseline_ms = timings["unfused"]
             for name in variant_names:
                 t = timings[name]
                 cols.append(f"{t:>15.3f}")
-                if name != baseline_name:
+                if name != "unfused":
                     speedup = baseline_ms / t if t > 0 else float("inf")
                     cols.append(f"{speedup:>14.2f}x")
             print("".join(cols))
@@ -265,36 +269,35 @@ def main():
 
     # ── Save markdown (rank 0) ───────────────────────────────────────────
     if args.output_file and rank == 0:
-        baseline_name = variants[0].name
         variant_names = [v.name for v in variants]
 
         lines = [
-            f"# Benchmark: {' vs '.join(variant_names)}",
+            f"# Benchmark: unfused vs fused",
             "",
             f"**World Size:** {world_size}  ",
             f"**Hidden Dimension:** {args.hidden_dim}  ",
             f"**dtype:** {dtype}  ",
             f"**Warmup:** {args.warmup}  ",
             f"**Trials:** {args.trials}  ",
-            f"**Baseline:** {baseline_name}  ",
+            f"**Baseline:** unfused  ",
             "",
         ]
 
         md_cols = ["Tokens"]
         for name in variant_names:
             md_cols.append(f"{name} (ms)")
-            if name != baseline_name:
+            if name != "unfused":
                 md_cols.append("Speedup")
         lines.append("| " + " | ".join(md_cols) + " |")
         lines.append("|" + "|".join("---:" for _ in md_cols) + "|")
 
         for num_tokens, timings in all_results.items():
-            baseline_ms = timings[baseline_name]
+            baseline_ms = timings["unfused"]
             row = [str(num_tokens)]
             for name in variant_names:
                 t = timings[name]
                 row.append(f"{t:.3f}")
-                if name != baseline_name:
+                if name != "unfused":
                     speedup = baseline_ms / t if t > 0 else float("inf")
                     row.append(f"{speedup:.2f}x")
             lines.append("| " + " | ".join(row) + " |")
