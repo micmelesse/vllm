@@ -167,6 +167,13 @@ def main():
         default=None,
         help="Optional output markdown file (rank 0 only)",
     )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        choices=["all", "unfused", "fused"],
+        default="all",
+        help="Which variant(s) to run (default: all)",
+    )
     args = parser.parse_args()
 
     # ── Distributed setup ────────────────────────────────────────────────
@@ -202,10 +209,14 @@ def main():
     group_name = get_tp_group().unique_name
 
     # ── Build variants ───────────────────────────────────────────────────
-    variants = [
+    all_variants = [
         BenchVariant(name="unfused", make_fn=_make_unfused_variant()),
         BenchVariant(name="fused", make_fn=_make_fused_variant()),
     ]
+    if args.variant == "all":
+        variants = all_variants
+    else:
+        variants = [v for v in all_variants if v.name == args.variant]
 
     # ── Run benchmarks ───────────────────────────────────────────────────
     dtype = torch.bfloat16
