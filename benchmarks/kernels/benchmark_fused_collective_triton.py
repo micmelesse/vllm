@@ -174,6 +174,13 @@ def main():
         default="all",
         help="Which variant(s) to run (default: all)",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Enable torch.profiler and save traces to DIR",
+    )
     args = parser.parse_args()
 
     # ── Distributed setup ────────────────────────────────────────────────
@@ -222,6 +229,23 @@ def main():
     dtype = torch.bfloat16
     all_results: dict[int, dict[str, float]] = {}
 
+    # Set up profiler context if --profile is specified
+    profiler: torch.profiler.profile | None = None
+    if args.profile is not None:
+        os.makedirs(args.profile, exist_ok=True)
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+        )
+        profiler.start()
+        if rank == 0:
+            logger.info("Profiler enabled, traces will be saved to %s",
+                        args.profile)
+
     for num_tokens in args.num_tokens:
         timings: dict[str, float] = {}
 
@@ -243,6 +267,16 @@ def main():
                 speedup = baseline / t if t > 0 else float("inf")
                 parts.append(f"{v.name}={t:.3f} ms ({speedup:.2f}x)")
             print("  ".join(parts))
+
+    # Stop profiler and export traces
+    if profiler is not None:
+        profiler.stop()
+        trace_path = os.path.join(
+            args.profile, f"trace_rank{rank}.json"
+        )
+        profiler.export_chrome_trace(trace_path)
+        if rank == 0:
+            logger.info("Traces saved to %s/trace_rank*.json", args.profile)
 
     # ── Print summary table (rank 0) ─────────────────────────────────────
     if rank == 0:
