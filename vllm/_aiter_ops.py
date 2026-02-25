@@ -884,6 +884,100 @@ def _triton_rotary_embedding_fake(
     return
 
 
+def _rocm_aiter_fused_allreduce_rms_quant_impl(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+        fused_allreduce_add_rms_quant,
+    )
+
+    allreduce_out, rms_out, _, quant_out, quant_scale_out = (
+        fused_allreduce_add_rms_quant(
+            input=input,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            quant_scale=quant_scale,
+            quant_dtype=quant_dtype,
+            group_name=group_name,
+            residual=None,
+        )
+    )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_fake(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(
+        1, device=input.device, dtype=torch.float32
+    )
+    return allreduce_out, rms_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+        fused_allreduce_add_rms_quant,
+    )
+
+    allreduce_out, rms_out, residual_out, quant_out, quant_scale_out = (
+        fused_allreduce_add_rms_quant(
+            input=input,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            quant_scale=quant_scale,
+            quant_dtype=quant_dtype,
+            group_name=group_name,
+            residual=residual,
+        )
+    )
+    assert residual_out is not None
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_scale: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_name: str,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    allreduce_out = torch.empty_like(input)
+    rms_out = torch.empty_like(input)
+    residual_out = torch.empty_like(input)
+    quant_out = torch.empty_like(input, dtype=quant_dtype)
+    quant_scale_out = torch.empty(
+        1, device=input.device, dtype=torch.float32
+    )
+    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -969,6 +1063,7 @@ class rocm_aiter_ops:
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _ALLREDUCE_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_ALLREDUCE_FUSION
 
     @classmethod
     def refresh_env_variables(cls):
@@ -993,6 +1088,7 @@ class rocm_aiter_ops:
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._ALLREDUCE_FUSION_ENABLED = envs.VLLM_ROCM_USE_AITER_ALLREDUCE_FUSION
 
     @classmethod
     @if_aiter_supported
@@ -1068,6 +1164,10 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_gemm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
+
+    @classmethod
+    def is_allreduce_fusion_enabled(cls) -> bool:
+        return cls._ALLREDUCE_FUSION_ENABLED
 
     @staticmethod
     @if_aiter_supported
@@ -1237,6 +1337,20 @@ class rocm_aiter_ops:
                 op_func=_triton_rotary_embedding_impl,
                 mutates_args=["query", "key"],  # These tensors are modified in-place
                 fake_impl=_triton_rotary_embedding_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_add_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
             )
 
             _OPS_REGISTERED = True
@@ -1639,6 +1753,14 @@ class rocm_aiter_ops:
             transpose_bm=transpose_bm,
             config=config,
         )
+    
+    @staticmethod
+    def get_fused_allreduce_rms_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default
+
+    @staticmethod
+    def get_fused_allreduce_add_rms_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default
 
     @staticmethod
     def group_fp8_quant(

@@ -122,7 +122,9 @@ class PassConfig:
     fuse_gemm_comms: bool = Field(default=None)
     """Enable async TP."""
     fuse_allreduce_rms: bool = Field(default=None)
-    """Enable flashinfer allreduce fusion."""
+    """Enable allreduce + rms norm + quant fusion.
+    On CUDA: Uses flashinfer (AllReduceFusionPass).
+    On ROCm: Uses AITER ops (RocmAiterAllReduceFusionPass)."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
 
