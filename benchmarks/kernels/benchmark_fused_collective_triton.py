@@ -135,7 +135,7 @@ def _make_fused_variant():
 def benchmark_eager(fn: Callable[[], None], warmup: int, trials: int) -> float:
     """Benchmark *fn()* in eager mode using CUDA events.
 
-    Returns average time in milliseconds.
+    Returns median time in milliseconds (robust to outliers).
     """
     for _ in range(warmup):
         fn()
@@ -151,7 +151,11 @@ def benchmark_eager(fn: Callable[[], None], warmup: int, trials: int) -> float:
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
 
-    return sum(times) / len(times)
+    times.sort()
+    mid = len(times) // 2
+    if len(times) % 2 == 0:
+        return (times[mid - 1] + times[mid]) / 2
+    return times[mid]
 
 
 def collect(
