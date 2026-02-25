@@ -18,6 +18,7 @@ from .vllm_inductor_pass import VllmInductorPass
 
 if rocm_aiter_ops.is_enabled():
     from .fusion.rocm_aiter_fusion import (
+        RocmAiterAllReduceFusionPass,
         RocmAiterRMSNormQuantFusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
@@ -122,7 +123,13 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [AsyncTPPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
-                self.passes += [AllReduceFusionPass(config)]
+                logger.info("AllReduce fusion: enabled")
+                if current_platform.is_cuda():
+                    self.passes += [AllReduceFusionPass(config)]
+                if rocm_aiter_ops.is_enabled():
+                    self.passes += [RocmAiterAllReduceFusionPass(config)]
+            else:
+                logger.info("AllReduce fusion: disabled (unfused path)")
 
             if self.pass_config.fuse_norm_quant:
                 self.passes += [RMSNormQuantFusionPass(config)]
