@@ -122,7 +122,9 @@ class PassConfig:
     fuse_gemm_comms: bool = Field(default=None)
     """Enable async TP."""
     fuse_allreduce_rms: bool = Field(default=None)
-    """Enable flashinfer allreduce fusion."""
+    """Enable allreduce + rms norm + quant fusion.
+    On CUDA: Uses flashinfer (AllReduceFusionPass).
+    On ROCm: Uses AITER ops (RocmAiterAllReduceFusionPass)."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
 
@@ -135,6 +137,12 @@ class PassConfig:
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
     Larger batch sizes e.g. during prefill will use the unfused kernels.
+    """
+
+    allreduce_rms_fusion_max_token_num: int = 512
+    """Max token count for fused allreduce on ROCm.
+    Compile ranges with end <= this value use the fused path.
+    Larger ranges fall back to unfused ops.
     """
 
     fi_allreduce_fusion_max_size_mb: float | None = None

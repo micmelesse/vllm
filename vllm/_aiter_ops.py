@@ -884,6 +884,98 @@ def _triton_rotary_embedding_fake(
     return
 
 
+def _rocm_aiter_fused_allreduce_rms_quant_impl(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant_gemm import (
+        fused_allreduce_add_rms_quant_gemm,
+    )
+
+    gemm_out, _ = fused_allreduce_add_rms_quant_gemm(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        gemm_weight=gemm_weight,
+        weight_scale=weight_scale,
+        out_dtype=out_dtype,
+        residual=None,
+    )
+    return (gemm_out,)
+
+
+def _rocm_aiter_fused_allreduce_rms_quant_fake(
+    input: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor]:
+    M = input.shape[0]
+    N = gemm_weight.shape[1]  # weight is (K, N) after transpose
+    gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+    return (gemm_out,)
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant_gemm import (
+        fused_allreduce_add_rms_quant_gemm,
+    )
+
+    gemm_out, residual_out = fused_allreduce_add_rms_quant_gemm(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        gemm_weight=gemm_weight,
+        weight_scale=weight_scale,
+        out_dtype=out_dtype,
+        residual=residual,
+    )
+    assert residual_out is not None
+    return gemm_out, residual_out
+
+
+def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    quant_dtype: torch.dtype,
+    group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M = input.shape[0]
+    N = gemm_weight.shape[1]  # weight is (K, N) after transpose
+    gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+    residual_out = torch.empty_like(input)
+    return gemm_out, residual_out
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -1237,6 +1329,20 @@ class rocm_aiter_ops:
                 op_func=_triton_rotary_embedding_impl,
                 mutates_args=["query", "key"],  # These tensors are modified in-place
                 fake_impl=_triton_rotary_embedding_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_rms_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_add_rms_quant",
+                op_func=_rocm_aiter_fused_allreduce_add_rms_quant_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_add_rms_quant_fake,
             )
 
             _OPS_REGISTERED = True
@@ -1639,6 +1745,14 @@ class rocm_aiter_ops:
             transpose_bm=transpose_bm,
             config=config,
         )
+    
+    @staticmethod
+    def get_fused_allreduce_rms_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant.default
+
+    @staticmethod
+    def get_fused_allreduce_add_rms_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant.default
 
     @staticmethod
     def group_fp8_quant(

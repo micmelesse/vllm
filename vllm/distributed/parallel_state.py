@@ -1224,6 +1224,19 @@ def get_pcp_group() -> GroupCoordinator:
     return _PCP
 
 
+def aiter_graph_capture():
+    """Notify aiter comms to skip device barriers during graph capture.
+
+    Returns nullcontext if aiter comms are not available.
+    """
+    try:
+        from aiter.ops.triton.comms import graph_capture
+        return graph_capture()
+    except ImportError:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -1240,7 +1253,9 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    with get_tp_group().graph_capture(context), \
+            get_pp_group().graph_capture(context), \
+            aiter_graph_capture():
         yield context
 
 

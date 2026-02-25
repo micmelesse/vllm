@@ -445,6 +445,67 @@ class MatcherQuantFP8(MatcherCustomOp):
         return [input]
 
 
+# ============================================================================
+# Custom Matchers for AllReduce Fusion (aiter custom ops)
+# These match the aiter custom ops that appear in the FX graph when
+# VLLM_ROCM_USE_AITER=1. These ops bypass vLLM's CustomOp system,
+# so they are not affected by custom_ops=['none'].
+# ============================================================================
+
+class MatcherRMSNormAiter:
+    """Matches torch.ops.vllm.rocm_aiter_rms_norm.default(input, weight, eps)"""
+
+    def __init__(self, epsilon: float) -> None:
+        self.epsilon = epsilon
+        self.RMSNORM_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([5, 16], device="meta", dtype=torch.bfloat16)
+        weight = torch.empty([16], device="meta", dtype=torch.bfloat16)
+        return [input, weight]
+
+    def __call__(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return self.RMSNORM_OP(input, weight, self.epsilon)
+
+
+class MatcherFusedAddRMSNormAiter:
+    """Matches torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default(x, residual, weight, eps)"""
+
+    def __init__(self, epsilon: float) -> None:
+        self.epsilon = epsilon
+        self.RMSNORM_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([5, 16], device="meta", dtype=torch.bfloat16)
+        weight = torch.empty([16], device="meta", dtype=torch.bfloat16)
+        residual = torch.empty([5, 16], device="meta", dtype=torch.bfloat16)
+        return [input, weight, residual]
+
+    def __call__(
+        self, input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.RMSNORM_ADD_OP(input, residual, weight, self.epsilon)
+
+
+class MatcherPerTensorQuantAiter:
+    """Matches torch.ops.vllm.rocm_aiter_per_tensor_quant.default(input, dtype, scale)"""
+
+    def __init__(self) -> None:
+        self.quant_dtype = current_platform.fp8_dtype()
+        self.QUANT_OP = torch.ops.vllm.rocm_aiter_per_tensor_quant.default
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = torch.empty([5, 16], device="meta", dtype=torch.bfloat16)
+        scale = torch.empty([1], device="meta", dtype=torch.float32)
+        return [input, scale]
+
+    def __call__(
+        self, input: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        result = self.QUANT_OP(input, self.quant_dtype, scale)
+        return result[0], result[1]
+
+
 class MatcherSiluAndMul(MatcherCustomOp):
     def __init__(self, enabled: bool | None = None) -> None:
         if enabled is None:
