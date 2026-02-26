@@ -459,6 +459,44 @@ def _run_fused_op_correctness_test(
             for (ar_out, rms_out, res_out, q_out, qs_out), \
                 (ar_ref_, rms_ref_, res_ref_, q_ref_, qs_ref_), \
                     check_tag in checks:
+                M, N = num_tokens, hidden_size
+
+                # Shape assertions: fused output
+                assert ar_out.shape == (M, N), (
+                    f"fused allreduce_out shape {ar_out.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert rms_out.shape == (M, N), (
+                    f"fused rms_out shape {rms_out.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert q_out.shape == (M, N), (
+                    f"fused quant_out shape {q_out.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert qs_out.shape in ((1,), (M,)), (
+                    f"fused scale_out shape {qs_out.shape}, "
+                    f"expected (1,) or ({M},) ({check_tag})"
+                )
+
+                # Shape assertions: reference output
+                assert ar_ref_.shape == (M, N), (
+                    f"ref allreduce_out shape {ar_ref_.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert rms_ref_.shape == (M, N), (
+                    f"ref rms_out shape {rms_ref_.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert q_ref_.shape == (M, N), (
+                    f"ref quant_out shape {q_ref_.shape}, "
+                    f"expected ({M}, {N}) ({check_tag})"
+                )
+                assert qs_ref_.shape == (1,), (
+                    f"ref scale_out shape {qs_ref_.shape}, "
+                    f"expected (1,) ({check_tag})"
+                )
+
                 torch.testing.assert_close(
                     ar_out, ar_ref_, atol=ATOL, rtol=RTOL,
                     msg=f"allreduce_out mismatch ({check_tag})",
@@ -469,14 +507,23 @@ def _run_fused_op_correctness_test(
                 )
                 if use_residual:
                     assert res_out is not None and res_ref_ is not None
+                    assert res_out.shape == (M, N), (
+                        f"residual_out shape {res_out.shape}, "
+                        f"expected ({M}, {N}) ({check_tag})"
+                    )
                     torch.testing.assert_close(
                         res_out, res_ref_, atol=ATOL, rtol=RTOL,
                         msg=f"residual_out mismatch ({check_tag})",
                     )
                 else:
                     assert res_out is None and res_ref_ is None
-                q_out_deq = q_out.to(torch.float32) * qs_out
-                q_ref_deq = q_ref_.to(torch.float32) * qs_ref_
+
+                # Dequantize with correct broadcasting for both
+                # per-tensor (1,) and per-row (M,) scales
+                q_out_deq = (q_out.to(torch.float32)
+                             * qs_out.unsqueeze(-1))
+                q_ref_deq = (q_ref_.to(torch.float32)
+                             * qs_ref_.unsqueeze(-1))
                 torch.testing.assert_close(
                     q_out_deq, q_ref_deq, atol=ATOL, rtol=RTOL,
                     msg=f"quant_out dequantized mismatch ({check_tag})",
