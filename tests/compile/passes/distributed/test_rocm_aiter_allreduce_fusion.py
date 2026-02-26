@@ -260,6 +260,7 @@ def _run_fused_op_correctness_test(
     hidden_size: int,
     dtype: torch.dtype,
     mode: str = "eager",
+    iterations: int = 1,
 ) -> None:
     """Worker for test_rocm_aiter_fused_op_correctness.
 
@@ -268,6 +269,8 @@ def _run_fused_op_correctness_test(
     Args:
         mode: "eager" for direct execution, "graph" for CUDA graph
             capture/replay.
+        iterations: Number of times to invoke the fused op. Values > 1 test
+            buffer reuse and barrier correctness across consecutive calls.
     """
     set_random_seed(0)
 
@@ -324,26 +327,51 @@ def _run_fused_op_correctness_test(
             checks = []
 
             if mode == "eager":
-                if use_residual:
-                    result = (
-                        torch.ops.vllm
-                        .rocm_aiter_fused_allreduce_add_rms_quant(
-                            input_base.clone(), residual_base.clone(),
-                            rms_weight, rms_eps, quant_scale, quant_dtype,
-                            group_name,
+                for i in range(iterations):
+                    # Generate fresh input each iteration to stress barriers
+                    if i > 0:
+                        input_base = torch.randn(
+                            (num_tokens, hidden_size), dtype=dtype,
+                            device=device,
                         )
-                    )
-                    ar_out, rms_out, res_out, q_out, qs_out = result
-                else:
-                    result = (
-                        torch.ops.vllm
-                        .rocm_aiter_fused_allreduce_rms_quant(
+                        if use_residual:
+                            residual_base = torch.randn(
+                                (num_tokens, hidden_size), dtype=dtype,
+                                device=device,
+                            )
+
+                    if use_residual:
+                        result = (
+                            torch.ops.vllm
+                            .rocm_aiter_fused_allreduce_add_rms_quant(
+                                input_base.clone(), residual_base.clone(),
+                                rms_weight, rms_eps, quant_scale, quant_dtype,
+                                group_name,
+                            )
+                        )
+                        ar_out, rms_out, res_out, q_out, qs_out = result
+                    else:
+                        result = (
+                            torch.ops.vllm
+                            .rocm_aiter_fused_allreduce_rms_quant(
+                                input_base.clone(), rms_weight, rms_eps,
+                                quant_scale, quant_dtype, group_name,
+                            )
+                        )
+                        ar_out, rms_out, q_out, qs_out = result
+                        res_out = None
+
+                # Recompute reference for the last iteration's input
+                if iterations > 1:
+                    (ar_ref, rms_ref, res_ref, q_ref, qs_ref) = (
+                        unfused_allreduce_add_rms_quant(
                             input_base.clone(), rms_weight, rms_eps,
                             quant_scale, quant_dtype, group_name,
+                            residual_base.clone()
+                            if residual_base is not None else None,
                         )
                     )
-                    ar_out, rms_out, q_out, qs_out = result
-                    res_out = None
+
                 checks.append(
                     ((ar_out, rms_out, res_out, q_out, qs_out),
                      (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
@@ -395,41 +423,37 @@ def _run_fused_op_correctness_test(
                             cap_ar, cap_rms, cap_q, cap_qs = cap
                             cap_res = None
 
-                    # Replay 1: same data as capture
-                    graph.replay()
-                    torch.cuda.synchronize()
-                    checks.append(
-                        ((cap_ar, cap_rms, cap_res, cap_q, cap_qs),
-                         (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
-                         tag + " (replay 1)"))
-
-                    # Replay 2: fresh data
-                    input_fresh = torch.randn(
-                        (num_tokens, hidden_size), dtype=dtype,
-                        device=device,
-                    )
-                    input_capture.copy_(input_fresh)
-                    if residual_base is not None:
-                        residual_fresh = torch.randn(
+                    # Replay iterations times with fresh data each time,
+                    # check correctness on the last replay.
+                    for i in range(iterations):
+                        input_fresh = torch.randn(
                             (num_tokens, hidden_size), dtype=dtype,
                             device=device,
                         )
-                        residual_capture.copy_(residual_fresh)
-                    else:
-                        residual_fresh = None
+                        input_capture.copy_(input_fresh)
+                        if residual_base is not None:
+                            residual_fresh = torch.randn(
+                                (num_tokens, hidden_size), dtype=dtype,
+                                device=device,
+                            )
+                            residual_capture.copy_(residual_fresh)
+                        else:
+                            residual_fresh = None
 
-                    ref2 = unfused_allreduce_add_rms_quant(
+                        graph.replay()
+                        torch.cuda.synchronize()
+
+                    # Check correctness on the last replay
+                    last_ref = unfused_allreduce_add_rms_quant(
                         input_fresh.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
                         residual_fresh.clone()
                         if residual_fresh is not None else None,
                     )
-
-                    graph.replay()
-                    torch.cuda.synchronize()
                     checks.append(
                         ((cap_ar, cap_rms, cap_res, cap_q, cap_qs),
-                         ref2, tag + " (replay 2)"))
+                         last_ref,
+                         tag + f" (replay {iterations})"))
 
             # Epilogue: compare outputs against reference
             for (ar_out, rms_out, res_out, q_out, qs_out), \
@@ -467,7 +491,7 @@ def _run_fused_op_correctness_test(
 # ============================================================================
 
 
-@multi_gpu_test(num_gpus=2)
+@multi_gpu_test(num_gpus=8)
 @pytest.mark.parametrize("model_name", [
     "amd/Llama-3.3-70B-Instruct-FP8-KV",
 ])
@@ -477,6 +501,8 @@ def _run_fused_op_correctness_test(
     (16, 4096),      # small batch, Llama 8B
     (17, 7168),      # odd token count, DeepSeek V3
     (32, 8192),      # larger batch, Llama 70B
+    (1, 8192),       # single token decode, Llama 70B hidden dim
+    (512, 8192),     # production decode batch
 ])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.skipif(
@@ -489,7 +515,7 @@ def test_rocm_aiter_allreduce_fusion_compile(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
-    num_processes: int = 2
+    num_processes: int = 8
 ):
     """Verify the fusion pass matches patterns and produces correct output.
 
@@ -511,9 +537,12 @@ def test_rocm_aiter_allreduce_fusion_compile(
     (16, 4096),      # small batch, Llama 8B
     (17, 7168),      # odd token count, DeepSeek V3
     (32, 8192),      # larger batch, Llama 70B
+    (1, 8192),       # single token decode, Llama 70B hidden dim
+    (512, 8192),     # production decode batch
 ])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("iterations", [1, 50])
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
@@ -523,6 +552,7 @@ def test_rocm_aiter_fused_op_correctness(
     hidden_size: int,
     dtype: torch.dtype,
     mode: str,
+    iterations: int,
     num_processes: int = 8
 ):
     """Compare fused torch ops against unfused individual ops.
@@ -539,6 +569,7 @@ def test_rocm_aiter_fused_op_correctness(
             hidden_size,
             dtype,
             mode,
+            iterations,
         ),
         nprocs=num_processes,
     )
