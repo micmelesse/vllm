@@ -132,15 +132,11 @@ def _make_fused_variant():
 
 # ── Data collection ──────────────────────────────────────────────────────────
 
-def benchmark_eager(fn: Callable[[], None], warmup: int, trials: int) -> float:
-    """Benchmark *fn()* in eager mode using CUDA events.
+def benchmark_eager(fn: Callable[[], None], trials: int) -> float:
+    """Time *fn()* using CUDA events, return median in milliseconds.
 
-    Returns median time in milliseconds (robust to outliers).
+    Caller is responsible for warmup before calling this function.
     """
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     times = []
@@ -170,9 +166,31 @@ def collect(
     world_size: int,
     profile_dir: Optional[str] = None,
 ) -> BenchResults:
-    """Run all variants across all token counts and return raw data."""
+    """Run all variants across all token counts and return raw data.
+
+    When profiling is enabled, warmup runs outside the profiler so that
+    JIT compilation and first-call overhead don't inflate the averages
+    reported by key_averages().
+    """
     rank = device.index or 0
 
+    # Build all run functions upfront so we can reuse them across phases.
+    all_run_fns: dict[int, dict[str, Callable]] = {}
+    for num_tokens in token_counts:
+        all_run_fns[num_tokens] = {}
+        for variant in variants:
+            all_run_fns[num_tokens][variant.name] = variant.make_fn(
+                num_tokens, hidden_dim, dtype, device, group_name,
+            )
+
+    # Warmup phase (always outside profiler).
+    for num_tokens in token_counts:
+        for run_fn in all_run_fns[num_tokens].values():
+            for _ in range(warmup):
+                run_fn()
+            torch.cuda.synchronize()
+
+    # Start profiler after warmup so traces only contain steady-state calls.
     profiler: torch.profiler.profile | None = None
     if profile_dir is not None:
         os.makedirs(profile_dir, exist_ok=True)
@@ -189,14 +207,13 @@ def collect(
             logger.info("Profiler enabled, traces will be saved to %s",
                         profile_dir)
 
+    # Timed trials.
     all_timings: dict[int, dict[str, float]] = {}
     for num_tokens in token_counts:
         timings: dict[str, float] = {}
         for variant in variants:
-            run_fn = variant.make_fn(
-                num_tokens, hidden_dim, dtype, device, group_name,
-            )
-            timings[variant.name] = benchmark_eager(run_fn, warmup, trials)
+            run_fn = all_run_fns[num_tokens][variant.name]
+            timings[variant.name] = benchmark_eager(run_fn, trials)
         all_timings[num_tokens] = timings
 
     if profiler is not None:
