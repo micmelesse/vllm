@@ -201,6 +201,10 @@ def collect(
 
     if profiler is not None:
         profiler.stop()
+        if rank == 0:
+            print(profiler.key_averages().table(
+                sort_by="self_cuda_time_total", row_limit=30,
+            ))
         trace_path = os.path.join(profile_dir, f"trace_rank{rank}.json")
         profiler.export_chrome_trace(trace_path)
         if rank == 0:
