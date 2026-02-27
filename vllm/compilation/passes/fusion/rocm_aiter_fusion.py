@@ -533,17 +533,13 @@ class RocmAiterAllReduceRMSNormQuantPattern:
         self,
         epsilon: float,
         quant_key: QuantKey,
-        match_aiter: bool = False,
+        enabled: bool | None = None,
     ) -> None:
         self.epsilon = epsilon
         self.quant_dtype = quant_key.dtype
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherRMSNorm(
-            epsilon, match_rocm_aiter=match_aiter
-        )
-        self.quant_matcher = MatcherQuantFP8(
-            quant_key, match_rocm_aiter=match_aiter
-        )
+        self.rmsnorm_matcher = MatcherRMSNorm(epsilon, enabled=enabled)
+        self.quant_matcher = MatcherQuantFP8(quant_key, enabled=enabled)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -627,17 +623,13 @@ class RocmAiterAllReduceAddRMSNormQuantPattern:
         self,
         epsilon: float,
         quant_key: QuantKey,
-        match_aiter: bool = False,
+        enabled: bool | None = None,
     ) -> None:
         self.epsilon = epsilon
         self.quant_dtype = quant_key.dtype
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(
-            epsilon, match_rocm_aiter=match_aiter
-        )
-        self.quant_matcher = MatcherQuantFP8(
-            quant_key, match_rocm_aiter=match_aiter
-        )
+        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon, enabled=enabled)
+        self.quant_matcher = MatcherQuantFP8(quant_key, enabled=enabled)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -758,21 +750,27 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
 
         quant_key = kFp8StaticTensorSym
 
-        for epsilon in [1e-5, 1e-6]:
-            # Pattern 1: No residual (first layer)
-            RocmAiterAllReduceRMSNormQuantPattern(
-                epsilon,
-                quant_key,
-            ).register(self.patterns)
+        # Register patterns for both enabled (custom ops) and disabled
+        # (decomposed native aten ops) forms. The graph content depends
+        # on custom_ops config at compile time, not VLLM_ROCM_USE_AITER.
+        for enabled in [True, False]:
+            for epsilon in [1e-5, 1e-6]:
+                # Pattern 1: No residual (first layer)
+                RocmAiterAllReduceRMSNormQuantPattern(
+                    epsilon,
+                    quant_key,
+                    enabled=enabled,
+                ).register(self.patterns)
 
-            # Pattern 2: With residual (layers after first)
-            RocmAiterAllReduceAddRMSNormQuantPattern(
-                epsilon,
-                quant_key,
-            ).register(self.patterns)
+                # Pattern 2: With residual (layers after first)
+                RocmAiterAllReduceAddRMSNormQuantPattern(
+                    epsilon,
+                    quant_key,
+                    enabled=enabled,
+                ).register(self.patterns)
 
-            # Clear pattern cache to allow multiple epsilon values
-            torch._inductor.pattern_matcher._seen_patterns.clear()
+                # Clear pattern cache to allow multiple epsilon/enabled combos
+                torch._inductor.pattern_matcher._seen_patterns.clear()
 
         self.disabled = False
 
