@@ -149,6 +149,22 @@ class AllReduceFusionModel(torch.nn.Module):
             ]
 
 
+def _get_batch_sizes(num_tokens: int) -> list[int]:
+    """Return the graph capture schedule for a given num_tokens.
+
+    Mirrors the production schedule from vllm/config/vllm.py
+    (VLLM_CUDAGRAPH_BATCH_SIZES), filtered to sizes <= num_tokens.
+    If num_tokens itself is not in the schedule, it is appended.
+    """
+    schedule = (
+        [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
+    )
+    batch_sizes = [s for s in schedule if s <= num_tokens]
+    if not batch_sizes or batch_sizes[-1] != num_tokens:
+        batch_sizes.append(num_tokens)
+    return batch_sizes
+
+
 # ============================================================================
 # Worker functions
 # ============================================================================
@@ -256,21 +272,23 @@ def _run_fusion_compile_test(
 def _run_fused_op_correctness_test(
     local_rank: int,
     world_size: int,
-    num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
-    mode: str = "eager",
-    iterations: int = 1,
+    mode: str,
+    batch_sizes: list[int],
 ) -> None:
     """Worker for test_rocm_aiter_fused_op_correctness.
 
-    Compares the registered torch ops against unfused individual ops.
+    Exercises the fused op across the production batch size schedule,
+    matching how vLLM actually uses these ops at runtime.
 
     Args:
-        mode: "eager" for direct execution, "graph" for CUDA graph
-            capture/replay.
-        iterations: Number of times to invoke the fused op. Values > 1 test
-            buffer reuse and barrier correctness across consecutive calls.
+        mode: "eager" runs the fused op at each batch size sequentially,
+            matching the warmup phase. "graph" does an eager warmup at
+            max batch size, then captures one CUDA graph per batch size
+            in sequence, then replays and verifies each -- matching the
+            production CUDA graph capture loop.
+        batch_sizes: List of batch sizes (token counts) to test.
     """
     set_random_seed(0)
 
@@ -303,50 +321,25 @@ def _run_fused_op_correctness_test(
             ATOL, RTOL = (1e-2, 1e-2)
 
         for use_residual in [False, True]:
-            input_base = torch.randn(
-                (num_tokens, hidden_size), dtype=dtype, device=device
-            )
-            residual_base = (
-                torch.randn((num_tokens, hidden_size), dtype=dtype,
-                            device=device)
-                if use_residual else None
-            )
-
-            # Run reference: individual unfused ops
-            (ar_ref, rms_ref, res_ref, q_ref, qs_ref) = (
-                unfused_allreduce_add_rms_quant(
-                    input_base.clone(), rms_weight, rms_eps, quant_scale,
-                    quant_dtype, group_name,
-                    residual_base.clone() if residual_base is not None
-                    else None,
-                )
-            )
-
-            tag = f"residual={use_residual}, mode={mode}"
-
             checks = []
 
             if mode == "eager":
-                for i in range(iterations):
-                    # Generate fresh input each iteration to stress barriers
-                    if i > 0:
-                        input_base = torch.randn(
-                            (num_tokens, hidden_size), dtype=dtype,
-                            device=device,
-                        )
-                        if use_residual:
-                            residual_base = torch.randn(
-                                (num_tokens, hidden_size), dtype=dtype,
-                                device=device,
-                            )
+                for M in batch_sizes:
+                    input_data = torch.randn(
+                        (M, hidden_size), dtype=dtype, device=device)
+                    residual_data = (
+                        torch.randn((M, hidden_size), dtype=dtype,
+                                    device=device)
+                        if use_residual else None
+                    )
 
                     if use_residual:
                         result = (
                             torch.ops.vllm
                             .rocm_aiter_fused_allreduce_add_rms_quant(
-                                input_base.clone(), residual_base.clone(),
-                                rms_weight, rms_eps, quant_scale, quant_dtype,
-                                group_name,
+                                input_data.clone(), residual_data.clone(),
+                                rms_weight, rms_eps, quant_scale,
+                                quant_dtype, group_name,
                             )
                         )
                         ar_out, rms_out, res_out, q_out, qs_out = result
@@ -354,114 +347,129 @@ def _run_fused_op_correctness_test(
                         result = (
                             torch.ops.vllm
                             .rocm_aiter_fused_allreduce_rms_quant(
-                                input_base.clone(), rms_weight, rms_eps,
+                                input_data.clone(), rms_weight, rms_eps,
                                 quant_scale, quant_dtype, group_name,
                             )
                         )
                         ar_out, rms_out, q_out, qs_out = result
                         res_out = None
 
-                # Recompute reference for the last iteration's input
-                if iterations > 1:
-                    (ar_ref, rms_ref, res_ref, q_ref, qs_ref) = (
-                        unfused_allreduce_add_rms_quant(
-                            input_base.clone(), rms_weight, rms_eps,
-                            quant_scale, quant_dtype, group_name,
-                            residual_base.clone()
-                            if residual_base is not None else None,
-                        )
+                    ref = unfused_allreduce_add_rms_quant(
+                        input_data.clone(), rms_weight, rms_eps,
+                        quant_scale, quant_dtype, group_name,
+                        residual_data.clone()
+                        if residual_data is not None else None,
                     )
-
-                checks.append(
-                    ((ar_out, rms_out, res_out, q_out, qs_out),
-                     (ar_ref, rms_ref, res_ref, q_ref, qs_ref),
-                     tag))
+                    tag = f"M={M}, residual={use_residual}, mode=eager"
+                    checks.append((
+                        (ar_out, rms_out, res_out, q_out, qs_out),
+                        ref, tag
+                    ))
 
             elif mode == "graph":
-                # Warmup pass (eager)
+                max_M = max(batch_sizes)
+
+                # Warmup at max batch size (eager), matching production
+                warmup_input = torch.randn(
+                    (max_M, hidden_size), dtype=dtype, device=device)
+                warmup_residual = (
+                    torch.randn((max_M, hidden_size), dtype=dtype,
+                                device=device)
+                    if use_residual else None
+                )
                 if use_residual:
-                    torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant(
-                        input_base.clone(), residual_base.clone(),
-                        rms_weight, rms_eps, quant_scale, quant_dtype,
-                        group_name,
-                    )
+                    torch.ops.vllm \
+                        .rocm_aiter_fused_allreduce_add_rms_quant(
+                            warmup_input, warmup_residual,
+                            rms_weight, rms_eps, quant_scale,
+                            quant_dtype, group_name,
+                        )
                 else:
                     torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant(
-                        input_base.clone(), rms_weight, rms_eps,
+                        warmup_input, rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
                     )
                 torch.cuda.synchronize()
 
-                # Capture
-                input_capture = input_base.clone()
-                residual_capture = (
-                    residual_base.clone() if residual_base is not None
-                    else None
-                )
+                # Sequential graph capture at each batch size
+                captured = []
 
                 with vllm_graph_capture(device=device) as ctx:
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=ctx.stream):
-                        if use_residual:
-                            cap = (
-                                torch.ops.vllm
-                                .rocm_aiter_fused_allreduce_add_rms_quant(
-                                    input_capture, residual_capture,
-                                    rms_weight, rms_eps, quant_scale,
-                                    quant_dtype, group_name,
-                                )
-                            )
-                            cap_ar, cap_rms, cap_res, cap_q, cap_qs = cap
-                        else:
-                            cap = (
-                                torch.ops.vllm
-                                .rocm_aiter_fused_allreduce_rms_quant(
-                                    input_capture, rms_weight, rms_eps,
-                                    quant_scale, quant_dtype, group_name,
-                                )
-                            )
-                            cap_ar, cap_rms, cap_q, cap_qs = cap
-                            cap_res = None
-
-                    # Replay iterations times with fresh data each time,
-                    # check correctness on the last replay.
-                    for i in range(iterations):
-                        input_fresh = torch.randn(
-                            (num_tokens, hidden_size), dtype=dtype,
-                            device=device,
+                    for M in batch_sizes:
+                        input_capture = torch.randn(
+                            (M, hidden_size), dtype=dtype, device=device)
+                        residual_capture = (
+                            torch.randn((M, hidden_size), dtype=dtype,
+                                        device=device)
+                            if use_residual else None
                         )
-                        input_capture.copy_(input_fresh)
-                        if residual_base is not None:
-                            residual_fresh = torch.randn(
-                                (num_tokens, hidden_size), dtype=dtype,
-                                device=device,
-                            )
-                            residual_capture.copy_(residual_fresh)
-                        else:
-                            residual_fresh = None
 
-                        graph.replay()
-                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, stream=ctx.stream):
+                            if use_residual:
+                                cap = (
+                                    torch.ops.vllm
+                                    .rocm_aiter_fused_allreduce_add_rms_quant(
+                                        input_capture, residual_capture,
+                                        rms_weight, rms_eps, quant_scale,
+                                        quant_dtype, group_name,
+                                    )
+                                )
+                                cap_ar, cap_rms, cap_res, cap_q, cap_qs = cap
+                            else:
+                                cap = (
+                                    torch.ops.vllm
+                                    .rocm_aiter_fused_allreduce_rms_quant(
+                                        input_capture, rms_weight, rms_eps,
+                                        quant_scale, quant_dtype, group_name,
+                                    )
+                                )
+                                cap_ar, cap_rms, cap_q, cap_qs = cap
+                                cap_res = None
 
-                    # Check correctness on the last replay
-                    last_ref = unfused_allreduce_add_rms_quant(
+                        captured.append((
+                            graph, input_capture, residual_capture,
+                            (cap_ar, cap_rms, cap_res, cap_q, cap_qs), M
+                        ))
+
+                # Replay and verify each captured graph
+                for idx, (graph, input_t, residual_t, outputs, M) in \
+                        enumerate(captured):
+                    cap_ar, cap_rms, cap_res, cap_q, cap_qs = outputs
+
+                    input_fresh = torch.randn(
+                        (M, hidden_size), dtype=dtype, device=device)
+                    input_t.copy_(input_fresh)
+                    if use_residual:
+                        residual_fresh = torch.randn(
+                            (M, hidden_size), dtype=dtype, device=device)
+                        residual_t.copy_(residual_fresh)
+                    else:
+                        residual_fresh = None
+
+                    graph.replay()
+                    torch.cuda.synchronize()
+
+                    ref = unfused_allreduce_add_rms_quant(
                         input_fresh.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
                         residual_fresh.clone()
                         if residual_fresh is not None else None,
                     )
-                    checks.append(
-                        ((cap_ar, cap_rms, cap_res, cap_q, cap_qs),
-                         last_ref,
-                         tag + f" (replay {iterations})"))
+                    tag = (f"graph {idx + 1}/{len(captured)}, "
+                           f"M={M}, residual={use_residual}")
+                    checks.append((
+                        (cap_ar, cap_rms, cap_res, cap_q, cap_qs),
+                        ref, tag
+                    ))
 
             # Epilogue: compare outputs against reference
             for (ar_out, rms_out, res_out, q_out, qs_out), \
                 (ar_ref_, rms_ref_, res_ref_, q_ref_, qs_ref_), \
                     check_tag in checks:
-                M, N = num_tokens, hidden_size
+                M, N = ar_ref_.shape
 
-                # Shape assertions: fused output
+                # Shape assertions
                 assert ar_out.shape == (M, N), (
                     f"fused allreduce_out shape {ar_out.shape}, "
                     f"expected ({M}, {N}) ({check_tag})"
@@ -479,7 +487,6 @@ def _run_fused_op_correctness_test(
                     f"expected (1,) or ({M},) ({check_tag})"
                 )
 
-                # Shape assertions: reference output
                 assert ar_ref_.shape == (M, N), (
                     f"ref allreduce_out shape {ar_ref_.shape}, "
                     f"expected ({M}, {N}) ({check_tag})"
@@ -579,44 +586,44 @@ def test_rocm_aiter_allreduce_fusion_compile(
 
 
 @multi_gpu_test(num_gpus=8)
-@pytest.mark.parametrize("num_tokens,hidden_size", [
-    (1, 2048),       # single token, Llama 1B
-    (16, 4096),      # small batch, Llama 8B
-    (17, 7168),      # odd token count, DeepSeek V3
-    (32, 8192),      # larger batch, Llama 70B
-    (1, 8192),       # single token decode, Llama 70B hidden dim
-    (512, 8192),     # production decode batch
-])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.timeout(120)
 @pytest.mark.parametrize("mode", ["eager", "graph"])
-@pytest.mark.parametrize("iterations", [1, 50])
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 7168, 8192, 16384])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 32, 128, 512, 576])
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip),
     reason="ROCm AITER fusion pass only runs on ROCm (HIP)",
 )
 def test_rocm_aiter_fused_op_correctness(
-    num_tokens: int,
+    mode: str,
     hidden_size: int,
     dtype: torch.dtype,
-    mode: str,
-    iterations: int,
-    num_processes: int = 8
+    num_tokens: int,
+    num_processes: int = 8,
 ):
     """Compare fused torch ops against unfused individual ops.
 
-    Tests both rocm_aiter_fused_allreduce_rms_quant (no residual) and
-    rocm_aiter_fused_allreduce_add_rms_quant (with residual) in eager
-    and CUDA graph modes.
+    Exercises the fused op across the CUDA graph capture schedule that
+    vLLM would generate for the given num_tokens, matching real usage.
+    Both residual and non-residual variants are tested within each
+    invocation.
+
+    In eager mode, the op is called at each batch size sequentially.
+    In graph mode, an eager warmup runs at the max batch size, then
+    one CUDA graph is captured per batch size in sequence, and each
+    graph is replayed and verified.
     """
+    batch_sizes = _get_batch_sizes(num_tokens)
+
     torch.multiprocessing.spawn(
         _run_fused_op_correctness_test,
         args=(
             num_processes,
-            num_tokens,
             hidden_size,
             dtype,
             mode,
-            iterations,
+            batch_sizes,
         ),
         nprocs=num_processes,
     )
