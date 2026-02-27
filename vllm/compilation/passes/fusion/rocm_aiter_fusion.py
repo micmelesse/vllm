@@ -29,8 +29,11 @@ from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .act_quant_fusion import ActivationQuantPattern
 from .matcher_utils import (
     MatcherFusedAddRMSNorm,
+    MatcherFusedAddRMSNormAiter,
+    MatcherPerTensorQuantAiter,
     MatcherQuantFP8,
     MatcherRMSNorm,
+    MatcherRMSNormAiter,
     MatcherSiluAndMul,
 )
 from .rms_quant_fusion import (
@@ -515,31 +518,27 @@ class RocmAiterTritonAddRMSNormPadFusionPass(VllmPatternMatcherPass):
 # =============================================================================
 # This is the ROCm equivalent of AllReduceFusionPass which uses flashinfer on CUDA.
 # It matches the allreduce -> rmsnorm -> quant pattern in the FX graph and
-# replaces it with a fused kernel. Uses the upstream MatcherRMSNorm/MatcherQuantFP8
-# which handle both custom-op-enabled and decomposed (native) forms.
+# replaces it with a fused kernel. Matches aiter custom ops directly
+# (rocm_aiter_rms_norm, rocm_aiter_per_tensor_quant) which bypass vLLM's
+# CustomOp decomposition and appear as opaque nodes in the graph.
 
 class RocmAiterAllReduceRMSNormQuantPattern:
     """
-    Pattern: all_reduce -> rmsnorm -> static_fp8_quant
+    Pattern: all_reduce -> rocm_aiter_rms_norm -> rocm_aiter_per_tensor_quant
 
     Applies to the first Transformer block where there's no residual.
-    Uses upstream matchers that handle both enabled custom ops and
-    decomposed native ops (when custom_ops=['none']).
+    Matches the aiter custom ops that appear in the graph when
+    VLLM_ROCM_USE_AITER=1. These ops bypass vLLM's CustomOp decomposition.
     """
 
     FUSED_OP = rocm_aiter_ops.get_fused_allreduce_rms_quant_op()
 
-    def __init__(
-        self,
-        epsilon: float,
-        quant_key: QuantKey,
-        enabled: bool | None = None,
-    ) -> None:
+    def __init__(self, epsilon: float) -> None:
         self.epsilon = epsilon
-        self.quant_dtype = quant_key.dtype
+        self.quant_dtype = current_platform.fp8_dtype()
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherRMSNorm(epsilon, enabled=enabled)
-        self.quant_matcher = MatcherQuantFP8(quant_key, enabled=enabled)
+        self.rmsnorm_matcher = MatcherRMSNormAiter(epsilon)
+        self.quant_matcher = MatcherPerTensorQuantAiter()
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -610,26 +609,21 @@ class RocmAiterAllReduceRMSNormQuantPattern:
 
 class RocmAiterAllReduceAddRMSNormQuantPattern:
     """
-    Pattern: all_reduce -> fused_add_rmsnorm -> static_fp8_quant
+    Pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add -> rocm_aiter_per_tensor_quant
 
     Applies to layers after the first where there's a residual connection.
-    Uses upstream matchers that handle both enabled custom ops and
-    decomposed native ops (when custom_ops=['none']).
+    Matches the aiter custom ops that appear in the graph when
+    VLLM_ROCM_USE_AITER=1. These ops bypass vLLM's CustomOp decomposition.
     """
 
     FUSED_OP = rocm_aiter_ops.get_fused_allreduce_add_rms_quant_op()
 
-    def __init__(
-        self,
-        epsilon: float,
-        quant_key: QuantKey,
-        enabled: bool | None = None,
-    ) -> None:
+    def __init__(self, epsilon: float) -> None:
         self.epsilon = epsilon
-        self.quant_dtype = quant_key.dtype
+        self.quant_dtype = current_platform.fp8_dtype()
         self.tp = get_tp_group()
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon, enabled=enabled)
-        self.quant_matcher = MatcherQuantFP8(quant_key, enabled=enabled)
+        self.rmsnorm_matcher = MatcherFusedAddRMSNormAiter(epsilon)
+        self.quant_matcher = MatcherPerTensorQuantAiter()
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -744,33 +738,19 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def register_patterns(self) -> None:
         """Register all pattern variants."""
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            kFp8StaticTensorSym,
-        )
+        for epsilon in [1e-5, 1e-6]:
+            # Pattern 1: No residual (first layer)
+            RocmAiterAllReduceRMSNormQuantPattern(
+                epsilon,
+            ).register(self.patterns)
 
-        quant_key = kFp8StaticTensorSym
+            # Pattern 2: With residual (layers after first)
+            RocmAiterAllReduceAddRMSNormQuantPattern(
+                epsilon,
+            ).register(self.patterns)
 
-        # Register patterns for both enabled (custom ops) and disabled
-        # (decomposed native aten ops) forms. The graph content depends
-        # on custom_ops config at compile time, not VLLM_ROCM_USE_AITER.
-        for enabled in [True, False]:
-            for epsilon in [1e-5, 1e-6]:
-                # Pattern 1: No residual (first layer)
-                RocmAiterAllReduceRMSNormQuantPattern(
-                    epsilon,
-                    quant_key,
-                    enabled=enabled,
-                ).register(self.patterns)
-
-                # Pattern 2: With residual (layers after first)
-                RocmAiterAllReduceAddRMSNormQuantPattern(
-                    epsilon,
-                    quant_key,
-                    enabled=enabled,
-                ).register(self.patterns)
-
-                # Clear pattern cache to allow multiple epsilon/enabled combos
-                torch._inductor.pattern_matcher._seen_patterns.clear()
+            # Clear pattern cache to allow multiple epsilon values
+            torch._inductor.pattern_matcher._seen_patterns.clear()
 
         self.disabled = False
 
