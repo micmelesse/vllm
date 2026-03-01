@@ -888,43 +888,44 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor]:
     from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
-        fused_allreduce_add_rms_quant,
+        fused_allreduce_add_rms_quant_gemm,
     )
 
-    allreduce_out, rms_out, _, quant_out, quant_scale_out = (
-        fused_allreduce_add_rms_quant(
-            input=input,
-            rms_weight=rms_weight,
-            rms_eps=rms_eps,
-            quant_scale=quant_scale,
-            quant_dtype=quant_dtype,
-            group_name=group_name,
-            residual=None,
-        )
+    gemm_out, _ = fused_allreduce_add_rms_quant_gemm(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        gemm_weight=gemm_weight,
+        weight_scale=weight_scale,
+        out_dtype=out_dtype,
+        residual=None,
     )
-    return allreduce_out, rms_out, quant_out, quant_scale_out
+    return (gemm_out,)
 
 
 def _rocm_aiter_fused_allreduce_rms_quant_fake(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    allreduce_out = torch.empty_like(input)
-    rms_out = torch.empty_like(input)
-    quant_out = torch.empty_like(input, dtype=quant_dtype)
-    quant_scale_out = torch.empty(
-        1, device=input.device, dtype=torch.float32
-    )
-    return allreduce_out, rms_out, quant_out, quant_scale_out
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor]:
+    M = input.shape[0]
+    N = gemm_weight.shape[0]
+    gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+    return (gemm_out,)
 
 
 def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
@@ -932,29 +933,29 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     residual: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
-        fused_allreduce_add_rms_quant,
+        fused_allreduce_add_rms_quant_gemm,
     )
 
-    allreduce_out, rms_out, residual_out, quant_out, quant_scale_out = (
-        fused_allreduce_add_rms_quant(
-            input=input,
-            rms_weight=rms_weight,
-            rms_eps=rms_eps,
-            quant_scale=quant_scale,
-            quant_dtype=quant_dtype,
-            group_name=group_name,
-            residual=residual,
-        )
+    gemm_out, residual_out = fused_allreduce_add_rms_quant_gemm(
+        input=input,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        quant_dtype=quant_dtype,
+        group_name=group_name,
+        gemm_weight=gemm_weight,
+        weight_scale=weight_scale,
+        out_dtype=out_dtype,
+        residual=residual,
     )
     assert residual_out is not None
-    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+    return gemm_out, residual_out
 
 
 def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
@@ -962,20 +963,17 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
     residual: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    allreduce_out = torch.empty_like(input)
-    rms_out = torch.empty_like(input)
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M = input.shape[0]
+    N = gemm_weight.shape[0]
+    gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
     residual_out = torch.empty_like(input)
-    quant_out = torch.empty_like(input, dtype=quant_dtype)
-    quant_scale_out = torch.empty(
-        1, device=input.device, dtype=torch.float32
-    )
-    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+    return gemm_out, residual_out
 
 
 # Global flag to ensure ops are registered only once

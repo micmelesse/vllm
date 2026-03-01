@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Benchmark: fused allreduce+rmsnorm+quant vs unfused baseline.
+Benchmark: fused allreduce+rmsnorm+quant+gemm vs unfused baseline.
 
-Compares unfused baseline (3 separate kernel launches) against the fused
+Compares unfused baseline (4 separate kernel launches) against the fused
 torch op (rocm_aiter_fused_allreduce_add_rms_quant), with residual and
-FP8 per-tensor quant.
+FP8 per-tensor quant + scaled_mm GEMM.
 
 Eager mode only (no CUDA graph capture) to avoid ROCm
 hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
@@ -33,14 +33,16 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
+from vllm.unfused_allreduce_add_rms_quant import (
+    unfused_allreduce_add_rms_quant_gemm,
+)
 
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
-# ── Benchmark variant ───────────────────────────────────────────────────────
+# -- Benchmark variant ---------------------------------------------------
 
 @dataclass
 class BenchVariant:
@@ -87,13 +89,20 @@ def _make_unfused_variant():
         residual = torch.randn_like(input_tensor)
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
         scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+        gemm_weight = torch.rand(
+            hidden_dim, hidden_dim, dtype=FP8_DTYPE, device=device,
+        ).contiguous().t()
+        weight_scale = torch.tensor(
+            1.0, dtype=torch.float32, device=device,
+        ).unsqueeze(0)
 
         def run():
             inp = input_tensor.clone()
             res = residual.clone()
-            unfused_allreduce_add_rms_quant(
+            unfused_allreduce_add_rms_quant_gemm(
                 inp, rms_weight, 1e-6, scale, FP8_DTYPE,
-                group_name, residual=res,
+                group_name, gemm_weight, weight_scale, dtype,
+                residual=res,
             )
 
         return run
@@ -116,13 +125,20 @@ def _make_fused_variant():
         )
         residual = torch.randn_like(input_tensor)
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
-        scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+        gemm_weight = torch.rand(
+            hidden_dim, hidden_dim, dtype=FP8_DTYPE, device=device,
+        ).contiguous().t()
+        weight_scale = torch.tensor(
+            1.0, dtype=torch.float32, device=device,
+        ).unsqueeze(0)
 
         def run():
             inp = input_tensor.clone()
             res = residual.clone()
             torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant(
-                inp, res, rms_weight, 1e-6, scale, FP8_DTYPE, group_name,
+                inp, res, rms_weight, 1e-6,
+                FP8_DTYPE, group_name,
+                gemm_weight, weight_scale, dtype,
             )
 
         return run
@@ -130,7 +146,7 @@ def _make_fused_variant():
     return make_fn
 
 
-# ── Data collection ──────────────────────────────────────────────────────────
+# -- Data collection ------------------------------------------------------
 
 def benchmark_eager(fn: Callable[[], None], trials: int) -> float:
     """Time *fn()* using CUDA events, return median in milliseconds.
@@ -240,7 +256,7 @@ def collect(
     )
 
 
-# ── Presentation ─────────────────────────────────────────────────────────────
+# -- Presentation ---------------------------------------------------------
 
 def _speedup(baseline_ms: Optional[float], ms: float) -> Optional[float]:
     if baseline_ms is None or ms <= 0:
@@ -327,11 +343,11 @@ def save_markdown(results: BenchResults, path: str) -> None:
     logger.info("Results saved to %s", path)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark fused allreduce+rmsnorm+quant vs unfused"
+        description="Benchmark fused allreduce+rmsnorm+quant+gemm vs unfused"
     )
     parser.add_argument(
         "--num-tokens",
@@ -371,7 +387,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── Distributed setup ────────────────────────────────────────────────
+    # -- Distributed setup ------------------------------------------------
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         raise RuntimeError(
             "Must run with torchrun. "
@@ -397,7 +413,7 @@ def main():
 
     group_name = get_tp_group().unique_name
 
-    # ── Build variants ───────────────────────────────────────────────────
+    # -- Build variants ---------------------------------------------------
     all_variants = [
         BenchVariant(name="unfused", make_fn=_make_unfused_variant(), is_baseline=True),
         BenchVariant(name="fused", make_fn=_make_fused_variant()),
@@ -407,7 +423,7 @@ def main():
     else:
         variants = [v for v in all_variants if v.name == args.variant]
 
-    # ── Collect data ─────────────────────────────────────────────────────
+    # -- Collect data -----------------------------------------------------
     results = collect(
         variants=variants,
         token_counts=args.num_tokens,
@@ -421,7 +437,7 @@ def main():
         profile_dir=args.profile,
     )
 
-    # ── Present results (rank 0) ─────────────────────────────────────────
+    # -- Present results (rank 0) -----------------------------------------
     if rank == 0:
         print_results(results)
         if args.output_file:

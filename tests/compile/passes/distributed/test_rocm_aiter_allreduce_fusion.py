@@ -5,6 +5,7 @@ Tests for RocmAiterAllReduceFusionPass.
 
 Verifies that the fusion pass correctly replaces:
     all_reduce -> rocm_aiter_rms_norm -> rocm_aiter_per_tensor_quant
+        -> rocm_per_tensor_float_w8a8_scaled_mm_impl
 with the fused op, and that the fused output matches the unfused output.
 """
 
@@ -40,18 +41,23 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.platforms import current_platform
-from vllm.unfused_allreduce_add_rms_quant import unfused_allreduce_add_rms_quant
+from vllm.unfused_allreduce_add_rms_quant import (
+    unfused_allreduce_add_rms_quant_gemm,
+)
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
 
 class AllReduceFusionModel(torch.nn.Module):
-    """Model with all_reduce -> RMSNorm -> per_tensor_quant blocks.
+    """Model with all_reduce -> RMSNorm -> per_tensor_quant -> scaled_mm.
 
     Mimics a transformer with 4 blocks. Block 1 always uses plain rms_norm
     (no residual). With use_residual=True, blocks 2-4 use
     fused_add_rms_norm with a residual connection, matching real transformer
     layers after the first.
+
+    The pattern now extends through the scaled_mm GEMM, matching the
+    fused op boundary.
 
     Args:
         use_residual: If True, blocks 2-4 use rocm_aiter_rmsnorm2d_fwd_with_add.
@@ -64,14 +70,24 @@ class AllReduceFusionModel(torch.nn.Module):
         self.hidden_size = hidden_size
         self.eps = eps
         self.use_residual = use_residual
-        self.w = [torch.rand(hidden_size, hidden_size) for _ in range(4)]
+        self.quant_dtype = current_platform.fp8_dtype()
+        self.out_dtype = torch.float16
+
+        # FP8 GEMM weights (N, K) transposed and per-tensor weight scales
+        self.gemm_weight = [
+            torch.rand(hidden_size, hidden_size,
+                       dtype=self.quant_dtype).contiguous().t()
+            for _ in range(4)
+        ]
+        self.weight_scale = [
+            torch.rand(1, dtype=torch.float32) for _ in range(4)
+        ]
         self.rms_weight = [
             torch.rand(hidden_size, dtype=torch.float16) for _ in range(4)
         ]
         self.scale = [
             torch.rand(1, dtype=torch.float32) for _ in range(4)
         ]
-        self.quant_dtype = current_platform.fp8_dtype()
 
     def _block_no_residual(
         self, x: torch.Tensor, idx: int,
@@ -81,7 +97,11 @@ class AllReduceFusionModel(torch.nn.Module):
             ar, self.rms_weight[idx], self.eps)
         q, s = torch.ops.vllm.rocm_aiter_per_tensor_quant(
             rms, self.quant_dtype, self.scale[idx])
-        return q, None
+        gemm = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+            q, self.gemm_weight[idx], self.out_dtype,
+            s, self.weight_scale[idx], None,
+        )
+        return gemm, None
 
     def _block_residual(
         self, x: torch.Tensor, resid: torch.Tensor, idx: int,
@@ -91,7 +111,11 @@ class AllReduceFusionModel(torch.nn.Module):
             ar, resid, self.rms_weight[idx], self.eps)
         q, s = torch.ops.vllm.rocm_aiter_per_tensor_quant(
             rms, self.quant_dtype, self.scale[idx])
-        return q, resid
+        gemm = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+            q, self.gemm_weight[idx], self.out_dtype,
+            s, self.weight_scale[idx], None,
+        )
+        return gemm, resid
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = torch.relu(x)
@@ -102,27 +126,25 @@ class AllReduceFusionModel(torch.nn.Module):
             resid = ar1
             rms1 = torch.ops.vllm.rocm_aiter_rms_norm(
                 ar1, self.rms_weight[0], self.eps)
-            q1, _ = torch.ops.vllm.rocm_aiter_per_tensor_quant(
+            q1, s1 = torch.ops.vllm.rocm_aiter_per_tensor_quant(
                 rms1, self.quant_dtype, self.scale[0])
-            z2 = torch.mm(q1.to(x.dtype), self.w[0])
+            z2 = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+                q1, self.gemm_weight[0], self.out_dtype,
+                s1, self.weight_scale[0], None,
+            )
 
             # Blocks 2-4: fused_add_rms_norm with residual
-            q2, resid = self._block_residual(z2, resid, 1)
-            z3 = torch.mm(q2.to(x.dtype), self.w[1])
-            q3, resid = self._block_residual(z3, resid, 2)
-            z4 = torch.mm(q3.to(x.dtype), self.w[2])
-            q4, resid = self._block_residual(z4, resid, 3)
+            z3, resid = self._block_residual(z2, resid, 1)
+            z4, resid = self._block_residual(z3, resid, 2)
+            z5, resid = self._block_residual(z4, resid, 3)
         else:
-            # All blocks: all_reduce -> rms_norm -> quant -> mm
-            q1, _ = self._block_no_residual(z, 0)
-            z2 = torch.mm(q1.to(x.dtype), self.w[0])
-            q2, _ = self._block_no_residual(z2, 1)
-            z3 = torch.mm(q2.to(x.dtype), self.w[1])
-            q3, _ = self._block_no_residual(z3, 2)
-            z4 = torch.mm(q3.to(x.dtype), self.w[2])
-            q4, _ = self._block_no_residual(z4, 3)
+            # All blocks: all_reduce -> rms_norm -> quant -> scaled_mm
+            z2, _ = self._block_no_residual(z, 0)
+            z3, _ = self._block_no_residual(z2, 1)
+            z4, _ = self._block_no_residual(z3, 2)
+            z5, _ = self._block_no_residual(z4, 3)
 
-        return q4.to(x.dtype)
+        return z5
 
     def ops_in_model_before(self) -> list:
         if self.use_residual:
@@ -130,12 +152,14 @@ class AllReduceFusionModel(torch.nn.Module):
                 torch.ops.vllm.all_reduce.default,
                 torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default,
                 torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
+                torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl.default,
             ]
         else:
             return [
                 torch.ops.vllm.all_reduce.default,
                 torch.ops.vllm.rocm_aiter_rms_norm.default,
                 torch.ops.vllm.rocm_aiter_per_tensor_quant.default,
+                torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl.default,
             ]
 
     def ops_in_model_after(self) -> list:
@@ -282,6 +306,10 @@ def _run_fused_op_correctness_test(
     Exercises the fused op across the production batch size schedule,
     matching how vLLM actually uses these ops at runtime.
 
+    The fused op now includes the GEMM: it takes BF16 in and produces
+    BF16 GEMM output. The reference (unfused) does the same 4 ops
+    separately.
+
     Args:
         mode: "eager" runs the fused op at each batch size sequentially,
             matching the warmup phase. "graph" does an eager warmup at
@@ -311,9 +339,17 @@ def _run_fused_op_correctness_test(
     try:
         quant_dtype = current_platform.fp8_dtype()
         group_name = get_tp_group().unique_name
+        out_dtype = dtype
+
         rms_weight = torch.rand(hidden_size, dtype=dtype, device=device)
         rms_eps = 1e-5
         quant_scale = torch.rand(1, dtype=torch.float32, device=device)
+
+        # GEMM params: weight (N, K) transposed, per-tensor weight scale
+        gemm_weight = torch.rand(
+            hidden_size, hidden_size, dtype=quant_dtype, device=device,
+        ).contiguous().t()
+        weight_scale = torch.rand(1, dtype=torch.float32, device=device)
 
         if dtype == torch.float16:
             ATOL, RTOL = (2e-3, 2e-3)
@@ -321,7 +357,7 @@ def _run_fused_op_correctness_test(
             ATOL, RTOL = (1e-2, 1e-2)
 
         for use_residual in [False, True]:
-            checks = []
+            checks: list[tuple] = []
 
             if mode == "eager":
                 for M in batch_sizes:
@@ -338,32 +374,35 @@ def _run_fused_op_correctness_test(
                             torch.ops.vllm
                             .rocm_aiter_fused_allreduce_add_rms_quant(
                                 input_data.clone(), residual_data.clone(),
-                                rms_weight, rms_eps, quant_scale,
+                                rms_weight, rms_eps,
                                 quant_dtype, group_name,
+                                gemm_weight, weight_scale, out_dtype,
                             )
                         )
-                        ar_out, rms_out, res_out, q_out, qs_out = result
+                        gemm_out, res_out = result
                     else:
                         result = (
                             torch.ops.vllm
                             .rocm_aiter_fused_allreduce_rms_quant(
                                 input_data.clone(), rms_weight, rms_eps,
-                                quant_scale, quant_dtype, group_name,
+                                quant_dtype, group_name,
+                                gemm_weight, weight_scale, out_dtype,
                             )
                         )
-                        ar_out, rms_out, q_out, qs_out = result
+                        gemm_out = result[0]
                         res_out = None
 
-                    ref = unfused_allreduce_add_rms_quant(
+                    ref_gemm, ref_res = unfused_allreduce_add_rms_quant_gemm(
                         input_data.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
-                        residual_data.clone()
+                        gemm_weight, weight_scale, out_dtype,
+                        residual=residual_data.clone()
                         if residual_data is not None else None,
                     )
                     tag = f"M={M}, residual={use_residual}, mode=eager"
                     checks.append((
-                        (ar_out, rms_out, res_out, q_out, qs_out),
-                        ref, tag
+                        (gemm_out, res_out),
+                        (ref_gemm, ref_res), tag
                     ))
 
             elif mode == "graph":
@@ -381,13 +420,15 @@ def _run_fused_op_correctness_test(
                     torch.ops.vllm \
                         .rocm_aiter_fused_allreduce_add_rms_quant(
                             warmup_input, warmup_residual,
-                            rms_weight, rms_eps, quant_scale,
+                            rms_weight, rms_eps,
                             quant_dtype, group_name,
+                            gemm_weight, weight_scale, out_dtype,
                         )
                 else:
                     torch.ops.vllm.rocm_aiter_fused_allreduce_rms_quant(
                         warmup_input, rms_weight, rms_eps,
-                        quant_scale, quant_dtype, group_name,
+                        quant_dtype, group_name,
+                        gemm_weight, weight_scale, out_dtype,
                     )
                 torch.cuda.synchronize()
 
@@ -411,31 +452,33 @@ def _run_fused_op_correctness_test(
                                     torch.ops.vllm
                                     .rocm_aiter_fused_allreduce_add_rms_quant(
                                         input_capture, residual_capture,
-                                        rms_weight, rms_eps, quant_scale,
+                                        rms_weight, rms_eps,
                                         quant_dtype, group_name,
+                                        gemm_weight, weight_scale, out_dtype,
                                     )
                                 )
-                                cap_ar, cap_rms, cap_res, cap_q, cap_qs = cap
+                                cap_gemm, cap_res = cap
                             else:
                                 cap = (
                                     torch.ops.vllm
                                     .rocm_aiter_fused_allreduce_rms_quant(
                                         input_capture, rms_weight, rms_eps,
-                                        quant_scale, quant_dtype, group_name,
+                                        quant_dtype, group_name,
+                                        gemm_weight, weight_scale, out_dtype,
                                     )
                                 )
-                                cap_ar, cap_rms, cap_q, cap_qs = cap
+                                cap_gemm = cap[0]
                                 cap_res = None
 
                         captured.append((
                             graph, input_capture, residual_capture,
-                            (cap_ar, cap_rms, cap_res, cap_q, cap_qs), M
+                            (cap_gemm, cap_res), M
                         ))
 
                 # Replay and verify each captured graph
                 for idx, (graph, input_t, residual_t, outputs, M) in \
                         enumerate(captured):
-                    cap_ar, cap_rms, cap_res, cap_q, cap_qs = outputs
+                    cap_gemm, cap_res = outputs
 
                     input_fresh = torch.randn(
                         (M, hidden_size), dtype=dtype, device=device)
@@ -450,91 +493,50 @@ def _run_fused_op_correctness_test(
                     graph.replay()
                     torch.cuda.synchronize()
 
-                    ref = unfused_allreduce_add_rms_quant(
+                    ref_gemm, ref_res = unfused_allreduce_add_rms_quant_gemm(
                         input_fresh.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,
-                        residual_fresh.clone()
+                        gemm_weight, weight_scale, out_dtype,
+                        residual=residual_fresh.clone()
                         if residual_fresh is not None else None,
                     )
                     tag = (f"graph {idx + 1}/{len(captured)}, "
                            f"M={M}, residual={use_residual}")
                     checks.append((
-                        (cap_ar, cap_rms, cap_res, cap_q, cap_qs),
-                        ref, tag
+                        (cap_gemm, cap_res),
+                        (ref_gemm, ref_res), tag
                     ))
 
             # Epilogue: compare outputs against reference
-            for (ar_out, rms_out, res_out, q_out, qs_out), \
-                (ar_ref_, rms_ref_, res_ref_, q_ref_, qs_ref_), \
+            for (gemm_out, res_out), \
+                (ref_gemm, ref_res), \
                     check_tag in checks:
-                M, N = ar_ref_.shape
+                M_out = gemm_out.shape[0]
+                N_out = gemm_out.shape[1]
 
-                # Shape assertions
-                assert ar_out.shape == (M, N), (
-                    f"fused allreduce_out shape {ar_out.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert rms_out.shape == (M, N), (
-                    f"fused rms_out shape {rms_out.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert q_out.shape == (M, N), (
-                    f"fused quant_out shape {q_out.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert qs_out.shape in ((1,), (M,)), (
-                    f"fused scale_out shape {qs_out.shape}, "
-                    f"expected (1,) or ({M},) ({check_tag})"
-                )
-
-                assert ar_ref_.shape == (M, N), (
-                    f"ref allreduce_out shape {ar_ref_.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert rms_ref_.shape == (M, N), (
-                    f"ref rms_out shape {rms_ref_.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert q_ref_.shape == (M, N), (
-                    f"ref quant_out shape {q_ref_.shape}, "
-                    f"expected ({M}, {N}) ({check_tag})"
-                )
-                assert qs_ref_.shape == (1,), (
-                    f"ref scale_out shape {qs_ref_.shape}, "
-                    f"expected (1,) ({check_tag})"
+                # GEMM output shape
+                assert gemm_out.shape == ref_gemm.shape, (
+                    f"gemm_out shape {gemm_out.shape} != "
+                    f"ref shape {ref_gemm.shape} ({check_tag})"
                 )
 
                 torch.testing.assert_close(
-                    ar_out, ar_ref_, atol=ATOL, rtol=RTOL,
-                    msg=f"allreduce_out mismatch ({check_tag})",
+                    gemm_out, ref_gemm, atol=ATOL, rtol=RTOL,
+                    msg=f"gemm_out mismatch ({check_tag})",
                 )
-                torch.testing.assert_close(
-                    rms_out, rms_ref_, atol=ATOL, rtol=RTOL,
-                    msg=f"rms_out mismatch ({check_tag})",
-                )
+
                 if use_residual:
-                    assert res_out is not None and res_ref_ is not None
-                    assert res_out.shape == (M, N), (
+                    assert res_out is not None and ref_res is not None
+                    assert res_out.shape == (M_out, hidden_size), (
                         f"residual_out shape {res_out.shape}, "
-                        f"expected ({M}, {N}) ({check_tag})"
+                        f"expected ({M_out}, {hidden_size}) ({check_tag})"
                     )
                     torch.testing.assert_close(
-                        res_out, res_ref_, atol=ATOL, rtol=RTOL,
+                        res_out, ref_res, atol=ATOL, rtol=RTOL,
                         msg=f"residual_out mismatch ({check_tag})",
                     )
                 else:
-                    assert res_out is None and res_ref_ is None
-
-                # Dequantize with correct broadcasting for both
-                # per-tensor (1,) and per-row (M,) scales
-                q_out_deq = (q_out.to(torch.float32)
-                             * qs_out.unsqueeze(-1))
-                q_ref_deq = (q_ref_.to(torch.float32)
-                             * qs_ref_.unsqueeze(-1))
-                torch.testing.assert_close(
-                    q_out_deq, q_ref_deq, atol=ATOL, rtol=RTOL,
-                    msg=f"quant_out dequantized mismatch ({check_tag})",
-                )
+                    assert res_out is None and ref_res is None
 
     finally:
         cleanup_dist_env_and_memory()
@@ -604,10 +606,10 @@ def test_rocm_aiter_fused_op_correctness(
 ):
     """Compare fused torch ops against unfused individual ops.
 
-    Exercises the fused op across the CUDA graph capture schedule that
-    vLLM would generate for the given num_tokens, matching real usage.
-    Both residual and non-residual variants are tested within each
-    invocation.
+    Exercises the fused op (which now includes the GEMM) across the
+    CUDA graph capture schedule that vLLM would generate for the given
+    num_tokens, matching real usage. Both residual and non-residual
+    variants are tested within each invocation.
 
     In eager mode, the op is called at each batch size sequentially.
     In graph mode, an eager warmup runs at the max batch size, then

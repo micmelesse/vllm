@@ -522,188 +522,174 @@ class RocmAiterTritonAddRMSNormPadFusionPass(VllmPatternMatcherPass):
 # (rocm_aiter_rms_norm, rocm_aiter_per_tensor_quant) which bypass vLLM's
 # CustomOp decomposition and appear as opaque nodes in the graph.
 
-class RocmAiterAllReduceRMSNormQuantPattern:
+class RocmAiterAllReduceRMSNormQuantGemmPattern:
     """
     Pattern: all_reduce -> rocm_aiter_rms_norm -> rocm_aiter_per_tensor_quant
+             -> rocm_per_tensor_float_w8a8_scaled_mm_impl
 
     Applies to the first Transformer block where there's no residual.
     Matches the aiter custom ops that appear in the graph when
-    VLLM_ROCM_USE_AITER=1. These ops bypass vLLM's CustomOp decomposition.
+    VLLM_ROCM_USE_AITER=1, extended through the scaled_mm GEMM.
+    The fused op takes BF16 in and produces BF16 GEMM output.
+    All FP8 is internal.
     """
 
     FUSED_OP = rocm_aiter_ops.get_fused_allreduce_rms_quant_op()
 
-    def __init__(self, epsilon: float) -> None:
+    def __init__(self, epsilon: float, out_dtype: torch.dtype) -> None:
         self.epsilon = epsilon
         self.quant_dtype = current_platform.fp8_dtype()
+        self.out_dtype = out_dtype
         self.tp = get_tp_group()
         self.rmsnorm_matcher = MatcherRMSNormAiter(epsilon)
         self.quant_matcher = MatcherPerTensorQuantAiter()
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        fp8_dtype = self.quant_dtype
+        N = 16  # dummy dimension for example inputs
+
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+        ) -> torch.Tensor:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out = self.rmsnorm_matcher(allreduce_out, weight)
             quant_out, quant_scale = self.quant_matcher(rms_out, scale)
-            return quant_out, quant_scale, allreduce_out
+            gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+                quant_out, gemm_weight, self.out_dtype,
+                quant_scale, weight_scale, None,
+            )
+            return gemm_out
 
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+        ) -> torch.Tensor:
             fused_result = self.FUSED_OP(
                 input=input,
                 rms_weight=weight,
                 rms_eps=self.epsilon,
-                quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
+                gemm_weight=gemm_weight,
+                weight_scale=weight_scale,
+                out_dtype=self.out_dtype,
             )
-            # Return quant_out, quant_scale_out, allreduce_out
-            return fused_result[2], fused_result[3], fused_result[0]
+            return fused_result[0]
 
         inputs = [
-            *self.rmsnorm_matcher.inputs(),
-            self.quant_matcher.inputs()[1],  # scale
+            *self.rmsnorm_matcher.inputs(),       # input (M,N), rms_weight (N,)
+            self.quant_matcher.inputs()[1],        # quant_scale (1,)
+            torch.empty(
+                [N, N], device="meta", dtype=fp8_dtype,
+            ).contiguous().t(),                    # gemm_weight (transposed)
+            torch.empty(
+                [1], device="meta", dtype=torch.float32,
+            ),                                     # weight_scale
         ]
 
         pm.register_replacement(
             pattern, replacement, inputs, pm.fwd_only, pm_pass
         )
 
-        # Also register pattern without allreduce_out in outputs
-        def pattern_single(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            allreduce_out = tensor_model_parallel_all_reduce(input)
-            rms_out = self.rmsnorm_matcher(allreduce_out, weight)
-            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
-            return quant_out, quant_scale
 
-        def replacement_single(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            fused_result = self.FUSED_OP(
-                input=input,
-                rms_weight=weight,
-                rms_eps=self.epsilon,
-                quant_scale=scale,
-                quant_dtype=self.quant_dtype,
-                group_name=self.tp.unique_name,
-            )
-            return fused_result[2], fused_result[3]
-
-        pm.register_replacement(
-            pattern_single, replacement_single, inputs, pm.fwd_only, pm_pass
-        )
-
-
-class RocmAiterAllReduceAddRMSNormQuantPattern:
+class RocmAiterAllReduceAddRMSNormQuantGemmPattern:
     """
-    Pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add -> rocm_aiter_per_tensor_quant
+    Pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+             -> rocm_aiter_per_tensor_quant
+             -> rocm_per_tensor_float_w8a8_scaled_mm_impl
 
     Applies to layers after the first where there's a residual connection.
     Matches the aiter custom ops that appear in the graph when
-    VLLM_ROCM_USE_AITER=1. These ops bypass vLLM's CustomOp decomposition.
+    VLLM_ROCM_USE_AITER=1, extended through the scaled_mm GEMM.
+    The fused op takes BF16 in and produces BF16 GEMM output + updated
+    residual. All FP8 is internal.
     """
 
     FUSED_OP = rocm_aiter_ops.get_fused_allreduce_add_rms_quant_op()
 
-    def __init__(self, epsilon: float) -> None:
+    def __init__(self, epsilon: float, out_dtype: torch.dtype) -> None:
         self.epsilon = epsilon
         self.quant_dtype = current_platform.fp8_dtype()
+        self.out_dtype = out_dtype
         self.tp = get_tp_group()
         self.rmsnorm_matcher = MatcherFusedAddRMSNormAiter(epsilon)
         self.quant_matcher = MatcherPerTensorQuantAiter()
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        fp8_dtype = self.quant_dtype
+        N = 16  # dummy dimension for example inputs
+
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
             residual: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             allreduce_out = tensor_model_parallel_all_reduce(input)
             rms_out, new_residual = self.rmsnorm_matcher(
                 allreduce_out, weight, residual
             )
             quant_out, quant_scale = self.quant_matcher(rms_out, scale)
-            return quant_out, quant_scale, new_residual, allreduce_out
+            gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+                quant_out, gemm_weight, self.out_dtype,
+                quant_scale, weight_scale, None,
+            )
+            return gemm_out, new_residual
 
         def replacement(
             input: torch.Tensor,
             weight: torch.Tensor,
             residual: torch.Tensor,
             scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             fused_result = self.FUSED_OP(
                 input=input,
                 residual=residual,
                 rms_weight=weight,
                 rms_eps=self.epsilon,
-                quant_scale=scale,
                 quant_dtype=self.quant_dtype,
                 group_name=self.tp.unique_name,
+                gemm_weight=gemm_weight,
+                weight_scale=weight_scale,
+                out_dtype=self.out_dtype,
             )
-            # Return quant_out, quant_scale_out, residual_out, allreduce_out
-            return fused_result[3], fused_result[4], fused_result[2], fused_result[0]
-
-        # Single-output variant: no allreduce_out in outputs
-        def pattern_single(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            residual: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            allreduce_out = tensor_model_parallel_all_reduce(input)
-            rms_out, new_residual = self.rmsnorm_matcher(
-                allreduce_out, weight, residual
-            )
-            quant_out, quant_scale = self.quant_matcher(rms_out, scale)
-            return quant_out, quant_scale, new_residual
-
-        def replacement_single(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            residual: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            fused_result = self.FUSED_OP(
-                input=input,
-                residual=residual,
-                rms_weight=weight,
-                rms_eps=self.epsilon,
-                quant_scale=scale,
-                quant_dtype=self.quant_dtype,
-                group_name=self.tp.unique_name,
-            )
-            return fused_result[3], fused_result[4], fused_result[2]
+            # Return gemm_out, residual_out
+            return fused_result[0], fused_result[1]
 
         inputs = [
-            *self.rmsnorm_matcher.inputs(),
-            self.quant_matcher.inputs()[1],  # scale
+            *self.rmsnorm_matcher.inputs(),       # input (M,N), rms_weight (N,), residual (M,N)
+            self.quant_matcher.inputs()[1],        # quant_scale (1,)
+            torch.empty(
+                [N, N], device="meta", dtype=fp8_dtype,
+            ).contiguous().t(),                    # gemm_weight (transposed)
+            torch.empty(
+                [1], device="meta", dtype=torch.float32,
+            ),                                     # weight_scale
         ]
 
         pm.register_replacement(
             pattern, replacement, inputs, pm.fwd_only, pm_pass
         )
-        pm.register_replacement(
-            pattern_single, replacement_single, inputs, pm.fwd_only, pm_pass
-        )
 
 
 class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
     """
-    ROCm-specific fusion pass that fuses AllReduce + RMSNorm + FP8 Quant.
+    ROCm-specific fusion pass that fuses AllReduce + RMSNorm + FP8 Quant + GEMM.
+
+    Matches the pattern: all_reduce -> rmsnorm -> per_tensor_quant -> scaled_mm
+    and replaces with a single fused op. All FP8 is internal to the fusion;
+    the op takes BF16 in and produces BF16 GEMM output.
 
     This is the ROCm equivalent of AllReduceFusionPass (which uses flashinfer).
     """
@@ -739,18 +725,19 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
     def register_patterns(self) -> None:
         """Register all pattern variants."""
         for epsilon in [1e-5, 1e-6]:
-            # Pattern 1: No residual (first layer)
-            RocmAiterAllReduceRMSNormQuantPattern(
-                epsilon,
-            ).register(self.patterns)
+            for out_dtype in [torch.bfloat16, torch.float16]:
+                # Pattern 1: No residual (first layer)
+                RocmAiterAllReduceRMSNormQuantGemmPattern(
+                    epsilon, out_dtype=out_dtype,
+                ).register(self.patterns)
 
-            # Pattern 2: With residual (layers after first)
-            RocmAiterAllReduceAddRMSNormQuantPattern(
-                epsilon,
-            ).register(self.patterns)
+                # Pattern 2: With residual (layers after first)
+                RocmAiterAllReduceAddRMSNormQuantGemmPattern(
+                    epsilon, out_dtype=out_dtype,
+                ).register(self.patterns)
 
-            # Clear pattern cache to allow multiple epsilon values
-            torch._inductor.pattern_matcher._seen_patterns.clear()
+                # Clear pattern cache to allow multiple combinations
+                torch._inductor.pattern_matcher._seen_patterns.clear()
 
         self.disabled = False
 
