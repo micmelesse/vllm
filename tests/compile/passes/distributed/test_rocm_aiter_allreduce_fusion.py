@@ -76,7 +76,7 @@ class AllReduceFusionModel(torch.nn.Module):
         # FP8 GEMM weights (N, K) transposed and per-tensor weight scales
         self.gemm_weight = [
             torch.rand(hidden_size, hidden_size,
-                       dtype=self.quant_dtype).contiguous().t()
+                       dtype=torch.float32).to(self.quant_dtype).contiguous().t()
             for _ in range(4)
         ]
         self.weight_scale = [
@@ -347,8 +347,8 @@ def _run_fused_op_correctness_test(
 
         # GEMM params: weight (N, K) transposed, per-tensor weight scale
         gemm_weight = torch.rand(
-            hidden_size, hidden_size, dtype=quant_dtype, device=device,
-        ).contiguous().t()
+            hidden_size, hidden_size, dtype=torch.float32, device=device,
+        ).to(quant_dtype).contiguous().t()
         weight_scale = torch.rand(1, dtype=torch.float32, device=device)
 
         if dtype == torch.float16:

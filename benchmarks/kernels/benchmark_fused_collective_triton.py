@@ -90,8 +90,8 @@ def _make_unfused_variant():
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
         scale = torch.tensor(1.0, dtype=torch.float32, device=device)
         gemm_weight = torch.rand(
-            hidden_dim, hidden_dim, dtype=FP8_DTYPE, device=device,
-        ).contiguous().t()
+            hidden_dim, hidden_dim, dtype=torch.float32, device=device,
+        ).to(FP8_DTYPE).contiguous().t()
         weight_scale = torch.tensor(
             1.0, dtype=torch.float32, device=device,
         ).unsqueeze(0)
@@ -126,8 +126,8 @@ def _make_fused_variant():
         residual = torch.randn_like(input_tensor)
         rms_weight = torch.ones(hidden_dim, dtype=dtype, device=device)
         gemm_weight = torch.rand(
-            hidden_dim, hidden_dim, dtype=FP8_DTYPE, device=device,
-        ).contiguous().t()
+            hidden_dim, hidden_dim, dtype=torch.float32, device=device,
+        ).to(FP8_DTYPE).contiguous().t()
         weight_scale = torch.tensor(
             1.0, dtype=torch.float32, device=device,
         ).unsqueeze(0)
