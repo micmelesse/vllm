@@ -15,6 +15,7 @@ import torch
 from tests.compile.backend import TestBackend
 from tests.utils import multi_gpu_test
 from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401 (registers ops)
+import vllm.model_executor.kernels.linear.scaled_mm.rocm  # noqa: F401 (registers scaled_mm op)
 from vllm.compilation.passes.fusion.rocm_aiter_fusion import (
     RocmAiterAllReduceFusionPass,
 )
