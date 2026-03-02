@@ -923,7 +923,7 @@ def _rocm_aiter_fused_allreduce_rms_quant_fake(
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor]:
     M = input.shape[0]
-    N = gemm_weight.shape[0]
+    N = gemm_weight.shape[1]  # weight is (K, N) after transpose
     gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
     return (gemm_out,)
 
@@ -970,7 +970,7 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_fake(
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M = input.shape[0]
-    N = gemm_weight.shape[0]
+    N = gemm_weight.shape[1]  # weight is (K, N) after transpose
     gemm_out = torch.empty(M, N, dtype=out_dtype, device=input.device)
     residual_out = torch.empty_like(input)
     return gemm_out, residual_out
