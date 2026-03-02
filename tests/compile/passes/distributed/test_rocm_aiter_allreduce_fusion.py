@@ -476,37 +476,47 @@ def _run_fused_op_correctness_test(
                             (cap_gemm, cap_res), M
                         ))
 
-                # Replay and verify each captured graph
+                # Replay and verify each captured graph multiple
+                # times with fresh data to test that the inlined
+                # barrier epoch advances correctly across repeated
+                # CUDA graph replays (production replays many times).
+                graph_replays = 10
                 for idx, (graph, input_t, residual_t, outputs, M) in \
                         enumerate(captured):
                     cap_gemm, cap_res = outputs
 
-                    input_fresh = torch.randn(
-                        (M, hidden_size), dtype=dtype, device=device)
-                    input_t.copy_(input_fresh)
-                    if use_residual:
-                        residual_fresh = torch.randn(
+                    for replay_i in range(graph_replays):
+                        input_fresh = torch.randn(
                             (M, hidden_size), dtype=dtype, device=device)
-                        residual_t.copy_(residual_fresh)
-                    else:
-                        residual_fresh = None
+                        input_t.copy_(input_fresh)
+                        if use_residual:
+                            residual_fresh = torch.randn(
+                                (M, hidden_size), dtype=dtype,
+                                device=device)
+                            residual_t.copy_(residual_fresh)
+                        else:
+                            residual_fresh = None
 
-                    graph.replay()
-                    torch.cuda.synchronize()
+                        graph.replay()
+                        torch.cuda.synchronize()
 
-                    ref_gemm, ref_res = unfused_allreduce_add_rms_quant_gemm(
-                        input_fresh.clone(), rms_weight, rms_eps,
-                        quant_scale, quant_dtype, group_name,
-                        gemm_weight, weight_scale, out_dtype,
-                        residual=residual_fresh.clone()
-                        if residual_fresh is not None else None,
-                    )
-                    tag = (f"graph {idx + 1}/{len(captured)}, "
-                           f"M={M}, residual={use_residual}")
-                    checks.append((
-                        (cap_gemm, cap_res),
-                        (ref_gemm, ref_res), tag
-                    ))
+                        ref_gemm, ref_res = \
+                            unfused_allreduce_add_rms_quant_gemm(
+                                input_fresh.clone(), rms_weight, rms_eps,
+                                quant_scale, quant_dtype, group_name,
+                                gemm_weight, weight_scale, out_dtype,
+                                residual=residual_fresh.clone()
+                                if residual_fresh is not None else None,
+                            )
+                        tag = (
+                            f"graph {idx + 1}/{len(captured)}, "
+                            f"replay {replay_i + 1}/{graph_replays}, "
+                            f"M={M}, residual={use_residual}"
+                        )
+                        checks.append((
+                            (cap_gemm, cap_res),
+                            (ref_gemm, ref_res), tag
+                        ))
 
             # Epilogue: compare outputs against reference
             for (gemm_out, res_out), \
@@ -615,7 +625,8 @@ def test_rocm_aiter_fused_op_correctness(
     In eager mode, the op is called at each batch size sequentially.
     In graph mode, an eager warmup runs at the max batch size, then
     one CUDA graph is captured per batch size in sequence, and each
-    graph is replayed and verified.
+    graph is replayed 10 times with fresh data to verify barrier
+    epoch correctness across repeated replays (matching production).
     """
     batch_sizes = _get_batch_sizes(num_tokens)
 

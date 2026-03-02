@@ -6,14 +6,16 @@ Benchmark: fused allreduce+rmsnorm+quant+gemm vs unfused baseline.
 
 Compares unfused baseline (4 separate kernel launches) against the fused
 torch op (rocm_aiter_fused_allreduce_add_rms_quant), with residual and
-FP8 per-tensor quant + scaled_mm GEMM.
+FP8 per-row quant + inlined GEMM.
 
-Eager mode only (no CUDA graph capture) to avoid ROCm
-hipErrorStreamCaptureUnsupported. Uses CUDA events for GPU-side timing.
+Uses CUDA graph capture + replay for timing.  All barriers are inlined
+in the fused kernel, so graph capture works on ROCm.  CUDA events around
+graph.replay() measure pure GPU execution time with zero CPU dispatch
+overhead — the same execution model as vLLM inference.
 
 Usage:
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py
-    torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py \
+    torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_fused_collective_triton.py \\
         --num-tokens 1 4 1024
 """
 
@@ -149,17 +151,47 @@ def _make_fused_variant():
 
 # -- Data collection ------------------------------------------------------
 
-def benchmark_eager(fn: Callable[[], None], trials: int) -> float:
-    """Time *fn()* using CUDA events, return median in milliseconds.
+def _capture_graph(
+    fn: Callable[[], None],
+    warmup: int,
+) -> torch.cuda.CUDAGraph:
+    """Warm up *fn* in eager mode, then capture into a CUDA graph.
 
-    Caller is responsible for warmup before calling this function.
+    The warmup runs ensure all lazy allocations, JIT compilations, and
+    autotuning are complete before graph capture begins.
+    """
+    stream = torch.cuda.current_stream()
+
+    # Eager warmup (outside capture)
+    for _ in range(warmup):
+        fn()
+    stream.synchronize()
+
+    # Capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        fn()
+    stream.synchronize()
+
+    return graph
+
+
+def benchmark_graph(
+    graph: torch.cuda.CUDAGraph,
+    trials: int,
+) -> float:
+    """Replay a captured CUDA graph, return median time in milliseconds.
+
+    CUDA events around graph.replay() measure pure GPU execution time
+    with zero CPU launch overhead.
     """
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    times = []
+    times: list[float] = []
+
     for _ in range(trials):
         start.record()
-        fn()
+        graph.replay()
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
@@ -183,32 +215,35 @@ def collect(
     world_size: int,
     profile_dir: Optional[str] = None,
 ) -> BenchResults:
-    """Run all variants across all token counts and return raw data.
+    """Capture CUDA graphs for all variants, time replays, return data.
 
-    When profiling is enabled, warmup runs outside the profiler so that
-    JIT compilation and first-call overhead don't inflate the averages
-    reported by key_averages().
+    Each (variant, token_count) pair gets its own CUDA graph.  Warmup
+    runs happen in eager mode before capture.  Profiling, when enabled,
+    wraps the timed replays.
     """
     rank = device.index or 0
 
-    # Build all run functions upfront so we can reuse them across phases.
+    # Build run functions and capture graphs.
     all_run_fns: dict[int, dict[str, Callable]] = {}
+    all_graphs: dict[int, dict[str, torch.cuda.CUDAGraph]] = {}
     for num_tokens in token_counts:
         all_run_fns[num_tokens] = {}
+        all_graphs[num_tokens] = {}
         for variant in variants:
-            all_run_fns[num_tokens][variant.name] = variant.make_fn(
+            run_fn = variant.make_fn(
                 num_tokens, hidden_dim, dtype, device, group_name,
             )
+            all_run_fns[num_tokens][variant.name] = run_fn
+            graph = _capture_graph(run_fn, warmup)
+            all_graphs[num_tokens][variant.name] = graph
+            if rank == 0:
+                logger.info(
+                    "Captured CUDA graph: %s, tokens=%d",
+                    variant.name, num_tokens,
+                )
 
-    # Warmup phase (always outside profiler).
-    for num_tokens in token_counts:
-        for run_fn in all_run_fns[num_tokens].values():
-            for _ in range(warmup):
-                run_fn()
-            torch.cuda.synchronize()
-
-    # Start profiler after warmup so traces only contain steady-state calls.
-    profiler: torch.profiler.profile | None = None
+    # Start profiler after capture so traces only contain replay calls.
+    profiler: Optional[torch.profiler.profile] = None
     if profile_dir is not None:
         os.makedirs(profile_dir, exist_ok=True)
         profiler = torch.profiler.profile(
@@ -224,13 +259,13 @@ def collect(
             logger.info("Profiler enabled, traces will be saved to %s",
                         profile_dir)
 
-    # Timed trials.
+    # Timed graph replays.
     all_timings: dict[int, dict[str, float]] = {}
     for num_tokens in token_counts:
         timings: dict[str, float] = {}
         for variant in variants:
-            run_fn = all_run_fns[num_tokens][variant.name]
-            timings[variant.name] = benchmark_eager(run_fn, trials)
+            graph = all_graphs[num_tokens][variant.name]
+            timings[variant.name] = benchmark_graph(graph, trials)
         all_timings[num_tokens] = timings
 
     if profiler is not None:
@@ -274,7 +309,7 @@ def print_results(results: BenchResults) -> None:
         f"Benchmark: {' vs '.join(results.variant_names)}\n"
         f"world_size={results.world_size}  hidden_dim={results.hidden_dim}  "
         f"dtype={results.dtype}  warmup={results.warmup}  "
-        f"trials={results.trials}\n"
+        f"trials={results.trials}  mode=cudagraph\n"
     )
     if bl:
         hdr += f"baseline={bl}\n"
@@ -314,6 +349,7 @@ def save_markdown(results: BenchResults, path: str) -> None:
         f"**dtype:** {results.dtype}  ",
         f"**Warmup:** {results.warmup}  ",
         f"**Trials:** {results.trials}  ",
+        "**Mode:** cudagraph  ",
     ]
     if bl:
         lines.append(f"**Baseline:** {bl}  ")
@@ -358,13 +394,13 @@ def main():
         help="Token counts to benchmark",
     )
     parser.add_argument(
-        "--hidden-dim", type=int, default=8192, help="Hidden dimension"
+        "--hidden-dim", type=int, default=8192, help="Hidden dimension",
     )
     parser.add_argument(
-        "--warmup", type=int, default=10, help="Warmup iterations"
+        "--warmup", type=int, default=10, help="Warmup iterations before graph capture",
     )
     parser.add_argument(
-        "--trials", type=int, default=50, help="Benchmark trials"
+        "--trials", type=int, default=50, help="Graph replay trials",
     )
     parser.add_argument(
         "--output-file",
