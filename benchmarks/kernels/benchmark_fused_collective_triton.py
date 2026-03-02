@@ -31,6 +31,7 @@ from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401 (registers torch.ops.vl
 import vllm.model_executor.kernels.linear.scaled_mm.rocm  # noqa: F401 (registers scaled_mm op)
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
+    graph_capture as vllm_graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -151,29 +152,11 @@ def _make_fused_variant():
 
 # -- Data collection ------------------------------------------------------
 
-def _capture_graph(
-    fn: Callable[[], None],
-    warmup: int,
-) -> torch.cuda.CUDAGraph:
-    """Warm up *fn* in eager mode, then capture into a CUDA graph.
-
-    The warmup runs ensure all lazy allocations, JIT compilations, and
-    autotuning are complete before graph capture begins.
-    """
-    stream = torch.cuda.current_stream()
-
-    # Eager warmup (outside capture)
+def _warmup(fn: Callable[[], None], warmup: int) -> None:
+    """Run *fn* in eager mode to complete lazy allocations and autotuning."""
     for _ in range(warmup):
         fn()
-    stream.synchronize()
-
-    # Capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        fn()
-    stream.synchronize()
-
-    return graph
+    torch.cuda.synchronize()
 
 
 def benchmark_graph(
@@ -223,24 +206,41 @@ def collect(
     """
     rank = device.index or 0
 
-    # Build run functions and capture graphs.
+    # Build run functions and warm up in eager mode.
     all_run_fns: dict[int, dict[str, Callable]] = {}
-    all_graphs: dict[int, dict[str, torch.cuda.CUDAGraph]] = {}
     for num_tokens in token_counts:
         all_run_fns[num_tokens] = {}
-        all_graphs[num_tokens] = {}
         for variant in variants:
             run_fn = variant.make_fn(
                 num_tokens, hidden_dim, dtype, device, group_name,
             )
             all_run_fns[num_tokens][variant.name] = run_fn
-            graph = _capture_graph(run_fn, warmup)
-            all_graphs[num_tokens][variant.name] = graph
+            _warmup(run_fn, warmup)
             if rank == 0:
                 logger.info(
-                    "Captured CUDA graph: %s, tokens=%d",
+                    "Warmup complete: %s, tokens=%d",
                     variant.name, num_tokens,
                 )
+
+    # Capture CUDA graphs inside vllm_graph_capture context.
+    # This creates a separate stream and enters the TP group's
+    # graph_capture context, matching production vLLM behavior.
+    all_graphs: dict[int, dict[str, torch.cuda.CUDAGraph]] = {}
+    with vllm_graph_capture(device=device) as ctx:
+        for num_tokens in token_counts:
+            all_graphs[num_tokens] = {}
+            for variant in variants:
+                run_fn = all_run_fns[num_tokens][variant.name]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=ctx.stream):
+                    run_fn()
+                ctx.stream.synchronize()
+                all_graphs[num_tokens][variant.name] = graph
+                if rank == 0:
+                    logger.info(
+                        "Captured CUDA graph: %s, tokens=%d",
+                        variant.name, num_tokens,
+                    )
 
     # Start profiler after capture so traces only contain replay calls.
     profiler: Optional[torch.profiler.profile] = None
