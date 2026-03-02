@@ -101,12 +101,10 @@ def _make_unfused_variant():
         ).unsqueeze(0)
 
         def run():
-            inp = input_tensor.clone()
-            res = residual.clone()
             unfused_allreduce_add_rms_quant_gemm(
-                inp, rms_weight, 1e-6, scale, FP8_DTYPE,
+                input_tensor, rms_weight, 1e-6, scale, FP8_DTYPE,
                 group_name, gemm_weight, weight_scale, dtype,
-                residual=res,
+                residual=residual,
             )
 
         return run
@@ -137,10 +135,8 @@ def _make_fused_variant():
         ).unsqueeze(0)
 
         def run():
-            inp = input_tensor.clone()
-            res = residual.clone()
             torch.ops.vllm.rocm_aiter_fused_allreduce_add_rms_quant(
-                inp, res, rms_weight, 1e-6,
+                input_tensor, residual, rms_weight, 1e-6,
                 FP8_DTYPE, group_name,
                 gemm_weight, weight_scale, dtype,
             )
