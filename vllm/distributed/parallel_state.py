@@ -54,6 +54,7 @@ from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
+from vllm._aiter_ops import aiter_graph_capture
 
 
 @dataclass
@@ -1240,7 +1241,9 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    with get_tp_group().graph_capture(context), \
+            get_pp_group().graph_capture(context), \
+            aiter_graph_capture():
         yield context
 
 
