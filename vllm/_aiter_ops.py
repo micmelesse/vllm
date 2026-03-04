@@ -1924,18 +1924,3 @@ class rocm_aiter_ops:
 
 
 rocm_aiter_ops.register_ops_once()
-
-
-def aiter_graph_capture():
-    """Context manager for graph capture.
-
-    Notifies aiter comms to skip device barriers during graph capture
-    warmup and recording phases. Returns nullcontext if aiter comms
-    are not available.
-    """
-    try:
-        from aiter.ops.triton.comms import graph_capture
-        return graph_capture()
-    except ImportError:
-        from contextlib import nullcontext
-        return nullcontext()

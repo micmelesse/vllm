@@ -54,7 +54,6 @@ from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
-from vllm._aiter_ops import aiter_graph_capture
 
 
 @dataclass
@@ -1223,6 +1222,19 @@ _PCP: GroupCoordinator | None = None
 def get_pcp_group() -> GroupCoordinator:
     assert _PCP is not None, "prefill context parallel group is not initialized"
     return _PCP
+
+
+def aiter_graph_capture():
+    """Notify aiter comms to skip device barriers during graph capture.
+
+    Returns nullcontext if aiter comms are not available.
+    """
+    try:
+        from aiter.ops.triton.comms import graph_capture
+        return graph_capture()
+    except ImportError:
+        from contextlib import nullcontext
+        return nullcontext()
 
 
 @contextmanager
