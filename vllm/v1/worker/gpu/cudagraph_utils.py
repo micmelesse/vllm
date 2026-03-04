@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -20,6 +21,8 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import make_num_tokens_across_dp
+
+logger = logging.getLogger(__name__)
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -134,6 +137,7 @@ class CudaGraphManager:
         num_tokens_across_dp = make_num_tokens_across_dp(self.dp_size, num_tokens)
 
         # Warm up.
+        logger.info("cudagraph num_tokens=%d mode=%s phase=warmup", num_tokens, capture_cg_mode)
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -159,6 +163,7 @@ class CudaGraphManager:
         if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
             self.aux_hidden_states = [torch.empty_like(x) for x in aux_hidden_states]
 
+        logger.info("cudagraph num_tokens=%d mode=%s phase=capture", num_tokens, capture_cg_mode)
         capture_fn(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
