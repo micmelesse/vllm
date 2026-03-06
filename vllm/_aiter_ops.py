@@ -894,7 +894,7 @@ def _rocm_aiter_fused_allreduce_rms_quant_impl(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor]:
-    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant_gemm import (
         fused_allreduce_add_rms_quant_gemm,
     )
 
@@ -939,7 +939,7 @@ def _rocm_aiter_fused_allreduce_add_rms_quant_impl(
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant import (
+    from aiter.ops.triton.comms.fused_allreduce_add_rms_quant_gemm import (
         fused_allreduce_add_rms_quant_gemm,
     )
 
