@@ -1410,22 +1410,29 @@ class VllmConfig:
         if compile_range_end is not None:
             computed_compile_ranges_split_points.append(compile_range_end)
 
-        # Add the compile ranges for flashinfer
+        # Add the compile ranges for allreduce fusion
         if compilation_config.pass_config.fuse_allreduce_rms:
             tp_size = self.parallel_config.tensor_parallel_size
             max_size = compilation_config.pass_config.flashinfer_max_size(tp_size)
             if max_size is not None:
+                # FlashInfer (CUDA): derive max_token_num from workspace size
                 max_token_num = max_size // (
                     self.model_config.get_hidden_size()
                     * self.model_config.dtype.itemsize
                 )
-                if compile_range_end is not None and max_token_num < compile_range_end:
-                    computed_compile_ranges_split_points.append(max_token_num)
-                else:
-                    logger.debug(
-                        "Max num batched tokens below allreduce-rms fusion threshold, "
-                        "allreduce-rms fusion will be enabled for all num_tokens."
-                    )
+            else:
+                # ROCm AITER: use configured threshold directly
+                max_token_num = (
+                    compilation_config.pass_config
+                    .allreduce_rms_fusion_max_token_num
+                )
+            if compile_range_end is not None and max_token_num < compile_range_end:
+                computed_compile_ranges_split_points.append(max_token_num)
+            else:
+                logger.debug(
+                    "Max num batched tokens below allreduce-rms fusion threshold, "
+                    "allreduce-rms fusion will be enabled for all num_tokens."
+                )
 
         if compilation_config.pass_config.fuse_rope_kvcache:
             max_token_num = (
