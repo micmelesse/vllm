@@ -717,6 +717,10 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
 
         self.hidden_dim = config.model_config.get_hidden_size()
         self.rank = get_tensor_model_parallel_rank()
+        self.max_token_num = (
+            config.compilation_config.pass_config
+            .allreduce_rms_fusion_max_token_num
+        )
 
         self.register_patterns()
         self.dump_patterns(config, self.patterns)
@@ -745,7 +749,7 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("RocmAiterAllReduceFusionPass is disabled.")
             return False
-        return True
+        return compile_range.end <= self.max_token_num
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:

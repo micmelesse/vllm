@@ -139,6 +139,12 @@ class PassConfig:
     Larger batch sizes e.g. during prefill will use the unfused kernels.
     """
 
+    allreduce_rms_fusion_max_token_num: int = 512
+    """The threshold for ROCm AITER AllReduce+RMSNorm+Quant fusion.
+    Only applied to compile ranges where end <= this value (small batch decode).
+    Prefill ranges exceed this and fall back to NCCL allreduce + separate ops.
+    """
+
     fi_allreduce_fusion_max_size_mb: float | None = None
     """The threshold of the communicated tensor sizes under which
     vllm should use flashinfer fused allreduce. Specified as a
