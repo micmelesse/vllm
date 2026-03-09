@@ -393,6 +393,10 @@ def _run_fused_op_correctness_test(
                         gemm_out = result[0]
                         res_out = None
 
+                    # Sync before unfused reference (NCCL) to prevent
+                    # deadlock with iris device_barriers still in-flight.
+                    torch.cuda.synchronize()
+
                     ref_gemm, ref_res = unfused_allreduce_add_rms_quant_gemm(
                         input_data.clone(), rms_weight, rms_eps,
                         quant_scale, quant_dtype, group_name,

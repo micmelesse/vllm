@@ -149,9 +149,15 @@ def _make_fused_variant():
 # -- Data collection ------------------------------------------------------
 
 def _warmup(fn: Callable[[], None], warmup: int) -> None:
-    """Run *fn* in eager mode to complete lazy allocations and autotuning."""
+    """Run *fn* in eager mode to complete lazy allocations and autotuning.
+
+    Sync after each call to keep ranks in lockstep. Without this,
+    staggered Triton JIT causes fast ranks to race ahead on the GPU
+    stream, desyncing the iris device_barriers and deadlocking.
+    """
     for _ in range(warmup):
         fn()
+        torch.cuda.synchronize()
     torch.cuda.synchronize()
 
 
