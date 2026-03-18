@@ -31,6 +31,7 @@ from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401 (registers torch.ops.vl
 import vllm.model_executor.kernels.linear.scaled_mm.rocm  # noqa: F401 (registers scaled_mm op)
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
+    graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -244,16 +245,16 @@ def collect(
                     variant.name, num_tokens,
                 )
 
-    # Capture CUDA graphs for graph-safe variants (fused uses iris
-    # barriers which support capture; unfused uses NCCL which does not).
-    # Plain stream + torch.cuda.graph (not vllm_graph_capture) to avoid
-    # NCCL ProcessGroup watchdog crash from hipErrorStreamCaptureUnsupported.
+    # Capture CUDA graphs for graph-safe variants.
+    # Use vLLM's graph_capture() context which routes NCCL through pynccl
+    # (ctypes wrapper, no ProcessGroupNCCL watchdog) to avoid
+    # hipErrorStreamCaptureUnsupported crashes on ROCm.
     graph_variants = [v for v in variants if v.graph_safe]
     eager_variants = [v for v in variants if not v.graph_safe]
     all_graphs: dict[int, dict[str, torch.cuda.CUDAGraph]] = {}
     if graph_variants:
-        capture_stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(capture_stream):
+        with graph_capture(device) as graph_capture_context:
+            capture_stream = graph_capture_context.stream
             for num_tokens in token_counts:
                 all_graphs.setdefault(num_tokens, {})
                 for variant in graph_variants:
@@ -493,7 +494,7 @@ def main():
 
     # -- Build variants ---------------------------------------------------
     all_variants = [
-        BenchVariant(name="unfused", make_fn=_make_unfused_variant(), is_baseline=True, graph_safe=False),
+        BenchVariant(name="unfused", make_fn=_make_unfused_variant(), is_baseline=True),
         BenchVariant(name="fused", make_fn=_make_fused_variant()),
     ]
     if args.variant == "all":
