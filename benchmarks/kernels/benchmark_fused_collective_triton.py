@@ -467,6 +467,12 @@ def main():
     args = parser.parse_args()
 
     # -- Distributed setup ------------------------------------------------
+    # Disable NCCL async error handling / watchdog before creating any
+    # ProcessGroupNCCL. The watchdog thread calls hipEventQuery() which
+    # crashes on ROCm when any stream is in CUDA graph capture mode.
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         raise RuntimeError(
             "Must run with torchrun. "
@@ -516,9 +522,11 @@ def main():
             )
         logger.info(
             "DEBUG NCCL env: TORCH_NCCL_ENABLE_MONITORING=%s "
-            "NCCL_ASYNC_ERROR_HANDLING=%s",
+            "NCCL_ASYNC_ERROR_HANDLING=%s "
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING=%s",
             os.environ.get("TORCH_NCCL_ENABLE_MONITORING", "unset"),
             os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "unset"),
+            os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING", "unset"),
         )
 
     # -- Build variants ---------------------------------------------------
