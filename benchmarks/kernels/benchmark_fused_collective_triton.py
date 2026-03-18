@@ -246,9 +246,6 @@ def collect(
                 )
 
     # Capture CUDA graphs for graph-safe variants.
-    # Use vLLM's graph_capture() context which routes NCCL through pynccl
-    # (ctypes wrapper, no ProcessGroupNCCL watchdog) to avoid
-    # hipErrorStreamCaptureUnsupported crashes on ROCm.
     graph_variants = [v for v in variants if v.graph_safe]
     eager_variants = [v for v in variants if not v.graph_safe]
     all_graphs: dict[int, dict[str, torch.cuda.CUDAGraph]] = {}
@@ -467,12 +464,6 @@ def main():
     args = parser.parse_args()
 
     # -- Distributed setup ------------------------------------------------
-    # Disable NCCL async error handling / watchdog before creating any
-    # ProcessGroupNCCL. The watchdog thread calls hipEventQuery() which
-    # crashes on ROCm when any stream is in CUDA graph capture mode.
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
-    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
-
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         raise RuntimeError(
             "Must run with torchrun. "
