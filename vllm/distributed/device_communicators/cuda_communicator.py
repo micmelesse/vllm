@@ -127,6 +127,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+    # DEBUG: track which allreduce path fires (remove after debugging)
+    _ar_path_logged = False
+
     def all_reduce(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -135,6 +138,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                self._log_ar_path("symm_mem_allreduce")
                 return out
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -146,6 +150,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
+            self._log_ar_path("quick_reduce")
             return out
         ca_comm = self.ca_comm
         if (
@@ -155,14 +160,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
+            self._log_ar_path("custom_allreduce")
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
+            self._log_ar_path("symm_mem")
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            self._log_ar_path("dist.all_reduce (no pynccl)")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
             return out
@@ -173,9 +181,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # this usually happens during testing.
             # when we run the model, allreduce only happens for the TP
             # group, where we always have either custom allreduce or pynccl.
+            self._log_ar_path("dist.all_reduce (pynccl returned None)")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+        else:
+            self._log_ar_path("pynccl")
         return out
+
+    def _log_ar_path(self, path: str):
+        """Log which allreduce path was taken (once per instance)."""
+        if not CudaCommunicator._ar_path_logged:
+            CudaCommunicator._ar_path_logged = True
+            logger.info(
+                "DEBUG allreduce path: %s | qr=%s(disabled=%s) | "
+                "ca=%s(disabled=%s) | pynccl=%s(disabled=%s) | "
+                "symm_mem=%s",
+                path,
+                self.qr_comm is not None,
+                getattr(self.qr_comm, 'disabled', 'N/A'),
+                self.ca_comm is not None,
+                getattr(self.ca_comm, 'disabled', 'N/A'),
+                self.pynccl_comm is not None,
+                getattr(self.pynccl_comm, 'disabled', 'N/A'),
+                self.symm_mem_comm is not None,
+            )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

@@ -490,7 +490,36 @@ def main():
             f"Got world_size={world_size}."
         )
 
-    group_name = get_tp_group().unique_name
+    tp_group = get_tp_group()
+    group_name = tp_group.unique_name
+
+    # DEBUG: dump communicator state so we know which allreduce path will fire
+    if rank == 0:
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+        dc = tp_group.device_communicator
+        logger.info("DEBUG tp_group.unique_name = %s", group_name)
+        logger.info("DEBUG device_communicator type = %s", type(dc).__name__)
+        if isinstance(dc, CudaCommunicator):
+            qr = dc.qr_comm
+            ca = dc.ca_comm
+            pn = dc.pynccl_comm
+            sm = dc.symm_mem_comm
+            logger.info(
+                "DEBUG qr_comm=%s disabled=%s | ca_comm=%s disabled=%s | "
+                "pynccl_comm=%s disabled=%s | symm_mem_comm=%s",
+                qr is not None, getattr(qr, 'disabled', 'N/A'),
+                ca is not None, getattr(ca, 'disabled', 'N/A'),
+                pn is not None, getattr(pn, 'disabled', 'N/A'),
+                sm is not None,
+            )
+        logger.info(
+            "DEBUG NCCL env: TORCH_NCCL_ENABLE_MONITORING=%s "
+            "NCCL_ASYNC_ERROR_HANDLING=%s",
+            os.environ.get("TORCH_NCCL_ENABLE_MONITORING", "unset"),
+            os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "unset"),
+        )
 
     # -- Build variants ---------------------------------------------------
     all_variants = [
