@@ -514,6 +514,13 @@ class RocmPlatform(Platform):
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+        # if rocm_aiter_ops.is_comms_enabled():
+        #     if compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+        #         logger.info(
+        #             "Aiter comms enabled. Overriding cudagraph_mode to FULL."
+        #         )
+        #         compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
         if cache_config and cache_config.block_size is None:
             if (
                 envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION and envs.VLLM_ROCM_USE_AITER

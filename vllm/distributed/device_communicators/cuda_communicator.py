@@ -48,8 +48,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             CustomAllreduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.device_communicators.quick_all_reduce import (
-            QuickAllReduce,
+        from vllm.distributed.device_communicators.rocm_communicator import (
+            RocmCommunicator,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
@@ -63,7 +63,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
-        self.qr_comm: QuickAllReduce | None = None
+        self.rocm_comm: RocmCommunicator | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -82,12 +82,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             if current_platform.is_rocm():
-                # Initialize a custom quick all-reduce implementation for AMD.
-                # Quick reduce is designed as a complement to custom allreduce.
-                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                # If it's a rocm, 'use_custom_allreduce==True' means it must
-                # currently be an MI300 series.
-                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+                self.rocm_comm = RocmCommunicator(
+                    group=self.cpu_group, device=self.device
+                )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
@@ -127,6 +124,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+    _ar_path_logged = False
+
     def all_reduce(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -135,17 +134,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                self._log_ar_path("symm_mem_allreduce")
                 return out
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
-        qr_comm = self.qr_comm
+        # ROCm allreduce (aiter or quick_reduce, selected at init)
+        rocm_comm = self.rocm_comm
         if (
-            qr_comm is not None
-            and not qr_comm.disabled
-            and qr_comm.should_quick_allreduce(input_)
+            rocm_comm is not None
+            and not rocm_comm.disabled
+            and rocm_comm.should_allreduce(input_)
         ):
-            out = qr_comm.quick_all_reduce(input_)
+            out = rocm_comm.all_reduce(input_)
             assert out is not None
+            self._log_ar_path(f"rocm({rocm_comm.backend_name})")
             return out
         ca_comm = self.ca_comm
         if (
@@ -155,14 +155,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
+            self._log_ar_path("custom_allreduce")
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
+            self._log_ar_path("symm_mem")
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            self._log_ar_path("dist.all_reduce (no pynccl)")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
             return out
@@ -173,9 +176,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # this usually happens during testing.
             # when we run the model, allreduce only happens for the TP
             # group, where we always have either custom allreduce or pynccl.
+            self._log_ar_path("dist.all_reduce (pynccl returned None)")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+        else:
+            self._log_ar_path("pynccl")
         return out
+
+    def _log_ar_path(self, path: str):
+        """Log which allreduce path was taken (once per process)."""
+        if not CudaCommunicator._ar_path_logged:
+            CudaCommunicator._ar_path_logged = True
+            rocm = self.rocm_comm
+            logger.info(
+                "allreduce path: %s | rocm=%s(backend=%s) | "
+                "ca=%s(disabled=%s) | "
+                "pynccl=%s(disabled=%s) | symm_mem=%s",
+                path,
+                rocm is not None,
+                getattr(rocm, 'backend_name', 'N/A'),
+                self.ca_comm is not None,
+                getattr(self.ca_comm, 'disabled', 'N/A'),
+                self.pynccl_comm is not None,
+                getattr(self.pynccl_comm, 'disabled', 'N/A'),
+                self.symm_mem_comm is not None,
+            )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
@@ -268,6 +293,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.rocm_comm is not None:
+            self.rocm_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.all2all_manager is not None:

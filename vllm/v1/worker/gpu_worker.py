@@ -220,6 +220,12 @@ class Worker(WorkerBase):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            # Disable NCCL watchdog when using aiter comms. The watchdog
+            # calls hipEventQuery() which crashes during CUDA graph capture
+            # on ROCm with hipErrorStreamCaptureUnsupported.
+            # NOTE: Did not work. Watchdog still runs.
+            # if envs.VLLM_ROCM_USE_AITER_COMMS:
+            #     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
