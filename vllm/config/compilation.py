@@ -1088,6 +1088,12 @@ class CompilationConfig:
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
 
+                # AiterCommunicator's zero-copy path uses DMA-BUF imports
+                # that are incompatible with CUDA graph recording. Splitting
+                # at allreduce lets it run in eager mode between segments.
+                if self._needs_allreduce_splitting_op():
+                    self.splitting_ops.append("vllm::all_reduce")
+
             elif len(self.splitting_ops) == 0:
                 if (
                     self.cudagraph_mode == CUDAGraphMode.PIECEWISE
@@ -1152,6 +1158,20 @@ class CompilationConfig:
         assert not self.splitting_ops_contain_attention(), (
             "attention ops should not be in splitting_ops when fuse_attn_quant is True"
         )
+
+    @staticmethod
+    def _needs_allreduce_splitting_op() -> bool:
+        """Check if allreduce should be a splitting op.
+
+        Required when AiterCommunicator is active — its symmetric heap
+        operations are incompatible with CUDA graph recording.
+        """
+        try:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            return rocm_aiter_ops.is_comms_enabled()
+        except ImportError:
+            return False
 
     def splitting_ops_contain_attention(self) -> bool:
         return self.splitting_ops is not None and all(

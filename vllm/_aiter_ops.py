@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 
 import torch
 from torch._ops import OpOverload
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
     rocm_aiter_sparse_attn_indexer_fake,
 )
+
+logger = init_logger(__name__)
 
 # fp8_dtype is not cached.
 # on ROCm the fp8_dtype always calls is_fp8_fnuz
@@ -54,6 +58,23 @@ def is_aiter_found_and_supported() -> bool:
 
         return on_mi3xx()
     return False
+
+
+def create_aiter_communicator(device):
+    """Create an aiter allreduce communicator if available.
+
+    Returns None if aiter is not available or not supported.
+    """
+    if not is_aiter_found_and_supported():
+        return None
+    try:
+        from aiter.ops.triton.comms.communicator import AiterCommunicator
+
+        allocator_type = os.environ.get("AITER_ALLREDUCE_ALLOCATOR", "vmem")
+        return AiterCommunicator(device=device, allocator_type=allocator_type)
+    except ImportError as e:
+        logger.warning("Failed to import AiterCommunicator: %s", e)
+        return None
 
 
 def if_aiter_supported(func: Callable) -> Callable:
@@ -1074,6 +1095,7 @@ class rocm_aiter_ops:
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     # TODO: Consolidate under _LINEAR_ENABLED
+    _COMMS_ENABLED = envs.VLLM_ROCM_USE_AITER_COMMS
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @classmethod
@@ -1098,6 +1120,7 @@ class rocm_aiter_ops:
         cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        cls._COMMS_ENABLED = envs.VLLM_ROCM_USE_AITER_COMMS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @staticmethod
@@ -1237,6 +1260,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_rotary_embed_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_ROTARY_EMBED
+
+    @classmethod
+    @if_aiter_supported
+    def is_comms_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._COMMS_ENABLED
 
     @classmethod
     @if_aiter_supported
