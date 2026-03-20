@@ -480,67 +480,8 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        # Debug: dump NCCL PG state before graph capture
-        self._debug_nccl_state("before graph_capture")
-
         with torch.cuda.stream(stream), maybe_ca_context:
             yield graph_capture_context
-
-    def _debug_nccl_state(self, label: str):
-        """Dump NCCL ProcessGroup state for debugging graph capture crashes."""
-        import torch.distributed as dist
-        rank = self.rank_in_group
-
-        # Enumerate all process groups
-        all_pgs = []
-        default_pg = dist.group.WORLD
-        if default_pg is not None:
-            all_pgs.append(("default_pg", default_pg))
-        for attr in ["device_group", "cpu_group"]:
-            pg = getattr(self, attr, None)
-            if pg is not None:
-                all_pgs.append((attr, pg))
-
-        for pg_name, pg in all_pgs:
-            backend_name = "unknown"
-            try:
-                backend_name = dist.get_backend(pg)
-            except Exception:
-                pass
-
-            # Try to get the NCCL backend object
-            nccl_backend = None
-            try:
-                nccl_backend = pg._get_backend(torch.device("cuda"))
-            except Exception:
-                pass
-
-            seq_num = -1
-            try:
-                if nccl_backend is not None:
-                    seq_num = nccl_backend._get_sequence_number_for_group()
-            except Exception:
-                pass
-
-            # List all methods/attrs containing "work" or "wait" or "pending"
-            nccl_methods = []
-            if nccl_backend is not None:
-                nccl_methods = [m for m in dir(nccl_backend)
-                                if any(k in m.lower() for k in
-                                       ["work", "wait", "pending", "flush",
-                                        "abort", "shutdown", "watchdog"])]
-
-            logger.info(
-                "[rank %d] NCCL debug (%s): pg=%s backend=%s "
-                "nccl_backend=%s seq_num=%d methods=%s",
-                rank, label, pg_name, backend_name,
-                type(nccl_backend).__name__ if nccl_backend else "None",
-                seq_num, nccl_methods,
-            )
-
-        # Sync device
-        torch.cuda.synchronize()
-        logger.info("[rank %d] NCCL debug (%s): cuda.synchronize() done", rank, label)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
