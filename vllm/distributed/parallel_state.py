@@ -522,23 +522,23 @@ class GroupCoordinator:
             except Exception:
                 pass
 
-            # Check for pending work via _workMetaList (PyTorch internal)
-            pending_count = -1
-            try:
-                if nccl_backend is not None:
-                    pending_count = len(nccl_backend._workMetaList)
-            except Exception:
-                pass
+            # List all methods/attrs containing "work" or "wait" or "pending"
+            nccl_methods = []
+            if nccl_backend is not None:
+                nccl_methods = [m for m in dir(nccl_backend)
+                                if any(k in m.lower() for k in
+                                       ["work", "wait", "pending", "flush",
+                                        "abort", "shutdown", "watchdog"])]
 
             logger.info(
                 "[rank %d] NCCL debug (%s): pg=%s backend=%s "
-                "nccl_backend=%s seq_num=%d pending_work=%d",
+                "nccl_backend=%s seq_num=%d methods=%s",
                 rank, label, pg_name, backend_name,
                 type(nccl_backend).__name__ if nccl_backend else "None",
-                seq_num, pending_count,
+                seq_num, nccl_methods,
             )
 
-        # Also sync device and do a dist.barrier to flush
+        # Sync device
         torch.cuda.synchronize()
         logger.info("[rank %d] NCCL debug (%s): cuda.synchronize() done", rank, label)
 
