@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 
 import torch
@@ -66,7 +67,11 @@ def create_aiter_communicator(group, device):
     try:
         from aiter.ops.triton.comms.communicator import AiterCommunicator
 
-        return AiterCommunicator(group=group, device=device)
+        allocator_type = os.environ.get(
+            "AITER_ALLREDUCE_ALLOCATOR", "vmem"
+        )
+        return AiterCommunicator(group=group, device=device,
+                                 allocator_type=allocator_type)
     except ImportError:
         return None
 
