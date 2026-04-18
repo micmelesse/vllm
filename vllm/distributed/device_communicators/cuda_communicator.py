@@ -67,6 +67,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.rocm_communicator import (
             RocmCommunicator,
+            create_rocm_communicator,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
@@ -107,7 +108,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             if current_platform.is_rocm():
-                self.rocm_comm = RocmCommunicator(
+                self.rocm_comm = create_rocm_communicator(
                     group=self.cpu_group, device=self.device
                 )
 
