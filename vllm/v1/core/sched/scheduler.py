@@ -951,7 +951,7 @@ class Scheduler(SchedulerInterface):
             running_n = len(self.running)
             waiting_n = len(self.waiting)
             new_n = len(new_reqs_data)
-            cached_n = len(cached_reqs_data)
+            cached_n = cached_reqs_data.num_reqs
             new_tok = sum(
                 num_scheduled_tokens[r.req_id] for r in new_reqs_data
             )
