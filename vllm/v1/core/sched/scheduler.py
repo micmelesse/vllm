@@ -946,6 +946,31 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if total_num_scheduled_tokens > 0:
+            running_n = len(self.running)
+            waiting_n = len(self.waiting)
+            new_n = len(new_reqs_data)
+            cached_n = len(cached_reqs_data)
+            new_tok = sum(
+                num_scheduled_tokens[r.req_id] for r in new_reqs_data
+            )
+            cont_tok = total_num_scheduled_tokens - new_tok
+            tok_counts = sorted(num_scheduled_tokens.values(), reverse=True)
+            tok_preview = tok_counts[:8] + (["..."] if len(tok_counts) > 8 else [])
+            now = time.perf_counter()
+            dt_ms = (now - getattr(self, "_last_step_ts", now)) * 1000.0
+            self._last_step_ts = now
+            logger.info(
+                "[batch] running=%d waiting=%d new=%d cached=%d "
+                "total_tok=%d new_tok=%d cont_tok=%d "
+                "per_req_tok=%s preempted=%d finished=%d dt_ms=%.2f",
+                running_n, waiting_n, new_n, cached_n,
+                total_num_scheduled_tokens, new_tok, cont_tok,
+                tok_preview, len(preempted_reqs), len(self.finished_req_ids),
+                dt_ms,
+            )
+
         return scheduler_output
 
     def _build_kv_connector_meta(
