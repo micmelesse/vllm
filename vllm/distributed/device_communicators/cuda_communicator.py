@@ -64,10 +64,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
         )
+        from vllm.distributed.device_communicators.aiter_communicator import (
+            AiterCommunicator,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.device_communicators.rocm_communicator import (
-            RocmCommunicator,
-            create_rocm_communicator,
+        from vllm.distributed.device_communicators.quick_all_reduce import (
+            QuickAllReduce,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
@@ -81,7 +83,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
-        self.rocm_comm: RocmCommunicator | None = None
+        self.qr_comm: QuickAllReduce | None = None
+        self.aiter_comm: AiterCommunicator | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
@@ -108,9 +111,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             if current_platform.is_rocm():
-                self.rocm_comm = create_rocm_communicator(
+                # Initialize a custom quick all-reduce implementation for AMD.
+                # Quick reduce is designed as a complement to custom allreduce.
+                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                # If it's a rocm, 'use_custom_allreduce==True' means it must
+                # currently be an MI300 series.
+                self.qr_comm = QuickAllReduce(
                     group=self.cpu_group, device=self.device
                 )
+                # Aiter allreduce; self-disables unless
+                # VLLM_ROCM_USE_AITER_COMMS is set and the lib is importable.
+                self.aiter_comm = AiterCommunicator(device=self.device)
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
@@ -187,16 +198,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if out is not None:
                 self._log_ar_path("symm_mem_allreduce")
                 return out
-        # ROCm allreduce (aiter or quick_reduce, selected at init)
-        rocm_comm = self.rocm_comm
+        aiter_comm = self.aiter_comm
         if (
-            rocm_comm is not None
-            and not rocm_comm.disabled
-            and rocm_comm.should_allreduce(input_)
+            aiter_comm is not None
+            and not aiter_comm.disabled
+            and aiter_comm.should_allreduce(input_)
         ):
-            out = rocm_comm.all_reduce(input_)
+            out = aiter_comm.all_reduce(input_)
             assert out is not None
-            self._log_ar_path(f"rocm({rocm_comm.backend_name})")
+            self._log_ar_path("aiter")
+            return out
+        # always try quick reduce first, then flashinfer, then custom allreduce,
+        # and then pynccl. (quick reduce just for ROCM MI3*)
+        qr_comm = self.qr_comm
+        if (
+            qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce(input_)
+        ):
+            out = qr_comm.quick_all_reduce(input_)
+            assert out is not None
+            self._log_ar_path("quick_reduce")
             return out
         fi_ar_comm = self.fi_ar_comm
         if (
@@ -247,14 +269,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """Log which allreduce path was taken (once per process)."""
         if not CudaCommunicator._ar_path_logged:
             CudaCommunicator._ar_path_logged = True
-            rocm = self.rocm_comm
             logger.info(
-                "allreduce path: %s | rocm=%s(backend=%s) | "
-                "ca=%s(disabled=%s) | "
+                "allreduce path: %s | aiter=%s(disabled=%s) | "
+                "qr=%s(disabled=%s) | ca=%s(disabled=%s) | "
                 "pynccl=%s(disabled=%s) | symm_mem=%s",
                 path,
-                rocm is not None,
-                getattr(rocm, "backend_name", "N/A"),
+                self.aiter_comm is not None,
+                getattr(self.aiter_comm, "disabled", "N/A"),
+                self.qr_comm is not None,
+                getattr(self.qr_comm, "disabled", "N/A"),
                 self.ca_comm is not None,
                 getattr(self.ca_comm, "disabled", "N/A"),
                 self.pynccl_comm is not None,
@@ -366,8 +389,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.rocm_comm is not None:
-            self.rocm_comm = None
+        if self.aiter_comm is not None:
+            self.aiter_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.fi_ar_comm is not None:
