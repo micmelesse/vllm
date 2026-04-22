@@ -961,7 +961,7 @@ class Scheduler(SchedulerInterface):
             now = time.perf_counter()
             dt_ms = (now - getattr(self, "_last_step_ts", now)) * 1000.0
             self._last_step_ts = now
-            logger.info(
+            logger.debug(
                 "[batch] running=%d waiting=%d new=%d cached=%d "
                 "total_tok=%d new_tok=%d cont_tok=%d "
                 "per_req_tok=%s preempted=%d finished=%d dt_ms=%.2f",

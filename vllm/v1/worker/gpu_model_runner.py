@@ -3889,7 +3889,7 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
-            logger.info(
+            logger.debug(
                 "[batch] cudagraph_mode=%s batch_desc=%s "
                 "should_ubatch=%s num_tokens_across_dp=%s",
                 cudagraph_mode,
