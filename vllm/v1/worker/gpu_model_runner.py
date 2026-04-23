@@ -3890,8 +3890,8 @@ class GPUModelRunner(
             )
 
             logger.debug(
-                "[batch] cudagraph_mode=%s batch_desc=%s "
-                "should_ubatch=%s num_tokens_across_dp=%s",
+                "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                "should_ubatch: %s, num_tokens_across_dp: %s",
                 cudagraph_mode,
                 batch_desc,
                 should_ubatch,

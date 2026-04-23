@@ -59,9 +59,6 @@ class ProfilerConfig:
     torch_profiler_dump_cuda_time_total: bool = True
     """If `True`, dumps total CUDA time in torch profiler traces. Enabled by default."""
 
-    torch_profiler_skip_traces: bool = False
-    """If `True`, skips writing trace files. Only the key_averages table is produced."""
-
     torch_profiler_record_shapes: bool = False
     """If `True`, records tensor shapes in the torch profiler. Disabled by default."""
 

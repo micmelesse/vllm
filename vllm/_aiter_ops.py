@@ -7,15 +7,12 @@ import torch
 from torch._ops import OpOverload
 
 import vllm.envs as envs
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
     rocm_aiter_sparse_attn_indexer_fake,
 )
-
-logger = init_logger(__name__)
 
 # fp8_dtype is not cached.
 # on ROCm the fp8_dtype always calls is_fp8_fnuz
@@ -57,22 +54,6 @@ def is_aiter_found_and_supported() -> bool:
 
         return on_mi3xx()
     return False
-
-
-def create_aiter_communicator(device):
-    """Create an aiter allreduce communicator if available.
-
-    Returns None if aiter is not available or not supported.
-    """
-    if not is_aiter_found_and_supported():
-        return None
-    try:
-        from aiter.ops.triton.comms.communicator import AiterCommunicator
-
-        return AiterCommunicator(device=device)
-    except ImportError as e:
-        logger.warning("Failed to import AiterCommunicator: %s", e)
-        return None
 
 
 def if_aiter_supported(func: Callable) -> Callable:
