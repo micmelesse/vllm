@@ -99,33 +99,33 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if use_custom_allreduce and self.world_size > 1:
-            # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-            )
+            if current_platform.is_rocm() and rocm_aiter_ops.is_comms_enabled():
+                # Aiter replaces CustomAllreduce for small AR (<8MB).
+                from aiter.ops.triton.comms.communicator import (
+                    AiterCommunicator,
+                )
+
+                self.aiter_comm = AiterCommunicator(
+                    group=self.cpu_group, device=self.device
+                )
+            else:
+                # Initialize a custom fast all-reduce implementation.
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    symm_mem_enabled=(
+                        self.symm_mem_comm is not None
+                        and not self.symm_mem_comm.disabled
+                    ),
+                )
 
             if current_platform.is_rocm():
-                if rocm_aiter_ops.is_comms_enabled():
-                    from aiter.ops.triton.comms.communicator import (
-                        AiterCommunicator,
-                    )
-
-                    self.aiter_comm = AiterCommunicator(
-                        group=self.cpu_group, device=self.device
-                    )
-                else:
-                    # Initialize a custom quick all-reduce implementation for AMD.
-                    # Quick reduce is designed as a complement to custom allreduce.
-                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                    # If it's a rocm, 'use_custom_allreduce==True' means it must
-                    # currently be an MI300 series.
-                    self.qr_comm = QuickAllReduce(
-                        group=self.cpu_group, device=self.device
-                    )
+                # QR handles >16MB AR (orthogonal to aiter/CA), always built on
+                # ROCm. Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                # 'use_custom_allreduce==True' on rocm means MI300 series.
+                self.qr_comm = QuickAllReduce(
+                    group=self.cpu_group, device=self.device
+                )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
