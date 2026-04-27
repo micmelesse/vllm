@@ -1074,6 +1074,7 @@ class rocm_aiter_ops:
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     # TODO: Consolidate under _LINEAR_ENABLED
+    _COMMS_ENABLED = envs.VLLM_ROCM_USE_AITER_COMMS
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @classmethod
@@ -1098,6 +1099,7 @@ class rocm_aiter_ops:
         cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        cls._COMMS_ENABLED = envs.VLLM_ROCM_USE_AITER_COMMS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @staticmethod
@@ -1237,6 +1239,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_rotary_embed_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_ROTARY_EMBED
+
+    @classmethod
+    @if_aiter_supported
+    def is_comms_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._COMMS_ENABLED
 
     @classmethod
     @if_aiter_supported

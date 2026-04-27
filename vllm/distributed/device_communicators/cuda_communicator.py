@@ -6,6 +6,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     should_nccl_symm_mem_allreduce,
 )
@@ -81,6 +82,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
+        self.aiter_comm = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
@@ -96,23 +98,44 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.world_size > 1:
-            # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-            )
-
+        if self.world_size > 1:
             if current_platform.is_rocm():
-                # Initialize a custom quick all-reduce implementation for AMD.
-                # Quick reduce is designed as a complement to custom allreduce.
-                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                # If it's a rocm, 'use_custom_allreduce==True' means it must
-                # currently be an MI300 series.
-                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+                if rocm_aiter_ops.is_comms_enabled():
+                    # Aiter handles small AR (<8MB) on ROCm; QR handles the rest.
+                    from aiter.ops.triton.comms.communicator import AiterCommunicator
+
+                    self.aiter_comm = AiterCommunicator(
+                        group=self.cpu_group, device=self.device
+                    )
+                    self.qr_comm = QuickAllReduce(
+                        group=self.cpu_group, device=self.device
+                    )
+                elif use_custom_allreduce:
+                    self.ca_comm = CustomAllreduce(
+                        group=self.cpu_group,
+                        device=self.device,
+                        symm_mem_enabled=(
+                            self.symm_mem_comm is not None
+                            and not self.symm_mem_comm.disabled
+                        ),
+                    )
+                    # Initialize a custom quick all-reduce implementation for AMD.
+                    # Quick reduce is designed as a complement to custom allreduce.
+                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                    # If it's a rocm, 'use_custom_allreduce==True' means it must
+                    # currently be an MI300 series.
+                    self.qr_comm = QuickAllReduce(
+                        group=self.cpu_group, device=self.device
+                    )
+            elif use_custom_allreduce:
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    symm_mem_enabled=(
+                        self.symm_mem_comm is not None
+                        and not self.symm_mem_comm.disabled
+                    ),
+                )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
@@ -186,6 +209,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
+        aiter_comm = self.aiter_comm
+        if (
+            aiter_comm is not None
+            and not aiter_comm.disabled
+            and aiter_comm.should_allreduce(input_)
+        ):
+            out = aiter_comm.all_reduce(input_)
+            assert out is not None
+            return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -340,6 +372,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
+        if self.aiter_comm is not None:
+            self.aiter_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.fi_ar_comm is not None:
