@@ -105,7 +105,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     from aiter.ops.triton.comms.communicator import AiterCommunicator
 
                     self.aiter_comm = AiterCommunicator(
-                        group=self.cpu_group, device=self.device
+                        group=self.cpu_group,
+                        device=self.device,
+                        device_group=self.device_group,
                     )
                     self.qr_comm = QuickAllReduce(
                         group=self.cpu_group, device=self.device
