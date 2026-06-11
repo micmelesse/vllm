@@ -122,6 +122,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_COMMS: bool = False
+    VLLM_ROCM_USE_AITER_ALLREDUCE: bool = True
+    VLLM_ROCM_USE_AITER_ALLGATHER: bool = True
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1040,6 +1042,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_COMMS": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_COMMS", "False").lower() in ("true", "1")
+    ),
+    # Per-collective ablation gates (only effective when AITER_COMMS is on): set
+    # to 0 to route that collective back to the base (NCCL/custom) path while
+    # leaving the others on aiter. Registered here (not a raw os.environ read) so
+    # they propagate to the TP workers where the collectives dispatch. Default on.
+    "VLLM_ROCM_USE_AITER_ALLREDUCE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_ALLREDUCE", "True").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_ALLGATHER": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_ALLGATHER", "True").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

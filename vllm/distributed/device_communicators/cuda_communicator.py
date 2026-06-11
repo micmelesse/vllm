@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import os
-
 import torch
 from torch.distributed import ProcessGroup
 
@@ -108,6 +106,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
                     self.aiter_comm = AiterCommunicator(
                         group=self.cpu_group, device=self.device
+                    )
+                    # Proof line: shows the per-collective gate values resolved
+                    # in THIS (worker) process, so an ablation run's log confirms
+                    # the gate actually took effect rather than silently
+                    # defaulting on.
+                    logger.info(
+                        "AiterCommunicator enabled: all_reduce=%s all_gather=%s",
+                        "aiter" if envs.VLLM_ROCM_USE_AITER_ALLREDUCE else "NCCL",
+                        "aiter" if envs.VLLM_ROCM_USE_AITER_ALLGATHER else "NCCL",
                     )
                     self.qr_comm = QuickAllReduce(
                         group=self.cpu_group, device=self.device
@@ -215,6 +222,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             aiter_comm is not None
             and not aiter_comm.disabled
+            and envs.VLLM_ROCM_USE_AITER_ALLREDUCE
             and aiter_comm.should_allreduce(input_)
         ):
             out = aiter_comm.all_reduce(input_)
@@ -272,14 +280,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         aiter_comm = self.aiter_comm
-        # Ablation knob: VLLM_ROCM_USE_AITER_ALLGATHER=0 forces all_gather back to
-        # the base (NCCL) path while leaving all_reduce on aiter — isolates the
-        # aiter all_gather as the suspected gsm8k-correctness culprit. Default
-        # (unset/"1") keeps current behavior.
+        # Ablation gate: VLLM_ROCM_USE_AITER_ALLGATHER=0 forces all_gather back to
+        # the base (NCCL) path while leaving all_reduce on aiter. Registered in
+        # envs.py so it propagates to the TP workers (a raw os.environ read may
+        # not reach them). Default on = current behavior.
         if (
             aiter_comm is not None
             and not aiter_comm.disabled
-            and os.environ.get("VLLM_ROCM_USE_AITER_ALLGATHER", "1") != "0"
+            and envs.VLLM_ROCM_USE_AITER_ALLGATHER
             and aiter_comm.should_allgather(input_)
         ):
             out = aiter_comm.all_gather(input_, dim)
