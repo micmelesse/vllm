@@ -49,9 +49,21 @@ from ..utils import (  # noqa: E402
     multi_process_parallel,
 )
 
-# Small enough to route to the aiter communicator (it handles small AR on ROCm);
-# bf16/fp16 hidden-state-shaped tensors like the serving decode all-reduce.
-SHAPES = [(64, 8192), (256, 8192)]
+# Bisect the input: sweep rows-per-rank (the "batch" axis) from tiny to
+# known-failing at the real hidden dim, all < 8MB so they route to the aiter
+# communicator. The all_gather worker runs the whole sweep in one go and reports
+# the boundary where the output first goes wrong (the boundary names the bug:
+# size-threshold => latency/race; tile-boundary => indexing).
+SHAPES = [
+    (1, 8192),
+    (2, 8192),
+    (4, 8192),
+    (8, 8192),
+    (16, 8192),
+    (32, 8192),
+    (64, 8192),
+    (256, 8192),
+]
 DTYPES = [torch.bfloat16, torch.float16]
 
 
@@ -140,6 +152,12 @@ def allreduce_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
 def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
     with monkeypatch.context() as m:
         device, group = _setup(m, tp_size, pp_size, rank, distributed_init_port)
+        # Input bisection in one run: sweep every size, DON'T stop at the first
+        # failure, and report the boundary. Eager only — a cudagraph crash would
+        # abort the sweep before we see where it flips. Every rank prints its own
+        # sweep + first-failure block pattern (ray re-raises only one worker).
+        results = []  # (shape, dtype, ok)
+        first_fail = None
         for shape in SHAPES:
             for dtype in DTYPES:
                 inp = torch.randint(1, 16, shape, dtype=dtype, device=device)
@@ -147,33 +165,23 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                 dist.all_gather(gathered, inp, group=group)
                 ref = torch.cat(gathered, dim=0)
 
-                eager = tensor_model_parallel_all_gather(inp, dim=0)
-                if not torch.equal(eager, ref):
-                    # print so EVERY rank's pattern surfaces (ray only re-raises
-                    # one worker's exception); distance-relative vs absolute tells
-                    # topology-race from addressing bug.
-                    report = (
-                        f"[rank{rank}] eager all_gather {shape} {dtype}: "
-                        f"{_diff(eager, ref)}\n  "
-                        f"{_block_diff(eager, ref, shape[0], tp_size, rank)}"
+                out = tensor_model_parallel_all_gather(inp, dim=0)
+                ok = torch.equal(out, ref)
+                results.append((shape, dtype, ok))
+                if not ok and first_fail is None:
+                    first_fail = (
+                        f"first fail {shape} {dtype}: {_diff(out, ref)}\n  "
+                        f"{_block_diff(out, ref, shape[0], tp_size, rank)}"
                     )
-                    print(report, flush=True)
-                    raise AssertionError(report)
 
-                with graph_capture(device=device) as cc:
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=cc.stream):
-                        graphed = tensor_model_parallel_all_gather(inp, dim=0)
-                graph.replay()
-                torch.accelerator.synchronize()
-                if not torch.equal(graphed, ref):
-                    report = (
-                        f"[rank{rank}] cudagraph all_gather {shape} {dtype}: "
-                        f"{_diff(graphed, ref)}\n  "
-                        f"{_block_diff(graphed, ref, shape[0], tp_size, rank)}"
-                    )
-                    print(report, flush=True)
-                    raise AssertionError(report)
+        summary = "  ".join(
+            f"{s[0]}x{s[1]}/{str(d).rsplit('.', 1)[-1]}={'ok' if ok else 'FAIL'}"
+            for s, d, ok in results
+        )
+        print(f"[rank{rank}] all_gather sweep: {summary}", flush=True)
+        if first_fail is not None:
+            print(f"[rank{rank}] {first_fail}", flush=True)
+            raise AssertionError(f"[rank{rank}] all_gather failed in sweep (see above)")
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="aiter communicator is ROCm-only")
