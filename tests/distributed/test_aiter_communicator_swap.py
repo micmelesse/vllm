@@ -149,10 +149,16 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
 
                 eager = tensor_model_parallel_all_gather(inp, dim=0)
                 if not torch.equal(eager, ref):
-                    raise AssertionError(
-                        f"eager all_gather {shape} {dtype}: {_diff(eager, ref)}\n"
+                    # print so EVERY rank's pattern surfaces (ray only re-raises
+                    # one worker's exception); distance-relative vs absolute tells
+                    # topology-race from addressing bug.
+                    report = (
+                        f"[rank{rank}] eager all_gather {shape} {dtype}: "
+                        f"{_diff(eager, ref)}\n  "
                         f"{_block_diff(eager, ref, shape[0], tp_size, rank)}"
                     )
+                    print(report, flush=True)
+                    raise AssertionError(report)
 
                 with graph_capture(device=device) as cc:
                     graph = torch.cuda.CUDAGraph()
@@ -161,10 +167,13 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                 graph.replay()
                 torch.accelerator.synchronize()
                 if not torch.equal(graphed, ref):
-                    raise AssertionError(
-                        f"cudagraph all_gather {shape} {dtype}: {_diff(graphed, ref)}\n"
+                    report = (
+                        f"[rank{rank}] cudagraph all_gather {shape} {dtype}: "
+                        f"{_diff(graphed, ref)}\n  "
                         f"{_block_diff(graphed, ref, shape[0], tp_size, rank)}"
                     )
+                    print(report, flush=True)
+                    raise AssertionError(report)
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="aiter communicator is ROCm-only")
