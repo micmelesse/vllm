@@ -55,6 +55,32 @@ SHAPES = [(64, 8192), (256, 8192)]
 DTYPES = [torch.bfloat16, torch.float16]
 
 
+def _diff(out, ref):
+    """One-line magnitude summary of how `out` differs from the reference.
+    Inputs are integers (exactly representable), so any delta is a real error,
+    not fp noise."""
+    d = (out.float() - ref.float()).abs()
+    n = int((d > 0).sum())
+    return f"mismatched {n}/{out.numel()}, max|delta|={d.max().item():.4g}"
+
+
+def _block_diff(out, ref, m, world, my_rank):
+    """All-gather pattern: which rank's row-block [r*m:(r+1)*m) is correct. The
+    push kernel writes each rank's slice to every peer, so a remote-write race
+    shows as this rank's OWN block clean but peers' blocks stale — that pattern
+    points at a memory-ordering bug, not a math bug."""
+    parts = []
+    for r in range(world):
+        blk = slice(r * m, (r + 1) * m)
+        own = "*" if r == my_rank else ""
+        if torch.equal(out[blk], ref[blk]):
+            parts.append(f"r{r}{own}=ok")
+        else:
+            md = (out[blk].float() - ref[blk].float()).abs().max().item()
+            parts.append(f"r{r}{own}=BAD({md:.3g})")
+    return "blocks[" + " ".join(parts) + "]  (*=own slice, written locally)"
+
+
 def _setup(monkeypatch, tp_size, pp_size, rank, port):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
@@ -93,9 +119,10 @@ def allreduce_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                 dist.all_reduce(ref, group=group)
 
                 eager = tensor_model_parallel_all_reduce(inp)
-                torch.testing.assert_close(
-                    eager, ref, msg=f"eager all_reduce {shape} {dtype}"
-                )
+                if not torch.equal(eager, ref):
+                    raise AssertionError(
+                        f"eager all_reduce {shape} {dtype}: {_diff(eager, ref)}"
+                    )
 
                 with graph_capture(device=device) as cc:
                     graph = torch.cuda.CUDAGraph()
@@ -103,9 +130,10 @@ def allreduce_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                         graphed = tensor_model_parallel_all_reduce(inp)
                 graph.replay()
                 torch.accelerator.synchronize()
-                torch.testing.assert_close(
-                    graphed, ref, msg=f"cudagraph all_reduce {shape} {dtype}"
-                )
+                if not torch.equal(graphed, ref):
+                    raise AssertionError(
+                        f"cudagraph all_reduce {shape} {dtype}: {_diff(graphed, ref)}"
+                    )
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -120,9 +148,11 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                 ref = torch.cat(gathered, dim=0)
 
                 eager = tensor_model_parallel_all_gather(inp, dim=0)
-                torch.testing.assert_close(
-                    eager, ref, msg=f"eager all_gather {shape} {dtype}"
-                )
+                if not torch.equal(eager, ref):
+                    raise AssertionError(
+                        f"eager all_gather {shape} {dtype}: {_diff(eager, ref)}\n"
+                        f"{_block_diff(eager, ref, shape[0], tp_size, rank)}"
+                    )
 
                 with graph_capture(device=device) as cc:
                     graph = torch.cuda.CUDAGraph()
@@ -130,9 +160,11 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                         graphed = tensor_model_parallel_all_gather(inp, dim=0)
                 graph.replay()
                 torch.accelerator.synchronize()
-                torch.testing.assert_close(
-                    graphed, ref, msg=f"cudagraph all_gather {shape} {dtype}"
-                )
+                if not torch.equal(graphed, ref):
+                    raise AssertionError(
+                        f"cudagraph all_gather {shape} {dtype}: {_diff(graphed, ref)}\n"
+                        f"{_block_diff(graphed, ref, shape[0], tp_size, rank)}"
+                    )
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="aiter communicator is ROCm-only")
