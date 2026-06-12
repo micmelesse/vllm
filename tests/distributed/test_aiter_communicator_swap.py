@@ -33,6 +33,7 @@ import torch.distributed as dist
 os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 os.environ.pop("HIP_VISIBLE_DEVICES", None)
 
+from vllm._aiter_ops import rocm_aiter_ops  # noqa: E402
 from vllm.distributed.communication_op import (  # noqa: E402
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -57,9 +58,13 @@ DTYPES = [torch.bfloat16, torch.float16]
 def _setup(monkeypatch, tp_size, pp_size, rank, port):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
-    # Enable the aiter communicator so the high-level ops dispatch to it.
+    # Enable the aiter communicator so the high-level ops dispatch to it. The
+    # flags are captured as class attrs when vllm._aiter_ops is imported (before
+    # this setenv runs), so reload them — vLLM's sanctioned hook for exactly the
+    # monkeypatch-in-a-test case — before the communicator is created below.
     monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
     monkeypatch.setenv("VLLM_ROCM_USE_AITER_COMMS", "1")
+    rocm_aiter_ops.refresh_env_variables()
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
     init_test_distributed_environment(tp_size, pp_size, rank, port)
@@ -130,9 +135,7 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
                 )
 
 
-@pytest.mark.skipif(
-    torch.version.hip is None, reason="aiter communicator is ROCm-only"
-)
+@pytest.mark.skipif(torch.version.hip is None, reason="aiter communicator is ROCm-only")
 @pytest.mark.parametrize("tp_size", [8])
 @pytest.mark.parametrize("test_target", [allreduce_worker, allgather_worker])
 def test_aiter_communicator_swap(monkeypatch, tp_size, test_target):
