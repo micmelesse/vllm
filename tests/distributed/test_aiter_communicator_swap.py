@@ -18,19 +18,31 @@ for all_gather), the bug is capture-regime-specific — caught in seconds, not a
 30-minute serve+gsm8k loop.
 """
 
+import os
+
 import pytest
 import ray
 import torch
 import torch.distributed as dist
 
-from vllm.distributed.communication_op import (  # noqa
+# Ray gives each worker HIP_VISIBLE_DEVICES (its assigned GPU) but
+# CUDA_VISIBLE_DEVICES is inherited from the driver (all GPUs); vLLM's ROCm
+# platform raises on the mismatch at import. Ray imports this whole module in the
+# worker, so reconcile the env HERE, before any vllm import — the worker then
+# selects its device by rank (set_device_index below), like the other dist tests.
+os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+os.environ.pop("HIP_VISIBLE_DEVICES", None)
+
+from vllm.distributed.communication_op import (  # noqa: E402
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.distributed.parallel_state import get_tp_group, graph_capture
-from vllm.platforms import current_platform
+from vllm.distributed.parallel_state import (  # noqa: E402
+    get_tp_group,
+    graph_capture,
+)
 
-from ..utils import (
+from ..utils import (  # noqa: E402
     ensure_model_parallel_initialized,
     init_test_distributed_environment,
     multi_process_parallel,
@@ -119,7 +131,7 @@ def allgather_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
 
 
 @pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="aiter communicator is ROCm-only"
+    torch.version.hip is None, reason="aiter communicator is ROCm-only"
 )
 @pytest.mark.parametrize("tp_size", [8])
 @pytest.mark.parametrize("test_target", [allreduce_worker, allgather_worker])
