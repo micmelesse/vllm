@@ -587,6 +587,9 @@ class GroupCoordinator:
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
+            aiter_comm = self.device_communicator.aiter_comm
+            if aiter_comm is not None:
+                maybe_aiter_context = aiter_comm.capture()  # type: ignore
 
             from vllm._aiter_ops import rocm_aiter_ops
 
