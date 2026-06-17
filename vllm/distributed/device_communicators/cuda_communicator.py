@@ -103,10 +103,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if current_platform.is_rocm():
                 if rocm_aiter_ops.is_comms_enabled():
                     # Aiter handles small AR (<8MB) on ROCm; QR handles the rest.
-                    from aiter.ops.triton.comms.communicator import AiterCommunicator
+                    from aiter.ops.triton.comms.communicator import make_communicator
 
-                    self.aiter_comm = AiterCommunicator(
-                        group=self.cpu_group, device=self.device
+                    self.aiter_comm = make_communicator(
+                        "iris", group=self.cpu_group, device=self.device
                     )
                     self.qr_comm = QuickAllReduce(
                         group=self.cpu_group, device=self.device
