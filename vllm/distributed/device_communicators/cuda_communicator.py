@@ -105,8 +105,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     # Aiter handles small AR (<8MB) on ROCm; QR handles the rest.
                     from aiter.ops.triton.comms.communicator import make_communicator
 
+                    # Pass both groups (mirrors DeviceCommunicatorBase): the
+                    # torch reference backend runs torch.dist collectives over the
+                    # device (nccl) group; iris uses neither (its own shmem). The
+                    # backend picks what it needs.
                     self.aiter_comm = make_communicator(
-                        group=self.cpu_group, device=self.device
+                        cpu_group=self.cpu_group,
+                        device_group=self.device_group,
+                        device=self.device,
                     )
                     self.qr_comm = QuickAllReduce(
                         group=self.cpu_group, device=self.device
