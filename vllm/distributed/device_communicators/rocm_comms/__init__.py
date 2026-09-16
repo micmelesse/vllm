@@ -4,7 +4,7 @@
 """ROCm TP collective backends: one interface, one file per implementation.
 
     base      the Communicator interface, and the admission rules every backend shares
-    hip       our own kernel, compiled on first use (hip.cu, hip_kernel.py)
+    hip       our own kernel, built into `_rocm_C` (csrc/rocm/rocm_comms.cu)
     iris      iris's GPU-initiated collectives
     torch     torch.distributed, the oracle the others are measured against
 

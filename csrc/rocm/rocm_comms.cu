@@ -21,7 +21,7 @@
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
 #include <hip/hip_runtime.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include <cstring>
 #include <sstream>
@@ -214,17 +214,16 @@ static Handle handle_from(const std::string& bytes) {
 // tensor within it. Returning both together is what keeps the two from drifting apart.
 static hipPointer_attribute range_start_attr = HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 
-// py::bytes, NOT std::string: pybind converts std::string to a Python `str` by decoding
-// UTF-8, and an IPC handle is arbitrary binary that will not decode. Returning it as a
-// string throws UnicodeDecodeError on the first call. The INPUT direction is safe as
-// std::string because pybind accepts `bytes` for it.
-static std::pair<py::bytes, int64_t> ipc_handle_and_offset(uintptr_t ptr) {
+// std::string as a BYTE BUFFER, not text: an IPC handle is arbitrary binary. It leaves
+// this file as `int[]` at the op boundary below, which is how vLLM's other all-reduces
+// carry handle bytes through a schema that has no bytes type.
+static std::pair<std::string, int64_t> ipc_handle_and_offset(uintptr_t ptr) {
   void* base = nullptr;
   HIP_CHECK(hipPointerGetAttribute(&base, range_start_attr,
                                    reinterpret_cast<hipDeviceptr_t>(ptr)));
   Handle h;
   HIP_CHECK(hipIpcGetMemHandle(&h, base));
-  return {py::bytes(reinterpret_cast<const char*>(&h), sizeof(Handle)),
+  return {std::string(reinterpret_cast<const char*>(&h), sizeof(Handle)),
           reinterpret_cast<char*>(ptr) - static_cast<char*>(base)};
 }
 
@@ -468,31 +467,110 @@ class Comms {
 
 }  // namespace hip_comms
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  using hip_comms::Comms;
-  m.attr("SIGNAL_BYTES")   = py::int_(sizeof(hip_comms::Signal));
-  m.attr("PEER_PTRS_BYTES") = py::int_(sizeof(hip_comms::PeerPtrs));
-  m.attr("MAX_BLOCKS")     = py::int_(hip_comms::kMaxBlocks);
-  m.attr("MAX_RANKS")      = py::int_(hip_comms::kMaxRanks);
-  m.attr("IPC_HANDLE_BYTES") = py::int_(sizeof(hipIpcMemHandle_t));
+// =================================================================================
+// THE TORCH OP BOUNDARY. `Comms` is a stateful C++ object and a torch op is a free
+// function over schema types, so the object crosses as an opaque handle -- the same
+// `fptr_t = int64_t` vLLM's custom all-reduce and quick-reduce use. IPC handles cross
+// as `int[]` for the same reason they do there: a schema has no bytes type.
+// =================================================================================
 
-  m.def("ipc_handle_and_offset", &hip_comms::ipc_handle_and_offset, py::arg("ptr"),
-        "The IPC handle of the allocation containing `ptr`, and `ptr`'s offset in it.");
+using fptr_t = int64_t;
+static_assert(sizeof(void*) == sizeof(fptr_t));
 
-  py::class_<Comms>(m, "Comms")
-      .def(py::init<int, int, uintptr_t, const std::vector<std::string>&,
-                    const std::vector<int64_t>&, uintptr_t, int64_t>(),
-           py::arg("rank"), py::arg("world_size"), py::arg("self_signal"),
-           py::arg("signal_handles"), py::arg("signal_offsets"), py::arg("peer_slab"),
-           py::arg("peer_slab_bytes"))
-      .def("register_buffer", &Comms::register_buffer, py::arg("handles"),
-           py::arg("offsets"), py::arg("self_ptr"))
-      .def("pending_graph_buffers", &Comms::pending_graph_buffers)
-      .def("register_graph_buffers", &Comms::register_graph_buffers, py::arg("handles"),
-           py::arg("offsets"))
-      .def("pending_count", &Comms::pending_count)
-      .def("all_reduce", &Comms::all_reduce, py::arg("out"), py::arg("inp"),
-           py::arg("algo"), py::arg("blocks"), py::arg("threads"))
-      .def("all_gather", &Comms::all_gather, py::arg("out"), py::arg("inp"),
-           py::arg("algo"), py::arg("blocks"), py::arg("threads"));
+namespace {
+std::string bytes_of(const std::vector<int64_t>& xs) {
+  std::string out;
+  out.reserve(xs.size());
+  for (int64_t x : xs) out.push_back(static_cast<char>(x));
+  return out;
+}
+
+std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) {
+  std::vector<std::string> out;
+  out.reserve(xss.size());
+  for (const auto& xs : xss) out.push_back(bytes_of(xs));
+  return out;
+}
+}  // namespace
+
+fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
+                       const std::vector<std::vector<int64_t>>& signal_handles,
+                       const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
+                       int64_t peer_slab_bytes) {
+  auto* comms = new hip_comms::Comms(
+      static_cast<int>(rank), static_cast<int>(world_size),
+      static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
+      static_cast<uintptr_t>(peer_slab), peer_slab_bytes);
+  return reinterpret_cast<fptr_t>(comms);
+}
+
+void rocm_comms_dispose(fptr_t comms) {
+  delete reinterpret_cast<hip_comms::Comms*>(comms);
+}
+
+void rocm_comms_register_buffer(fptr_t comms,
+                                const std::vector<std::vector<int64_t>>& handles,
+                                const std::vector<int64_t>& offsets, int64_t self_ptr) {
+  reinterpret_cast<hip_comms::Comms*>(comms)->register_buffer(
+      bytes_of(handles), offsets, static_cast<uintptr_t>(self_ptr));
+}
+
+std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms) {
+  auto pending =
+      reinterpret_cast<hip_comms::Comms*>(comms)->pending_graph_buffers();
+  return std::vector<int64_t>(pending.begin(), pending.end());
+}
+
+// ONE ENTRY PER PENDING BUFFER, each the WORLD'S handles for it laid end to end: a
+// schema nests two deep and this needs three (buffer, rank, byte), so the innermost
+// level is split back out here by the handle size, which is fixed.
+void rocm_comms_register_graph_buffers(
+    fptr_t comms, const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<std::vector<int64_t>>& offsets) {
+  const size_t stride = sizeof(hip_comms::Handle);
+  std::vector<std::vector<std::string>> bytes;
+  bytes.reserve(handles.size());
+  for (const auto& joined : handles) {
+    TORCH_CHECK(joined.size() % stride == 0,
+                "rocm_comms: ", joined.size(),
+                " handle bytes is not a whole number of ", stride, "-byte handles");
+    std::string all = bytes_of(joined);
+    std::vector<std::string> per_rank;
+    per_rank.reserve(all.size() / stride);
+    for (size_t at = 0; at < all.size(); at += stride)
+      per_rank.push_back(all.substr(at, stride));
+    bytes.push_back(std::move(per_rank));
+  }
+  reinterpret_cast<hip_comms::Comms*>(comms)->register_graph_buffers(bytes, offsets);
+}
+
+int64_t rocm_comms_pending_count(fptr_t comms) {
+  return reinterpret_cast<hip_comms::Comms*>(comms)->pending_count();
+}
+
+void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                           int64_t algo, int64_t blocks, int64_t threads) {
+  reinterpret_cast<hip_comms::Comms*>(comms)->all_reduce(out, inp, algo, blocks, threads);
+}
+
+void rocm_comms_all_gather(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                           int64_t algo, int64_t blocks, int64_t threads) {
+  reinterpret_cast<hip_comms::Comms*>(comms)->all_gather(out, inp, algo, blocks, threads);
+}
+
+std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
+  auto [handle, offset] = hip_comms::ipc_handle_and_offset(static_cast<uintptr_t>(ptr));
+  std::vector<int64_t> bytes(handle.begin(), handle.end());
+  return std::make_tuple(bytes, offset);
+}
+
+// The sizes Python needs to allocate the signal block and the peer slab, and the bounds it
+// checks a world size and a launch against. Constants of the kernel, so they are asked for
+// rather than restated.
+std::vector<int64_t> rocm_comms_sizes() {
+  return {static_cast<int64_t>(sizeof(hip_comms::Signal)),
+          static_cast<int64_t>(sizeof(hip_comms::PeerPtrs)),
+          static_cast<int64_t>(hip_comms::kMaxBlocks),
+          static_cast<int64_t>(hip_comms::kMaxRanks),
+          static_cast<int64_t>(sizeof(hipIpcMemHandle_t))};
 }

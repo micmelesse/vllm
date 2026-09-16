@@ -2,9 +2,9 @@
 # rights reserved.
 """Python interface to our HIP collectives, and the only place they are TUNED.
 
-Two files, both ours: this and `hip_comms.cu`. `torch.utils.cpp_extension.load` compiles
-the `.cu` with hipcc and caches the `.so`, so there is no build system, no entry in no
-CMake entry and nothing in vLLM's `csrc`.
+The kernel is `csrc/rocm/rocm_comms.cu`, compiled into vLLM's `_rocm_C` extension with
+the rest of the ROCm sources. This module calls the ops it registers; it compiles
+nothing and there is no cache to warm.
 
 THE SPLIT. The `.cu` is mechanism and holds no policy; every decision -- which
 algorithm, how many blocks, how many threads -- is made here, by `config_for`, and
@@ -22,55 +22,23 @@ during capture and replay is pure kernel launch with no Python at all.
 template instantiation rather than being passed; the `.cu`'s dispatch names every
 combination that exists and REFUSES anything else rather than substituting.
 
-Two environment knobs, both set by the arm's Dockerfile rather than defaulted here:
-`TORCH_EXTENSIONS_DIR` (where the `.so` is cached; must be an image path, not the
-mounted `~/.cache`) and `PYTORCH_ROCM_ARCH` (which torch turns into `--offload-arch`;
-required when warming the build with no GPU present to detect).
+THE CONTEXT IS AN OPAQUE HANDLE. A torch op is a free function over schema types, so
+the C++ object crosses as an `int` -- the same shape vLLM's custom all-reduce uses. The
+consequence is that nothing frees it for us: `close()` has to run, and dropping the last
+Python reference does not.
 """
 
-import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-# The extension's import name. Only used for the build cache and error messages: the
-# module object is held here, never imported by name from anywhere else.
-NAME = "vllm_rocm_hip_comms"
-
-SOURCE = Path(__file__).resolve().parent / "hip.cu"
-
 # Algorithms, matching the `.cu`'s dispatch. One today.
 ALGO_ONE_SHOT = 0
-
-_module: Any = None
-_lock = threading.Lock()
-
-
-def load(verbose: bool = False) -> Any:
-    """Compile (first call) and return the extension. Idempotent; raises on failure.
-
-    Raising is deliberate. A missing iris is genuine unavailability and self-disables,
-    but our own source failing to build is a broken toolchain or broken code, and
-    disabling would let vLLM fall back to its own all-reduce and call the run READY.
-    """
-    global _module
-    if _module is not None:
-        return _module
-    with _lock:
-        if _module is not None:
-            return _module
-        if not SOURCE.is_file():
-            raise RuntimeError(f"{NAME}: source is missing at {SOURCE}")
-        from torch.utils.cpp_extension import load as _cpp_load
-
-        _module = _cpp_load(name=NAME, sources=[str(SOURCE)], verbose=verbose)
-        return _module
 
 
 # =================================================================================
@@ -140,8 +108,10 @@ class HipComms:
         max_buffers: int = 131072,
         max_size: int = 8 << 20,
     ) -> None:
-        mod = load()
-        self.mod = mod
+        # The kernel's own constants, asked for rather than restated here.
+        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle = (
+            torch.ops._rocm_C.rocm_comms_sizes()
+        )
         self.cpu_group = cpu_group
         self.device = device
         self.rank = dist.get_rank(cpu_group)
@@ -150,11 +120,11 @@ class HipComms:
         # ONE allocation per rank holds the signal block and the scratch after it, so
         # the two-stage algorithm needs no new buffer or handshake -- only a kernel.
         self._signal = torch.zeros(
-            mod.SIGNAL_BYTES + scratch_bytes, dtype=torch.uint8, device=device
+            signal_bytes + scratch_bytes, dtype=torch.uint8, device=device
         )
         # Device-side array of peer-pointer sets, one slot per registered buffer.
         self._slab = torch.zeros(
-            mod.PEER_PTRS_BYTES * max_buffers, dtype=torch.uint8, device=device
+            peer_ptrs_bytes * max_buffers, dtype=torch.uint8, device=device
         )
         # A pre-registered buffer for the EAGER path. The kernel reads peer pointers, so
         # an input has to be registered -- and eagerly the caller hands us whatever the
@@ -167,14 +137,14 @@ class HipComms:
 
         self.max_size = max_size
         handles, offsets = self._exchange(self._signal.data_ptr())
-        self.comms = mod.Comms(
-            rank=self.rank,
-            world_size=self.world_size,
-            self_signal=self._signal.data_ptr(),
-            signal_handles=handles,
-            signal_offsets=offsets,
-            peer_slab=self._slab.data_ptr(),
-            peer_slab_bytes=self._slab.numel(),
+        self._comms = torch.ops._rocm_C.rocm_comms_init(
+            self.rank,
+            self.world_size,
+            self._signal.data_ptr(),
+            handles,
+            offsets,
+            self._slab.data_ptr(),
+            self._slab.numel(),
         )
         self.register(self._staging)
         # Say what will actually be launched, once. Otherwise a run tells you the answer
@@ -188,9 +158,11 @@ class HipComms:
             flush=True,
         )
 
-    def _exchange(self, ptr: int) -> tuple[list[bytes], list[int]]:
-        """Every rank's IPC handle + offset for its own `ptr`, in rank order."""
-        mine = self.mod.ipc_handle_and_offset(ptr)
+    def _exchange(self, ptr: int) -> tuple[list[list[int]], list[int]]:
+        """Every rank's IPC handle + offset for its own `ptr`, in rank order. A handle
+        is a list of byte values: an op schema has no bytes type, which is how vLLM's
+        other all-reduces carry theirs too."""
+        mine = torch.ops._rocm_C.rocm_comms_handle_and_offset(ptr)
         gathered = _all_gather_object(self.cpu_group, mine)
         return [h for h, _ in gathered], [o for _, o in gathered]
 
@@ -198,8 +170,8 @@ class HipComms:
         """Make `tensor` usable as a collective INPUT. Collective: every rank must call
         it for its own tensor, in the same order."""
         handles, offsets = self._exchange(tensor.data_ptr())
-        self.comms.register_buffer(
-            handles=handles, offsets=offsets, self_ptr=tensor.data_ptr()
+        torch.ops._rocm_C.rocm_comms_register_buffer(
+            self._comms, handles, offsets, tensor.data_ptr()
         )
         self._registered.add(tensor.data_ptr())
 
@@ -228,12 +200,14 @@ class HipComms:
         ALWAYS one collective, even with nothing pending -- a rank that returned early
         here would leave the others waiting in the gather. Nothing is registered when
         nothing is pending; the exchange still has to happen."""
-        pending: Sequence[int] = self.comms.pending_graph_buffers()
+        pending: Sequence[int] = torch.ops._rocm_C.rocm_comms_pending_graph_buffers(
+            self._comms
+        )
         # ONE collective for ALL of them, not one each. A capture records a buffer per
         # collective in the graph -- a layer each, in vLLM -- so per-buffer exchanges
         # are how a graph-heavy startup becomes thousands of round trips.
-        mine = [self.mod.ipc_handle_and_offset(p) for p in pending]
-        gathered: list[list[tuple[bytes, int]]] = _all_gather_object(
+        mine = [torch.ops._rocm_C.rocm_comms_handle_and_offset(p) for p in pending]
+        gathered: list[list[tuple[list[int], int]]] = _all_gather_object(
             self.cpu_group, mine
         )
         # Every rank must agree on the count. The same gather that carries the handles
@@ -247,9 +221,12 @@ class HipComms:
             )
         if not pending:
             return
-        self.comms.register_graph_buffers(
-            handles=[[g[i][0] for g in gathered] for i in range(len(pending))],
-            offsets=[[g[i][1] for g in gathered] for i in range(len(pending))],
+        # ONE ENTRY PER BUFFER, the world's handles laid end to end: the op splits them
+        # back by handle size, because a schema nests two deep and this needs three.
+        torch.ops._rocm_C.rocm_comms_register_graph_buffers(
+            self._comms,
+            [[b for g in gathered for b in g[i][0]] for i in range(len(pending))],
+            [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
@@ -275,12 +252,8 @@ class HipComms:
         """Sum `inp` across every rank into `out`, in place."""
         if cfg is None:
             cfg = config_for("all_reduce", inp.dtype, inp.numel(), self.world_size)
-        self.comms.all_reduce(
-            out=out,
-            inp=self._as_input(inp),
-            algo=cfg.algo,
-            blocks=cfg.blocks,
-            threads=cfg.threads,
+        torch.ops._rocm_C.rocm_comms_all_reduce(
+            self._comms, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
 
     def all_gather(
@@ -301,13 +274,21 @@ class HipComms:
         staged = torch.empty(
             (self.world_size,) + shape, dtype=inp.dtype, device=inp.device
         )
-        self.comms.all_gather(
-            out=staged,
-            inp=self._as_input(inp),
-            algo=cfg.algo,
-            blocks=cfg.blocks,
-            threads=cfg.threads,
+        torch.ops._rocm_C.rocm_comms_all_gather(
+            self._comms, staged, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
         return staged.movedim(0, dim).reshape(
             shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
         )
+
+    def close(self) -> None:
+        """Release the context, NOW. Idempotent.
+
+        THE HANDLE IS AN `int`, so nothing collects it: dropping this object frees the
+        tensors and leaves the C++ side holding every peer handle it opened. The
+        communicator above calls this from its own `close`, which vLLM's teardown calls.
+        """
+        if getattr(self, "_comms", None) is None:
+            return
+        torch.ops._rocm_C.rocm_comms_dispose(self._comms)
+        self._comms = None

@@ -1146,9 +1146,6 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
-        # HIP collectives compiled on first use by rocm_comms.hip_kernel: the source
-        # has to sit beside the module that compiles it.
-        "distributed/device_communicators/rocm_comms/*.cu",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",

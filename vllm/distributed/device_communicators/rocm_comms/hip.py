@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All
 # rights reserved.
 
-"""The HIP backend: our own kernel, compiled on first use by `hip_kernel`."""
+"""The HIP backend: our own kernel in `_rocm_C`, tuned and driven by `hip_kernel`."""
 
 import logging
 from contextlib import AbstractContextManager
@@ -17,13 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class HipCommunicator(Communicator):
-    """Communicator over HIP collectives we own: `hip_kernel.cu` beside this file,
-    compiled by
-    `hip_kernel.py`, depending on torch and the HIP runtime only.
+    """Communicator over HIP collectives we own: `csrc/rocm/rocm_comms.cu`, built into
+    `_rocm_C` and driven by `hip_kernel.py`.
 
-    Self-disables on an unsupported arch or world size. A failed COMPILE instead RAISES
-    -- disabling would let vLLM fall back to its own all-reduce and report the run
-    READY.
+    Self-disables on an unsupported arch or world size. It does NOT self-disable when
+    the ops are missing: that means a build without them, and falling back quietly would
+    let vLLM use its own all-reduce and report the run READY.
     """
 
     # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
@@ -104,9 +103,12 @@ class HipCommunicator(Communicator):
         return self._comms.capture()
 
     def _on_close(self) -> None:
-        # Dropping this runs `~Comms()`, which calls `hipIpcCloseMemHandle` on every
-        # peer base it opened. That is the release worth being deterministic about: the
-        # handles are a per-process resource, and a construct/destroy cycle that leaks
-        # them fails later and elsewhere.
+        # CALLED, not collected. The context lives behind an opaque handle now, so
+        # dropping this reference frees nothing: `close()` is what runs `~Comms()` and
+        # its `hipIpcCloseMemHandle` on every peer base it opened. The handles are a
+        # per-process resource, and a construct/destroy cycle that leaks them fails
+        # later and elsewhere.
+        if self._comms is not None:
+            self._comms.close()
         self._comms = None
         self.disabled = True
