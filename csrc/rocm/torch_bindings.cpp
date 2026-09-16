@@ -81,35 +81,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 
-  // ROCm TP collectives. The context is a stateful object behind an opaque handle, so
-  // everything but the two collectives is a CPU-side call on that handle; only
-  // all_reduce/all_gather touch tensors and therefore carry a device impl.
-  rocm_ops.def(
-      "rocm_comms_init(int rank, int world_size, int self_signal, "
-      "int[][] signal_handles, int[] signal_offsets, int peer_slab, "
-      "int peer_slab_bytes) -> int");
-  rocm_ops.impl("rocm_comms_init", torch::kCPU, &rocm_comms_init);
-
-  rocm_ops.def("rocm_comms_dispose(int comms) -> ()");
-  rocm_ops.impl("rocm_comms_dispose", torch::kCPU, &rocm_comms_dispose);
-
-  rocm_ops.def(
-      "rocm_comms_register_buffer(int comms, int[][] handles, int[] offsets, "
-      "int self_ptr) -> ()");
-  rocm_ops.impl("rocm_comms_register_buffer", torch::kCPU, &rocm_comms_register_buffer);
-
-  rocm_ops.def("rocm_comms_pending_graph_buffers(int comms) -> int[]");
-  rocm_ops.impl("rocm_comms_pending_graph_buffers", torch::kCPU,
-                &rocm_comms_pending_graph_buffers);
-
-  rocm_ops.def(
-      "rocm_comms_register_graph_buffers(int comms, int[][] handles, "
-      "int[][] offsets) -> ()");
-  rocm_ops.impl("rocm_comms_register_graph_buffers", torch::kCPU,
-                &rocm_comms_register_graph_buffers);
-
-  rocm_ops.def("rocm_comms_pending_count(int comms) -> int");
-  rocm_ops.impl("rocm_comms_pending_count", torch::kCPU, &rocm_comms_pending_count);
+  // ROCm TP collectives. Only the two collectives take tensors, so only they get a
+  // schema plus a device impl. THE REST TAKE NONE, and an op with no tensor argument
+  // has nothing for the dispatcher to select a backend from -- a `kCPU` impl is then
+  // unreachable and the call raises "no fallback function is registered". So they are
+  // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
+  rocm_ops.def("rocm_comms_init", &rocm_comms_init);
+  rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
+  rocm_ops.def("rocm_comms_register_buffer", &rocm_comms_register_buffer);
+  rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);
+  rocm_ops.def("rocm_comms_register_graph_buffers", &rocm_comms_register_graph_buffers);
+  rocm_ops.def("rocm_comms_pending_count", &rocm_comms_pending_count);
+  rocm_ops.def("rocm_comms_handle_and_offset", &rocm_comms_handle_and_offset);
+  rocm_ops.def("rocm_comms_sizes", &rocm_comms_sizes);
 
   rocm_ops.def(
       "rocm_comms_all_reduce(int comms, Tensor! out, Tensor inp, int algo, "
@@ -120,13 +104,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rocm_comms_all_gather(int comms, Tensor! out, Tensor inp, int algo, "
       "int blocks, int threads) -> ()");
   rocm_ops.impl("rocm_comms_all_gather", torch::kCUDA, &rocm_comms_all_gather);
-
-  rocm_ops.def("rocm_comms_handle_and_offset(int ptr) -> (int[], int)");
-  rocm_ops.impl("rocm_comms_handle_and_offset", torch::kCPU,
-                &rocm_comms_handle_and_offset);
-
-  rocm_ops.def("rocm_comms_sizes() -> int[]");
-  rocm_ops.impl("rocm_comms_sizes", torch::kCPU, &rocm_comms_sizes);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
