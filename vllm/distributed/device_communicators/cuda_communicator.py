@@ -6,7 +6,6 @@ import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_allreduce,
@@ -83,7 +82,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
-        self.aiter_comm = None
+        self.rocm_comm = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
@@ -101,18 +100,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if self.world_size > 1:
             if current_platform.is_rocm():
-                if rocm_aiter_ops.is_comms_enabled():
-                    # Aiter handles small AR (<8MB) on ROCm; QR handles the rest.
-                    from aiter.ops.triton.comms.communicator import make_communicator
+                if envs.VLLM_ROCM_COMMS_BACKEND:
+                    # Our backends take small AR (<8MB) on ROCm; QR takes the rest.
+                    from vllm.distributed.device_communicators.rocm_comms import (
+                        make_communicator,
+                    )
 
                     # Pass both groups (mirrors DeviceCommunicatorBase): the
                     # torch reference backend runs torch.dist collectives over the
                     # device (nccl) group; iris uses neither (its own shmem). The
                     # backend picks what it needs.
-                    self.aiter_comm = make_communicator(
+                    self.rocm_comm = make_communicator(
                         cpu_group=self.cpu_group,
                         device_group=self.device_group,
                         device=self.device,
+                        backend=envs.VLLM_ROCM_COMMS_BACKEND,
                     )
                     self.qr_comm = QuickAllReduce(
                         group=self.cpu_group, device=self.device
@@ -289,13 +291,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        aiter_comm = self.aiter_comm
+        rocm_comm = self.rocm_comm
         if (
-            aiter_comm is not None
-            and not aiter_comm.disabled
-            and aiter_comm.should_allreduce(input_)
+            rocm_comm is not None
+            and not rocm_comm.disabled
+            and rocm_comm.should_allreduce(input_)
         ):
-            out = aiter_comm.all_reduce(input_)
+            out = rocm_comm.all_reduce(input_)
             assert out is not None
             return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
@@ -349,13 +351,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        aiter_comm = self.aiter_comm
+        rocm_comm = self.rocm_comm
         if (
-            aiter_comm is not None
-            and not aiter_comm.disabled
-            and aiter_comm.should_allgather(input_)
+            rocm_comm is not None
+            and not rocm_comm.disabled
+            and rocm_comm.should_allgather(input_)
         ):
-            out = aiter_comm.all_gather(input_, dim)
+            out = rocm_comm.all_gather(input_, dim)
             assert out is not None
             return out
         return super().all_gather(input_, dim)
@@ -464,8 +466,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.aiter_comm is not None:
-            self.aiter_comm = None
+        if self.rocm_comm is not None:
+            self.rocm_comm.close()
+            self.rocm_comm = None
         if self.qr_comm is not None:
             self.qr_comm = None
         if self.ca_comm is not None:

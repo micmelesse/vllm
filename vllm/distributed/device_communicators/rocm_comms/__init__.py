@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MIT Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All
+# rights reserved.
+
+"""ROCm TP collective backends: one interface, one file per implementation.
+
+    base      the Communicator interface, and the admission rules every backend shares
+    hip       our own kernel, compiled on first use (hip.cu, hip_kernel.py)
+    iris      iris's GPU-initiated collectives
+    torch     torch.distributed, the oracle the others are measured against
+
+WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN. Nothing here reads the
+environment or vLLM's config: this package takes process groups, a device and a backend
+name, and knows nothing else about the program around it.
+"""
+
+import logging
+from typing import Literal, get_args
+
+import torch
+from torch.distributed import ProcessGroup
+
+from .base import _DEFAULT_MAX_SIZE, Communicator
+
+logger = logging.getLogger(__name__)
+
+# THE BACKENDS THERE ARE, one file each beside this one. `vllm.envs` states the same set
+# for the env var it reads; the two meet where the value is passed in, so a name vLLM
+# admits and this package does not is a type error at that call rather than a surprise.
+Backend = Literal["hip", "iris", "torch"]
+
+__all__ = ["Backend", "Communicator", "make_communicator"]
+
+
+def make_communicator(
+    cpu_group: ProcessGroup,
+    device_group: ProcessGroup,
+    device: int | str | torch.device,
+    backend: Backend,
+    max_size: int = _DEFAULT_MAX_SIZE,
+) -> Communicator:
+    """Construct the TP collective backend at the one branching point.
+
+    Takes both of vLLM's process groups and each backend uses what it needs. The backend
+    comes from the `backend` argument or `VLLM_ROCM_COMMS_BACKEND`, with NO default, so
+    it is always an explicit choice; a missing or unknown one raises.
+
+    Unavailability does NOT raise -- the caller checks `.disabled`. A config error does.
+
+    IMPORTED ONE AT A TIME: `iris` needs the iris package installed and `hip` compiles a
+    kernel on first use, so naming one backend must not cost the others.
+    """
+    if backend not in get_args(Backend):
+        raise ValueError(
+            f"unknown communicator backend {backend!r}; there is "
+            f"{', '.join(get_args(Backend))}"
+        )
+    logger.info("rocm_comms make_communicator: backend=%s", backend)
+    if backend == "iris":
+        from .iris import IrisCommunicator
+
+        return IrisCommunicator(cpu_group, device_group, device, max_size)
+    if backend == "torch":
+        from .torch import TorchCommunicator
+
+        return TorchCommunicator(cpu_group, device_group, device, max_size)
+    if backend == "hip":
+        from .hip import HipCommunicator
+
+        return HipCommunicator(cpu_group, device_group, device, max_size)
+    raise AssertionError(f"backend {backend!r} is in Backend and has no branch here")

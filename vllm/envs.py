@@ -128,7 +128,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
-    VLLM_ROCM_USE_AITER_COMMS: bool = False
+    VLLM_ROCM_COMMS_BACKEND: Literal["hip", "iris", "torch"] | None = None
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1173,9 +1173,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter allreduce for collective ops.
     # By default is disabled.
-    "VLLM_ROCM_USE_AITER_COMMS": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_COMMS", "False").lower() in ("true", "1")
-    ),
+    # Which ROCm TP collective backend handles small all-reduce, or unset for none.
+    # The set of names is `rocm_comms.Backend`.
+    "VLLM_ROCM_COMMS_BACKEND": lambda: os.getenv("VLLM_ROCM_COMMS_BACKEND") or None,
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
