@@ -37,8 +37,8 @@ from vllm.distributed.device_communicators.rocm_comms import (
     make_communicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
-from vllm.distributed.device_communicators.rocm_comms.iris import (  # noqa: F401
-    IrisCommunicator,  # re-enabled by uncommenting it in BACKENDS below
+from vllm.distributed.device_communicators.rocm_comms.iris import (
+    IrisCommunicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.parallel_state import (
@@ -149,13 +149,35 @@ def _atol(op_name: str, dtype: torch.dtype) -> float:
 _BACKEND_CLASS = {
     "torch": TorchCommunicator,  # the known-good reference
     "hip": HipCommunicator,
-    # "iris": IrisCommunicator,     # someone else's kernel; re-enable to measure
-    # against it
+    "iris": IrisCommunicator,  # someone else's kernel; expected to fail, see below
+}
+
+# WHAT WE ALREADY KNOW IS BROKEN, and why it stays in the matrix anyway. A backend left
+# out is a backend nobody measures; a backend in and red is a suite nobody trusts. `xfail`
+# is the third option: the case runs, its failure is expected and quiet, and the day it
+# passes pytest says XPASS instead of going quietly green.
+#
+# iris serves and computes WRONG ANSWERS -- gsm8k 0.000 against baseline's 0.805 on
+# 2026-09-14 -- and on 2026-09-17 it stopped serving at all, raising inside all_gather.
+# It is not ours; we measure against it.
+#
+# NOT STRICT, because we do not yet know which of the three modes it fails. Strict turns
+# an XPASS into a failure, which is what you want once the expectation is precise -- so
+# tighten this to the modes that actually fail as soon as one run says which they are.
+EXPECTED_TO_FAIL = {
+    "iris": "iris computes wrong answers (gsm8k 0.000, 2026-09-14) and has since stopped "
+            "serving (all_gather raises, 2026-09-17)",
 }
 
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
-BACKENDS = tuple(_BACKEND_CLASS)
+BACKENDS = tuple(
+    name if name not in EXPECTED_TO_FAIL
+    else pytest.param(
+        name, marks=pytest.mark.xfail(reason=EXPECTED_TO_FAIL[name], strict=False)
+    )
+    for name in _BACKEND_CLASS
+)
 
 
 # Enumerated rather than property-generated: a shrinking framework cannot drive across
