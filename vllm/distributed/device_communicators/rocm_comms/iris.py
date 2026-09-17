@@ -5,13 +5,10 @@
 
 import logging
 from dataclasses import dataclass
-from typing import get_args
 
 import torch
-from torch.distributed import ProcessGroup
 
-from .base import Communicator, WorldSize, rocm_arch_available
-from .tunables import Tunables
+from .base import Communicator
 
 logger = logging.getLogger(__name__)
 
@@ -37,49 +34,30 @@ def _iris_available() -> bool:
 class IrisCommunicator(Communicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
-    API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
-    tunables), should_allreduce, all_reduce (out-of-place), capture, plus
-    disabled. Iris drives its own GPU-initiated CCL over a symmetric heap, so it
-    uses neither torch group for collectives; it accepts both for interface
-    parity with the other backends (and any future CPU-side coordination).
+    Iris drives its own GPU-initiated CCL over a symmetric heap, so it uses neither
+    torch group for collectives; it accepts both for interface parity with the other
+    backends (and any future CPU-side coordination).
+
+    THE HEAP IS ALLOCATED IN `_open`, which runs only once the shared gates pass -- 8 GB
+    is not something to take on a box whose width we do not serve.
     """
 
-    def __init__(
-        self,
-        cpu_group: ProcessGroup,
-        device_group: ProcessGroup,
-        device: int | str | torch.device,
-        tunables: Tunables,
-    ) -> None:
-        self.disabled = True
-        self.cpu_group = cpu_group
-        self.device_group = device_group
-        self.tunables = tunables
-        # Iris's own numbers, constructed here and settable by nobody.
-        self.iris = IrisTunables()
-        self._shmem = None
-        self._workspace = None
-        self._input_buf = None
-        self._buf_shape = None
-        self._buf_dtype = None
-        self._ag_input_slab = None
-        self._ag_output_slab = None
+    # Set in `_open`. Class attributes so a DISABLED communicator is still a safe
+    # object to hold and close.
+    iris: IrisTunables = IrisTunables()
+    _shmem = None
+    _gluon_config = None
+    _workspace = None
+    _input_buf = None
+    _buf_shape = None
+    _buf_dtype = None
+    _ag_input_slab = None
+    _ag_output_slab = None
 
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        assert isinstance(device, torch.device)
-        self.device = device
-
-        if not rocm_arch_available():
-            logger.debug("IrisCommunicator disabled: unsupported ROCm arch")
-            return
-
+    def _open(self) -> bool:
         if not _iris_available():
-            logger.warning("Iris library not available. Allreduce disabled.")
-            return
-
+            logger.warning("IrisCommunicator disabled: the iris package is not here")
+            return False
         try:
             import iris
             from iris.ccl.config import Config as CclConfig
@@ -87,40 +65,41 @@ class IrisCommunicator(Communicator):
             self._shmem = iris.iris(heap_size=self.iris.heap_bytes)
             self._gluon_config = CclConfig(use_gluon=self.iris.use_gluon)
         except Exception as e:
-            logger.warning("Failed to initialize Allreduce: %s", e)
-            return
+            logger.warning("IrisCommunicator disabled: iris failed to start: %s", e)
+            return False
 
-        world_size = self._shmem.num_ranks
-        self.world_size = world_size
-        if world_size not in get_args(WorldSize):
-            logger.debug(
-                "IrisCommunicator disabled: world_size=%d not in %s",
-                world_size,
-                get_args(WorldSize),
+        # ITS RANKS AND OURS MUST AGREE. iris counts its own, and every buffer below is
+        # sized by `self.world_size`, which came from the device group. They match in
+        # any arrangement we run; a mismatch would be a silently wrong shape, so it is
+        # a disable and not an assumption.
+        if self._shmem.num_ranks != self.world_size:
+            logger.warning(
+                "IrisCommunicator disabled: iris has %d ranks, the device group %d",
+                self._shmem.num_ranks,
+                self.world_size,
             )
-            return
+            return False
 
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size
         # -- so a large enough input can still exhaust the heap at call time.
-        small = tunables.small_limit
+        small = self.tunables.small_limit
         if small * 2 > self.iris.heap_bytes or small > self.iris.slab_bytes:
             logger.warning(
-                "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back "
-                "the admitted bounds",
+                "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back a "
+                "%dMB small path",
                 self.iris.heap_bytes >> 30,
                 self.iris.slab_bytes >> 20,
+                small >> 20,
             )
-            return
-        self.disabled = False
+            return False
         logger.info(
             "IrisCommunicator ready: world_size=%d heap=%dGB small_limit=%dMB",
-            world_size,
+            self.world_size,
             self.iris.heap_bytes >> 30,
-            self.tunables.small_limit >> 20,
+            small >> 20,
         )
-
-    # No admission of its own: `_shmem is None` already means `disabled`.
+        return True
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:
@@ -167,7 +146,7 @@ class IrisCommunicator(Communicator):
         # symmetric heap never frees).
         if self._ag_input_slab is None:
             assert self._shmem is not None
-            world_size = self._shmem.num_ranks
+            world_size = self.world_size
             self._ag_input_slab = self._shmem.empty(
                 (self.iris.slab_bytes,), dtype=torch.uint8
             )
@@ -183,7 +162,7 @@ class IrisCommunicator(Communicator):
         try:
             if dim < 0:
                 dim += inp.dim()
-            world_size = self._shmem.num_ranks
+            world_size = self.world_size
             input_size = inp.size()
 
             input_buf, output_buf = self._get_allgather_buffers(inp.numel(), inp.dtype)

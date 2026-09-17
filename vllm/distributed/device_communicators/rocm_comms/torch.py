@@ -11,10 +11,8 @@ import logging
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from .base import Communicator
-from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
@@ -26,30 +24,18 @@ class TorchCommunicator(Communicator):
     Collectives run over `device_group` (nccl/rccl); the gloo `cpu_group` is accepted
     for interface parity and unused. It admits exactly what the others admit, taking the
     shared envelope unchanged.
+
+    NEITHER LIMIT IS ITS. torch.distributed runs on any arch at any width, so the two
+    gates `base.__init__` enforces are switched off here rather than inherited. A
+    control that disabled itself where the backends do would have nothing to compare
+    against exactly where the comparison is wanted.
+
+    Supplies no `_open` and no `_on_capture`: there is nothing to bring up, and nothing
+    to do around a capture.
     """
 
-    def __init__(
-        self,
-        cpu_group: ProcessGroup,
-        device_group: ProcessGroup,
-        device: int | str | torch.device,
-        tunables: Tunables,
-    ) -> None:
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        assert isinstance(device, torch.device)
-        self.cpu_group = cpu_group
-        self.device_group = device_group
-        self.device = device
-        self.tunables = tunables
-        self.world_size = dist.get_world_size(device_group)
-        self.disabled = False
-
-    # Supplies neither `_admits_*` nor `_on_capture`: it takes the shared envelope
-    # unchanged -- the control has to admit exactly what it is a control for -- and
-    # needs no capture handling.
+    _NEEDS_OUR_ARCH = False
+    _WORLD_SIZES = ()
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.clone()

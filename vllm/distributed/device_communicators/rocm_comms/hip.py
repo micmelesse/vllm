@@ -7,10 +7,9 @@ The kernel is `csrc/rocm/rocm_comms.cu`, compiled into vLLM's `_rocm_C` extensio
 the rest of the ROCm sources. This module calls the ops it registers; it compiles
 nothing and there is no cache to warm.
 
-TWO CLASSES, ONE FILE, like every other backend here. `PeerContext` is the peer memory
--- the IPC handshake, the signal block, registration -- and `HipCommunicator` is the
-`Communicator` over it. They were two modules and nothing but the second ever
-imported the first, while the package's own map has always said one file per backend.
+TWO CLASSES, ONE FILE, like every other backend here. `HipCommsImpl` is the peer
+memory -- the IPC handshake, the signal block, registration -- and `HipCommunicator`
+is the `Communicator` that delegates to it.
 
 THE SPLIT THAT DOES MATTER is between this file and the `.cu`. The `.cu` is mechanism
 and holds no policy; every decision -- which algorithm, how many blocks, how many
@@ -35,14 +34,13 @@ import logging
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, WorldSize, rocm_arch_available
-from .tunables import Tunables
+from .base import Communicator
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +86,13 @@ def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
     return out
 
 
-class PeerContext:
+class HipCommsImpl:
     """Peer memory: the IPC handshake, the signal block, the scratch, the registrations.
 
-    NAMED FOR WHAT IT IS, after being `HipComms` beside a `HipCommunicator` -- two
-    spellings of one word for two different things. A CONTEXT is the right word because
-    the defining property is that it must be opened, held and closed: the C++ object
-    crosses as an int, so nothing collects it.
+    `HipCommsImpl` and not `HipComms`, which read as a second spelling of
+    `HipCommunicator`. This is the implementation the communicator delegates to, and the
+    one thing to know about it is that it must be opened, held and CLOSED: the C++
+    object crosses as an int, so nothing collects it.
 
     ONE per process group, like vLLM's `CustomAllreduce`, because peer pointers are
     group-scoped. It knows nothing about which collective runs over it, which is the
@@ -324,64 +322,33 @@ class PeerContext:
 
 class HipCommunicator(Communicator):
     """Communicator over HIP collectives we own: `csrc/rocm/rocm_comms.cu`, built into
-    `_rocm_C` and driven by `py`.
+    `_rocm_C`, over the `HipCommsImpl` above.
 
-    Self-disables on an unsupported arch or world size. It does NOT self-disable when
-    the ops are missing: that means a build without them, and falling back quietly would
-    let vLLM use its own all-reduce and report the run READY.
+    It does NOT self-disable when the ops are missing: that means a build without them,
+    and falling back quietly would let vLLM use its own all-reduce and report the run
+    READY.
     """
 
-    def __init__(
-        self,
-        cpu_group: ProcessGroup,
-        device_group: ProcessGroup,
-        device: int | str | torch.device,
-        tunables: Tunables,
-    ) -> None:
-        # Disabled FIRST, so every early return below leaves a safe object rather than
-        # one whose disabled flag depends on how far __init__ got.
-        self.disabled = True
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        assert isinstance(device, torch.device)
-        self.cpu_group = cpu_group
-        self.device_group = device_group
-        self.device = device
-        self.tunables = tunables
-        # Hip's own numbers, constructed here and settable by nobody: they are this
-        # backend's internals, not a caller's choice.
-        self.hip_tunables = HipTunables()
-        self.world_size = dist.get_world_size(device_group)
+    # Set in `_open`, which runs only once the shared gates pass. Class attributes so a
+    # DISABLED communicator is still a safe object to close.
+    _impl: HipCommsImpl | None = None
+    hip_tunables: HipTunables = HipTunables()
 
-        if not rocm_arch_available():
-            logger.info("HipCommunicator disabled: unsupported ROCm arch")
-            return
-        if self.world_size not in get_args(WorldSize):
-            logger.info(
-                "HipCommunicator disabled: world_size=%d not in %s",
-                self.world_size,
-                get_args(WorldSize),
-            )
-            return
-
-        # EAGER, and after the disable checks: compiling inside vLLM's cudagraph capture
+    def _open(self) -> bool:
+        # EAGER, and after the shared gates: compiling inside vLLM's cudagraph capture
         # is not recoverable, and a box that cannot run this backend should not pay a
-        # build. The context owns the peer handshake and is built once per group, like
-        # CustomAllreduce; it knows nothing about which collective runs over it.  NOTE
-        # this line is a COLLECTIVE (it all-gathers IPC handles), so every rank must
-        # reach it. The disable checks above are uniform across a TP group in practice
+        # build. NOTE this line is a COLLECTIVE (it all-gathers IPC handles), so every
+        # rank must reach it. The gates above are uniform across a TP group in practice
         # -- same arch, same world size -- but if they ever were not, the ranks that got
         # here would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        self._peers = PeerContext(cpu_group, self.device, self.hip_tunables)
-        self.disabled = False
+        self._impl = HipCommsImpl(self.cpu_group, self.device, self.hip_tunables)
         logger.info(
             "HipCommunicator ready: world_size=%d small_limit=%dMB",
             self.world_size,
             self.tunables.small_limit >> 20,
         )
+        return True
 
     # No admission of its own. A two-stage reduce-scatter will need the count to divide
     # the ranks; the shipped kernel is one-shot and does not, and the baseline does not
@@ -390,27 +357,30 @@ class HipCommunicator(Communicator):
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks. The launch knobs are `HipTunables`."""
+        assert self._impl is not None
         out = torch.empty_like(inp)
-        self._peers.all_reduce(out, inp)
+        self._impl.all_reduce(out, inp)
         return out
 
     def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's `inp` along `dim`, rank-ordered."""
-        return self._peers.all_gather(inp.contiguous(), dim)
+        assert self._impl is not None
+        return self._impl.all_gather(inp.contiguous(), dim)
 
     def _on_capture(self) -> AbstractContextManager[None]:
         # A captured input's address is not registered when the launch is recorded, so
-        # the context reserves a slot during capture and exchanges the IPC handles on
-        # the way out.
-        return self._peers.capture()
+        # the impl reserves a slot during capture and exchanges the IPC handles on the
+        # way out.
+        assert self._impl is not None
+        return self._impl.capture()
 
     def _on_close(self) -> None:
-        # CALLED, not collected. The context lives behind an opaque handle now, so
-        # dropping this reference frees nothing: `close()` is what runs `~Comms()` and
-        # its `hipIpcCloseMemHandle` on every peer base it opened. The handles are a
+        # CALLED, not collected. The impl lives behind an opaque handle, so dropping
+        # this reference frees nothing: `close()` is what runs `~Comms()` and its
+        # `hipIpcCloseMemHandle` on every peer base it opened. The handles are a
         # per-process resource, and a construct/destroy cycle that leaks them fails
         # later and elsewhere.
-        if self._peers is not None:
-            self._peers.close()
-        self._peers = None
+        if self._impl is not None:
+            self._impl.close()
+        self._impl = None
         self.disabled = True

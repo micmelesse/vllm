@@ -14,9 +14,11 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from .tunables import Tunables
 
@@ -38,18 +40,24 @@ WorldSize = Literal[2, 4, 8]
 SUPPORTED_ARCHS = ("gfx94", "gfx95")
 
 
-def rocm_arch_available() -> bool:
-    """Whether this box is one our kernels were built for.
-
-    NO UNDERSCORE: both backends import it, so it is part of this module's surface
-    whatever the name claims.
-    """
+def _rocm_arch_available() -> bool:
+    """Whether this box is one our kernels were built for. PRIVATE: `__init__` runs it,
+    so no backend has to know it exists."""
     try:
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
         return any(gfx in gcn_arch for gfx in SUPPORTED_ARCHS)
     except Exception:
         return False
+
+
+def _as_device(device: int | str | torch.device) -> torch.device:
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    if isinstance(device, str):
+        return torch.device(device)
+    assert isinstance(device, torch.device)
+    return device
 
 
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
@@ -77,15 +85,22 @@ class Communicator(ABC):
     # and fall back on the others.
     _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
-    # Class attributes, so a backend needs no cooperating `__init__` to get either
-    # invariant.
     _capturing: bool = False
     _closed: bool = False
+
+    # WHAT THIS BACKEND CAN SERVE, DECLARED AND NOT CHECKED. `__init__` enforces both,
+    # so a backend states its limits and never writes the gate -- which is what stopped
+    # `_rocm_arch_available` and the world-size list from being things two backends
+    # imported. Empty `_WORLD_SIZES` means any width, which is torch: it is a control,
+    # not one of our kernels, so neither limit is its.
+    _NEEDS_OUR_ARCH: bool = True
+    _WORLD_SIZES: tuple[int, ...] = get_args(WorldSize)
 
     # WHAT THE BASE OWNS, and therefore what a backend may not override -- checked
     # when the class is DEFINED. `_is_supported` is private and still belongs here: a
     # backend redefining it would change what the shared envelope means.
     _OWNED = (
+        "__init__",
         "should_allreduce",
         "should_allgather",
         "all_reduce",
@@ -108,6 +123,43 @@ class Communicator(ABC):
                 f"`_on_close` instead -- what the kernel supports and how long it "
                 f"lives are not a backend's to redefine."
             )
+
+    def __init__(
+        self,
+        cpu_group: ProcessGroup,
+        device_group: ProcessGroup,
+        device: int | str | torch.device,
+        tunables: Tunables,
+    ) -> None:
+        """Every backend's construction, done ONCE here.
+
+        It was three copies of the same prelude -- normalise the device, keep the two
+        groups, read the world size, run the two availability gates -- and a backend now
+        supplies only `_open`, the part that is actually its own.
+
+        DISABLED FIRST, so every early return leaves a safe object rather than one whose
+        flag depends on how far this got. Unavailability is not an error: the caller
+        checks `.disabled`.
+        """
+        self.disabled = True
+        self.cpu_group = cpu_group
+        self.device_group = device_group
+        self.device = _as_device(device)
+        self.tunables = tunables
+        self.world_size = dist.get_world_size(device_group)
+        who = type(self).__name__
+        if self._NEEDS_OUR_ARCH and not _rocm_arch_available():
+            logger.info("%s disabled: unsupported ROCm arch", who)
+            return
+        if self._WORLD_SIZES and self.world_size not in self._WORLD_SIZES:
+            logger.info(
+                "%s disabled: world_size=%d not in %s",
+                who,
+                self.world_size,
+                self._WORLD_SIZES,
+            )
+            return
+        self.disabled = not self._open()
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
 
@@ -265,6 +317,15 @@ class Communicator(ABC):
     @abstractmethod
     def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
+
+    def _open(self) -> bool:
+        """Bring this backend up, having passed the shared gates. True when it is
+        usable; False leaves it disabled, which is not an error.
+
+        NOTHING, by default -- torch needs no setup. It is where a backend's OWN
+        availability checks go, the ones nobody else could run.
+        """
+        return True
 
     def _on_capture(self) -> AbstractContextManager[None]:
         """What this backend needs around a capture. Nothing, by default."""
