@@ -5,6 +5,7 @@
 
 import logging
 from contextlib import AbstractContextManager
+from typing import Literal, get_args
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,16 @@ from .tunables import Tunables
 logger = logging.getLogger(__name__)
 
 
+# THE `.cu`'s INSTANTIATION MENU, transcribed: `switch (world_size_)` in
+# `csrc/rocm/rocm_comms.cu` has case 2, 4 and 8, and `ngpus` is a template argument, so
+# this is what a kernel EXISTS for. A capability, not a tunable: adding 16 here without
+# adding the instantiation is a dispatch error at launch.
+#
+# NOT SHARED WITH IRIS, which declares its own. The two agree today and are different
+# facts: ours is this switch, iris's is iris's.
+WorldSize = Literal[2, 4, 8]
+
+
 class HipCommunicator(Communicator):
     """Communicator over HIP collectives we own: `csrc/rocm/rocm_comms.cu`, built into
     `_rocm_C` and driven by `hip_kernel.py`.
@@ -25,10 +36,6 @@ class HipCommunicator(Communicator):
     the ops are missing: that means a build without them, and falling back quietly would
     let vLLM use its own all-reduce and report the run READY.
     """
-
-    # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
-    # divisible by the world size, and these are the TP widths we actually run.
-    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
 
     def __init__(
         self,
@@ -57,11 +64,11 @@ class HipCommunicator(Communicator):
         if not _rocm_arch_available():
             logger.info("HipCommunicator disabled: unsupported ROCm arch")
             return
-        if self.world_size not in self._SUPPORTED_WORLD_SIZES:
+        if self.world_size not in get_args(WorldSize):
             logger.info(
                 "HipCommunicator disabled: world_size=%d not in %s",
                 self.world_size,
-                self._SUPPORTED_WORLD_SIZES,
+                get_args(WorldSize),
             )
             return
 

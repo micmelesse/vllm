@@ -5,6 +5,7 @@
 
 import logging
 from dataclasses import dataclass
+from typing import Literal, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -13,6 +14,12 @@ from .base import Communicator, _rocm_arch_available
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
+
+
+# The TP widths iris serves. A capability, not a tunable. Declared here and not shared
+# with hip: hip's identical set is a transcription of its `.cu` dispatch, a different
+# fact that happens to agree.
+WorldSize = Literal[2, 4, 8]
 
 
 @dataclass(frozen=True)
@@ -42,8 +49,6 @@ class IrisCommunicator(Communicator):
     uses neither torch group for collectives; it accepts both for interface
     parity with the other backends (and any future CPU-side coordination).
     """
-
-    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
 
     def __init__(
         self,
@@ -93,11 +98,11 @@ class IrisCommunicator(Communicator):
 
         world_size = self._shmem.num_ranks
         self.world_size = world_size
-        if world_size not in self._SUPPORTED_WORLD_SIZES:
+        if world_size not in get_args(WorldSize):
             logger.debug(
                 "IrisCommunicator disabled: world_size=%d not in %s",
                 world_size,
-                self._SUPPORTED_WORLD_SIZES,
+                get_args(WorldSize),
             )
             return
 
