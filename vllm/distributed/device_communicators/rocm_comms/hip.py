@@ -7,9 +7,12 @@ The kernel is `csrc/rocm/rocm_comms.cu`, compiled into vLLM's `_rocm_C` extensio
 the rest of the ROCm sources. This module calls the ops it registers; it compiles
 nothing and there is no cache to warm.
 
-TWO CLASSES, ONE FILE, like every other backend here. `HipCommsImpl` is the peer
-memory -- the IPC handshake, the signal block, registration -- and `HipCommunicator`
-is the `Communicator` that delegates to it.
+ONE CLASS, like every other backend here. The peer memory -- the IPC handshake, the
+signal block, the registrations -- was a `HipCommsImpl` the communicator delegated to,
+which bought nothing once `base` took over construction: the outer class was four
+forwarding methods, each opening with an assert that the inner one existed, and the two
+carried four same-named methods with different contracts (`all_reduce(out, inp)` against
+`all_reduce(inp)`). iris and torch each hold their own machinery in one class.
 
 THE SPLIT THAT DOES MATTER is between this file and the `.cu`. The `.cu` is mechanism
 and holds no policy; every decision -- which algorithm, how many blocks, how many
@@ -32,7 +35,7 @@ Python reference does not.
 
 import logging
 from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,51 +89,59 @@ def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
     return out
 
 
-class HipCommsImpl:
-    """Peer memory: the IPC handshake, the signal block, the scratch, the registrations.
-
-    `HipCommsImpl` and not `HipComms`, which read as a second spelling of
-    `HipCommunicator`. This is the implementation the communicator delegates to, and the
-    one thing to know about it is that it must be opened, held and CLOSED: the C++
-    object crosses as an int, so nothing collects it.
+class HipCommunicator(Communicator):
+    """Communicator over HIP collectives we own, and the peer memory they run on.
 
     ONE per process group, like vLLM's `CustomAllreduce`, because peer pointers are
-    group-scoped. It knows nothing about which collective runs over it, which is the
-    property that keeps a new workload from touching it.
+    group-scoped.
 
-    The handle EXCHANGE happens here rather than in C++: it is a collective over the
-    gloo `cpu_group`, and a process group is not something the kernel layer should know
-    about. C++ only opens the handles it is handed.
+    The handle EXCHANGE happens in Python rather than in C++: it is a collective over
+    the gloo `cpu_group`, and a process group is not something the kernel layer should
+    know about. C++ only opens the handles it is handed.
+
+    It does NOT self-disable when the ops are missing: that means a build without them,
+    and falling back quietly would let vLLM use its own all-reduce and report the run
+    READY.
     """
 
-    def __init__(
-        self,
-        cpu_group: ProcessGroup,
-        device: torch.device,
-        tunables: HipTunables,
-    ) -> None:
+    hip_tunables: HipTunables = HipTunables()
+
+    # Set in `_open`, which runs only once the shared gates pass. Declared here so a
+    # DISABLED communicator is still a safe object to hold and close.
+    _handle: int | None = None
+    _registered: dict[int, torch.UntypedStorage]
+
+    def _open(self) -> bool:
+        """Open the peer memory. A COLLECTIVE -- it all-gathers IPC handles -- so every
+        rank must reach it.
+
+        EAGER, and after the shared gates: doing this inside vLLM's cudagraph capture is
+        not recoverable, and a box that cannot run this backend should not pay for it.
+        The gates are uniform across a TP group in practice (same arch, same world
+        size), but if they ever were not, the ranks that got here would HANG waiting for
+        the ones that returned rather than failing. Worth knowing: a deadlock is far
+        worse than an error.
+        """
+        tunables = self.hip_tunables
         # The kernel's own constants, asked for rather than restated here.
         signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
-        self.cpu_group = cpu_group
-        self.device = device
-        self.tunables = tunables
-        self.rank = dist.get_rank(cpu_group)
-        self.world_size = dist.get_world_size(cpu_group)
-
+        self.rank = dist.get_rank(self.cpu_group)
         # ONE allocation per rank holds the signal block and the scratch after it, so
         # the two-stage algorithm needs no new buffer or handshake -- only a kernel.
         self._signal = torch.zeros(
-            signal_bytes + tunables.scratch_bytes, dtype=torch.uint8, device=device
+            signal_bytes + tunables.scratch_bytes, dtype=torch.uint8, device=self.device
         )
         # Device-side array of peer-pointer sets, one slot per registered buffer.
         self._slab = torch.zeros(
-            peer_ptrs_bytes * tunables.max_buffers, dtype=torch.uint8, device=device
+            peer_ptrs_bytes * tunables.max_buffers,
+            dtype=torch.uint8,
+            device=self.device,
         )
         # EVERY input is registered; nothing is ever copied. See `_as_input`. The value
         # is the input's STORAGE, held on purpose -- see `register`.
-        self._registered: dict[int, torch.UntypedStorage] = {}
+        self._registered = {}
 
         handles, offsets = self._exchange(self._signal.data_ptr())
         self._handle = torch.ops._rocm_C.rocm_comms_init(
@@ -143,12 +154,21 @@ class HipCommsImpl:
             self._slab.numel(),
         )
         # Say what will actually be launched, once. Otherwise a run tells you the answer
-        # was wrong but not what was asked for, and "what was it tuned to" is the
-        # first question every time.
-        print(
-            f"[hip_comms] rank {self.rank}/{self.world_size} ready: {tunables}",
-            flush=True,
+        # was wrong but not what was asked for, and "what was it tuned to" is the first
+        # question every time.
+        logger.info(
+            "HipCommunicator ready: rank %d/%d, small_limit=%dMB, %s",
+            self.rank,
+            self.world_size,
+            self.tunables.small_limit >> 20,
+            tunables,
         )
+        return True
+
+    # No admission of its own. A two-stage reduce-scatter will need the count to divide
+    # the ranks; the shipped kernel is one-shot and does not, and the baseline does not
+    # check it either, so adding it would refuse tensors both we and the path we replace
+    # can handle.
 
     def _exchange(self, ptr: int) -> tuple[list[list[int]], list[int]]:
         """Every rank's IPC handle + offset for its own `ptr`, in rank order. A handle
@@ -176,10 +196,10 @@ class HipCommsImpl:
         The cost is retention, and `HipTunables.max_buffers` bounds it.
         """
         ptr = tensor.data_ptr()
-        if len(self._registered) >= self.tunables.max_buffers:
+        if len(self._registered) >= self.hip_tunables.max_buffers:
             raise RuntimeError(
                 f"hip_comms: {len(self._registered)} registered buffers hits the "
-                f"{self.tunables.max_buffers} limit. Every collective input is "
+                f"{self.hip_tunables.max_buffers} limit. Every collective input is "
                 f"registered and held, so the caller allocates fresh buffers per step "
                 f"rather than reusing them; raise max_buffers or reuse."
             )
@@ -205,7 +225,7 @@ class HipCommsImpl:
         self._registered[ptr] = tensor.untyped_storage()
 
     @contextmanager
-    def capture(self) -> Iterator[None]:
+    def _on_capture(self) -> Iterator[None]:
         """Wrap a cudagraph capture. Buffers used inside are registered on EXIT.
 
         While capturing, an input's address is not registered yet, so the kernel layer
@@ -278,14 +298,16 @@ class HipCommsImpl:
         self.register(inp)
         return inp
 
-    def all_reduce(self, out: torch.Tensor, inp: torch.Tensor) -> None:
-        """Sum `inp` across every rank into `out`, in place."""
-        cfg = self.tunables
+    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """Sum `inp` across the TP ranks, out of place."""
+        cfg = self.hip_tunables
+        out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._handle, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
+        return out
 
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's `inp` along `dim`, rank-ordered.
 
         The kernel fills a RANK-MAJOR `(world, *inp.shape)` buffer and the axis is moved
@@ -293,7 +315,8 @@ class HipCommsImpl:
         reference in the correctness suite covers both. The `movedim`+`reshape` copy is
         a known cost and a later perf item, not a correctness one.
         """
-        cfg = self.tunables
+        cfg = self.hip_tunables
+        inp = inp.contiguous()
         if dim < 0:
             dim += inp.dim()
         shape = tuple(inp.size())
@@ -307,80 +330,17 @@ class HipCommsImpl:
             shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
         )
 
-    def close(self) -> None:
-        """Release the context, NOW. Idempotent.
+    def _on_close(self) -> None:
+        """Release the peer memory, NOW. Idempotent.
 
-        THE HANDLE IS AN `int`, so nothing collects it: dropping this object frees the
-        tensors and leaves the C++ side holding every peer handle it opened. The
-        communicator above calls this from its own `close`, which vLLM's teardown calls.
+        CALLED, not collected. THE HANDLE IS AN `int`, so dropping this object frees the
+        tensors and leaves the C++ side holding every peer handle it opened; this is
+        what runs `~Comms()` and its `hipIpcCloseMemHandle` on every peer base. The
+        handles are a per-process resource, and a construct/destroy cycle that leaks
+        them fails later and elsewhere.
         """
-        if getattr(self, "_handle", None) is None:
+        self.disabled = True
+        if self._handle is None:
             return
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
         self._handle = None
-
-
-class HipCommunicator(Communicator):
-    """Communicator over HIP collectives we own: `csrc/rocm/rocm_comms.cu`, built into
-    `_rocm_C`, over the `HipCommsImpl` above.
-
-    It does NOT self-disable when the ops are missing: that means a build without them,
-    and falling back quietly would let vLLM use its own all-reduce and report the run
-    READY.
-    """
-
-    # Set in `_open`, which runs only once the shared gates pass. Class attributes so a
-    # DISABLED communicator is still a safe object to close.
-    _impl: HipCommsImpl | None = None
-    hip_tunables: HipTunables = HipTunables()
-
-    def _open(self) -> bool:
-        # EAGER, and after the shared gates: compiling inside vLLM's cudagraph capture
-        # is not recoverable, and a box that cannot run this backend should not pay a
-        # build. NOTE this line is a COLLECTIVE (it all-gathers IPC handles), so every
-        # rank must reach it. The gates above are uniform across a TP group in practice
-        # -- same arch, same world size -- but if they ever were not, the ranks that got
-        # here would HANG waiting for the ones that returned, rather than failing. Worth
-        # knowing because a deadlock is far worse than an error.
-        self._impl = HipCommsImpl(self.cpu_group, self.device, self.hip_tunables)
-        logger.info(
-            "HipCommunicator ready: world_size=%d small_limit=%dMB",
-            self.world_size,
-            self.tunables.small_limit >> 20,
-        )
-        return True
-
-    # No admission of its own. A two-stage reduce-scatter will need the count to divide
-    # the ranks; the shipped kernel is one-shot and does not, and the baseline does not
-    # check it either, so adding it would refuse tensors both we and the path we replace
-    # can handle.
-
-    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """Sum `inp` across the TP ranks. The launch knobs are `HipTunables`."""
-        assert self._impl is not None
-        out = torch.empty_like(inp)
-        self._impl.all_reduce(out, inp)
-        return out
-
-    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
-        """Concatenate every rank's `inp` along `dim`, rank-ordered."""
-        assert self._impl is not None
-        return self._impl.all_gather(inp.contiguous(), dim)
-
-    def _on_capture(self) -> AbstractContextManager[None]:
-        # A captured input's address is not registered when the launch is recorded, so
-        # the impl reserves a slot during capture and exchanges the IPC handles on the
-        # way out.
-        assert self._impl is not None
-        return self._impl.capture()
-
-    def _on_close(self) -> None:
-        # CALLED, not collected. The impl lives behind an opaque handle, so dropping
-        # this reference frees nothing: `close()` is what runs `~Comms()` and its
-        # `hipIpcCloseMemHandle` on every peer base it opened. The handles are a
-        # per-process resource, and a construct/destroy cycle that leaks them fails
-        # later and elsewhere.
-        if self._impl is not None:
-            self._impl.close()
-        self._impl = None
-        self.disabled = True

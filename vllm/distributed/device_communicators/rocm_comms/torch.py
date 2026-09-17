@@ -25,17 +25,12 @@ class TorchCommunicator(Communicator):
     for interface parity and unused. It admits exactly what the others admit, taking the
     shared envelope unchanged.
 
-    NEITHER LIMIT IS ITS. torch.distributed runs on any arch at any width, so the two
-    gates `base.__init__` enforces are switched off here rather than inherited. A
-    control that disabled itself where the backends do would have nothing to compare
-    against exactly where the comparison is wanted.
-
-    Supplies no `_open` and no `_on_capture`: there is nothing to bring up, and nothing
+    Supplies no `_open` and no `_on_capture`: there is nothing to bring up and nothing
     to do around a capture.
-    """
 
-    _NEEDS_OUR_ARCH = False
-    _WORLD_SIZES = ()
+    It is gated on arch and width like the others even though torch.distributed is
+    neither -- see `base.__init__`. A control is only wanted where the backends run.
+    """
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.clone()

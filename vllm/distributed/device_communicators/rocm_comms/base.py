@@ -88,14 +88,6 @@ class Communicator(ABC):
     _capturing: bool = False
     _closed: bool = False
 
-    # WHAT THIS BACKEND CAN SERVE, DECLARED AND NOT CHECKED. `__init__` enforces both,
-    # so a backend states its limits and never writes the gate -- which is what stopped
-    # `_rocm_arch_available` and the world-size list from being things two backends
-    # imported. Empty `_WORLD_SIZES` means any width, which is torch: it is a control,
-    # not one of our kernels, so neither limit is its.
-    _NEEDS_OUR_ARCH: bool = True
-    _WORLD_SIZES: tuple[int, ...] = get_args(WorldSize)
-
     # WHAT THE BASE OWNS, and therefore what a backend may not override -- checked
     # when the class is DEFINED. `_is_supported` is private and still belongs here: a
     # backend redefining it would change what the shared envelope means.
@@ -134,8 +126,8 @@ class Communicator(ABC):
         """Every backend's construction, done ONCE here.
 
         It was three copies of the same prelude -- normalise the device, keep the two
-        groups, read the world size, run the two availability gates -- and a backend now
-        supplies only `_open`, the part that is actually its own.
+        groups, read the world size, gate on the hardware -- and a backend now supplies
+        only `_open`, the part that is actually its own.
 
         DISABLED FIRST, so every early return leaves a safe object rather than one whose
         flag depends on how far this got. Unavailability is not an error: the caller
@@ -147,16 +139,22 @@ class Communicator(ABC):
         self.device = _as_device(device)
         self.tunables = tunables
         self.world_size = dist.get_world_size(device_group)
+
+        # THE BOX, NOT THE BACKEND. Whether our kernels exist here is a fact about the
+        # arch and the build, and every backend in this package got the same answer --
+        # so it is asked once, unconditionally, rather than being something each one
+        # calls or switches off. torch is gated too: it is the CONTROL, and a control
+        # available where no backend is has nothing to be a control for.
         who = type(self).__name__
-        if self._NEEDS_OUR_ARCH and not _rocm_arch_available():
+        if not _rocm_arch_available():
             logger.info("%s disabled: unsupported ROCm arch", who)
             return
-        if self._WORLD_SIZES and self.world_size not in self._WORLD_SIZES:
+        if self.world_size not in get_args(WorldSize):
             logger.info(
                 "%s disabled: world_size=%d not in %s",
                 who,
                 self.world_size,
-                self._WORLD_SIZES,
+                get_args(WorldSize),
             )
             return
         self.disabled = not self._open()
@@ -319,11 +317,11 @@ class Communicator(ABC):
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
 
     def _open(self) -> bool:
-        """Bring this backend up, having passed the shared gates. True when it is
-        usable; False leaves it disabled, which is not an error.
+        """Bring this backend up. True when it is usable; False leaves it disabled,
+        which is not an error.
 
         NOTHING, by default -- torch needs no setup. It is where a backend's OWN
-        availability checks go, the ones nobody else could run.
+        availability checks go, the ones only it could run.
         """
         return True
 
