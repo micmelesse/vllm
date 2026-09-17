@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.rocm_comms import (
     Communicator,
     make_communicator,
@@ -721,7 +722,15 @@ def run_rank(
     init_distributed_environment(
         world_size=world, rank=rank, distributed_init_method=init_method
     )
-    ensure_model_parallel_initialized(world, pp)
+    # A CONFIG CONTEXT, because `ensure_model_parallel_initialized` builds vLLM's device
+    # communicators and those instantiate CustomOps, which read the current config. The
+    # aiter version of this test built its groups with plain `torch.distributed` and never
+    # touched `parallel_state`, so it needed none; the port does, and without it every rank
+    # dies with "Current vLLM config is not set" before a single collective runs.
+    # HERE AND NOT A FIXTURE: each rank is its own process, so a fixture in the parent is
+    # not in scope where the config is read.
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, pp)
     cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
     dist.all_reduce(
         torch.zeros(1).cuda(), group=group
