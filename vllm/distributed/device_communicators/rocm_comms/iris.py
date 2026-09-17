@@ -5,21 +5,15 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import get_args
 
 import torch
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, _rocm_arch_available
+from .base import Communicator, WorldSize, rocm_arch_available
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
-
-
-# The TP widths iris serves. A capability, not a tunable. Declared here and not shared
-# with hip: hip's identical set is a transcription of its `.cu` dispatch, a different
-# fact that happens to agree.
-WorldSize = Literal[2, 4, 8]
 
 
 @dataclass(frozen=True)
@@ -78,7 +72,7 @@ class IrisCommunicator(Communicator):
         assert isinstance(device, torch.device)
         self.device = device
 
-        if not _rocm_arch_available():
+        if not rocm_arch_available():
             logger.debug("IrisCommunicator disabled: unsupported ROCm arch")
             return
 

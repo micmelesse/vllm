@@ -7,9 +7,9 @@ The kernel is `csrc/rocm/rocm_comms.cu`, compiled into vLLM's `_rocm_C` extensio
 the rest of the ROCm sources. This module calls the ops it registers; it compiles
 nothing and there is no cache to warm.
 
-TWO CLASSES, ONE FILE, like every other backend here. `HipComms` is the peer-memory
-context -- the IPC handshake, the signal block, registration -- and `HipCommunicator` is
-the `Communicator` over it. They were two modules and nothing but the second ever
+TWO CLASSES, ONE FILE, like every other backend here. `PeerContext` is the peer memory
+-- the IPC handshake, the signal block, registration -- and `HipCommunicator` is the
+`Communicator` over it. They were two modules and nothing but the second ever
 imported the first, while the package's own map has always said one file per backend.
 
 THE SPLIT THAT DOES MATTER is between this file and the `.cu`. The `.cu` is mechanism
@@ -35,13 +35,13 @@ import logging
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, get_args
+from typing import Any, get_args
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, _rocm_arch_available
+from .base import Communicator, WorldSize, rocm_arch_available
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
@@ -88,8 +88,13 @@ def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
     return out
 
 
-class HipComms:
-    """The peer-memory context: IPC handshake, signal block, scratch, registration.
+class PeerContext:
+    """Peer memory: the IPC handshake, the signal block, the scratch, the registrations.
+
+    NAMED FOR WHAT IT IS, after being `HipComms` beside a `HipCommunicator` -- two
+    spellings of one word for two different things. A CONTEXT is the right word because
+    the defining property is that it must be opened, held and closed: the C++ object
+    crosses as an int, so nothing collects it.
 
     ONE per process group, like vLLM's `CustomAllreduce`, because peer pointers are
     group-scoped. It knows nothing about which collective runs over it, which is the
@@ -107,7 +112,7 @@ class HipComms:
         tunables: HipTunables,
     ) -> None:
         # The kernel's own constants, asked for rather than restated here.
-        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle = (
+        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
         self.cpu_group = cpu_group
@@ -130,7 +135,7 @@ class HipComms:
         self._registered: dict[int, torch.UntypedStorage] = {}
 
         handles, offsets = self._exchange(self._signal.data_ptr())
-        self._comms = torch.ops._rocm_C.rocm_comms_init(
+        self._handle = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
             self.world_size,
             self._signal.data_ptr(),
@@ -194,7 +199,7 @@ class HipComms:
                 f"every rank must register in the same order with the same shapes."
             )
         torch.ops._rocm_C.rocm_comms_register_buffer(
-            self._comms,
+            self._handle,
             [h for (h, _), _ in gathered],
             [o for (_, o), _ in gathered],
             ptr,
@@ -227,7 +232,7 @@ class HipComms:
         here would leave the others waiting in the gather. Nothing is registered when
         nothing is pending; the exchange still has to happen."""
         pending: Sequence[int] = torch.ops._rocm_C.rocm_comms_pending_graph_buffers(
-            self._comms
+            self._handle
         )
         # ONE collective for ALL of them, not one each. A capture records a buffer per
         # collective in the graph -- a layer each, in vLLM -- so per-buffer exchanges
@@ -250,7 +255,7 @@ class HipComms:
         # ONE ENTRY PER BUFFER, the world's handles laid end to end: the op splits them
         # back by handle size, because a schema nests two deep and this needs three.
         torch.ops._rocm_C.rocm_comms_register_graph_buffers(
-            self._comms,
+            self._handle,
             [[b for g in gathered for b in g[i][0]] for i in range(len(pending))],
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
@@ -279,7 +284,7 @@ class HipComms:
         """Sum `inp` across every rank into `out`, in place."""
         cfg = self.tunables
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._comms, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
+            self._handle, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -298,7 +303,7 @@ class HipComms:
             (self.world_size,) + shape, dtype=inp.dtype, device=inp.device
         )
         torch.ops._rocm_C.rocm_comms_all_gather(
-            self._comms, staged, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
+            self._handle, staged, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
         return staged.movedim(0, dim).reshape(
             shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
@@ -311,20 +316,10 @@ class HipComms:
         tensors and leaves the C++ side holding every peer handle it opened. The
         communicator above calls this from its own `close`, which vLLM's teardown calls.
         """
-        if getattr(self, "_comms", None) is None:
+        if getattr(self, "_handle", None) is None:
             return
-        torch.ops._rocm_C.rocm_comms_dispose(self._comms)
-        self._comms = None
-
-
-# THE `.cu`'s INSTANTIATION MENU, transcribed: `switch (world_size_)` in
-# `csrc/rocm/rocm_comms.cu` has case 2, 4 and 8, and `ngpus` is a template argument, so
-# this is what a kernel EXISTS for. A capability, not a tunable: adding 16 here without
-# adding the instantiation is a dispatch error at launch.
-#
-# NOT SHARED WITH IRIS, which declares its own. The two agree today and are different
-# facts: ours is this switch, iris's is iris's.
-WorldSize = Literal[2, 4, 8]
+        torch.ops._rocm_C.rocm_comms_dispose(self._handle)
+        self._handle = None
 
 
 class HipCommunicator(Communicator):
@@ -360,7 +355,7 @@ class HipCommunicator(Communicator):
         self.hip_tunables = HipTunables()
         self.world_size = dist.get_world_size(device_group)
 
-        if not _rocm_arch_available():
+        if not rocm_arch_available():
             logger.info("HipCommunicator disabled: unsupported ROCm arch")
             return
         if self.world_size not in get_args(WorldSize):
@@ -380,7 +375,7 @@ class HipCommunicator(Communicator):
         # -- same arch, same world size -- but if they ever were not, the ranks that got
         # here would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        self._comms = HipComms(cpu_group, self.device, self.hip_tunables)
+        self._peers = PeerContext(cpu_group, self.device, self.hip_tunables)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d small_limit=%dMB",
@@ -396,18 +391,18 @@ class HipCommunicator(Communicator):
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks. The launch knobs are `HipTunables`."""
         out = torch.empty_like(inp)
-        self._comms.all_reduce(out, inp)
+        self._peers.all_reduce(out, inp)
         return out
 
     def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's `inp` along `dim`, rank-ordered."""
-        return self._comms.all_gather(inp.contiguous(), dim)
+        return self._peers.all_gather(inp.contiguous(), dim)
 
     def _on_capture(self) -> AbstractContextManager[None]:
         # A captured input's address is not registered when the launch is recorded, so
         # the context reserves a slot during capture and exchanges the IPC handles on
         # the way out.
-        return self._comms.capture()
+        return self._peers.capture()
 
     def _on_close(self) -> None:
         # CALLED, not collected. The context lives behind an opaque handle now, so
@@ -415,7 +410,7 @@ class HipCommunicator(Communicator):
         # its `hipIpcCloseMemHandle` on every peer base it opened. The handles are a
         # per-process resource, and a construct/destroy cycle that leaks them fails
         # later and elsewhere.
-        if self._comms is not None:
-            self._comms.close()
-        self._comms = None
+        if self._peers is not None:
+            self._peers.close()
+        self._peers = None
         self.disabled = True

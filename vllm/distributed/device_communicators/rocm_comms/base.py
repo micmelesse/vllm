@@ -14,6 +14,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Literal
 
 import torch
 
@@ -21,12 +22,32 @@ from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
+# ---- THE CAPABILITIES EVERY BACKEND HERE IS BOUND BY. Not tunables: a tunable is a
+# number you may change with the code still correct, and changing one of these means
+# changing a kernel. They are declared ONCE, here, for the same reason the admission
+# envelope is: torch is the control, and a control that serves a superset is answering a
+# different question than the backends it is a control for. ----
 
-def _rocm_arch_available() -> bool:
+# THE WIDTHS OUR KERNELS EXIST FOR. `csrc/rocm/rocm_comms.cu` dispatches
+# `switch (world_size_)` over case 2, 4 and 8, and `ngpus` is a template argument, so
+# this is the instantiation menu; iris serves the same three. Adding 16 here without
+# adding the instantiation is a dispatch error at launch.
+WorldSize = Literal[2, 4, 8]
+
+# What `_rocm_C` is built for.
+SUPPORTED_ARCHS = ("gfx94", "gfx95")
+
+
+def rocm_arch_available() -> bool:
+    """Whether this box is one our kernels were built for.
+
+    NO UNDERSCORE: both backends import it, so it is part of this module's surface
+    whatever the name claims.
+    """
     try:
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        return any(gfx in gcn_arch for gfx in ["gfx94", "gfx95"])
+        return any(gfx in gcn_arch for gfx in SUPPORTED_ARCHS)
     except Exception:
         return False
 
