@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .base import Communicator
-from .config import Config
+from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class TorchCommunicator(Communicator):
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        config: Config,
+        tunables: Tunables,
     ) -> None:
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -43,7 +43,7 @@ class TorchCommunicator(Communicator):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = device
-        self.config = config
+        self.tunables = tunables
         self.world_size = dist.get_world_size(device_group)
         self.disabled = False
 

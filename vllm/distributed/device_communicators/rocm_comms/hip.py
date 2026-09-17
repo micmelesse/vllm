@@ -12,7 +12,7 @@ from torch.distributed import ProcessGroup
 
 from . import hip_kernel
 from .base import Communicator, _rocm_arch_available
-from .config import Config
+from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,7 @@ class HipCommunicator(Communicator):
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        config: Config,
-        hip: hip_kernel.HipConfig | None = None,
+        tunables: Tunables,
     ) -> None:
         # Disabled FIRST, so every early return below leaves a safe object rather than
         # one whose disabled flag depends on how far __init__ got.
@@ -49,8 +48,10 @@ class HipCommunicator(Communicator):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = device
-        self.config = config
-        self.hip = hip or hip_kernel.HipConfig()
+        self.tunables = tunables
+        # Hip's own numbers, constructed here and settable by nobody: they are this
+        # backend's internals, not a caller's choice.
+        self.hip_tunables = hip_kernel.HipTunables()
         self.world_size = dist.get_world_size(device_group)
 
         if not _rocm_arch_available():
@@ -73,12 +74,12 @@ class HipCommunicator(Communicator):
         # -- same arch, same world size -- but if they ever were not, the ranks that got
         # here would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        self._comms = hip_kernel.HipComms(cpu_group, self.device, self.hip)
+        self._comms = hip_kernel.HipComms(cpu_group, self.device, self.hip_tunables)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d small_limit=%dMB",
             self.world_size,
-            self.config.small_limit >> 20,
+            self.tunables.small_limit >> 20,
         )
 
     # No admission of its own. A two-stage reduce-scatter will need the count to divide
@@ -87,7 +88,7 @@ class HipCommunicator(Communicator):
     # can handle.
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """Sum `inp` across the TP ranks. The launch config is chosen in `hip_comms`."""
+        """Sum `inp` across the TP ranks. The launch knobs are `HipTunables`."""
         out = torch.empty_like(inp)
         self._comms.all_reduce(out, inp)
         return out

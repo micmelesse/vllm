@@ -17,7 +17,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 
-from .config import Config
+from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ class Communicator(ABC):
     """
 
     disabled: bool
-    config: Config
+    tunables: Tunables
     world_size: int
 
     # The admission envelope, shared by EVERY backend including torch. Uniform on
@@ -123,7 +123,7 @@ class Communicator(ABC):
         Nothing calls it to refuse work; it is the switch for when a second kernel
         exists.
         """
-        return inp.numel() * inp.element_size() < self.config.small_limit
+        return inp.numel() * inp.element_size() < self.tunables.small_limit
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE.

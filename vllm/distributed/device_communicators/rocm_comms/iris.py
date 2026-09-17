@@ -10,13 +10,13 @@ import torch
 from torch.distributed import ProcessGroup
 
 from .base import Communicator, _rocm_arch_available
-from .config import Config
+from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class IrisConfig:
+class IrisTunables:
     """Every arbitrary number this backend has, in one place."""
 
     heap_bytes: int = 2**33  # symmetric heap, 8 GB
@@ -37,7 +37,7 @@ class IrisCommunicator(Communicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
     API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
-    config), should_allreduce, all_reduce (out-of-place), capture, plus
+    tunables), should_allreduce, all_reduce (out-of-place), capture, plus
     disabled. Iris drives its own GPU-initiated CCL over a symmetric heap, so it
     uses neither torch group for collectives; it accepts both for interface
     parity with the other backends (and any future CPU-side coordination).
@@ -50,14 +50,14 @@ class IrisCommunicator(Communicator):
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        config: Config,
-        iris_config: IrisConfig | None = None,
+        tunables: Tunables,
     ) -> None:
         self.disabled = True
         self.cpu_group = cpu_group
         self.device_group = device_group
-        self.config = config
-        self.iris = iris_config or IrisConfig()
+        self.tunables = tunables
+        # Iris's own numbers, constructed here and settable by nobody.
+        self.iris = IrisTunables()
         self._shmem = None
         self._workspace = None
         self._input_buf = None
@@ -104,7 +104,7 @@ class IrisCommunicator(Communicator):
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size
         # -- so a large enough input can still exhaust the heap at call time.
-        small = config.small_limit
+        small = tunables.small_limit
         if small * 2 > self.iris.heap_bytes or small > self.iris.slab_bytes:
             logger.warning(
                 "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back "
@@ -118,7 +118,7 @@ class IrisCommunicator(Communicator):
             "IrisCommunicator ready: world_size=%d heap=%dGB small_limit=%dMB",
             world_size,
             self.iris.heap_bytes >> 30,
-            self.config.small_limit >> 20,
+            self.tunables.small_limit >> 20,
         )
 
     # No admission of its own: `_shmem is None` already means `disabled`.

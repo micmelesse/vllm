@@ -7,13 +7,13 @@ the rest of the ROCm sources. This module calls the ops it registers; it compile
 nothing and there is no cache to warm.
 
 THE SPLIT. The `.cu` is mechanism and holds no policy; every decision -- which
-algorithm, how many blocks, how many threads, how big a buffer -- is `HipConfig`, below.
+algorithm, how many blocks, how many threads, how big a buffer -- is `HipTunables`.
 Same shape as a Triton kernel with `@triton.autotune`: the kernel body has no heuristics
 and the meta-parameters are chosen outside it. A `if (size < N)` in the `.cu` would be a
 decision nobody can see, and the env var it eventually grows is how you end up with
 `VLLM_CUSTOM_ALLREDUCE_ALGO`.
 
-`HipConfig` is hip's alone. The tunables every backend shares are `config.Config`.
+`HipTunables` is hip's alone. What every backend shares is `tunables.Tunables`.
 
 `ngpus` and the dtype have to be compile-time to unroll and vectorize, so they select a
 template instantiation rather than being passed; the `.cu`'s dispatch names every
@@ -39,7 +39,7 @@ ALGO_ONE_SHOT = 0
 
 
 @dataclass(frozen=True)
-class HipConfig:
+class HipTunables:
     """Every arbitrary number this backend has, in one place.
 
     A SINGLE DEFAULT, deliberately: each field is a guess until there is a measurement,
@@ -91,7 +91,7 @@ class HipComms:
         self,
         cpu_group: ProcessGroup,
         device: torch.device,
-        config: HipConfig,
+        tunables: HipTunables,
     ) -> None:
         # The kernel's own constants, asked for rather than restated here.
         signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle = (
@@ -99,18 +99,18 @@ class HipComms:
         )
         self.cpu_group = cpu_group
         self.device = device
-        self.config = config
+        self.tunables = tunables
         self.rank = dist.get_rank(cpu_group)
         self.world_size = dist.get_world_size(cpu_group)
 
         # ONE allocation per rank holds the signal block and the scratch after it, so
         # the two-stage algorithm needs no new buffer or handshake -- only a kernel.
         self._signal = torch.zeros(
-            signal_bytes + config.scratch_bytes, dtype=torch.uint8, device=device
+            signal_bytes + tunables.scratch_bytes, dtype=torch.uint8, device=device
         )
         # Device-side array of peer-pointer sets, one slot per registered buffer.
         self._slab = torch.zeros(
-            peer_ptrs_bytes * config.max_buffers, dtype=torch.uint8, device=device
+            peer_ptrs_bytes * tunables.max_buffers, dtype=torch.uint8, device=device
         )
         # EVERY input is registered; nothing is ever copied. See `_as_input`. The value
         # is the input's STORAGE, held on purpose -- see `register`.
@@ -127,10 +127,10 @@ class HipComms:
             self._slab.numel(),
         )
         # Say what will actually be launched, once. Otherwise a run tells you the answer
-        # was wrong but not what was asked for, and "which config produced this" is the
+        # was wrong but not what was asked for, and "what was it tuned to" is the
         # first question every time.
         print(
-            f"[hip_comms] rank {self.rank}/{self.world_size} ready: {config}",
+            f"[hip_comms] rank {self.rank}/{self.world_size} ready: {tunables}",
             flush=True,
         )
 
@@ -157,13 +157,13 @@ class HipComms:
         caching allocator were free to recycle that block the peers would read whatever
         landed there next -- silent corruption. Keeping a reference makes the block
         un-recyclable, which is the invalidation problem answered by not having one.
-        The cost is retention, and `HipConfig.max_buffers` bounds it.
+        The cost is retention, and `HipTunables.max_buffers` bounds it.
         """
         ptr = tensor.data_ptr()
-        if len(self._registered) >= self.config.max_buffers:
+        if len(self._registered) >= self.tunables.max_buffers:
             raise RuntimeError(
                 f"hip_comms: {len(self._registered)} registered buffers hits the "
-                f"{self.config.max_buffers} limit. Every collective input is "
+                f"{self.tunables.max_buffers} limit. Every collective input is "
                 f"registered and held, so the caller allocates fresh buffers per step "
                 f"rather than reusing them; raise max_buffers or reuse."
             )
@@ -264,7 +264,7 @@ class HipComms:
 
     def all_reduce(self, out: torch.Tensor, inp: torch.Tensor) -> None:
         """Sum `inp` across every rank into `out`, in place."""
-        cfg = self.config
+        cfg = self.tunables
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._comms, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
         )
@@ -277,7 +277,7 @@ class HipComms:
         reference in the correctness suite covers both. The `movedim`+`reshape` copy is
         a known cost and a later perf item, not a correctness one.
         """
-        cfg = self.config
+        cfg = self.tunables
         if dim < 0:
             dim += inp.dim()
         shape = tuple(inp.size())
