@@ -11,7 +11,8 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from . import hip_kernel
-from .base import _DEFAULT_MAX_SIZE, Communicator, _rocm_arch_available
+from .base import Communicator, _rocm_arch_available
+from .config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ class HipCommunicator(Communicator):
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        max_size: int = _DEFAULT_MAX_SIZE,
+        config: Config,
+        hip: hip_kernel.HipConfig | None = None,
     ) -> None:
         # Disabled FIRST, so every early return below leaves a safe object rather than
         # one whose disabled flag depends on how far __init__ got.
@@ -47,7 +49,8 @@ class HipCommunicator(Communicator):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = device
-        self.max_size = max_size
+        self.config = config
+        self.hip = hip or hip_kernel.HipConfig()
         self.world_size = dist.get_world_size(device_group)
 
         if not _rocm_arch_available():
@@ -70,12 +73,12 @@ class HipCommunicator(Communicator):
         # -- same arch, same world size -- but if they ever were not, the ranks that got
         # here would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        self._comms = hip_kernel.HipComms(cpu_group, self.device)
+        self._comms = hip_kernel.HipComms(cpu_group, self.device, self.hip)
         self.disabled = False
         logger.info(
-            "HipCommunicator ready: world_size=%d max_size=%dMB",
+            "HipCommunicator ready: world_size=%d small_limit=%dMB",
             self.world_size,
-            self.max_size >> 20,
+            self.config.small_limit >> 20,
         )
 
     # No admission of its own. A two-stage reduce-scatter will need the count to divide

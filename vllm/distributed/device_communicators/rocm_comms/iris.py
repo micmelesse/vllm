@@ -4,13 +4,24 @@
 """The iris backend: GPU-initiated collectives over iris's own symmetric heap."""
 
 import logging
+from dataclasses import dataclass
 
 import torch
 from torch.distributed import ProcessGroup
 
-from .base import _DEFAULT_MAX_SIZE, Communicator, _rocm_arch_available
+from .base import Communicator, _rocm_arch_available
+from .config import Config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IrisConfig:
+    """Every arbitrary number this backend has, in one place."""
+
+    heap_bytes: int = 2**33  # symmetric heap, 8 GB
+    slab_bytes: int = 2**25  # all-gather, 32 MB per rank
+    use_gluon: bool = True
 
 
 def _iris_available() -> bool:
@@ -26,27 +37,27 @@ class IrisCommunicator(Communicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
     API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
-    max_size), should_allreduce, all_reduce (out-of-place), capture, plus
+    config), should_allreduce, all_reduce (out-of-place), capture, plus
     disabled. Iris drives its own GPU-initiated CCL over a symmetric heap, so it
     uses neither torch group for collectives; it accepts both for interface
     parity with the other backends (and any future CPU-side coordination).
     """
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-    _HEAP_SIZE = 2**33  # 8 GB
-    _AG_SLAB_SIZE = 2**25  # 32 MB per rank
 
     def __init__(
         self,
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        max_size: int = _DEFAULT_MAX_SIZE,
+        config: Config,
+        iris_config: IrisConfig | None = None,
     ) -> None:
         self.disabled = True
         self.cpu_group = cpu_group
         self.device_group = device_group
-        self.max_size = max_size
+        self.config = config
+        self.iris = iris_config or IrisConfig()
         self._shmem = None
         self._workspace = None
         self._input_buf = None
@@ -72,10 +83,10 @@ class IrisCommunicator(Communicator):
 
         try:
             import iris
-            from iris.ccl.config import Config
+            from iris.ccl.config import Config as CclConfig
 
-            self._shmem = iris.iris(heap_size=self._HEAP_SIZE)
-            self._gluon_config = Config(use_gluon=True)
+            self._shmem = iris.iris(heap_size=self.iris.heap_bytes)
+            self._gluon_config = CclConfig(use_gluon=self.iris.use_gluon)
         except Exception as e:
             logger.warning("Failed to initialize Allreduce: %s", e)
             return
@@ -93,20 +104,21 @@ class IrisCommunicator(Communicator):
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size
         # -- so a large enough input can still exhaust the heap at call time.
-        if max_size * 2 > self._HEAP_SIZE or max_size > self._AG_SLAB_SIZE:
+        small = config.small_limit
+        if small * 2 > self.iris.heap_bytes or small > self.iris.slab_bytes:
             logger.warning(
                 "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back "
                 "the admitted bounds",
-                self._HEAP_SIZE >> 30,
-                self._AG_SLAB_SIZE >> 20,
+                self.iris.heap_bytes >> 30,
+                self.iris.slab_bytes >> 20,
             )
             return
         self.disabled = False
         logger.info(
-            "IrisCommunicator ready: world_size=%d heap=%dGB max_size=%dMB",
+            "IrisCommunicator ready: world_size=%d heap=%dGB small_limit=%dMB",
             world_size,
-            self._HEAP_SIZE >> 30,
-            self.max_size >> 20,
+            self.iris.heap_bytes >> 30,
+            self.config.small_limit >> 20,
         )
 
     # No admission of its own: `_shmem is None` already means `disabled`.
@@ -158,10 +170,10 @@ class IrisCommunicator(Communicator):
             assert self._shmem is not None
             world_size = self._shmem.num_ranks
             self._ag_input_slab = self._shmem.empty(
-                (self._AG_SLAB_SIZE,), dtype=torch.uint8
+                (self.iris.slab_bytes,), dtype=torch.uint8
             )
             self._ag_output_slab = self._shmem.empty(
-                (world_size, self._AG_SLAB_SIZE), dtype=torch.uint8
+                (world_size, self.iris.slab_bytes), dtype=torch.uint8
             )
         input_buf = self._ag_input_slab.view(dtype)[:numel].view(1, numel)
         output_buf = self._ag_output_slab.view(dtype)[:, :numel]

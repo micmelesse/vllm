@@ -17,12 +17,9 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 
-logger = logging.getLogger(__name__)
+from .config import Config
 
-# vLLM's CustomAllreduce default, and the only bound its admission uses. That class is
-# what these backends replace, so the envelope is transcribed from it rather than
-# invented.
-_DEFAULT_MAX_SIZE = 8 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def _rocm_arch_available() -> bool:
@@ -50,7 +47,7 @@ class Communicator(ABC):
     """
 
     disabled: bool
-    max_size: int
+    config: Config
     world_size: int
 
     # The admission envelope, shared by EVERY backend including torch. Uniform on
@@ -121,17 +118,18 @@ class Communicator(ABC):
         )
 
     def _is_small(self, inp: torch.Tensor) -> bool:
-        """Whether `inp` is under `max_size` -- the line that used to pick between this
-        backend and QuickReduce, and now picks between this backend's OWN paths. Nothing
-        calls it to refuse work; it is the switch for when a second kernel exists.
+        """Whether `inp` is under `small_limit` -- the line that used to pick between
+        this backend and QuickReduce, and now picks between this backend's OWN paths.
+        Nothing calls it to refuse work; it is the switch for when a second kernel
+        exists.
         """
-        return inp.numel() * inp.element_size() < self.max_size
+        return inp.numel() * inp.element_size() < self.config.small_limit
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE.
 
         The size used to decide whether the caller kept it or handed it to QuickReduce,
-        so an arm named for a backend was that backend under `max_size` and something
+        so an arm named for a backend was that backend under the limit and something
         else above it. Now the collective is ours and `_is_small` picks which of OUR
         paths it takes.
 
@@ -145,7 +143,7 @@ class Communicator(ABC):
         if self._is_small(inp):
             return self._all_reduce(inp)
         else:
-            # OVER `max_size`. Used to be QuickReduce's; ours now, and its own kernel
+            # OVER `small_limit`. Used to be QuickReduce's; ours now, and its own kernel
             # when there is one.
             return self._all_reduce(inp)
 

@@ -36,6 +36,7 @@ from vllm.distributed.device_communicators.rocm_comms import (
     Communicator,
     make_communicator,
 )
+from vllm.distributed.device_communicators.rocm_comms.config import Config
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
@@ -862,7 +863,8 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
     only, so closing it needs a kernel.
     """
     ours = object.__new__(TorchCommunicator)
-    ours.disabled, ours.world_size, ours.max_size = False, world_size, BASELINE_MAX_SIZE
+    ours.disabled, ours.world_size = False, world_size
+    ours.config = Config(small_limit=BASELINE_MAX_SIZE)
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real

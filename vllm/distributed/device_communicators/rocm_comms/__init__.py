@@ -3,6 +3,7 @@
 
 """ROCm TP collective backends: one interface, one file per implementation.
 
+    config    the tunable parameters every backend shares
     base      the Communicator interface, and the admission rules every backend shares
     hip       our own kernel, built into `_rocm_C` (csrc/rocm/rocm_comms.cu)
     iris      iris's GPU-initiated collectives
@@ -19,7 +20,8 @@ from typing import Literal, get_args
 import torch
 from torch.distributed import ProcessGroup
 
-from .base import _DEFAULT_MAX_SIZE, Communicator
+from .base import Communicator
+from .config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,6 @@ def make_communicator(
     device_group: ProcessGroup,
     device: int | str | torch.device,
     backend: Backend,
-    max_size: int = _DEFAULT_MAX_SIZE,
 ) -> Communicator:
     """Construct the TP collective backend at the one branching point.
 
@@ -54,17 +55,20 @@ def make_communicator(
             f"unknown communicator backend {backend!r}; there is "
             f"{', '.join(get_args(Backend))}"
         )
-    logger.info("rocm_comms make_communicator: backend=%s", backend)
+    # FILLED IN HERE, not asked for. The tunables are this package's own business, so a
+    # caller picks a backend and nothing else; `config` is what the backends are handed.
+    config = Config()
+    logger.info("rocm_comms make_communicator: backend=%s config=%s", backend, config)
     if backend == "iris":
         from .iris import IrisCommunicator
 
-        return IrisCommunicator(cpu_group, device_group, device, max_size)
+        return IrisCommunicator(cpu_group, device_group, device, config)
     if backend == "torch":
         from .torch import TorchCommunicator
 
-        return TorchCommunicator(cpu_group, device_group, device, max_size)
+        return TorchCommunicator(cpu_group, device_group, device, config)
     if backend == "hip":
         from .hip import HipCommunicator
 
-        return HipCommunicator(cpu_group, device_group, device, max_size)
+        return HipCommunicator(cpu_group, device_group, device, config)
     raise AssertionError(f"backend {backend!r} is in Backend and has no branch here")
