@@ -153,7 +153,7 @@ _BACKEND_CLASS = {
 }
 
 # WHAT WE ALREADY KNOW IS BROKEN, and why it stays in the matrix anyway. A backend left
-# out is a backend nobody measures; a backend in and red is a suite nobody trusts. `xfail`
+# out is a backend nobody measures; one in and red is a suite nobody trusts. `xfail`
 # is the third option: the case runs, its failure is expected and quiet, and the day it
 # passes pytest says XPASS instead of going quietly green.
 #
@@ -165,14 +165,15 @@ _BACKEND_CLASS = {
 # an XPASS into a failure, which is what you want once the expectation is precise -- so
 # tighten this to the modes that actually fail as soon as one run says which they are.
 EXPECTED_TO_FAIL = {
-    "iris": "iris computes wrong answers (gsm8k 0.000, 2026-09-14) and has since stopped "
-            "serving (all_gather raises, 2026-09-17)",
+    "iris": "iris computes wrong answers (gsm8k 0.000, 2026-09-14) and has since "
+    "stopped serving (all_gather raises, 2026-09-17)",
 }
 
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
 BACKENDS = tuple(
-    name if name not in EXPECTED_TO_FAIL
+    name
+    if name not in EXPECTED_TO_FAIL
     else pytest.param(
         name, marks=pytest.mark.xfail(reason=EXPECTED_TO_FAIL[name], strict=False)
     )
@@ -476,8 +477,8 @@ def run_collective(
     once per graph.
 
     The graphs are LOCALS and die here; a live one makes `destroy_process_group` block
-    forever. The warmup runs EAGER on the same communicator, registering the staging
-    buffer. Only a snapshot sits between replays, so they stay back-to-back -- an elided
+    forever. The warmup runs EAGER on the same communicator, which registers the
+    statics. Only a snapshot sits between replays, so they stay back-to-back; an elided
     end barrier needs that to race.
     """
     shapes = [tuple(m[0].shape) for m in mine]
@@ -519,7 +520,7 @@ def run_collective(
 
     for _ in range(
         3
-    ):  # eager warmup: first-call allocations, and the staging registration
+    ):  # eager warmup: first-call allocations, and the statics' registration
         for s in range(n):
             body(s)
     torch.cuda.synchronize()
@@ -746,10 +747,10 @@ def run_rank(
     )
     # A CONFIG CONTEXT, because `ensure_model_parallel_initialized` builds vLLM's device
     # communicators and those instantiate CustomOps, which read the current config. The
-    # aiter version of this test built its groups with plain `torch.distributed` and never
-    # touched `parallel_state`, so it needed none; the port does, and without it every rank
+    # aiter version of this test built its groups with plain `torch.distributed` and
+    # never touched `parallel_state`; the port does, and without it every rank
     # dies with "Current vLLM config is not set" before a single collective runs.
-    # HERE AND NOT A FIXTURE: each rank is its own process, so a fixture in the parent is
+    # HERE AND NOT A FIXTURE: each rank is its own process, so a parent fixture is
     # not in scope where the config is read.
     with set_current_vllm_config(VllmConfig()):
         ensure_model_parallel_initialized(world, pp)
@@ -876,13 +877,13 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             want = baseline_admits(nbytes)
             # ALL-REDUCE IS OURS AT EVERY SIZE. The size term moved out of the envelope
             # and into `is_small`, so what remains is whether the kernel can compile for
-            # this tensor at all -- true here for every case, since the grid is fp16/bf16
+            # this tensor at all -- true for every case here, the grid being fp16/bf16
             # and 16-byte aligned by construction.
             assert ours.should_allreduce(t), (
                 f"all_reduce was declined: {dtype} {nbytes}B world={world_size}"
             )
             # AND THE SIZE STILL SPLITS THE SAME WAY, checked against CustomAllreduce's
-            # rule, because that is the line the fast path was drawn at: it decides which
+            # rule, because that is where the fast path was drawn: it decides which
             # of our paths a tensor takes now instead of whether we take it.
             assert ours._is_small(t) == want, (
                 f"all_reduce routing diverged from CustomAllreduce: "

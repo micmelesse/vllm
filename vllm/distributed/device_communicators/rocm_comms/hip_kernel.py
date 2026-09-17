@@ -106,7 +106,6 @@ class HipComms:
         # per batch size and a collective per layer, so the count is capture_sizes x
         # layers -- thousands. 131072 slots is 8MB, the size vLLM gives the same array.
         max_buffers: int = 131072,
-        max_size: int = 8 << 20,
     ) -> None:
         # The kernel's own constants, asked for rather than restated here.
         signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle = (
@@ -126,16 +125,11 @@ class HipComms:
         self._slab = torch.zeros(
             peer_ptrs_bytes * max_buffers, dtype=torch.uint8, device=device
         )
-        # A pre-registered buffer for the EAGER path. The kernel reads peer pointers, so
-        # an input has to be registered -- and eagerly the caller hands us whatever the
-        # allocator gave it. Staging into this buffer is the copy the capture path
-        # exists to avoid, and that asymmetry is the point: the copy lives ONLY on the
-        # path nobody measures. vLLM's CustomAllreduce does the same thing for the same
-        # reason.
-        self._staging = torch.zeros(max_size, dtype=torch.uint8, device=device)
-        self._registered: set = set()
+        # EVERY input is registered; nothing is ever copied. See `_as_input`. The value
+        # is the input's STORAGE, held on purpose -- see `register`.
+        self._registered: dict[int, torch.UntypedStorage] = {}
+        self._max_buffers = max_buffers
 
-        self.max_size = max_size
         handles, offsets = self._exchange(self._signal.data_ptr())
         self._comms = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
@@ -146,15 +140,13 @@ class HipComms:
             self._slab.data_ptr(),
             self._slab.numel(),
         )
-        self.register(self._staging)
         # Say what will actually be launched, once. Otherwise a run tells you the answer
         # was wrong but not what was asked for, and "which config produced this" is the
         # first question every time.
         cfg = config_for("all_reduce", torch.bfloat16, 0, self.world_size)
         print(
             f"[hip_comms] rank {self.rank}/{self.world_size} ready: algo={cfg.algo} "
-            f"blocks={cfg.blocks} threads={cfg.threads} "
-            f"staging={self._staging.numel()}B slots={max_buffers}",
+            f"blocks={cfg.blocks} threads={cfg.threads} slots={max_buffers}",
             flush=True,
         )
 
@@ -167,13 +159,50 @@ class HipComms:
         return [h for h, _ in gathered], [o for _, o in gathered]
 
     def register(self, tensor: torch.Tensor) -> None:
-        """Make `tensor` usable as a collective INPUT. Collective: every rank must call
-        it for its own tensor, in the same order."""
-        handles, offsets = self._exchange(tensor.data_ptr())
+        """Make `tensor` usable as a collective INPUT, permanently.
+
+        COLLECTIVE AND ORDER-SENSITIVE: every rank must call this for its own tensor, in
+        the same order. It rests on the assumption `flush_pending` already states --
+        every rank runs the same collectives on the same shapes -- since that is what
+        makes the first-touch miss in `_as_input` happen on all of them at once. A rank
+        that misses when its peers hit HANGS in the gather below rather than failing:
+        the pointers compared there are local, and only the identical call sequence
+        makes the comparison agree. That is this path's standing hazard.
+
+        IT HOLDS THE STORAGE. A registration hands peers a raw address, so if the
+        caching allocator were free to recycle that block the peers would read whatever
+        landed there next -- silent corruption. Keeping a reference makes the block
+        un-recyclable, which is the invalidation problem answered by not having one.
+        The cost is retention, and `_max_buffers` bounds it.
+        """
+        ptr = tensor.data_ptr()
+        if len(self._registered) >= self._max_buffers:
+            raise RuntimeError(
+                f"hip_comms: {len(self._registered)} registered buffers hits the "
+                f"{self._max_buffers} limit. Every collective input is registered and "
+                f"held, so this means the caller allocates fresh buffers per step "
+                f"rather than reusing them; raise max_buffers or reuse."
+            )
+        # ONE gather, carrying the handle and the signature together: it is the
+        # rendezvous this path pays for, and it also proves the ranks agree on WHAT they
+        # are registering. It cannot prove they agree on WHETHER to -- that disagreement
+        # is this same gather, hanging.
+        mine = torch.ops._rocm_C.rocm_comms_handle_and_offset(ptr)
+        signature = (tensor.numel() * tensor.element_size(), str(tensor.dtype))
+        gathered = _all_gather_object(self.cpu_group, (mine, signature))
+        seen = {sig for _, sig in gathered}
+        if len(seen) != 1:
+            raise RuntimeError(
+                f"hip_comms: ranks registered different tensors ({sorted(seen)}); "
+                f"every rank must register in the same order with the same shapes."
+            )
         torch.ops._rocm_C.rocm_comms_register_buffer(
-            self._comms, handles, offsets, tensor.data_ptr()
+            self._comms,
+            [h for (h, _), _ in gathered],
+            [o for (_, o), _ in gathered],
+            ptr,
         )
-        self._registered.add(tensor.data_ptr())
+        self._registered[ptr] = tensor.untyped_storage()
 
     @contextmanager
     def capture(self) -> Iterator[None]:
@@ -230,21 +259,24 @@ class HipComms:
         )
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
-        """The tensor the kernel may read as an input: `inp` when it is registered or we
-        are capturing (registration is deferred then), else a staged copy."""
+        """The tensor the kernel reads as an input: ALWAYS `inp` itself.
+
+        REGISTRATION IS THE ONLY MEMORY PATH; there is no staging buffer and no copy, at
+        any size. Staging cost a full device copy of the message on every collective and
+        never got cheaper, because the copy WAS the mechanism; a registration costs one
+        CPU rendezvous the first time a buffer is seen and nothing afterwards, and vLLM
+        reuses its activation buffers every step. That is also what lifts the old 8 MiB
+        bound -- it was the staging buffer's, never the kernel's.
+
+        CAPTURING is the deferred case: the address is not valid yet, so the kernel
+        layer records it and `capture()` registers the batch on exit.
+        """
         if inp.data_ptr() in self._registered:
             return inp
         if torch.cuda.is_current_stream_capturing():
             return inp
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes > self._staging.numel():
-            raise RuntimeError(
-                f"hip_comms: {nbytes} bytes exceeds the {self._staging.numel()}-byte "
-                f"staging buffer. Register the tensor, or raise max_size."
-            )
-        staged = self._staging[:nbytes].view(inp.dtype).view_as(inp)
-        staged.copy_(inp)
-        return staged
+        self.register(inp)
+        return inp
 
     def all_reduce(
         self, out: torch.Tensor, inp: torch.Tensor, cfg: LaunchConfig | None = None

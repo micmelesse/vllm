@@ -64,11 +64,9 @@ class Communicator(ABC):
     _capturing: bool = False
     _closed: bool = False
 
-    # WHAT THE BASE OWNS, and therefore what a backend may not override -- checked when
-    # the class is DEFINED, the earliest moment there is. Not an export list and not the
-    # caller's surface, which is what it used to be called: `_is_supported` is private and
-    # belongs here precisely because a backend redefining it would change what the shared
-    # envelope means.
+    # WHAT THE BASE OWNS, and therefore what a backend may not override -- checked
+    # when the class is DEFINED. `_is_supported` is private and still belongs here: a
+    # backend redefining it would change what the shared envelope means.
     _OWNED = (
         "should_allreduce",
         "should_allgather",
@@ -89,39 +87,31 @@ class Communicator(ABC):
                 f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an "
                 f"override skips the capture invariant and the shared envelope. "
                 f"Supply `_all_reduce`, `_all_gather`, `_on_capture` or "
-                f"`_on_close` instead -- what the kernel supports and how long it lives "
-                f"are not a backend's to redefine."
+                f"`_on_close` instead -- what the kernel supports and how long it "
+                f"lives are not a backend's to redefine."
             )
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
-        """Whether this backend takes `inp`, which is every SIZE: it owns the collective.
-        The only no is a tensor the kernel cannot compile for, or being disabled -- and a
-        no still means the caller goes elsewhere, which is why this stays public."""
+        """Whether this backend takes `inp` -- every SIZE, because it owns the
+        collective. The only no is a tensor the kernel cannot compile for, or being
+        disabled, and a no sends the caller elsewhere, so this stays public."""
         return not self.disabled and self._is_supported(inp)
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
-        """Whether this backend takes `inp`, and like all-reduce it takes every SIZE: the
-        only no is a tensor the kernel cannot compile for, or being disabled."""
+        """Whether this backend takes `inp`. Every SIZE too; same two noes."""
         return not self.disabled and self._is_supported(inp)
 
     def _is_supported(self, inp: torch.Tensor) -> bool:
-        """CAN THIS BACKEND'S KERNEL TAKE THIS TENSOR AT ALL -- its shape and its dtype.
+        """CAN THIS KERNEL TAKE THIS TENSOR AT ALL -- its shape and its dtype.
 
-        NOT `_admits`, which is what this was called when a False meant the caller took the
-        work elsewhere. Nothing is admitted or refused now; the question is what the kernel
-        was compiled to handle.
+        Transcribed from `custom_all_reduce.should_custom_ar`, the path these backends
+        replace: a 16-byte multiple and weak-contiguous. DTYPE is the one addition --
+        our kernels are instantiated for fp16 and bf16 only.
 
-        Transcribed from
-        `vllm.distributed.device_communicators.custom_all_reduce.should_custom_ar`, the
-        path these backends replace: a 16-byte multiple and weak-contiguous. DTYPE is the
-        one addition -- our kernels are instantiated for fp16 and bf16 only.
-
-        SIZE IS NOT HERE ANY MORE; it is `_is_small`. The two were one predicate when the
-        caller used it to decide whether to hand the work elsewhere, and separating them
-        is what lets an all-reduce of ANY size be ours while a dtype we cannot compile for
-        is still honestly refused.
+        SIZE IS NOT HERE; it is `_is_small`. Splitting them is what lets an all-reduce
+        of ANY size be ours while a dtype we cannot compile for is still refused.
         """
         nbytes = inp.numel() * inp.element_size()
         return (
@@ -131,28 +121,23 @@ class Communicator(ABC):
         )
 
     def _is_small(self, inp: torch.Tensor) -> bool:
-        """Whether `inp` is under `max_size` -- the line that used to decide between this
-        backend and QuickReduce, and now decides between this backend's OWN paths. BOTH
-        collectives are ours at every size, so nothing calls this to refuse work; it is
-        the switch for when a second kernel exists, and what the tests check the line with.
-
-        The bound is the INPUT's, which is what our buffers hold: hip stages the input in
-        a `max_size` buffer, and iris's per-rank gather slab is larger still.
+        """Whether `inp` is under `max_size` -- the line that used to pick between this
+        backend and QuickReduce, and now picks between this backend's OWN paths. Nothing
+        calls it to refuse work; it is the switch for when a second kernel exists.
         """
         return inp.numel() * inp.element_size() < self.max_size
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE.
 
-        The size used to decide whether the caller kept it or handed it to QuickReduce, so
-        an arm named for a backend was that backend under `max_size` and something else
-        above it -- split by a rule inherited from `should_custom_ar` rather than chosen.
-        Now the collective is ours and `_is_small` picks which of OUR paths it takes.
+        The size used to decide whether the caller kept it or handed it to QuickReduce,
+        so an arm named for a backend was that backend under `max_size` and something
+        else above it. Now the collective is ours and `_is_small` picks which of OUR
+        paths it takes.
 
         BOTH ARMS RUN THE SAME KERNEL TODAY, and the branch is here anyway: it is where
         the two paths part, and a split that exists only in a comment is one the next
-        person has to rediscover. What changed is which tensors ARRIVE, not what happens
-        to them.
+        person has to rediscover.
         """
         self._check_capture("all_reduce")
         if not self.should_allreduce(inp):

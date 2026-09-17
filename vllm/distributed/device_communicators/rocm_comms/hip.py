@@ -69,11 +69,8 @@ class HipCommunicator(Communicator):
         # reach it. The disable checks above are uniform across a TP group in practice
         # -- same arch, same world size -- but if they ever were not, the ranks that got
         # here would HANG waiting for the ones that returned, rather than failing. Worth
-        # knowing because a deadlock is far worse than an error. The staging buffer
-        # backs the EAGER path and holds the largest input we admit.
-        self._comms = hip_kernel.HipComms(
-            cpu_group, self.device, max_size=self.max_size
-        )
+        # knowing because a deadlock is far worse than an error.
+        self._comms = hip_kernel.HipComms(cpu_group, self.device)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d max_size=%dMB",

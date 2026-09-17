@@ -90,9 +90,9 @@ class IrisCommunicator(Communicator):
             )
             return
 
-        # The heap and the slab are limits on the CONFIGURATION, not on a tensor: if
-        # `max_size` fits inside both, no admitted input can exceed either, so nothing
-        # needs re-checking per call.
+        # A floor on the CONFIGURATION: the heap has to back at least the small path.
+        # It is no longer an upper bound on a tensor -- admission stopped gating on size
+        # -- so a large enough input can still exhaust the heap at call time.
         if max_size * 2 > self._HEAP_SIZE or max_size > self._AG_SLAB_SIZE:
             logger.warning(
                 "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back "
@@ -109,8 +109,7 @@ class IrisCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    # No admission of its own: `_shmem is None` already means `disabled`, and the heap
-    # and slab are checked against `max_size` at construction.
+    # No admission of its own: `_shmem is None` already means `disabled`.
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:
