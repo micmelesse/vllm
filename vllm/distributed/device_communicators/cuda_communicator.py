@@ -101,7 +101,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size > 1:
             if current_platform.is_rocm():
                 if envs.VLLM_ROCM_COMMS_BACKEND:
-                    # Our backends take small AR (<8MB) on ROCm; QR takes the rest.
+                    # OUR BACKEND OWNS THE ALL-REDUCE, all of it. It used to take what
+                    # fitted its envelope (<8MB) and QuickReduce took the rest, which made
+                    # an arm named for a backend a mixture of two -- and the split was a
+                    # rule inherited from `should_custom_ar`, not one we chose. The split
+                    # still exists; it is inside the backend now, where we can see it,
+                    # measure it and change which kernel serves which size.
                     from vllm.distributed.device_communicators.rocm_comms import (
                         make_communicator,
                     )
@@ -115,9 +120,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                         device_group=self.device_group,
                         device=self.device,
                         backend=envs.VLLM_ROCM_COMMS_BACKEND,
-                    )
-                    self.qr_comm = QuickAllReduce(
-                        group=self.cpu_group, device=self.device
                     )
                 elif use_custom_allreduce:
                     self.ca_comm = CustomAllreduce(

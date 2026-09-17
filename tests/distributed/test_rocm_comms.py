@@ -874,13 +874,23 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
                 continue
             t = torch.empty(nbytes // es, dtype=dtype)
             want = baseline_admits(nbytes)
-            assert ours.should_allreduce(t) == want, (
-                f"all_reduce admission diverged from CustomAllreduce: "
-                f"{dtype} {nbytes}B "
-                f"world={world_size} baseline={want}"
+            # ALL-REDUCE IS OURS AT EVERY SIZE. The size term moved out of the envelope
+            # and into `is_small`, so what remains is whether the kernel can compile for
+            # this tensor at all -- true here for every case, since the grid is fp16/bf16
+            # and 16-byte aligned by construction.
+            assert ours.should_allreduce(t), (
+                f"all_reduce was declined: {dtype} {nbytes}B world={world_size}"
             )
-            assert ours.should_allgather(t) == want, (
-                f"all_gather admission diverged: {dtype} {nbytes}B world={world_size}"
+            # AND THE SIZE STILL SPLITS THE SAME WAY, checked against CustomAllreduce's
+            # rule, because that is the line the fast path was drawn at: it decides which
+            # of our paths a tensor takes now instead of whether we take it.
+            assert ours._is_small(t) == want, (
+                f"all_reduce routing diverged from CustomAllreduce: "
+                f"{dtype} {nbytes}B world={world_size} baseline={want}"
+            )
+            # AND SO IS all_gather, at every size, for the same reason.
+            assert ours.should_allgather(t), (
+                f"all_gather was declined: {dtype} {nbytes}B world={world_size}"
             )
 
 
