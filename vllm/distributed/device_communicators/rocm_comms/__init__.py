@@ -9,9 +9,11 @@
     iris      iris's GPU-initiated collectives
     torch     torch.distributed, the oracle the others are measured against
 
-WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN. Nothing here reads the
-environment or vLLM's config: this package takes process groups, a device and a backend
-name, and knows nothing else about the program around it.
+WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN: this package takes process groups,
+a device and a backend name, and reads no environment variable. The one thing it asks
+vLLM for is the current config, in `hip._staging_bytes`, to size a buffer against the
+widest batch the workload declared -- a number nobody else has and a constant would get
+wrong.
 """
 
 import logging

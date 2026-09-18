@@ -876,25 +876,33 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             if nbytes % es:
                 continue
             t = torch.empty(nbytes // es, dtype=dtype)
-            want = baseline_admits(nbytes)
-            # ALL-REDUCE IS OURS AT EVERY SIZE. The size term moved out of the envelope
-            # and into `is_small`, so what remains is whether the kernel can compile for
-            # this tensor at all -- true for every case here, the grid being fp16/bf16
-            # and 16-byte aligned by construction.
-            assert ours.should_allreduce(t), (
-                f"all_reduce was declined: {dtype} {nbytes}B world={world_size}"
+            where = f"{dtype} {nbytes}B world={world_size}"
+            aligned = nbytes % BASELINE_ALIGNMENT == 0
+            # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. The size moved out to
+            # `_is_small`, and the dtype grid here is fp16/bf16, so what `should_*`
+            # still refuses is a tensor the kernel cannot vectorise: `vec` is 16 bytes
+            # wide. The grid REACHES those on purpose -- an edge +/- one element is 14
+            # and 18 bytes off the 16-byte edge -- and asserting they are admitted is
+            # how this read `assert ours.should_allreduce(t)` and failed on the first
+            # run that ever executed it (2026-09-17).
+            assert ours.should_allreduce(t) is aligned, (
+                f"all_reduce admission is not the alignment rule: {where}"
             )
-            # AND THE SIZE STILL SPLITS THE SAME WAY, checked against CustomAllreduce's
-            # rule, because that is where the fast path was drawn: it decides which
-            # of our paths a tensor takes now instead of whether we take it.
-            assert ours._is_small(t) == want, (
-                f"all_reduce routing diverged from CustomAllreduce: "
-                f"{dtype} {nbytes}B world={world_size} baseline={want}"
+            assert ours.should_allgather(t) is aligned, (
+                f"all_gather admission is not the alignment rule: {where}"
             )
-            # AND SO IS all_gather, at every size, for the same reason.
-            assert ours.should_allgather(t), (
-                f"all_gather was declined: {dtype} {nbytes}B world={world_size}"
+            # SIZE ALONE, and nothing else: `_is_small` is the algorithm switch, so it
+            # says nothing about whether the tensor is ours.
+            assert ours._is_small(t) is (nbytes < BASELINE_MAX_SIZE), (
+                f"the small/large line moved: {where}"
             )
+            # AND THE TWO COMPOSE BACK TO THE BASELINE. This is the property the matrix
+            # rests on: CustomAllreduce took a tensor iff it was aligned AND small, and
+            # that is exactly the set we now call ours-and-small. What changed is that
+            # the rest is ours too, not that the line moved.
+            assert (ours.should_allreduce(t) and ours._is_small(t)) is baseline_admits(
+                nbytes
+            ), f"our fast path is not CustomAllreduce's: {where}"
 
 
 @pytest.mark.parametrize("mode", MODES)

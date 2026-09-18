@@ -23,9 +23,20 @@ env var it eventually grows is how you end up with `VLLM_CUSTOM_ALLREDUCE_ALGO`.
 
 `HipTunables` is hip's alone. What every backend shares is `tunables.Tunables`.
 
+TWO MEMORY PATHS, AND THE SPLIT IS LIFETIME, not size. A CAPTURED buffer is vLLM's and
+it holds it for the graph's life, so it is registered once at capture exit and read in
+place. An EAGER input is the caching allocator's, borrowed for the call, so it is copied
+into a staging buffer we own. Registering an eager input instead means holding it, and
+holding one 2 GiB activation per layer OOM'd the 70B profile run (2026-09-17); not
+holding it means peers read recycled memory. `CustomAllreduce` splits the same way for
+the same reason. See `_as_input`.
+
 `ngpus` and the dtype have to be compile-time to unroll and vectorize, so they select a
 template instantiation rather than being passed; the `.cu`'s dispatch names every
 combination that exists and REFUSES anything else rather than substituting.
+
+THE ONE THING IT READS FROM VLLM is the current config, to size that staging buffer --
+see `_staging_bytes`. The rest of the package knows nothing about the program around it.
 
 THE CONTEXT IS AN OPAQUE HANDLE. A torch op is a free function over schema types, so
 the C++ object crosses as an `int` -- the same shape vLLM's custom all-reduce uses. The
@@ -42,6 +53,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+from vllm.config import get_current_vllm_config_or_none
 
 from .base import Communicator
 
@@ -71,11 +84,16 @@ class HipTunables:
     # Scratch after the signal block in one allocation, so a two-stage algorithm needs a
     # kernel and neither a new buffer nor a new handshake.
     scratch_bytes: int = 8 << 20
-    # Peer-pointer slots: one per CAPTURED LAUNCH over a context's life (a capture
-    # always records -- see `capture`) and one per registered eager buffer. vLLM
-    # captures a graph per batch size and a collective per layer, so the count is
-    # capture_sizes x layers. 131072 slots is 8MB, the size vLLM gives the same array.
+    # Peer-pointer slots, one per CAPTURED LAUNCH over a communicator's life (a capture
+    # always records). vLLM captures a graph per batch size and a collective per layer,
+    # so the count is capture_sizes x layers. 131072 slots is 8MB, the size vLLM gives
+    # the same array.
     max_buffers: int = 131072
+    # A FLOOR on the eager staging buffer, not its size: `_staging_bytes` derives that
+    # from the workload. It matters only when there is no vLLM config to derive from --
+    # the correctness suite, say -- where the shapes are the caller's own business and
+    # 128 MiB covers anything a test has reason to try.
+    staging_floor_bytes: int = 128 << 20
 
 
 # =================================================================================
@@ -87,6 +105,29 @@ def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
     out: list[Any] = [None] * dist.get_world_size(group)
     dist.all_gather_object(out, obj, group=group)
     return out
+
+
+def _staging_bytes(floor: int) -> int:
+    """How big the eager staging buffer has to be: ONE all-reduce input at the largest
+    batch vLLM will build.
+
+    FROM THE WORKLOAD, NOT FROM A CONSTANT. QuickReduce takes the other route and
+    allocates `INT32_MAX + 1` because its indices are 32-bit -- a ceiling that is right
+    by accident. `max_num_batched_tokens x hidden x itemsize` is the same number for
+    this model and says why.
+
+    NO CONFIG IS NOT AN ERROR: this package is usable without vLLM around it, and the
+    floor is what it gets then.
+    """
+    config = get_current_vllm_config_or_none()
+    try:
+        assert config is not None
+        widest = config.scheduler_config.max_num_batched_tokens
+        row = config.model_config.get_hidden_size()
+        item = torch.empty(0, dtype=config.model_config.dtype).element_size()
+        return max(floor, widest * row * item)
+    except Exception:
+        return floor
 
 
 class HipCommunicator(Communicator):
@@ -109,7 +150,13 @@ class HipCommunicator(Communicator):
     # Set in `_open`, which runs only once the shared gates pass. Declared here so a
     # DISABLED communicator is still a safe object to hold and close.
     _handle: int | None = None
-    _registered: dict[int, torch.UntypedStorage]
+    # POINTERS ONLY. It held each input's storage for a while, to stop the caching
+    # allocator recycling a block a peer points into -- which pinned one 2 GiB
+    # activation per layer and OOM'd the 70B profile run (2026-09-17). Nothing here
+    # needs pinning now: the staging buffer is ours and we hold it, and a captured
+    # buffer is held by vLLM for the graph's life.
+    _registered: set[int]
+    _staging: torch.Tensor
 
     def _open(self) -> bool:
         """Open the peer memory. A COLLECTIVE -- it all-gathers IPC handles -- so every
@@ -139,9 +186,15 @@ class HipCommunicator(Communicator):
             dtype=torch.uint8,
             device=self.device,
         )
-        # EVERY input is registered; nothing is ever copied. See `_as_input`. The value
-        # is the input's STORAGE, held on purpose -- see `register`.
-        self._registered = {}
+        self._registered = set()
+        # THE EAGER PATH'S PEER-VISIBLE MEMORY, allocated ONCE, here, before vLLM
+        # profiles: a buffer that appeared later would change the memory the profile run
+        # measures, and one that grew during a capture would be worse than that.
+        self._staging = torch.zeros(
+            _staging_bytes(tunables.staging_floor_bytes),
+            dtype=torch.uint8,
+            device=self.device,
+        )
 
         handles, offsets = self._exchange(self._signal.data_ptr())
         self._handle = torch.ops._rocm_C.rocm_comms_init(
@@ -153,14 +206,19 @@ class HipCommunicator(Communicator):
             self._slab.data_ptr(),
             self._slab.numel(),
         )
+        # ONE COLLECTIVE, AT STARTUP, with every rank here in the same order. That is
+        # the whole of eager registration now, which is why nothing in this class has to
+        # reason about ranks disagreeing about whether to register.
+        self._register(self._staging)
         # Say what will actually be launched, once. Otherwise a run tells you the answer
         # was wrong but not what was asked for, and "what was it tuned to" is the first
         # question every time.
         logger.info(
-            "HipCommunicator ready: rank %d/%d, small_limit=%dMB, %s",
+            "HipCommunicator ready: rank %d/%d, small_limit=%dMB, staging=%dMB, %s",
             self.rank,
             self.world_size,
             self.tunables.small_limit >> 20,
+            self._staging.numel() >> 20,
             tunables,
         )
         return True
@@ -178,35 +236,30 @@ class HipCommunicator(Communicator):
         gathered = _all_gather_object(self.cpu_group, mine)
         return [h for h, _ in gathered], [o for _, o in gathered]
 
-    def register(self, tensor: torch.Tensor) -> None:
+    def _register(self, tensor: torch.Tensor) -> None:
         """Make `tensor` usable as a collective INPUT, permanently.
 
-        COLLECTIVE AND ORDER-SENSITIVE: every rank must call this for its own tensor, in
-        the same order. It rests on the assumption `flush_pending` already states --
-        every rank runs the same collectives on the same shapes -- since that is what
-        makes the first-touch miss in `_as_input` happen on all of them at once. A rank
-        that misses when its peers hit HANGS in the gather below rather than failing:
-        the pointers compared there are local, and only the identical call sequence
-        makes the comparison agree. That is this path's standing hazard.
+        COLLECTIVE. Called from exactly two places and NEVER from a collective: `_open`,
+        for the staging buffer, and `_flush_pending`, for what a capture recorded. Both
+        are reached by every rank in the same order by construction -- one is startup,
+        the other is a graph every rank captures -- so there is no rule here about ranks
+        agreeing, because there is no decision for them to disagree about. It used to be
+        called per eager call on a pointer test that was local to each rank, which could
+        have hung; that is gone with staging's return.
 
-        IT HOLDS THE STORAGE. A registration hands peers a raw address, so if the
-        caching allocator were free to recycle that block the peers would read whatever
-        landed there next -- silent corruption. Keeping a reference makes the block
-        un-recyclable, which is the invalidation problem answered by not having one.
-        The cost is retention, and `HipTunables.max_buffers` bounds it.
+        IT DOES NOT HOLD THE TENSOR. Whoever owns the buffer keeps it alive: we hold the
+        staging buffer ourselves, and vLLM holds a captured graph's buffers for the
+        graph's life. Holding it here instead is what OOM'd the 70B profile run.
         """
         ptr = tensor.data_ptr()
         if len(self._registered) >= self.hip_tunables.max_buffers:
             raise RuntimeError(
                 f"hip_comms: {len(self._registered)} registered buffers hits the "
-                f"{self.hip_tunables.max_buffers} limit. Every collective input is "
-                f"registered and held, so the caller allocates fresh buffers per step "
-                f"rather than reusing them; raise max_buffers or reuse."
+                f"{self.hip_tunables.max_buffers} limit; raise max_buffers."
             )
         # ONE gather, carrying the handle and the signature together: it is the
-        # rendezvous this path pays for, and it also proves the ranks agree on WHAT they
-        # are registering. It cannot prove they agree on WHETHER to -- that disagreement
-        # is this same gather, hanging.
+        # rendezvous this pays for, and it also proves the ranks agree on what they are
+        # registering.
         mine = torch.ops._rocm_C.rocm_comms_handle_and_offset(ptr)
         signature = (tensor.numel() * tensor.element_size(), str(tensor.dtype))
         gathered = _all_gather_object(self.cpu_group, (mine, signature))
@@ -222,7 +275,7 @@ class HipCommunicator(Communicator):
             [o for (_, o), _ in gathered],
             ptr,
         )
-        self._registered[ptr] = tensor.untyped_storage()
+        self._registered.add(ptr)
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
@@ -241,9 +294,9 @@ class HipCommunicator(Communicator):
             # Without it the slots stay null and the next launch faults on a null peer
             # pointer -- the original error is then buried under a GPU memory fault that
             # names nothing.
-            self.flush_pending()
+            self._flush_pending()
 
-    def flush_pending(self) -> None:
+    def _flush_pending(self) -> None:
         """Register whatever the capture deferred.
 
         ALWAYS one collective, even with nothing pending -- a rank that returned early
@@ -279,24 +332,55 @@ class HipCommunicator(Communicator):
         )
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
-        """The tensor the kernel reads as an input: ALWAYS `inp` itself.
+        """An address the KERNEL may read as an input. `inp` itself, or a copy of it in
+        memory the peers can already see.
 
-        REGISTRATION IS THE ONLY MEMORY PATH; there is no staging buffer and no copy, at
-        any size. Staging cost a full device copy of the message on every collective and
-        never got cheaper, because the copy WAS the mechanism; a registration costs one
-        CPU rendezvous the first time a buffer is seen and nothing afterwards, and vLLM
-        reuses its activation buffers every step. That is also what lifts the old 8 MiB
-        bound -- it was the staging buffer's, never the kernel's.
-
-        CAPTURING is the deferred case: the address is not valid yet, so the kernel
-        layer records it and `capture()` registers the batch on exit.
+        THE TWO PATHS ARE THE TWO LIFETIMES, and that is the whole of the distinction:
+        whether anyone guarantees this address outlives the collective. A captured
+        buffer is vLLM's and it holds it for the graph's life, so registering costs one
+        rendezvous at capture exit and nothing per call. An eager input is the caching
+        allocator's, borrowed for the duration of the call, so registering it would mean
+        either holding it (a 2 GiB leak per layer) or letting peers read recycled memory
+        (silent corruption). It is copied instead.
         """
-        if inp.data_ptr() in self._registered:
-            return inp
-        if torch.cuda.is_current_stream_capturing():
-            return inp
-        self.register(inp)
-        return inp
+        return inp if self._visible_to_peers(inp) else self._staged(inp)
+
+    def _visible_to_peers(self, inp: torch.Tensor) -> bool:
+        """Whether the peers can read `inp` BY THE TIME THIS LAUNCH RUNS, which is the
+        only moment that matters and is not always now.
+
+        Registered is visible now. CAPTURING is the other case: nothing runs while a
+        graph is recorded, the kernel layer reserves a slot and notes the address, and
+        `_flush_pending` registers it on the way out -- before any replay.
+        """
+        return (
+            inp.data_ptr() in self._registered
+            or torch.cuda.is_current_stream_capturing()
+        )
+
+    def _staged(self, inp: torch.Tensor) -> torch.Tensor:
+        """`inp` copied into the staging buffer, which IS registered.
+
+        THE COPY IS THE EAGER PATH'S WHOLE COST, and it is paid where nothing is
+        measured: vLLM serves decode from cudagraphs, so this runs during profiling,
+        warmup and any shape outside a capture size. It is also what the incumbent does
+        -- `CustomAllreduce` stages eagerly and registers only what a capture records.
+
+        THE BOUND IS THIS BUFFER'S, NOT THE KERNEL'S. The kernel is grid-stride and
+        takes any size; `_staging_bytes` is sized so a vLLM workload cannot exceed it,
+        and exceeding it is a configuration error rather than something to work around.
+        """
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes > self._staging.numel():
+            raise RuntimeError(
+                f"hip_comms: an eager {nbytes}-byte collective exceeds the "
+                f"{self._staging.numel()}-byte staging buffer, which was sized for the "
+                f"widest batch this workload declared. Raise staging_floor_bytes, or "
+                f"ask why a collective is larger than max_num_batched_tokens allows."
+            )
+        staged = self._staging[:nbytes].view(inp.dtype).view_as(inp)
+        staged.copy_(inp)
+        return staged
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
