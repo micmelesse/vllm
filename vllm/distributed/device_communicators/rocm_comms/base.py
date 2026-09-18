@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from vllm.config import get_current_vllm_config_or_none
+
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
@@ -139,6 +141,12 @@ class Communicator(ABC):
         self.device = _as_device(device)
         self.tunables = tunables
         self.world_size = dist.get_world_size(device_group)
+        # THE WORKLOAD AROUND US, read once and here. Every backend sizes something by
+        # it -- hip its staging buffer, iris its heap -- and reading it in each one
+        # would be three places asking the same question of a global. NONE IS NOT AN
+        # ERROR: this package is usable without vLLM around it, which is how the
+        # correctness suite runs it, and a backend falls back to its own floor.
+        self.config = get_current_vllm_config_or_none()
 
         # THE BOX, NOT THE BACKEND. Whether our kernels exist here is a fact about the
         # arch and the build, and every backend in this package got the same answer --
@@ -315,6 +323,19 @@ class Communicator(ABC):
     @abstractmethod
     def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
+
+    def widest_input_bytes(self) -> int:
+        """ONE ALL-REDUCE INPUT at the largest batch vLLM will build, or 0 without a
+        config. What every backend sizes its buffers against, derived once here so that
+        `max_num_batched_tokens x hidden x itemsize` is not written out per backend."""
+        try:
+            assert self.config is not None
+            widest = self.config.scheduler_config.max_num_batched_tokens
+            row = self.config.model_config.get_hidden_size()
+            item = torch.empty(0, dtype=self.config.model_config.dtype).element_size()
+            return int(widest) * int(row) * int(item)
+        except Exception:
+            return 0
 
     def _open(self) -> bool:
         """Bring this backend up. True when it is usable; False leaves it disabled,

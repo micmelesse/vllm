@@ -55,7 +55,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .base import Communicator
-from .utils import widest_input_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -106,20 +105,6 @@ def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
     return out
 
 
-def _staging_bytes(floor: int) -> int:
-    """How big the eager staging buffer has to be: ONE all-reduce input at the largest
-    batch vLLM will build.
-
-    FROM THE WORKLOAD, NOT FROM A CONSTANT. QuickReduce takes the other route and
-    allocates `INT32_MAX + 1` because its indices are 32-bit -- a ceiling that is right
-    by accident. `widest_input_bytes` is the same number for this model and says why.
-
-    NO CONFIG IS NOT AN ERROR: this package is usable without vLLM around it, and the
-    floor is what it gets then.
-    """
-    return max(floor, widest_input_bytes())
-
-
 class HipCommunicator(Communicator):
     """Communicator over HIP collectives we own, and the peer memory they run on.
 
@@ -147,6 +132,16 @@ class HipCommunicator(Communicator):
     # buffer is held by vLLM for the graph's life.
     _registered: set[int]
     _staging: torch.Tensor
+
+    def _staging_bytes(self) -> int:
+        """How big the eager staging buffer has to be: ONE all-reduce input at the
+        largest batch vLLM will build, or the floor when there is no vLLM around us.
+
+        FROM THE WORKLOAD, NOT FROM A CONSTANT. QuickReduce takes the other route and
+        allocates `INT32_MAX + 1` because its indices are 32-bit -- a ceiling that is
+        right by accident. This is the same number for this model and says why.
+        """
+        return max(self.hip_tunables.staging_floor_bytes, self.widest_input_bytes())
 
     def _open(self) -> bool:
         """Open the peer memory. A COLLECTIVE -- it all-gathers IPC handles -- so every
@@ -181,7 +176,7 @@ class HipCommunicator(Communicator):
         # profiles: a buffer that appeared later would change the memory the profile run
         # measures, and one that grew during a capture would be worse than that.
         self._staging = torch.zeros(
-            _staging_bytes(tunables.staging_floor_bytes),
+            self._staging_bytes(),
             dtype=torch.uint8,
             device=self.device,
         )

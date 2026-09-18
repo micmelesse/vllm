@@ -9,23 +9,8 @@ from dataclasses import dataclass
 import torch
 
 from .base import Communicator
-from .utils import widest_input_bytes
 
 logger = logging.getLogger(__name__)
-
-
-def _heap_bytes(floor: int) -> int:
-    """How big iris's symmetric heap has to be: what iris itself keeps there, plus room
-    for the inputs it will be handed.
-
-    THE FLOOR IS IRIS'S OWN and the rest is the workload's. The OOM that grounded this
-    arm reported 6.8 GiB of an 8 GiB heap already in use before a 2 GiB input arrived,
-    so the floor covers the first part and the input size is added to it. FOUR of them,
-    because a collective holds more than one at once and the exact number is iris's
-    business -- this is headroom chosen from a measured failure, not a derivation, and
-    the next run is what checks it.
-    """
-    return floor + 4 * widest_input_bytes()
 
 
 @dataclass(frozen=True)
@@ -73,6 +58,19 @@ class IrisCommunicator(Communicator):
     _ag_input_slab = None
     _ag_output_slab = None
 
+    def _heap_bytes(self) -> int:
+        """How big iris's symmetric heap has to be: what iris itself keeps there, plus
+        room for the inputs it will be handed.
+
+        THE FLOOR IS IRIS'S OWN and the rest is the workload's. The OOM that grounded
+        this arm reported 6.8 GiB of an 8 GiB heap already in use before a 2 GiB input
+        arrived, so the floor covers the first part and the input size is added to it.
+        FOUR of them, because a collective holds more than one at once and the exact
+        number is iris's business -- this is headroom chosen from a measured failure,
+        not a derivation, and the next run is what checks it.
+        """
+        return self.iris.heap_floor_bytes + 4 * self.widest_input_bytes()
+
     def _open(self) -> bool:
         if not _iris_available():
             logger.warning("IrisCommunicator disabled: the iris package is not here")
@@ -81,7 +79,7 @@ class IrisCommunicator(Communicator):
             import iris
             from iris.ccl.config import Config as CclConfig
 
-            self._heap = _heap_bytes(self.iris.heap_floor_bytes)
+            self._heap = self._heap_bytes()
             self._shmem = iris.iris(heap_size=self._heap)
             self._gluon_config = CclConfig(use_gluon=self.iris.use_gluon)
         except Exception as e:
