@@ -54,9 +54,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from vllm.config import get_current_vllm_config_or_none
-
 from .base import Communicator
+from .utils import widest_input_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -113,21 +112,12 @@ def _staging_bytes(floor: int) -> int:
 
     FROM THE WORKLOAD, NOT FROM A CONSTANT. QuickReduce takes the other route and
     allocates `INT32_MAX + 1` because its indices are 32-bit -- a ceiling that is right
-    by accident. `max_num_batched_tokens x hidden x itemsize` is the same number for
-    this model and says why.
+    by accident. `widest_input_bytes` is the same number for this model and says why.
 
     NO CONFIG IS NOT AN ERROR: this package is usable without vLLM around it, and the
     floor is what it gets then.
     """
-    config = get_current_vllm_config_or_none()
-    try:
-        assert config is not None
-        widest = config.scheduler_config.max_num_batched_tokens
-        row = config.model_config.get_hidden_size()
-        item = torch.empty(0, dtype=config.model_config.dtype).element_size()
-        return max(floor, widest * row * item)
-    except Exception:
-        return floor
+    return max(floor, widest_input_bytes())
 
 
 class HipCommunicator(Communicator):
