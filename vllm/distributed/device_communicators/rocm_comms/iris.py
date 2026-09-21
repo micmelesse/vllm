@@ -17,11 +17,15 @@ logger = logging.getLogger(__name__)
 class IrisTunables:
     """Every arbitrary number this backend has, in one place."""
 
-    # A FLOOR on the symmetric heap, not its size: `_heap_bytes` adds what the workload
-    # will actually hand us. 8 GiB was this backend's whole heap while admission capped
-    # inputs at `small_limit`; owning every size means whole activations arrive, and a
-    # 2 GiB input against 1.16 GiB free is what iris refused (2026-09-17).
-    heap_floor_bytes: int = 2**33  # 8 GiB
+    # THE WHOLE HEAP, as one number. Two measured failures bracket it: at 8 GiB iris had
+    # 6.8 GiB in use and refused a 2 GiB input against 1.16 GiB free (2026-09-17); at 16 GiB
+    # the card ran out, because the heap is allocated OUTSIDE vLLM's accounting and
+    # gpu-memory-utilization 0.90 left no room for it (2026-09-19, 4 MB free, 0/128 served).
+    # So the need is about 9 GiB and the ceiling is under 16, and this is the flat number in
+    # between. A CONSTANT AND NOT A FORMULA: the one it replaces derived headroom from
+    # `max_num_batched_tokens`, a scheduler CEILING of 131072 that no decode batch comes near,
+    # so it sized the heap off a number that had nothing to do with what arrives.
+    heap_bytes: int = 12 * 2**30  # 12 GiB
     slab_bytes: int = 2**25  # all-gather, 32 MB per rank
     use_gluon: bool = True
 
@@ -59,17 +63,8 @@ class IrisCommunicator(Communicator):
     _ag_output_slab = None
 
     def _heap_bytes(self) -> int:
-        """How big iris's symmetric heap has to be: what iris itself keeps there, plus
-        room for the inputs it will be handed.
-
-        THE FLOOR IS IRIS'S OWN and the rest is the workload's. The OOM that grounded
-        this arm reported 6.8 GiB of an 8 GiB heap already in use before a 2 GiB input
-        arrived, so the floor covers the first part and the input size is added to it.
-        FOUR of them, because a collective holds more than one at once and the exact
-        number is iris's business -- this is headroom chosen from a measured failure,
-        not a derivation, and the next run is what checks it.
-        """
-        return self.iris.heap_floor_bytes + 4 * self.widest_input_bytes()
+        """How big iris's symmetric heap is. See `heap_bytes` for why it is a constant."""
+        return self.iris.heap_bytes
 
     def _open(self) -> bool:
         if not _iris_available():
