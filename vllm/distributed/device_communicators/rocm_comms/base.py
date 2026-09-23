@@ -212,19 +212,19 @@ class Communicator(ABC):
         else above it. Now the collective is ours and `_is_small` picks which of OUR
         paths it takes.
 
-        BOTH ARMS RUN THE SAME KERNEL TODAY, and the branch is here anyway: it is where
-        the two paths part, and a split that exists only in a comment is one the next
-        person has to rediscover.
+        SIZE IS NOT DECIDED HERE, though `_is_small` and `small_limit` live on this
+        class because the LINE is shared. What a backend does on either side of it is
+        the backend's, so the classification is offered and not applied.
         """
         self._check_capture("all_reduce")
         if not self.should_allreduce(inp):
             raise RuntimeError(self._rejected("all_reduce", inp))
-        if self._is_small(inp):
-            return self._all_reduce(inp)
-        else:
-            # OVER `small_limit`. Used to be QuickReduce's; ours now, and its own kernel
-            # when there is one.
-            return self._all_reduce(inp)
+        # NO BRANCH HERE. It used to fork on `_is_small` and call the same thing on
+        # both sides, marking where the paths would part. They part now -- in the
+        # BACKEND: one with a kernel per size asks `_is_small` itself (see `hip`), and
+        # one with a single kernel never hears about it. Splitting here would mean
+        # every backend carrying a parameter for one backend's benefit.
+        return self._all_reduce(inp)
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
         self._check_capture("all_gather")

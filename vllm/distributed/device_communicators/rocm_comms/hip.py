@@ -60,16 +60,16 @@ logger = logging.getLogger(__name__)
 
 
 # Algorithms, matching the `.cu`'s dispatch. One today.
-# WHICH ALGORITHM THE KERNEL RUNS. A closed set, so it is a Literal union of NAMES rather
-# than a pair of int constants: a name is checkable, it reads in a log and a config, and a
+# WHICH ALGORITHM THE KERNEL RUNS. A closed set, so a Literal union of NAMES rather than
+# a pair of int constants: a name is checkable, it reads in a log and in a config, and a
 # typo is a checker error instead of a kernel nobody built.
 #
 #   one_shot   every rank reads every peer's whole buffer. (ngpus-1) x N per rank, one
 #              barrier. The right algorithm while the barrier dominates the bytes.
-#   two_shot   reduce-scatter then all-gather. (ngpus-1)/ngpus x N twice -- 1.75N against
-#              7N at ngpus=8 -- and one more barrier. The right algorithm once the bytes
-#              dominate. Which side of that a workload sits on is MEASURED, which is why
-#              this is a tunable and not a size threshold picked here.
+#   two_shot   reduce-scatter then all-gather. (ngpus-1)/ngpus x N twice -- 1.75N
+#              against 7N at ngpus=8 -- and one more barrier. The right algorithm once
+#              the bytes dominate. Which side a workload sits on is MEASURED, which is
+#              why this is a tunable and not a threshold picked here.
 Algo = Literal["one_shot", "two_shot"]
 
 # THE WIRE VALUE, and the only place the mapping lives. The kernel dispatches on an int
@@ -87,7 +87,18 @@ class HipTunables:
     the problem; nothing outside this file changes when it does.
     """
 
-    algo: Algo = "one_shot"
+    # ONE ALGORITHM PER REGIME, because which one wins depends on the message size and
+    # nothing else we can see from here. Below `small_limit` the barrier dominates the
+    # bytes and one-shot wins; above it the bytes dominate and two-shot's 1.75N beats
+    # 7N. Both pinned to the same value is how an A/B of the two is run.
+    #
+    # THE LINE IS `Tunables.small_limit`, 8 MiB -- CustomAllreduce's `max_size`, where
+    # vLLM itself stops using the small-message collective. We take the same split at
+    # the same point rather than inventing one. WHETHER THAT IS THE RIGHT POINT FOR US
+    # IS UNMEASURED: a decode all-reduce here is ~1 MB, far below it, so today this
+    # leaves decode on one-shot and gives two-shot only the prefill-sized traffic.
+    small_algo: Algo = "one_shot"
+    large_algo: Algo = "two_shot"
     # vLLM's tuned value on this hardware, carried over because a measured constant
     # beats an unmeasured one -- their note is that too many SMs contend on the
     # interconnect.
@@ -385,12 +396,17 @@ class HipCommunicator(Communicator):
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         cfg = self.hip_tunables
+        # WHICH KERNEL, FROM THE SIZE. `_is_small` is the base's -- `small_limit` is a
+        # shared tunable and the classification is the same for everyone -- but what to
+        # DO about it is ours, so the decision is here rather than threaded through an
+        # interface the other backends would have to carry and ignore.
+        algo = cfg.small_algo if self._is_small(inp) else cfg.large_algo
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._handle,
             out,
             self._as_input(inp),
-            _ALGO_WIRE[cfg.algo],
+            _ALGO_WIRE[algo],
             cfg.blocks,
             cfg.threads,
         )
@@ -416,7 +432,7 @@ class HipCommunicator(Communicator):
             self._handle,
             staged,
             self._as_input(inp),
-            _ALGO_WIRE[cfg.algo],
+            _ALGO_WIRE[cfg.small_algo],
             cfg.blocks,
             cfg.threads,
         )
