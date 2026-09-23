@@ -170,6 +170,74 @@ __global__ void __launch_bounds__(512, 1)
   barrier_end<ngpus, true>(sigs, self, rank);
 }
 
+// TWO-SHOT: reduce-scatter, then all-gather. Every rank owns one slice of the buffer,
+// reduces ONLY that slice by reading every peer's copy of it, publishes the result in its
+// own scratch, and then every rank copies all ngpus slices back out.
+//
+// WHY IT EXISTS: bytes. One-shot moves (ngpus-1) x N per rank in one pass; this moves
+// (ngpus-1)/ngpus x N twice, so 1.75N against 7N at ngpus=8 -- a 4x reduction, which is
+// exactly the ratio measured between vLLM's two-stage and our one-shot on a real capture.
+// It costs one more barrier, so it is the WRONG algorithm below the crossover where that
+// barrier dominates and the right one above it. Neither is universally better and the
+// caller picks: `algo` is the caller's decision, as it is for blocks and threads.
+//
+// THE SLICE IS ceil(size/ngpus) AND THE LAST RANK TAKES WHAT IS LEFT, so a buffer that
+// does not divide by ngpus is still reduced exactly once everywhere -- no padding, no
+// element summed twice, and a rank whose slice is empty still runs both barriers.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    two_shot_all_reduce(const PeerPtrs* peers, PeerSignals sigs, Signal* self,
+                        T* __restrict__ out, int rank, int size) {
+  using V = typename traits<T>::V;
+
+  // ROTATED by rank, for the reason one-shot rotates: the ranks do not all read rank 0
+  // first. The same consequence follows -- each rank sums in a different order, so the
+  // slices agree to within one ULP rather than bitwise. Unlike one-shot, EVERY element of
+  // the output here was summed by exactly one rank, so all ranks see identical bytes;
+  // what differs is only which order that one rank used.
+  const V* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+    ptrs[i] = reinterpret_cast<const V*>(peers->p[(rank + i) % ngpus]);
+
+  const int chunk = (size + ngpus - 1) / ngpus;
+  const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+
+  barrier_start<ngpus>(sigs, self, rank);
+
+  // PHASE 1 -- reduce-scatter. Our slice, summed across every rank, into our own scratch.
+  {
+    const int begin = rank * chunk;
+    const int end   = begin + chunk < size ? begin + chunk : size;
+    V* mine = reinterpret_cast<V*>(scratch_of(self));
+    for (int idx = begin + tid; idx < end; idx += stride)
+      mine[idx - begin] = reduce_at<T, ngpus>(ptrs, idx);
+  }
+
+  // NOT `final_sync`: the peers are about to READ what we just wrote, so this barrier has
+  // to carry the release/acquire pair that the last one is allowed to drop.
+  barrier_end<ngpus, false>(sigs, self, rank);
+
+  // PHASE 2 -- all-gather. Slice i is finished and sitting in rank i's scratch; every rank
+  // copies all ngpus of them into its own output.
+  {
+    V* dst = reinterpret_cast<V*>(out);
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) {
+      const int begin = i * chunk;
+      const int end   = begin + chunk < size ? begin + chunk : size;
+      const V* src = reinterpret_cast<const V*>(scratch_of(sigs.s[i]));
+      for (int idx = begin + tid; idx < end; idx += stride)
+        dst[idx] = src[idx - begin];
+    }
+  }
+
+  // Required for the same reason one-shot's is: without it a rank can return and let its
+  // INPUT be reused while a peer is still reading that input.
+  barrier_end<ngpus, true>(sigs, self, rank);
+}
+
 // ONE-SHOT ALL-GATHER. Same handshake and same read pattern as the all-reduce; it
 // concatenates instead of summing. `out` is filled RANK-MAJOR -- shape (ngpus, *inp) --
 // and the Python layer moves the axis where the caller wanted it, exactly as the torch
@@ -235,10 +303,11 @@ class Comms {
   Comms(int rank, int world_size, uintptr_t self_signal,
         const std::vector<std::string>& signal_handles,
         const std::vector<int64_t>& signal_offsets, uintptr_t peer_slab,
-        int64_t peer_slab_bytes)
+        int64_t peer_slab_bytes, int64_t scratch_bytes)
       : rank_(rank),
         world_size_(world_size),
         self_signal_(reinterpret_cast<Signal*>(self_signal)),
+        scratch_bytes_(scratch_bytes),
         slab_(reinterpret_cast<PeerPtrs*>(peer_slab)),
         slab_end_(reinterpret_cast<PeerPtrs*>(peer_slab) +
                   peer_slab_bytes / sizeof(PeerPtrs)),
@@ -316,6 +385,16 @@ class Comms {
                 " must be a multiple of ", lanes, " for 16-byte vectorized access");
     const int n = static_cast<int>(inp.numel() / lanes);
 
+    // TWO-SHOT PUBLISHES ITS SLICE IN THE SCRATCH, so the scratch bounds the buffer it can
+    // reduce: ceil(n/ngpus) vectors of 16 bytes. Checked HERE, where the tensor can be named,
+    // rather than discovered as a peer reading past the end of an IPC mapping.
+    if (algo == kAlgoTwoShot) {
+      const int64_t chunk = (static_cast<int64_t>(n) + world_size_ - 1) / world_size_;
+      TORCH_CHECK(chunk * 16 <= scratch_bytes_, "hip_comms: two_shot needs ", chunk * 16,
+                  " scratch bytes for a ", inp.numel() * inp.element_size(),
+                  "-byte buffer across ", world_size_, " ranks, but only ", scratch_bytes_,
+                  " were allocated. Raise HipTunables.scratch_bytes.");
+    }
     PeerPtrs* slot = slot_for(inp.data_ptr());
     dispatch<false>(out, algo, blocks, threads, slot, n);
   }
@@ -417,10 +496,15 @@ class Comms {
   void dispatch(torch::Tensor& out, int64_t algo, int64_t blocks, int64_t threads,
                 PeerPtrs* slot, int n) {
     auto stream = at::cuda::getCurrentCUDAStream();
-#define LAUNCH_ONE_SHOT(T, NG)                                                          \
+  // THE ALGO PICKS THE KERNEL; `gather` picks the operation. All-gather has one algorithm,
+  // because there is nothing to reduce and so nothing for a second pass to save.
+#define LAUNCH(T, NG)                                                                   \
   do {                                                                                  \
     if constexpr (gather)                                                               \
       one_shot_all_gather<T, NG><<<dim3(blocks), dim3(threads), 0, stream>>>(           \
+          slot, peer_signals_, self_signal_, out.data_ptr<T>(), rank_, n);              \
+    else if (algo == kAlgoTwoShot)                                                      \
+      two_shot_all_reduce<T, NG><<<dim3(blocks), dim3(threads), 0, stream>>>(           \
           slot, peer_signals_, self_signal_, out.data_ptr<T>(), rank_, n);              \
     else                                                                                \
       one_shot_all_reduce<T, NG><<<dim3(blocks), dim3(threads), 0, stream>>>(           \
@@ -429,15 +513,17 @@ class Comms {
 
 #define BY_NGPUS(T)                                                                     \
   switch (world_size_) {                                                                \
-    case 2: LAUNCH_ONE_SHOT(T, 2); return;                                              \
-    case 4: LAUNCH_ONE_SHOT(T, 4); return;                                              \
-    case 8: LAUNCH_ONE_SHOT(T, 8); return;                                              \
+    case 2: LAUNCH(T, 2); return;                                                       \
+    case 4: LAUNCH(T, 4); return;                                                       \
+    case 8: LAUNCH(T, 8); return;                                                       \
     default: break;                                                                     \
   }
 
-    if (algo != kAlgoOneShot)
+    if (algo != kAlgoOneShot && algo != kAlgoTwoShot)
       throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
-                               " is not built. Built: 0 (one_shot).");
+                               " is not built. Built: 0 (one_shot), 1 (two_shot).");
+    if (gather && algo != kAlgoOneShot)
+      throw std::runtime_error("hip_comms: all_gather has only algo 0 (one_shot)");
     switch (out.scalar_type()) {
       case at::ScalarType::Half: BY_NGPUS(at::Half) break;
       case at::ScalarType::BFloat16: BY_NGPUS(at::BFloat16) break;
@@ -447,14 +533,16 @@ class Comms {
     throw std::runtime_error("hip_comms: world_size " + std::to_string(world_size_) +
                              " not built. Built: 2, 4, 8.");
 #undef BY_NGPUS
-#undef LAUNCH_ONE_SHOT
+#undef LAUNCH
   }
 
   static constexpr int64_t kAlgoOneShot = 0;
+  static constexpr int64_t kAlgoTwoShot = 1;
 
   int rank_;
   int world_size_;
   Signal* self_signal_;
+  int64_t scratch_bytes_;
   PeerSignals peer_signals_{};
   PeerPtrs* slab_;
   PeerPtrs* slab_end_;
@@ -496,11 +584,11 @@ std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) 
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
-                       int64_t peer_slab_bytes) {
+                       int64_t peer_slab_bytes, int64_t scratch_bytes) {
   auto* comms = new hip_comms::Comms(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
-      static_cast<uintptr_t>(peer_slab), peer_slab_bytes);
+      static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes);
   return reinterpret_cast<fptr_t>(comms);
 }
 

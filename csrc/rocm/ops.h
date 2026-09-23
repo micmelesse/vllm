@@ -54,7 +54,7 @@ using fptr_t = int64_t;
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
-                       int64_t peer_slab_bytes);
+                       int64_t peer_slab_bytes, int64_t scratch_bytes);
 
 void rocm_comms_dispose(fptr_t comms);
 

@@ -45,10 +45,10 @@ Python reference does not.
 """
 
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -60,7 +60,21 @@ logger = logging.getLogger(__name__)
 
 
 # Algorithms, matching the `.cu`'s dispatch. One today.
-ALGO_ONE_SHOT = 0
+# WHICH ALGORITHM THE KERNEL RUNS. A closed set, so it is a Literal union of NAMES rather
+# than a pair of int constants: a name is checkable, it reads in a log and a config, and a
+# typo is a checker error instead of a kernel nobody built.
+#
+#   one_shot   every rank reads every peer's whole buffer. (ngpus-1) x N per rank, one
+#              barrier. The right algorithm while the barrier dominates the bytes.
+#   two_shot   reduce-scatter then all-gather. (ngpus-1)/ngpus x N twice -- 1.75N against
+#              7N at ngpus=8 -- and one more barrier. The right algorithm once the bytes
+#              dominate. Which side of that a workload sits on is MEASURED, which is why
+#              this is a tunable and not a size threshold picked here.
+Algo = Literal["one_shot", "two_shot"]
+
+# THE WIRE VALUE, and the only place the mapping lives. The kernel dispatches on an int
+# because that is what a torch custom op can carry; nothing above this line says one.
+_ALGO_WIRE: Mapping[Algo, int] = {"one_shot": 0, "two_shot": 1}
 
 
 @dataclass(frozen=True)
@@ -73,7 +87,7 @@ class HipTunables:
     the problem; nothing outside this file changes when it does.
     """
 
-    algo: int = ALGO_ONE_SHOT
+    algo: Algo = "one_shot"
     # vLLM's tuned value on this hardware, carried over because a measured constant
     # beats an unmeasured one -- their note is that too many SMs contend on the
     # interconnect.
@@ -190,6 +204,7 @@ class HipCommunicator(Communicator):
             offsets,
             self._slab.data_ptr(),
             self._slab.numel(),
+            tunables.scratch_bytes,
         )
         # ONE COLLECTIVE, AT STARTUP, with every rank here in the same order. That is
         # the whole of eager registration now, which is why nothing in this class has to
@@ -372,7 +387,12 @@ class HipCommunicator(Communicator):
         cfg = self.hip_tunables
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
+            self._handle,
+            out,
+            self._as_input(inp),
+            _ALGO_WIRE[cfg.algo],
+            cfg.blocks,
+            cfg.threads,
         )
         return out
 
@@ -393,7 +413,12 @@ class HipCommunicator(Communicator):
             (self.world_size,) + shape, dtype=inp.dtype, device=inp.device
         )
         torch.ops._rocm_C.rocm_comms_all_gather(
-            self._handle, staged, self._as_input(inp), cfg.algo, cfg.blocks, cfg.threads
+            self._handle,
+            staged,
+            self._as_input(inp),
+            _ALGO_WIRE[cfg.algo],
+            cfg.blocks,
+            cfg.threads,
         )
         return staged.movedim(0, dim).reshape(
             shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
