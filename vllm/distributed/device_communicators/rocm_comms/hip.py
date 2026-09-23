@@ -87,26 +87,25 @@ class HipTunables:
     the problem; nothing outside this file changes when it does.
     """
 
-    # ONE ALGORITHM PER REGIME, because which one wins depends on the message size and
-    # nothing else we can see from here. Below `small_limit` the barrier dominates the
-    # bytes and one-shot wins; above it the bytes dominate and two-shot's 1.75N beats
-    # 7N. Both pinned to the same value is how an A/B of the two is run.
-    #
-    # THE LINE IS `Tunables.small_limit`, 8 MiB -- CustomAllreduce's `max_size`, where
-    # vLLM itself stops using the small-message collective. We take the same split at
-    # the same point rather than inventing one. WHETHER THAT IS THE RIGHT POINT FOR US
-    # IS UNMEASURED: a decode all-reduce here is ~1 MB, far below it, so today this
-    # leaves decode on one-shot and gives two-shot only the prefill-sized traffic.
-    small_algo: Algo = "one_shot"
-    large_algo: Algo = "two_shot"
+    # NO `algo` FIELD. Which kernel runs is decided by the message SIZE, in
+    # `_all_reduce`, and a tunable here would advertise a choice that does not exist --
+    # a caller setting it would be overruled by the next tensor that crossed the line.
     # vLLM's tuned value on this hardware, carried over because a measured constant
     # beats an unmeasured one -- their note is that too many SMs contend on the
     # interconnect.
     blocks: int = 16
     threads: int = 512
-    # Scratch after the signal block in one allocation, so a two-stage algorithm needs a
-    # kernel and neither a new buffer nor a new handshake.
-    scratch_bytes: int = 8 << 20
+    # Scratch after the signal block in one allocation, so two_shot needs a kernel and
+    # neither a new buffer nor a new handshake. It holds ONE RANK'S SLICE of the
+    # reduce-scatter -- ceil(numel/ngpus) x 16 bytes -- so it caps the buffer two_shot
+    # can reduce at `scratch_bytes` x ngpus.
+    #
+    # 32 MiB AND NOT 8. At 8 the largest shape the correctness suite sweeps --
+    # (4088, 8192) bf16, 67 MB -- needed 8,372,224 of 8,388,608 bytes: 99.8% of the
+    # allocation, 16 KB of headroom. A bound one existing test very nearly trips is a
+    # bound nobody can reason about later. 32 MiB carries a 268 MB buffer at 8 ranks
+    # and costs 24 MiB more device memory per rank, noise beside the weights.
+    scratch_bytes: int = 32 << 20
     # Peer-pointer slots, one per CAPTURED LAUNCH over a communicator's life (a capture
     # always records). vLLM captures a graph per batch size and a collective per layer,
     # so the count is capture_sizes x layers. 131072 slots is 8MB, the size vLLM gives
@@ -396,11 +395,16 @@ class HipCommunicator(Communicator):
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         cfg = self.hip_tunables
-        # WHICH KERNEL, FROM THE SIZE. `_is_small` is the base's -- `small_limit` is a
-        # shared tunable and the classification is the same for everyone -- but what to
-        # DO about it is ours, so the decision is here rather than threaded through an
-        # interface the other backends would have to carry and ignore.
-        algo = cfg.small_algo if self._is_small(inp) else cfg.large_algo
+        # WHICH KERNEL, FROM THE SIZE, and there is nothing else it could be from: below
+        # `small_limit` the barrier dominates the bytes and one-shot wins, above it the
+        # bytes dominate and two-shot's 1.75N beats 7N. `_is_small` is the base's,
+        # because the LINE is shared; the mapping is ours.
+        #
+        # THE LINE IS 8 MiB -- CustomAllreduce's `max_size`, where vLLM itself stops
+        # using its small-message collective. Same split at the same point, not an
+        # invented one. WHETHER THAT IS RIGHT FOR US IS UNMEASURED: a decode all-reduce
+        # here is ~1 MB, far below it, so this leaves decode on one-shot today.
+        algo: Algo = "one_shot" if self._is_small(inp) else "two_shot"
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._handle,
@@ -432,7 +436,9 @@ class HipCommunicator(Communicator):
             self._handle,
             staged,
             self._as_input(inp),
-            _ALGO_WIRE[cfg.small_algo],
+            # ALL-GATHER HAS ONE ALGORITHM: nothing is reduced, so a second pass
+            # saves no bytes. The kernel refuses any other value.
+            _ALGO_WIRE["one_shot"],
             cfg.blocks,
             cfg.threads,
         )
