@@ -154,18 +154,23 @@ _BACKEND_CLASS = {
 }
 
 # WHAT WE ALREADY KNOW IS BROKEN, and why it stays in the matrix anyway. A backend left
-# out is a backend nobody measures; one in and red is a suite nobody trusts. `xfail`
-# is the third option: the case runs, its failure is expected and quiet, and the day it
-# passes pytest says XPASS instead of going quietly green.
+# out of the list is a backend nobody measures; one left in and red is a suite nobody
+# trusts. Naming it here is the third option: the case appears in the report, with the
+# reason, and nothing is spent running it.
 #
 # iris serves and computes WRONG ANSWERS -- gsm8k 0.000 against baseline's 0.805 on
 # 2026-09-14 -- and on 2026-09-17 it stopped serving at all, raising inside all_gather.
 # It is not ours; we measure against it.
 #
-# NOT STRICT, because we do not yet know which of the three modes it fails. Strict turns
-# an XPASS into a failure, which is what you want once the expectation is precise -- so
-# tighten this to the modes that actually fail as soon as one run says which they are.
-EXPECTED_TO_FAIL = {
+# SKIP AND NOT XFAIL, which is what this was. `xfail` RUNS the case: it spawns eight
+# ranks, initialises NCCL and waits for the failure it already expects -- a third of
+# this suite's wall clock spent confirming a dated line above. The suite gates every
+# run, so that time is charged to every run.
+#
+# WHAT IS GIVEN UP: the day iris starts working, `xfail` would have said XPASS and skip
+# says nothing. That is the trade, and it is the right way round while the thing is
+# known broken. Turn it back into an xfail when there is a reason to think it passes.
+DISABLED = {
     "iris": "iris computes wrong answers (gsm8k 0.000, 2026-09-14) and has since "
     "stopped serving (all_gather raises, 2026-09-17)",
 }
@@ -174,10 +179,8 @@ EXPECTED_TO_FAIL = {
 # case to run: if torch is red, nothing after it means anything.
 BACKENDS = tuple(
     name
-    if name not in EXPECTED_TO_FAIL
-    else pytest.param(
-        name, marks=pytest.mark.xfail(reason=EXPECTED_TO_FAIL[name], strict=False)
-    )
+    if name not in DISABLED
+    else pytest.param(name, marks=pytest.mark.skip(reason=DISABLED[name]))
     for name in _BACKEND_CLASS
 )
 
