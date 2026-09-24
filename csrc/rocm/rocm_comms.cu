@@ -2,14 +2,11 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Our HIP collectives. Self-contained: torch + the HIP runtime, nothing from aiter's
-// csrc, no build system. hip_comms.py compiles this file.
+// csrc. Built into `_rocm_C` with the other ROCm sources.
 //
-// THIS FILE HOLDS NO POLICY. It has no size heuristics, no getenv, and no tuned
-// constants: which algorithm, how many blocks and how many threads all arrive as
-// arguments, chosen in Python. A decision made here would be invisible and untestable,
-// and the escape hatch it eventually needs is how you end up with an env var deciding
-// how a kernel runs. What lives here is mechanism -- the peer handshake, the barrier,
-// the reduction -- plus a dispatch table over the instantiations that exist.
+// NO TUNED CONSTANTS AND NO getenv. The algorithm, the `mixed` switch point, blocks and
+// threads all arrive as arguments, so every number that moves with the hardware is a
+// Python tunable and visible there.
 //
 // Compile-time vs runtime is the one distinction that shapes everything. `ngpus` and the
 // dtype must be constexpr to unroll and vectorize, so they are template parameters and
@@ -42,15 +39,20 @@ namespace hip_comms {
 
 constexpr int64_t kAlgoOneShot = 0;
 constexpr int64_t kAlgoTwoShot = 1;
+// Not a kernel: one-shot below `small_limit` bytes, two-shot at or above it.
+constexpr int64_t kAlgoMixed = 2;
 
-void check_algo(int64_t algo) {
-  if (algo != kAlgoOneShot && algo != kAlgoTwoShot)
-    throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
-                             " is not built. Built: 0 (one_shot), 1 (two_shot).");
+// The kernel `algo` names for a buffer of `nbytes`.
+int64_t kernel_algo(int64_t algo, int64_t nbytes, int64_t small_limit) {
+  if (algo == kAlgoMixed) return nbytes < small_limit ? kAlgoOneShot : kAlgoTwoShot;
+  if (algo == kAlgoOneShot || algo == kAlgoTwoShot) return algo;
+  throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
+                           " is not built. Built: 0 (one_shot), 1 (two_shot), 2 (mixed).");
 }
 
 // THE instantiation menu. Every combination that exists is named here exactly once, so
 // an unsupported request is a listed refusal rather than a wrong kernel.
+// `algo` is a kernel here: `mixed` was resolved by the caller.
 void dispatch(ipc::Group& group, torch::Tensor& out, void* input, int64_t algo,
               int64_t blocks, int64_t threads, int n) {
   auto stream        = at::cuda::getCurrentCUDAStream();
@@ -73,7 +75,6 @@ void dispatch(ipc::Group& group, torch::Tensor& out, void* input, int64_t algo,
     default: break;                                                                     \
   }
 
-  check_algo(algo);
   switch (out.scalar_type()) {
     case at::ScalarType::Half: BY_NGPUS(at::Half) break;
     case at::ScalarType::BFloat16: BY_NGPUS(at::BFloat16) break;
@@ -86,10 +87,8 @@ void dispatch(ipc::Group& group, torch::Tensor& out, void* input, int64_t algo,
 #undef LAUNCH
 }
 
-// `algo`, `blocks` and `threads` are the CALLER's decision. Nothing here inspects the
-// size to pick them.
 void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64_t algo,
-                int64_t blocks, int64_t threads) {
+                int64_t small_limit, int64_t blocks, int64_t threads) {
   TORCH_CHECK(out.is_cuda() && inp.is_cuda(), "out and inp must be on device");
   TORCH_CHECK(out.is_contiguous() && inp.is_contiguous(), "out and inp must be contiguous");
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
@@ -102,6 +101,7 @@ void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64
   TORCH_CHECK(inp.numel() % lanes == 0, "numel ", inp.numel(),
               " must be a multiple of ", lanes, " for 16-byte vectorized access");
   const int n = static_cast<int>(inp.numel() / lanes);
+  algo = kernel_algo(algo, inp.numel() * inp.element_size(), small_limit);
 
   // TWO-SHOT PUBLISHES ITS SLICE IN THE SCRATCH, so the scratch bounds the buffer it can
   // reduce: ceil(n/ngpus) vectors of 16 bytes. Checked HERE, where the tensor can be named,
@@ -122,12 +122,12 @@ void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64
 // `residual_out` the sum-plus-residual the next block needs -- both are real outputs, so
 // nothing here is scratch.
 //
-// `algo` picks one-shot or two-shot, as for the plain all-reduce.
 void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
                         torch::Tensor& residual_out, torch::Tensor& inp,
                         torch::Tensor& residual, torch::Tensor& weight, double eps,
-                        int64_t algo, int64_t blocks, int64_t threads) {
-  check_algo(algo);
+                        int64_t algo, int64_t small_limit, int64_t blocks,
+                        int64_t threads) {
+  algo = kernel_algo(algo, inp.numel() * inp.element_size(), small_limit);
   TORCH_CHECK(out.is_cuda() && inp.is_cuda() && residual.is_cuda() && weight.is_cuda(),
               "every tensor must be on device");
   TORCH_CHECK(out.is_contiguous() && residual_out.is_contiguous() &&
@@ -295,19 +295,20 @@ int64_t rocm_comms_pending_count(fptr_t comms) {
 }
 
 void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
-                           int64_t algo, int64_t blocks, int64_t threads) {
+                           int64_t algo, int64_t small_limit, int64_t blocks,
+                           int64_t threads) {
   hip_comms::all_reduce(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out, inp, algo,
-                        blocks, threads);
+                        small_limit, blocks, threads);
 }
 
 void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
                                    torch::Tensor& residual_out, torch::Tensor& inp,
                                    torch::Tensor& residual, torch::Tensor& weight,
-                                   double eps, int64_t algo, int64_t blocks,
-                                   int64_t threads) {
+                                   double eps, int64_t algo, int64_t small_limit,
+                                   int64_t blocks, int64_t threads) {
   hip_comms::all_reduce_rmsnorm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
-                                residual_out, inp, residual, weight, eps, algo, blocks,
-                                threads);
+                                residual_out, inp, residual, weight, eps, algo,
+                                small_limit, blocks, threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

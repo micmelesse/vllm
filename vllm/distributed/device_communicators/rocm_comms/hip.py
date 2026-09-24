@@ -14,12 +14,9 @@ forwarding methods, each opening with an assert that the inner one existed, and 
 carried four same-named methods with different contracts (`all_reduce(out, inp)` against
 `all_reduce(inp)`). iris and torch each hold their own machinery in one class.
 
-THE SPLIT THAT DOES MATTER is between this file and the `.cu`. The `.cu` is mechanism
-and holds no policy; every decision -- which algorithm, how many blocks, how many
-threads, how big a buffer -- is `HipTunables`. Same shape as a Triton kernel with
-`@triton.autotune`: the kernel body has no heuristics and the meta-parameters are chosen
-outside it. A `if (size < N)` in the `.cu` would be a decision nobody can see, and the
-env var it eventually grows is how you end up with `VLLM_CUSTOM_ALLREDUCE_ALGO`.
+THE SPLIT THAT DOES MATTER is between this file and the `.cu`. Every number that moves
+with the hardware -- the algorithm, the `mixed` switch point, blocks, threads, buffer
+sizes -- is a tunable here and passed through; the `.cu` has no constants of its own.
 
 `HipTunables` is hip's alone. What every backend shares is `tunables.Tunables`.
 
@@ -66,13 +63,12 @@ logger = logging.getLogger(__name__)
 #   two_shot   reduce-scatter then all-gather. (ngpus-1)/ngpus x N twice -- 1.75N
 #              against 7N at ngpus=8 -- and one more barrier. The right algorithm once
 #              the bytes dominate.
-#   mixed      one_shot below `small_limit`, two_shot above it. A POLICY over the two
-#              kernels, decided here per call; the `.cu` never sees it.
+#   mixed      one_shot below `small_limit`, two_shot at or above it. The `.cu` switches
+#              per call, on the `small_limit` passed with it.
 Algo = Literal["one_shot", "two_shot", "mixed"]
 
-# THE WIRE VALUE of each KERNEL, and the only place the mapping lives. `mixed` is not a
-# kernel, so it has none: it resolves to one of these first.
-_ALGO_WIRE: Mapping[Algo, int] = {"one_shot": 0, "two_shot": 1}
+# THE WIRE VALUE, and the only place the mapping lives: a torch op carries an int.
+_ALGO_WIRE: Mapping[Algo, int] = {"one_shot": 0, "two_shot": 1, "mixed": 2}
 
 
 @dataclass(frozen=True)
@@ -392,18 +388,6 @@ class HipCommunicator(Communicator):
         staged.copy_(inp)
         return staged
 
-    def _wire_algo(self, inp: torch.Tensor) -> int:
-        """The kernel `hip_tunables.algo` picks for `inp`, as the `.cu` numbers it.
-
-        `mixed` splits at `small_limit`, 8 MiB -- CustomAllreduce's `max_size`, where
-        vLLM stops using its small-message collective. Unmeasured for us: a decode
-        all-reduce here is ~1 MB, so `mixed` leaves decode on one-shot.
-        """
-        algo = self.hip_tunables.algo
-        if algo == "mixed":
-            algo = "one_shot" if self._is_small(inp) else "two_shot"
-        return _ALGO_WIRE[algo]
-
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         cfg = self.hip_tunables
@@ -412,7 +396,8 @@ class HipCommunicator(Communicator):
             self._handle,
             out,
             self._as_input(inp),
-            self._wire_algo(inp),
+            _ALGO_WIRE[cfg.algo],
+            self.tunables.small_limit,
             cfg.blocks,
             cfg.threads,
         )
@@ -446,7 +431,8 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
-            self._wire_algo(inp),
+            _ALGO_WIRE[cfg.algo],
+            self.tunables.small_limit,
             cfg.blocks,
             cfg.threads,
         )

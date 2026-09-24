@@ -111,7 +111,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   rocm_ops.def(
       "rocm_comms_all_reduce(int comms, Tensor! out, Tensor inp, int algo, "
-      "int blocks, int threads) -> ()");
+      "int small_limit, int blocks, int threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
 
   // FUSED. Two mutable outputs: `out` is the normed result, `residual_out` the
@@ -120,7 +120,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "rocm_comms_all_reduce_rmsnorm(int comms, Tensor! out, Tensor! residual_out, "
       "Tensor inp, Tensor residual, Tensor weight, float eps, int algo, "
-      "int blocks, int threads) -> ()");
+      "int small_limit, int blocks, int threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rmsnorm", torch::kCUDA,
                 &rocm_comms_all_reduce_rmsnorm);
 

@@ -31,9 +31,9 @@ __all__ = ["Tunables"]
 class Tunables:
     """What `base` asks of every backend uniformly."""
 
-    # Where a collective stops being small. It was CustomAllreduce's `max_size`, the
-    # point at which vLLM handed the work to QuickReduce; we own every size now, so it
-    # picks which of OUR kernels runs and caps nothing.
+    # Where a collective stops being small: hip's `mixed` switches from one-shot to
+    # two-shot here. CustomAllreduce's `max_size`, where vLLM stops using its
+    # small-message collective; unmeasured for us.
     small_limit: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
