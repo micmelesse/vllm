@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include "peer.cuh"
-#include "reduce.cuh"
+#include "ipc.cuh"
+#include "utils.cuh"
 
 namespace hip_comms {
 
@@ -52,18 +52,19 @@ DINLINE float block_sum(float v) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) one_shot_all_reduce_rmsnorm(
-    const PeerPtrs* peers, PeerSignals sigs, Signal* self, T* __restrict__ out,
-    T* __restrict__ residual_out, const T* __restrict__ residual,
-    const T* __restrict__ weight, float eps, int rank, int rows, int packs) {
+__global__ void __launch_bounds__(512, 1) allreduce_one_shot_rmsnorm(
+    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    const T* __restrict__ residual, const T* __restrict__ weight, float eps, int rows,
+    int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  const int rank   = p.rank();
   const V* ptrs[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
-    ptrs[i] = reinterpret_cast<const V*>(peers->p[(rank + i) % ngpus]);
+    ptrs[i] = p.input<V>((rank + i) % ngpus);
 
-  barrier_start<ngpus>(sigs, self, rank);
+  p.barrier_start<ngpus>();
 
   const V* res_in = reinterpret_cast<const V*>(residual);
   V* res_out      = reinterpret_cast<V*>(residual_out);
@@ -102,7 +103,7 @@ __global__ void __launch_bounds__(512, 1) one_shot_all_reduce_rmsnorm(
   }
   // Same reason as one-shot's: a rank that returns lets its INPUT be reused while a peer
   // is still reading it.
-  barrier_end<ngpus, true>(sigs, self, rank);
+  p.barrier_end<ngpus, true>();
 }
 
 }  // namespace hip_comms

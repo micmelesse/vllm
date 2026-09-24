@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Summing one 16-byte packet across ranks.
+// Shared by the collectives: the 16-byte vector and the sum of one across ranks.
 
 #pragma once
 
-#include "peer.cuh"
+#include <hip/hip_runtime.h>
+
+#define DINLINE __device__ __forceinline__
 
 namespace hip_comms {
 

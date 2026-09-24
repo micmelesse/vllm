@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include "peer.cuh"
-#include "reduce.cuh"
+#include "ipc.cuh"
+#include "utils.cuh"
 
 namespace hip_comms {
 
@@ -26,9 +26,9 @@ namespace hip_comms {
 // element summed twice, and a rank whose slice is empty still runs both barriers.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
-    two_shot_all_reduce(const PeerPtrs* peers, PeerSignals sigs, Signal* self,
-                        T* __restrict__ out, int rank, int size) {
-  using V = typename traits<T>::V;
+    allreduce_two_shot(ipc::Peers p, T* __restrict__ out, int size) {
+  using V        = typename traits<T>::V;
+  const int rank = p.rank();
 
   // ROTATED by rank, for the reason one-shot rotates: the ranks do not all read rank 0
   // first. The same consequence follows -- each rank sums in a different order, so the
@@ -38,26 +38,26 @@ __global__ void __launch_bounds__(512, 1)
   const V* ptrs[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
-    ptrs[i] = reinterpret_cast<const V*>(peers->p[(rank + i) % ngpus]);
+    ptrs[i] = p.input<V>((rank + i) % ngpus);
 
   const int chunk = (size + ngpus - 1) / ngpus;
   const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
 
-  barrier_start<ngpus>(sigs, self, rank);
+  p.barrier_start<ngpus>();
 
   // PHASE 1 -- reduce-scatter. Our slice, summed across every rank, into our own scratch.
   {
     const int begin = rank * chunk;
     const int end   = begin + chunk < size ? begin + chunk : size;
-    V* mine = reinterpret_cast<V*>(scratch_of(self));
+    V* mine = p.scratch<V>(rank);
     for (int idx = begin + tid; idx < end; idx += stride)
       mine[idx - begin] = reduce_at<T, ngpus>(ptrs, idx);
   }
 
   // NOT `final_sync`: the peers are about to READ what we just wrote, so this barrier has
   // to carry the release/acquire pair that the last one is allowed to drop.
-  barrier_end<ngpus, false>(sigs, self, rank);
+  p.barrier_end<ngpus, false>();
 
   // PHASE 2 -- all-gather. Slice i is finished and sitting in rank i's scratch; every rank
   // copies all ngpus of them into its own output.
@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(512, 1)
     for (int i = 0; i < ngpus; ++i) {
       const int begin = i * chunk;
       const int end   = begin + chunk < size ? begin + chunk : size;
-      const V* src = reinterpret_cast<const V*>(scratch_of(sigs.s[i]));
+      const V* src = p.scratch<V>(i);
       for (int idx = begin + tid; idx < end; idx += stride)
         dst[idx] = src[idx - begin];
     }
@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(512, 1)
 
   // Required for the same reason one-shot's is: without it a rank can return and let its
   // INPUT be reused while a peer is still reading that input.
-  barrier_end<ngpus, true>(sigs, self, rank);
+  p.barrier_end<ngpus, true>();
 }
 
 }  // namespace hip_comms
