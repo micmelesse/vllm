@@ -19,12 +19,12 @@ import math
 import multiprocessing as mp
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from itertools import product
 from multiprocessing import set_start_method
 from multiprocessing.pool import AsyncResult, Pool
-from typing import Optional
+from typing import Optional, get_args
 
 import pytest
 import torch
@@ -36,7 +36,7 @@ from vllm.distributed.device_communicators.rocm_comms import (
     Communicator,
     make_communicator,
 )
-from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
+from vllm.distributed.device_communicators.rocm_comms.hip import Algo, HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
 )
@@ -175,11 +175,17 @@ DISABLED = {
 
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
-BACKENDS = tuple(
-    name
-    if name not in DISABLED
-    else pytest.param(name, marks=pytest.mark.skip(reason=DISABLED[name]))
+# hip once per algorithm; the other backends have one kernel and take no `algo`.
+ALGOS: tuple[Algo, ...] = get_args(Algo)
+BACKEND_ALGOS = tuple(
+    pytest.param(
+        name,
+        algo,
+        id=name if algo is None else f"{name}-{algo}",
+        marks=[pytest.mark.skip(reason=DISABLED[name])] if name in DISABLED else [],
+    )
     for name in _BACKEND_CLASS
+    for algo in (ALGOS if name == "hip" else (None,))
 )
 
 
@@ -302,8 +308,13 @@ def _build_communicator(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
     device: torch.device,
+    algo: Algo | None = None,
 ) -> Communicator:
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
+    if algo is not None:
+        if not isinstance(comm, HipCommunicator):
+            raise RuntimeError(f"algo={algo!r} is hip's; {backend} has no algorithms")
+        comm.hip_tunables = replace(comm.hip_tunables, algo=algo)
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
     # remember to extend when a backend is added.
@@ -623,6 +634,7 @@ def exercise(
     device: torch.device,
     cpu_group: ProcessGroup,
     group: ProcessGroup,
+    algo: Algo | None = None,
 ) -> tuple[Measurement | None, str | None]:
     """CREATE a communicator, exercise its whole API, TEAR IT DOWN. `(worst verdict,
     None)`, or
@@ -655,7 +667,7 @@ def exercise(
     # inside, where `del` only releases if nothing else holds a reference -- and a
     # failing cell's traceback holds the frames that hold the communicator, so `del`
     # fails exactly when it matters.
-    with _build_communicator(backend, cpu_group, group, device) as comm:
+    with _build_communicator(backend, cpu_group, group, device, algo) as comm:
         for op_name, dtype_name in product(OPS, DTYPES):
             dtype = D_DTYPES[dtype_name]
             atol = _atol(op_name, dtype)
@@ -733,7 +745,13 @@ def exercise(
 
 
 def run_rank(
-    rank: int, world: int, pp: int, backend: str, mode: str, init_method: str
+    rank: int,
+    world: int,
+    pp: int,
+    backend: str,
+    mode: str,
+    init_method: str,
+    algo: Algo | None = None,
 ) -> tuple[Measurement | None, str | None]:
     """ONE per-rank worker. It owns the PROCESS GROUP; the communicator's life is
     `exercise`'s.
@@ -765,7 +783,9 @@ def run_rank(
     # socket rather than seeing a clean disconnect, turning one rank's error into
     # everyone's 600-second timeout.
     try:
-        return exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
+        return exercise(
+            backend, SCHEDULES[mode], world, rank, device, cpu_group, group, algo
+        )
     except Exception as e:
         # Logged HERE, with the rank and the full traceback, before anything crosses the
         # process boundary -- then RETURNED, not re-raised. Re-raising surfaces one rank
@@ -790,7 +810,13 @@ def run_rank(
 
 
 def run_communicator(
-    backend: str, mode: str, world: int, addr: str, port: int, pp: int = 1
+    backend: str,
+    mode: str,
+    world: int,
+    addr: str,
+    port: int,
+    pp: int = 1,
+    algo: Algo | None = None,
 ) -> tuple[Measurement | None, str | None]:
     """Spawn `world` ranks, collect under a timeout, fold to the WORST rank's numbers --
     a collective's
@@ -799,7 +825,7 @@ def run_communicator(
     init = get_distributed_init_method(addr, port)
     try:
         rets = [
-            pool.apply_async(run_rank, args=(r, world, pp, backend, mode, init))
+            pool.apply_async(run_rank, args=(r, world, pp, backend, mode, init, algo))
             for r in range(world)
         ]
         pool.close()
@@ -904,9 +930,13 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
 
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(("backend", "algo"), BACKEND_ALGOS)
 def test_communicator(
-    backend: str, mode: str, world: int, rendezvous: tuple[str, int]
+    backend: str,
+    algo: Algo | None,
+    mode: str,
+    world: int,
+    rendezvous: tuple[str, int],
 ) -> None:
     """Does this communicator work? One instance, its whole API, in one mode.
 
@@ -918,15 +948,16 @@ def test_communicator(
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     addr, port = rendezvous
-    print(f"\n  {backend} / {mode}", flush=True)
-    got, err = run_communicator(backend, mode, world, addr, port)
+    name = backend if algo is None else f"{backend}-{algo}"
+    print(f"\n  {name} / {mode}", flush=True)
+    got, err = run_communicator(backend, mode, world, addr, port, algo=algo)
     # THE ERROR TRACK, checked explicitly against None: set means the case produced no
     # measurement at all, and `got` is not to be read. Only then is there a verdict to
     # assert on.
     if err is not None:
-        pytest.fail(f"{backend}/{mode}: {err}")
+        pytest.fail(f"{name}/{mode}: {err}")
     print(f"      => {got}", flush=True)
-    assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"
+    assert got.within_tolerance, f"{name}/{mode}: outside tolerance (cells above)"
 
 
 # ---------------------------------------------------------------------------------
@@ -976,7 +1007,12 @@ def _fused_tolerance(dtype: torch.dtype) -> tuple[float, float]:
 
 
 def run_fused_rank(
-    rank: int, world: int, shape: tuple[int, int], dtype_name: str, init_method: str
+    rank: int,
+    world: int,
+    shape: tuple[int, int],
+    dtype_name: str,
+    algo: Algo,
+    init_method: str,
 ) -> tuple[bool, str | None]:
     """ONE rank: run the fused op and the two ops it replaces, and say whether they
     agree. Returns `(agreed, err)`; `err` is `NO_FUSED_KERNEL` when this backend has
@@ -998,7 +1034,7 @@ def run_fused_rank(
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
         residual = _one_input(world, 1, shape, dtype)
         weight = _one_input(world + 1, 2, (shape[1],), dtype)
-        with _build_communicator("hip", cpu_group, group, device) as comm:
+        with _build_communicator("hip", cpu_group, group, device, algo) as comm:
             mine = inputs[rank].to(device)
             if not comm.should_allreduce_rmsnorm(mine):
                 return False, NO_FUSED_KERNEL
@@ -1032,10 +1068,16 @@ def run_fused_rank(
             logger.exception("rank %d: teardown failed", rank)
 
 
+# `mixed` is the other two chosen by size, and both are here at every shape.
+@pytest.mark.parametrize("algo", ("one_shot", "two_shot"))
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
-    shape: tuple[int, int], dtype_name: str, world: int, rendezvous: tuple[str, int]
+    shape: tuple[int, int],
+    dtype_name: str,
+    algo: Algo,
+    world: int,
+    rendezvous: tuple[str, int],
 ) -> None:
     """The fused kernel against `all_reduce` then `fused_add_rms_norm`.
 
@@ -1055,7 +1097,7 @@ def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
     pool = Pool(processes=world)
     try:
         rets = [
-            pool.apply_async(run_fused_rank, (r, world, shape, dtype_name, init))
+            pool.apply_async(run_fused_rank, (r, world, shape, dtype_name, algo, init))
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
@@ -1065,6 +1107,7 @@ def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
     # -- which IS the reference -- vouching for a kernel that does not exist.
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip has no fused all_reduce_rmsnorm for {shape} {dtype_name}")
+    where = f"{algo} {shape} {dtype_name}"
     bad = [err for _, err in got if err is not None]
-    assert not bad, f"{shape} {dtype_name}: " + "; ".join(bad)
-    assert all(agreed for agreed, _ in got), f"{shape} {dtype_name}: ranks disagreed"
+    assert not bad, f"{where}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{where}: ranks disagreed"

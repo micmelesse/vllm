@@ -35,12 +35,19 @@
 #include "rocm_comms/allreduce_one_shot.cuh"
 #include "rocm_comms/allreduce_one_shot_rmsnorm.cuh"
 #include "rocm_comms/allreduce_two_shot.cuh"
+#include "rocm_comms/allreduce_two_shot_rmsnorm.cuh"
 #include "rocm_comms/ipc.cuh"
 
 namespace hip_comms {
 
 constexpr int64_t kAlgoOneShot = 0;
 constexpr int64_t kAlgoTwoShot = 1;
+
+void check_algo(int64_t algo) {
+  if (algo != kAlgoOneShot && algo != kAlgoTwoShot)
+    throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
+                             " is not built. Built: 0 (one_shot), 1 (two_shot).");
+}
 
 // THE instantiation menu. Every combination that exists is named here exactly once, so
 // an unsupported request is a listed refusal rather than a wrong kernel.
@@ -66,9 +73,7 @@ void dispatch(ipc::Group& group, torch::Tensor& out, void* input, int64_t algo,
     default: break;                                                                     \
   }
 
-  if (algo != kAlgoOneShot && algo != kAlgoTwoShot)
-    throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
-                             " is not built. Built: 0 (one_shot), 1 (two_shot).");
+  check_algo(algo);
   switch (out.scalar_type()) {
     case at::ScalarType::Half: BY_NGPUS(at::Half) break;
     case at::ScalarType::BFloat16: BY_NGPUS(at::BFloat16) break;
@@ -117,14 +122,12 @@ void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64
 // `residual_out` the sum-plus-residual the next block needs -- both are real outputs, so
 // nothing here is scratch.
 //
-// ONE-SHOT ONLY, and it says so rather than silently picking. Two-shot leaves each rank
-// holding one SLICE of the row after its reduce-scatter, and a row's variance needs the
-// whole row -- so a fused two-shot wants another reduction of the partial sums of squares
-// between the two phases. That is a real design and it is not this one.
+// `algo` picks one-shot or two-shot, as for the plain all-reduce.
 void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
                         torch::Tensor& residual_out, torch::Tensor& inp,
-                        torch::Tensor& residual, torch::Tensor& weight,
-                        double eps, int64_t blocks, int64_t threads) {
+                        torch::Tensor& residual, torch::Tensor& weight, double eps,
+                        int64_t algo, int64_t blocks, int64_t threads) {
+  check_algo(algo);
   TORCH_CHECK(out.is_cuda() && inp.is_cuda() && residual.is_cuda() && weight.is_cuda(),
               "every tensor must be on device");
   TORCH_CHECK(out.is_contiguous() && residual_out.is_contiguous() &&
@@ -155,16 +158,38 @@ void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
   const int rows  = static_cast<int>(inp.size(0));
   const int packs = static_cast<int>(hidden / lanes);
 
+  // TWO-SHOT PUBLISHES BOTH OUTPUTS FOR ITS ROWS in the scratch: 2 x ceil(rows/ngpus) rows.
+  if (algo == kAlgoTwoShot) {
+    const int world_size  = group.world_size();
+    const int64_t scratch = group.scratch_bytes();
+    const int64_t need =
+        2 * ((static_cast<int64_t>(rows) + world_size - 1) / world_size) * packs * 16;
+    TORCH_CHECK(need <= scratch, "hip_comms: two_shot rmsnorm needs ", need,
+                " scratch bytes for ", rows, " rows of ", hidden, " across ", world_size,
+                " ranks, but only ", scratch,
+                " were allocated. Raise HipTunables.scratch_bytes.");
+  }
+
   const ipc::Peers p = group.peers(inp.data_ptr());
   auto stream        = at::cuda::getCurrentCUDAStream();
-  // ONE BLOCK PER ROW, capped by what was asked for: a grid wider than the rows leaves
-  // blocks with nothing to do and still pays both barriers.
-  const int grid = static_cast<int>(std::min<int64_t>(blocks, rows));
+  // ONE-SHOT: ONE BLOCK PER ROW, capped by what was asked for, since a block past the last
+  // row has nothing to do and still pays both barriers. Two-shot keeps every block: its
+  // gather is grid-stride over the flat buffer.
+  const int grid = algo == kAlgoTwoShot
+                       ? static_cast<int>(blocks)
+                       : static_cast<int>(std::min<int64_t>(blocks, rows));
 
 #define LAUNCH_FUSED(T, NG)                                                             \
-  allreduce_one_shot_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(          \
-      p, out.data_ptr<T>(), residual_out.data_ptr<T>(), residual.data_ptr<T>(),         \
-      weight.data_ptr<T>(), static_cast<float>(eps), rows, packs)
+  do {                                                                                  \
+    if (algo == kAlgoTwoShot)                                                           \
+      allreduce_two_shot_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(      \
+          p, out.data_ptr<T>(), residual_out.data_ptr<T>(), residual.data_ptr<T>(),     \
+          weight.data_ptr<T>(), static_cast<float>(eps), rows, packs);                  \
+    else                                                                                \
+      allreduce_one_shot_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(      \
+          p, out.data_ptr<T>(), residual_out.data_ptr<T>(), residual.data_ptr<T>(),     \
+          weight.data_ptr<T>(), static_cast<float>(eps), rows, packs);                  \
+  } while (0)
 
 #define FUSED_BY_NGPUS(T)                                                               \
   switch (group.world_size()) {                                                         \
@@ -278,9 +303,11 @@ void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
 void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
                                    torch::Tensor& residual_out, torch::Tensor& inp,
                                    torch::Tensor& residual, torch::Tensor& weight,
-                                   double eps, int64_t blocks, int64_t threads) {
+                                   double eps, int64_t algo, int64_t blocks,
+                                   int64_t threads) {
   hip_comms::all_reduce_rmsnorm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
-                                residual_out, inp, residual, weight, eps, blocks, threads);
+                                residual_out, inp, residual, weight, eps, algo, blocks,
+                                threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

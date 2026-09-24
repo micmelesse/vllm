@@ -48,7 +48,7 @@ import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import torch
 import torch.distributed as dist
@@ -59,21 +59,19 @@ from .base import Communicator
 logger = logging.getLogger(__name__)
 
 
-# Algorithms, matching the `.cu`'s dispatch. One today.
-# WHICH ALGORITHM THE KERNEL RUNS. A closed set, so a Literal union of NAMES rather than
-# a pair of int constants: a name is checkable, it reads in a log and in a config, and a
-# typo is a checker error instead of a kernel nobody built.
+# WHICH ALGORITHM RUNS. A closed set of NAMES: checkable, and readable in a log.
 #
 #   one_shot   every rank reads every peer's whole buffer. (ngpus-1) x N per rank, one
 #              barrier. The right algorithm while the barrier dominates the bytes.
 #   two_shot   reduce-scatter then all-gather. (ngpus-1)/ngpus x N twice -- 1.75N
 #              against 7N at ngpus=8 -- and one more barrier. The right algorithm once
-#              the bytes dominate. Which side a workload sits on is MEASURED, which is
-#              why this is a tunable and not a threshold picked here.
-Algo = Literal["one_shot", "two_shot"]
+#              the bytes dominate.
+#   mixed      one_shot below `small_limit`, two_shot above it. A POLICY over the two
+#              kernels, decided here per call; the `.cu` never sees it.
+Algo = Literal["one_shot", "two_shot", "mixed"]
 
-# THE WIRE VALUE, and the only place the mapping lives. The kernel dispatches on an int
-# because that is what a torch custom op can carry; nothing above this line says one.
+# THE WIRE VALUE of each KERNEL, and the only place the mapping lives. `mixed` is not a
+# kernel, so it has none: it resolves to one of these first.
 _ALGO_WIRE: Mapping[Algo, int] = {"one_shot": 0, "two_shot": 1}
 
 
@@ -87,9 +85,9 @@ class HipTunables:
     the problem; nothing outside this file changes when it does.
     """
 
-    # NO `algo` FIELD. Which kernel runs is decided by the message SIZE, in
-    # `_all_reduce`, and a tunable here would advertise a choice that does not exist --
-    # a caller setting it would be overruled by the next tensor that crossed the line.
+    # Two-shot by default: a quarter of one-shot's bytes at 8 ranks, and one algorithm
+    # everywhere keeps an arm about one kernel. `mixed` is the size switch.
+    algo: Algo = "two_shot"
     # vLLM's tuned value on this hardware, carried over because a measured constant
     # beats an unmeasured one -- their note is that too many SMs contend on the
     # interconnect.
@@ -116,6 +114,10 @@ class HipTunables:
     # the correctness suite, say -- where the shapes are the caller's own business and
     # 128 MiB covers anything a test has reason to try.
     staging_floor_bytes: int = 128 << 20
+
+    def __post_init__(self) -> None:
+        if self.algo not in get_args(Algo):
+            raise ValueError(f"algo must be one of {get_args(Algo)}, not {self.algo!r}")
 
 
 # =================================================================================
@@ -233,10 +235,8 @@ class HipCommunicator(Communicator):
         )
         return True
 
-    # No admission of its own. A two-stage reduce-scatter will need the count to divide
-    # the ranks; the shipped kernel is one-shot and does not, and the baseline does not
-    # check it either, so adding it would refuse tensors both we and the path we replace
-    # can handle.
+    # No admission of its own: both kernels take a count that does not divide the ranks
+    # (two-shot's last slice takes what is left), as the baseline does.
 
     def _exchange(self, ptr: int) -> tuple[list[list[int]], list[int]]:
         """Every rank's IPC handle + offset for its own `ptr`, in rank order. A handle
@@ -392,25 +392,27 @@ class HipCommunicator(Communicator):
         staged.copy_(inp)
         return staged
 
+    def _wire_algo(self, inp: torch.Tensor) -> int:
+        """The kernel `hip_tunables.algo` picks for `inp`, as the `.cu` numbers it.
+
+        `mixed` splits at `small_limit`, 8 MiB -- CustomAllreduce's `max_size`, where
+        vLLM stops using its small-message collective. Unmeasured for us: a decode
+        all-reduce here is ~1 MB, so `mixed` leaves decode on one-shot.
+        """
+        algo = self.hip_tunables.algo
+        if algo == "mixed":
+            algo = "one_shot" if self._is_small(inp) else "two_shot"
+        return _ALGO_WIRE[algo]
+
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         cfg = self.hip_tunables
-        # WHICH KERNEL, FROM THE SIZE, and there is nothing else it could be from: below
-        # `small_limit` the barrier dominates the bytes and one-shot wins, above it the
-        # bytes dominate and two-shot's 1.75N beats 7N. `_is_small` is the base's,
-        # because the LINE is shared; the mapping is ours.
-        #
-        # THE LINE IS 8 MiB -- CustomAllreduce's `max_size`, where vLLM itself stops
-        # using its small-message collective. Same split at the same point, not an
-        # invented one. WHETHER THAT IS RIGHT FOR US IS UNMEASURED: a decode all-reduce
-        # here is ~1 MB, far below it, so this leaves decode on one-shot today.
-        algo: Algo = "one_shot" if self._is_small(inp) else "two_shot"
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._handle,
             out,
             self._as_input(inp),
-            _ALGO_WIRE[algo],
+            self._wire_algo(inp),
             cfg.blocks,
             cfg.threads,
         )
@@ -430,9 +432,6 @@ class HipCommunicator(Communicator):
         this backend SAYS it fuses: `should_allreduce_rmsnorm` reads the
         override itself.
 
-        ONE-SHOT ONLY, so it is not `algo`-parameterised. See the `.cu`: two-shot leaves
-        a rank holding one slice of the row, and a row's variance needs the whole row.
-
         RETURNS BOTH, in the order the fused op's schema wants them: the normed result,
         then the sum-plus-residual the next block reads.
         """
@@ -447,6 +446,7 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
+            self._wire_algo(inp),
             cfg.blocks,
             cfg.threads,
         )
