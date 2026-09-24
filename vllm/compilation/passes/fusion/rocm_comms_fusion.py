@@ -36,7 +36,10 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
-from vllm.distributed.device_communicators.rocm_comms.fusion import FUSED_AR_RMSNORM_OP
+from vllm.distributed.device_communicators.rocm_comms.fusion import (
+    ALL_REDUCE_FUSED_ADD_RMS_NORM_OP,
+    ALL_REDUCE_RMS_NORM_OP,
+)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
@@ -69,62 +72,47 @@ class BasePattern:
         return torch.empty(*args, dtype=self.dtype, device=self.device, **kwargs)
 
 
-class HipAllreduceFusedRMSNormPattern(BasePattern, VllmPatternReplacement):
-    """`all_reduce` then `rms_norm`, with no residual carried in.
+class HipAllReduceRMSNormPattern(BasePattern, VllmPatternReplacement):
+    """`all_reduce` then `rms_norm`, no residual (e.g. Kimi-K3's latent MoE tail).
 
-    THE ZEROS ARE NOT WASTE ONCE THE KERNEL EXISTS. One op serves this and the
-    fused-add form, and it does so by taking a residual; passing zeros here is how the
-    two collapse into one entry point rather than two kernels that drift."""
+    Returns only the norm, so it matches only where the all-reduce output has no other
+    user: exactly where skipping it is legal."""
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str | None) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
-        self.dtype = dtype
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [self.empty(5, 16), self.empty(16)]
 
     @property
     def pattern(self):
-        def _pattern(
-            input: torch.Tensor, weight: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        def _pattern(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             allreduce_output = tensor_model_parallel_all_reduce(input)
-            rms = vllm.ir.ops.rms_norm(allreduce_output, weight, self.epsilon)
-            return rms, allreduce_output
+            return vllm.ir.ops.rms_norm(allreduce_output, weight, self.epsilon)
 
         return _pattern
 
     @property
     def replacement(self):
-        def _replacement(
-            input: torch.Tensor, weight: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            fused = FUSED_AR_RMSNORM_OP(
-                input_=input,
-                residual=torch.zeros_like(input),
-                weight=weight.to(input.dtype),
-                epsilon=self.epsilon,
+        def _replacement(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return ALL_REDUCE_RMS_NORM_OP(
+                input_=input, weight=weight.to(input.dtype), epsilon=self.epsilon
             )
-            return fused[0], fused[1]
 
         return _replacement
 
 
-class HipAllreduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
-    """`all_reduce` then `fused_add_rms_norm`: THE ONE THAT ACTUALLY APPEARS.
-
-    Every decoder block after the first carries a residual into its norm, so this is the
-    shape that occurs per layer per step, and the no-residual form above is the first
-    block only. It is also the cheaper rewrite -- no `zeros_like` to allocate."""
+class HipAllReduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
+    """`all_reduce` then `fused_add_rms_norm`: the per-layer form in a standard
+    decoder."""
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str | None) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
-        self.dtype = dtype
 
     def get_inputs(self) -> list[torch.Tensor]:
-        # input, residual, weight
+        # residual, input, weight
         return [self.empty(5, 16), self.empty(5, 16), self.empty(16)]
 
     @property
@@ -145,7 +133,7 @@ class HipAllreduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
         def _replacement(
             residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            fused = FUSED_AR_RMSNORM_OP(
+            fused = ALL_REDUCE_FUSED_ADD_RMS_NORM_OP(
                 input_=input,
                 residual=residual,
                 weight=weight.to(input.dtype),
@@ -199,12 +187,12 @@ class RocmHipAllReduceFusionPass(VllmFusionPatternMatcherPass):
             # smaller one first lets it consume the `all_reduce` node and strand the
             # trailing add as its own kernel -- the ordering aiter's pass learned.
             self.register(
-                HipAllreduceFusedAddRMSNormPattern(
+                HipAllReduceFusedAddRMSNormPattern(
                     epsilon, self.model_dtype, self.device
                 )
             )
             self.register(
-                HipAllreduceFusedRMSNormPattern(epsilon, self.model_dtype, self.device)
+                HipAllReduceRMSNormPattern(epsilon, self.model_dtype, self.device)
             )
             # The pattern matcher caches by traced graph, and two epsilons trace alike;
             # without this the second registration is silently dropped.

@@ -79,11 +79,16 @@ void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
                            int64_t algo, int64_t small_limit, int64_t blocks,
                            int64_t threads);
 
-void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
-                                   torch::Tensor& residual_out, torch::Tensor& inp,
-                                   torch::Tensor& residual, torch::Tensor& weight,
-                                   double eps, int64_t algo, int64_t small_limit,
-                                   int64_t blocks, int64_t threads);
+void rocm_comms_all_reduce_rms_norm(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                                    torch::Tensor& weight, double eps, int64_t algo,
+                                    int64_t small_limit, int64_t blocks, int64_t threads);
+
+void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
+                                              torch::Tensor& residual_out,
+                                              torch::Tensor& inp, torch::Tensor& residual,
+                                              torch::Tensor& weight, double eps,
+                                              int64_t algo, int64_t small_limit,
+                                              int64_t blocks, int64_t threads);
 
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);

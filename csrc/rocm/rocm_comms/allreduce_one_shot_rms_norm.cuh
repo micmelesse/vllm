@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot all-reduce fused with residual add + RMSNorm.
+// One-shot all-reduce fused with RMSNorm: `rms_norm`, or `fused_add_rms_norm` when kAdd.
 
 #pragma once
 
@@ -14,10 +14,10 @@ namespace hip_comms {
 // saves an HBM round trip and a launch against an all-reduce followed by a norm kernel.
 //
 // A BLOCK OWNS A ROW, because the variance needs the whole row: one block per row,
-// striding over rows, where plain one-shot is grid-stride over the flat buffer. (aiter's
-// 1-stage fused gate, `hidden_dim / pack_size <= 1024`, is the same constraint.)
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) allreduce_one_shot_rmsnorm(
+// striding over rows, where plain one-shot is grid-stride over the flat buffer.
+// `residual` and `residual_out` are unused (null) unless kAdd.
+template <typename T, int ngpus, bool kAdd>
+__global__ void __launch_bounds__(512, 1) allreduce_one_shot_rms_norm(
     ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const T* __restrict__ weight, float eps, int rows,
     int packs) {
@@ -38,8 +38,9 @@ __global__ void __launch_bounds__(512, 1) allreduce_one_shot_rmsnorm(
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   // Uniform across the block, so every `__syncthreads` inside is reached by every thread.
   for (int row = blockIdx.x; row < rows; row += gridDim.x)
-    add_rmsnorm_row<T, ngpus>(ptrs, res_in, w, row, packs, inv_hidden, eps,
-                              res_out + row * packs, o + row * packs);
+    rms_norm_row<T, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
+                                 kAdd ? res_out + row * packs : nullptr,
+                                 o + row * packs);
 
   // A rank that returns lets its INPUT be reused while a peer is still reading it.
   p.barrier_end<ngpus, true>();

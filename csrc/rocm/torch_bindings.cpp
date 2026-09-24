@@ -114,15 +114,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int small_limit, int blocks, int threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
 
-  // FUSED. Two mutable outputs: `out` is the normed result, `residual_out` the
-  // sum-plus-residual the next block reads. `eps` is a float in the schema because
+  // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
+  // (which also returns the sum plus residual). `eps` is a float in the schema because
   // torch has no `double` there; the kernel narrows it.
   rocm_ops.def(
-      "rocm_comms_all_reduce_rmsnorm(int comms, Tensor! out, Tensor! residual_out, "
-      "Tensor inp, Tensor residual, Tensor weight, float eps, int algo, "
-      "int small_limit, int blocks, int threads) -> ()");
-  rocm_ops.impl("rocm_comms_all_reduce_rmsnorm", torch::kCUDA,
-                &rocm_comms_all_reduce_rmsnorm);
+      "rocm_comms_all_reduce_rms_norm(int comms, Tensor! out, Tensor inp, "
+      "Tensor weight, float eps, int algo, int small_limit, int blocks, "
+      "int threads) -> ()");
+  rocm_ops.impl("rocm_comms_all_reduce_rms_norm", torch::kCUDA,
+                &rocm_comms_all_reduce_rms_norm);
+  rocm_ops.def(
+      "rocm_comms_all_reduce_fused_add_rms_norm(int comms, Tensor! out, "
+      "Tensor! residual_out, Tensor inp, Tensor residual, Tensor weight, float eps, "
+      "int algo, int small_limit, int blocks, int threads) -> ()");
+  rocm_ops.impl("rocm_comms_all_reduce_fused_add_rms_norm", torch::kCUDA,
+                &rocm_comms_all_reduce_fused_add_rms_norm);
 
 }
 

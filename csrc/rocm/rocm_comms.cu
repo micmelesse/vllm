@@ -30,9 +30,9 @@
 #include <vector>
 
 #include "rocm_comms/allreduce_one_shot.cuh"
-#include "rocm_comms/allreduce_one_shot_rmsnorm.cuh"
+#include "rocm_comms/allreduce_one_shot_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot.cuh"
-#include "rocm_comms/allreduce_two_shot_rmsnorm.cuh"
+#include "rocm_comms/allreduce_two_shot_rms_norm.cuh"
 #include "rocm_comms/ipc.cuh"
 
 namespace hip_comms {
@@ -118,30 +118,35 @@ void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64
   dispatch(group, out, inp.data_ptr(), algo, blocks, threads, n);
 }
 
-// FUSED: sum across ranks, add the residual, normalise. `out` is the normed result and
-// `residual_out` the sum-plus-residual the next block needs -- both are real outputs, so
-// nothing here is scratch.
-//
-void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
-                        torch::Tensor& residual_out, torch::Tensor& inp,
-                        torch::Tensor& residual, torch::Tensor& weight, double eps,
-                        int64_t algo, int64_t small_limit, int64_t blocks,
-                        int64_t threads) {
+// FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
+// given (and then `residual_out` too). Exact to those ops' roundings; see `rms_norm_row`.
+void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* residual_out,
+                         torch::Tensor& inp, const torch::Tensor* residual,
+                         torch::Tensor& weight, double eps, int64_t algo,
+                         int64_t small_limit, int64_t blocks, int64_t threads) {
+  const bool add = residual != nullptr;
+  TORCH_CHECK(add == (residual_out != nullptr),
+              "residual and residual_out come together or not at all");
   algo = kernel_algo(algo, inp.numel() * inp.element_size(), small_limit);
-  TORCH_CHECK(out.is_cuda() && inp.is_cuda() && residual.is_cuda() && weight.is_cuda(),
+  TORCH_CHECK(out.is_cuda() && inp.is_cuda() && weight.is_cuda(),
               "every tensor must be on device");
-  TORCH_CHECK(out.is_contiguous() && residual_out.is_contiguous() &&
-                  inp.is_contiguous() && residual.is_contiguous() &&
-                  weight.is_contiguous(),
+  TORCH_CHECK(out.is_contiguous() && inp.is_contiguous() && weight.is_contiguous(),
               "every tensor must be contiguous");
-  TORCH_CHECK(out.sizes() == inp.sizes() && residual_out.sizes() == inp.sizes() &&
-                  residual.sizes() == inp.sizes(),
-              "out, residual_out and residual must have inp's shape");
+  TORCH_CHECK(out.sizes() == inp.sizes(), "out must have inp's shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type() &&
-                  residual_out.scalar_type() == inp.scalar_type() &&
-                  residual.scalar_type() == inp.scalar_type() &&
                   weight.scalar_type() == inp.scalar_type(),
               "every tensor must share inp's dtype");
+  if (add) {
+    TORCH_CHECK(residual->is_cuda() && residual_out->is_cuda(),
+                "every tensor must be on device");
+    TORCH_CHECK(residual->is_contiguous() && residual_out->is_contiguous(),
+                "every tensor must be contiguous");
+    TORCH_CHECK(residual->sizes() == inp.sizes() && residual_out->sizes() == inp.sizes(),
+                "residual and residual_out must have inp's shape");
+    TORCH_CHECK(residual->scalar_type() == inp.scalar_type() &&
+                    residual_out->scalar_type() == inp.scalar_type(),
+                "every tensor must share inp's dtype");
+  }
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
   TORCH_CHECK(weight.dim() == 1 && weight.numel() == inp.size(1),
               "weight must be 1-D of hidden=", inp.size(1));
@@ -149,22 +154,27 @@ void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
               ipc::kMaxBlocks, "]");
   TORCH_CHECK(threads > 0 && threads <= 512, "threads must be in [1, 512]");
 
-  const int lanes = 16 / static_cast<int>(inp.element_size());
+  const int lanes      = 16 / static_cast<int>(inp.element_size());
   const int64_t hidden = inp.size(1);
-  // A BLOCK OWNS A ROW, so a row has to divide into whole 16-byte packs. Refused here,
-  // where the tensor can be named, rather than by a partial pack read past the end.
+  // A BLOCK OWNS A ROW, so a row has to divide into whole 16-byte packs, and the row is
+  // held in registers, so it has to fit kMaxRowPacks per thread.
   TORCH_CHECK(hidden % lanes == 0, "hidden ", hidden, " must be a multiple of ", lanes,
               " for 16-byte vectorized access");
   const int rows  = static_cast<int>(inp.size(0));
   const int packs = static_cast<int>(hidden / lanes);
+  TORCH_CHECK(packs <= kMaxRowPacks * threads, "hidden ", hidden, " is ", packs,
+              " packs; at most ", kMaxRowPacks, " x ", threads,
+              " threads fit in registers");
 
-  // TWO-SHOT PUBLISHES BOTH OUTPUTS FOR ITS ROWS in the scratch: 2 x ceil(rows/ngpus) rows.
+  // TWO-SHOT PUBLISHES ITS ROWS' OUTPUTS in the scratch: ceil(rows/ngpus) rows, twice
+  // when the residual comes back too.
   if (algo == kAlgoTwoShot) {
     const int world_size  = group.world_size();
     const int64_t scratch = group.scratch_bytes();
-    const int64_t need =
-        2 * ((static_cast<int64_t>(rows) + world_size - 1) / world_size) * packs * 16;
-    TORCH_CHECK(need <= scratch, "hip_comms: two_shot rmsnorm needs ", need,
+    const int64_t need = (add ? 2 : 1) *
+                         ((static_cast<int64_t>(rows) + world_size - 1) / world_size) *
+                         packs * 16;
+    TORCH_CHECK(need <= scratch, "hip_comms: two_shot rms_norm needs ", need,
                 " scratch bytes for ", rows, " rows of ", hidden, " across ", world_size,
                 " ranks, but only ", scratch,
                 " were allocated. Raise HipTunables.scratch_bytes.");
@@ -179,23 +189,31 @@ void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
                        ? static_cast<int>(blocks)
                        : static_cast<int>(std::min<int64_t>(blocks, rows));
 
-#define LAUNCH_FUSED(T, NG)                                                             \
+#define LAUNCH_FUSED(T, NG, ADD)                                                        \
   do {                                                                                  \
+    T* res_out      = ADD ? residual_out->data_ptr<T>() : nullptr;                      \
+    const T* res_in = ADD ? residual->data_ptr<T>() : nullptr;                          \
     if (algo == kAlgoTwoShot)                                                           \
-      allreduce_two_shot_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(      \
-          p, out.data_ptr<T>(), residual_out.data_ptr<T>(), residual.data_ptr<T>(),     \
-          weight.data_ptr<T>(), static_cast<float>(eps), rows, packs);                  \
+      allreduce_two_shot_rms_norm<T, NG, ADD><<<dim3(grid), dim3(threads), 0, stream>>>( \
+          p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<T>(),                  \
+          static_cast<float>(eps), rows, packs);                                        \
     else                                                                                \
-      allreduce_one_shot_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(      \
-          p, out.data_ptr<T>(), residual_out.data_ptr<T>(), residual.data_ptr<T>(),     \
-          weight.data_ptr<T>(), static_cast<float>(eps), rows, packs);                  \
+      allreduce_one_shot_rms_norm<T, NG, ADD><<<dim3(grid), dim3(threads), 0, stream>>>( \
+          p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<T>(),                  \
+          static_cast<float>(eps), rows, packs);                                        \
   } while (0)
+
+#define FUSED_BY_ADD(T, NG)                                                             \
+  if (add)                                                                              \
+    LAUNCH_FUSED(T, NG, true);                                                          \
+  else                                                                                  \
+    LAUNCH_FUSED(T, NG, false)
 
 #define FUSED_BY_NGPUS(T)                                                               \
   switch (group.world_size()) {                                                         \
-    case 2: LAUNCH_FUSED(T, 2); return;                                                 \
-    case 4: LAUNCH_FUSED(T, 4); return;                                                 \
-    case 8: LAUNCH_FUSED(T, 8); return;                                                 \
+    case 2: FUSED_BY_ADD(T, 2); return;                                                 \
+    case 4: FUSED_BY_ADD(T, 4); return;                                                 \
+    case 8: FUSED_BY_ADD(T, 8); return;                                                 \
     default: break;                                                                     \
   }
 
@@ -208,6 +226,7 @@ void all_reduce_rmsnorm(ipc::Group& group, torch::Tensor& out,
   throw std::runtime_error("hip_comms: world_size " + std::to_string(group.world_size()) +
                            " not built. Built: 2, 4, 8.");
 #undef FUSED_BY_NGPUS
+#undef FUSED_BY_ADD
 #undef LAUNCH_FUSED
 }
 
@@ -301,14 +320,23 @@ void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
                         small_limit, blocks, threads);
 }
 
-void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
-                                   torch::Tensor& residual_out, torch::Tensor& inp,
-                                   torch::Tensor& residual, torch::Tensor& weight,
-                                   double eps, int64_t algo, int64_t small_limit,
-                                   int64_t blocks, int64_t threads) {
-  hip_comms::all_reduce_rmsnorm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
-                                residual_out, inp, residual, weight, eps, algo,
-                                small_limit, blocks, threads);
+void rocm_comms_all_reduce_rms_norm(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                                    torch::Tensor& weight, double eps, int64_t algo,
+                                    int64_t small_limit, int64_t blocks, int64_t threads) {
+  hip_comms::all_reduce_rms_norm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
+                                 nullptr, inp, nullptr, weight, eps, algo, small_limit,
+                                 blocks, threads);
+}
+
+void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
+                                              torch::Tensor& residual_out,
+                                              torch::Tensor& inp, torch::Tensor& residual,
+                                              torch::Tensor& weight, double eps,
+                                              int64_t algo, int64_t small_limit,
+                                              int64_t blocks, int64_t threads) {
+  hip_comms::all_reduce_rms_norm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
+                                 &residual_out, inp, &residual, weight, eps, algo,
+                                 small_limit, blocks, threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
@@ -325,5 +353,6 @@ std::vector<int64_t> rocm_comms_sizes() {
           static_cast<int64_t>(sizeof(hip_comms::ipc::PeerPtrs)),
           static_cast<int64_t>(hip_comms::ipc::kMaxBlocks),
           static_cast<int64_t>(hip_comms::ipc::kMaxRanks),
-          static_cast<int64_t>(sizeof(hip_comms::ipc::Handle))};
+          static_cast<int64_t>(sizeof(hip_comms::ipc::Handle)),
+          static_cast<int64_t>(hip_comms::kMaxRowPacks)};
 }

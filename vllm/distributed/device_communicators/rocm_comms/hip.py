@@ -88,6 +88,7 @@ class HipCommunicator(Communicator):
     # graph's buffers).
     _registered: set[int]
     _staging: torch.Tensor
+    _max_row_packs: int = 0
 
     def _staging_bytes(self) -> int:
         """One all-reduce input at the widest batch vLLM will build, or the floor."""
@@ -100,9 +101,10 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         tunables = self.hip_tunables
-        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
+        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes, row_packs = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
+        self._max_row_packs = row_packs
         self.rank = dist.get_rank(self.cpu_group)
         # One allocation per rank: the signal block, then the scratch.
         self._signal = torch.zeros(
@@ -266,19 +268,47 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    def _all_reduce_rmsnorm(
+    def _fits_rms_norm(self, inp: torch.Tensor) -> bool:
+        """The fused kernels hold a row in registers: `_max_row_packs` 16-byte packs per
+        thread."""
+        if inp.dim() != 2:
+            return False
+        row_bytes = inp.shape[1] * inp.element_size()
+        return (
+            row_bytes % 16 == 0
+            and row_bytes // 16 <= self._max_row_packs * self.hip_tunables.threads
+        )
+
+    def _all_reduce_rms_norm(
+        self, inp: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        cfg = self.hip_tunables
+        out = torch.empty_like(inp)
+        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
+            self._handle,
+            out,
+            self._as_input(inp),
+            weight,
+            eps,
+            _ALGO_WIRE[cfg.algo],
+            self.tunables.small_limit,
+            cfg.blocks,
+            cfg.threads,
+        )
+        return out
+
+    def _all_reduce_fused_add_rms_norm(
         self,
         inp: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sum across the TP ranks, add `residual`, RMS-normalise, in one kernel.
-        Returns the normed result, then the sum plus residual."""
+        """Returns the normed result, then the sum plus residual."""
         cfg = self.hip_tunables
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(inp)
-        torch.ops._rocm_C.rocm_comms_all_reduce_rmsnorm(
+        torch.ops._rocm_C.rocm_comms_all_reduce_fused_add_rms_norm(
             self._handle,
             out,
             residual_out,

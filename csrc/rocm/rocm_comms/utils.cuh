@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Shared by the collectives: the 16-byte vector, its sum across ranks, and one row
-// of the fused residual add + RMSNorm.
+// of all-reduce + RMSNorm.
 
 #pragma once
 
@@ -68,48 +68,62 @@ DINLINE float block_sum(float v) {
   return total;
 }
 
-// ONE ROW of all-reduce + residual add + RMSNorm, by the whole block. `row` indexes the
-// inputs and `residual`; the two outputs are written at `res_dst` and `out_dst`, which
-// is where the variants differ (the output tensors, or scratch).
+// How many 16-byte packs of one row a thread holds in registers. A row wider than
+// kMaxRowPacks x blockDim is refused by the host.
+constexpr int kMaxRowPacks = 4;
+
+// ONE ROW of all-reduce + RMSNorm by the whole block, matching vLLM's reference ops
+// (`vllm/ir/ops/layernorm.py`) rounding for rounding:
 //
-// TWO PASSES OVER THE ROW: the second reads back the residual the first wrote -- a row this
-// block wrote microseconds ago, so L2 rather than HBM -- instead of holding the row in
-// registers, which would bound the hidden size silently.
+//   s   = float(T(sum over ranks))                  the all-reduce output, as it would land
+//   s  += float(residual); res_dst = T(s)           kAdd only: fused_add_rms_norm
+//   out = T(float(T(s * rsqrt(mean(s^2) + eps))) * float(w))
 //
-// THE VARIANCE IS AN fp32 SUM OF fp32 SQUARES, matching `vllm.ir.ops.fused_add_rms_norm`.
-// What differs: the second pass reads the ROUNDED residual where the reference scales the
-// unrounded fp32 value. One rounding, inside the norm's own tolerance.
-template <typename T, int ngpus>
-DINLINE void add_rmsnorm_row(const typename traits<T>::V* const ptrs[],
-                             const typename traits<T>::V* residual,
-                             const typename traits<T>::V* weight, int row, int packs,
-                             float inv_hidden, float eps,
-                             typename traits<T>::V* res_dst,
-                             typename traits<T>::V* out_dst) {
+// The variance is taken from `s` before any further rounding, and `s` stays in registers
+// between the two passes, so nothing is read back.
+template <typename T, int ngpus, bool kAdd>
+DINLINE void rms_norm_row(const typename traits<T>::V* const ptrs[],
+                          const typename traits<T>::V* residual,
+                          const typename traits<T>::V* weight, int row, int packs,
+                          float inv_hidden, float eps, typename traits<T>::V* res_dst,
+                          typename traits<T>::V* out_dst) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
-  float acc        = 0.0f;
-  for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-    V sum = reduce_at<T, ngpus>(ptrs, base + i);
-    V r   = residual[base + i];
+  float s[kMaxRowPacks][NL];
+  float acc = 0.0f;
 #pragma unroll
-    for (int j = 0; j < NL; ++j) {
-      const float s = static_cast<float>(sum.d[j]) + static_cast<float>(r.d[j]);
-      sum.d[j]      = static_cast<T>(s);
-      acc += s * s;
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+    const V sum = reduce_at<T, ngpus>(ptrs, base + i);
+#pragma unroll
+    for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(sum.d[j]);
+    if constexpr (kAdd) {
+      const V r = residual[base + i];
+      V rounded;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) {
+        s[k][j] += static_cast<float>(r.d[j]);
+        rounded.d[j] = static_cast<T>(s[k][j]);
+      }
+      res_dst[i] = rounded;
     }
-    res_dst[i] = sum;
+#pragma unroll
+    for (int j = 0; j < NL; ++j) acc += s[k][j] * s[k][j];
   }
   const float scale = rsqrtf(block_sum(acc) * inv_hidden + eps);
-  for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-    V r  = res_dst[i];
-    V wv = weight[i];
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+    const V w = weight[i];
+    V o;
 #pragma unroll
     for (int j = 0; j < NL; ++j)
-      r.d[j] = static_cast<T>(static_cast<float>(r.d[j]) * scale *
-                              static_cast<float>(wv.d[j]));
-    out_dst[i] = r;
+      o.d[j] = static_cast<T>(static_cast<float>(static_cast<T>(s[k][j] * scale)) *
+                              static_cast<float>(w.d[j]));
+    out_dst[i] = o;
   }
   // Before the next row reuses `block_sum`'s shared slots.
   __syncthreads();

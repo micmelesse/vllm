@@ -961,54 +961,60 @@ def test_communicator(
 
 
 # ---------------------------------------------------------------------------------
-# THE FUSED VARIANT. `all_reduce_rmsnorm` is not in `OPS` above because it does not fit
-# that sweep's shape: it takes three tensors rather than one, only the backends that
-# override `_all_reduce_rmsnorm` have it, and what it must be judged against is not a
-# reference written here but THE TWO OPS A FUSION PASS REPLACED. So it gets its own
-# runner, and the comparison is against `vllm.ir.ops.fused_add_rms_norm` itself.
+# THE FUSED VARIANTS. Not in `OPS` above: each takes more than one tensor, and what it
+# must be judged against is THE TWO OPS A FUSION PASS REPLACED, not a reference written
+# here. So they get their own runner, compared against `vllm.ir.ops` itself.
 # ---------------------------------------------------------------------------------
 
-# WHAT "NO KERNEL" LOOKS LIKE COMING BACK FROM A RANK, so the parent can SKIP rather
-# than pass. A backend without a fused kernel falls back to the unfused pair, which is
-# exactly the reference -- so a test that just compared numbers would pass on the
-# fallback forever, and go on passing the day the kernel lands and is wrong. That is the
-# `17 file(s) -> PASS` failure, and the cure is that absence has its own answer.
+# What "no kernel" looks like coming back from a rank, so the parent can SKIP rather
+# than pass: the fallback IS the reference, and would pass forever.
 NO_FUSED_KERNEL = "no fused kernel"
 
 FUSED_EPS = 1e-5
+# all_reduce -> rms_norm, and all_reduce -> fused_add_rms_norm.
+FORMS = ("rms_norm", "fused_add_rms_norm")
+# Kimi-K3's latent MoE row (3584) and hidden row (7168), then the sweep's 8192. Four
+# rows is fewer than the ranks, which two-shot must still get right.
+FUSED_SHAPES = (
+    (4, 3584),
+    (128, 3584),
+    (4, 7168),
+    (128, 7168),
+    (4088, 7168),
+    (512, 8192),
+)
 
 
 def _fused_reference(
-    inputs: Sequence[torch.Tensor], residual: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """What the fused kernel has to agree with: the all-reduce, then the exact op a
-    fusion pass rewrote away. Summed in fp32 for the same reason `_expected` is."""
+    form: str,
+    inputs: Sequence[torch.Tensor],
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The all-reduce, landed in the input dtype as an all-reduce would land it, then
+    the exact op the pass rewrote away."""
     import vllm.ir.ops
 
     acc = torch.zeros_like(inputs[0], dtype=torch.float32)
     for x in inputs:
         acc += x.to(torch.float32)
-    return vllm.ir.ops.fused_add_rms_norm(
-        acc.to(inputs[0].dtype), residual, weight, FUSED_EPS
-    )
+    summed = acc.to(inputs[0].dtype)
+    if form == "rms_norm":
+        return vllm.ir.ops.rms_norm(summed, weight, FUSED_EPS), None
+    return vllm.ir.ops.fused_add_rms_norm(summed, residual, weight, FUSED_EPS)
 
 
 def _fused_tolerance(dtype: torch.dtype) -> tuple[float, float]:
-    """`(atol, rtol)` for the normed output.
-
-    TIGHTER THAN THE RAW REDUCE'S, and it can be: RMSNorm divides by the row's own
-    magnitude, so the result is O(1) whatever the sum was, and an absolute tolerance
-    means something here where on the raw sum it does not. It is not arbitrarily tight
-    either -- the kernel's second pass reads back the ROUNDED residual where the
-    reference scales the unrounded fp32 value, so one extra rounding is expected and
-    this is what bounds it.
-    """
+    """`(atol, rtol)` for the normed output. The kernel matches the reference's
+    roundings; what is left is the sum's order, which the rank rotation changes by an
+    ULP of the input dtype, and the norm carries through."""
     return (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 2e-3)
 
 
 def run_fused_rank(
     rank: int,
     world: int,
+    form: str,
     shape: tuple[int, int],
     dtype_name: str,
     algo: Algo,
@@ -1029,26 +1035,39 @@ def run_fused_rank(
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
     try:
-        # EVERY RANK REBUILDS EVERY RANK'S INPUT from the seed, as the sweep above does,
+        # Every rank rebuilds every rank's input from the seed, as the sweep above does,
         # so the reference is computed locally and no tensor crosses a process boundary.
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
         residual = _one_input(world, 1, shape, dtype)
         weight = _one_input(world + 1, 2, (shape[1],), dtype)
         with _build_communicator("hip", cpu_group, group, device, algo) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce_rmsnorm(mine):
-                return False, NO_FUSED_KERNEL
-            got, got_residual = comm.all_reduce_rmsnorm(
-                mine, residual.to(device), weight.to(device), FUSED_EPS
-            )
-        want, want_residual = _fused_reference(inputs, residual, weight)
+            if form == "rms_norm":
+                if not comm.should_allreduce_rms_norm(mine):
+                    return False, NO_FUSED_KERNEL
+                got = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS)
+                got_residual = None
+            else:
+                if not comm.should_allreduce_fused_add_rms_norm(mine):
+                    return False, NO_FUSED_KERNEL
+                got, got_residual = comm.all_reduce_fused_add_rms_norm(
+                    mine, residual.to(device), weight.to(device), FUSED_EPS
+                )
+        want, want_residual = _fused_reference(form, inputs, residual, weight)
         atol, rtol = _fused_tolerance(dtype)
-        for name, a, b, tol in (
-            ("out", got.cpu(), want, atol),
-            # THE RESIDUAL IS THE RAW SUM plus the incoming residual, unnormalised, so
+        checks = [("out", got.cpu(), want, atol)]
+        if got_residual is not None:
+            # The residual is the raw sum plus the incoming residual, unnormalised, so
             # it gets the raw reduce's tolerance and not the normed one.
-            ("residual", got_residual.cpu(), want_residual, _atol("all_reduce", dtype)),
-        ):
+            checks.append(
+                (
+                    "residual",
+                    got_residual.cpu(),
+                    want_residual,
+                    _atol("all_reduce", dtype),
+                )
+            )
+        for name, a, b, tol in checks:
             worst = (a.to(torch.float32) - b.to(torch.float32)).abs().max().item()
             if not torch.allclose(
                 a.to(torch.float32), b.to(torch.float32), atol=tol, rtol=rtol
@@ -1056,7 +1075,7 @@ def run_fused_rank(
                 return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
         return True, None
     except Exception as e:
-        logger.exception("rank %d failed the fused all_reduce_rmsnorm", rank)
+        logger.exception("rank %d failed the fused all_reduce_%s", rank, form)
         return False, f"{type(e).__name__}: {e}"
     finally:
         try:
@@ -1071,24 +1090,20 @@ def run_fused_rank(
 # `mixed` is the other two chosen by size, and both are here at every shape.
 @pytest.mark.parametrize("algo", ("one_shot", "two_shot"))
 @pytest.mark.parametrize("dtype_name", DTYPES)
-@pytest.mark.parametrize("shape", SHAPES)
-def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
+@pytest.mark.parametrize("shape", FUSED_SHAPES)
+@pytest.mark.parametrize("form", FORMS)
+def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
+    form: str,
     shape: tuple[int, int],
     dtype_name: str,
     algo: Algo,
     world: int,
     rendezvous: tuple[str, int],
 ) -> None:
-    """The fused kernel against `all_reduce` then `fused_add_rms_norm`.
+    """Each fused op against all_reduce then the `vllm.ir.ops` norm it replaces.
 
-    THE REFERENCE IS THE THING THE PASS REWROTE, not a reimplementation: `rocm_comms`
-    fusion replaces exactly that pair in an FX graph, so agreeing with it is the whole
-    contract. A reimplementation here would be a second opinion about RMSNorm and could
-    be wrong in the same direction as the kernel.
-
-    ENUMERATED, NOT PROPERTY-GENERATED, for the reason stated where `SHAPES` is: a
-    shrinking framework cannot drive across spawned ranks, and each candidate is a full
-    eight-process run.
+    Enumerated, not property-generated: a shrinking framework cannot drive across
+    spawned ranks, and each candidate is a full eight-process run.
     """
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
@@ -1097,17 +1112,17 @@ def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
     pool = Pool(processes=world)
     try:
         rets = [
-            pool.apply_async(run_fused_rank, (r, world, shape, dtype_name, algo, init))
+            pool.apply_async(
+                run_fused_rank, (r, world, form, shape, dtype_name, algo, init)
+            )
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
-    # A BACKEND WITH NO FUSED KERNEL SKIPS, LOUDLY. Passing here would mean the fallback
-    # -- which IS the reference -- vouching for a kernel that does not exist.
+    where = f"{form} {algo} {shape} {dtype_name}"
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip has no fused all_reduce_rmsnorm for {shape} {dtype_name}")
-    where = f"{algo} {shape} {dtype_name}"
+        pytest.skip(f"hip has no fused all_reduce_{form} for {where}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{where}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{where}: ranks disagreed"
