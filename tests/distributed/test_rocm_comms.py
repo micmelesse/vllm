@@ -85,7 +85,11 @@ BASELINE_ALIGNMENT = 16  # "input byte size to be multiples of 16"
 # to call and, with the underscores dropped, the gate to ask (`all_reduce` /
 # `should_allreduce`), so `getattr` needs no table -- and renaming the API breaks this
 # loudly instead of testing something else quietly.
-OPS = ("all_reduce", "all_gather")
+# ALL-REDUCE AND ITS VARIANTS, AND NOTHING ELSE. all_gather left the package on
+# 2026-09-24: a second collective to keep correct, instantiate and measure, for
+# something the decode path this work studies never calls. The gathering that
+# matters is a PHASE INSIDE two-shot and is covered by two-shot's own cases.
+OPS = ("all_reduce",)
 
 
 def _say(rank: int, line: str) -> None:
@@ -105,16 +109,13 @@ def _expected(op_name: str, inputs: Sequence[torch.Tensor]) -> torch.Tensor:
     """What every rank should hold after `op_name` -- the one thing not derivable from
     the API.
 
-    all_reduce sums in fp32 so the reference does not itself eat bf16 rounding;
-    all_gather concatenates rank-ordered along the last axis, the
-    `Communicator.all_gather` contract for every backend.
+    all_reduce sums in fp32 so the reference does not itself eat bf16 rounding.
     """
-    if op_name == "all_reduce":
-        acc = torch.zeros_like(inputs[0], dtype=torch.float32)
-        for x in inputs:
-            acc += x.to(torch.float32)
-        return acc.to(inputs[0].dtype)
-    return torch.cat(inputs, dim=-1)
+    assert op_name == "all_reduce", op_name
+    acc = torch.zeros_like(inputs[0], dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    return acc.to(inputs[0].dtype)
 
 
 # The RELATIVE half of the tolerance. One value for every case, where `atol` is per (op,
@@ -127,14 +128,11 @@ RTOL = 0.01
 
 
 def _atol(op_name: str, dtype: torch.dtype) -> float:
-    """all_gather is data movement, so effectively exact. all_reduce sums world_size
-    values, and
-    bf16's 7-bit mantissa (ULP ~8x fp16's) makes tree-vs-sequential accumulation diverge
-    by a few ULPs -- benign, but a CORRECT bf16 reduce needs a dtype-aware tolerance or
-    it reads as a failure.
+    """all_reduce sums world_size values, and bf16's 7-bit mantissa (ULP ~8x fp16's)
+    makes tree-vs-sequential accumulation diverge by a few ULPs -- benign, but a CORRECT
+    bf16 reduce needs a dtype-aware tolerance or it reads as a failure.
     A real bug is orders of magnitude past this."""
-    if op_name == "all_gather":
-        return 1e-3
+    assert op_name == "all_reduce", op_name
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
@@ -227,8 +225,8 @@ class Schedule:
 
         `replays` is the budget for the whole GROUP, so the shapes that share a capture
         share it too: adding a shape to the ladder must not multiply the snapshots,
-        which at `all_gather`'s eight-fold fan-out is what decides whether the group
-        fits on a card at all. Truncated, so every shape gets the SAME count and the
+        which is what decides whether the group fits on a card at all. Truncated, so
+        every shape gets the SAME count and the
         arithmetic is identical for all of them.
         """
         return self.buffers * max(1, self.replays // admitted)
@@ -891,9 +889,6 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             assert ours.should_allreduce(t) is aligned, (
                 f"all_reduce admission is not the alignment rule: {where}"
             )
-            assert ours.should_allgather(t) is aligned, (
-                f"all_gather admission is not the alignment rule: {where}"
-            )
             # SIZE ALONE, and nothing else: `_is_small` is the algorithm switch, so it
             # says nothing about whether the tensor is ours.
             assert ours._is_small(t) is (nbytes < BASELINE_MAX_SIZE), (
@@ -932,3 +927,144 @@ def test_communicator(
         pytest.fail(f"{backend}/{mode}: {err}")
     print(f"      => {got}", flush=True)
     assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"
+
+
+# ---------------------------------------------------------------------------------
+# THE FUSED VARIANT. `all_reduce_rmsnorm` is not in `OPS` above because it does not fit
+# that sweep's shape: it takes three tensors rather than one, only the backends that
+# override `_all_reduce_rmsnorm` have it, and what it must be judged against is not a
+# reference written here but THE TWO OPS A FUSION PASS REPLACED. So it gets its own
+# runner, and the comparison is against `vllm.ir.ops.fused_add_rms_norm` itself.
+# ---------------------------------------------------------------------------------
+
+# WHAT "NO KERNEL" LOOKS LIKE COMING BACK FROM A RANK, so the parent can SKIP rather
+# than pass. A backend without a fused kernel falls back to the unfused pair, which is
+# exactly the reference -- so a test that just compared numbers would pass on the
+# fallback forever, and go on passing the day the kernel lands and is wrong. That is the
+# `17 file(s) -> PASS` failure, and the cure is that absence has its own answer.
+NO_FUSED_KERNEL = "no fused kernel"
+
+FUSED_EPS = 1e-5
+
+
+def _fused_reference(
+    inputs: Sequence[torch.Tensor], residual: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """What the fused kernel has to agree with: the all-reduce, then the exact op a
+    fusion pass rewrote away. Summed in fp32 for the same reason `_expected` is."""
+    import vllm.ir.ops
+
+    acc = torch.zeros_like(inputs[0], dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    return vllm.ir.ops.fused_add_rms_norm(
+        acc.to(inputs[0].dtype), residual, weight, FUSED_EPS
+    )
+
+
+def _fused_tolerance(dtype: torch.dtype) -> tuple[float, float]:
+    """`(atol, rtol)` for the normed output.
+
+    TIGHTER THAN THE RAW REDUCE'S, and it can be: RMSNorm divides by the row's own
+    magnitude, so the result is O(1) whatever the sum was, and an absolute tolerance
+    means something here where on the raw sum it does not. It is not arbitrarily tight
+    either -- the kernel's second pass reads back the ROUNDED residual where the
+    reference scales the unrounded fp32 value, so one extra rounding is expected and
+    this is what bounds it.
+    """
+    return (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 2e-3)
+
+
+def run_fused_rank(
+    rank: int, world: int, shape: tuple[int, int], dtype_name: str, init_method: str
+) -> tuple[bool, str | None]:
+    """ONE rank: run the fused op and the two ops it replaces, and say whether they
+    agree. Returns `(agreed, err)`; `err` is `NO_FUSED_KERNEL` when this backend has
+    none, which is a skip and not a failure."""
+    dtype = D_DTYPES[dtype_name]
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(
+        world_size=world, rank=rank, distributed_init_method=init_method
+    )
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, 1)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+    try:
+        # EVERY RANK REBUILDS EVERY RANK'S INPUT from the seed, as the sweep above does,
+        # so the reference is computed locally and no tensor crosses a process boundary.
+        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+        residual = _one_input(world, 1, shape, dtype)
+        weight = _one_input(world + 1, 2, (shape[1],), dtype)
+        with _build_communicator("hip", cpu_group, group, device) as comm:
+            mine = inputs[rank].to(device)
+            if not comm.should_allreduce_rmsnorm(mine):
+                return False, NO_FUSED_KERNEL
+            got, got_residual = comm.all_reduce_rmsnorm(
+                mine, residual.to(device), weight.to(device), FUSED_EPS
+            )
+        want, want_residual = _fused_reference(inputs, residual, weight)
+        atol, rtol = _fused_tolerance(dtype)
+        for name, a, b, tol in (
+            ("out", got.cpu(), want, atol),
+            # THE RESIDUAL IS THE RAW SUM plus the incoming residual, unnormalised, so
+            # it gets the raw reduce's tolerance and not the normed one.
+            ("residual", got_residual.cpu(), want_residual, _atol("all_reduce", dtype)),
+        ):
+            worst = (a.to(torch.float32) - b.to(torch.float32)).abs().max().item()
+            if not torch.allclose(
+                a.to(torch.float32), b.to(torch.float32), atol=tol, rtol=rtol
+            ):
+                return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
+        return True, None
+    except Exception as e:
+        logger.exception("rank %d failed the fused all_reduce_rmsnorm", rank)
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if dist.is_initialized():
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception("rank %d: teardown failed", rank)
+
+
+@pytest.mark.parametrize("dtype_name", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_all_reduce_rmsnorm_matches_the_two_ops_it_replaces(
+    shape: tuple[int, int], dtype_name: str, world: int, rendezvous: tuple[str, int]
+) -> None:
+    """The fused kernel against `all_reduce` then `fused_add_rms_norm`.
+
+    THE REFERENCE IS THE THING THE PASS REWROTE, not a reimplementation: `rocm_comms`
+    fusion replaces exactly that pair in an FX graph, so agreeing with it is the whole
+    contract. A reimplementation here would be a second opinion about RMSNorm and could
+    be wrong in the same direction as the kernel.
+
+    ENUMERATED, NOT PROPERTY-GENERATED, for the reason stated where `SHAPES` is: a
+    shrinking framework cannot drive across spawned ranks, and each candidate is a full
+    eight-process run.
+    """
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    init = get_distributed_init_method(addr, port)
+    pool = Pool(processes=world)
+    try:
+        rets = [
+            pool.apply_async(run_fused_rank, (r, world, shape, dtype_name, init))
+            for r in range(world)
+        ]
+        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
+    finally:
+        pool.terminate()
+    # A BACKEND WITH NO FUSED KERNEL SKIPS, LOUDLY. Passing here would mean the fallback
+    # -- which IS the reference -- vouching for a kernel that does not exist.
+    if any(err == NO_FUSED_KERNEL for _, err in got):
+        pytest.skip(f"hip has no fused all_reduce_rmsnorm for {shape} {dtype_name}")
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shape} {dtype_name}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{shape} {dtype_name}: ranks disagreed"

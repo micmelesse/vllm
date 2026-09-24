@@ -100,10 +100,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int blocks, int threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
 
+  // FUSED. Two mutable outputs: `out` is the normed result, `residual_out` the
+  // sum-plus-residual the next block reads. `eps` is a float in the schema because
+  // torch has no `double` there; the kernel narrows it.
   rocm_ops.def(
-      "rocm_comms_all_gather(int comms, Tensor! out, Tensor inp, int algo, "
-      "int blocks, int threads) -> ()");
-  rocm_ops.impl("rocm_comms_all_gather", torch::kCUDA, &rocm_comms_all_gather);
+      "rocm_comms_all_reduce_rmsnorm(int comms, Tensor! out, Tensor! residual_out, "
+      "Tensor inp, Tensor residual, Tensor weight, float eps, int blocks, "
+      "int threads) -> ()");
+  rocm_ops.impl("rocm_comms_all_reduce_rmsnorm", torch::kCUDA,
+                &rocm_comms_all_reduce_rmsnorm);
+
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

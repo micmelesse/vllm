@@ -170,6 +170,101 @@ __global__ void __launch_bounds__(512, 1)
   barrier_end<ngpus, true>(sigs, self, rank);
 }
 
+// ONE-SHOT, FUSED WITH RMSNorm. The sum is already in registers when one-shot is about to
+// store it, so normalising there costs one HBM round trip less than an all-reduce kernel
+// followed by a norm kernel, and one launch less.
+//
+// THE DECOMPOSITION IS THE WHOLE COST, and it is why this is a separate kernel rather than a
+// flag on the one above. RMSNorm needs the sum of squares across a WHOLE ROW, so a block has
+// to own a row; plain one-shot is grid-stride over the flat buffer and a block owns whatever
+// it lands on. So this is one block per row, striding over rows, and the reduction inside a
+// block is what the norm needs. (aiter reaches the same constraint from the other side and
+// spells it `hidden_dim / pack_size <= 1024` -- their gate for the 1-stage fused path.)
+//
+// TWO PASSES OVER THE ROW, NOT ONE, and the second reads what the first wrote. Holding the
+// row in registers would avoid it, but only up to a hidden size the register file allows,
+// and the bound would then be a silent wrong answer rather than a refusal. `residual_out` has
+// to be written anyway, so the re-read is of a 16 KB row this block wrote microseconds ago --
+// L2, not HBM. If profiling says otherwise, a register-resident variant is the next step.
+//
+// THE VARIANCE IS AN fp32 SUM OF fp32 SQUARES, matching `vllm.ir.ops.fused_add_rms_norm`.
+// What differs from it: the second pass reads back the ROUNDED residual, where the reference
+// scales the unrounded fp32 value. One rounding, inside the norm's own tolerance, and the
+// equivalence test is what says so rather than this comment.
+DINLINE float block_sum(float v) {
+  // 8 = 512 / 64, the launch bound over the wavefront. A block wider than the bound cannot
+  // be launched, so this cannot be overrun.
+  __shared__ float partial[8];
+  __shared__ float total;
+  const int lane = threadIdx.x % warpSize;
+  const int warp = threadIdx.x / warpSize;
+  for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+  if (lane == 0) partial[warp] = v;
+  __syncthreads();
+  const int warps = (blockDim.x + warpSize - 1) / warpSize;
+  if (warp == 0) {
+    v = (lane < warps) ? partial[lane] : 0.0f;
+    for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+    if (lane == 0) total = v;
+  }
+  __syncthreads();
+  return total;
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) one_shot_all_reduce_rmsnorm(
+    const PeerPtrs* peers, PeerSignals sigs, Signal* self, T* __restrict__ out,
+    T* __restrict__ residual_out, const T* __restrict__ residual,
+    const T* __restrict__ weight, float eps, int rank, int rows, int packs) {
+  using V          = typename traits<T>::V;
+  constexpr int NL = traits<T>::N;
+  const V* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+    ptrs[i] = reinterpret_cast<const V*>(peers->p[(rank + i) % ngpus]);
+
+  barrier_start<ngpus>(sigs, self, rank);
+
+  const V* res_in = reinterpret_cast<const V*>(residual);
+  V* res_out      = reinterpret_cast<V*>(residual_out);
+  const V* w      = reinterpret_cast<const V*>(weight);
+  V* o            = reinterpret_cast<V*>(out);
+  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+
+  // A BLOCK OWNS A ROW AT A TIME. Uniform across the block, so every `__syncthreads`
+  // below is reached by every thread in it.
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const int base = row * packs;
+    float acc      = 0.0f;
+    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+      V sum = reduce_at<T, ngpus>(ptrs, base + i);
+      V r   = res_in[base + i];
+#pragma unroll
+      for (int j = 0; j < NL; ++j) {
+        const float s = static_cast<float>(sum.d[j]) + static_cast<float>(r.d[j]);
+        sum.d[j]      = static_cast<T>(s);
+        acc += s * s;
+      }
+      res_out[base + i] = sum;
+    }
+    const float scale = rsqrtf(block_sum(acc) * inv_hidden + eps);
+    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+      V r  = res_out[base + i];
+      V wv = w[i];
+#pragma unroll
+      for (int j = 0; j < NL; ++j)
+        r.d[j] = static_cast<T>(static_cast<float>(r.d[j]) * scale *
+                                static_cast<float>(wv.d[j]));
+      o[base + i] = r;
+    }
+    // Before the next row reuses `block_sum`'s shared slots.
+    __syncthreads();
+  }
+  // Same reason as one-shot's: a rank that returns lets its INPUT be reused while a peer
+  // is still reading it.
+  barrier_end<ngpus, true>(sigs, self, rank);
+}
+
 // TWO-SHOT: reduce-scatter, then all-gather. Every rank owns one slice of the buffer,
 // reduces ONLY that slice by reading every peer's copy of it, publishes the result in its
 // own scratch, and then every rank copies all ngpus slices back out.
@@ -235,30 +330,6 @@ __global__ void __launch_bounds__(512, 1)
 
   // Required for the same reason one-shot's is: without it a rank can return and let its
   // INPUT be reused while a peer is still reading that input.
-  barrier_end<ngpus, true>(sigs, self, rank);
-}
-
-// ONE-SHOT ALL-GATHER. Same handshake and same read pattern as the all-reduce; it
-// concatenates instead of summing. `out` is filled RANK-MAJOR -- shape (ngpus, *inp) --
-// and the Python layer moves the axis where the caller wanted it, exactly as the torch
-// path did, so the two produce identical results.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    one_shot_all_gather(const PeerPtrs* peers, PeerSignals sigs, Signal* self,
-                        T* __restrict__ out, int rank, int size) {
-  using V = typename traits<T>::V;
-  const V* ptrs[ngpus];
-#pragma unroll
-  for (int i = 0; i < ngpus; ++i) ptrs[i] = reinterpret_cast<const V*>(peers->p[i]);
-
-  barrier_start<ngpus>(sigs, self, rank);
-  const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = gridDim.x * blockDim.x;
-  V* dst           = reinterpret_cast<V*>(out);
-  for (int idx = tid; idx < size; idx += stride) {
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) dst[i * size + idx] = ptrs[i][idx];
-  }
   barrier_end<ngpus, true>(sigs, self, rank);
 }
 
@@ -396,26 +467,81 @@ class Comms {
                   " were allocated. Raise HipTunables.scratch_bytes.");
     }
     PeerPtrs* slot = slot_for(inp.data_ptr());
-    dispatch<false>(out, algo, blocks, threads, slot, n);
+    dispatch(out, algo, blocks, threads, slot, n);
   }
 
   // `out` must be rank-major with ngpus x inp.numel() elements; the caller reshapes.
-  void all_gather(torch::Tensor& out, torch::Tensor& inp, int64_t algo, int64_t blocks,
-                  int64_t threads) {
-    TORCH_CHECK(out.is_cuda() && inp.is_cuda(), "out and inp must be on device");
-    TORCH_CHECK(out.is_contiguous() && inp.is_contiguous(), "out and inp must be contiguous");
-    TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
-    TORCH_CHECK(out.numel() == inp.numel() * world_size_, "all_gather: out must hold ",
-                world_size_, " x inp (", inp.numel() * world_size_, "), got ", out.numel());
+  // FUSED: sum across ranks, add the residual, normalise. `out` is the normed result and
+  // `residual_out` the sum-plus-residual the next block needs -- both are real outputs, so
+  // nothing here is scratch.
+  //
+  // ONE-SHOT ONLY, and it says so rather than silently picking. Two-shot leaves each rank
+  // holding one SLICE of the row after its reduce-scatter, and a row's variance needs the
+  // whole row -- so a fused two-shot wants another reduction of the partial sums of squares
+  // between the two phases. That is a real design and it is not this one.
+  void all_reduce_rmsnorm(torch::Tensor& out, torch::Tensor& residual_out,
+                          torch::Tensor& inp, torch::Tensor& residual,
+                          torch::Tensor& weight, double eps, int64_t blocks,
+                          int64_t threads) {
+    TORCH_CHECK(out.is_cuda() && inp.is_cuda() && residual.is_cuda() && weight.is_cuda(),
+                "every tensor must be on device");
+    TORCH_CHECK(out.is_contiguous() && residual_out.is_contiguous() &&
+                    inp.is_contiguous() && residual.is_contiguous() &&
+                    weight.is_contiguous(),
+                "every tensor must be contiguous");
+    TORCH_CHECK(out.sizes() == inp.sizes() && residual_out.sizes() == inp.sizes() &&
+                    residual.sizes() == inp.sizes(),
+                "out, residual_out and residual must have inp's shape");
+    TORCH_CHECK(out.scalar_type() == inp.scalar_type() &&
+                    residual_out.scalar_type() == inp.scalar_type() &&
+                    residual.scalar_type() == inp.scalar_type() &&
+                    weight.scalar_type() == inp.scalar_type(),
+                "every tensor must share inp's dtype");
+    TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
+    TORCH_CHECK(weight.dim() == 1 && weight.numel() == inp.size(1),
+                "weight must be 1-D of hidden=", inp.size(1));
     TORCH_CHECK(blocks > 0 && blocks <= kMaxBlocks, "blocks must be in [1, ", kMaxBlocks, "]");
     TORCH_CHECK(threads > 0 && threads <= 512, "threads must be in [1, 512]");
 
     const int lanes = 16 / static_cast<int>(inp.element_size());
-    TORCH_CHECK(inp.numel() % lanes == 0, "numel ", inp.numel(),
-                " must be a multiple of ", lanes, " for 16-byte vectorized access");
+    const int64_t hidden = inp.size(1);
+    // A BLOCK OWNS A ROW, so a row has to divide into whole 16-byte packs. Refused here,
+    // where the tensor can be named, rather than by a partial pack read past the end.
+    TORCH_CHECK(hidden % lanes == 0, "hidden ", hidden, " must be a multiple of ", lanes,
+                " for 16-byte vectorized access");
+    const int rows  = static_cast<int>(inp.size(0));
+    const int packs = static_cast<int>(hidden / lanes);
+
     PeerPtrs* slot = slot_for(inp.data_ptr());
-    dispatch<true>(out, algo, blocks, threads, slot,
-                   static_cast<int>(inp.numel() / lanes));
+    auto stream    = at::cuda::getCurrentCUDAStream();
+    // ONE BLOCK PER ROW, capped by what was asked for: a grid wider than the rows leaves
+    // blocks with nothing to do and still pays both barriers.
+    const int grid = static_cast<int>(std::min<int64_t>(blocks, rows));
+
+#define LAUNCH_FUSED(T, NG)                                                             \
+  one_shot_all_reduce_rmsnorm<T, NG><<<dim3(grid), dim3(threads), 0, stream>>>(         \
+      slot, peer_signals_, self_signal_, out.data_ptr<T>(),                             \
+      residual_out.data_ptr<T>(), residual.data_ptr<T>(), weight.data_ptr<T>(),         \
+      static_cast<float>(eps), rank_, rows, packs)
+
+#define FUSED_BY_NGPUS(T)                                                               \
+  switch (world_size_) {                                                                \
+    case 2: LAUNCH_FUSED(T, 2); return;                                                 \
+    case 4: LAUNCH_FUSED(T, 4); return;                                                 \
+    case 8: LAUNCH_FUSED(T, 8); return;                                                 \
+    default: break;                                                                     \
+  }
+
+    switch (inp.scalar_type()) {
+      case at::ScalarType::Half: FUSED_BY_NGPUS(at::Half) break;
+      case at::ScalarType::BFloat16: FUSED_BY_NGPUS(at::BFloat16) break;
+      default:
+        throw std::runtime_error("hip_comms: dtype not built. Built: float16, bfloat16.");
+    }
+    throw std::runtime_error("hip_comms: world_size " + std::to_string(world_size_) +
+                             " not built. Built: 2, 4, 8.");
+#undef FUSED_BY_NGPUS
+#undef LAUNCH_FUSED
   }
 
  private:
@@ -492,18 +618,16 @@ class Comms {
 
   // THE instantiation menu. Every combination that exists is named here exactly once, so
   // an unsupported request is a listed refusal rather than a wrong kernel.
-  template <bool gather>
   void dispatch(torch::Tensor& out, int64_t algo, int64_t blocks, int64_t threads,
                 PeerPtrs* slot, int n) {
     auto stream = at::cuda::getCurrentCUDAStream();
-  // THE ALGO PICKS THE KERNEL; `gather` picks the operation. All-gather has one algorithm,
-  // because there is nothing to reduce and so nothing for a second pass to save.
+  // THE ALGO PICKS THE KERNEL, and there is nothing else it picks: this backend does
+  // all-reduce. all_gather was here and moved to `torch.distributed` (2026-09-24) --
+  // it was a second op to keep correct for something nothing in the decode path we
+  // study ever called, and the two-shot phase that gathers is internal to that kernel.
 #define LAUNCH(T, NG)                                                                   \
   do {                                                                                  \
-    if constexpr (gather)                                                               \
-      one_shot_all_gather<T, NG><<<dim3(blocks), dim3(threads), 0, stream>>>(           \
-          slot, peer_signals_, self_signal_, out.data_ptr<T>(), rank_, n);              \
-    else if (algo == kAlgoTwoShot)                                                      \
+    if (algo == kAlgoTwoShot)                                                           \
       two_shot_all_reduce<T, NG><<<dim3(blocks), dim3(threads), 0, stream>>>(           \
           slot, peer_signals_, self_signal_, out.data_ptr<T>(), rank_, n);              \
     else                                                                                \
@@ -522,8 +646,6 @@ class Comms {
     if (algo != kAlgoOneShot && algo != kAlgoTwoShot)
       throw std::runtime_error("hip_comms: algo " + std::to_string(algo) +
                                " is not built. Built: 0 (one_shot), 1 (two_shot).");
-    if (gather && algo != kAlgoOneShot)
-      throw std::runtime_error("hip_comms: all_gather has only algo 0 (one_shot)");
     switch (out.scalar_type()) {
       case at::ScalarType::Half: BY_NGPUS(at::Half) break;
       case at::ScalarType::BFloat16: BY_NGPUS(at::BFloat16) break;
@@ -641,9 +763,12 @@ void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
   reinterpret_cast<hip_comms::Comms*>(comms)->all_reduce(out, inp, algo, blocks, threads);
 }
 
-void rocm_comms_all_gather(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
-                           int64_t algo, int64_t blocks, int64_t threads) {
-  reinterpret_cast<hip_comms::Comms*>(comms)->all_gather(out, inp, algo, blocks, threads);
+void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
+                                   torch::Tensor& residual_out, torch::Tensor& inp,
+                                   torch::Tensor& residual, torch::Tensor& weight,
+                                   double eps, int64_t blocks, int64_t threads) {
+  reinterpret_cast<hip_comms::Comms*>(comms)->all_reduce_rmsnorm(
+      out, residual_out, inp, residual, weight, eps, blocks, threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

@@ -416,35 +416,41 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
-        """Concatenate every rank's `inp` along `dim`, rank-ordered.
+    def _all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sum across the TP ranks, add `residual`, and RMS-normalise -- in one kernel.
 
-        The kernel fills a RANK-MAJOR `(world, *inp.shape)` buffer and the axis is moved
-        here, which is what the torch path did -- so the two agree bit for bit and the
-        reference in the correctness suite covers both. The `movedim`+`reshape` copy is
-        a known cost and a later perf item, not a correctness one.
+        THE HOOK, NOT THE API. `Communicator.all_reduce_rmsnorm` is the public one and
+        it owns the capture check and the admission check; supplying this is also how
+        this backend SAYS it fuses: `should_allreduce_rmsnorm` reads the
+        override itself.
+
+        ONE-SHOT ONLY, so it is not `algo`-parameterised. See the `.cu`: two-shot leaves
+        a rank holding one slice of the row, and a row's variance needs the whole row.
+
+        RETURNS BOTH, in the order the fused op's schema wants them: the normed result,
+        then the sum-plus-residual the next block reads.
         """
         cfg = self.hip_tunables
-        inp = inp.contiguous()
-        if dim < 0:
-            dim += inp.dim()
-        shape = tuple(inp.size())
-        staged = torch.empty(
-            (self.world_size,) + shape, dtype=inp.dtype, device=inp.device
-        )
-        torch.ops._rocm_C.rocm_comms_all_gather(
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp)
+        torch.ops._rocm_C.rocm_comms_all_reduce_rmsnorm(
             self._handle,
-            staged,
+            out,
+            residual_out,
             self._as_input(inp),
-            # ALL-GATHER HAS ONE ALGORITHM: nothing is reduced, so a second pass
-            # saves no bytes. The kernel refuses any other value.
-            _ALGO_WIRE["one_shot"],
+            residual,
+            weight,
+            eps,
             cfg.blocks,
             cfg.threads,
         )
-        return staged.movedim(0, dim).reshape(
-            shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
-        )
+        return out, residual_out
 
     def _on_close(self) -> None:
         """Release the peer memory, NOW. Idempotent.

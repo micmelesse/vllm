@@ -96,9 +96,9 @@ class Communicator(ABC):
     _OWNED = (
         "__init__",
         "should_allreduce",
-        "should_allgather",
+        "should_allreduce_rmsnorm",
         "all_reduce",
-        "all_gather",
+        "all_reduce_rmsnorm",
         "capture",
         "_is_supported",
         "close",
@@ -113,7 +113,7 @@ class Communicator(ABC):
             raise TypeError(
                 f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an "
                 f"override skips the capture invariant and the shared envelope. "
-                f"Supply `_all_reduce`, `_all_gather`, `_on_capture` or "
+                f"Supply `_all_reduce`, `_on_capture` or "
                 f"`_on_close` instead -- what the kernel supports and how long it "
                 f"lives are not a backend's to redefine."
             )
@@ -175,9 +175,20 @@ class Communicator(ABC):
         disabled, and a no sends the caller elsewhere, so this stays public."""
         return not self.disabled and self._is_supported(inp)
 
-    def should_allgather(self, inp: torch.Tensor) -> bool:
-        """Whether this backend takes `inp`. Every SIZE too; same two noes."""
-        return not self.disabled and self._is_supported(inp)
+    def should_allreduce_rmsnorm(self, inp: torch.Tensor) -> bool:
+        """Whether this backend can all-reduce AND normalise `inp` in one kernel.
+
+        DERIVED FROM THE OVERRIDE, never from a flag beside it. A `fuses = True` that a
+        backend sets by hand is a second copy of "I implemented `_all_reduce_rmsnorm`",
+        and two copies of one fact that can disagree is what every bug in this area has
+        been made of. Asking whether the method was overridden asks the fact itself.
+
+        SAME ENVELOPE AS THE PLAIN COLLECTIVE, because a fused kernel is an all-reduce
+        with an epilogue: whatever the backend cannot reduce it cannot fuse either."""
+        return (
+            type(self)._all_reduce_rmsnorm is not Communicator._all_reduce_rmsnorm
+            and self.should_allreduce(inp)
+        )
 
     def _is_supported(self, inp: torch.Tensor) -> bool:
         """CAN THIS KERNEL TAKE THIS TENSOR AT ALL -- its shape and its dtype.
@@ -218,7 +229,7 @@ class Communicator(ABC):
         """
         self._check_capture("all_reduce")
         if not self.should_allreduce(inp):
-            raise RuntimeError(self._rejected("all_reduce", inp))
+            raise RuntimeError(self._rejected("all_reduce", "should_allreduce", inp))
         # NO BRANCH HERE. It used to fork on `_is_small` and call the same thing on
         # both sides, marking where the paths would part. They part now -- in the
         # BACKEND: one with a kernel per size asks `_is_small` itself (see `hip`), and
@@ -226,11 +237,29 @@ class Communicator(ABC):
         # every backend carrying a parameter for one backend's benefit.
         return self._all_reduce(inp)
 
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        self._check_capture("all_gather")
-        if not self.should_allgather(inp):
-            raise RuntimeError(self._rejected("all_gather", inp))
-        return self._all_gather(inp, dim)
+    def all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sum across ranks, add `residual`, RMS-normalise -- in one kernel.
+
+        A VARIANT OF THE COLLECTIVE, so it goes through the same two doors: the
+        capture check and the admission check. It was a public method on `hip` alone,
+        reached by `getattr`, and so it skipped BOTH -- which is what `_OWNED` exists to
+        prevent.
+
+        RETURNS BOTH: the normed result, then the sum-plus-residual the next block
+        reads.
+        """
+        self._check_capture("all_reduce_rmsnorm")
+        if not self.should_allreduce_rmsnorm(inp):
+            raise RuntimeError(
+                self._rejected("all_reduce_rmsnorm", "should_allreduce_rmsnorm", inp)
+            )
+        return self._all_reduce_rmsnorm(inp, residual, weight, eps)
 
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
@@ -305,12 +334,18 @@ class Communicator(ABC):
                 f"replays against addresses that were never registered."
             )
 
-    def _rejected(self, op: str, inp: torch.Tensor) -> str:
+    def _rejected(self, op: str, gate: str, inp: torch.Tensor) -> str:
+        """Why a collective was refused, and which gate to ask instead.
+
+        THE GATE IS PASSED, NOT DERIVED. It used to be `should_{op.replace('_', '')}`,
+        which turns `all_reduce` into `should_allreduce` and is right, and turns
+        `all_reduce_rmsnorm` into `should_allreducermsnorm` and is a name that does not
+        exist. A message that names a method nobody can call is worse than no message.
+        """
         return (
             f"{type(self).__name__} rejected {op}: shape={tuple(inp.shape)} "
             f"dtype={inp.dtype} disabled={self.disabled}. Ask "
-            f"should_{op.replace('_', '')} first and fall back "
-            f"when it says no."
+            f"{gate} first and fall back when it says no."
         )
 
     # ---- What a BACKEND supplies. ----
@@ -320,9 +355,23 @@ class Communicator(ABC):
         """SUM across ranks, out of place: input untouched, new tensor returned. Assume
         `inp` is admitted -- the base checked."""
 
-    @abstractmethod
-    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
-        """The per-rank inputs concatenated along `dim`, rank-ordered."""
+    def _all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The fused variant, for a backend that has one.
+
+        NOT ABSTRACT, and that is the point: a backend with no fused kernel is not a
+        broken backend, it is one the fusion pass leaves alone. Overriding this is how a
+        backend says it fuses -- `should_allreduce_rmsnorm` reads the override and
+        nothing else."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no fused all-reduce + RMSNorm; "
+            f"ask should_allreduce_rmsnorm first."
+        )
 
     def widest_input_bytes(self) -> int:
         """ONE ALL-REDUCE INPUT at the largest batch vLLM will build, or 0 without a

@@ -154,61 +154,6 @@ class IrisCommunicator(Communicator):
             )
             raise
 
-    def _get_allgather_buffers(self, numel, dtype):
-        # Fixed byte slabs allocated once; per-call views avoid heap churn (the
-        # symmetric heap never frees).
-        if self._ag_input_slab is None:
-            assert self._shmem is not None
-            world_size = self.world_size
-            self._ag_input_slab = self._shmem.empty(
-                (self.iris.slab_bytes,), dtype=torch.uint8
-            )
-            self._ag_output_slab = self._shmem.empty(
-                (world_size, self.iris.slab_bytes), dtype=torch.uint8
-            )
-        input_buf = self._ag_input_slab.view(dtype)[:numel].view(1, numel)
-        output_buf = self._ag_output_slab.view(dtype)[:, :numel]
-        return input_buf, output_buf
-
-    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
-        assert self._shmem is not None
-        try:
-            if dim < 0:
-                dim += inp.dim()
-            world_size = self.world_size
-            input_size = inp.size()
-
-            input_buf, output_buf = self._get_allgather_buffers(inp.numel(), inp.dtype)
-            input_buf.view(-1).copy_(inp.reshape(-1))
-
-            self._shmem.ccl.all_gather(
-                output_buf,
-                input_buf,
-                config=self._gluon_config,
-                async_op=True,
-            )
-
-            # Same reshape contract as vLLM's DeviceCommunicatorBase.all_gather.
-            # output_buf is a non-contiguous slab view, so reshape always copies; the
-            # result never aliases the symmetric heap.
-            output = output_buf.reshape((world_size,) + input_size).movedim(0, dim)
-            return output.reshape(
-                input_size[:dim]
-                + (world_size * input_size[dim],)
-                + input_size[dim + 1 :]
-            )
-
-        except Exception as e:
-            logger.error(
-                "IrisCommunicator.all_gather failed: shape=%s dtype=%s "
-                "capturing=%s err=%s",
-                tuple(inp.shape),
-                inp.dtype,
-                torch.cuda.is_current_stream_capturing(),
-                e,
-            )
-            raise
-
     def _on_close(self) -> None:
         # The symmetric heap NEVER frees, so its slabs live as long as it does --
         # dropping the heap is the only way to give the memory back, and it has to go

@@ -36,19 +36,3 @@ class TorchCommunicator(Communicator):
         out = inp.clone()
         dist.all_reduce(out, group=self.device_group)  # SUM
         return out
-
-    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
-        if dim < 0:
-            dim += inp.dim()
-        input_size = inp.size()
-        out = torch.empty(
-            (self.world_size,) + tuple(input_size),
-            dtype=inp.dtype,
-            device=inp.device,
-        )
-        dist.all_gather_into_tensor(out, inp.contiguous(), group=self.device_group)
-        return out.movedim(0, dim).reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
-        )
