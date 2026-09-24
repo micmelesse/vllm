@@ -94,6 +94,36 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // ROCm TP collectives. Only the two collectives take tensors, so only they get a
+  // schema plus a device impl. THE REST TAKE NONE, and an op with no tensor argument
+  // has nothing for the dispatcher to select a backend from -- a `kCPU` impl is then
+  // unreachable and the call raises "no fallback function is registered". So they are
+  // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
+  rocm_ops.def("rocm_comms_init", &rocm_comms_init);
+  rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
+  rocm_ops.def("rocm_comms_register_buffer", &rocm_comms_register_buffer);
+  rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);
+  rocm_ops.def("rocm_comms_register_graph_buffers", &rocm_comms_register_graph_buffers);
+  rocm_ops.def("rocm_comms_pending_count", &rocm_comms_pending_count);
+  rocm_ops.def("rocm_comms_handle_and_offset", &rocm_comms_handle_and_offset);
+  rocm_ops.def("rocm_comms_sizes", &rocm_comms_sizes);
+
+  rocm_ops.def(
+      "rocm_comms_all_reduce(int comms, Tensor! out, Tensor inp, int algo, "
+      "int blocks, int threads) -> ()");
+  rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
+
+  // FUSED. Two mutable outputs: `out` is the normed result, `residual_out` the
+  // sum-plus-residual the next block reads. `eps` is a float in the schema because
+  // torch has no `double` there; the kernel narrows it.
+  rocm_ops.def(
+      "rocm_comms_all_reduce_rmsnorm(int comms, Tensor! out, Tensor! residual_out, "
+      "Tensor inp, Tensor residual, Tensor weight, float eps, int blocks, "
+      "int threads) -> ()");
+  rocm_ops.impl("rocm_comms_all_reduce_rmsnorm", torch::kCUDA,
+                &rocm_comms_all_reduce_rmsnorm);
+
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

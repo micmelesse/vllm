@@ -51,3 +51,39 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+// ROCm TP collectives (vllm/distributed/device_communicators/rocm_comms). The context is a
+// stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
+using fptr_t = int64_t;
+
+fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
+                       const std::vector<std::vector<int64_t>>& signal_handles,
+                       const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
+                       int64_t peer_slab_bytes, int64_t scratch_bytes);
+
+void rocm_comms_dispose(fptr_t comms);
+
+void rocm_comms_register_buffer(fptr_t comms,
+                                const std::vector<std::vector<int64_t>>& handles,
+                                const std::vector<int64_t>& offsets, int64_t self_ptr);
+
+std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms);
+
+void rocm_comms_register_graph_buffers(
+    fptr_t comms, const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<std::vector<int64_t>>& offsets);
+
+int64_t rocm_comms_pending_count(fptr_t comms);
+
+void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                           int64_t algo, int64_t blocks, int64_t threads);
+
+void rocm_comms_all_reduce_rmsnorm(fptr_t comms, torch::Tensor& out,
+                                   torch::Tensor& residual_out, torch::Tensor& inp,
+                                   torch::Tensor& residual, torch::Tensor& weight,
+                                   double eps, int64_t blocks, int64_t threads);
+
+
+std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
+
+std::vector<int64_t> rocm_comms_sizes();

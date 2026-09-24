@@ -105,6 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
+        self.rocm_comm = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
@@ -124,31 +125,58 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if (
-            self.use_flashinfer_pcie_ipc_allreduce
-            and self.world_size > 1
-            and self.device_group is not None
+            self.world_size > 1
+            and current_platform.is_rocm()
+            and envs.VLLM_ROCM_COMMS_BACKEND
         ):
-            self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
-                group=self.device_group,
-                tune_group=self.cpu_group,
-                device=self.device,
+            # OUR BACKEND OWNS THE ALL-REDUCE, all of it. When one is named, none of
+            # upstream's TP all-reduce paths are built -- not AITER's, not
+            # CustomAllreduce, not QuickReduce -- so an arm named for a backend is not a
+            # mixture of two. When none is named, upstream's code below runs untouched.
+            from vllm.distributed.device_communicators.rocm_comms import (
+                make_communicator,
             )
 
-        if self.use_aiter_allreduce and self.world_size > 1:
-            self.aiter_ar_comm = AiterCustomAllreduce(
-                group=self.cpu_group,
+            # Both groups (mirrors DeviceCommunicatorBase): the torch reference backend
+            # runs torch.dist over the device group; iris uses its own shmem.
+            self.rocm_comm = make_communicator(
+                cpu_group=self.cpu_group,
+                device_group=self.device_group,
                 device=self.device,
+                backend=envs.VLLM_ROCM_COMMS_BACKEND,
             )
+        else:
+            if (
+                self.use_flashinfer_pcie_ipc_allreduce
+                and self.world_size > 1
+                and self.device_group is not None
+            ):
+                self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
+                    group=self.device_group,
+                    tune_group=self.cpu_group,
+                    device=self.device,
+                )
 
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
-            # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-            )
+            if self.use_aiter_allreduce and self.world_size > 1:
+                self.aiter_ar_comm = AiterCustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+
+            if (
+                use_custom_allreduce
+                and self.aiter_ar_comm is None
+                and self.world_size > 1
+            ):
+                # Initialize a custom fast all-reduce implementation.
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    symm_mem_enabled=(
+                        self.symm_mem_comm is not None
+                        and not self.symm_mem_comm.disabled
+                    ),
+                )
 
         # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine
         if (
@@ -166,7 +194,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else:
                 self.use_aiter_ag_rs = True
 
-        if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
+        if (
+            use_custom_allreduce
+            and self.world_size > 1
+            and current_platform.is_rocm()
+            and self.rocm_comm is None
+        ):
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
             # (vLLM's or AITER's), so it is initialized for either backend.
@@ -270,6 +303,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
+            "ROCM_COMMS",
             "QUICK_REDUCE",
             "AITER_CUSTOM",
             "CUSTOM",
@@ -308,6 +342,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
+        # Named with its backend, so a step log states which collective an arm ran.
+        if self.rocm_comm is not None and not self.rocm_comm.disabled:
+            enabled_ar_backends.append(f"ROCM_COMMS:{envs.VLLM_ROCM_COMMS_BACKEND}")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if (
@@ -350,6 +387,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
+        rocm_comm = self.rocm_comm
+        if (
+            rocm_comm is not None
+            and not rocm_comm.disabled
+            and rocm_comm.should_allreduce(input_)
+        ):
+            out = rocm_comm.all_reduce(input_)
+            assert out is not None
+            return out
+        # always try quick reduce first, then flashinfer, then custom allreduce,
+        # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -662,6 +710,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
+        if self.rocm_comm is not None:
+            self.rocm_comm.close()
+            self.rocm_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.aiter_ar_comm is not None:

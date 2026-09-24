@@ -18,6 +18,9 @@ from .ir.clone_elimination import UnsafeCloneEliminationPass
 from .ir.lowering_pass import VllmIRLoweringPass
 from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
+if current_platform.is_rocm():
+    from .fusion.rocm_comms_fusion import RocmHipAllReduceFusionPass
+
 if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
@@ -172,7 +175,14 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
-                if rocm_aiter_ops.is_enabled():
+                # OURS FIRST, and gated on the switch that already picks the
+                # collective. `VLLM_ROCM_COMMS_BACKEND` has no default, so naming `hip`
+                # is an explicit choice and an arm that turns fusion on has still
+                # changed one thing. Ahead of aiter because both can be on at once and
+                # the backend actually running the collective is the one to fuse into.
+                if envs.VLLM_ROCM_COMMS_BACKEND == "hip":
+                    self.passes += [RocmHipAllReduceFusionPass(config)]
+                elif rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
                     self.passes += [AllReduceFusionPass(config)]
