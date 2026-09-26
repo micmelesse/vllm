@@ -61,20 +61,27 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
   p.barrier_end<ngpus, false>();
 
   // PHASE 2 -- gather. Rank i's rows sit in rank i's scratch.
+  //
+  // BY THE ROWS THIS BLOCK'S PEERS WROTE, not grid-stride over the flat buffer. The
+  // barrier above is PER BLOCK: block b here has waited for block b on every rank and for
+  // no other block. Phase 1 gave block b the rows begin + b, begin + b + gridDim.x, ...,
+  // so those rows, and only those, are known finished in every peer's scratch. A flat
+  // gather read rows other blocks were still writing: wrong output on two-shot at shapes
+  // and timings where the blocks drifted apart (first run in `test`, 2026-09-26).
   {
-    V* o             = reinterpret_cast<V*>(out);
-    V* res_out       = reinterpret_cast<V*>(residual_out);
-    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
+    V* o       = reinterpret_cast<V*>(out);
+    V* res_out = reinterpret_cast<V*>(residual_out);
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const int begin = i * chunk;
       const int end   = begin + chunk < rows ? begin + chunk : rows;
-      const int n     = (end - begin) * packs;
       const V* src    = p.scratch<V>(i);
-      for (int idx = tid; idx < n; idx += stride) {
-        o[begin * packs + idx] = src[idx];
-        if constexpr (kAdd) res_out[begin * packs + idx] = src[half + idx];
+      for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
+        const int local = (row - begin) * packs;
+        for (int k = threadIdx.x; k < packs; k += blockDim.x) {
+          o[row * packs + k] = src[local + k];
+          if constexpr (kAdd) res_out[row * packs + k] = src[half + local + k];
+        }
       }
     }
   }
