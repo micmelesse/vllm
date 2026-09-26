@@ -1019,10 +1019,12 @@ def run_fused_rank(
     dtype_name: str,
     algo: Algo,
     init_method: str,
+    weight_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
     """ONE rank: run the fused op and the two ops it replaces, and say whether they
-    agree. Returns `(agreed, err)`; `err` is `NO_FUSED_KERNEL` when this backend has
-    none, which is a skip and not a failure."""
+    agree. `weight_dtype` None is the input's dtype. Returns `(agreed, err)`; `err`
+    is `NO_FUSED_KERNEL` when this backend has none, which is a skip and not a
+    failure."""
     dtype = D_DTYPES[dtype_name]
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -1039,7 +1041,7 @@ def run_fused_rank(
         # so the reference is computed locally and no tensor crosses a process boundary.
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
         residual = _one_input(world, 1, shape, dtype)
-        weight = _one_input(world + 1, 2, (shape[1],), dtype)
+        weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
         with _build_communicator("hip", cpu_group, group, device, algo) as comm:
             mine = inputs[rank].to(device)
             if form == "rms_norm":
@@ -1105,6 +1107,38 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     Enumerated, not property-generated: a shrinking framework cannot drive across
     spawned ranks, and each candidate is a full eight-process run.
     """
+    _fused_case(form, shape, dtype_name, algo, None, world, rendezvous)
+
+
+# AN FP32 WEIGHT, in its own dtype: the reference rounds the normed row to the WEIGHT's
+# dtype, so this is a different rounding from a weight in the input's, not the same one
+# with a cast. Kimi-K3's latent row and its hidden row, both algos: the rounding is per
+# element, so more shapes would say nothing new.
+@pytest.mark.parametrize("algo", ("one_shot", "two_shot"))
+@pytest.mark.parametrize("dtype_name", DTYPES)
+@pytest.mark.parametrize("shape", ((4, 3584), (128, 7168)))
+@pytest.mark.parametrize("form", FORMS)
+def test_all_reduce_rms_norm_takes_an_fp32_weight(
+    form: str,
+    shape: tuple[int, int],
+    dtype_name: str,
+    algo: Algo,
+    world: int,
+    rendezvous: tuple[str, int],
+) -> None:
+    _fused_case(form, shape, dtype_name, algo, torch.float32, world, rendezvous)
+
+
+def _fused_case(
+    form: str,
+    shape: tuple[int, int],
+    dtype_name: str,
+    algo: Algo,
+    weight_dtype: torch.dtype | None,
+    world: int,
+    rendezvous: tuple[str, int],
+) -> None:
+    """One fused case across every rank, judged by `run_fused_rank`."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     addr, port = rendezvous
@@ -1113,14 +1147,15 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     try:
         rets = [
             pool.apply_async(
-                run_fused_rank, (r, world, form, shape, dtype_name, algo, init)
+                run_fused_rank,
+                (r, world, form, shape, dtype_name, algo, init, weight_dtype),
             )
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
-    where = f"{form} {algo} {shape} {dtype_name}"
+    where = f"{form} {algo} {shape} {dtype_name} weight={weight_dtype or dtype_name}"
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip has no fused all_reduce_{form} for {where}")
     bad = [err for _, err in got if err is not None]

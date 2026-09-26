@@ -77,14 +77,19 @@ constexpr int kMaxRowPacks = 4;
 //
 //   s   = float(T(sum over ranks))                  the all-reduce output, as it would land
 //   s  += float(residual); res_dst = T(s)           kAdd only: fused_add_rms_norm
-//   out = T(float(T(s * rsqrt(mean(s^2) + eps))) * float(w))
+//   x   = W(s * rsqrt(mean(s^2) + eps))             `x.to(weight.dtype)`
+//   out = T(W(x * float(w)))                        the product in W, then to the input's T
+//
+// THE WEIGHT KEEPS ITS OWN DTYPE W, as the reference does: it rounds to the WEIGHT's dtype,
+// so an fp32 weight multiplies an unrounded x, and casting it to T first would be a
+// different op. With W == T this is the one rounding it always was.
 //
 // The variance is taken from `s` before any further rounding, and `s` stays in registers
 // between the two passes, so nothing is read back.
-template <typename T, int ngpus, bool kAdd>
+template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void rms_norm_row(const typename traits<T>::V* const ptrs[],
                           const typename traits<T>::V* residual,
-                          const typename traits<T>::V* weight, int row, int packs,
+                          const vec<W, traits<T>::N>* weight, int row, int packs,
                           float inv_hidden, float eps, typename traits<T>::V* res_dst,
                           typename traits<T>::V* out_dst) {
   using V          = typename traits<T>::V;
@@ -117,12 +122,14 @@ DINLINE void rms_norm_row(const typename traits<T>::V* const ptrs[],
   for (int k = 0; k < kMaxRowPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
-    const V w = weight[i];
+    const vec<W, NL> w = weight[i];
     V o;
 #pragma unroll
-    for (int j = 0; j < NL; ++j)
-      o.d[j] = static_cast<T>(static_cast<float>(static_cast<T>(s[k][j] * scale)) *
-                              static_cast<float>(w.d[j]));
+    for (int j = 0; j < NL; ++j) {
+      const float x  = static_cast<float>(static_cast<W>(s[k][j] * scale));
+      const float xw = static_cast<float>(static_cast<W>(x * static_cast<float>(w.d[j])));
+      o.d[j]         = static_cast<T>(xw);
+    }
     out_dst[i] = o;
   }
   // Before the next row reuses `block_sum`'s shared slots.

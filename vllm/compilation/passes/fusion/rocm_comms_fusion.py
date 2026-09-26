@@ -97,7 +97,7 @@ class HipAllReduceRMSNormPattern(BasePattern, VllmPatternReplacement):
     def replacement(self):
         def _replacement(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             return ALL_REDUCE_RMS_NORM_OP(
-                input_=input, weight=weight.to(input.dtype), epsilon=self.epsilon
+                input_=input, weight=weight, epsilon=self.epsilon
             )
 
         return _replacement
@@ -136,7 +136,7 @@ class HipAllReduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
             fused = ALL_REDUCE_FUSED_ADD_RMS_NORM_OP(
                 input_=input,
                 residual=residual,
-                weight=weight.to(input.dtype),
+                weight=weight,
                 epsilon=self.epsilon,
             )
             return fused[0], fused[1]

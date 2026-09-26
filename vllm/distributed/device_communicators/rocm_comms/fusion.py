@@ -45,6 +45,12 @@ def _summed(input_: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_reduce(input_)
 
 
+def _weight_fits(input_: torch.Tensor, weight: torch.Tensor) -> bool:
+    """The kernel takes the weight in its own dtype: the input's, or fp32, rounding as
+    `vllm.ir.ops` does for either. Any other goes to the two ops, uncast."""
+    return weight.dtype in (input_.dtype, torch.float32)
+
+
 _WARNED: set[str] = set()
 
 
@@ -63,7 +69,11 @@ def _all_reduce_rms_norm_impl(
     input_: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> torch.Tensor:
     comm = _rocm_comm()
-    if comm is not None and comm.should_allreduce_rms_norm(input_):
+    if (
+        comm is not None
+        and comm.should_allreduce_rms_norm(input_)
+        and _weight_fits(input_, weight)
+    ):
         return comm.all_reduce_rms_norm(input_, weight, epsilon)
     _warn_unfused("rocm_comms_all_reduce_rms_norm")
     return vllm.ir.ops.rms_norm(_summed(input_), weight, epsilon)
@@ -82,7 +92,11 @@ def _all_reduce_fused_add_rms_norm_impl(
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     comm = _rocm_comm()
-    if comm is not None and comm.should_allreduce_fused_add_rms_norm(input_):
+    if (
+        comm is not None
+        and comm.should_allreduce_fused_add_rms_norm(input_)
+        and _weight_fits(input_, weight)
+    ):
         return comm.all_reduce_fused_add_rms_norm(input_, residual, weight, epsilon)
     _warn_unfused("rocm_comms_all_reduce_fused_add_rms_norm")
     return vllm.ir.ops.fused_add_rms_norm(_summed(input_), residual, weight, epsilon)

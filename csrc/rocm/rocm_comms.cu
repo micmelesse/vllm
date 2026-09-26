@@ -25,6 +25,7 @@
 #include <torch/all.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -133,9 +134,12 @@ void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* r
   TORCH_CHECK(out.is_contiguous() && inp.is_contiguous() && weight.is_contiguous(),
               "every tensor must be contiguous");
   TORCH_CHECK(out.sizes() == inp.sizes(), "out must have inp's shape");
-  TORCH_CHECK(out.scalar_type() == inp.scalar_type() &&
-                  weight.scalar_type() == inp.scalar_type(),
-              "every tensor must share inp's dtype");
+  TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
+  // THE WEIGHT IN ITS OWN DTYPE: inp's, or fp32, the two a norm's weight is kept in. The
+  // kernel rounds as the reference does for either, so nothing casts it on the way in.
+  const bool fp32_weight = weight.scalar_type() == at::ScalarType::Float;
+  TORCH_CHECK(fp32_weight || weight.scalar_type() == inp.scalar_type(),
+              "weight must be inp's dtype or float32; got ", weight.scalar_type());
   if (add) {
     TORCH_CHECK(residual->is_cuda() && residual_out->is_cuda(),
                 "every tensor must be on device");
@@ -160,6 +164,10 @@ void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* r
   // held in registers, so it has to fit kMaxRowPacks per thread.
   TORCH_CHECK(hidden % lanes == 0, "hidden ", hidden, " must be a multiple of ", lanes,
               " for 16-byte vectorized access");
+  // The weight is read a pack at a time, `lanes` of its elements per load.
+  const int64_t weight_pack = lanes * weight.element_size();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack == 0,
+              "weight must be aligned to ", weight_pack, " bytes");
   const int rows  = static_cast<int>(inp.size(0));
   const int packs = static_cast<int>(hidden / lanes);
   TORCH_CHECK(packs <= kMaxRowPacks * threads, "hidden ", hidden, " is ", packs,
@@ -189,42 +197,52 @@ void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* r
                        ? static_cast<int>(blocks)
                        : static_cast<int>(std::min<int64_t>(blocks, rows));
 
-#define LAUNCH_FUSED(T, NG, ADD)                                                        \
+#define LAUNCH_FUSED(T, W, NG, ADD)                                                     \
   do {                                                                                  \
     T* res_out      = ADD ? residual_out->data_ptr<T>() : nullptr;                      \
     const T* res_in = ADD ? residual->data_ptr<T>() : nullptr;                          \
     if (algo == kAlgoTwoShot)                                                           \
-      allreduce_two_shot_rms_norm<T, NG, ADD><<<dim3(grid), dim3(threads), 0, stream>>>( \
-          p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<T>(),                  \
-          static_cast<float>(eps), rows, packs);                                        \
+      allreduce_two_shot_rms_norm<T, W, NG, ADD>                                        \
+          <<<dim3(grid), dim3(threads), 0, stream>>>(                                   \
+              p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<W>(),              \
+              static_cast<float>(eps), rows, packs);                                    \
     else                                                                                \
-      allreduce_one_shot_rms_norm<T, NG, ADD><<<dim3(grid), dim3(threads), 0, stream>>>( \
-          p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<T>(),                  \
-          static_cast<float>(eps), rows, packs);                                        \
+      allreduce_one_shot_rms_norm<T, W, NG, ADD>                                        \
+          <<<dim3(grid), dim3(threads), 0, stream>>>(                                   \
+              p, out.data_ptr<T>(), res_out, res_in, weight.data_ptr<W>(),              \
+              static_cast<float>(eps), rows, packs);                                    \
   } while (0)
 
-#define FUSED_BY_ADD(T, NG)                                                             \
+#define FUSED_BY_ADD(T, W, NG)                                                          \
   if (add)                                                                              \
-    LAUNCH_FUSED(T, NG, true);                                                          \
+    LAUNCH_FUSED(T, W, NG, true);                                                       \
   else                                                                                  \
-    LAUNCH_FUSED(T, NG, false)
+    LAUNCH_FUSED(T, W, NG, false)
 
-#define FUSED_BY_NGPUS(T)                                                               \
+#define FUSED_BY_NGPUS(T, W)                                                            \
   switch (group.world_size()) {                                                         \
-    case 2: FUSED_BY_ADD(T, 2); return;                                                 \
-    case 4: FUSED_BY_ADD(T, 4); return;                                                 \
-    case 8: FUSED_BY_ADD(T, 8); return;                                                 \
+    case 2: FUSED_BY_ADD(T, W, 2); return;                                              \
+    case 4: FUSED_BY_ADD(T, W, 4); return;                                              \
+    case 8: FUSED_BY_ADD(T, W, 8); return;                                              \
     default: break;                                                                     \
   }
 
+#define FUSED_BY_WEIGHT(T)                                                              \
+  if (fp32_weight) {                                                                    \
+    FUSED_BY_NGPUS(T, float)                                                            \
+  } else {                                                                              \
+    FUSED_BY_NGPUS(T, T)                                                                \
+  }
+
   switch (inp.scalar_type()) {
-    case at::ScalarType::Half: FUSED_BY_NGPUS(at::Half) break;
-    case at::ScalarType::BFloat16: FUSED_BY_NGPUS(at::BFloat16) break;
+    case at::ScalarType::Half: FUSED_BY_WEIGHT(at::Half) break;
+    case at::ScalarType::BFloat16: FUSED_BY_WEIGHT(at::BFloat16) break;
     default:
       throw std::runtime_error("hip_comms: dtype not built. Built: float16, bfloat16.");
   }
   throw std::runtime_error("hip_comms: world_size " + std::to_string(group.world_size()) +
                            " not built. Built: 2, 4, 8.");
+#undef FUSED_BY_WEIGHT
 #undef FUSED_BY_NGPUS
 #undef FUSED_BY_ADD
 #undef LAUNCH_FUSED

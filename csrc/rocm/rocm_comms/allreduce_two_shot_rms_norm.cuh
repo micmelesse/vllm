@@ -21,10 +21,11 @@ namespace hip_comms {
 // Every output element is computed by exactly one rank, so all ranks hold identical bytes.
 // Fewer rows than ranks is correct and unbalanced: the ranks past the end own nothing and
 // still run both barriers.
-template <typename T, int ngpus, bool kAdd>
+// `weight` is in its own dtype W: T, or fp32 (see `rms_norm_row`).
+template <typename T, typename W, int ngpus, bool kAdd>
 __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
     ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
-    const T* __restrict__ residual, const T* __restrict__ weight, float eps, int rows,
+    const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
@@ -44,15 +45,15 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
   // PHASE 1 -- our rows, finished, into our own scratch.
   {
     const V* res_in        = reinterpret_cast<const V*>(residual);
-    const V* w             = reinterpret_cast<const V*>(weight);
+    const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
     V* mine                = p.scratch<V>(rank);
     const int begin        = rank * chunk;
     const int end          = begin + chunk < rows ? begin + chunk : rows;
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
-      rms_norm_row<T, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
-                                   kAdd ? mine + half + local : nullptr, mine + local);
+      rms_norm_row<T, W, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
+                                      kAdd ? mine + half + local : nullptr, mine + local);
     }
   }
 

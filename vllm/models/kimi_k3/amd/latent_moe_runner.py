@@ -6,6 +6,7 @@ import torch
 
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
@@ -73,9 +74,23 @@ class ROCmLatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
-        latent = tensor_model_parallel_all_reduce(fused_output)
-        if transform.norm is not None:
-            latent = transform.norm(latent)
+        # THE ALL-REDUCE AND ITS NORM IN ONE KERNEL when our backend (rocm_comms, hip)
+        # is live and takes the input. Here and not in a fusion pass: Kimi-K3 is not
+        # torch.compiled, so no pass ever sees this code.
+        norm = transform.norm
+        comm = getattr(get_tp_group().device_communicator, "rocm_comm", None)
+        if (
+            norm is not None
+            and comm is not None
+            and comm.should_allreduce_rms_norm(fused_output)
+        ):
+            latent = comm.all_reduce_rms_norm(
+                fused_output, norm.weight, norm.variance_epsilon
+            )
+        else:
+            latent = tensor_model_parallel_all_reduce(fused_output)
+            if norm is not None:
+                latent = norm(latent)
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
