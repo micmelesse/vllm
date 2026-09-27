@@ -98,11 +98,11 @@ class Communicator(ABC):
         "should_allreduce",
         "should_allreduce_rms_norm",
         "should_allreduce_fused_add_rms_norm",
-        "should_allreduce_attn_res",
+        "should_allreduce_add_attn_res_rms_norm",
         "all_reduce",
         "all_reduce_rms_norm",
         "all_reduce_fused_add_rms_norm",
-        "all_reduce_attn_res",
+        "all_reduce_add_attn_res_rms_norm",
         "capture",
         "_is_supported",
         "close",
@@ -280,15 +280,16 @@ class Communicator(ABC):
             )
         return self._all_reduce_fused_add_rms_norm(inp, residual, weight, eps)
 
-    def should_allreduce_attn_res(self, inp: torch.Tensor) -> bool:
+    def should_allreduce_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
         return (
-            type(self)._all_reduce_attn_res is not Communicator._all_reduce_attn_res
+            type(self)._all_reduce_add_attn_res_rms_norm
+            is not Communicator._all_reduce_add_attn_res_rms_norm
             and self.should_allreduce(inp)
             and self._fits_rms_norm(inp)
         )
 
-    def all_reduce_attn_res(
+    def all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
         prefix: torch.Tensor | None,
@@ -305,12 +306,16 @@ class Communicator(ABC):
         `prefix` the sum starting one. Returns the prefix (updated in place when given)
         and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
         block."""
-        self._check_capture("all_reduce_attn_res")
-        if not self.should_allreduce_attn_res(inp):
+        self._check_capture("all_reduce_add_attn_res_rms_norm")
+        if not self.should_allreduce_add_attn_res_rms_norm(inp):
             raise RuntimeError(
-                self._rejected("all_reduce_attn_res", "should_allreduce_attn_res", inp)
+                self._rejected(
+                    "all_reduce_add_attn_res_rms_norm",
+                    "should_allreduce_add_attn_res_rms_norm",
+                    inp,
+                )
             )
-        return self._all_reduce_attn_res(
+        return self._all_reduce_add_attn_res_rms_norm(
             inp,
             prefix,
             blocks,
@@ -440,7 +445,7 @@ class Communicator(ABC):
             f"ask should_allreduce_fused_add_rms_norm first."
         )
 
-    def _all_reduce_attn_res(
+    def _all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
         prefix: torch.Tensor | None,
@@ -455,7 +460,7 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
-            f"ask should_allreduce_attn_res first."
+            f"ask should_allreduce_add_attn_res_rms_norm first."
         )
 
     def _fits_rms_norm(self, inp: torch.Tensor) -> bool:

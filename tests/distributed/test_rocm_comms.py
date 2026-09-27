@@ -1172,7 +1172,7 @@ def _fused_case(
 # full eight-process run, so the cases are the ones Kimi-K3 runs -- decode rows, 0 to 9
 # stored blocks, the block-write layer where the sum starts the prefix, with and without
 # the output norm -- plus a prefill-sized row count.
-ATTN_RES_CASES = (
+ADD_ATTN_RES_RMS_NORM_CASES = (
     ((4, 7168), True, 0, -1, True),
     ((16, 7168), True, 4, -1, True),
     ((16, 7168), True, 9, -1, False),
@@ -1182,7 +1182,7 @@ ATTN_RES_CASES = (
 ATTN_RES_SOURCES = 10
 
 
-def run_attn_res_rank(
+def run_add_attn_res_rms_norm_rank(
     rank: int,
     world: int,
     case: tuple[tuple[int, int], bool, int, int, bool],
@@ -1241,10 +1241,10 @@ def run_attn_res_rank(
 
         with _build_communicator("hip", cpu_group, group, device, "one_shot") as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce_attn_res(mine):
+            if not comm.should_allreduce_add_attn_res_rms_norm(mine):
                 return False, NO_FUSED_KERNEL
             got_blocks = blocks.to(device).clone()
-            got_prefix, got = comm.all_reduce_attn_res(
+            got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
                 mine,
                 prefix.to(device).clone() if has_prefix else None,
                 got_blocks,
@@ -1271,7 +1271,9 @@ def run_attn_res_rank(
                 return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
         return True, None
     except Exception as e:
-        logger.exception("rank %d failed the fused all_reduce_attn_res", rank)
+        logger.exception(
+            "rank %d failed the fused all_reduce_add_attn_res_rms_norm", rank
+        )
         return False, f"{type(e).__name__}: {e}"
     finally:
         try:
@@ -1283,8 +1285,8 @@ def run_attn_res_rank(
             logger.exception("rank %d: teardown failed", rank)
 
 
-@pytest.mark.parametrize("case", ATTN_RES_CASES)
-def test_all_reduce_attn_res_matches_the_two_ops_it_replaces(
+@pytest.mark.parametrize("case", ADD_ATTN_RES_RMS_NORM_CASES)
+def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     case: tuple[tuple[int, int], bool, int, int, bool],
     world: int,
     rendezvous: tuple[str, int],
@@ -1298,14 +1300,14 @@ def test_all_reduce_attn_res_matches_the_two_ops_it_replaces(
     pool = Pool(processes=world)
     try:
         rets = [
-            pool.apply_async(run_attn_res_rank, (r, world, case, init))
+            pool.apply_async(run_add_attn_res_rms_norm_rank, (r, world, case, init))
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip has no fused all_reduce_attn_res for {case}")
+        pytest.skip(f"hip has no fused all_reduce_add_attn_res_rms_norm for {case}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"

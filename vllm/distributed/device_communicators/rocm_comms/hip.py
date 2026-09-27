@@ -297,7 +297,7 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    def _all_reduce_attn_res(
+    def _all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
         prefix: torch.Tensor | None,
@@ -316,7 +316,7 @@ class HipCommunicator(Communicator):
         started = prefix is None
         prefix_out = torch.empty_like(inp) if started else prefix
         out = torch.empty_like(inp)
-        torch.ops._rocm_C.rocm_comms_all_reduce_attn_res(
+        torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
             prefix_out,
             out,

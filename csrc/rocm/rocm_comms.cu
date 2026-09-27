@@ -34,7 +34,7 @@
 #include "rocm_comms/allreduce_one_shot_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot.cuh"
 #include "rocm_comms/allreduce_two_shot_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_attn_res.cuh"
+#include "rocm_comms/allreduce_one_shot_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/ipc.cuh"
 
 namespace hip_comms {
@@ -249,10 +249,10 @@ void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* r
 #undef LAUNCH_FUSED
 }
 
-// FUSED: all-reduce, then Kimi-K3's AttnRes on each row (see `attn_res_row`). With `has_prefix`
+// FUSED: all-reduce, then Kimi-K3's AttnRes on each row (see `add_attn_res_rms_norm_row`). With `has_prefix`
 // the sum is added to `prefix` in place; without, the sum IS the new prefix and is written there.
 // ONE-SHOT ONLY: every rank reduces every row, so there is no gather to align.
-void all_reduce_attn_res(ipc::Group& group, torch::Tensor& prefix, torch::Tensor& out,
+void all_reduce_add_attn_res_rms_norm(ipc::Group& group, torch::Tensor& prefix, torch::Tensor& out,
                          torch::Tensor& inp, torch::Tensor& blocks,
                          torch::Tensor& norm_weight, torch::Tensor& qk_weight,
                          const torch::Tensor* out_norm_weight, int64_t num_blocks,
@@ -302,39 +302,39 @@ void all_reduce_attn_res(ipc::Group& group, torch::Tensor& prefix, torch::Tensor
   auto stream        = at::cuda::getCurrentCUDAStream();
   const int grid     = static_cast<int>(std::min<int64_t>(block_count, rows));
 
-#define LAUNCH_ATTN_RES(T, NG, PRE)                                                     \
-  allreduce_one_shot_attn_res<T, NG, PRE><<<dim3(grid), dim3(threads), 0, stream>>>(    \
+#define LAUNCH_ADD_ATTN_RES_RMS_NORM(T, NG, PRE)                                                     \
+  allreduce_one_shot_add_attn_res_rms_norm<T, NG, PRE><<<dim3(grid), dim3(threads), 0, stream>>>(    \
       p, prefix.data_ptr<T>(), blocks.data_ptr<T>(), blocks.stride(0), blocks.stride(1),  \
       norm_weight.data_ptr<T>(), qk_weight.data_ptr<T>(),                               \
       out_norm_weight ? out_norm_weight->data_ptr<T>() : nullptr, out.data_ptr<T>(),    \
       static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), \
       static_cast<float>(out_eps), rows, packs)
 
-#define ATTN_RES_BY_PREFIX(T, NG)                                                       \
+#define ADD_ATTN_RES_RMS_NORM_BY_PREFIX(T, NG)                                                       \
   if (has_prefix)                                                                       \
-    LAUNCH_ATTN_RES(T, NG, true);                                                       \
+    LAUNCH_ADD_ATTN_RES_RMS_NORM(T, NG, true);                                                       \
   else                                                                                  \
-    LAUNCH_ATTN_RES(T, NG, false)
+    LAUNCH_ADD_ATTN_RES_RMS_NORM(T, NG, false)
 
-#define ATTN_RES_BY_NGPUS(T)                                                            \
+#define ADD_ATTN_RES_RMS_NORM_BY_NGPUS(T)                                                            \
   switch (group.world_size()) {                                                         \
-    case 2: ATTN_RES_BY_PREFIX(T, 2); return;                                           \
-    case 4: ATTN_RES_BY_PREFIX(T, 4); return;                                           \
-    case 8: ATTN_RES_BY_PREFIX(T, 8); return;                                           \
+    case 2: ADD_ATTN_RES_RMS_NORM_BY_PREFIX(T, 2); return;                                           \
+    case 4: ADD_ATTN_RES_RMS_NORM_BY_PREFIX(T, 4); return;                                           \
+    case 8: ADD_ATTN_RES_RMS_NORM_BY_PREFIX(T, 8); return;                                           \
     default: break;                                                                     \
   }
 
   switch (inp.scalar_type()) {
-    case at::ScalarType::Half: ATTN_RES_BY_NGPUS(at::Half) break;
-    case at::ScalarType::BFloat16: ATTN_RES_BY_NGPUS(at::BFloat16) break;
+    case at::ScalarType::Half: ADD_ATTN_RES_RMS_NORM_BY_NGPUS(at::Half) break;
+    case at::ScalarType::BFloat16: ADD_ATTN_RES_RMS_NORM_BY_NGPUS(at::BFloat16) break;
     default:
       throw std::runtime_error("hip_comms: dtype not built. Built: float16, bfloat16.");
   }
   throw std::runtime_error("hip_comms: world_size " + std::to_string(group.world_size()) +
                            " not built. Built: 2, 4, 8.");
-#undef ATTN_RES_BY_NGPUS
-#undef ATTN_RES_BY_PREFIX
-#undef LAUNCH_ATTN_RES
+#undef ADD_ATTN_RES_RMS_NORM_BY_NGPUS
+#undef ADD_ATTN_RES_RMS_NORM_BY_PREFIX
+#undef LAUNCH_ADD_ATTN_RES_RMS_NORM
 }
 
 }  // namespace hip_comms
@@ -446,14 +446,14 @@ void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
                                  small_limit, blocks, threads);
 }
 
-void rocm_comms_all_reduce_attn_res(fptr_t comms, torch::Tensor& prefix, torch::Tensor& out,
+void rocm_comms_all_reduce_add_attn_res_rms_norm(fptr_t comms, torch::Tensor& prefix, torch::Tensor& out,
                                     torch::Tensor& inp, torch::Tensor& blocks,
                                     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
                                     const std::optional<torch::Tensor>& out_norm_weight,
                                     int64_t num_blocks, int64_t write_idx, double eps,
                                     double out_eps, bool has_prefix, int64_t block_count,
                                     int64_t threads) {
-  hip_comms::all_reduce_attn_res(*reinterpret_cast<hip_comms::ipc::Group*>(comms), prefix,
+  hip_comms::all_reduce_add_attn_res_rms_norm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), prefix,
                                  out, inp, blocks, norm_weight, qk_weight,
                                  out_norm_weight ? &*out_norm_weight : nullptr, num_blocks,
                                  write_idx, eps, out_eps, has_prefix, block_count, threads);
