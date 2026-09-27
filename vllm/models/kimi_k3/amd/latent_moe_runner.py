@@ -6,11 +6,10 @@ import torch
 
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.models.kimi_k3.amd.fused_all_reduce import latent_tail
 
 logger = init_logger(__name__)
 
@@ -74,49 +73,12 @@ class ROCmLatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
-        # THE WHOLE TAIL IN ONE KERNEL, or failing that the all-reduce and its norm in
-        # one, when our backend (rocm_comms, hip) is live and takes the input. Here and
-        # not in a fusion pass: Kimi-K3 is not torch.compiled, so no pass sees this.
-        norm = transform.norm
-        comm = getattr(get_tp_group().device_communicator, "rocm_comm", None)
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
         up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
-        if (
-            norm is not None
-            and comm is not None
-            and norm.weight.dtype == fused_output.dtype
-            and comm.should_allreduce_rms_norm_gemm_add(fused_output)
-        ):
-            comm.all_reduce_rms_norm_gemm_add(
-                fused_output,
-                norm.weight,
-                norm.variance_epsilon,
-                up_proj_shard,
-                shared_output,
-                shard_start,
-            )
-            return self._maybe_reduce_final_output(
-                shared_output, trunc_size, output_is_reduced=False
-            )
-        if (
-            norm is not None
-            and comm is not None
-            and comm.should_allreduce_rms_norm(fused_output)
-        ):
-            latent = comm.all_reduce_rms_norm(
-                fused_output, norm.weight, norm.variance_epsilon
-            )
-        else:
-            latent = tensor_model_parallel_all_reduce(fused_output)
-            if norm is not None:
-                latent = norm(latent)
-
-        hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
-
-        # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
-        # beta-add epilogue so folding in the shared partial costs no kernel.
-        hidden_shard.addmm_(latent, up_proj_shard.t())
+        latent_tail(
+            fused_output, shared_output, transform.norm, up_proj_shard, shard_start
+        )
 
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
