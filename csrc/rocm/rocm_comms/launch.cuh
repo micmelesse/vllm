@@ -50,22 +50,22 @@ constexpr Kernel kernel_of(Op op, bool two_shot) {
 constexpr Op op_of(Kernel k) { return static_cast<Op>(static_cast<int>(k) / 2); }
 constexpr bool is_two_shot(Kernel k) { return static_cast<int>(k) % 2 == 1; }
 
-// THE gfx950 TABLE, until the microbench sweep replaces it. One-shot moves ngpus x the
-// bytes and pays one barrier; two-shot moves about 2x and pays a sync, so one-shot wins
-// while the buffer is small. 16 blocks of 512 threads is vLLM's setting, not yet measured
-// here.
+// THE gfx950 TABLE, from the microbench sweep of 2026-09-27 (Kimi-K3 shapes, 8 x MI355X).
+// One-shot wins while the buffer is small (12.9 vs 27.1 us at 16 x 7168; two-shot wins by
+// 3.67 MB). Decode is flat in geometry; two-shot gains about 13% from 16 to 36 blocks at
+// prefill, 36 being the most the signal block holds.
 constexpr int64_t kOneShotMaxBytes = int64_t{512} << 10;
-constexpr int kBlocks              = 16;
+constexpr int kOneShotBlocks       = 16;
+constexpr int kTwoShotBlocks       = 36;
 constexpr int kThreads             = 512;
-// THE GEMM TAIL IS DECLINED at every size: its GEMM runs on the collective's 16 blocks,
-// one row at a time, and loses to all-reduce + norm + hipBLASLt even at one row (50 vs 37
-// us; 272 vs 37 at 16 rows, microbench 2026-09-27). Forcing it through the override still
-// runs it.
-inline Launch pick(Op op, int64_t rows, int64_t bytes) {
-  if (op == Op::rms_norm_gemm_add) return {Kernel::none, 0, 0};
-  const bool one_shot =
-      bytes <= kOneShotMaxBytes && !(op == Op::rms_norm_gemm_add && rows > kGemmRows);
-  return {kernel_of(op, !one_shot), kBlocks, kThreads};
+// Declined, so the caller runs the unfused ops: the GEMM tail everywhere (its GEMM runs on
+// the collective's blocks, one row at a time: 272 vs 37 us unfused at 16 rows), and AttnRes
+// past one-shot's range (two-shot fused 2143 vs 1093 us unfused at 4096 rows).
+inline Launch pick(Op op, int64_t /*rows*/, int64_t bytes) {
+  const bool one_shot = bytes <= kOneShotMaxBytes;
+  if (op == Op::rms_norm_gemm_add || (op == Op::add_attn_res_rms_norm && !one_shot))
+    return {Kernel::none, 0, 0};
+  return {kernel_of(op, !one_shot), one_shot ? kOneShotBlocks : kTwoShotBlocks, kThreads};
 }
 
 }  // namespace hip_comms
