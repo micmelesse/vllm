@@ -180,10 +180,10 @@ class Comm {
                                   __MEMORY_SCOPE_SYSTEM);
 #pragma unroll
         for (int i = 0; i < ngpus; ++i)
-          wait<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
+          wait<true, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
         __scoped_atomic_fetch_add(&self->gen, 1u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       } else {
-        wait<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>(&self->gen, g + 1, "sync: grid", -1);
+        wait<true, __MEMORY_SCOPE_SYSTEM>(&self->gen, g + 1, "sync: grid", -1);
       }
     }
     __syncthreads();
@@ -208,23 +208,30 @@ class Comm {
       uint32_t* mine   = start ? &self->start[blockIdx.x][threadIdx.x]
                                : &self->end[blockIdx.x][threadIdx.x];
       __scoped_atomic_store_n(theirs, f, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      wait<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(mine, f, start ? "start" : "close",
-                                                    threadIdx.x);
+      wait<false, __MEMORY_SCOPE_DEVICE>(mine, f, start ? "start" : "close", threadIdx.x);
     }
     __syncthreads();
     if (threadIdx.x == 0) self->seq[blockIdx.x] = f;
   }
 
-  template <int kOrder, int kScope>
+  // Spins relaxed and acquires once, after: an acquire per poll would invalidate the
+  // caches on every iteration of every spinning block.
+  template <bool kAcquire, int kScope>
   DINLINE void wait(const uint32_t* flag, uint32_t want, const char* what, int peer) const {
     const uint64_t t0 = wall_clock64();
     uint32_t seen;
-    while ((seen = __scoped_atomic_load_n(flag, kOrder, kScope)) < want) {
+    while ((seen = __scoped_atomic_load_n(flag, __ATOMIC_RELAXED, kScope)) < want) {
       if (wall_clock64() - t0 > p_.timeout_ticks_) {
         printf("rocm_comms: rank %d block %d timed out in %s, peer %d: flag %u, want %u\n",
                p_.rank_, blockIdx.x, what, peer, seen, want);
         __builtin_trap();
       }
+    }
+    if constexpr (kAcquire) {
+      if constexpr (kScope == __MEMORY_SCOPE_SYSTEM)
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+      else
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
   }
 
