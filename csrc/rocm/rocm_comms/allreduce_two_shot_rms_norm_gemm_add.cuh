@@ -12,8 +12,9 @@
 namespace hip_comms {
 
 // Each rank owns ceil(rows/ngpus) whole rows: it reduces and norms them into its own
-// scratch, and after the sync every rank reads every normed row from its owner's scratch
-// for the GEMM, kGemmRows rows per pass. The same roundings as the one-shot kernel.
+// scratch, and after the world barrier every rank reads every normed row from its owner's
+// scratch for the GEMM, kGemmRows rows per pass. The same roundings as the one-shot
+// kernel.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm_gemm_add(
     ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
@@ -37,7 +38,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm_gemm_add(
     }
   }
 
-  c.sync();
+  c.world_barrier();
 
   for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
     gemm_add_rows<T>(

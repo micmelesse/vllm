@@ -14,12 +14,12 @@ namespace hip_comms {
 //
 //   phase 1  our rows: reduce, update the prefix, AttnRes; put [out rows | prefix rows] in
 //            our scratch
-//   sync
+//   world_barrier
 //   phase 2  every rank gathers every rank's rows into `out`, `prefix` and the written
 //            block
 //
 // Phase 1 reads the replicated `prefix` and `blocks`; phase 2 overwrites them, which the
-// sync between makes safe. Every output element is computed by exactly one rank.
+// world_barrier between makes safe. Every output element is computed by exactly one rank.
 template <typename T, int ngpus, bool kPrefix>
 __global__ void __launch_bounds__(512, 1) allreduce_two_shot_add_attn_res_rms_norm(
     ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_add_attn_res_rms_no
     }
   }
 
-  c.sync();
+  c.world_barrier();
 
   V* o             = reinterpret_cast<V*>(out);
   V* pre           = reinterpret_cast<V*>(prefix);

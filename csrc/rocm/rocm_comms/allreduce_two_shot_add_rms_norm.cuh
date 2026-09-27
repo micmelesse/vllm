@@ -18,12 +18,12 @@ namespace hip_comms {
 //
 //   phase 1  reduce our rows across ranks, (kAdd: add the residual, replicated on every
 //            rank,) normalise, and put them in our scratch: [out rows | residual rows]
-//   sync
+//   world_barrier
 //   phase 2  every rank gathers every rank's rows into its own outputs
 //
 // Every output element is computed by exactly one rank, so all ranks hold identical bytes.
 // Fewer rows than ranks is correct and unbalanced: the ranks past the end own nothing and
-// still reach every sync.
+// still reach every barrier.
 // `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
@@ -54,7 +54,7 @@ DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
     }
   }
 
-  c.sync();
+  c.world_barrier();
 
   V* o       = reinterpret_cast<V*>(out);
   V* res_out = reinterpret_cast<V*>(residual_out);

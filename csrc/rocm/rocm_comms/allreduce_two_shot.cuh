@@ -12,11 +12,11 @@ namespace hip_comms {
 
 // TWO-SHOT: each rank sums one slice into its own scratch, then every rank gathers every
 // slice. (ngpus-1)/ngpus x N moved twice against one-shot's (ngpus-1) x N, for one more
-// sync: the right algorithm once the bytes dominate.
+// world barrier: the right algorithm once the bytes dominate.
 //
 // THE SLICE IS ceil(size/ngpus) AND THE LAST RANK TAKES WHAT IS LEFT, so a buffer that
 // does not divide by ngpus is still reduced exactly once, and a rank with an empty slice
-// still reaches every sync.
+// still reaches every barrier.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     allreduce_two_shot(ipc::Peers p, T* __restrict__ out, int size) {
@@ -32,7 +32,7 @@ __global__ void __launch_bounds__(512, 1)
   for (int idx = mine_begin + tid; idx < mine_end; idx += stride)
     c.put(rank, idx - mine_begin, c.sum(idx));
 
-  c.sync();
+  c.world_barrier();
 
   V* dst = reinterpret_cast<V*>(out);
   for (int i = 0; i < ngpus; ++i) {

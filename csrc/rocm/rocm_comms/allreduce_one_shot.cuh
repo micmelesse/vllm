@@ -11,7 +11,7 @@
 namespace hip_comms {
 
 // ONE-SHOT: every rank sums every peer's input over the whole buffer into its own output.
-// Moves ngpus x the bytes of two-shot and needs no sync between phases, so it wins while
+// Moves ngpus x the bytes of two-shot and needs no barrier between phases, so it wins while
 // the barrier, not the bytes, dominates.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)

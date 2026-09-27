@@ -41,8 +41,9 @@ constexpr int kMaxBlocks = 36;
 // is still at the first, and with a single array the peer would write counter+1 while we
 // busy-wait on counter. `seq` is the per-block monotonic sequence number.
 //
-// `Comm::sync` uses the rest: `peer[r]` is the last sync rank r posted here, `arrive` and
-// `gen` the grid barrier on this device, `epoch` the syncs this rank has completed.
+// The barriers use the rest: `peer[r]` is the last world barrier rank r posted here,
+// `arrive` and `gen` the grid barrier on this device, `epoch` the syncs this rank has
+// completed.
 struct Signal {
   alignas(128) uint32_t start[kMaxBlocks][kMaxRanks];
   alignas(128) uint32_t end[kMaxBlocks][kMaxRanks];
@@ -93,16 +94,17 @@ class Peers {
 
 // =================================================================================
 // THE KERNEL'S WHOLE VIEW OF ITS PEERS. Every rank's input is read only through `sum`;
-// every rank's scratch (its own included) through `put` and `get`; `sync` orders all of
-// it. Indices are in 16-byte packs of T.
+// every rank's scratch (its own included) through `put` and `get`; the barriers order it.
+// Indices are in 16-byte packs of T.
 //
 //   Comm c(p);             returns once every peer has launched: their inputs are ready
 //   c.sum(idx)             input pack idx summed over ranks, fp32, rounded once
 //   c.put(peer, idx, v)    into peer's scratch
 //   c.get(peer, idx)       from peer's scratch
-//   c.sync()               every put before it, by any block of any rank, is visible to
+//   c.world_barrier()      every put before it, by any block of any rank, is visible to
 //                          every get after it
-//   c.sync_local()         the same for this rank's own scratch only
+//   c.grid_barrier()       the same for the blocks of this rank and its own scratch
+//   c.block_barrier()      the threads of this block
 //   c.close()              last; after it this rank's input may be reused
 //
 // A wait that outlives the timeout prints where it was and traps, so a hang is an error.
@@ -160,11 +162,14 @@ class Comm {
     return scratch_of(peer)[idx];
   }
 
-  DINLINE void sync() { grid_barrier<true>(); }
+  DINLINE void world_barrier() { barrier<true>(); }
 
   // Every block of THIS rank's kernel: puts to our own scratch before it are visible to our
-  // own gets after it. Cheaper than `sync`, and wrong for anything a peer put.
-  DINLINE void sync_local() { grid_barrier<false>(); }
+  // own gets after it. Cheaper than `world_barrier`, and wrong for anything a peer put.
+  DINLINE void grid_barrier() { barrier<false>(); }
+
+  // The threads of this block.
+  DINLINE void block_barrier() const { __syncthreads(); }
 
   DINLINE void close() {
     skew();
@@ -177,7 +182,7 @@ class Comm {
   // barrier: the barrier waits for every wave's stores, and a release writes back the whole
   // L2, so one covers the block where one per thread wrote it back 512 times.
   template <bool kPeers>
-  DINLINE void grid_barrier() {
+  DINLINE void barrier() {
     constexpr int kScope = kPeers ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
     skew();
     __syncthreads();
@@ -198,11 +203,12 @@ class Comm {
                                     __MEMORY_SCOPE_SYSTEM);
 #pragma unroll
           for (int i = 0; i < ngpus; ++i)
-            wait<true, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
+            wait<true, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "world_barrier: peer", i);
         }
         __scoped_atomic_fetch_add(&self->gen, 1u, __ATOMIC_RELEASE, kScope);
       } else {
-        wait<true, kScope>(&self->gen, g + 1, kPeers ? "sync: grid" : "sync_local", -1);
+        wait<true, kScope>(&self->gen, g + 1, kPeers ? "world_barrier" : "grid_barrier",
+                           -1);
       }
     }
     __syncthreads();
@@ -234,7 +240,7 @@ class Comm {
 
   // Block b waits for block b on every rank, and for no other block: enough at the ends,
   // where it says "every peer has launched" or "every peer is done reading me", and not
-  // enough between phases, which is what `sync` is for.
+  // enough between phases, which is what `world_barrier` is for.
   DINLINE void pair_blocks(bool start) const {
     if (!start) __syncthreads();
     Signal* self     = p_.self_;
