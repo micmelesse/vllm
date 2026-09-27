@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// WHICH KERNEL RUNS, AND HOW WIDE. The caller names an op; this picks one kernel from the flat
-// list and its launch geometry, for gfx950. Nothing above C++ sees an algorithm or a geometry.
+// WHICH KERNEL RUNS, AND HOW WIDE. The caller names an op; this picks one kernel from the
+// flat list and its launch geometry, for gfx950. Nothing above C++ sees an algorithm or a
+// geometry.
 
 #pragma once
 
@@ -49,19 +50,19 @@ constexpr Kernel kernel_of(Op op, bool two_shot) {
 constexpr Op op_of(Kernel k) { return static_cast<Op>(static_cast<int>(k) / 2); }
 constexpr bool is_two_shot(Kernel k) { return static_cast<int>(k) % 2 == 1; }
 
-// THE gfx950 TABLE, until the microbench sweep replaces it. One-shot moves ngpus x the bytes
-// and pays one barrier; two-shot moves about 2x and pays a sync, so one-shot wins while the
-// buffer is small. 16 blocks of 512 threads is vLLM's setting, not yet measured here.
+// THE gfx950 TABLE, until the microbench sweep replaces it. One-shot moves ngpus x the
+// bytes and pays one barrier; two-shot moves about 2x and pays a sync, so one-shot wins
+// while the buffer is small. 16 blocks of 512 threads is vLLM's setting, not yet measured
+// here.
 constexpr int64_t kOneShotMaxBytes = int64_t{512} << 10;
 constexpr int kBlocks              = 16;
 constexpr int kThreads             = 512;
-// The GEMM tail's GEMM runs on the collective's few blocks, so past a decode batch it loses to
-// hipBLASLt on the whole device and is declined.
-constexpr int64_t kGemmTailMaxBytes = int64_t{512} << 10;
-
+// THE GEMM TAIL IS DECLINED at every size: its GEMM runs on the collective's 16 blocks,
+// one row at a time, and loses to all-reduce + norm + hipBLASLt even at one row (50 vs 37
+// us; 272 vs 37 at 16 rows, microbench 2026-09-27). Forcing it through the override still
+// runs it.
 inline Launch pick(Op op, int64_t rows, int64_t bytes) {
-  if (op == Op::rms_norm_gemm_add && bytes > kGemmTailMaxBytes)
-    return {Kernel::none, 0, 0};
+  if (op == Op::rms_norm_gemm_add) return {Kernel::none, 0, 0};
   const bool one_shot =
       bytes <= kOneShotMaxBytes && !(op == Op::rms_norm_gemm_add && rows > kGemmRows);
   return {kernel_of(op, !one_shot), kBlocks, kThreads};
