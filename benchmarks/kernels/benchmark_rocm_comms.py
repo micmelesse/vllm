@@ -2,39 +2,42 @@
 # SPDX-License-Identifier: MIT Copyright (C) 2026, Advanced Micro Devices, Inc. All
 # rights reserved.
 
-"""Latency of the rocm_comms collectives: the benchmark twin of
+"""Latency of the rocm_comms ops: the benchmark twin of
 `tests/distributed/test_rocm_comms.py`. Same communicators, built the same way, timed
 instead of checked.
 
-Each case is a [tokens, hidden] all-reduce, captured N times into one cudagraph (how
+Each case is one op over [tokens, hidden], captured N times into one cudagraph (how
 vLLM decodes) and replayed; the reported latency is per op, the slowest rank's. Every
-case is also checked once against RCCL, so a fast wrong kernel shows as `ok=False`.
+case is also checked once against RCCL followed by the model's own ops, so a fast wrong
+kernel shows as `ok=False`.
+
+Ops (--op), each all-reduce then the ops named, in order:
+    all_reduce               the plain collective
+    rms_norm                 then vllm.ir.ops.rms_norm
+    add_rms_norm             then vllm.ir.ops.fused_add_rms_norm
+    add_attn_res_rms_norm    then Kimi-K3's Triton attn_res, with its output norm
+    rms_norm_gemm_add        then rms_norm, then addmm_ into a 1/world column shard
 
 Arms:
-    rccl                 vLLM's PyNccl all-reduce, the floor
-    aiter                aiter's custom all-reduce, what the baseline arm runs
-    hip-<algo>           our kernel, per --algos, swept over --blocks x --threads
-    with --fused, also (the norm is --norm: rms_norm or fused_add_rms_norm):
-    <arm>+norm           the arm, then vllm.ir.ops.<norm> (the unfused pair)
-    aiter-fused          aiter's fused all-reduce + RMSNorm, what the baseline's pass
-                         rewrites to (rms_norm passes it a zero residual, as that pass
-                         does)
-    hip-<algo>-fused     our all_reduce_<norm>
+    rccl / aiter             that all-reduce, then the ops (for all_reduce, just it)
+    aiter-fused              aiter's fused all-reduce + RMSNorm (the norm ops only)
+    hip                      our all-reduce, then the ops
+    hip-fused                our fused op, the kernel C++ picks
+    hip-<kernel>[-bB-tT]     our fused op forced to one kernel, per --blocks x --threads
 
-Usage (Kimi-K3's latent MoE all-reduce, then its hidden one):
+Usage (Kimi-K3's decode shapes):
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_rocm_comms.py \\
-        --hidden 3584 --fused --norm rms_norm --output latent.jsonl
-    torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_rocm_comms.py \\
-        --hidden 7168 --output hidden.jsonl
+        --op add_attn_res_rms_norm --hidden 7168 --output attn_res.jsonl
 """
 
 import argparse
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from itertools import product
+from typing import cast, get_args
 
 import torch
 import torch.distributed as dist
@@ -44,9 +47,10 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.rocm_comms import make_communicator
+from vllm.distributed.device_communicators.rocm_comms.base import FusedOp
 from vllm.distributed.device_communicators.rocm_comms.hip import (
-    Algo,
     HipCommunicator,
+    Kernel,
 )
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -58,14 +62,19 @@ from vllm.distributed.parallel_state import (
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 EPS = 1e-5
-NORMS = ("rms_norm", "fused_add_rms_norm")
+OPS = ("all_reduce", *get_args(FusedOp))
 # Decode batch sizes up to Kimi-K3's max_num_seqs, then prefill chunks up to its
 # max_num_batched_tokens.
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+# Kimi-K3 mid-model: 4 stored AttnRes blocks of the 10 a row holds.
+ATTN_RES_SOURCES, ATTN_RES_VALID = 10, 4
+
+AllReduce = Callable[[torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
 class Result:
+    op: str
     arm: str
     tokens: int
     hidden: int
@@ -80,102 +89,176 @@ class Result:
 
 
 @dataclass(frozen=True)
+class Inputs:
+    """Everything one op reads, for one token count. `x` is this rank's partial; the
+    rest is replicated across ranks, as in the model."""
+
+    x: torch.Tensor
+    residual: torch.Tensor
+    weight: torch.Tensor
+    prefix: torch.Tensor
+    blocks: torch.Tensor
+    qk_weight: torch.Tensor
+    shared: torch.Tensor
+    up_proj: torch.Tensor
+    col0: int
+
+    def fresh(self) -> "Inputs":
+        """The tensors the ops write into, copied: prefix, blocks and shared."""
+        return replace(
+            self,
+            prefix=self.prefix.clone(),
+            blocks=self.blocks.clone(),
+            shared=self.shared.clone(),
+        )
+
+
+@dataclass(frozen=True)
 class Case:
-    """One timed thing: `run(x, residual, weight)` returns what gets checked."""
+    """One timed thing: `run(inputs)` returns what gets checked."""
 
     arm: str
-    run: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+    run: Callable[[Inputs], torch.Tensor]
     capture: Callable[[], AbstractContextManager]
-    fused: bool
     blocks: int | None = None
     threads: int | None = None
 
 
-def _hip_cases(
-    comm: HipCommunicator,
-    algos: list[Algo],
-    blocks: list[int],
-    threads: list[int],
-    norm: str | None,
-) -> Iterator[Case]:
-    for algo, b, t in product(algos, blocks, threads):
-        tunables = replace(comm.hip_tunables, algo=algo, blocks=b, threads=t)
-        suffix = "" if len(blocks) == len(threads) == 1 else f"-b{b}-t{t}"
+def _inputs(op: str, tokens: int, hidden: int, dtype, world, rank, device) -> Inputs:
+    gen = torch.Generator(device=device).manual_seed(rank)
 
-        def tuned(fn, tunables=tunables):
-            def call(x, r, w):
-                comm.hip_tunables = tunables
-                return fn(x, r, w)
+    def randn(*shape: int) -> torch.Tensor:
+        return torch.randn(shape, dtype=dtype, device=device, generator=gen)
 
-            return call
+    x = randn(tokens, hidden)
+    gen.manual_seed(1234)
+    # The GEMM tail up-projects the latent `hidden` into a row `world` shards wide.
+    out_hidden = hidden * 2 if op == "rms_norm_gemm_add" else hidden
+    shard = out_hidden // world
+    return Inputs(
+        x=x,
+        residual=randn(tokens, hidden),
+        weight=randn(hidden),
+        prefix=randn(tokens, hidden),
+        blocks=randn(tokens, ATTN_RES_SOURCES, hidden),
+        qk_weight=randn(hidden),
+        shared=randn(tokens, out_hidden),
+        up_proj=randn(shard, hidden) / hidden**0.5,
+        col0=rank * shard,
+    )
 
-        yield Case(
-            f"hip-{algo}{suffix}",
-            tuned(lambda x, r, w: comm.all_reduce(x)),
-            comm.capture,
-            False,
-            b,
-            t,
+
+def _tail(op: str, summed: torch.Tensor, t: Inputs) -> torch.Tensor:
+    """The model's own ops after the all-reduce, as the unfused path runs them."""
+    if op == "all_reduce":
+        return summed
+    if op == "rms_norm":
+        return vllm.ir.ops.rms_norm(summed, t.weight, EPS)
+    if op == "add_rms_norm":
+        return vllm.ir.ops.fused_add_rms_norm(summed, t.residual, t.weight, EPS)[0]
+    if op == "add_attn_res_rms_norm":
+        from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+
+        return attn_res(
+            t.prefix,
+            summed,
+            t.blocks,
+            t.weight,
+            t.qk_weight,
+            t.weight,
+            ATTN_RES_VALID,
+            -1,
+            EPS,
+            EPS,
         )
-        if norm is not None:
-            yield Case(
-                f"hip-{algo}{suffix}+norm",
-                tuned(lambda x, r, w: _then_norm(norm, comm.all_reduce(x), r, w)),
-                comm.capture,
-                True,
-                b,
-                t,
+    latent = vllm.ir.ops.rms_norm(summed, t.weight, EPS)
+    t.shared.narrow(-1, t.col0, t.up_proj.shape[0]).addmm_(latent, t.up_proj.t())
+    return t.shared
+
+
+def _fused(comm: HipCommunicator, op: FusedOp, t: Inputs) -> torch.Tensor:
+    if op == "rms_norm":
+        return comm.all_reduce_rms_norm(t.x, t.weight, EPS)
+    if op == "add_rms_norm":
+        return comm.all_reduce_add_rms_norm(t.x, t.residual, t.weight, EPS)[0]
+    if op == "add_attn_res_rms_norm":
+        return comm.all_reduce_add_attn_res_rms_norm(
+            t.x,
+            t.prefix,
+            t.blocks,
+            t.weight,
+            t.qk_weight,
+            t.weight,
+            ATTN_RES_VALID,
+            -1,
+            EPS,
+            EPS,
+        )[1]
+    comm.all_reduce_rms_norm_gemm_add(t.x, t.weight, EPS, t.up_proj, t.shared, t.col0)
+    return t.shared
+
+
+def _admitted(comm: HipCommunicator, op: FusedOp, x: torch.Tensor) -> bool:
+    return getattr(comm, f"should_allreduce_{op}")(x)
+
+
+def _forced(
+    comm: HipCommunicator, kernel: Kernel, blocks: int, threads: int, fn
+) -> Callable[[Inputs], torch.Tensor]:
+    """`fn` with `kernel` forced for its call, so a capture records that kernel."""
+
+    def call(t: Inputs) -> torch.Tensor:
+        comm.set_launch_override(kernel, blocks, threads)
+        try:
+            return fn(t)
+        finally:
+            comm.set_launch_override(None)
+
+    return call
+
+
+def _unfused_case(arm: str, op: str, all_reduce: AllReduce, capture) -> Case:
+    return Case(arm, lambda t: _tail(op, all_reduce(t.x), t), capture)
+
+
+def _hip_cases(
+    comm: HipCommunicator, op: str, x: torch.Tensor, blocks, threads
+) -> list[Case]:
+    cases = [_unfused_case("hip", op, comm.all_reduce, comm.capture)]
+    sweep = len(blocks) * len(threads) > 1
+    if op == "all_reduce":
+        kernels: list[Kernel] = ["one_shot", "two_shot"]
+        run = lambda t: comm.all_reduce(t.x)  # noqa: E731
+    else:
+        fop = cast(FusedOp, op)
+        kernels = [cast(Kernel, f"{v}_{op}") for v in ("one_shot", "two_shot")]
+        run = lambda t: _fused(comm, fop, t)  # noqa: E731
+        if _admitted(comm, fop, x):
+            cases.append(Case("hip-fused", run, comm.capture))
+    for kernel, b, tr in product(kernels, blocks, threads):
+        comm.set_launch_override(kernel, b, tr)
+        try:
+            ok = op == "all_reduce" or _admitted(comm, cast(FusedOp, op), x)
+        finally:
+            comm.set_launch_override(None)
+        if ok:
+            arm = f"hip-{kernel}" + (f"-b{b}-t{tr}" if sweep else "")
+            cases.append(
+                Case(arm, _forced(comm, kernel, b, tr, run), comm.capture, b, tr)
             )
-            if norm == "rms_norm":
-                fused_fn = lambda x, r, w: comm.all_reduce_rms_norm(x, w, EPS)  # noqa: E731
-            else:
-                fused_fn = lambda x, r, w: comm.all_reduce_add_rms_norm(  # noqa: E731
-                    x, r, w, EPS
-                )[0]
-            yield Case(
-                f"hip-{algo}{suffix}-fused", tuned(fused_fn), comm.capture, True, b, t
-            )
+    return cases
 
 
-def _then_norm(
-    norm: str, summed: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
-    """The norm vLLM runs after the all-reduce, through `vllm.ir.ops` so it dispatches
-    to the platform's kernel (aiter's on ROCm with aiter on)."""
-    if norm == "rms_norm":
-        return vllm.ir.ops.rms_norm(summed, weight, EPS)
-    return vllm.ir.ops.fused_add_rms_norm(summed, residual, weight, EPS)[0]
-
-
-def _reference(
-    pynccl: PyNcclCommunicator,
-    x: torch.Tensor,
-    r: torch.Tensor,
-    w: torch.Tensor,
-    norm: str | None,
-) -> torch.Tensor:
-    summed = pynccl.all_reduce(x.clone())
-    return summed if norm is None else _then_norm(norm, summed, r, w)
-
-
-def _time(
-    case: Case,
-    x: torch.Tensor,
-    r: torch.Tensor,
-    w: torch.Tensor,
-    ops_per_graph: int,
-    warmup: int,
-    trials: int,
-) -> float:
+def _time(case: Case, t: Inputs, ops_per_graph: int, warmup: int, trials: int) -> float:
     """Microseconds per op on this rank: `ops_per_graph` launches in one graph."""
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         for _ in range(3):
-            case.run(x, r, w)
+            case.run(t)
         graph = torch.cuda.CUDAGraph()
         with case.capture(), torch.cuda.graph(graph, stream=stream):
             for _ in range(ops_per_graph):
-                case.run(x, r, w)
+                case.run(t)
     torch.cuda.synchronize()
     for _ in range(warmup):
         graph.replay()
@@ -205,7 +288,7 @@ def _print_table(results: list[Result]) -> None:
     arms = list(dict.fromkeys(r.arm for r in results))
     cell = {(r.arm, r.tokens): r for r in results}
     width = max(12, *(len(a) for a in arms)) + 2
-    print("\nus per op (slowest rank); * = disagrees with rccl")
+    print(f"\n{results[0].op}: us per op (slowest rank); * = disagrees with rccl")
     print(f"{'tokens':>8} {'MB':>8} " + "".join(f"{a:>{width}}" for a in arms))
     for tokens in sorted({r.tokens for r in results}):
         row = [cell.get((a, tokens)) for a in arms]
@@ -221,16 +304,12 @@ def _print_table(results: list[Result]) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--op", choices=OPS, default="all_reduce")
     p.add_argument("--hidden", type=int, default=7168, help="Kimi-K3 is 7168")
     p.add_argument("--tokens", type=int, nargs="+", default=DEFAULT_TOKENS)
     p.add_argument("--dtype", choices=DTYPES, default="bf16")
-    p.add_argument(
-        "--algos", nargs="+", default=["one_shot", "two_shot", "mixed"], type=str
-    )
     p.add_argument("--blocks", type=int, nargs="+", default=[16])
     p.add_argument("--threads", type=int, nargs="+", default=[512])
-    p.add_argument("--fused", action="store_true", help="also time all-reduce + norm")
-    p.add_argument("--norm", choices=NORMS, default="rms_norm")
     p.add_argument("--no-baselines", action="store_true", help="hip arms only")
     p.add_argument("--ops-per-graph", type=int, default=10)
     p.add_argument("--warmup", type=int, default=10)
@@ -247,27 +326,17 @@ def main() -> None:
         ensure_model_parallel_initialized(world, 1)
     cpu_group = get_tp_group().cpu_group
     dtype = DTYPES[args.dtype]
-    norm = args.norm if args.fused else None
+    op = args.op
 
     pynccl = PyNcclCommunicator(group=cpu_group, device=device)
     hip = make_communicator(cpu_group, get_tp_group().device_group, device, "hip")
     assert isinstance(hip, HipCommunicator) and not hip.disabled, "hip unavailable"
 
-    cases: list[Case] = []
-    aiter = None
+    baselines: list[Case] = []
     if not args.no_baselines:
-        cases.append(
-            Case("rccl", lambda x, r, w: pynccl.all_reduce(x), nullcontext, False)
+        baselines.append(
+            _unfused_case("rccl", op, lambda x: pynccl.all_reduce(x), nullcontext)
         )
-        if norm is not None:
-            cases.append(
-                Case(
-                    "rccl+norm",
-                    lambda x, r, w: _then_norm(norm, pynccl.all_reduce(x), r, w),
-                    nullcontext,
-                    True,
-                )
-            )
         if rocm_aiter_ops.is_custom_all_reduce_enabled():
             from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
                 AiterCustomAllreduce,
@@ -276,60 +345,41 @@ def main() -> None:
             widest = max(args.tokens) * args.hidden * dtype.itemsize
             aiter = AiterCustomAllreduce(cpu_group, device, max_size=2 * widest + 1)
             if not aiter.disabled:
-                cases.append(
-                    Case(
-                        "aiter",
-                        lambda x, r, w: aiter.custom_all_reduce(x),
-                        aiter.capture,
-                        False,
-                    )
+                baselines.append(
+                    _unfused_case("aiter", op, aiter.custom_all_reduce, aiter.capture)
                 )
-                if norm is not None:
-                    cases.append(
-                        Case(
-                            "aiter+norm",
-                            lambda x, r, w: _then_norm(
-                                norm, aiter.custom_all_reduce(x), r, w
-                            ),
-                            aiter.capture,
-                            True,
-                        )
-                    )
-        # The fused op the baseline's aiter pass rewrites to. It runs on the aiter
-        # all-reduce vLLM itself built on the TP communicator.
+        # The fused op the baseline's aiter pass rewrites to, on the aiter all-reduce
+        # vLLM itself built on the TP communicator.
         vllm_aiter = rocm_aiter_ops.get_aiter_allreduce()
-        if norm is not None and vllm_aiter is not None:
+        if op in ("rms_norm", "add_rms_norm") and vllm_aiter is not None:
             aiter_fused = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
-            if norm == "rms_norm":
-                run = lambda x, r, w: aiter_fused(x, torch.zeros_like(x), w, EPS)[0]  # noqa: E731
+            if op == "rms_norm":
+                run = lambda t: aiter_fused(t.x, torch.zeros_like(t.x), t.weight, EPS)[
+                    0
+                ]  # noqa: E731
             else:
-                run = lambda x, r, w: aiter_fused(x, r, w, EPS)[0]  # noqa: E731
-            cases.append(Case("aiter-fused", run, vllm_aiter.capture, True))
-    cases += _hip_cases(hip, args.algos, args.blocks, args.threads, norm)
+                run = lambda t: aiter_fused(t.x, t.residual, t.weight, EPS)[0]  # noqa: E731
+            baselines.append(Case("aiter-fused", run, vllm_aiter.capture))
 
     results: list[Result] = []
     for tokens in args.tokens:
-        gen = torch.Generator(device=device).manual_seed(rank)
-        shape = (tokens, args.hidden)
-        x = torch.randn(shape, dtype=dtype, device=device, generator=gen)
-        # The residual and weight are replicated across ranks, as in the model.
-        gen.manual_seed(1234)
-        r = torch.randn(shape, dtype=dtype, device=device, generator=gen)
-        w = torch.randn(args.hidden, dtype=dtype, device=device, generator=gen)
-        nbytes = x.numel() * x.element_size()
+        t = _inputs(op, tokens, args.hidden, dtype, world, rank, device)
+        cases = baselines + _hip_cases(hip, op, t.x, args.blocks, args.threads)
+        nbytes = t.x.numel() * t.x.element_size()
+        want = _tail(op, pynccl.all_reduce(t.x.clone()), t.fresh())
         for case in cases:
-            want = _reference(pynccl, x, r, w, norm if case.fused else None)
-            got = case.run(x, r, w)
+            got = case.run(t.fresh())
             ok = _all_ranks(
                 torch.allclose(got.float(), want.float(), atol=0.1, rtol=0.05), device
             )
             us = _slowest(
-                _time(case, x, r, w, args.ops_per_graph, args.warmup, args.trials),
+                _time(case, t.fresh(), args.ops_per_graph, args.warmup, args.trials),
                 device,
             )
             busbw = nbytes / (us * 1e-6) * 2 * (world - 1) / world / 1e9
             results.append(
                 Result(
+                    op,
                     case.arm,
                     tokens,
                     args.hidden,

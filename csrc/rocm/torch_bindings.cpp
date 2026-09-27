@@ -103,6 +103,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_init", &rocm_comms_init);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
   rocm_ops.def("rocm_comms_set_checked", &rocm_comms_set_checked);
+  rocm_ops.def("rocm_comms_set_launch_override", &rocm_comms_set_launch_override);
+  rocm_ops.def("rocm_comms_admits", &rocm_comms_admits);
   rocm_ops.def("rocm_comms_register_buffer", &rocm_comms_register_buffer);
   rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);
   rocm_ops.def("rocm_comms_register_graph_buffers", &rocm_comms_register_graph_buffers);
@@ -111,8 +113,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_sizes", &rocm_comms_sizes);
 
   rocm_ops.def(
-      "rocm_comms_all_reduce(int comms, Tensor! out, Tensor inp, int algo, "
-      "int small_limit, int blocks, int threads) -> ()");
+      "rocm_comms_all_reduce(int comms, Tensor! out, Tensor inp) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
 
   // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
@@ -120,14 +121,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // torch has no `double` there; the kernel narrows it.
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm(int comms, Tensor! out, Tensor inp, "
-      "Tensor weight, float eps, int algo, int small_limit, int blocks, "
-      "int threads) -> ()");
+      "Tensor weight, float eps) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm);
   rocm_ops.def(
       "rocm_comms_all_reduce_add_rms_norm(int comms, Tensor! out, "
-      "Tensor! residual_out, Tensor inp, Tensor residual, Tensor weight, float eps, "
-      "int algo, int small_limit, int blocks, int threads) -> ()");
+      "Tensor! residual_out, Tensor inp, Tensor residual, Tensor weight, float eps) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_add_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_rms_norm);
 
@@ -135,15 +134,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rocm_comms_all_reduce_add_attn_res_rms_norm(int comms, Tensor! prefix, Tensor! out, "
       "Tensor inp, "
       "Tensor! blocks, Tensor norm_weight, Tensor qk_weight, Tensor? out_norm_weight, "
-      "int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix, "
-      "int block_count, int threads) -> ()");
+      "int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_attn_res_rms_norm);
 
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm_gemm_add(int comms, Tensor! out, int out_col0, "
-      "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, int block_count, "
-      "int threads) -> ()");
+      "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm_add", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm_gemm_add);
 

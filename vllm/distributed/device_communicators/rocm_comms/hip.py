@@ -4,8 +4,9 @@
 """The HIP backend: our kernels in `_rocm_C` (`csrc/rocm/rocm_comms.cu`) and the peer
 memory they run over.
 
-Every number that moves with the hardware is a `HipTunables` field passed to the op;
-the `.cu` has no constants of its own.
+The caller names an op and C++ picks the kernel and its launch geometry
+(`csrc/rocm/rocm_comms/launch.cuh`); `set_launch_override` is the one way to force one,
+for the sweep and the tests.
 
 TWO MEMORY PATHS, split by lifetime. A captured buffer is held by vLLM for the graph's
 life, so it is registered once at capture exit and read in place. An eager input is
@@ -20,36 +21,49 @@ import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator
+from .base import Communicator, FusedOp
 
 logger = logging.getLogger(__name__)
 
 
-#   one_shot   every rank reads every peer's whole buffer: (ngpus-1) x N per rank, one
-#              barrier. Wins while the barrier dominates.
-#   two_shot   reduce-scatter then all-gather: 1.75N against 7N at ngpus=8, one more
-#              barrier. Wins once the bytes dominate.
-#   mixed      one_shot below `small_limit`, two_shot at or above it; the .cu switches.
-Algo = Literal["one_shot", "two_shot", "mixed"]
+# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh). Named
+# only to force one through `set_launch_override`; nothing else picks.
+Kernel = Literal[
+    "one_shot",
+    "two_shot",
+    "one_shot_rms_norm",
+    "two_shot_rms_norm",
+    "one_shot_add_rms_norm",
+    "two_shot_add_rms_norm",
+    "one_shot_add_attn_res_rms_norm",
+    "two_shot_add_attn_res_rms_norm",
+    "one_shot_rms_norm_gemm_add",
+    "two_shot_rms_norm_gemm_add",
+]
+_KERNEL_WIRE: Mapping[Kernel, int] = {
+    k: i
+    for i, k in enumerate(Kernel.__args__)  # type: ignore[attr-defined]
+}
 
-# The op carries the algorithm as an int.
-_ALGO_WIRE: Mapping[Algo, int] = {"one_shot": 0, "two_shot": 1, "mixed": 2}
+# The ops as C++ numbers them (`enum class Op`); the plain all-reduce is 0.
+_OP_WIRE: Mapping[FusedOp, int] = {
+    "rms_norm": 1,
+    "add_rms_norm": 2,
+    "add_attn_res_rms_norm": 3,
+    "rms_norm_gemm_add": 4,
+}
 
 
 @dataclass(frozen=True)
 class HipTunables:
     """Every arbitrary number this backend has. One default each until measured."""
 
-    algo: Algo = "two_shot"
-    # vLLM's tuned value on this hardware: more blocks contend on the interconnect.
-    blocks: int = 16
-    threads: int = 512
     # Two-shot's scratch, after the signal block. It holds one rank's slice, so it caps
     # a two-shot buffer at `scratch_bytes` x ngpus (268 MB at 8 ranks).
     scratch_bytes: int = 32 << 20
@@ -61,10 +75,6 @@ class HipTunables:
     staging_floor_bytes: int = 128 << 20
     # How long a kernel waits on a peer before it prints where it was and traps.
     sync_timeout_s: float = 10.0
-
-    def __post_init__(self) -> None:
-        if self.algo not in get_args(Algo):
-            raise ValueError(f"algo must be one of {get_args(Algo)}, not {self.algo!r}")
 
 
 def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
@@ -90,7 +100,6 @@ class HipCommunicator(Communicator):
     # graph's buffers).
     _registered: set[int]
     _staging: torch.Tensor
-    _max_row_packs: int = 0
 
     def _staging_bytes(self) -> int:
         """One all-reduce input at the widest batch vLLM will build, or the floor."""
@@ -103,10 +112,9 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         tunables = self.hip_tunables
-        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes, row_packs = (
+        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes, _row_packs = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
-        self._max_row_packs = row_packs
         self.rank = dist.get_rank(self.cpu_group)
         # One allocation per rank: the signal block, then the scratch.
         self._signal = torch.zeros(
@@ -139,10 +147,9 @@ class HipCommunicator(Communicator):
         )
         self._register(self._staging)
         logger.info(
-            "HipCommunicator ready: rank %d/%d, small_limit=%dMB, staging=%dMB, %s",
+            "HipCommunicator ready: rank %d/%d, staging=%dMB, %s",
             self.rank,
             self.world_size,
-            self.tunables.small_limit >> 20,
             self._staging.numel() >> 20,
             tunables,
         )
@@ -225,6 +232,17 @@ class HipCommunicator(Communicator):
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
 
+    def set_launch_override(
+        self, kernel: Kernel | None, blocks: int = 16, threads: int = 512
+    ) -> None:
+        """Force `kernel` at this geometry for every later launch of its op (and refuse
+        any other op) until cleared with None. The sweep's and the tests' handle; the
+        model never calls it."""
+        wire = -1 if kernel is None else _KERNEL_WIRE[kernel]
+        torch.ops._rocm_C.rocm_comms_set_launch_override(
+            self._handle, wire, blocks, threads
+        )
+
     def set_checked(self, checked: bool) -> None:
         """Bounds checks and random skew in every later kernel: the tests' mode, which
         turns a race into a failure on every run."""
@@ -263,57 +281,25 @@ class HipCommunicator(Communicator):
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
-        cfg = self.hip_tunables
         out = torch.empty_like(inp)
-        torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle,
-            out,
-            self._as_input(inp),
-            _ALGO_WIRE[cfg.algo],
-            self.tunables.small_limit,
-            cfg.blocks,
-            cfg.threads,
-        )
+        torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, self._as_input(inp))
         return out
 
-    def _fits_rms_norm(self, inp: torch.Tensor) -> bool:
-        """The fused kernels hold a row in registers: `_max_row_packs` 16-byte packs per
-        thread."""
-        if inp.dim() != 2:
-            return False
-        row_bytes = inp.shape[1] * inp.element_size()
-        return (
-            row_bytes % 16 == 0
-            and row_bytes // 16 <= self._max_row_packs * self.hip_tunables.threads
+    def _admits(self, op: FusedOp, inp: torch.Tensor) -> bool:
+        """What C++ picks for this shape runs here: it has a kernel for it, the row fits
+        in registers at that kernel's width, and its scratch fits."""
+        return inp.dim() == 2 and torch.ops._rocm_C.rocm_comms_admits(
+            self._handle, _OP_WIRE[op], inp.shape[0], inp.shape[1], inp.element_size()
         )
 
     def _all_reduce_rms_norm(
         self, inp: torch.Tensor, weight: torch.Tensor, eps: float
     ) -> torch.Tensor:
-        cfg = self.hip_tunables
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
-            self._handle,
-            out,
-            self._as_input(inp),
-            weight,
-            eps,
-            _ALGO_WIRE[cfg.algo],
-            self.tunables.small_limit,
-            cfg.blocks,
-            cfg.threads,
+            self._handle, out, self._as_input(inp), weight, eps
         )
         return out
-
-    # THE FUSED ONE-SHOT KERNELS' ROW LIMIT: a decode step and no more (`kGemmRows`
-    # in the GEMM tail). One-shot moves ngpus x the bytes, so prefill stays unfused.
-    _max_fused_rows = 16
-
-    def _fits_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
-        return inp.dim() == 2 and inp.shape[0] <= self._max_fused_rows
-
-    def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
-        return inp.dim() == 2 and inp.shape[0] <= self._max_fused_rows
 
     def _all_reduce_rms_norm_gemm_add(
         self,
@@ -324,9 +310,6 @@ class HipCommunicator(Communicator):
         out: torch.Tensor,
         out_col0: int,
     ) -> None:
-        """One-shot and the norm into scratch, a sync, then the GEMM over every
-        block."""
-        cfg = self.hip_tunables
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
             out,
@@ -335,8 +318,6 @@ class HipCommunicator(Communicator):
             norm_weight,
             eps,
             gemm_weight,
-            cfg.blocks,
-            cfg.threads,
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -352,9 +333,6 @@ class HipCommunicator(Communicator):
         eps: float,
         out_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One-shot whatever the algo: every rank reduces every row, so AttnRes runs
-        where the sum already is, with nothing to gather."""
-        cfg = self.hip_tunables
         started = prefix is None
         prefix_out = torch.empty_like(inp) if started else prefix
         out = torch.empty_like(inp)
@@ -372,8 +350,6 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             not started,
-            cfg.blocks,
-            cfg.threads,
         )
         return prefix_out, out
 
@@ -385,21 +361,10 @@ class HipCommunicator(Communicator):
         eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns the normed result, then the sum plus residual."""
-        cfg = self.hip_tunables
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
-            self._handle,
-            out,
-            residual_out,
-            self._as_input(inp),
-            residual,
-            weight,
-            eps,
-            _ALGO_WIRE[cfg.algo],
-            self.tunables.small_limit,
-            cfg.blocks,
-            cfg.threads,
+            self._handle, out, residual_out, self._as_input(inp), residual, weight, eps
         )
         return out, residual_out
 

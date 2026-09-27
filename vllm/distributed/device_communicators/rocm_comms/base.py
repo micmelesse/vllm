@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 # adding the instantiation is a dispatch error at launch.
 WorldSize = Literal[2, 4, 8]
 
+# THE FUSED OPS a backend may admit, by name: all-reduce then the ops named, in order.
+FusedOp = Literal[
+    "rms_norm", "add_rms_norm", "add_attn_res_rms_norm", "rms_norm_gemm_add"
+]
+
 # What `_rocm_C` is built for.
 SUPPORTED_ARCHS = ("gfx94", "gfx95")
 
@@ -185,11 +190,11 @@ class Communicator(ABC):
         """Whether this backend can all-reduce then `rms_norm` `inp` in one kernel.
 
         Derived from the override, never from a flag beside it, and within the plain
-        collective's envelope plus the backend's row limit (`_fits_rms_norm`)."""
+        collective's envelope plus what the backend admits (`_admits`)."""
         return (
             type(self)._all_reduce_rms_norm is not Communicator._all_reduce_rms_norm
             and self.should_allreduce(inp)
-            and self._fits_rms_norm(inp)
+            and self._admits("rms_norm", inp)
         )
 
     def should_allreduce_add_rms_norm(self, inp: torch.Tensor) -> bool:
@@ -198,7 +203,7 @@ class Communicator(ABC):
             type(self)._all_reduce_add_rms_norm
             is not Communicator._all_reduce_add_rms_norm
             and self.should_allreduce(inp)
-            and self._fits_rms_norm(inp)
+            and self._admits("add_rms_norm", inp)
         )
 
     def _is_supported(self, inp: torch.Tensor) -> bool:
@@ -288,8 +293,7 @@ class Communicator(ABC):
             type(self)._all_reduce_add_attn_res_rms_norm
             is not Communicator._all_reduce_add_attn_res_rms_norm
             and self.should_allreduce(inp)
-            and self._fits_rms_norm(inp)
-            and self._fits_add_attn_res_rms_norm(inp)
+            and self._admits("add_attn_res_rms_norm", inp)
         )
 
     def all_reduce_add_attn_res_rms_norm(
@@ -333,14 +337,12 @@ class Communicator(ABC):
 
     def should_allreduce_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM added
-        into an output, within the backend's row limit for the GEMM
-        (`_fits_rms_norm_gemm_add`)."""
+        into an output."""
         return (
             type(self)._all_reduce_rms_norm_gemm_add
             is not Communicator._all_reduce_rms_norm_gemm_add
             and self.should_allreduce(inp)
-            and self._fits_rms_norm(inp)
-            and self._fits_rms_norm_gemm_add(inp)
+            and self._admits("rms_norm_gemm_add", inp)
         )
 
     def all_reduce_rms_norm_gemm_add(
@@ -516,19 +518,9 @@ class Communicator(ABC):
             f"ask should_allreduce_rms_norm_gemm_add first."
         )
 
-    def _fits_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
-        """Whether the fused AttnRes takes this many rows. No limit unless the backend
+    def _admits(self, op: FusedOp, inp: torch.Tensor) -> bool:
+        """Whether the backend runs fused `op` over `inp`. No limit unless the backend
         has one."""
-        return True
-
-    def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
-        """Whether the fused GEMM takes this many rows. No limit unless the backend has
-        one."""
-        return True
-
-    def _fits_rms_norm(self, inp: torch.Tensor) -> bool:
-        """Whether a fused kernel takes this row shape. No limit unless the backend has
-        one."""
         return True
 
     def widest_input_bytes(self) -> int:

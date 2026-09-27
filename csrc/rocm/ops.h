@@ -78,36 +78,32 @@ void rocm_comms_register_graph_buffers(
 
 int64_t rocm_comms_pending_count(fptr_t comms);
 
-void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
-                           int64_t algo, int64_t small_limit, int64_t blocks,
-                           int64_t threads);
+void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
+                                    int64_t threads);
+
+bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
+                       int64_t element_size);
+
+void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp);
 
 void rocm_comms_all_reduce_rms_norm(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
-                                    torch::Tensor& weight, double eps, int64_t algo,
-                                    int64_t small_limit, int64_t blocks, int64_t threads);
+                                    torch::Tensor& weight, double eps);
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t comms, torch::Tensor& out,
-                                              torch::Tensor& residual_out,
-                                              torch::Tensor& inp, torch::Tensor& residual,
-                                              torch::Tensor& weight, double eps,
-                                              int64_t algo, int64_t small_limit,
-                                              int64_t blocks, int64_t threads);
+                                        torch::Tensor& residual_out, torch::Tensor& inp,
+                                        torch::Tensor& residual, torch::Tensor& weight,
+                                        double eps);
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t comms, torch::Tensor& out,
                                              int64_t out_col0, torch::Tensor& inp,
                                              torch::Tensor& norm_weight, double eps,
-                                             torch::Tensor& gemm_weight,
-                                             int64_t block_count, int64_t threads);
+                                             torch::Tensor& gemm_weight);
 
-void rocm_comms_all_reduce_add_attn_res_rms_norm(fptr_t comms, torch::Tensor& prefix,
-                                                 torch::Tensor& out,
-                                    torch::Tensor& inp, torch::Tensor& blocks,
-                                    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-                                    const std::optional<torch::Tensor>& out_norm_weight,
-                                    int64_t num_blocks, int64_t write_idx, double eps,
-                                    double out_eps, bool has_prefix, int64_t block_count,
-                                    int64_t threads);
-
+void rocm_comms_all_reduce_add_attn_res_rms_norm(
+    fptr_t comms, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
+    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
+    int64_t write_idx, double eps, double out_eps, bool has_prefix);
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
 
