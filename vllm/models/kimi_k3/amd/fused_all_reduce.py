@@ -10,7 +10,6 @@ same order. Here and not in a fusion pass: Kimi-K3 is not torch.compiled.
 from typing import Any
 
 import torch
-from torch import nn
 
 from vllm.distributed import (
     get_pp_group,
@@ -31,23 +30,10 @@ def _comm() -> Any | None:
     return None if comm is None or comm.disabled else comm
 
 
-def defer_reductions(layer: nn.Module) -> bool:
-    """Leave the attention and MLP outputs of an AttnRes `layer` unreduced, for the
-    `attn_res` that consumes each to reduce. Only with the backend live and no pipeline
-    split, whose stage boundary needs the sum. Returns whether it deferred."""
-    if not (
-        getattr(layer, "use_attn_residuals", False)
-        and hasattr(layer.self_attn, "o_proj")
-        and get_pp_group().world_size == 1
-        and _comm() is not None
-    ):
-        return False
-    layer.self_attn.o_proj.reduce_results = False
-    if hasattr(layer.mlp, "experts"):
-        layer.mlp.experts.moe_config.skip_final_all_reduce = True
-    else:
-        layer.mlp.down_proj.reduce_results = False
-    return True
+def fusion_enabled() -> bool:
+    """Whether a layer should leave its outputs unreduced for `attn_res` to reduce:
+    the backend live and no pipeline split, whose stage boundary needs the sum."""
+    return get_pp_group().world_size == 1 and _comm() is not None
 
 
 def attn_res(

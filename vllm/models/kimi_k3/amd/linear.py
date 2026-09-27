@@ -61,7 +61,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.kimi_k3.amd.fused_all_reduce import attn_res, defer_reductions
+from vllm.models.kimi_k3.amd.fused_all_reduce import attn_res, fusion_enabled
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
@@ -145,6 +145,7 @@ class KimiMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_idx: int = 0,
+        reduce_results: bool = True,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -267,6 +268,10 @@ class KimiMoE(nn.Module):
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
             runner_cls=ROCmLatentMoERunner if self.use_latent_moe else None,
+            reduce_results=reduce_results,
+        )
+        assert reduce_results or self.experts.moe_config.skip_final_all_reduce, (
+            "reduce_results=False was not honored; the output would be reduced twice"
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -308,6 +313,7 @@ class KimiMLAAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -378,6 +384,7 @@ class KimiMLAAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -451,6 +458,11 @@ class KimiDecoderLayer(nn.Module):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        # Left unreduced for the AttnRes that consumes each output to reduce.
+        self.defer_all_reduce = config.attn_res_block_size is not None and (
+            fusion_enabled()
+        )
+        reduce_results = not self.defer_all_reduce
 
         if config.is_kda_layer(layer_idx):
             # Kimi-K3 sets use_full_rank_gate and uses the ROCm-specific K3 KDA
@@ -462,6 +474,7 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=reduce_results,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -495,6 +508,7 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
+                reduce_results=reduce_results,
             )
 
         if (
@@ -508,6 +522,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
+                reduce_results=reduce_results,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -519,6 +534,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                reduce_results=reduce_results,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -550,7 +566,6 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
-        self.defer_all_reduce = defer_reductions(self)
 
     def _run_self_attn(
         self,
