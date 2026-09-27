@@ -23,7 +23,8 @@ Arms:
     aiter-fused              aiter's fused all-reduce + RMSNorm (the norm ops only)
     hip                      our all-reduce, then the ops
     hip-fused                our fused op, the kernel C++ picks
-    hip-<kernel>[-bB-tT]     our fused op forced to one kernel, per --blocks x --threads
+    hip-<kernel>[-bB-tT-vV]  our fused op forced to one kernel, per --blocks x --threads
+                             (x --variants, the GEMM tail's lanes per column)
 
 Usage (Kimi-K3's decode shapes):
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_rocm_comms.py \\
@@ -203,12 +204,12 @@ def _admitted(comm: HipCommunicator, op: FusedOp, x: torch.Tensor) -> bool:
 
 
 def _forced(
-    comm: HipCommunicator, kernel: Kernel, blocks: int, threads: int, fn
+    comm: HipCommunicator, kernel: Kernel, blocks: int, threads: int, variant: int, fn
 ) -> Callable[[Inputs], torch.Tensor]:
     """`fn` with `kernel` forced for its call, so a capture records that kernel."""
 
     def call(t: Inputs) -> torch.Tensor:
-        comm.set_launch_override(kernel, blocks, threads)
+        comm.set_launch_override(kernel, blocks, threads, variant)
         try:
             return fn(t)
         finally:
@@ -222,10 +223,12 @@ def _unfused_case(arm: str, op: str, all_reduce: AllReduce, capture) -> Case:
 
 
 def _hip_cases(
-    comm: HipCommunicator, op: str, x: torch.Tensor, blocks, threads
+    comm: HipCommunicator, op: str, x: torch.Tensor, blocks, threads, variants
 ) -> list[Case]:
     cases = [_unfused_case("hip", op, comm.all_reduce, comm.capture)]
-    sweep = len(blocks) * len(threads) > 1
+    if op != "rms_norm_gemm_add":
+        variants = [0]
+    sweep = len(blocks) * len(threads) * len(variants) > 1
     if op == "all_reduce":
         kernels: list[Kernel] = ["one_shot", "two_shot"]
         run = lambda t: comm.all_reduce(t.x)  # noqa: E731
@@ -235,17 +238,17 @@ def _hip_cases(
         run = lambda t: _fused(comm, fop, t)  # noqa: E731
         if _admitted(comm, fop, x):
             cases.append(Case("hip-fused", run, comm.capture))
-    for kernel, b, tr in product(kernels, blocks, threads):
-        comm.set_launch_override(kernel, b, tr)
+    for kernel, b, tr, v in product(kernels, blocks, threads, variants):
+        comm.set_launch_override(kernel, b, tr, v)
         try:
             ok = op == "all_reduce" or _admitted(comm, cast(FusedOp, op), x)
         finally:
             comm.set_launch_override(None)
         if ok:
             arm = f"hip-{kernel}" + (f"-b{b}-t{tr}" if sweep else "")
-            cases.append(
-                Case(arm, _forced(comm, kernel, b, tr, run), comm.capture, b, tr)
-            )
+            arm += f"-v{v}" if v else ""
+            forced = _forced(comm, kernel, b, tr, v, run)
+            cases.append(Case(arm, forced, comm.capture, b, tr))
     return cases
 
 
@@ -310,6 +313,9 @@ def main() -> None:
     p.add_argument("--dtype", choices=DTYPES, default="bf16")
     p.add_argument("--blocks", type=int, nargs="+", default=[16])
     p.add_argument("--threads", type=int, nargs="+", default=[512])
+    p.add_argument(
+        "--variants", type=int, nargs="+", default=[0], help="GEMM lanes per column"
+    )
     p.add_argument("--no-baselines", action="store_true", help="hip arms only")
     p.add_argument("--ops-per-graph", type=int, default=10)
     p.add_argument("--warmup", type=int, default=10)
@@ -364,7 +370,9 @@ def main() -> None:
     results: list[Result] = []
     for tokens in args.tokens:
         t = _inputs(op, tokens, args.hidden, dtype, world, rank, device)
-        cases = baselines + _hip_cases(hip, op, t.x, args.blocks, args.threads)
+        cases = baselines + _hip_cases(
+            hip, op, t.x, args.blocks, args.threads, args.variants
+        )
         nbytes = t.x.numel() * t.x.element_size()
         want = _tail(op, pynccl.all_reduce(t.x.clone()), t.fresh())
         for case in cases:
