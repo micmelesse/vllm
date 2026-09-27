@@ -74,11 +74,31 @@ class ROCmLatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
-        # THE ALL-REDUCE AND ITS NORM IN ONE KERNEL when our backend (rocm_comms, hip)
-        # is live and takes the input. Here and not in a fusion pass: Kimi-K3 is not
-        # torch.compiled, so no pass ever sees this code.
+        # THE WHOLE TAIL IN ONE KERNEL, or failing that the all-reduce and its norm in
+        # one, when our backend (rocm_comms, hip) is live and takes the input. Here and
+        # not in a fusion pass: Kimi-K3 is not torch.compiled, so no pass sees this.
         norm = transform.norm
         comm = getattr(get_tp_group().device_communicator, "rocm_comm", None)
+        shard_size = self._up_proj_shard_size
+        shard_start = get_tensor_model_parallel_rank() * shard_size
+        up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
+        if (
+            norm is not None
+            and comm is not None
+            and norm.weight.dtype == fused_output.dtype
+            and comm.should_allreduce_rms_norm_gemm_add(fused_output)
+        ):
+            comm.all_reduce_rms_norm_gemm_add(
+                fused_output,
+                norm.weight,
+                norm.variance_epsilon,
+                up_proj_shard,
+                shared_output,
+                shard_start,
+            )
+            return self._maybe_reduce_final_output(
+                shared_output, trunc_size, output_is_reduced=False
+            )
         if (
             norm is not None
             and comm is not None
@@ -92,9 +112,6 @@ class ROCmLatentMoERunner(MoERunner):
             if norm is not None:
                 latent = norm(latent)
 
-        shard_size = self._up_proj_shard_size
-        shard_start = get_tensor_model_parallel_rank() * shard_size
-        up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
         hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
 
         # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's

@@ -297,6 +297,41 @@ class HipCommunicator(Communicator):
         )
         return out
 
+    # THE GEMM PHASE'S ROW LIMIT, `kGemmRows` in the kernel: a decode step and no more.
+    _max_gemm_rows = 16
+
+    def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
+        return inp.dim() == 2 and inp.shape[0] <= self._max_gemm_rows
+
+    def _all_reduce_rms_norm_gemm_add(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+    ) -> None:
+        """One-shot, then a grid barrier, then the GEMM over every block. The barrier's
+        two counters are made once, zero, and never cleared: the barrier is by
+        generation, so they are right for every later launch and graph replay."""
+        cfg = self.hip_tunables
+        if getattr(self, "_grid_sync", None) is None:
+            self._grid_sync = torch.zeros(2, dtype=torch.int32, device=inp.device)
+        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
+            self._handle,
+            out,
+            out_col0,
+            self._as_input(inp),
+            norm_weight,
+            eps,
+            gemm_weight,
+            torch.empty_like(inp),
+            self._grid_sync,
+            cfg.blocks,
+            cfg.threads,
+        )
+
     def _all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,

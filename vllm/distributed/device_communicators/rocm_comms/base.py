@@ -99,10 +99,12 @@ class Communicator(ABC):
         "should_allreduce_rms_norm",
         "should_allreduce_add_rms_norm",
         "should_allreduce_add_attn_res_rms_norm",
+        "should_allreduce_rms_norm_gemm_add",
         "all_reduce",
         "all_reduce_rms_norm",
         "all_reduce_add_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
+        "all_reduce_rms_norm_gemm_add",
         "capture",
         "_is_supported",
         "close",
@@ -328,6 +330,42 @@ class Communicator(ABC):
             out_eps,
         )
 
+    def should_allreduce_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
+        """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM added
+        into an output, within the backend's row limit for the GEMM
+        (`_fits_rms_norm_gemm_add`)."""
+        return (
+            type(self)._all_reduce_rms_norm_gemm_add
+            is not Communicator._all_reduce_rms_norm_gemm_add
+            and self.should_allreduce(inp)
+            and self._fits_rms_norm(inp)
+            and self._fits_rms_norm_gemm_add(inp)
+        )
+
+    def all_reduce_rms_norm_gemm_add(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+    ) -> None:
+        """`out[:, out_col0:out_col0 + N] += rms_norm(all_reduce(inp), norm_weight, eps)
+        @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
+        self._check_capture("all_reduce_rms_norm_gemm_add")
+        if not self.should_allreduce_rms_norm_gemm_add(inp):
+            raise RuntimeError(
+                self._rejected(
+                    "all_reduce_rms_norm_gemm_add",
+                    "should_allreduce_rms_norm_gemm_add",
+                    inp,
+                )
+            )
+        self._all_reduce_rms_norm_gemm_add(
+            inp, norm_weight, eps, gemm_weight, out, out_col0
+        )
+
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
         disabled one.
@@ -462,6 +500,25 @@ class Communicator(ABC):
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
             f"ask should_allreduce_add_attn_res_rms_norm first."
         )
+
+    def _all_reduce_rms_norm_gemm_add(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm + add; "
+            f"ask should_allreduce_rms_norm_gemm_add first."
+        )
+
+    def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
+        """Whether the fused GEMM takes this many rows. No limit unless the backend has
+        one."""
+        return True
 
     def _fits_rms_norm(self, inp: torch.Tensor) -> bool:
         """Whether a fused kernel takes this row shape. No limit unless the backend has

@@ -1311,3 +1311,116 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
+
+
+# ---------------------------------------------------------------------------------
+# ALL-REDUCE + RMSNORM + GEMM + ADD, judged against the three ops Kimi-K3's latent MoE
+# tail runs: the all-reduce, `vllm.ir.ops.rms_norm`, and `addmm_` into this rank's
+# column shard of the shared output.
+# ---------------------------------------------------------------------------------
+
+# (rows, latent, hidden, shard). Example-based: each case is a full eight-process run,
+# so the cases are Kimi-K3's decode tail (latent 3584 -> hidden 7168, a 1/8 shard) at
+# 1, 4 and 16 rows, plus a shard that is not a multiple of the kernel's column tile.
+RMS_NORM_GEMM_ADD_CASES = (
+    (1, 3584, 7168, 896),
+    (4, 3584, 7168, 896),
+    (16, 3584, 7168, 896),
+    (16, 3584, 7168, 30),
+)
+
+
+def run_rms_norm_gemm_add_rank(
+    rank: int,
+    world: int,
+    case: tuple[int, int, int, int],
+    init_method: str,
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against the three it replaces, over the whole output."""
+    import vllm.ir.ops
+
+    rows, latent, hidden, shard = case
+    dtype = torch.bfloat16
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(
+        world_size=world, rank=rank, distributed_init_method=init_method
+    )
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, 1)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+    try:
+        inputs = [_one_input(r, 0, (rows, latent), dtype) for r in range(world)]
+        norm_w = _one_input(world, 1, (latent,), dtype).to(device)
+        # A NARROWED VIEW of the full weight, as the model passes its up_proj shard.
+        full_w = (_one_input(world + 1, 2, (hidden, latent), dtype) / latent**0.5).to(
+            device
+        )
+        col0 = (rank * shard) % (hidden - shard + 1)
+        gemm_w = full_w.narrow(0, col0, shard)
+        shared = _one_input(world + 2, 3, (rows, hidden), dtype).to(device)
+
+        acc = torch.zeros((rows, latent), dtype=torch.float32)
+        for x in inputs:
+            acc += x.to(torch.float32)
+        normed = vllm.ir.ops.rms_norm(acc.to(dtype).to(device), norm_w, FUSED_EPS)
+        want = shared.clone()
+        want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
+        torch.cuda.synchronize()
+
+        with _build_communicator("hip", cpu_group, group, device, "one_shot") as comm:
+            mine = inputs[rank].to(device)
+            if not comm.should_allreduce_rms_norm_gemm_add(mine):
+                return False, NO_FUSED_KERNEL
+            got = shared.clone()
+            comm.all_reduce_rms_norm_gemm_add(
+                mine, norm_w, FUSED_EPS, gemm_w, got, col0
+            )
+            torch.cuda.synchronize()
+        atol, rtol = _fused_tolerance(dtype)
+        a32, b32 = got.float().cpu(), want.float().cpu()
+        if not torch.allclose(a32, b32, atol=atol, rtol=rtol):
+            worst = (a32 - b32).abs().max().item()
+            return False, f"out differs: worst|diff|={worst:.4g} atol={atol}"
+        return True, None
+    except Exception as e:
+        logger.exception("rank %d failed the fused all_reduce_rms_norm_gemm_add", rank)
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if dist.is_initialized():
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception("rank %d: teardown failed", rank)
+
+
+@pytest.mark.parametrize("case", RMS_NORM_GEMM_ADD_CASES)
+def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
+    case: tuple[int, int, int, int],
+    world: int,
+    rendezvous: tuple[str, int],
+) -> None:
+    """The fused op against all_reduce, rms_norm and addmm_ into a column shard: the
+    shard gets the GEMM added, every other column is left as it was."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    init = get_distributed_init_method(addr, port)
+    pool = Pool(processes=world)
+    try:
+        rets = [
+            pool.apply_async(run_rms_norm_gemm_add_rank, (r, world, case, init))
+            for r in range(world)
+        ]
+        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
+    finally:
+        pool.terminate()
+    if any(err == NO_FUSED_KERNEL for _, err in got):
+        pytest.skip(f"hip has no fused all_reduce_rms_norm_gemm_add for {case}")
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{case}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
