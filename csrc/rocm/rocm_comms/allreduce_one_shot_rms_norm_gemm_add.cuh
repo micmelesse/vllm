@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_one_shot_rms_norm_gemm_add(
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
   c.grid_barrier();
 
-  gemm_add_rows<T>([&](int r, int k) { return c.get(rank, r * packs + k); }, rows, gemm_w,
+  gemm_add_rows<T>([&](int r) { return c.ptr(rank, r * packs, packs); }, rows, gemm_w,
                    n_cols, packs, out, out_stride, out_col0);
   c.close();
 }

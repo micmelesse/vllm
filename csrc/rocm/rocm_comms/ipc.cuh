@@ -101,6 +101,7 @@ class Peers {
 //   c.sum(idx)             input pack idx summed over ranks, fp32, rounded once
 //   c.put(peer, idx, v)    into peer's scratch
 //   c.get(peer, idx)       from peer's scratch
+//   c.ptr(peer, idx, n)    a direct pointer to n packs of it, checked once, for hot loops
 //   c.world_barrier()      every put before it, by any block of any rank, is visible to
 //                          every get after it
 //   c.grid_barrier()       the same for the blocks of this rank and its own scratch
@@ -160,6 +161,14 @@ class Comm {
     check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "get", peer, idx,
           p_.scratch_packs_);
     return scratch_of(peer)[idx];
+  }
+
+  // SHMEM's `shmem_ptr`: a hot loop reads through this rather than paying `get`'s check on
+  // every load, which keeps the loads free to issue back to back.
+  DINLINE const V* ptr(int peer, int64_t idx, int64_t n) const {
+    check(peer >= 0 && peer < ngpus && idx + n <= p_.scratch_packs_, "ptr", peer, idx + n,
+          p_.scratch_packs_);
+    return scratch_of(peer) + idx;
   }
 
   DINLINE void world_barrier() { barrier<true>(); }

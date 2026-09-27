@@ -42,10 +42,10 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm_gemm_add(
 
   for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
     gemm_add_rows<T>(
-        [&](int r, int k) {
+        [&](int r) {
           const int row   = r0 + r;
           const int owner = row / chunk;
-          return c.get(owner, (row - owner * chunk) * packs + k);
+          return c.ptr(owner, (row - owner * chunk) * packs, packs);
         },
         min(kGemmRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
         out_stride, out_col0);

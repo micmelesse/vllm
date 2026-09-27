@@ -312,8 +312,9 @@ constexpr int kGemmTile     = 64;
 constexpr int kGemmMaxWaves = 8;
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
-// rows <= kGemmRows, the sum in fp32 and rounded once. `load(r, k)` returns pack k of row
-// r of x, wherever it lives.
+// rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
+// wherever it lives; the hot loop reads through those pointers with no branch, and a row
+// past `rows` reads row 0 into sums that are never stored.
 //
 // A SKINNY GEMM: a lane owns an output column and keeps its rows' sums in registers, the
 // waves of a block split K and reduce through LDS, and blocks stride over 64-column tiles.
@@ -321,8 +322,8 @@ constexpr int kGemmMaxWaves = 8;
 // 16 bytes at a time. Every loop over rows has a constant trip count, predicated on `rows`,
 // so the sums stay in registers. The order of the sum differs from hipBLASLt's, so a
 // result agrees to the rounding of the last bits, not bitwise.
-template <typename T, typename Load>
-DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, int n_cols,
+template <typename T, typename Row>
+DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int n_cols,
                            int packs, T* __restrict__ out, int64_t out_stride,
                            int out_col0) {
   using V          = typename traits<T>::V;
@@ -336,6 +337,9 @@ DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, in
   const int k1    = min(k0 + per, packs);
   const V* wv     = reinterpret_cast<const V*>(gemm_w);
   const int tiles = (n_cols + kGemmTile - 1) / kGemmTile;
+  const V* x[kGemmRows];
+#pragma unroll
+  for (int r = 0; r < kGemmRows; ++r) x[r] = row(r < rows ? r : 0);
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
     const int n    = tile * kGemmTile + lane;
     const V* wrow  = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
@@ -349,11 +353,9 @@ DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, in
       for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
 #pragma unroll
       for (int r = 0; r < kGemmRows; ++r) {
-        if (r < rows) {
-          const V x = load(r, k);
+        const V xr = x[r][k];
 #pragma unroll
-          for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(x.d[j]) * w[j];
-        }
+        for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
       }
     }
 #pragma unroll
