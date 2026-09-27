@@ -208,12 +208,17 @@ class Comm {
     __syncthreads();
   }
 
+  // The builtin takes the ordering as a literal, so each case is spelled out.
   template <int kOrder, int kScope>
   DINLINE void fence() const {
-    if constexpr (kScope == __MEMORY_SCOPE_SYSTEM)
-      __builtin_amdgcn_fence(kOrder, "");
-    else
-      __builtin_amdgcn_fence(kOrder, "agent");
+    constexpr bool system = kScope == __MEMORY_SCOPE_SYSTEM;
+    if constexpr (kOrder == __ATOMIC_RELEASE) {
+      if constexpr (system) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      else __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    } else {
+      if constexpr (system) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+      else __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
   }
 
   // BY SELECT, NOT `scratch_[peer]`: a runtime index into a register array moves the
