@@ -305,72 +305,72 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 // The GEMM phase of the latent MoE tail (the one-shot and two-shot GEMM-tail kernels).
 // ---------------------------------------------------------------------------------
 
-// The most rows one pass takes: each wave holds kGemmRows x kGemmCols accumulators.
+// The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kGemmRows = 16;
-constexpr int kGemmCols = 4;
+// A tile is one wave wide: 64 output columns per block pass.
+constexpr int kGemmTile     = 64;
+constexpr int kGemmMaxWaves = 8;
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `load(r, k)` returns pack k of row
-// r of x, wherever it lives. Each wave takes kGemmCols columns for every row: x is loaded
-// once per pack and used for all of them, the weight rows once each. The sum runs in a
-// different order than hipBLASLt's, so a result agrees to the rounding of the last bits,
-// not bitwise.
+// r of x, wherever it lives.
+//
+// A SKINNY GEMM: a lane owns an output column and keeps its rows' sums in registers, the
+// waves of a block split K and reduce through LDS, and blocks stride over 64-column tiles.
+// x is the same for every lane of a wave (a broadcast load); each weight row is read once,
+// 16 bytes at a time. Every loop over rows has a constant trip count, predicated on `rows`,
+// so the sums stay in registers. The order of the sum differs from hipBLASLt's, so a
+// result agrees to the rounding of the last bits, not bitwise.
 template <typename T, typename Load>
 DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, int n_cols,
                            int packs, T* __restrict__ out, int64_t out_stride,
                            int out_col0) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  const int lane   = threadIdx.x % warpSize;
-  const int waves  = gridDim.x * (blockDim.x / warpSize);
-  const int wave   = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
-  const V* wv      = reinterpret_cast<const V*>(gemm_w);
-  for (int c0 = wave * kGemmCols; c0 < n_cols; c0 += waves * kGemmCols) {
-    float acc[kGemmRows][kGemmCols];
+  __shared__ float partial[kGemmMaxWaves][kGemmRows][kGemmTile];
+  const int lane  = threadIdx.x % kGemmTile;
+  const int wave  = threadIdx.x / kGemmTile;
+  const int waves = blockDim.x / kGemmTile;
+  const int per   = (packs + waves - 1) / waves;
+  const int k0    = wave * per;
+  const int k1    = min(k0 + per, packs);
+  const V* wv     = reinterpret_cast<const V*>(gemm_w);
+  const int tiles = (n_cols + kGemmTile - 1) / kGemmTile;
+  for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+    const int n    = tile * kGemmTile + lane;
+    const V* wrow  = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
+    float acc[kGemmRows];
 #pragma unroll
-    for (int r = 0; r < kGemmRows; ++r)
+    for (int r = 0; r < kGemmRows; ++r) acc[r] = 0.0f;
+    for (int k = k0; k < k1; ++k) {
+      const V wx = wrow[k];
+      float w[NL];
 #pragma unroll
-      for (int q = 0; q < kGemmCols; ++q) acc[r][q] = 0.0f;
-    // EVERY LOOP OVER r AND q HAS A CONSTANT TRIP COUNT, predicated on rows and n_cols
-    // rather than broken out of: a runtime bound stops the unroll, `acc[r]` becomes a
-    // runtime index, and the accumulators move to scratch memory (536 bytes/lane, 10x
-    // slower, 2026-09-27).
-    for (int k = lane; k < packs; k += warpSize) {
-      float w[kGemmCols][NL];
-#pragma unroll
-      for (int q = 0; q < kGemmCols; ++q) {
-        V x{};
-        if (c0 + q < n_cols) x = wv[(c0 + q) * packs + k];
-#pragma unroll
-        for (int j = 0; j < NL; ++j) w[q][j] = static_cast<float>(x.d[j]);
-      }
+      for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
 #pragma unroll
       for (int r = 0; r < kGemmRows; ++r) {
-        V x{};
-        if (r < rows) x = load(r, k);
-        float a[NL];
+        if (r < rows) {
+          const V x = load(r, k);
 #pragma unroll
-        for (int j = 0; j < NL; ++j) a[j] = static_cast<float>(x.d[j]);
-#pragma unroll
-        for (int q = 0; q < kGemmCols; ++q)
-#pragma unroll
-          for (int j = 0; j < NL; ++j) acc[r][q] += a[j] * w[q][j];
-      }
-    }
-    // The wave's partial sums, reduced so every lane holds every total; lane (r, q) writes.
-#pragma unroll
-    for (int r = 0; r < kGemmRows; ++r) {
-#pragma unroll
-      for (int q = 0; q < kGemmCols; ++q) {
-        float v = acc[r][q];
-#pragma unroll
-        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
-        if (r < rows && lane == r * kGemmCols + q && c0 + q < n_cols) {
-          T* at = out + r * out_stride + out_col0 + c0 + q;
-          *at   = static_cast<T>(static_cast<float>(*at) + v);
+          for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(x.d[j]) * w[j];
         }
       }
     }
+#pragma unroll
+    for (int r = 0; r < kGemmRows; ++r) partial[wave][r][lane] = acc[r];
+    __syncthreads();
+    for (int i = threadIdx.x; i < kGemmRows * kGemmTile; i += blockDim.x) {
+      const int r   = i / kGemmTile;
+      const int col = tile * kGemmTile + i % kGemmTile;
+      if (r < rows && col < n_cols) {
+        float v = 0.0f;
+        for (int q = 0; q < waves; ++q) v += partial[q][r][i % kGemmTile];
+        T* at = out + r * out_stride + out_col0 + col;
+        *at   = static_cast<T>(static_cast<float>(*at) + v);
+      }
+    }
+    // Before the next tile overwrites `partial`.
+    __syncthreads();
   }
 }
 

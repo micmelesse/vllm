@@ -102,6 +102,7 @@ class Peers {
 //   c.get(peer, idx)       from peer's scratch
 //   c.sync()               every put before it, by any block of any rank, is visible to
 //                          every get after it
+//   c.sync_local()         the same for this rank's own scratch only
 //   c.close()              last; after it this rank's input may be reused
 //
 // A wait that outlives the timeout prints where it was and traps, so a hang is an error.
@@ -159,35 +160,11 @@ class Comm {
     return scratch_of(peer)[idx];
   }
 
-  // The grid on this device, then one exchange with the peers by the last block to
-  // arrive, then the grid released. System scope throughout: the puts cross devices.
-  DINLINE void sync() {
-    skew();
-    __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      Signal* self     = p_.self_;
-      const uint32_t g = __scoped_atomic_load_n(&self->gen, __ATOMIC_ACQUIRE,
-                                                __MEMORY_SCOPE_SYSTEM);
-      if (__scoped_atomic_fetch_add(&self->arrive, 1u, __ATOMIC_ACQ_REL,
-                                    __MEMORY_SCOPE_DEVICE) == gridDim.x - 1) {
-        __scoped_atomic_store_n(&self->arrive, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-        const uint32_t e = self->epoch + 1;
-        self->epoch      = e;
-#pragma unroll
-        for (int i = 0; i < ngpus; ++i)
-          __scoped_atomic_store_n(&p_.signals_.s[i]->peer[p_.rank_], e, __ATOMIC_RELEASE,
-                                  __MEMORY_SCOPE_SYSTEM);
-#pragma unroll
-        for (int i = 0; i < ngpus; ++i)
-          wait<true, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
-        __scoped_atomic_fetch_add(&self->gen, 1u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-      } else {
-        wait<true, __MEMORY_SCOPE_SYSTEM>(&self->gen, g + 1, "sync: grid", -1);
-      }
-    }
-    __syncthreads();
-  }
+  DINLINE void sync() { grid_barrier<true>(); }
+
+  // Every block of THIS rank's kernel: puts to our own scratch before it are visible to our
+  // own gets after it. Cheaper than `sync`, and wrong for anything a peer put.
+  DINLINE void sync_local() { grid_barrier<false>(); }
 
   DINLINE void close() {
     skew();
@@ -195,6 +172,50 @@ class Comm {
   }
 
  private:
+  // The grid on this device, then (kPeers) one exchange with the peers by the last block
+  // to arrive, then the grid released. ONE FENCE PER BLOCK, by thread 0 after the block
+  // barrier: the barrier waits for every wave's stores, and a release writes back the whole
+  // L2, so one covers the block where one per thread wrote it back 512 times.
+  template <bool kPeers>
+  DINLINE void grid_barrier() {
+    constexpr int kScope = kPeers ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
+    skew();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      fence<__ATOMIC_RELEASE, kScope>();
+      Signal* self     = p_.self_;
+      const uint32_t g = __scoped_atomic_load_n(&self->gen, __ATOMIC_ACQUIRE, kScope);
+      if (__scoped_atomic_fetch_add(&self->arrive, 1u, __ATOMIC_ACQ_REL,
+                                    __MEMORY_SCOPE_DEVICE) == gridDim.x - 1) {
+        __scoped_atomic_store_n(&self->arrive, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        if constexpr (kPeers) {
+          const uint32_t e = self->epoch + 1;
+          self->epoch      = e;
+          fence<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>();
+#pragma unroll
+          for (int i = 0; i < ngpus; ++i)
+            __scoped_atomic_store_n(&p_.signals_.s[i]->peer[p_.rank_], e, __ATOMIC_RELAXED,
+                                    __MEMORY_SCOPE_SYSTEM);
+#pragma unroll
+          for (int i = 0; i < ngpus; ++i)
+            wait<true, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
+        }
+        __scoped_atomic_fetch_add(&self->gen, 1u, __ATOMIC_RELEASE, kScope);
+      } else {
+        wait<true, kScope>(&self->gen, g + 1, kPeers ? "sync: grid" : "sync_local", -1);
+      }
+    }
+    __syncthreads();
+  }
+
+  template <int kOrder, int kScope>
+  DINLINE void fence() const {
+    if constexpr (kScope == __MEMORY_SCOPE_SYSTEM)
+      __builtin_amdgcn_fence(kOrder, "");
+    else
+      __builtin_amdgcn_fence(kOrder, "agent");
+  }
+
   // BY SELECT, NOT `scratch_[peer]`: a runtime index into a register array moves the
   // array to scratch memory, and every put and get would load its pointer from there
   // first.
@@ -238,12 +259,7 @@ class Comm {
         __builtin_trap();
       }
     }
-    if constexpr (kAcquire) {
-      if constexpr (kScope == __MEMORY_SCOPE_SYSTEM)
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-      else
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    }
+    if constexpr (kAcquire) fence<__ATOMIC_ACQUIRE, kScope>();
   }
 
   DINLINE void check(bool ok, const char* what, int peer, int64_t idx,
