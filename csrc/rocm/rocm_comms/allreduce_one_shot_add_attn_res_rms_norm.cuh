@@ -39,9 +39,9 @@ DINLINE float2 block_sum2(float a, float b) {
 // ONE ROW of all-reduce + AttnRes by the whole block, matching
 // `vllm/models/kimi_k3/amd/ops/attn_res.py` rounding for rounding:
 //
-//   d   = float(T(sum over ranks))                     the all-reduce output, as it would land
-//   u   = kPrefix ? float(T(float(prefix) + d)) : d    the running prefix, updated or started
-//   prefix_out = T(u); blocks[write] = T(u)            the new prefix, and the block if written
+//   d   = float(T(sum over ranks))                   the all-reduce output, as it lands
+//   u   = kPrefix ? float(T(float(prefix) + d)) : d  the running prefix, updated or started
+//   prefix_out = T(u); blocks[write] = T(u)          the new prefix, and the block written
 //   per source s (the stored blocks, then u):
 //       logit_s = dot(s, norm_w * qk_w) * rsqrt(mean(s^2) + eps)
 //   m   = softmax(logit) . sources                     online, one source at a time

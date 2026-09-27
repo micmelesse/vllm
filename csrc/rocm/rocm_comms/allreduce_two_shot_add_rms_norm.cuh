@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Two-shot all-reduce fused with RMSNorm: `rms_norm`, or `fused_add_rms_norm` when kAdd.
+// Two-shot all-reduce then RMSNorm (`allreduce_two_shot_rms_norm`), and all-reduce then
+// add then RMSNorm (`allreduce_two_shot_add_rms_norm`): one body, a kernel per op, so a
+// trace names the op that ran.
 
 #pragma once
 
@@ -21,12 +23,13 @@ namespace hip_comms {
 // Every output element is computed by exactly one rank, so all ranks hold identical bytes.
 // Fewer rows than ranks is correct and unbalanced: the ranks past the end own nothing and
 // still run both barriers.
-// `weight` is in its own dtype W: T, or fp32 (see `rms_norm_row`).
+// `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
 template <typename T, typename W, int ngpus, bool kAdd>
-__global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
-    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
-    const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
-    int packs) {
+DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
+                                     T* __restrict__ residual_out,
+                                     const T* __restrict__ residual,
+                                     const W* __restrict__ weight, float eps, int rows,
+                                     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int rank   = p.rank();
@@ -52,7 +55,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
-      rms_norm_row<T, W, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
+      add_rms_norm_row<T, W, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
                                       kAdd ? mine + half + local : nullptr, mine + local);
     }
   }
@@ -88,6 +91,24 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
 
   // A rank that returns lets its INPUT be reused while a peer is still reading it.
   p.barrier_end<ngpus, true>();
+}
+
+// THE KERNELS, one per op, both the body above.
+template <typename T, typename W, int ngpus>
+__global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
+    ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    int packs) {
+  two_shot_add_rms_norm<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps, rows,
+                                              packs);
+}
+
+template <typename T, typename W, int ngpus>
+__global__ void __launch_bounds__(512, 1) allreduce_two_shot_add_rms_norm(
+    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
+    int packs) {
+  two_shot_add_rms_norm<T, W, ngpus, true>(p, out, residual_out, residual, weight, eps,
+                                             rows, packs);
 }
 
 }  // namespace hip_comms

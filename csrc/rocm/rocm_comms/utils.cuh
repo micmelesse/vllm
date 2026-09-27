@@ -72,8 +72,8 @@ DINLINE float block_sum(float v) {
 // kMaxRowPacks x blockDim is refused by the host.
 constexpr int kMaxRowPacks = 4;
 
-// ONE ROW of all-reduce + RMSNorm by the whole block, matching vLLM's reference ops
-// (`vllm/ir/ops/layernorm.py`) rounding for rounding:
+// ONE ROW of all-reduce, then (kAdd) add, then RMSNorm by the whole block, matching vLLM's
+// reference ops (`vllm/ir/ops/layernorm.py`) rounding for rounding:
 //
 //   s   = float(T(sum over ranks))                  the all-reduce output, as it would land
 //   s  += float(residual); res_dst = T(s)           kAdd only: fused_add_rms_norm
@@ -87,7 +87,7 @@ constexpr int kMaxRowPacks = 4;
 // The variance is taken from `s` before any further rounding, and `s` stays in registers
 // between the two passes, so nothing is read back.
 template <typename T, typename W, int ngpus, bool kAdd>
-DINLINE void rms_norm_row(const typename traits<T>::V* const ptrs[],
+DINLINE void add_rms_norm_row(const typename traits<T>::V* const ptrs[],
                           const typename traits<T>::V* residual,
                           const vec<W, traits<T>::N>* weight, int row, int packs,
                           float inv_hidden, float eps, typename traits<T>::V* res_dst,
