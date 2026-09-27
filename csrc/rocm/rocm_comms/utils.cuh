@@ -307,21 +307,23 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kGemmRows = 16;
-// A tile is one wave wide: 64 output columns per block pass.
-constexpr int kGemmTile     = 64;
-constexpr int kGemmMaxWaves = 8;
+// A block pass covers kGemmTile output columns; kGemmLanesPerCol lanes of a wave split each
+// column's K, so a wave is kGemmTile x kGemmLanesPerCol = 64 lanes.
+constexpr int kGemmTile        = 16;
+constexpr int kGemmLanesPerCol = 4;
+constexpr int kGemmMaxWaves    = 8;
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
 // wherever it lives; the hot loop reads through those pointers with no branch, and a row
 // past `rows` reads row 0 into sums that are never stored.
 //
-// A SKINNY GEMM: a lane owns an output column and keeps its rows' sums in registers, the
-// waves of a block split K and reduce through LDS, and blocks stride over 64-column tiles.
-// x is the same for every lane of a wave (a broadcast load); each weight row is read once,
-// 16 bytes at a time. Every loop over rows has a constant trip count, predicated on `rows`,
-// so the sums stay in registers. The order of the sum differs from hipBLASLt's, so a
-// result agrees to the rounding of the last bits, not bitwise.
+// A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
+// kGemmLanesPerCol lanes of the column and over the waves of the block, so each lane walks
+// K / (4 x waves) packs; two shuffles and an LDS pass add the splits; blocks stride over
+// kGemmTile-column tiles. The four lanes of a column read adjacent packs of its weight row.
+// The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
+// the last bits, not bitwise.
 template <typename T, typename Row>
 DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int n_cols,
                            int packs, T* __restrict__ out, int64_t out_stride,
@@ -329,24 +331,25 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   __shared__ float partial[kGemmMaxWaves][kGemmRows][kGemmTile];
-  const int lane  = threadIdx.x % kGemmTile;
-  const int wave  = threadIdx.x / kGemmTile;
-  const int waves = blockDim.x / kGemmTile;
-  const int per   = (packs + waves - 1) / waves;
-  const int k0    = wave * per;
-  const int k1    = min(k0 + per, packs);
-  const V* wv     = reinterpret_cast<const V*>(gemm_w);
-  const int tiles = (n_cols + kGemmTile - 1) / kGemmTile;
+  const int lane   = threadIdx.x % 64;
+  const int wave   = threadIdx.x / 64;
+  const int waves  = blockDim.x / 64;
+  const int column = lane % kGemmTile;
+  const int splits = waves * kGemmLanesPerCol;
+  const int split  = wave * kGemmLanesPerCol + lane / kGemmTile;
+  const V* wv      = reinterpret_cast<const V*>(gemm_w);
+  const int tiles  = (n_cols + kGemmTile - 1) / kGemmTile;
   const V* x[kGemmRows];
 #pragma unroll
   for (int r = 0; r < kGemmRows; ++r) x[r] = row(r < rows ? r : 0);
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
-    const int n    = tile * kGemmTile + lane;
-    const V* wrow  = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
+    const int n   = tile * kGemmTile + column;
+    const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
     float acc[kGemmRows];
 #pragma unroll
     for (int r = 0; r < kGemmRows; ++r) acc[r] = 0.0f;
-    for (int k = k0; k < k1; ++k) {
+#pragma unroll 2
+    for (int k = split; k < packs; k += splits) {
       const V wx = wrow[k];
       float w[NL];
 #pragma unroll
@@ -358,8 +361,16 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
         for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
       }
     }
+    // The column's four lanes are kGemmTile apart in the wave.
 #pragma unroll
-    for (int r = 0; r < kGemmRows; ++r) partial[wave][r][lane] = acc[r];
+    for (int r = 0; r < kGemmRows; ++r) {
+      acc[r] += __shfl_xor(acc[r], kGemmTile, 64);
+      acc[r] += __shfl_xor(acc[r], 2 * kGemmTile, 64);
+    }
+    if (lane < kGemmTile) {
+#pragma unroll
+      for (int r = 0; r < kGemmRows; ++r) partial[wave][r][column] = acc[r];
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < kGemmRows * kGemmTile; i += blockDim.x) {
       const int r   = i / kGemmTile;
