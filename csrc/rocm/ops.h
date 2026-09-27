@@ -90,6 +90,14 @@ void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
                                               int64_t algo, int64_t small_limit,
                                               int64_t blocks, int64_t threads);
 
+void rocm_comms_all_reduce_attn_res(fptr_t comms, torch::Tensor& prefix, torch::Tensor& out,
+                                    torch::Tensor& inp, torch::Tensor& blocks,
+                                    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+                                    const std::optional<torch::Tensor>& out_norm_weight,
+                                    int64_t num_blocks, int64_t write_idx, double eps,
+                                    double out_eps, bool has_prefix, int64_t block_count,
+                                    int64_t threads);
+
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
 

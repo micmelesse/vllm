@@ -297,6 +297,44 @@ class HipCommunicator(Communicator):
         )
         return out
 
+    def _all_reduce_attn_res(
+        self,
+        inp: torch.Tensor,
+        prefix: torch.Tensor | None,
+        blocks: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qk_weight: torch.Tensor,
+        out_norm_weight: torch.Tensor | None,
+        num_blocks: int,
+        write_idx: int,
+        eps: float,
+        out_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One-shot whatever the algo: every rank reduces every row, so AttnRes runs
+        where the sum already is, with nothing to gather."""
+        cfg = self.hip_tunables
+        started = prefix is None
+        prefix_out = torch.empty_like(inp) if started else prefix
+        out = torch.empty_like(inp)
+        torch.ops._rocm_C.rocm_comms_all_reduce_attn_res(
+            self._handle,
+            prefix_out,
+            out,
+            self._as_input(inp),
+            blocks,
+            norm_weight,
+            qk_weight,
+            out_norm_weight,
+            num_blocks,
+            write_idx,
+            eps,
+            out_eps,
+            not started,
+            cfg.blocks,
+            cfg.threads,
+        )
+        return prefix_out, out
+
     def _all_reduce_fused_add_rms_norm(
         self,
         inp: torch.Tensor,

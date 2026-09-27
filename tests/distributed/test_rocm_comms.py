@@ -1161,3 +1161,151 @@ def _fused_case(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{where}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{where}: ranks disagreed"
+
+
+# ---------------------------------------------------------------------------------
+# ALL-REDUCE + ATTNRES, judged against the model's own Triton `attn_res` applied to the
+# all-reduced sum: the op the fusion replaces, not a reference written here.
+# ---------------------------------------------------------------------------------
+
+# (shape, has_prefix, num_blocks, write_idx, output_norm). Example-based: each case is a
+# full eight-process run, so the cases are the ones Kimi-K3 runs -- decode rows, 0 to 9
+# stored blocks, the block-write layer where the sum starts the prefix, with and without
+# the output norm -- plus a prefill-sized row count.
+ATTN_RES_CASES = (
+    ((4, 7168), True, 0, -1, True),
+    ((16, 7168), True, 4, -1, True),
+    ((16, 7168), True, 9, -1, False),
+    ((16, 7168), False, 4, 4, True),
+    ((128, 7168), True, 9, -1, True),
+)
+ATTN_RES_SOURCES = 10
+
+
+def run_attn_res_rank(
+    rank: int,
+    world: int,
+    case: tuple[tuple[int, int], bool, int, int, bool],
+    init_method: str,
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against the two it replaces, on every output it writes."""
+    from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+
+    shape, has_prefix, num_blocks, write_idx, output_norm = case
+    dtype = torch.bfloat16
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(
+        world_size=world, rank=rank, distributed_init_method=init_method
+    )
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, 1)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+    try:
+        rows, hidden = shape
+        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+        prefix = _one_input(world, 1, shape, dtype)
+        blocks = torch.stack(
+            [
+                _one_input(world + 2 + s, 3, shape, dtype)
+                for s in range(ATTN_RES_SOURCES)
+            ],
+            dim=1,
+        ).contiguous()
+        norm_w = _one_input(world + 20, 4, (hidden,), dtype)
+        qk_w = _one_input(world + 21, 5, (hidden,), dtype)
+        out_w = _one_input(world + 22, 6, (hidden,), dtype) if output_norm else None
+
+        # THE REFERENCE: the sum as an all-reduce lands it, then the model's kernel.
+        acc = torch.zeros(shape, dtype=torch.float32)
+        for x in inputs:
+            acc += x.to(torch.float32)
+        summed = acc.to(dtype).to(device)
+        ref_prefix = prefix.to(device).clone() if has_prefix else summed.clone()
+        ref_blocks = blocks.to(device).clone()
+        want = attn_res(
+            ref_prefix,
+            summed if has_prefix else None,
+            ref_blocks,
+            norm_w.to(device),
+            qk_w.to(device),
+            None if out_w is None else out_w.to(device),
+            num_blocks,
+            write_idx,
+            1e-6,
+            1e-5,
+        )
+        torch.cuda.synchronize()
+
+        with _build_communicator("hip", cpu_group, group, device, "one_shot") as comm:
+            mine = inputs[rank].to(device)
+            if not comm.should_allreduce_attn_res(mine):
+                return False, NO_FUSED_KERNEL
+            got_blocks = blocks.to(device).clone()
+            got_prefix, got = comm.all_reduce_attn_res(
+                mine,
+                prefix.to(device).clone() if has_prefix else None,
+                got_blocks,
+                norm_w.to(device),
+                qk_w.to(device),
+                None if out_w is None else out_w.to(device),
+                num_blocks,
+                write_idx,
+                1e-6,
+                1e-5,
+            )
+            torch.cuda.synchronize()
+        atol, rtol = _fused_tolerance(dtype)
+        sum_tol = _atol("all_reduce", dtype)
+        checks = [
+            ("out", got, want, atol),
+            ("prefix", got_prefix, ref_prefix, sum_tol),
+            ("blocks", got_blocks, ref_blocks, sum_tol),
+        ]
+        for name, a, b, tol in checks:
+            a32, b32 = a.float().cpu(), b.float().cpu()
+            if not torch.allclose(a32, b32, atol=tol, rtol=rtol):
+                worst = (a32 - b32).abs().max().item()
+                return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
+        return True, None
+    except Exception as e:
+        logger.exception("rank %d failed the fused all_reduce_attn_res", rank)
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if dist.is_initialized():
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception("rank %d: teardown failed", rank)
+
+
+@pytest.mark.parametrize("case", ATTN_RES_CASES)
+def test_all_reduce_attn_res_matches_the_two_ops_it_replaces(
+    case: tuple[tuple[int, int], bool, int, int, bool],
+    world: int,
+    rendezvous: tuple[str, int],
+) -> None:
+    """The fused op against all_reduce then Kimi-K3's `attn_res`: the output, the prefix
+    it updates or starts, and the block it writes."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    init = get_distributed_init_method(addr, port)
+    pool = Pool(processes=world)
+    try:
+        rets = [
+            pool.apply_async(run_attn_res_rank, (r, world, case, init))
+            for r in range(world)
+        ]
+        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
+    finally:
+        pool.terminate()
+    if any(err == NO_FUSED_KERNEL for _, err in got):
+        pytest.skip(f"hip has no fused all_reduce_attn_res for {case}")
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{case}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"

@@ -34,6 +34,7 @@
 #include "rocm_comms/allreduce_one_shot_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot.cuh"
 #include "rocm_comms/allreduce_two_shot_rms_norm.cuh"
+#include "rocm_comms/allreduce_one_shot_attn_res.cuh"
 #include "rocm_comms/ipc.cuh"
 
 namespace hip_comms {
@@ -248,6 +249,94 @@ void all_reduce_rms_norm(ipc::Group& group, torch::Tensor& out, torch::Tensor* r
 #undef LAUNCH_FUSED
 }
 
+// FUSED: all-reduce, then Kimi-K3's AttnRes on each row (see `attn_res_row`). With `has_prefix`
+// the sum is added to `prefix` in place; without, the sum IS the new prefix and is written there.
+// ONE-SHOT ONLY: every rank reduces every row, so there is no gather to align.
+void all_reduce_attn_res(ipc::Group& group, torch::Tensor& prefix, torch::Tensor& out,
+                         torch::Tensor& inp, torch::Tensor& blocks,
+                         torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+                         const torch::Tensor* out_norm_weight, int64_t num_blocks,
+                         int64_t write_idx, double eps, double out_eps, bool has_prefix,
+                         int64_t block_count, int64_t threads) {
+  TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
+  const int64_t hidden = inp.size(1);
+  for (const torch::Tensor* t : {&prefix, &out}) {
+    TORCH_CHECK(t->sizes() == inp.sizes(), "prefix and out must have inp's shape");
+    TORCH_CHECK(t->is_contiguous(), "prefix and out must be contiguous");
+  }
+  TORCH_CHECK(inp.is_contiguous(), "inp must be contiguous");
+  TORCH_CHECK(blocks.dim() == 3 && blocks.size(0) == inp.size(0) && blocks.size(2) == hidden &&
+                  blocks.stride(2) == 1,
+              "blocks must be [tokens, sources, hidden] with a unit hidden stride");
+  TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1),
+              "num_blocks must be in [0, ", blocks.size(1), "]");
+  TORCH_CHECK(write_idx < blocks.size(1), "write_idx must be < ", blocks.size(1));
+  std::vector<const torch::Tensor*> same = {&prefix, &out, &blocks, &norm_weight, &qk_weight};
+  if (out_norm_weight != nullptr) same.push_back(out_norm_weight);
+  for (const torch::Tensor* t : same) {
+    TORCH_CHECK(t->is_cuda(), "every tensor must be on device");
+    TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
+  }
+  for (const torch::Tensor* t : {&norm_weight, &qk_weight}) {
+    TORCH_CHECK(t->dim() == 1 && t->numel() == hidden && t->is_contiguous(),
+                "weights must be contiguous 1-D of hidden=", hidden);
+  }
+  if (out_norm_weight != nullptr)
+    TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == hidden &&
+                    out_norm_weight->is_contiguous(),
+                "out_norm_weight must be contiguous 1-D of hidden=", hidden);
+  TORCH_CHECK(block_count > 0 && block_count <= ipc::kMaxBlocks, "blocks must be in [1, ",
+              ipc::kMaxBlocks, "]");
+  TORCH_CHECK(threads > 0 && threads <= 512, "threads must be in [1, 512]");
+  const int lanes = 16 / static_cast<int>(inp.element_size());
+  TORCH_CHECK(hidden % lanes == 0, "hidden ", hidden, " must be a multiple of ", lanes);
+  TORCH_CHECK(blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
+                  reinterpret_cast<uintptr_t>(blocks.data_ptr()) % 16 == 0,
+              "blocks must be 16-byte aligned in every row and source");
+  const int rows  = static_cast<int>(inp.size(0));
+  const int packs = static_cast<int>(hidden / lanes);
+  TORCH_CHECK(packs <= kMaxRowPacks * threads, "hidden ", hidden, " is ", packs,
+              " packs; at most ", kMaxRowPacks, " x ", threads, " threads fit in registers");
+
+  const ipc::Peers p = group.peers(inp.data_ptr());
+  auto stream        = at::cuda::getCurrentCUDAStream();
+  const int grid     = static_cast<int>(std::min<int64_t>(block_count, rows));
+
+#define LAUNCH_ATTN_RES(T, NG, PRE)                                                     \
+  allreduce_one_shot_attn_res<T, NG, PRE><<<dim3(grid), dim3(threads), 0, stream>>>(    \
+      p, prefix.data_ptr<T>(), blocks.data_ptr<T>(), blocks.stride(0), blocks.stride(1),  \
+      norm_weight.data_ptr<T>(), qk_weight.data_ptr<T>(),                               \
+      out_norm_weight ? out_norm_weight->data_ptr<T>() : nullptr, out.data_ptr<T>(),    \
+      static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), \
+      static_cast<float>(out_eps), rows, packs)
+
+#define ATTN_RES_BY_PREFIX(T, NG)                                                       \
+  if (has_prefix)                                                                       \
+    LAUNCH_ATTN_RES(T, NG, true);                                                       \
+  else                                                                                  \
+    LAUNCH_ATTN_RES(T, NG, false)
+
+#define ATTN_RES_BY_NGPUS(T)                                                            \
+  switch (group.world_size()) {                                                         \
+    case 2: ATTN_RES_BY_PREFIX(T, 2); return;                                           \
+    case 4: ATTN_RES_BY_PREFIX(T, 4); return;                                           \
+    case 8: ATTN_RES_BY_PREFIX(T, 8); return;                                           \
+    default: break;                                                                     \
+  }
+
+  switch (inp.scalar_type()) {
+    case at::ScalarType::Half: ATTN_RES_BY_NGPUS(at::Half) break;
+    case at::ScalarType::BFloat16: ATTN_RES_BY_NGPUS(at::BFloat16) break;
+    default:
+      throw std::runtime_error("hip_comms: dtype not built. Built: float16, bfloat16.");
+  }
+  throw std::runtime_error("hip_comms: world_size " + std::to_string(group.world_size()) +
+                           " not built. Built: 2, 4, 8.");
+#undef ATTN_RES_BY_NGPUS
+#undef ATTN_RES_BY_PREFIX
+#undef LAUNCH_ATTN_RES
+}
+
 }  // namespace hip_comms
 
 // =================================================================================
@@ -355,6 +444,19 @@ void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
   hip_comms::all_reduce_rms_norm(*reinterpret_cast<hip_comms::ipc::Group*>(comms), out,
                                  &residual_out, inp, &residual, weight, eps, algo,
                                  small_limit, blocks, threads);
+}
+
+void rocm_comms_all_reduce_attn_res(fptr_t comms, torch::Tensor& prefix, torch::Tensor& out,
+                                    torch::Tensor& inp, torch::Tensor& blocks,
+                                    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+                                    const std::optional<torch::Tensor>& out_norm_weight,
+                                    int64_t num_blocks, int64_t write_idx, double eps,
+                                    double out_eps, bool has_prefix, int64_t block_count,
+                                    int64_t threads) {
+  hip_comms::all_reduce_attn_res(*reinterpret_cast<hip_comms::ipc::Group*>(comms), prefix,
+                                 out, inp, blocks, norm_weight, qk_weight,
+                                 out_norm_weight ? &*out_norm_weight : nullptr, num_blocks,
+                                 write_idx, eps, out_eps, has_prefix, block_count, threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
