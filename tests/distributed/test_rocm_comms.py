@@ -1173,13 +1173,12 @@ def _fused_case(
 # (shape, has_prefix, num_blocks, write_idx, output_norm). Example-based: each case is a
 # full eight-process run, so the cases are the ones Kimi-K3 runs -- decode rows, 0 to 9
 # stored blocks, the block-write layer where the sum starts the prefix, with and without
-# the output norm -- plus a prefill-sized row count.
+# the output norm. Prefill-sized row counts are declined and stay unfused.
 ADD_ATTN_RES_RMS_NORM_CASES = (
     ((4, 7168), True, 0, -1, True),
     ((16, 7168), True, 4, -1, True),
     ((16, 7168), True, 9, -1, False),
     ((16, 7168), False, 4, 4, True),
-    ((128, 7168), True, 9, -1, True),
 )
 ATTN_RES_SOURCES = 10
 

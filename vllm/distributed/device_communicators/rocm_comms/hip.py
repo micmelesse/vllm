@@ -305,11 +305,15 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    # THE GEMM PHASE'S ROW LIMIT, `kGemmRows` in the kernel: a decode step and no more.
-    _max_gemm_rows = 16
+    # THE FUSED ONE-SHOT KERNELS' ROW LIMIT: a decode step and no more (`kGemmRows`
+    # in the GEMM tail). One-shot moves ngpus x the bytes, so prefill stays unfused.
+    _max_fused_rows = 16
+
+    def _fits_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
+        return inp.dim() == 2 and inp.shape[0] <= self._max_fused_rows
 
     def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
-        return inp.dim() == 2 and inp.shape[0] <= self._max_gemm_rows
+        return inp.dim() == 2 and inp.shape[0] <= self._max_fused_rows
 
     def _all_reduce_rms_norm_gemm_add(
         self,

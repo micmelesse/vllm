@@ -289,6 +289,7 @@ class Communicator(ABC):
             is not Communicator._all_reduce_add_attn_res_rms_norm
             and self.should_allreduce(inp)
             and self._fits_rms_norm(inp)
+            and self._fits_add_attn_res_rms_norm(inp)
         )
 
     def all_reduce_add_attn_res_rms_norm(
@@ -514,6 +515,11 @@ class Communicator(ABC):
             f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm + add; "
             f"ask should_allreduce_rms_norm_gemm_add first."
         )
+
+    def _fits_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
+        """Whether the fused AttnRes takes this many rows. No limit unless the backend
+        has one."""
+        return True
 
     def _fits_rms_norm_gemm_add(self, inp: torch.Tensor) -> bool:
         """Whether the fused GEMM takes this many rows. No limit unless the backend has
