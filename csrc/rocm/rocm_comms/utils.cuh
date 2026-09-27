@@ -320,7 +320,7 @@ constexpr int kGemmRows = 16;
 // past `rows` reads row 0 into sums that are never stored.
 //
 // A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
-// kLanesPerCol lanes of a column (the tuned variant, launch.cuh) and over the waves of the
+// kLanesPerCol lanes of a column (tuned in launch.cuh) and over the waves of the
 // block; shuffles and an LDS pass add the splits; blocks stride over tiles of
 // kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of

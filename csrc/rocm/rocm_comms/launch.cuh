@@ -38,13 +38,13 @@ enum class Kernel : int {
   two_shot_rms_norm_gemm_add     = 9,
 };
 
-// What runs: the kernel, its grid and block, and its tuned variant (the GEMM tail's lanes
-// per column; 0 for every other kernel).
+// What runs: the kernel, its grid and block, and for the GEMM tail its lanes per column (0
+// for every other kernel).
 struct Launch {
   Kernel kernel;
   int grid;
   int threads;
-  int variant;
+  int gemm_lanes_per_col;
 };
 
 // Each op has a one-shot and a two-shot kernel, numbered as a pair.
@@ -61,14 +61,14 @@ constexpr bool is_two_shot(Kernel k) { return static_cast<int>(k) % 2 == 1; }
 //   fused_max_bytes      declined above, so the caller runs the unfused ops (kNever: never
 //                        declined; kAlways: always)
 //   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks
-//   variant              the GEMM tail's lanes per column
+//   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
 struct OpTuning {
   int64_t one_shot_max_bytes;
   int64_t fused_max_bytes;
   int one_shot_blocks;
   int two_shot_blocks;
   int threads;
-  int variant;
+  int gemm_lanes_per_col;
 };
 
 constexpr int64_t kNever  = INT64_MAX;
@@ -104,7 +104,7 @@ inline Launch pick(Op op, int64_t rows, int64_t bytes) {
       bytes <= t.one_shot_max_bytes && !(op == Op::rms_norm_gemm_add && rows > kGemmRows);
   const Kernel k = kernel_of(op, !one_shot);
   return {k, grid_of(k, one_shot ? t.one_shot_blocks : t.two_shot_blocks, rows), t.threads,
-          t.variant};
+          t.gemm_lanes_per_col};
 }
 
 }  // namespace hip_comms

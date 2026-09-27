@@ -23,8 +23,8 @@ Arms:
     aiter-fused              aiter's fused all-reduce + RMSNorm (the norm ops only)
     hip                      our all-reduce, then the ops
     hip-fused                our fused op, the kernel C++ picks
-    hip-<kernel>[-bB-tT-vV]  our fused op forced to one kernel, per --blocks x --threads
-                             (x --variants, the GEMM tail's lanes per column)
+    hip-<kernel>[-bB-tT-lL]  our fused op forced to one kernel, per --blocks x --threads
+                             (x --gemm-lanes-per-col for the GEMM tail)
 
 Usage (Kimi-K3's decode shapes):
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_rocm_comms.py \\
@@ -204,12 +204,12 @@ def _admitted(comm: HipCommunicator, op: FusedOp, x: torch.Tensor) -> bool:
 
 
 def _forced(
-    comm: HipCommunicator, kernel: Kernel, blocks: int, threads: int, variant: int, fn
+    comm: HipCommunicator, kernel: Kernel, blocks: int, threads: int, lanes: int, fn
 ) -> Callable[[Inputs], torch.Tensor]:
     """`fn` with `kernel` forced for its call, so a capture records that kernel."""
 
     def call(t: Inputs) -> torch.Tensor:
-        comm.set_launch_override(kernel, blocks, threads, variant)
+        comm.set_launch_override(kernel, blocks, threads, lanes)
         try:
             return fn(t)
         finally:
@@ -223,12 +223,12 @@ def _unfused_case(arm: str, op: str, all_reduce: AllReduce, capture) -> Case:
 
 
 def _hip_cases(
-    comm: HipCommunicator, op: str, x: torch.Tensor, blocks, threads, variants
+    comm: HipCommunicator, op: str, x: torch.Tensor, blocks, threads, lanes_per_col
 ) -> list[Case]:
     cases = [_unfused_case("hip", op, comm.all_reduce, comm.capture)]
     if op != "rms_norm_gemm_add":
-        variants = [0]
-    sweep = len(blocks) * len(threads) * len(variants) > 1
+        lanes_per_col = [0]
+    sweep = len(blocks) * len(threads) * len(lanes_per_col) > 1
     if op == "all_reduce":
         kernels: list[Kernel] = ["one_shot", "two_shot"]
         run = lambda t: comm.all_reduce(t.x)  # noqa: E731
@@ -238,7 +238,7 @@ def _hip_cases(
         run = lambda t: _fused(comm, fop, t)  # noqa: E731
         if _admitted(comm, fop, x):
             cases.append(Case("hip-fused", run, comm.capture))
-    for kernel, b, tr, v in product(kernels, blocks, threads, variants):
+    for kernel, b, tr, v in product(kernels, blocks, threads, lanes_per_col):
         comm.set_launch_override(kernel, b, tr, v)
         try:
             ok = op == "all_reduce" or _admitted(comm, cast(FusedOp, op), x)
@@ -246,7 +246,7 @@ def _hip_cases(
             comm.set_launch_override(None)
         if ok:
             arm = f"hip-{kernel}" + (f"-b{b}-t{tr}" if sweep else "")
-            arm += f"-v{v}" if v else ""
+            arm += f"-l{v}" if v else ""
             forced = _forced(comm, kernel, b, tr, v, run)
             cases.append(Case(arm, forced, comm.capture, b, tr))
     return cases
@@ -314,7 +314,7 @@ def main() -> None:
     p.add_argument("--blocks", type=int, nargs="+", default=[16])
     p.add_argument("--threads", type=int, nargs="+", default=[512])
     p.add_argument(
-        "--variants", type=int, nargs="+", default=[0], help="GEMM lanes per column"
+        "--gemm-lanes-per-col", type=int, nargs="+", default=[0], help="0: the table's"
     )
     p.add_argument("--no-baselines", action="store_true", help="hip arms only")
     p.add_argument("--ops-per-graph", type=int, default=10)
@@ -371,7 +371,7 @@ def main() -> None:
     for tokens in args.tokens:
         t = _inputs(op, tokens, args.hidden, dtype, world, rank, device)
         cases = baselines + _hip_cases(
-            hip, op, t.x, args.blocks, args.threads, args.variants
+            hip, op, t.x, args.blocks, args.threads, args.gemm_lanes_per_col
         )
         nbytes = t.x.numel() * t.x.element_size()
         want = _tail(op, pynccl.all_reduce(t.x.clone()), t.fresh())

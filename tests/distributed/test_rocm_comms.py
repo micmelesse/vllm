@@ -88,7 +88,7 @@ BASELINE_ALIGNMENT = 16  # "input byte size to be multiples of 16"
 # to call and, with the underscores dropped, the gate to ask (`all_reduce` /
 # `should_allreduce`), so `getattr` needs no table -- and renaming the API breaks this
 # loudly instead of testing something else quietly.
-# ALL-REDUCE AND ITS VARIANTS, AND NOTHING ELSE. all_gather left the package on
+# ALL-REDUCE AND ITS SHOTS, AND NOTHING ELSE. all_gather left the package on
 # 2026-09-24: a second collective to keep correct, instantiate and measure, for
 # something the decode path this work studies never calls. The gathering that
 # matters is a PHASE INSIDE two-shot and is covered by two-shot's own cases.
@@ -179,9 +179,9 @@ DISABLED = {
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
 # hip three ways: as C++ picks, and each plain kernel forced; the other backends have
-# one kernel each. A VARIANT names a kernel of the op under test, `f"{variant}_{op}"`.
-Variant = Literal["one_shot", "two_shot"]
-VARIANTS: tuple[Variant, ...] = get_args(Variant)
+# one kernel each. A SHOT names a kernel of the op under test, `f"{shot}_{op}"`.
+Shot = Literal["one_shot", "two_shot"]
+SHOTS: tuple[Shot, ...] = get_args(Shot)
 BACKEND_KERNELS = tuple(
     pytest.param(
         name,
@@ -190,7 +190,7 @@ BACKEND_KERNELS = tuple(
         marks=[pytest.mark.skip(reason=DISABLED[name])] if name in DISABLED else [],
     )
     for name in _BACKEND_CLASS
-    for kernel in ((None, *VARIANTS) if name == "hip" else (None,))
+    for kernel in ((None, *SHOTS) if name == "hip" else (None,))
 )
 
 
@@ -968,7 +968,7 @@ def test_communicator(
 
 
 # ---------------------------------------------------------------------------------
-# THE FUSED VARIANTS. Not in `OPS` above: each takes more than one tensor, and what it
+# THE FUSED SHOTS. Not in `OPS` above: each takes more than one tensor, and what it
 # must be judged against is THE TWO OPS A FUSION PASS REPLACED, not a reference written
 # here. So they get their own runner, compared against `vllm.ir.ops` itself.
 # ---------------------------------------------------------------------------------
@@ -1024,7 +1024,7 @@ def run_fused_rank(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    variant: Variant,
+    shot: Shot,
     init_method: str,
     weight_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
@@ -1049,7 +1049,7 @@ def run_fused_rank(
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
         residual = _one_input(world, 1, shape, dtype)
         weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-        kernel = cast(Kernel, f"{variant}_{form}")
+        kernel = cast(Kernel, f"{shot}_{form}")
         with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
             mine = inputs[rank].to(device)
             if form == "rms_norm":
@@ -1098,7 +1098,7 @@ def run_fused_rank(
 
 
 # Both kernels at every shape, forced: what C++ would pick is one of them.
-@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("shape", FUSED_SHAPES)
 @pytest.mark.parametrize("form", FORMS)
@@ -1106,7 +1106,7 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    variant: Variant,
+    shot: Shot,
     world: int,
     rendezvous: tuple[str, int],
 ) -> None:
@@ -1115,14 +1115,14 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     Enumerated, not property-generated: a shrinking framework cannot drive across
     spawned ranks, and each candidate is a full eight-process run.
     """
-    _fused_case(form, shape, dtype_name, variant, None, world, rendezvous)
+    _fused_case(form, shape, dtype_name, shot, None, world, rendezvous)
 
 
 # AN FP32 WEIGHT, in its own dtype: the reference rounds the normed row to the WEIGHT's
 # dtype, so this is a different rounding from a weight in the input's, not the same one
 # with a cast. Kimi-K3's latent row and its hidden row, both kernels: the rounding is
 # per element, so more shapes would say nothing new.
-@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("shape", ((4, 3584), (128, 7168)))
 @pytest.mark.parametrize("form", FORMS)
@@ -1130,18 +1130,18 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    variant: Variant,
+    shot: Shot,
     world: int,
     rendezvous: tuple[str, int],
 ) -> None:
-    _fused_case(form, shape, dtype_name, variant, torch.float32, world, rendezvous)
+    _fused_case(form, shape, dtype_name, shot, torch.float32, world, rendezvous)
 
 
 def _fused_case(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    variant: Variant,
+    shot: Shot,
     weight_dtype: torch.dtype | None,
     world: int,
     rendezvous: tuple[str, int],
@@ -1156,14 +1156,14 @@ def _fused_case(
         rets = [
             pool.apply_async(
                 run_fused_rank,
-                (r, world, form, shape, dtype_name, variant, init, weight_dtype),
+                (r, world, form, shape, dtype_name, shot, init, weight_dtype),
             )
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
-    where = f"{form} {variant} {shape} {dtype_name} weight={weight_dtype or dtype_name}"
+    where = f"{form} {shot} {shape} {dtype_name} weight={weight_dtype or dtype_name}"
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip has no fused all_reduce_{form} for {where}")
     bad = [err for _, err in got if err is not None]
@@ -1196,7 +1196,7 @@ def run_add_attn_res_rms_norm_rank(
     rank: int,
     world: int,
     case: tuple[tuple[int, int], bool, int, int, bool],
-    variant: Variant,
+    shot: Shot,
     init_method: str,
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against the two it replaces, on every output it writes."""
@@ -1250,7 +1250,7 @@ def run_add_attn_res_rms_norm_rank(
         )
         torch.cuda.synchronize()
 
-        kernel = cast(Kernel, f"{variant}_add_attn_res_rms_norm")
+        kernel = cast(Kernel, f"{shot}_add_attn_res_rms_norm")
         with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
             mine = inputs[rank].to(device)
             if not comm.should_allreduce_add_attn_res_rms_norm(mine):
@@ -1297,11 +1297,11 @@ def run_add_attn_res_rms_norm_rank(
             logger.exception("rank %d: teardown failed", rank)
 
 
-@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("case", ADD_ATTN_RES_RMS_NORM_CASES)
 def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     case: tuple[tuple[int, int], bool, int, int, bool],
-    variant: Variant,
+    shot: Shot,
     world: int,
     rendezvous: tuple[str, int],
 ) -> None:
@@ -1315,7 +1315,7 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     try:
         rets = [
             pool.apply_async(
-                run_add_attn_res_rms_norm_rank, (r, world, case, variant, init)
+                run_add_attn_res_rms_norm_rank, (r, world, case, shot, init)
             )
             for r in range(world)
         ]
@@ -1323,9 +1323,7 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     finally:
         pool.terminate()
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(
-            f"hip declines {variant} all_reduce_add_attn_res_rms_norm at {case}"
-        )
+        pytest.skip(f"hip declines {shot} all_reduce_add_attn_res_rms_norm at {case}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
@@ -1355,7 +1353,7 @@ def run_rms_norm_gemm_add_rank(
     rank: int,
     world: int,
     case: tuple[int, int, int, int],
-    variant: Variant,
+    shot: Shot,
     init_method: str,
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against the three it replaces, over the whole output."""
@@ -1392,7 +1390,7 @@ def run_rms_norm_gemm_add_rank(
         want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
         torch.cuda.synchronize()
 
-        kernel = cast(Kernel, f"{variant}_rms_norm_gemm_add")
+        kernel = cast(Kernel, f"{shot}_rms_norm_gemm_add")
         with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
             mine = inputs[rank].to(device)
             if not comm.should_allreduce_rms_norm_gemm_add(mine):
@@ -1421,11 +1419,11 @@ def run_rms_norm_gemm_add_rank(
             logger.exception("rank %d: teardown failed", rank)
 
 
-@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("case", RMS_NORM_GEMM_ADD_CASES)
 def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
     case: tuple[int, int, int, int],
-    variant: Variant,
+    shot: Shot,
     world: int,
     rendezvous: tuple[str, int],
 ) -> None:
@@ -1438,16 +1436,14 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
     pool = Pool(processes=world)
     try:
         rets = [
-            pool.apply_async(
-                run_rms_norm_gemm_add_rank, (r, world, case, variant, init)
-            )
+            pool.apply_async(run_rms_norm_gemm_add_rank, (r, world, case, shot, init))
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip declines {variant} all_reduce_rms_norm_gemm_add at {case}")
+        pytest.skip(f"hip declines {shot} all_reduce_rms_norm_gemm_add at {case}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"

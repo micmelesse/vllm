@@ -17,7 +17,7 @@ namespace hip_comms {
 //   out[:, col0:col0+N] = T(float(out) + n @ W^T)   `gemm_add_rows`
 //
 // At most kGemmRows rows: one GEMM pass.
-// kLanesPerCol is the GEMM's tuned variant (launch.cuh).
+// kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_rms_norm_gemm_add(
     ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,

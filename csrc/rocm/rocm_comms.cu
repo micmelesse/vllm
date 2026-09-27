@@ -55,17 +55,18 @@ constexpr bool table_fits() {
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
   }
-  const int v = tuning(Op::rms_norm_gemm_add).variant;
+  const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
   return v == 1 || v == 2 || v == 4 || v == 8;
 }
 static_assert(table_fits(), "launch.cuh's table exceeds a kernel capability");
 
-// The launch the sweep forces: a kernel and its geometry, and a variant (0: the table's).
+// The launch the sweep forces: a kernel, its geometry, and the GEMM tail's lanes per column
+// (0: the table's).
 struct Forced {
   Kernel kernel;
   int blocks;
   int threads;
-  int variant;
+  int gemm_lanes_per_col;
 };
 
 // What Python holds: the peers, and the launch the sweep forces, if any.
@@ -82,7 +83,7 @@ Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
   return {f.kernel, grid_of(f.kernel, f.blocks, rows), f.threads,
-          f.variant ? f.variant : tuning(op).variant};
+          f.gemm_lanes_per_col ? f.gemm_lanes_per_col : tuning(op).gemm_lanes_per_col};
 }
 
 int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
@@ -412,12 +413,13 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
   else                                                                                   \
     GEMM_ADD_KERNEL(one_shot, T, NG, LPC)
 #define LAUNCH_GEMM_ADD(T, NG)                                                           \
-  switch (l.variant) {                                                                   \
+  switch (l.gemm_lanes_per_col) {                                                        \
     case 1: GEMM_ADD_SHOT(T, NG, 1); break;                                              \
     case 2: GEMM_ADD_SHOT(T, NG, 2); break;                                              \
     case 4: GEMM_ADD_SHOT(T, NG, 4); break;                                              \
     case 8: GEMM_ADD_SHOT(T, NG, 8); break;                                              \
-    default: TORCH_CHECK(false, "hip_comms: no GEMM variant ", l.variant);                \
+    default:                                                                             \
+      TORCH_CHECK(false, "hip_comms: no GEMM lanes per column ", l.gemm_lanes_per_col);  \
   }
 #define GEMM_ADD_HALF(NG) LAUNCH_GEMM_ADD(at::Half, NG)
 #define GEMM_ADD_BF16(NG) LAUNCH_GEMM_ADD(at::BFloat16, NG)
@@ -489,10 +491,10 @@ void rocm_comms_set_checked(fptr_t comms, bool checked) {
 }
 
 // THE SWEEP'S ONE HANDLE: every later launch of that kernel's op runs `kernel` at this
-// geometry and variant (0: the table's), and a launch of any other op is refused. `kernel`
-// -1 clears it.
+// geometry and GEMM lanes per column (0: the table's), and a launch of any other op is
+// refused. `kernel` -1 clears it.
 void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
-                                    int64_t threads, int64_t variant) {
+                                    int64_t threads, int64_t gemm_lanes_per_col) {
   using hip_comms::Kernel;
   if (kernel < 0) {
     comms_of(comms).forced = {Kernel::none, 0, 0, 0};
@@ -506,10 +508,11 @@ void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks
                   threads % hip_comms::kWaveSize == 0,
               "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
               hip_comms::kMaxThreads);
-  TORCH_CHECK(variant == 0 || variant == 1 || variant == 2 || variant == 4 || variant == 8,
-              "variant must be 0 (the table's) or a GEMM lanes-per-column in 1, 2, 4, 8");
+  const int64_t lpc = gemm_lanes_per_col;
+  TORCH_CHECK(lpc == 0 || lpc == 1 || lpc == 2 || lpc == 4 || lpc == 8,
+              "gemm_lanes_per_col must be 0 (the table's), 1, 2, 4 or 8");
   comms_of(comms).forced = {static_cast<Kernel>(kernel), static_cast<int>(blocks),
-                            static_cast<int>(threads), static_cast<int>(variant)};
+                            static_cast<int>(threads), static_cast<int>(lpc)};
 }
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
