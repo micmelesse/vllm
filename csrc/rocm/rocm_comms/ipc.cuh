@@ -57,8 +57,7 @@ struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
 struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
 // =================================================================================
-// DEVICE SIDE. Everything a collective kernel may do with its peers: read their input,
-// read and write scratch, and synchronise.
+// DEVICE SIDE.
 // =================================================================================
 
 template <typename T, int ngpus>
@@ -77,50 +76,6 @@ class Peers {
         input_packs_(input_packs),
         scratch_packs_(scratch_packs),
         timeout_ticks_(timeout_ticks) {}
-
-  template <typename V>
-  DINLINE const V* input(int r) const {
-    return reinterpret_cast<const V*>(inputs_->p[r]);
-  }
-
-  template <typename V>
-  DINLINE V* scratch(int r) const {
-    return reinterpret_cast<V*>(signals_.s[r] + 1);
-  }
-
-  // System scope to REACH a peer's memory, device scope to poll our own.
-  template <int ngpus>
-  DINLINE void barrier_start() const {
-    uint32_t f = self_->seq[blockIdx.x] + 1;
-    if (threadIdx.x < ngpus) {
-      __scoped_atomic_store_n(&signals_.s[threadIdx.x]->start[blockIdx.x][rank_], f,
-                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      while (__scoped_atomic_load_n(&self_->start[blockIdx.x][threadIdx.x],
-                                    __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) < f);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) self_->seq[blockIdx.x] = f;
-  }
-
-  // `final_sync` drops the release/acquire pair: nothing after the last barrier reads what
-  // this kernel wrote, so ordering costs without buying anything.
-  template <int ngpus, bool final_sync>
-  DINLINE void barrier_end() const {
-    __syncthreads();
-    uint32_t f = self_->seq[blockIdx.x] + 1;
-    if (threadIdx.x < ngpus) {
-      __scoped_atomic_store_n(&signals_.s[threadIdx.x]->end[blockIdx.x][rank_], f,
-                              final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
-                              __MEMORY_SCOPE_SYSTEM);
-      while (__scoped_atomic_load_n(&self_->end[blockIdx.x][threadIdx.x],
-                                    final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                    __MEMORY_SCOPE_DEVICE) < f);
-    }
-    if constexpr (!final_sync) __syncthreads();
-    if (threadIdx.x == 0) self_->seq[blockIdx.x] = f;
-  }
-
-  DINLINE int rank() const { return rank_; }
 
  private:
   template <typename, int>
@@ -159,7 +114,7 @@ class Comm {
  public:
   using V = typename traits<T>::V;
 
-  DINLINE explicit Comm(const Peers& p) : p_(p) {
+  DINLINE explicit Comm(Peers p) : p_(p) {
     // ROTATED by rank, so the ranks do not all read rank 0 first. Each rank then sums in
     // a different order, so one-shot outputs agree to one ULP of T, not bitwise.
 #pragma unroll
