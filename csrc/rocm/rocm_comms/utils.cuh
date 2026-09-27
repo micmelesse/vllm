@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Shared by the collectives: the 16-byte vector, block sums, and one row of all-reduce +
-// RMSNorm.
+// Shared by the collectives: the 16-byte vector, block sums, the rows of all-reduce +
+// RMSNorm and + AttnRes, and the latent MoE tail's GEMM phase.
 
 #pragma once
 
 #include <hip/hip_runtime.h>
+
+#include <cmath>
 
 #define DINLINE __device__ __forceinline__
 
@@ -117,6 +119,257 @@ DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
   }
   // Before the next row reuses `block_sum`'s shared slots.
   __syncthreads();
+}
+
+// ---------------------------------------------------------------------------------
+// One row of all-reduce + Kimi-K3's AttnRes + its RMSNorm (the one-shot and two-shot
+// AttnRes kernels).
+// ---------------------------------------------------------------------------------
+
+// Two sums over the block in one pass: AttnRes needs a source's sum of squares and its
+// weighted dot together, and one pass is half the barriers of two `block_sum`s.
+DINLINE float2 block_sum2(float a, float b) {
+  __shared__ float2 partial[8];
+  __shared__ float2 total;
+  const int lane = threadIdx.x % warpSize;
+  const int warp = threadIdx.x / warpSize;
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    a += __shfl_down(a, off, warpSize);
+    b += __shfl_down(b, off, warpSize);
+  }
+  if (lane == 0) partial[warp] = make_float2(a, b);
+  __syncthreads();
+  const int warps = (blockDim.x + warpSize - 1) / warpSize;
+  if (warp == 0) {
+    float2 v = (lane < warps) ? partial[lane] : make_float2(0.0f, 0.0f);
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      v.x += __shfl_down(v.x, off, warpSize);
+      v.y += __shfl_down(v.y, off, warpSize);
+    }
+    if (lane == 0) total = v;
+  }
+  __syncthreads();
+  return total;
+}
+
+// ONE ROW of all-reduce + AttnRes by the whole block, matching
+// `vllm/models/kimi_k3/amd/ops/attn_res.py` rounding for rounding:
+//
+//   d   = float(T(sum over ranks))                   the all-reduce output, as it lands
+//   u   = kPrefix ? float(T(float(prefix) + d)) : d  the running prefix, updated or started
+//   prefix_out = T(u); blocks[write] = T(u)          the new prefix, and the block written
+//   per source s (the stored blocks, then u):
+//       logit_s = dot(s, norm_w * qk_w) * rsqrt(mean(s^2) + eps)
+//   m   = softmax(logit) . sources                     online, one source at a time
+//   out = T(m), or T(m * rsqrt(mean(m^2) + out_eps) * out_norm_w)
+//
+// The prefix and the mix stay in registers across the sources, so only the stored blocks
+// are read back. The sums run in a different order than Triton's, so a result agrees to
+// the rounding of the last few bits, not bitwise. `c` is the kernel's `ipc::Comm`; the
+// new prefix leaves through `store_prefix(i, v)` and the output through `store_out(i,
+// v)`, i the pack within the row, so a kernel lands them in place or in scratch.
+template <typename T, bool kPrefix, typename C, typename StorePrefix, typename StoreOut>
+DINLINE void add_attn_res_rms_norm_row(const C& c,
+                          const typename traits<T>::V* prefix, const T* blocks,
+                          int64_t block_stride_r,
+                          const typename traits<T>::V* norm_w,
+                          const typename traits<T>::V* qk_w,
+                          const typename traits<T>::V* out_norm_w, int num_blocks, int row,
+                          int packs, float inv_hidden, float eps, float out_eps,
+                          StorePrefix store_prefix, StoreOut store_out) {
+  using V          = typename traits<T>::V;
+  constexpr int NL = traits<T>::N;
+  const int base   = row * packs;
+  float u[kMaxRowPacks][NL];
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+    const V sum = c.sum(base + i);
+    V rounded;
+    if constexpr (kPrefix) {
+      const V p = prefix[base + i];
+#pragma unroll
+      for (int j = 0; j < NL; ++j) {
+        rounded.d[j] = static_cast<T>(static_cast<float>(p.d[j]) +
+                                      static_cast<float>(sum.d[j]));
+        u[k][j]      = static_cast<float>(rounded.d[j]);
+      }
+    } else {
+      rounded = sum;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) u[k][j] = static_cast<float>(sum.d[j]);
+    }
+    store_prefix(i, rounded);
+  }
+
+  float m[kMaxRowPacks][NL];
+  if (num_blocks == 0) {
+    // With only the prefix source, the softmax is exactly one.
+#pragma unroll
+    for (int k = 0; k < kMaxRowPacks; ++k)
+#pragma unroll
+      for (int j = 0; j < NL; ++j) m[k][j] = u[k][j];
+  } else {
+    float w[kMaxRowPacks][NL];
+#pragma unroll
+    for (int k = 0; k < kMaxRowPacks; ++k) {
+      const int i = threadIdx.x + k * blockDim.x;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) m[k][j] = 0.0f;
+      if (i >= packs) continue;
+      const V a = norm_w[i], b = qk_w[i];
+#pragma unroll
+      for (int j = 0; j < NL; ++j)
+        w[k][j] = static_cast<float>(a.d[j]) * static_cast<float>(b.d[j]);
+    }
+    float max_logit = -INFINITY, denominator = 0.0f;
+    for (int s = 0; s <= num_blocks; ++s) {
+      // The stored blocks first, the prefix last, as the reference orders its sources.
+      const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
+      float v[kMaxRowPacks][NL];
+      float ss = 0.0f, dot = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kMaxRowPacks; ++k) {
+        const int i = threadIdx.x + k * blockDim.x;
+        if (i >= packs) break;
+        if (s < num_blocks) {
+          const V x = src[i];
+#pragma unroll
+          for (int j = 0; j < NL; ++j) v[k][j] = static_cast<float>(x.d[j]);
+        } else {
+#pragma unroll
+          for (int j = 0; j < NL; ++j) v[k][j] = u[k][j];
+        }
+#pragma unroll
+        for (int j = 0; j < NL; ++j) {
+          ss += v[k][j] * v[k][j];
+          dot += v[k][j] * w[k][j];
+        }
+      }
+      const float2 sums       = block_sum2(ss, dot);
+      const float logit       = sums.y * rsqrtf(sums.x * inv_hidden + eps);
+      const float new_max     = fmaxf(max_logit, logit);
+      const float old_scale   = __expf(max_logit - new_max);
+      const float this_scale  = __expf(logit - new_max);
+      denominator             = denominator * old_scale + this_scale;
+      max_logit               = new_max;
+#pragma unroll
+      for (int k = 0; k < kMaxRowPacks; ++k) {
+        const int i = threadIdx.x + k * blockDim.x;
+        if (i >= packs) break;
+#pragma unroll
+        for (int j = 0; j < NL; ++j) m[k][j] = m[k][j] * old_scale + this_scale * v[k][j];
+      }
+    }
+    const float inv_den = 1.0f / denominator;
+#pragma unroll
+    for (int k = 0; k < kMaxRowPacks; ++k)
+#pragma unroll
+      for (int j = 0; j < NL; ++j) m[k][j] *= inv_den;
+  }
+
+  float scale = 1.0f;
+  if (out_norm_w != nullptr) {
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kMaxRowPacks; ++k) {
+      const int i = threadIdx.x + k * blockDim.x;
+      if (i >= packs) break;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) ss += m[k][j] * m[k][j];
+    }
+    scale = rsqrtf(block_sum2(ss, 0.0f).x * inv_hidden + out_eps);
+  }
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+    V o;
+    if (out_norm_w != nullptr) {
+      const V g = out_norm_w[i];
+#pragma unroll
+      for (int j = 0; j < NL; ++j)
+        o.d[j] = static_cast<T>(m[k][j] * scale * static_cast<float>(g.d[j]));
+    } else {
+#pragma unroll
+      for (int j = 0; j < NL; ++j) o.d[j] = static_cast<T>(m[k][j]);
+    }
+    store_out(i, o);
+  }
+  // Before the next row reuses the reductions' shared slots.
+  __syncthreads();
+}
+
+// ---------------------------------------------------------------------------------
+// The GEMM phase of the latent MoE tail (the one-shot and two-shot GEMM-tail kernels).
+// ---------------------------------------------------------------------------------
+
+// The most rows one pass takes: each wave holds kGemmRows x kGemmCols accumulators.
+constexpr int kGemmRows = 16;
+constexpr int kGemmCols = 4;
+
+// out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
+// rows <= kGemmRows, the sum in fp32 and rounded once. `load(r, k)` returns pack k of row
+// r of x, wherever it lives. Each wave takes kGemmCols columns for every row: x is loaded
+// once per pack and used for all of them, the weight rows once each. The sum runs in a
+// different order than hipBLASLt's, so a result agrees to the rounding of the last bits,
+// not bitwise.
+template <typename T, typename Load>
+DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, int n_cols,
+                           int packs, T* __restrict__ out, int64_t out_stride,
+                           int out_col0) {
+  using V          = typename traits<T>::V;
+  constexpr int NL = traits<T>::N;
+  const int lane   = threadIdx.x % warpSize;
+  const int waves  = gridDim.x * (blockDim.x / warpSize);
+  const int wave   = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  const V* wv      = reinterpret_cast<const V*>(gemm_w);
+  for (int c0 = wave * kGemmCols; c0 < n_cols; c0 += waves * kGemmCols) {
+    float acc[kGemmRows][kGemmCols];
+#pragma unroll
+    for (int r = 0; r < kGemmRows; ++r)
+#pragma unroll
+      for (int q = 0; q < kGemmCols; ++q) acc[r][q] = 0.0f;
+    for (int k = lane; k < packs; k += warpSize) {
+      float w[kGemmCols][NL];
+#pragma unroll
+      for (int q = 0; q < kGemmCols; ++q) {
+        if (c0 + q >= n_cols) break;
+        const V x = wv[(c0 + q) * packs + k];
+#pragma unroll
+        for (int j = 0; j < NL; ++j) w[q][j] = static_cast<float>(x.d[j]);
+      }
+#pragma unroll
+      for (int r = 0; r < kGemmRows; ++r) {
+        if (r >= rows) break;
+        const V x = load(r, k);
+        float a[NL];
+#pragma unroll
+        for (int j = 0; j < NL; ++j) a[j] = static_cast<float>(x.d[j]);
+#pragma unroll
+        for (int q = 0; q < kGemmCols; ++q) {
+          if (c0 + q >= n_cols) break;
+#pragma unroll
+          for (int j = 0; j < NL; ++j) acc[r][q] += a[j] * w[q][j];
+        }
+      }
+    }
+    // The wave's partial sums, reduced so every lane holds every total; lane (r, q) writes.
+#pragma unroll
+    for (int r = 0; r < kGemmRows; ++r) {
+      if (r >= rows) break;
+#pragma unroll
+      for (int q = 0; q < kGemmCols; ++q) {
+        float v = acc[r][q];
+        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_xor(v, off, warpSize);
+        if (lane == r * kGemmCols + q && c0 + q < n_cols) {
+          T* at = out + r * out_stride + out_col0 + c0 + q;
+          *at   = static_cast<T>(static_cast<float>(*at) + v);
+        }
+      }
+    }
+  }
 }
 
 }  // namespace hip_comms
