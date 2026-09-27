@@ -59,6 +59,8 @@ class HipTunables:
     # A floor on the eager staging buffer, for when there is no vLLM config to size it
     # from (the correctness suite).
     staging_floor_bytes: int = 128 << 20
+    # How long a kernel waits on a peer before it prints where it was and traps.
+    sync_timeout_s: float = 10.0
 
     def __post_init__(self) -> None:
         if self.algo not in get_args(Algo):
@@ -133,6 +135,7 @@ class HipCommunicator(Communicator):
             self._slab.data_ptr(),
             self._slab.numel(),
             tunables.scratch_bytes,
+            tunables.sync_timeout_s,
         )
         self._register(self._staging)
         logger.info(
@@ -221,6 +224,11 @@ class HipCommunicator(Communicator):
             [[b for g in gathered for b in g[i][0]] for i in range(len(pending))],
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
+
+    def set_checked(self, checked: bool) -> None:
+        """Bounds checks and random skew in every later kernel: the tests' mode, which
+        turns a race into a failure on every run."""
+        torch.ops._rocm_C.rocm_comms_set_checked(self._handle, checked)
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
         """`inp` if the peers can read it, otherwise a copy in the staging buffer.

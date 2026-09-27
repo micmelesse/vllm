@@ -328,6 +328,8 @@ def _build_communicator(
         )
     if comm.disabled:
         raise RuntimeError(f"{backend} communicator disabled")
+    if isinstance(comm, HipCommunicator):
+        comm.set_checked(True)
     return comm
 
 

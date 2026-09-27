@@ -10,72 +10,37 @@
 
 namespace hip_comms {
 
-// TWO-SHOT: reduce-scatter, then all-gather. Every rank owns one slice of the buffer,
-// reduces ONLY that slice by reading every peer's copy of it, publishes the result in its
-// own scratch, and then every rank copies all ngpus slices back out.
-//
-// WHY IT EXISTS: bytes. One-shot moves (ngpus-1) x N per rank in one pass; this moves
-// (ngpus-1)/ngpus x N twice, so 1.75N against 7N at ngpus=8 -- a 4x reduction, which is
-// exactly the ratio measured between vLLM's two-stage and our one-shot on a real capture.
-// It costs one more barrier, so it is the WRONG algorithm below the crossover where that
-// barrier dominates and the right one above it. Neither is universally better and the
-// caller picks: `algo` is the caller's decision, as it is for blocks and threads.
+// TWO-SHOT: each rank sums one slice into its own scratch, then every rank gathers every
+// slice. (ngpus-1)/ngpus x N moved twice against one-shot's (ngpus-1) x N, for one more
+// sync: the right algorithm once the bytes dominate.
 //
 // THE SLICE IS ceil(size/ngpus) AND THE LAST RANK TAKES WHAT IS LEFT, so a buffer that
-// does not divide by ngpus is still reduced exactly once everywhere -- no padding, no
-// element summed twice, and a rank whose slice is empty still runs both barriers.
+// does not divide by ngpus is still reduced exactly once, and a rank with an empty slice
+// still reaches every sync.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     allreduce_two_shot(ipc::Peers p, T* __restrict__ out, int size) {
-  using V        = typename traits<T>::V;
-  const int rank = p.rank();
-
-  // ROTATED by rank, for the reason one-shot rotates: the ranks do not all read rank 0
-  // first. The same consequence follows -- each rank sums in a different order, so the
-  // slices agree to within one ULP rather than bitwise. Unlike one-shot, EVERY element of
-  // the output here was summed by exactly one rank, so all ranks see identical bytes;
-  // what differs is only which order that one rank used.
-  const V* ptrs[ngpus];
-#pragma unroll
-  for (int i = 0; i < ngpus; ++i)
-    ptrs[i] = p.input<V>((rank + i) % ngpus);
-
-  const int chunk = (size + ngpus - 1) / ngpus;
+  using V = typename traits<T>::V;
+  ipc::Comm<T, ngpus> c(p);
+  const int chunk  = (size + ngpus - 1) / ngpus;
   const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
+  const int rank   = c.rank();
 
-  p.barrier_start<ngpus>();
+  const int mine_begin = rank * chunk;
+  const int mine_end   = min(mine_begin + chunk, size);
+  for (int idx = mine_begin + tid; idx < mine_end; idx += stride)
+    c.put(rank, idx - mine_begin, c.sum(idx));
 
-  // PHASE 1 -- reduce-scatter. Our slice, summed across every rank, into our own scratch.
-  {
-    const int begin = rank * chunk;
-    const int end   = begin + chunk < size ? begin + chunk : size;
-    V* mine = p.scratch<V>(rank);
-    for (int idx = begin + tid; idx < end; idx += stride)
-      mine[idx - begin] = reduce_at<T, ngpus>(ptrs, idx);
+  c.sync();
+
+  V* dst = reinterpret_cast<V*>(out);
+  for (int i = 0; i < ngpus; ++i) {
+    const int begin = i * chunk;
+    const int end   = min(begin + chunk, size);
+    for (int idx = begin + tid; idx < end; idx += stride) dst[idx] = c.get(i, idx - begin);
   }
-
-  // NOT `final_sync`: the peers are about to READ what we just wrote, so this barrier has
-  // to carry the release/acquire pair that the last one is allowed to drop.
-  p.barrier_end<ngpus, false>();
-
-  // PHASE 2 -- all-gather. Slice i is finished and sitting in rank i's scratch; every rank
-  // copies all ngpus of them into its own output.
-  {
-    V* dst = reinterpret_cast<V*>(out);
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) {
-      const int begin = i * chunk;
-      const int end   = begin + chunk < size ? begin + chunk : size;
-      const V* src = p.scratch<V>(i);
-      for (int idx = begin + tid; idx < end; idx += stride)
-        dst[idx] = src[idx - begin];
-    }
-  }
-
-  // Required for the same reason one-shot's is: without it a rank can return and let its
-  // INPUT be reused while a peer is still reading that input.
-  p.barrier_end<ngpus, true>();
+  c.close();
 }
 
 }  // namespace hip_comms

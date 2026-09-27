@@ -2,8 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // The layer every collective is built on: peer memory and synchronisation over HIP IPC.
-// `Peers` is what a kernel gets; `Group` is the host object that maps the peers and
-// hands out a `Peers` per launch.
+// A kernel is passed `Peers` and does everything through `Comm`, built from it; `Group`
+// is the host object that maps the peers and hands out a `Peers` per launch.
 
 #pragma once
 
@@ -40,10 +40,17 @@ constexpr int kMaxBlocks = 36;
 // TWO counter arrays, not one. A peer block can reach the second barrier while this one
 // is still at the first, and with a single array the peer would write counter+1 while we
 // busy-wait on counter. `seq` is the per-block monotonic sequence number.
+//
+// `Comm::sync` uses the rest: `peer[r]` is the last sync rank r posted here, `arrive` and
+// `gen` the grid barrier on this device, `epoch` the syncs this rank has completed.
 struct Signal {
   alignas(128) uint32_t start[kMaxBlocks][kMaxRanks];
   alignas(128) uint32_t end[kMaxBlocks][kMaxRanks];
   alignas(128) uint32_t seq[kMaxBlocks];
+  alignas(128) uint32_t peer[kMaxRanks];
+  alignas(128) uint32_t arrive;
+  alignas(128) uint32_t gen;
+  alignas(128) uint32_t epoch;
 };
 
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
@@ -54,10 +61,22 @@ struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 // read and write scratch, and synchronise.
 // =================================================================================
 
+template <typename T, int ngpus>
+class Comm;
+
+// What a launch passes: opaque to the kernel, which hands it to `Comm`.
 class Peers {
  public:
-  Peers(const PeerPtrs* inputs, PeerSignals signals, Signal* self, int rank)
-      : rank_(rank), inputs_(inputs), signals_(signals), self_(self) {}
+  Peers(const PeerPtrs* inputs, PeerSignals signals, Signal* self, int rank,
+        int64_t input_packs, int64_t scratch_packs, uint64_t timeout_ticks, bool checked)
+      : rank_(rank),
+        checked_(checked),
+        inputs_(inputs),
+        signals_(signals),
+        self_(self),
+        input_packs_(input_packs),
+        scratch_packs_(scratch_packs),
+        timeout_ticks_(timeout_ticks) {}
 
   template <typename V>
   DINLINE const V* input(int r) const {
@@ -104,10 +123,182 @@ class Peers {
   DINLINE int rank() const { return rank_; }
 
  private:
+  template <typename, int>
+  friend class Comm;
+
   int rank_;
+  bool checked_;
   const PeerPtrs* inputs_;
   PeerSignals signals_;
   Signal* self_;
+  int64_t input_packs_;
+  int64_t scratch_packs_;
+  uint64_t timeout_ticks_;
+};
+
+// =================================================================================
+// THE KERNEL'S WHOLE VIEW OF ITS PEERS. Every rank's input is read only through `sum`;
+// every rank's scratch (its own included) through `put` and `get`; `sync` orders all of
+// it. Indices are in 16-byte packs of T.
+//
+//   Comm c(p);             returns once every peer has launched: their inputs are ready
+//   c.sum(idx)             input pack idx summed over ranks, fp32, rounded once
+//   c.put(peer, idx, v)    into peer's scratch
+//   c.get(peer, idx)       from peer's scratch
+//   c.sync()               every put before it, by any block of any rank, is visible to
+//                          every get after it
+//   c.close()              last; after it this rank's input may be reused
+//
+// A wait that outlives the timeout prints where it was and traps, so a hang is an error.
+// Checked (the tests), every index is bounds-checked and every wait is skewed by a
+// random per-block delay, so a race shows on every run.
+// =================================================================================
+
+template <typename T, int ngpus>
+class Comm {
+ public:
+  using V = typename traits<T>::V;
+
+  DINLINE explicit Comm(const Peers& p) : p_(p) {
+    // ROTATED by rank, so the ranks do not all read rank 0 first. Each rank then sums in
+    // a different order, so one-shot outputs agree to one ULP of T, not bitwise.
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) {
+      in_[i]      = reinterpret_cast<const V*>(p.inputs_->p[(p.rank_ + i) % ngpus]);
+      scratch_[i] = reinterpret_cast<V*>(p.signals_.s[i] + 1);
+    }
+    skew();
+    pair_blocks(true);
+  }
+
+  DINLINE int rank() const { return p_.rank_; }
+
+  DINLINE V sum(int64_t idx) const {
+    check(idx < p_.input_packs_, "sum", -1, idx, p_.input_packs_);
+    constexpr int N = traits<T>::N;
+    float acc[N];
+    const V v0 = in_[0][idx];
+#pragma unroll
+    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(v0.d[j]);
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i) {
+      const V v = in_[i][idx];
+#pragma unroll
+      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(v.d[j]);
+    }
+    V out;
+#pragma unroll
+    for (int j = 0; j < N; ++j) out.d[j] = static_cast<T>(acc[j]);
+    return out;
+  }
+
+  DINLINE void put(int peer, int64_t idx, const V& v) const {
+    check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "put", peer, idx,
+          p_.scratch_packs_);
+    scratch_[peer][idx] = v;
+  }
+
+  DINLINE V get(int peer, int64_t idx) const {
+    check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "get", peer, idx,
+          p_.scratch_packs_);
+    return scratch_[peer][idx];
+  }
+
+  // The grid on this device, then one exchange with the peers by the last block to
+  // arrive, then the grid released. System scope throughout: the puts cross devices.
+  DINLINE void sync() {
+    skew();
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      Signal* self     = p_.self_;
+      const uint32_t g = __scoped_atomic_load_n(&self->gen, __ATOMIC_ACQUIRE,
+                                                __MEMORY_SCOPE_SYSTEM);
+      if (__scoped_atomic_fetch_add(&self->arrive, 1u, __ATOMIC_ACQ_REL,
+                                    __MEMORY_SCOPE_DEVICE) == gridDim.x - 1) {
+        __scoped_atomic_store_n(&self->arrive, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        const uint32_t e = self->epoch + 1;
+        self->epoch      = e;
+#pragma unroll
+        for (int i = 0; i < ngpus; ++i)
+          __scoped_atomic_store_n(&p_.signals_.s[i]->peer[p_.rank_], e, __ATOMIC_RELEASE,
+                                  __MEMORY_SCOPE_SYSTEM);
+#pragma unroll
+        for (int i = 0; i < ngpus; ++i)
+          wait<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>(&self->peer[i], e, "sync: peer", i);
+        __scoped_atomic_fetch_add(&self->gen, 1u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+      } else {
+        wait<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>(&self->gen, g + 1, "sync: grid", -1);
+      }
+    }
+    __syncthreads();
+  }
+
+  DINLINE void close() {
+    skew();
+    pair_blocks(false);
+  }
+
+ private:
+  // Block b waits for block b on every rank, and for no other block: enough at the ends,
+  // where it says "every peer has launched" or "every peer is done reading me", and not
+  // enough between phases, which is what `sync` is for.
+  DINLINE void pair_blocks(bool start) const {
+    if (!start) __syncthreads();
+    Signal* self     = p_.self_;
+    const uint32_t f = self->seq[blockIdx.x] + 1;
+    if (threadIdx.x < ngpus) {
+      uint32_t* theirs = start ? &p_.signals_.s[threadIdx.x]->start[blockIdx.x][p_.rank_]
+                               : &p_.signals_.s[threadIdx.x]->end[blockIdx.x][p_.rank_];
+      uint32_t* mine   = start ? &self->start[blockIdx.x][threadIdx.x]
+                               : &self->end[blockIdx.x][threadIdx.x];
+      __scoped_atomic_store_n(theirs, f, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+      wait<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(mine, f, start ? "start" : "close",
+                                                    threadIdx.x);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) self->seq[blockIdx.x] = f;
+  }
+
+  template <int kOrder, int kScope>
+  DINLINE void wait(const uint32_t* flag, uint32_t want, const char* what, int peer) const {
+    const uint64_t t0 = wall_clock64();
+    uint32_t seen;
+    while ((seen = __scoped_atomic_load_n(flag, kOrder, kScope)) < want) {
+      if (wall_clock64() - t0 > p_.timeout_ticks_) {
+        printf("rocm_comms: rank %d block %d timed out in %s, peer %d: flag %u, want %u\n",
+               p_.rank_, blockIdx.x, what, peer, seen, want);
+        __builtin_trap();
+      }
+    }
+  }
+
+  DINLINE void check(bool ok, const char* what, int peer, int64_t idx,
+                     int64_t limit) const {
+    if (p_.checked_ && (!ok || idx < 0)) {
+      printf("rocm_comms: rank %d block %d thread %d: %s(peer %d, idx %lld) outside "
+             "[0, %lld)\n",
+             p_.rank_, blockIdx.x, threadIdx.x, what, peer, static_cast<long long>(idx),
+             static_cast<long long>(limit));
+      __builtin_trap();
+    }
+  }
+
+  // Checked only: up to ~32 x 8K cycles, different per rank, block and call.
+  DINLINE void skew() {
+    ++calls_;
+    if (!p_.checked_) return;
+    uint32_t h = static_cast<uint32_t>(p_.rank_) * 73856093u ^ blockIdx.x * 19349663u ^
+                 calls_ * 83492791u;
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    for (uint32_t n = (h ^ (h >> 15)) % 32; n > 0; --n) __builtin_amdgcn_s_sleep(127);
+  }
+
+  const Peers p_;
+  const V* in_[ngpus];
+  V* scratch_[ngpus];
+  uint32_t calls_ = 0;
 };
 
 // =================================================================================
@@ -147,7 +338,7 @@ class Group {
   Group(int rank, int world_size, uintptr_t self_signal,
         const std::vector<std::string>& signal_handles,
         const std::vector<int64_t>& signal_offsets, uintptr_t peer_slab,
-        int64_t peer_slab_bytes, int64_t scratch_bytes)
+        int64_t peer_slab_bytes, int64_t scratch_bytes, double sync_timeout_s)
       : rank_(rank),
         world_size_(world_size),
         self_signal_(reinterpret_cast<Signal*>(self_signal)),
@@ -164,6 +355,11 @@ class Group {
     auto opened = open_peers(signal_handles, signal_offsets, self_signal);
     for (int i = 0; i < world_size_; ++i)
       signals_.s[i] = reinterpret_cast<Signal*>(opened[i]);
+    // The device wall clock is fixed-rate, in kHz; the kernels count the timeout in it.
+    int device = 0, khz = 0;
+    HIP_CHECK(hipGetDevice(&device));
+    HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
+    timeout_ticks_ = static_cast<uint64_t>(sync_timeout_s * khz * 1000.0);
   }
 
   ~Group() {
@@ -171,6 +367,8 @@ class Group {
   }
 
   int world_size() const { return world_size_; }
+  // Bounds checks and random skew in every kernel launched after this. The tests' mode.
+  void set_checked(bool checked) { checked_ = checked; }
   int64_t scratch_bytes() const { return scratch_bytes_; }
 
   // A buffer whose address is known ahead of time. The eager path.
@@ -215,8 +413,10 @@ class Group {
   int64_t pending_count() const { return static_cast<int64_t>(pending_.size()); }
 
   // What a launch over `input` passes to its kernel.
-  Peers peers(void* input) {
-    return Peers(slot_for(input), signals_, self_signal_, rank_);
+  Peers peers(const torch::Tensor& input) {
+    return Peers(slot_for(input.data_ptr()), signals_, self_signal_, rank_,
+                 input.numel() * input.element_size() / 16, scratch_bytes_ / 16,
+                 timeout_ticks_, checked_);
   }
 
  private:
@@ -285,6 +485,8 @@ class Group {
   int world_size_;
   Signal* self_signal_;
   int64_t scratch_bytes_;
+  uint64_t timeout_ticks_ = 0;
+  bool checked_           = false;
   PeerSignals signals_{};
   PeerPtrs* slab_end_;
   PeerPtrs* cursor_;

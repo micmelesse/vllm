@@ -56,8 +56,8 @@ int64_t kernel_algo(int64_t algo, int64_t nbytes, int64_t small_limit) {
 // THE instantiation menu. Every combination that exists is named here exactly once, so
 // an unsupported request is a listed refusal rather than a wrong kernel.
 // `algo` is a kernel here: `mixed` was resolved by the caller.
-void dispatch(ipc::Group& group, torch::Tensor& out, void* input, int64_t algo,
-              int64_t blocks, int64_t threads, int n) {
+void dispatch(ipc::Group& group, torch::Tensor& out, const torch::Tensor& input,
+              int64_t algo, int64_t blocks, int64_t threads, int n) {
   auto stream        = at::cuda::getCurrentCUDAStream();
   const ipc::Peers p = group.peers(input);
 #define LAUNCH(T, NG)                                                                    \
@@ -118,7 +118,7 @@ void all_reduce(ipc::Group& group, torch::Tensor& out, torch::Tensor& inp, int64
                 "-byte buffer across ", world_size, " ranks, but only ", scratch,
                 " were allocated. Raise HipTunables.scratch_bytes.");
   }
-  dispatch(group, out, inp.data_ptr(), algo, blocks, threads, n);
+  dispatch(group, out, inp, algo, blocks, threads, n);
 }
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
@@ -192,7 +192,7 @@ void all_reduce_add_rms_norm(ipc::Group& group, torch::Tensor& out,
                 " were allocated. Raise HipTunables.scratch_bytes.");
   }
 
-  const ipc::Peers p = group.peers(inp.data_ptr());
+  const ipc::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // ONE-SHOT: ONE BLOCK PER ROW, capped by what was asked for, since a block past the last
   // row has nothing to do and still pays both barriers. Two-shot keeps every block: its
@@ -318,7 +318,7 @@ void all_reduce_add_attn_res_rms_norm(ipc::Group& group, torch::Tensor& prefix,
               " packs; at most ", kMaxRowPacks, " x ", threads,
               " threads fit in registers");
 
-  const ipc::Peers p = group.peers(inp.data_ptr());
+  const ipc::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   const int grid     = static_cast<int>(std::min<int64_t>(block_count, rows));
 
@@ -401,7 +401,7 @@ void all_reduce_rms_norm_gemm_add(ipc::Group& group, torch::Tensor& out,
               " packs; at most ", kMaxRowPacks, " x ", threads,
               " threads fit in registers");
 
-  const ipc::Peers p = group.peers(inp.data_ptr());
+  const ipc::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: phase 2 spreads the columns over the whole grid.
   const int grid = static_cast<int>(block_count);
@@ -466,12 +466,17 @@ std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) 
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
-                       int64_t peer_slab_bytes, int64_t scratch_bytes) {
+                       int64_t peer_slab_bytes, int64_t scratch_bytes,
+                       double sync_timeout_s) {
   auto* comms = new hip_comms::ipc::Group(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
-      static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes);
+      static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes, sync_timeout_s);
   return reinterpret_cast<fptr_t>(comms);
+}
+
+void rocm_comms_set_checked(fptr_t comms, bool checked) {
+  reinterpret_cast<hip_comms::ipc::Group*>(comms)->set_checked(checked);
 }
 
 void rocm_comms_dispose(fptr_t comms) {
