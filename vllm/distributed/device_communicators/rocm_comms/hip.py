@@ -320,12 +320,9 @@ class HipCommunicator(Communicator):
         out: torch.Tensor,
         out_col0: int,
     ) -> None:
-        """One-shot, then a grid barrier, then the GEMM over every block. The barrier's
-        two counters are made once, zero, and never cleared: the barrier is by
-        generation, so they are right for every later launch and graph replay."""
+        """One-shot and the norm into scratch, a sync, then the GEMM over every
+        block."""
         cfg = self.hip_tunables
-        if getattr(self, "_grid_sync", None) is None:
-            self._grid_sync = torch.zeros(2, dtype=torch.int32, device=inp.device)
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
             out,
@@ -334,8 +331,6 @@ class HipCommunicator(Communicator):
             norm_weight,
             eps,
             gemm_weight,
-            torch.empty_like(inp),
-            self._grid_sync,
             cfg.blocks,
             cfg.threads,
         )

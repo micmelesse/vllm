@@ -97,7 +97,6 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t comms, torch::Tensor& out,
                                              int64_t out_col0, torch::Tensor& inp,
                                              torch::Tensor& norm_weight, double eps,
                                              torch::Tensor& gemm_weight,
-                                             torch::Tensor& normed, torch::Tensor& sync,
                                              int64_t block_count, int64_t threads);
 
 void rocm_comms_all_reduce_add_attn_res_rms_norm(fptr_t comms, torch::Tensor& prefix,

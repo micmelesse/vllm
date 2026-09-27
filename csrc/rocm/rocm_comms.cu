@@ -365,14 +365,11 @@ void all_reduce_add_attn_res_rms_norm(ipc::Group& group, torch::Tensor& prefix,
 void all_reduce_rms_norm_gemm_add(ipc::Group& group, torch::Tensor& out,
                                   int64_t out_col0, torch::Tensor& inp,
                                   torch::Tensor& norm_weight, double eps,
-                                  torch::Tensor& gemm_weight, torch::Tensor& normed,
-                                  torch::Tensor& sync, int64_t block_count,
+                                  torch::Tensor& gemm_weight, int64_t block_count,
                                   int64_t threads) {
   TORCH_CHECK(inp.dim() == 2 && inp.is_contiguous(), "inp must be contiguous 2-D");
   const int64_t rows = inp.size(0), hidden = inp.size(1);
   TORCH_CHECK(rows <= kGemmRows, "at most ", kGemmRows, " rows; got ", rows);
-  TORCH_CHECK(normed.sizes() == inp.sizes() && normed.is_contiguous(),
-              "normed must be contiguous with inp's shape");
   TORCH_CHECK(gemm_weight.dim() == 2 && gemm_weight.size(1) == hidden &&
                   gemm_weight.stride(1) == 1 && gemm_weight.stride(0) == hidden,
               "gemm_weight must be [N, hidden] with contiguous rows");
@@ -383,9 +380,10 @@ void all_reduce_rms_norm_gemm_add(ipc::Group& group, torch::Tensor& out,
   TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == hidden &&
                   norm_weight.is_contiguous(),
               "norm_weight must be contiguous 1-D of hidden=", hidden);
-  TORCH_CHECK(sync.numel() >= 2 && sync.scalar_type() == at::ScalarType::Int,
-              "sync must be int32 with two counters");
-  for (const torch::Tensor* t : {&out, &normed, &norm_weight, &gemm_weight}) {
+  TORCH_CHECK(inp.numel() * inp.element_size() <= group.scratch_bytes(),
+              "the normed rows go in scratch: ", inp.numel() * inp.element_size(),
+              " bytes, ", group.scratch_bytes(), " allocated");
+  for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight}) {
     TORCH_CHECK(t->is_cuda(), "every tensor must be on device");
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(),
                 "every tensor must share inp's dtype");
@@ -405,15 +403,13 @@ void all_reduce_rms_norm_gemm_add(ipc::Group& group, torch::Tensor& out,
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: phase 2 spreads the columns over the whole grid.
   const int grid = static_cast<int>(block_count);
-  int* arrive    = sync.data_ptr<int>();
 
 #define LAUNCH_RMS_NORM_GEMM_ADD(T, NG)                                                  \
   allreduce_one_shot_rms_norm_gemm_add<T, NG>                                            \
       <<<dim3(grid), dim3(threads), 0, stream>>>(                                        \
           p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                         \
-          gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), normed.data_ptr<T>(),     \
-          out.data_ptr<T>(), out.stride(0), static_cast<int>(out_col0), arrive,          \
-          arrive + 1, static_cast<int>(rows), packs)
+          gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),        \
+          out.stride(0), static_cast<int>(out_col0), static_cast<int>(rows), packs)
 
 #define RMS_NORM_GEMM_ADD_BY_NGPUS(T)                                                    \
   switch (group.world_size()) {                                                          \
@@ -568,11 +564,10 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t comms, torch::Tensor& out,
                                              int64_t out_col0, torch::Tensor& inp,
                                              torch::Tensor& norm_weight, double eps,
                                              torch::Tensor& gemm_weight,
-                                             torch::Tensor& normed, torch::Tensor& sync,
                                              int64_t block_count, int64_t threads) {
   hip_comms::all_reduce_rms_norm_gemm_add(*reinterpret_cast<hip_comms::ipc::Group*>(comms),
                                           out, out_col0, inp, norm_weight, eps,
-                                          gemm_weight, normed, sync, block_count, threads);
+                                          gemm_weight, block_count, threads);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

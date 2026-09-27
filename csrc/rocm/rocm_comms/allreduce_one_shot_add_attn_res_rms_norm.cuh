@@ -49,9 +49,9 @@ DINLINE float2 block_sum2(float a, float b) {
 //
 // The prefix and the mix stay in registers across the sources, so only the stored blocks
 // are read back. The sums run in a different order than Triton's, so a result agrees to
-// the rounding of the last few bits, not bitwise.
-template <typename T, int ngpus, bool kPrefix>
-DINLINE void add_attn_res_rms_norm_row(const typename traits<T>::V* const ptrs[],
+// the rounding of the last few bits, not bitwise. `c` is the kernel's `ipc::Comm`.
+template <typename T, bool kPrefix, typename C>
+DINLINE void add_attn_res_rms_norm_row(const C& c,
                           typename traits<T>::V* prefix, const T* blocks,
                           int64_t block_stride_r, T* block_dst,
                           const typename traits<T>::V* norm_w,
@@ -67,7 +67,7 @@ DINLINE void add_attn_res_rms_norm_row(const typename traits<T>::V* const ptrs[]
   for (int k = 0; k < kMaxRowPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
-    const V sum = reduce_at<T, ngpus>(ptrs, base + i);
+    const V sum = c.sum(base + i);
     V rounded;
     if constexpr (kPrefix) {
       const V p = prefix[base + i];
@@ -195,28 +195,20 @@ __global__ void __launch_bounds__(512, 1) allreduce_one_shot_add_attn_res_rms_no
     float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  const int rank   = p.rank();
-  const V* ptrs[ngpus];
-#pragma unroll
-  for (int i = 0; i < ngpus; ++i)
-    ptrs[i] = p.input<V>((rank + i) % ngpus);
-
-  p.barrier_start<ngpus>();
-
+  ipc::Comm<T, ngpus> c(p);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const T* row_blocks = blocks + row * block_stride_m;
     T* dst = write_idx >= 0 ? blocks + row * block_stride_m + write_idx * block_stride_r
                             : nullptr;
-    add_attn_res_rms_norm_row<T, ngpus, kPrefix>(
-        ptrs, reinterpret_cast<V*>(prefix), row_blocks, block_stride_r, dst,
+    add_attn_res_rms_norm_row<T, kPrefix>(
+        c, reinterpret_cast<V*>(prefix), row_blocks, block_stride_r, dst,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
         reinterpret_cast<const V*>(out_norm_w), num_blocks, row, packs, inv_hidden, eps,
         out_eps, reinterpret_cast<V*>(out));
   }
 
-  // A rank that returns lets its INPUT be reused while a peer is still reading it.
-  p.barrier_end<ngpus, true>();
+  c.close();
 }
 
 }  // namespace hip_comms
