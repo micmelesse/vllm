@@ -21,7 +21,7 @@ namespace hip_comms {
 // Phase 1 reads the replicated `prefix` and `blocks`; phase 2 overwrites them, which the
 // world_barrier between makes safe. Every output element is computed by exactly one rank.
 template <typename T, int ngpus, bool kPrefix>
-__global__ void __launch_bounds__(512, 1) allreduce_two_shot_add_attn_res_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_add_attn_res_rms_norm(
     ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
     int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
     const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,

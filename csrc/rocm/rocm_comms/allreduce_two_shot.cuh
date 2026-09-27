@@ -18,7 +18,7 @@ namespace hip_comms {
 // does not divide by ngpus is still reduced exactly once, and a rank with an empty slice
 // still reaches every barrier.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
+__global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot(ipc::Peers p, T* __restrict__ out, int size) {
   using V = typename traits<T>::V;
   ipc::Comm<T, ngpus> c(p);

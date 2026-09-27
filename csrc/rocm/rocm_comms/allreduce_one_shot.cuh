@@ -14,7 +14,7 @@ namespace hip_comms {
 // Moves ngpus x the bytes of two-shot and needs no barrier between phases, so it wins while
 // the barrier, not the bytes, dominates.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
+__global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot(ipc::Peers p, T* __restrict__ out, int size) {
   using V = typename traits<T>::V;
   ipc::Comm<T, ngpus> c(p);

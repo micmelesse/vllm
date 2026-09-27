@@ -73,7 +73,7 @@ DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
 
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus>
-__global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_rms_norm(
     ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   two_shot_add_rms_norm<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps, rows,
@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm(
 }
 
 template <typename T, typename W, int ngpus>
-__global__ void __launch_bounds__(512, 1) allreduce_two_shot_add_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_add_rms_norm(
     ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {

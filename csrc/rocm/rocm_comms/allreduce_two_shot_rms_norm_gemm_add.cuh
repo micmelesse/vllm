@@ -15,8 +15,9 @@ namespace hip_comms {
 // scratch, and after the world barrier every rank reads every normed row from its owner's
 // scratch for the GEMM, kGemmRows rows per pass. The same roundings as the one-shot
 // kernel.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm_gemm_add(
+// kLanesPerCol is the GEMM's tuned variant (launch.cuh).
+template <typename T, int ngpus, int kLanesPerCol>
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_rms_norm_gemm_add(
     ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
@@ -41,7 +42,7 @@ __global__ void __launch_bounds__(512, 1) allreduce_two_shot_rms_norm_gemm_add(
   c.world_barrier();
 
   for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
-    gemm_add_rows<T>(
+    gemm_add_rows<kLanesPerCol, T>(
         [&](int r) {
           const int row   = r0 + r;
           const int owner = row / chunk;

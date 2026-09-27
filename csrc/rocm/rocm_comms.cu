@@ -46,20 +46,43 @@
 
 namespace hip_comms {
 
+// THE TABLE STAYS WITHIN WHAT THE KERNELS WERE BUILT FOR: a tuned value past a capability
+// is a compile error, not a kernel that overruns its signal slots or register arrays.
+constexpr bool table_fits() {
+  for (const OpTuning& t : kGfx950) {
+    if (t.one_shot_blocks < 1 || t.one_shot_blocks > ipc::kMaxBlocks) return false;
+    if (t.two_shot_blocks < 1 || t.two_shot_blocks > ipc::kMaxBlocks) return false;
+    if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
+    if (t.threads % kWaveSize != 0) return false;
+  }
+  const int v = tuning(Op::rms_norm_gemm_add).variant;
+  return v == 1 || v == 2 || v == 4 || v == 8;
+}
+static_assert(table_fits(), "launch.cuh's table exceeds a kernel capability");
+
+// The launch the sweep forces: a kernel and its geometry, and a variant (0: the table's).
+struct Forced {
+  Kernel kernel;
+  int blocks;
+  int threads;
+  int variant;
+};
+
 // What Python holds: the peers, and the launch the sweep forces, if any.
 struct Comms {
   template <typename... A>
   explicit Comms(A&&... a) : group(std::forward<A>(a)...) {}
   ipc::Group group;
-  Launch forced{Kernel::none, 0, 0};
+  Forced forced{Kernel::none, 0, 0, 0};
 };
 
 Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
-  if (comms.forced.kernel == Kernel::none) return pick(op, rows, bytes);
-  TORCH_CHECK(op_of(comms.forced.kernel) == op, "hip_comms: the forced kernel ",
-              static_cast<int>(comms.forced.kernel), " is not one of op ",
-              static_cast<int>(op), "'s");
-  return comms.forced;
+  const Forced& f = comms.forced;
+  if (f.kernel == Kernel::none) return pick(op, rows, bytes);
+  TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
+              static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
+  return {f.kernel, grid_of(f.kernel, f.blocks, rows), f.threads,
+          f.variant ? f.variant : tuning(op).variant};
 }
 
 int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
@@ -135,10 +158,10 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
   if (two)                                                                               \
-    allreduce_two_shot<T, NG><<<dim3(l.blocks), dim3(l.threads), 0, stream>>>(           \
+    allreduce_two_shot<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(             \
         p, out.data_ptr<T>(), n);                                                        \
   else                                                                                   \
-    allreduce_one_shot<T, NG><<<dim3(l.blocks), dim3(l.threads), 0, stream>>>(           \
+    allreduce_one_shot<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(             \
         p, out.data_ptr<T>(), n)
 #define ALL_REDUCE_HALF(NG) LAUNCH_ALL_REDUCE(at::Half, NG)
 #define ALL_REDUCE_BF16(NG) LAUNCH_ALL_REDUCE(at::BFloat16, NG)
@@ -153,13 +176,6 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 #undef ALL_REDUCE_BF16
 #undef ALL_REDUCE_HALF
 #undef LAUNCH_ALL_REDUCE
-}
-
-// Every row op's grid: one block per row for one-shot, capped by what was picked, since a
-// block past the last row has nothing to do and still pays the barriers; two-shot keeps
-// every block for its gather.
-int grid_for(const Launch& l, int rows) {
-  return is_two_shot(l.kernel) ? l.blocks : std::min(l.blocks, rows);
 }
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
@@ -207,7 +223,7 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
                                    inp.size(1), inp.element_size());
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
-  const int grid     = grid_for(l, rows);
+  const int grid     = l.grid;
   const bool two     = is_two_shot(l.kernel);
   const float feps   = static_cast<float>(eps);
 
@@ -311,7 +327,7 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
                                    inp.element_size());
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
-  const int grid     = grid_for(l, rows);
+  const int grid     = l.grid;
   const bool two     = is_two_shot(l.kernel);
 
 #define ATTN_RES_ARGS(T)                                                                 \
@@ -377,25 +393,32 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
   const int packs = static_cast<int>(hidden / lanes);
   const Launch l =
       checked_launch(comms, Op::rms_norm_gemm_add, rows, hidden, inp.element_size());
-  TORCH_CHECK(l.threads % 64 == 0, "the GEMM phase needs whole waves; threads ", l.threads);
+  TORCH_CHECK(l.threads % kWaveSize == 0, "the GEMM phase needs whole waves; threads ",
+              l.threads);
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: the GEMM phase spreads the columns over the whole grid.
   const bool two = is_two_shot(l.kernel);
 
-#define LAUNCH_GEMM_ADD(T, NG)                                                           \
+#define GEMM_ADD_KERNEL(SHOT, T, NG, LPC)                                                \
+  allreduce_##SHOT##_rms_norm_gemm_add<T, NG, LPC>                                       \
+      <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(                                    \
+          p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                         \
+          gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),        \
+          out.stride(0), static_cast<int>(out_col0), static_cast<int>(rows), packs)
+#define GEMM_ADD_SHOT(T, NG, LPC)                                                        \
   if (two)                                                                               \
-    allreduce_two_shot_rms_norm_gemm_add<T, NG>                                          \
-        <<<dim3(l.blocks), dim3(l.threads), 0, stream>>>(                                \
-            p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                       \
-            gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),      \
-            out.stride(0), static_cast<int>(out_col0), static_cast<int>(rows), packs);   \
+    GEMM_ADD_KERNEL(two_shot, T, NG, LPC);                                               \
   else                                                                                   \
-    allreduce_one_shot_rms_norm_gemm_add<T, NG>                                          \
-        <<<dim3(l.blocks), dim3(l.threads), 0, stream>>>(                                \
-            p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                       \
-            gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),      \
-            out.stride(0), static_cast<int>(out_col0), static_cast<int>(rows), packs)
+    GEMM_ADD_KERNEL(one_shot, T, NG, LPC)
+#define LAUNCH_GEMM_ADD(T, NG)                                                           \
+  switch (l.variant) {                                                                   \
+    case 1: GEMM_ADD_SHOT(T, NG, 1); break;                                              \
+    case 2: GEMM_ADD_SHOT(T, NG, 2); break;                                              \
+    case 4: GEMM_ADD_SHOT(T, NG, 4); break;                                              \
+    case 8: GEMM_ADD_SHOT(T, NG, 8); break;                                              \
+    default: TORCH_CHECK(false, "hip_comms: no GEMM variant ", l.variant);                \
+  }
 #define GEMM_ADD_HALF(NG) LAUNCH_GEMM_ADD(at::Half, NG)
 #define GEMM_ADD_BF16(NG) LAUNCH_GEMM_ADD(at::BFloat16, NG)
 
@@ -409,6 +432,8 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
 #undef GEMM_ADD_BF16
 #undef GEMM_ADD_HALF
 #undef LAUNCH_GEMM_ADD
+#undef GEMM_ADD_SHOT
+#undef GEMM_ADD_KERNEL
 }
 
 #undef BY_NGPUS
@@ -464,22 +489,27 @@ void rocm_comms_set_checked(fptr_t comms, bool checked) {
 }
 
 // THE SWEEP'S ONE HANDLE: every later launch of that kernel's op runs `kernel` at this
-// geometry, and a launch of any other op is refused. `kernel` -1 clears it.
+// geometry and variant (0: the table's), and a launch of any other op is refused. `kernel`
+// -1 clears it.
 void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
-                                    int64_t threads) {
+                                    int64_t threads, int64_t variant) {
   using hip_comms::Kernel;
   if (kernel < 0) {
-    comms_of(comms).forced = {Kernel::none, 0, 0};
+    comms_of(comms).forced = {Kernel::none, 0, 0, 0};
     return;
   }
   TORCH_CHECK(kernel <= static_cast<int64_t>(Kernel::two_shot_rms_norm_gemm_add),
               "hip_comms: no kernel ", kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::ipc::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::ipc::kMaxBlocks, "]");
-  TORCH_CHECK(threads > 0 && threads <= 512 && threads % 64 == 0,
-              "threads must be a multiple of 64 in [64, 512]");
+  TORCH_CHECK(threads > 0 && threads <= hip_comms::kMaxThreads &&
+                  threads % hip_comms::kWaveSize == 0,
+              "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
+              hip_comms::kMaxThreads);
+  TORCH_CHECK(variant == 0 || variant == 1 || variant == 2 || variant == 4 || variant == 8,
+              "variant must be 0 (the table's) or a GEMM lanes-per-column in 1, 2, 4, 8");
   comms_of(comms).forced = {static_cast<Kernel>(kernel), static_cast<int>(blocks),
-                            static_cast<int>(threads)};
+                            static_cast<int>(threads), static_cast<int>(variant)};
 }
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,

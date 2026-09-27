@@ -233,14 +233,18 @@ class HipCommunicator(Communicator):
         )
 
     def set_launch_override(
-        self, kernel: Kernel | None, blocks: int = 16, threads: int = 512
+        self,
+        kernel: Kernel | None,
+        blocks: int = 16,
+        threads: int = 512,
+        variant: int = 0,
     ) -> None:
-        """Force `kernel` at this geometry for every later launch of its op (and refuse
-        any other op) until cleared with None. The sweep's and the tests' handle; the
-        model never calls it."""
+        """Force `kernel` at this geometry and variant (0: the table's) for every later
+        launch of its op, refusing any other op, until cleared with None. The sweep's and
+        the tests' handle; the model never calls it."""
         wire = -1 if kernel is None else _KERNEL_WIRE[kernel]
         torch.ops._rocm_C.rocm_comms_set_launch_override(
-            self._handle, wire, blocks, threads
+            self._handle, wire, blocks, threads, variant
         )
 
     def set_checked(self, checked: bool) -> None:

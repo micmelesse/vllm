@@ -17,8 +17,9 @@ namespace hip_comms {
 //   out[:, col0:col0+N] = T(float(out) + n @ W^T)   `gemm_add_rows`
 //
 // At most kGemmRows rows: one GEMM pass.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) allreduce_one_shot_rms_norm_gemm_add(
+// kLanesPerCol is the GEMM's tuned variant (launch.cuh).
+template <typename T, int ngpus, int kLanesPerCol>
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_rms_norm_gemm_add(
     ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
@@ -37,8 +38,8 @@ __global__ void __launch_bounds__(512, 1) allreduce_one_shot_rms_norm_gemm_add(
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
   c.grid_barrier();
 
-  gemm_add_rows<T>([&](int r) { return c.ptr(rank, r * packs, packs); }, rows, gemm_w,
-                   n_cols, packs, out, out_stride, out_col0);
+  gemm_add_rows<kLanesPerCol, T>([&](int r) { return c.ptr(rank, r * packs, packs); },
+                                 rows, gemm_w, n_cols, packs, out, out_stride, out_col0);
   c.close();
 }
 

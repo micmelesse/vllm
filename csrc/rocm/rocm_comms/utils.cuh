@@ -29,20 +29,26 @@ struct traits {
   using V = vec<T, N>;
 };
 
-// Sum of `v` over the block. 8 = 512 / 64, the launch bound over the wavefront: a block
-// wider than the bound cannot be launched, so `partial` cannot be overrun.
+// THE HARDWARE, named once: gfx9 runs 64-lane waves, and every kernel here is built for at
+// most kMaxThreads per block (its __launch_bounds__), so a block holds at most kMaxWaves.
+constexpr int kWaveSize   = 64;
+constexpr int kMaxThreads = 512;
+constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
+
+// Sum of `v` over the block. A block wider than kMaxThreads cannot be launched, so
+// `partial` cannot be overrun.
 DINLINE float block_sum(float v) {
-  __shared__ float partial[8];
+  __shared__ float partial[kMaxWaves];
   __shared__ float total;
-  const int lane = threadIdx.x % warpSize;
-  const int warp = threadIdx.x / warpSize;
-  for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+  const int lane = threadIdx.x % kWaveSize;
+  const int warp = threadIdx.x / kWaveSize;
+  for (int off = kWaveSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, kWaveSize);
   if (lane == 0) partial[warp] = v;
   __syncthreads();
-  const int warps = (blockDim.x + warpSize - 1) / warpSize;
+  const int warps = (blockDim.x + kWaveSize - 1) / kWaveSize;
   if (warp == 0) {
     v = (lane < warps) ? partial[lane] : 0.0f;
-    for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, warpSize);
+    for (int off = kWaveSize / 2; off > 0; off >>= 1) v += __shfl_down(v, off, kWaveSize);
     if (lane == 0) total = v;
   }
   __syncthreads();
@@ -129,22 +135,22 @@ DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
 // Two sums over the block in one pass: AttnRes needs a source's sum of squares and its
 // weighted dot together, and one pass is half the barriers of two `block_sum`s.
 DINLINE float2 block_sum2(float a, float b) {
-  __shared__ float2 partial[8];
+  __shared__ float2 partial[kMaxWaves];
   __shared__ float2 total;
-  const int lane = threadIdx.x % warpSize;
-  const int warp = threadIdx.x / warpSize;
-  for (int off = warpSize / 2; off > 0; off >>= 1) {
-    a += __shfl_down(a, off, warpSize);
-    b += __shfl_down(b, off, warpSize);
+  const int lane = threadIdx.x % kWaveSize;
+  const int warp = threadIdx.x / kWaveSize;
+  for (int off = kWaveSize / 2; off > 0; off >>= 1) {
+    a += __shfl_down(a, off, kWaveSize);
+    b += __shfl_down(b, off, kWaveSize);
   }
   if (lane == 0) partial[warp] = make_float2(a, b);
   __syncthreads();
-  const int warps = (blockDim.x + warpSize - 1) / warpSize;
+  const int warps = (blockDim.x + kWaveSize - 1) / kWaveSize;
   if (warp == 0) {
     float2 v = (lane < warps) ? partial[lane] : make_float2(0.0f, 0.0f);
-    for (int off = warpSize / 2; off > 0; off >>= 1) {
-      v.x += __shfl_down(v.x, off, warpSize);
-      v.y += __shfl_down(v.y, off, warpSize);
+    for (int off = kWaveSize / 2; off > 0; off >>= 1) {
+      v.x += __shfl_down(v.x, off, kWaveSize);
+      v.y += __shfl_down(v.y, off, kWaveSize);
     }
     if (lane == 0) total = v;
   }
@@ -307,11 +313,6 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kGemmRows = 16;
-// A block pass covers kGemmTile output columns; kGemmLanesPerCol lanes of a wave split each
-// column's K, so a wave is kGemmTile x kGemmLanesPerCol = 64 lanes.
-constexpr int kGemmTile        = 16;
-constexpr int kGemmLanesPerCol = 4;
-constexpr int kGemmMaxWaves    = 8;
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
@@ -319,31 +320,33 @@ constexpr int kGemmMaxWaves    = 8;
 // past `rows` reads row 0 into sums that are never stored.
 //
 // A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
-// kGemmLanesPerCol lanes of the column and over the waves of the block, so each lane walks
-// K / (4 x waves) packs; two shuffles and an LDS pass add the splits; blocks stride over
-// kGemmTile-column tiles. The four lanes of a column read adjacent packs of its weight row.
+// kLanesPerCol lanes of a column (the tuned variant, launch.cuh) and over the waves of the
+// block; shuffles and an LDS pass add the splits; blocks stride over tiles of
+// kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <typename T, typename Row>
+template <int kLanesPerCol, typename T, typename Row>
 DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int n_cols,
                            int packs, T* __restrict__ out, int64_t out_stride,
                            int out_col0) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  __shared__ float partial[kGemmMaxWaves][kGemmRows][kGemmTile];
-  const int lane   = threadIdx.x % 64;
-  const int wave   = threadIdx.x / 64;
-  const int waves  = blockDim.x / 64;
-  const int column = lane % kGemmTile;
-  const int splits = waves * kGemmLanesPerCol;
-  const int split  = wave * kGemmLanesPerCol + lane / kGemmTile;
+  constexpr int kTile = kWaveSize / kLanesPerCol;
+  static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
+  __shared__ float partial[kMaxWaves][kGemmRows][kTile];
+  const int lane   = threadIdx.x % kWaveSize;
+  const int wave   = threadIdx.x / kWaveSize;
+  const int waves  = blockDim.x / kWaveSize;
+  const int column = lane % kTile;
+  const int splits = waves * kLanesPerCol;
+  const int split  = wave * kLanesPerCol + lane / kTile;
   const V* wv      = reinterpret_cast<const V*>(gemm_w);
-  const int tiles  = (n_cols + kGemmTile - 1) / kGemmTile;
+  const int tiles  = (n_cols + kTile - 1) / kTile;
   const V* x[kGemmRows];
 #pragma unroll
   for (int r = 0; r < kGemmRows; ++r) x[r] = row(r < rows ? r : 0);
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
-    const int n   = tile * kGemmTile + column;
+    const int n   = tile * kTile + column;
     const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
     float acc[kGemmRows];
 #pragma unroll
@@ -361,23 +364,23 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
         for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
       }
     }
-    // The column's four lanes are kGemmTile apart in the wave.
+    // A column's lanes are kTile apart in the wave.
 #pragma unroll
-    for (int r = 0; r < kGemmRows; ++r) {
-      acc[r] += __shfl_xor(acc[r], kGemmTile, 64);
-      acc[r] += __shfl_xor(acc[r], 2 * kGemmTile, 64);
-    }
-    if (lane < kGemmTile) {
+    for (int r = 0; r < kGemmRows; ++r)
+#pragma unroll
+      for (int s = kTile; s < kWaveSize; s <<= 1)
+        acc[r] += __shfl_xor(acc[r], s, kWaveSize);
+    if (lane < kTile) {
 #pragma unroll
       for (int r = 0; r < kGemmRows; ++r) partial[wave][r][column] = acc[r];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < kGemmRows * kGemmTile; i += blockDim.x) {
-      const int r   = i / kGemmTile;
-      const int col = tile * kGemmTile + i % kGemmTile;
+    for (int i = threadIdx.x; i < kGemmRows * kTile; i += blockDim.x) {
+      const int r   = i / kTile;
+      const int col = tile * kTile + i % kTile;
       if (r < rows && col < n_cols) {
         float v = 0.0f;
-        for (int q = 0; q < waves; ++q) v += partial[q][r][i % kGemmTile];
+        for (int q = 0; q < waves; ++q) v += partial[q][r][i % kTile];
         T* at = out + r * out_stride + out_col0 + col;
         *at   = static_cast<T>(static_cast<float>(*at) + v);
       }
