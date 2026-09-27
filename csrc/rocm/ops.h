@@ -83,7 +83,7 @@ void rocm_comms_all_reduce_rms_norm(fptr_t comms, torch::Tensor& out, torch::Ten
                                     torch::Tensor& weight, double eps, int64_t algo,
                                     int64_t small_limit, int64_t blocks, int64_t threads);
 
-void rocm_comms_all_reduce_fused_add_rms_norm(fptr_t comms, torch::Tensor& out,
+void rocm_comms_all_reduce_add_rms_norm(fptr_t comms, torch::Tensor& out,
                                               torch::Tensor& residual_out,
                                               torch::Tensor& inp, torch::Tensor& residual,
                                               torch::Tensor& weight, double eps,

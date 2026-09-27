@@ -972,7 +972,7 @@ NO_FUSED_KERNEL = "no fused kernel"
 
 FUSED_EPS = 1e-5
 # all_reduce -> rms_norm, and all_reduce -> fused_add_rms_norm.
-FORMS = ("rms_norm", "fused_add_rms_norm")
+FORMS = ("rms_norm", "add_rms_norm")
 # Kimi-K3's latent MoE row (3584) and hidden row (7168), then the sweep's 8192. Four
 # rows is fewer than the ranks, which two-shot must still get right.
 FUSED_SHAPES = (
@@ -1050,9 +1050,9 @@ def run_fused_rank(
                 got = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS)
                 got_residual = None
             else:
-                if not comm.should_allreduce_fused_add_rms_norm(mine):
+                if not comm.should_allreduce_add_rms_norm(mine):
                     return False, NO_FUSED_KERNEL
-                got, got_residual = comm.all_reduce_fused_add_rms_norm(
+                got, got_residual = comm.all_reduce_add_rms_norm(
                     mine, residual.to(device), weight.to(device), FUSED_EPS
                 )
         want, want_residual = _fused_reference(form, inputs, residual, weight)

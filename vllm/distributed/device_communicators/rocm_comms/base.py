@@ -97,11 +97,11 @@ class Communicator(ABC):
         "__init__",
         "should_allreduce",
         "should_allreduce_rms_norm",
-        "should_allreduce_fused_add_rms_norm",
+        "should_allreduce_add_rms_norm",
         "should_allreduce_add_attn_res_rms_norm",
         "all_reduce",
         "all_reduce_rms_norm",
-        "all_reduce_fused_add_rms_norm",
+        "all_reduce_add_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
         "capture",
         "_is_supported",
@@ -190,11 +190,11 @@ class Communicator(ABC):
             and self._fits_rms_norm(inp)
         )
 
-    def should_allreduce_fused_add_rms_norm(self, inp: torch.Tensor) -> bool:
+    def should_allreduce_add_rms_norm(self, inp: torch.Tensor) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
         return (
-            type(self)._all_reduce_fused_add_rms_norm
-            is not Communicator._all_reduce_fused_add_rms_norm
+            type(self)._all_reduce_add_rms_norm
+            is not Communicator._all_reduce_add_rms_norm
             and self.should_allreduce(inp)
             and self._fits_rms_norm(inp)
         )
@@ -260,7 +260,7 @@ class Communicator(ABC):
             )
         return self._all_reduce_rms_norm(inp, weight, eps)
 
-    def all_reduce_fused_add_rms_norm(
+    def all_reduce_add_rms_norm(
         self,
         inp: torch.Tensor,
         residual: torch.Tensor,
@@ -269,16 +269,16 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, then the sum plus residual."""
-        self._check_capture("all_reduce_fused_add_rms_norm")
-        if not self.should_allreduce_fused_add_rms_norm(inp):
+        self._check_capture("all_reduce_add_rms_norm")
+        if not self.should_allreduce_add_rms_norm(inp):
             raise RuntimeError(
                 self._rejected(
-                    "all_reduce_fused_add_rms_norm",
-                    "should_allreduce_fused_add_rms_norm",
+                    "all_reduce_add_rms_norm",
+                    "should_allreduce_add_rms_norm",
                     inp,
                 )
             )
-        return self._all_reduce_fused_add_rms_norm(inp, residual, weight, eps)
+        return self._all_reduce_add_rms_norm(inp, residual, weight, eps)
 
     def should_allreduce_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
@@ -433,7 +433,7 @@ class Communicator(ABC):
             f"ask should_allreduce_rms_norm first."
         )
 
-    def _all_reduce_fused_add_rms_norm(
+    def _all_reduce_add_rms_norm(
         self,
         inp: torch.Tensor,
         residual: torch.Tensor,
@@ -442,7 +442,7 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm; "
-            f"ask should_allreduce_fused_add_rms_norm first."
+            f"ask should_allreduce_add_rms_norm first."
         )
 
     def _all_reduce_add_attn_res_rms_norm(

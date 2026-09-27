@@ -129,7 +129,7 @@ def _hip_cases(
             if norm == "rms_norm":
                 fused_fn = lambda x, r, w: comm.all_reduce_rms_norm(x, w, EPS)  # noqa: E731
             else:
-                fused_fn = lambda x, r, w: comm.all_reduce_fused_add_rms_norm(  # noqa: E731
+                fused_fn = lambda x, r, w: comm.all_reduce_add_rms_norm(  # noqa: E731
                     x, r, w, EPS
                 )[0]
             yield Case(

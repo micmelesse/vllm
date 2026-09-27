@@ -335,7 +335,7 @@ class HipCommunicator(Communicator):
         )
         return prefix_out, out
 
-    def _all_reduce_fused_add_rms_norm(
+    def _all_reduce_add_rms_norm(
         self,
         inp: torch.Tensor,
         residual: torch.Tensor,
@@ -346,7 +346,7 @@ class HipCommunicator(Communicator):
         cfg = self.hip_tunables
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(inp)
-        torch.ops._rocm_C.rocm_comms_all_reduce_fused_add_rms_norm(
+        torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
             self._handle,
             out,
             residual_out,

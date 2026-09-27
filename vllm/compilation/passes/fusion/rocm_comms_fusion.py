@@ -37,7 +37,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.rocm_comms.fusion import (
-    ALL_REDUCE_FUSED_ADD_RMS_NORM_OP,
+    ALL_REDUCE_ADD_RMS_NORM_OP,
     ALL_REDUCE_RMS_NORM_OP,
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
@@ -103,7 +103,7 @@ class HipAllReduceRMSNormPattern(BasePattern, VllmPatternReplacement):
         return _replacement
 
 
-class HipAllReduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
+class HipAllReduceAddRMSNormPattern(BasePattern, VllmPatternReplacement):
     """`all_reduce` then `fused_add_rms_norm`: the per-layer form in a standard
     decoder."""
 
@@ -133,7 +133,7 @@ class HipAllReduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
         def _replacement(
             residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            fused = ALL_REDUCE_FUSED_ADD_RMS_NORM_OP(
+            fused = ALL_REDUCE_ADD_RMS_NORM_OP(
                 input_=input,
                 residual=residual,
                 weight=weight,
@@ -187,9 +187,7 @@ class RocmHipAllReduceFusionPass(VllmFusionPatternMatcherPass):
             # smaller one first lets it consume the `all_reduce` node and strand the
             # trailing add as its own kernel -- the ordering aiter's pass learned.
             self.register(
-                HipAllReduceFusedAddRMSNormPattern(
-                    epsilon, self.model_dtype, self.device
-                )
+                HipAllReduceAddRMSNormPattern(epsilon, self.model_dtype, self.device)
             )
             self.register(
                 HipAllReduceRMSNormPattern(epsilon, self.model_dtype, self.device)

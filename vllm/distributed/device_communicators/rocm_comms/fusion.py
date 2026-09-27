@@ -4,7 +4,7 @@
 """The fused custom ops a torch.compile pass rewrites the graph to call.
 
     rocm_comms_all_reduce_rms_norm            all_reduce -> ir.ops.rms_norm
-    rocm_comms_all_reduce_fused_add_rms_norm  all_reduce -> ir.ops.fused_add_rms_norm
+    rocm_comms_all_reduce_add_rms_norm  all_reduce -> ir.ops.fused_add_rms_norm
 
 Free functions over schema types, not communicator methods: they find the live backend
 themselves (`rocm_comm` on the TP device communicator), so one set of peer buffers
@@ -85,7 +85,7 @@ def _all_reduce_rms_norm_fake(
     return torch.empty_like(input_)
 
 
-def _all_reduce_fused_add_rms_norm_impl(
+def _all_reduce_add_rms_norm_impl(
     input_: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -94,15 +94,15 @@ def _all_reduce_fused_add_rms_norm_impl(
     comm = _rocm_comm()
     if (
         comm is not None
-        and comm.should_allreduce_fused_add_rms_norm(input_)
+        and comm.should_allreduce_add_rms_norm(input_)
         and _weight_fits(input_, weight)
     ):
-        return comm.all_reduce_fused_add_rms_norm(input_, residual, weight, epsilon)
-    _warn_unfused("rocm_comms_all_reduce_fused_add_rms_norm")
+        return comm.all_reduce_add_rms_norm(input_, residual, weight, epsilon)
+    _warn_unfused("rocm_comms_all_reduce_add_rms_norm")
     return vllm.ir.ops.fused_add_rms_norm(_summed(input_), residual, weight, epsilon)
 
 
-def _all_reduce_fused_add_rms_norm_fake(
+def _all_reduce_add_rms_norm_fake(
     input_: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -117,12 +117,10 @@ direct_register_custom_op(
     fake_impl=_all_reduce_rms_norm_fake,
 )
 direct_register_custom_op(
-    op_name="rocm_comms_all_reduce_fused_add_rms_norm",
-    op_func=_all_reduce_fused_add_rms_norm_impl,
-    fake_impl=_all_reduce_fused_add_rms_norm_fake,
+    op_name="rocm_comms_all_reduce_add_rms_norm",
+    op_func=_all_reduce_add_rms_norm_impl,
+    fake_impl=_all_reduce_add_rms_norm_fake,
 )
 
 ALL_REDUCE_RMS_NORM_OP = torch.ops.vllm.rocm_comms_all_reduce_rms_norm.default
-ALL_REDUCE_FUSED_ADD_RMS_NORM_OP = (
-    torch.ops.vllm.rocm_comms_all_reduce_fused_add_rms_norm.default
-)
+ALL_REDUCE_ADD_RMS_NORM_OP = torch.ops.vllm.rocm_comms_all_reduce_add_rms_norm.default

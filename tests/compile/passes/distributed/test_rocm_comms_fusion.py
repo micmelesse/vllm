@@ -5,7 +5,7 @@
 Three all-reduces in one graph:
     a -> rms_norm only               fused: rocm_comms_all_reduce_rms_norm
     b -> rms_norm, and b used again  NOT fused: skipping b would lose that use
-    c -> fused_add_rms_norm          fused: rocm_comms_all_reduce_fused_add_rms_norm
+    c -> fused_add_rms_norm          fused: rocm_comms_all_reduce_add_rms_norm
 and the compiled model must agree with the eager one.
 """
 
@@ -33,7 +33,7 @@ from vllm.config import (
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.rocm_comms.fusion import (
-    ALL_REDUCE_FUSED_ADD_RMS_NORM_OP,
+    ALL_REDUCE_ADD_RMS_NORM_OP,
     ALL_REDUCE_RMS_NORM_OP,
 )
 from vllm.distributed.parallel_state import (
@@ -125,9 +125,7 @@ def _run(local_rank: int, world_size: int, port: int, hidden_size: int, tokens: 
         backend.check_before_ops(
             [torch.ops.vllm.all_reduce.default], fully_replaced=False
         )
-        backend.check_after_ops(
-            [ALL_REDUCE_RMS_NORM_OP, ALL_REDUCE_FUSED_ADD_RMS_NORM_OP]
-        )
+        backend.check_after_ops([ALL_REDUCE_RMS_NORM_OP, ALL_REDUCE_ADD_RMS_NORM_OP])
 
 
 @multi_gpu_test(num_gpus=2)

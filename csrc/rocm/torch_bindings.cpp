@@ -124,11 +124,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm);
   rocm_ops.def(
-      "rocm_comms_all_reduce_fused_add_rms_norm(int comms, Tensor! out, "
+      "rocm_comms_all_reduce_add_rms_norm(int comms, Tensor! out, "
       "Tensor! residual_out, Tensor inp, Tensor residual, Tensor weight, float eps, "
       "int algo, int small_limit, int blocks, int threads) -> ()");
-  rocm_ops.impl("rocm_comms_all_reduce_fused_add_rms_norm", torch::kCUDA,
-                &rocm_comms_all_reduce_fused_add_rms_norm);
+  rocm_ops.impl("rocm_comms_all_reduce_add_rms_norm", torch::kCUDA,
+                &rocm_comms_all_reduce_add_rms_norm);
 
   rocm_ops.def(
       "rocm_comms_all_reduce_add_attn_res_rms_norm(int comms, Tensor! prefix, Tensor! out, Tensor inp, "
