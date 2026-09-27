@@ -150,13 +150,13 @@ class Comm {
   DINLINE void put(int peer, int64_t idx, const V& v) const {
     check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "put", peer, idx,
           p_.scratch_packs_);
-    scratch_[peer][idx] = v;
+    scratch_of(peer)[idx] = v;
   }
 
   DINLINE V get(int peer, int64_t idx) const {
     check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "get", peer, idx,
           p_.scratch_packs_);
-    return scratch_[peer][idx];
+    return scratch_of(peer)[idx];
   }
 
   // The grid on this device, then one exchange with the peers by the last block to
@@ -195,6 +195,17 @@ class Comm {
   }
 
  private:
+  // BY SELECT, NOT `scratch_[peer]`: a runtime index into a register array moves the
+  // array to scratch memory, and every put and get would load its pointer from there
+  // first.
+  DINLINE V* scratch_of(int peer) const {
+    V* at = scratch_[0];
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i)
+      if (peer == i) at = scratch_[i];
+    return at;
+  }
+
   // Block b waits for block b on every rank, and for no other block: enough at the ends,
   // where it says "every peer has launched" or "every peer is done reading me", and not
   // enough between phases, which is what `sync` is for.

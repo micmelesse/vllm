@@ -331,39 +331,41 @@ DINLINE void gemm_add_rows(Load load, int rows, const T* __restrict__ gemm_w, in
     for (int r = 0; r < kGemmRows; ++r)
 #pragma unroll
       for (int q = 0; q < kGemmCols; ++q) acc[r][q] = 0.0f;
+    // EVERY LOOP OVER r AND q HAS A CONSTANT TRIP COUNT, predicated on rows and n_cols
+    // rather than broken out of: a runtime bound stops the unroll, `acc[r]` becomes a
+    // runtime index, and the accumulators move to scratch memory (536 bytes/lane, 10x
+    // slower, 2026-09-27).
     for (int k = lane; k < packs; k += warpSize) {
       float w[kGemmCols][NL];
 #pragma unroll
       for (int q = 0; q < kGemmCols; ++q) {
-        if (c0 + q >= n_cols) break;
-        const V x = wv[(c0 + q) * packs + k];
+        V x{};
+        if (c0 + q < n_cols) x = wv[(c0 + q) * packs + k];
 #pragma unroll
         for (int j = 0; j < NL; ++j) w[q][j] = static_cast<float>(x.d[j]);
       }
 #pragma unroll
       for (int r = 0; r < kGemmRows; ++r) {
-        if (r >= rows) break;
-        const V x = load(r, k);
+        V x{};
+        if (r < rows) x = load(r, k);
         float a[NL];
 #pragma unroll
         for (int j = 0; j < NL; ++j) a[j] = static_cast<float>(x.d[j]);
 #pragma unroll
-        for (int q = 0; q < kGemmCols; ++q) {
-          if (c0 + q >= n_cols) break;
+        for (int q = 0; q < kGemmCols; ++q)
 #pragma unroll
           for (int j = 0; j < NL; ++j) acc[r][q] += a[j] * w[q][j];
-        }
       }
     }
     // The wave's partial sums, reduced so every lane holds every total; lane (r, q) writes.
 #pragma unroll
     for (int r = 0; r < kGemmRows; ++r) {
-      if (r >= rows) break;
 #pragma unroll
       for (int q = 0; q < kGemmCols; ++q) {
         float v = acc[r][q];
-        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_xor(v, off, warpSize);
-        if (lane == r * kGemmCols + q && c0 + q < n_cols) {
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+        if (r < rows && lane == r * kGemmCols + q && c0 + q < n_cols) {
           T* at = out + r * out_stride + out_col0 + c0 + q;
           *at   = static_cast<T>(static_cast<float>(*at) + v);
         }
