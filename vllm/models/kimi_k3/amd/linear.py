@@ -11,6 +11,8 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -161,6 +163,64 @@ def _apply_attn_res(
         norm.variance_epsilon,
         0.0 if output_norm is None else output_norm.variance_epsilon,
     )
+
+
+def _fusing_comm() -> Any | None:
+    """Our all-reduce backend (rocm_comms, hip) when the all-reduces that feed AttnRes
+    can be deferred into it: live, TP above one, and no pipeline split (a stage
+    boundary needs the sum). None otherwise, and every all-reduce stays where it is."""
+    if get_tensor_model_parallel_world_size() <= 1 or get_pp_group().world_size > 1:
+        return None
+    comm = getattr(get_tp_group().device_communicator, "rocm_comm", None)
+    return None if comm is None or comm.disabled else comm
+
+
+def _all_reduce_add_attn_res_rms_norm(
+    partial: torch.Tensor,
+    prefix_sum: torch.Tensor | None,
+    block_residual: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    num_valid_blocks: int,
+    *,
+    output_norm: RMSNorm | None = None,
+    block_write_idx: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce `partial`, add it to `prefix_sum` (or, with none, start the prefix
+    with it), then AttnRes and its output norm: one kernel where our backend takes the
+    input, else the all-reduce and the Triton kernel it replaces. Returns (prefix,
+    output)."""
+    comm = _fusing_comm()
+    weights = (
+        norm.weight,
+        proj.weight.squeeze(0),
+        None if output_norm is None else output_norm.weight,
+    )
+    out_eps = 0.0 if output_norm is None else output_norm.variance_epsilon
+    if comm is not None and comm.should_allreduce_add_attn_res_rms_norm(partial):
+        return comm.all_reduce_add_attn_res_rms_norm(
+            partial,
+            prefix_sum,
+            block_residual,
+            *weights,
+            num_valid_blocks,
+            block_write_idx,
+            norm.variance_epsilon,
+            out_eps,
+        )
+    summed = tensor_model_parallel_all_reduce(partial)
+    prefix = summed if prefix_sum is None else prefix_sum
+    out = attn_res(
+        prefix,
+        None if prefix_sum is None else summed,
+        block_residual,
+        *weights,
+        num_valid_blocks,
+        block_write_idx,
+        norm.variance_epsilon,
+        out_eps,
+    )
+    return prefix, out
 
 
 class KimiMoE(nn.Module):
@@ -576,6 +636,23 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
+        # THE TWO ALL-REDUCES THAT FEED AttnRes MOVE INTO IT when our backend can take
+        # them: the attention output and the MLP output are handed on as per-rank
+        # partial sums, and the AttnRes that consumes each reduces it in the same
+        # kernel. Set on the built modules, as deepseek_v32 does for its MoE; both flags
+        # are read at forward time.
+        self.defer_all_reduce = (
+            self.use_attn_residuals
+            and hasattr(self.self_attn, "o_proj")
+            and _fusing_comm() is not None
+        )
+        if self.defer_all_reduce:
+            self.self_attn.o_proj.reduce_results = False
+            if isinstance(self.mlp, KimiMoE):
+                self.mlp.experts.moe_config.skip_final_all_reduce = True
+            else:
+                self.mlp.down_proj.reduce_results = False
+
     def _run_self_attn(
         self,
         positions: torch.Tensor,
@@ -625,6 +702,10 @@ class KimiDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         prefix_delta: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.defer_all_reduce:
+            return self._forward_attn_residual_deferred(
+                positions, hidden_states, block_residual, prefix_delta
+            )
         prefix_sum = hidden_states
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -663,6 +744,60 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.mlp(hidden_states)
         return prefix_sum, block_residual, hidden_states
+
+    def _forward_attn_residual_deferred(
+        self,
+        positions: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+        prefix_delta: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`forward_attn_residual` with the attention and MLP outputs left UNREDUCED:
+        each is reduced by the AttnRes that consumes it. `prefix_delta` is the previous
+        layer's MLP partial (None at the first layer), and the MLP partial this returns
+        is the next layer's."""
+        write = self.block_write_idx if self.is_block_write_layer else -1
+        if prefix_delta is None:
+            hidden_states = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.prev_valid_blocks,
+                output_norm=self.input_layernorm,
+                block_write_idx=write,
+            )
+        else:
+            prefix_sum, hidden_states = _all_reduce_add_attn_res_rms_norm(
+                prefix_delta,
+                prefix_sum,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.prev_valid_blocks,
+                output_norm=self.input_layernorm,
+                block_write_idx=write,
+            )
+
+        attn_partial = self._run_self_attn(positions, hidden_states)
+
+        # A BLOCK-WRITE LAYER STARTS A NEW PREFIX with the attention output; any other
+        # adds it.
+        mlp_valid_blocks = self.prev_valid_blocks + (
+            1 if self.is_block_write_layer else 0
+        )
+        prefix_sum, hidden_states = _all_reduce_add_attn_res_rms_norm(
+            attn_partial,
+            None if self.is_block_write_layer else prefix_sum,
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            mlp_valid_blocks,
+            output_norm=self.post_attention_layernorm,
+        )
+
+        mlp_partial = self.mlp(hidden_states)
+        return prefix_sum, block_residual, mlp_partial
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin):
@@ -818,6 +953,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
         prefix_delta = None
+        # A DEFERRED prefix_delta IS A PER-RANK PARTIAL, and the auxiliary hidden states
+        # below add it as if it were the sum: refused rather than read wrong.
+        if self.aux_hidden_state_layers and any(
+            getattr(layer, "defer_all_reduce", False)
+            for layer in self.layers[self.start_layer : self.end_layer]
+        ):
+            raise NotImplementedError(
+                "auxiliary hidden states with the AttnRes all-reduces deferred into "
+                "rocm_comms; unset VLLM_ROCM_COMMS_BACKEND for EAGLE"
+            )
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -843,14 +988,28 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states = _apply_attn_res(
-            hidden_states,
-            residual,
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-            attn_res_block_num,
-            delta=prefix_delta,
+        deferred = any(
+            getattr(layer, "defer_all_reduce", False)
+            for layer in self.layers[self.start_layer : self.end_layer]
         )
+        if deferred and prefix_delta is not None:
+            _, hidden_states = _all_reduce_add_attn_res_rms_norm(
+                prefix_delta,
+                hidden_states,
+                residual,
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                attn_res_block_num,
+            )
+        else:
+            hidden_states = _apply_attn_res(
+                hidden_states,
+                residual,
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                attn_res_block_num,
+                delta=prefix_delta,
+            )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
         if aux_hidden_states:
