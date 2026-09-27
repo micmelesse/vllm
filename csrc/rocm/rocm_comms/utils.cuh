@@ -86,12 +86,16 @@ constexpr int kMaxRowPacks = 4;
 //
 // The variance is taken from `s` before any further rounding, and `s` stays in registers
 // between the two passes, so nothing is read back.
-template <typename T, typename W, int ngpus, bool kAdd>
-DINLINE void add_rms_norm_row(const typename traits<T>::V* const ptrs[],
-                          const typename traits<T>::V* residual,
-                          const vec<W, traits<T>::N>* weight, int row, int packs,
-                          float inv_hidden, float eps, typename traits<T>::V* res_dst,
-                          typename traits<T>::V* out_dst) {
+//
+// `c` is the kernel's `ipc::Comm` (the sum comes from its `sum`); the results leave
+// through `store_res(i, v)` and `store_out(i, v)`, i the pack within the row, so a kernel
+// can land them in its output or in scratch through `put`.
+template <typename T, typename W, bool kAdd, typename C, typename StoreRes,
+          typename StoreOut>
+DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
+                              const vec<W, traits<T>::N>* weight, int row, int packs,
+                              float inv_hidden, float eps, StoreRes store_res,
+                              StoreOut store_out) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
@@ -101,7 +105,7 @@ DINLINE void add_rms_norm_row(const typename traits<T>::V* const ptrs[],
   for (int k = 0; k < kMaxRowPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
-    const V sum = reduce_at<T, ngpus>(ptrs, base + i);
+    const V sum = c.sum(base + i);
 #pragma unroll
     for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(sum.d[j]);
     if constexpr (kAdd) {
@@ -112,7 +116,7 @@ DINLINE void add_rms_norm_row(const typename traits<T>::V* const ptrs[],
         s[k][j] += static_cast<float>(r.d[j]);
         rounded.d[j] = static_cast<T>(s[k][j]);
       }
-      res_dst[i] = rounded;
+      store_res(i, rounded);
     }
 #pragma unroll
     for (int j = 0; j < NL; ++j) acc += s[k][j] * s[k][j];
@@ -130,7 +134,7 @@ DINLINE void add_rms_norm_row(const typename traits<T>::V* const ptrs[],
       const float xw = static_cast<float>(static_cast<W>(x * static_cast<float>(w.d[j])));
       o.d[j]         = static_cast<T>(xw);
     }
-    out_dst[i] = o;
+    store_out(i, o);
   }
   // Before the next row reuses `block_sum`'s shared slots.
   __syncthreads();

@@ -27,27 +27,20 @@ DINLINE void one_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
                                      int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  const int rank   = p.rank();
-  const V* ptrs[ngpus];
-#pragma unroll
-  for (int i = 0; i < ngpus; ++i)
-    ptrs[i] = p.input<V>((rank + i) % ngpus);
-
-  p.barrier_start<ngpus>();
-
+  ipc::Comm<T, ngpus> c(p);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   // Uniform across the block, so every `__syncthreads` inside is reached by every thread.
-  for (int row = blockIdx.x; row < rows; row += gridDim.x)
-    add_rms_norm_row<T, W, ngpus, kAdd>(ptrs, res_in, w, row, packs, inv_hidden, eps,
-                                    kAdd ? res_out + row * packs : nullptr,
-                                    o + row * packs);
-
-  // A rank that returns lets its INPUT be reused while a peer is still reading it.
-  p.barrier_end<ngpus, true>();
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    add_rms_norm_row<T, W, kAdd>(
+        c, res_in, w, row, packs, inv_hidden, eps,
+        [&](int i, const V& v) { res_out[row * packs + i] = v; },
+        [&](int i, const V& v) { o[row * packs + i] = v; });
+  }
+  c.close();
 }
 
 // THE KERNELS, one per op, both the body above.
