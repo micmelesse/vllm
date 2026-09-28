@@ -407,7 +407,7 @@ class Comm {
     const int at   = box.payload(region, src, g);
     const int sent = payload_packs<C>(n);
 #pragma unroll
-    for (int w = 0; w < C::kPayloadPacks; ++w) q[w] = w < sent ? get(rank(), at + w) : V{};
+    for (int w = 0; w < C::kPayloadPacks; ++w) q[w] = w < sent ? get_pushed(at + w) : V{};
     float scale = 1.0f;
     if constexpr (C::kScaled)
       if (n > 0) scale = get_float(rank(), box.scale(region, src, g));
@@ -597,6 +597,12 @@ class Comm {
     for (int w = 0; w < C::kPayloadPacks; ++w)
       if (w < sent) put(peer, at + w, q[w]);
     if constexpr (C::kScaled) put_float(peer, box.scale(region, rank(), g), scale);
+  }
+
+  // A pack peers pushed into this rank's scratch (see `load_uncached`).
+  DINLINE V get_pushed(int64_t idx) const {
+    check(idx < p_.scratch_packs_, "get_pushed", rank(), idx, p_.scratch_packs_);
+    return load_uncached(scratch_of(rank()) + idx);
   }
 
   // A float in peer's scratch, `idx` in floats: a scaled codec's scales.

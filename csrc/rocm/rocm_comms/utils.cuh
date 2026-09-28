@@ -53,6 +53,21 @@ DINLINE void store_global(V* p, const V& v) {
   *(global_u32x4*)(p) = raw;
 }
 
+// WHAT A PEER PUSHED, read past every cache (system-scope loads, `sc0 sc1`), as
+// QuickReduce reads what it receives: a peer's stores into this GPU's memory do not reach
+// this GPU's L2, so a plain load could return a line cached before they landed.
+template <typename V>
+DINLINE V load_uncached(const V* p) {
+  static_assert(sizeof(V) == 16, "a pack is 16 bytes");
+  const auto* q     = reinterpret_cast<const uint64_t*>(p);
+  const uint64_t raw[2] = {
+      __scoped_atomic_load_n(q, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM),
+      __scoped_atomic_load_n(q + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)};
+  V v;
+  __builtin_memcpy(&v, raw, 16);
+  return v;
+}
+
 // PACKS PER PEER A THREAD HAS IN FLIGHT in a batched `sum`: bandwidth is bytes in flight
 // over latency, and one pack per peer per wait left the one-shot at a quarter of aiter's.
 constexpr int kSumBatch = 4;

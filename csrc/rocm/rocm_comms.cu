@@ -206,17 +206,18 @@ void by_bits(int bits, F&& f) {
 
 // ONE CASE PER KERNEL: `CASE_PULL(kernel, args, template args...)` launches
 // allreduce_<kernel>; `CASE_PUSH` the same at the launch's codec bits, which the template
-// arguments name as kB. Every op's launch is one switch over its kernels.
-#define LAUNCH_CFG dim3(l.grid), dim3(l.threads), 0, stream
+// arguments name as kB. Every op's launch is one switch over its kernels. The launch
+// configuration is spelled out: hipify parses `<<<...>>>` as text.
 #define CASE_PULL(KERNEL, ARGS, ...)                                                     \
   case Kernel::KERNEL:                                                                   \
-    allreduce_##KERNEL<__VA_ARGS__><<<LAUNCH_CFG>>>(ARGS);                               \
+    allreduce_##KERNEL<__VA_ARGS__><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(ARGS); \
     break;
 #define CASE_PUSH(KERNEL, ARGS, ...)                                                     \
   case Kernel::KERNEL:                                                                   \
     by_bits(l.quant_bits, [&](auto b) {                                                  \
       constexpr int kB = decltype(b)::value;                                             \
-      allreduce_##KERNEL<__VA_ARGS__><<<LAUNCH_CFG>>>(ARGS);                             \
+      allreduce_##KERNEL<__VA_ARGS__>                                                    \
+          <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(ARGS);                          \
     });                                                                                  \
     break;
 
@@ -516,7 +517,6 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
 #undef BY_NGPUS
 #undef CASE_PUSH
 #undef CASE_PULL
-#undef LAUNCH_CFG
 
 }  // namespace hip_comms
 
