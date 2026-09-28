@@ -12,20 +12,11 @@
 
 namespace hip_comms {
 
-// Each rank owns ceil(rows/ngpus) WHOLE rows, as the pull kernel does, and every transfer
-// is a store into a peer's inbox:
-//
-//   phase 1  each of our input rows, encoded, into its owner's inbox
-//   peer_block_barrier
-//   phase 2  our rows: reduced out of the inbox, prefix updated, AttnRes; the output row,
-//            encoded, and the prefix row, unquantized, into every rank's inboxes
-//   peer_block_barrier
-//   phase 3  every owner's rows out of our inboxes into `out`, `prefix` and the written
-//            block
-//
-// THE PREFIX IS NEVER QUANTIZED (Codec 16 whatever kBits): it is the running residual.
-// Phase 2 reads the replicated `prefix` and `blocks` of a row and phase 3 overwrites them,
-// both in the one block that takes that local row, so the order is the block's own.
+// Each rank owns whole rows, as the pull kernel does, and every transfer is a store into
+// a peer's slot: each input row, encoded, to its owner; barrier; the owner reduces, runs
+// AttnRes and shares the out row (encoded) and the prefix row with every rank; barrier;
+// every rank gathers. THE PREFIX IS NEVER QUANTIZED (16 bits whatever kBits): it is the
+// running residual.
 template <typename T, int ngpus, int kBits, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_push_add_attn_res_rms_norm(
@@ -33,55 +24,52 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
         int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
-  using V            = typename traits<T>::V;
-  using C            = p2p::Codec<T, kBits>;
-  using R            = p2p::Codec<T, 16>;
-  constexpr int NL   = traits<T>::N;
-  namespace fusion   = fusions::add_attn_res_rms_norm;
-  const auto w       = p2p::start<T, ngpus>(p);
-  const int rank     = p.rank;
-  const int chunk    = (rows + ngpus - 1) / ngpus;
-  const auto box_in  = p2p::push::row_inbox<C>(w, chunk);
-  const auto box_out = p2p::push::row_inbox<C>(w, chunk, box_in.end());
-  const auto box_pre = p2p::push::row_inbox<R>(w, chunk, box_out.end());
-  p2p::push::scatter_rows(w, box_in, chunk, rows, packs);
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::add_attn_res_rms_norm;
+  const auto w           = p2p::start<T, ngpus>(p);
+  const auto tiling      = tiles::rows_of(rows, packs);
+  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+  V* pre                 = reinterpret_cast<V*>(prefix);
+  V* o                   = reinterpret_cast<V*>(out);
+  // The block row `row` writes, or none.
+  auto written = [&](int row) -> V* {
+    return write_idx < 0 ? nullptr
+                         : reinterpret_cast<V*>(blocks + row * block_stride_m +
+                                                write_idx * block_stride_r);
+  };
+  const auto mine        = tiles::owned(tiling, p.rank, ngpus);
+  const auto in          = p2p::push::slot<kBits>(w, tiling, p2p::To::owners);
+  const auto out_slot    = p2p::push::slot<kBits>(w, tiling, p2p::To::owners, in);
+  const auto pre_slot    = p2p::push::slot<16>(w, tiling, p2p::To::owners, out_slot);
 
-  p2p::peer_block_barrier(w);
+  p2p::push::scatter(w, in, tiling);
 
-  {
-    const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-    const int begin        = rank * chunk;
-    const int end          = min(begin + chunk, rows);
-    for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
-      V sum[kMaxRowPacks];
-      p2p::push::reduce_row(w, box_in, row - begin, packs, sum);
-      V mixed[kMaxRowPacks] = {}, pre[kMaxRowPacks] = {};
-      fusion::row<T, kPrefix>(
-          sum, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
-          block_stride_r, reinterpret_cast<const V*>(norm_w),
-          reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
-          num_blocks, row, packs, inv_hidden, eps, out_eps,
-          [&](int k, int, const V& v) { pre[k] = v; },
-          [&](int k, int, const V& v) { mixed[k] = v; });
-      p2p::push::broadcast_row(w, box_out, row - begin, packs, mixed);
-      p2p::push::broadcast_row(w, box_pre, row - begin, packs, pre);
-    }
+  p2p::peer_barrier(w);
+
+  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+    V sum[kMaxRowPacks];
+    p2p::push::reduce(w, in, tiling, row, sum);
+    V mixed[kMaxRowPacks] = {}, shared_pre[kMaxRowPacks] = {};
+    fusion::row<T, kPrefix>(
+        sum, pre, blocks + row * block_stride_m, block_stride_r,
+        reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
+        reinterpret_cast<const V*>(out_norm_w), num_blocks, row, packs, inv_hidden, eps,
+        out_eps, [&](int k, int, const V& v) { shared_pre[k] = v; },
+        [&](int k, int, const V& v) { mixed[k] = v; });
+    p2p::push::share(w, out_slot, tiling, row, mixed);
+    p2p::push::share(w, pre_slot, tiling, row, shared_pre);
   }
 
-  p2p::peer_block_barrier(w);
+  p2p::peer_barrier(w);
 
-  V* o   = reinterpret_cast<V*>(out);
-  V* pre = reinterpret_cast<V*>(prefix);
-  p2p::push::gather_rows(w, box_out, chunk, rows, packs, [&](int row, int i, const V& v) {
+  p2p::push::gather(w, out_slot, tiling, [&](int row, int i, const V& v) {
     store_global(o + row * packs + i, v);
   });
-  p2p::push::gather_rows(
-      w, box_pre, chunk, rows, packs, [&](int row, int i, const V& v) {
-        store_global(pre + row * packs + i, v);
-        if (write_idx >= 0)
-          store_global(reinterpret_cast<V*>(blocks + row * block_stride_m +
-                                            write_idx * block_stride_r) + i, v);
-      });
+  p2p::push::gather(w, pre_slot, tiling, [&](int row, int i, const V& v) {
+    store_global(pre + row * packs + i, v);
+    if (V* dst = written(row)) store_global(dst + i, v);
+  });
 }
 
 }  // namespace hip_comms

@@ -58,19 +58,20 @@ struct Peers {
   uint64_t timeout_ticks;      // a wait longer than this traps
 };
 
-// THE INBOX LAYOUT'S SIZE, which the host needs to size scratch and push.cuh's `Groups`
-// and `Inbox` lay out on the device (they must agree): a buffer span's groups at a grid of
-// `grid_threads`, and the packs of an inbox of `groups` groups at kbits (16: T itself).
-// A group is kSumBatch packs.
-inline int64_t buffer_groups(int64_t span, int64_t grid_threads) {
-  const int64_t per_iter = grid_threads * kSumBatch;
-  return (span + per_iter - 1) / per_iter * grid_threads;
+// THE SLOT SIZES, in packs, which the host needs to size scratch and pull.cuh / push.cuh
+// lay out on the device (they must agree). A pull slot holds this rank's rows of a
+// two-shot, plain; a push slot holds, per source rank, a group per thread per row it
+// holds (`held`: every row for a one-shot, a rank's rows for a two-shot) at kbits (16: T
+// itself), then the scales of a scaled codec.
+inline int64_t pull_slot_packs(const tiles::Rows& rows, int world) {
+  return int64_t{tiles::chunk_of(rows, world)} * rows.packs;
 }
 
-inline int64_t inbox_packs(int kbits, int regions, int world, int64_t groups) {
+inline int64_t push_slot_packs(int kbits, int64_t held, int threads, int world) {
+  const int64_t groups  = held * threads;
   const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
   const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
-  return int64_t{regions} * world * (groups * payload + scales);
+  return int64_t{world} * (groups * payload + scales);
 }
 
 }  // namespace hip_comms::p2p

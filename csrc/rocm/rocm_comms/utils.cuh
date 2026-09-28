@@ -10,6 +10,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstdint>
 
 #define DINLINE __device__ __forceinline__
 
@@ -128,7 +129,80 @@ DINLINE float2 block_sum2(float a, float b) {
 // How many 16-byte packs of one row a thread holds in registers: packs threadIdx.x +
 // k * blockDim.x, k < kMaxRowPacks. A row wider than kMaxRowPacks x blockDim is refused by
 // the host. The same as kSumBatch, so a thread's share of a row is one batched `sum` and
-// one push GROUP (a row group in p2p/impl/push.cuh).
+// one push group.
 constexpr int kMaxRowPacks = kSumBatch;
+
+// =================================================================================
+// ROWS, THE ONE WORK DISTRIBUTION. Block b takes rows b, b + grid, ...; thread t of a
+// block holds packs t + k x blockDim of a row, k < kMaxRowPacks. A fused op's rows are
+// its tokens; a plain buffer is cut into rows sized to the launch (`buffer_rows`), its
+// last row short. `size` is the packs that exist. A two-shot splits the rows into ranks:
+// rank r owns rows [r x chunk, r x chunk + chunk).
+// =================================================================================
+namespace tiles {
+
+struct Rows {
+  int rows;
+  int packs;
+  int size;
+};
+
+__host__ __device__ inline Rows rows_of(int rows, int packs) {
+  return {rows, packs, rows * packs};
+}
+
+// A buffer of `size` packs at `grid` x `threads`: rows `threads` x u packs wide, u the
+// fewest packs a thread needs (at most kMaxRowPacks) for the grid to cover the buffer in
+// one pass, so a small buffer still spreads over every block.
+__host__ __device__ inline Rows buffer_rows(int64_t size, int grid, int threads) {
+  const int64_t pass = int64_t{grid} * threads;
+  int64_t u          = (size + pass - 1) / pass;
+  u                  = u < 1 ? 1 : (u > kMaxRowPacks ? kMaxRowPacks : u);
+  const int packs    = static_cast<int>(u) * threads;
+  return {static_cast<int>((size + packs - 1) / packs), packs, static_cast<int>(size)};
+}
+
+DINLINE Rows buffer_rows(int size) { return buffer_rows(size, gridDim.x, blockDim.x); }
+
+// The rows a rank owns in a two-shot.
+__host__ __device__ inline int chunk_of(const Rows& r, int world) {
+  return (r.rows + world - 1) / world;
+}
+
+struct Owned {
+  int begin;
+  int end;
+};
+
+__host__ __device__ inline Owned owned(const Rows& r, int rank, int world) {
+  const int chunk = chunk_of(r, world);
+  const int begin = rank * chunk;
+  return {begin, begin + chunk < r.rows ? begin + chunk : r.rows};
+}
+
+// This thread's pack k of a row, within the row; whether it exists; how many do (the
+// ones that exist are a prefix of k).
+DINLINE int pack(int k) { return threadIdx.x + k * blockDim.x; }
+
+DINLINE bool has(const Rows& r, int row, int k) {
+  return pack(k) < r.packs && row * r.packs + pack(k) < r.size;
+}
+
+DINLINE int members(const Rows& r, int row) {
+  int n = 0;
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) n += has(r, row, k) ? 1 : 0;
+  return n;
+}
+
+// This thread's share of `row` into `dst`, a [size]-pack buffer.
+template <typename V>
+DINLINE void store_row(V* dst, const Rows& r, int row, const V (&v)[kMaxRowPacks]) {
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k)
+    if (has(r, row, k)) store_global(dst + row * r.packs + pack(k), v[k]);
+}
+
+}  // namespace tiles
 
 }  // namespace hip_comms

@@ -12,70 +12,53 @@
 
 namespace hip_comms {
 
-// Each rank owns ceil(rows/ngpus) WHOLE rows, as the pull kernel does, and every transfer
-// is a store into a peer's inbox:
-//
-//   phase 1  each of our input rows, encoded, into its owner's inbox
-//   peer_block_barrier
-//   phase 2  our rows: reduced out of the inbox and normed; the normed row, encoded, into
-//            every rank's inbox
-//   peer_block_barrier
-//   phase 3  every owner's normed rows out of our inbox, plain, into our scratch after
-//            the inboxes
-//   grid_barrier
-//   phase 4  the GEMM over every row, kRows rows per pass, from our own scratch
-//
-// The same roundings as the pull kernel (the normed rows land as T; a codec below 16
-// bits rounds them further). kLanesPerCol is the GEMM's lanes per column, tuned in
-// launch.cuh.
+// Each rank owns whole rows, as the pull kernel does, and every transfer is a store into
+// a peer's slot: each input row, encoded, to its owner; barrier; the owner reduces, norms
+// and shares the normed row (encoded) with every rank; barrier; every rank gathers every
+// normed row into `workspace`; a grid barrier; the GEMM, fusion::kRows rows per pass.
 template <typename T, int ngpus, int kBits, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_push_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
-    int packs) {
-  using V            = typename traits<T>::V;
-  using C            = p2p::Codec<T, kBits>;
-  constexpr int NL   = traits<T>::N;
-  namespace fusion   = fusions::rms_norm_gemm_add;
-  const auto w       = p2p::start<T, ngpus>(p);
-  const int rank     = p.rank;
-  const int chunk    = (rows + ngpus - 1) / ngpus;
-  const auto box_in  = p2p::push::row_inbox<C>(w, chunk);
-  const auto box_out = p2p::push::row_inbox<C>(w, chunk, box_in.end());
-  // Every normed row, plain, after the inboxes.
-  const int normed = box_out.end();
-  p2p::push::scatter_rows(w, box_in, chunk, rows, packs);
+    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    T* __restrict__ workspace, int rows, int packs) {
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::rms_norm_gemm_add;
+  const auto w           = p2p::start<T, ngpus>(p);
+  const auto tiling      = tiles::rows_of(rows, packs);
+  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+  const V* weight        = reinterpret_cast<const V*>(norm_w);
+  V* normed              = reinterpret_cast<V*>(workspace);
+  const auto mine        = tiles::owned(tiling, p.rank, ngpus);
+  const auto in          = p2p::push::slot<kBits>(w, tiling, p2p::To::owners);
+  const auto slot        = p2p::push::slot<kBits>(w, tiling, p2p::To::owners, in);
 
-  p2p::peer_block_barrier(w);
+  p2p::push::scatter(w, in, tiling);
 
-  {
-    const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-    const int begin        = rank * chunk;
-    const int end          = min(begin + chunk, rows);
-    for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
-      V sum[kMaxRowPacks];
-      p2p::push::reduce_row(w, box_in, row - begin, packs, sum);
-      V n[kMaxRowPacks] = {};
-      fusion::norm_row<T>(sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-                          [&](int k, int, const V& v) { n[k] = v; });
-      p2p::push::broadcast_row(w, box_out, row - begin, packs, n);
-    }
+  p2p::peer_barrier(w);
+
+  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+    V sum[kMaxRowPacks];
+    p2p::push::reduce(w, in, tiling, row, sum);
+    V n[kMaxRowPacks] = {};
+    fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
+                        [&](int k, int, const V& v) { n[k] = v; });
+    p2p::push::share(w, slot, tiling, row, n);
   }
 
-  p2p::peer_block_barrier(w);
+  p2p::peer_barrier(w);
 
-  p2p::push::gather_rows(w, box_out, chunk, rows, packs, [&](int row, int i, const V& v) {
-    p2p::put(w, rank, normed + row * packs + i, v);
+  p2p::push::gather(w, slot, tiling, [&](int row, int i, const V& v) {
+    store_global(normed + row * packs + i, v);
   });
 
-  // The GEMM reads rows other blocks of this rank wrote, in our own scratch.
+  // The GEMM reads rows other blocks of this rank gathered.
   p2p::grid_barrier(w);
 
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
-    fusion::gemm<kLanesPerCol, T>(
-        [&](int r) { return p2p::ptr(w, rank, normed + (r0 + r) * packs, packs); },
-        min(fusion::kRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
-        out_stride, out_col0);
+    fusion::gemm<kLanesPerCol, T>([&](int r) { return normed + (r0 + r) * packs; },
+                                  min(fusion::kRows, rows - r0), gemm_w, n_cols, packs,
+                                  out + r0 * out_stride, out_stride, out_col0);
   }
 }
 

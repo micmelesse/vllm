@@ -116,45 +116,42 @@ Launch launch_for(const Forced& f, Op op, int64_t rows, int64_t bytes) {
           f.quant_bits ? f.quant_bits : tuning(op).quant_bits};
 }
 
-int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
-
-// The scratch a launch needs on each rank, in bytes. `packs` is a row's, `flat` the whole
-// buffer's (plain all-reduce). The push kernels' inboxes are laid out as the kernels lay
-// them (p2p::Inbox): a row kernel's hold a group per thread per row, the residual and
-// prefix inboxes are unquantized, and the GEMM tail's plain normed rows come last.
+// The scratch a launch needs on each rank, in bytes: the slots its kernel lays out, from
+// the same rows the kernel works in (a buffer's cut to the launch; see tiles::Rows) and
+// the same slot sizes (p2p's pull_slot_packs / push_slot_packs). A residual or prefix
+// slot is always 16 bits.
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
-  const int q = l.quant_bits;
-  // Inboxes of `groups` groups: `n` of the launch's codec, then `plain` unquantized.
-  auto inboxes = [&](int64_t groups, int n, int plain) {
-    return (n * p2p::inbox_packs(q, 1, world, groups) +
-            plain * p2p::inbox_packs(16, 1, world, groups)) * 16;
+  const tiles::Rows tiling =
+      op_of(l.kernel) == Op::all_reduce
+          ? tiles::buffer_rows(flat, l.grid, l.threads)
+          : tiles::rows_of(static_cast<int>(rows), static_cast<int>(packs));
+  const int64_t chunk = tiles::chunk_of(tiling, world);
+  auto pull = [&](int n) { return n * p2p::pull_slot_packs(tiling, world) * 16; };
+  // `n` owner slots at the launch's bits and `plain` at 16; `all`: one slot of every
+  // row.
+  auto push = [&](int n, int plain) {
+    return (n * p2p::push_slot_packs(l.quant_bits, chunk, l.threads, world) +
+            plain * p2p::push_slot_packs(16, chunk, l.threads, world)) * 16;
   };
-  const int64_t grid_threads = int64_t{l.grid} * l.threads;
-  const int64_t all_rows     = rows * l.threads;
-  const int64_t owned_rows   = ceil_div(rows, world) * l.threads;
+  const int64_t all =
+      p2p::push_slot_packs(l.quant_bits, tiling.rows, l.threads, world) * 16;
   switch (l.kernel) {
-    case Kernel::two_shot_pull: return ceil_div(flat, world) * 16;
-    case Kernel::two_shot_pull_rms_norm: return ceil_div(rows, world) * packs * 16;
+    case Kernel::two_shot_pull:
+    case Kernel::two_shot_pull_rms_norm:
+    case Kernel::two_shot_pull_rms_norm_gemm_add: return pull(1);
     case Kernel::two_shot_pull_add_rms_norm:
-    case Kernel::two_shot_pull_add_attn_res_rms_norm:
-      return 2 * ceil_div(rows, world) * packs * 16;
-    case Kernel::one_shot_pull_rms_norm_gemm_add: return rows * packs * 16;
-    case Kernel::two_shot_pull_rms_norm_gemm_add: return ceil_div(rows, world) * packs * 16;
+    case Kernel::two_shot_pull_add_attn_res_rms_norm: return pull(2);
     case Kernel::one_shot_push:
-      return inboxes(p2p::buffer_groups(flat, grid_threads), 1, 0);
-    case Kernel::two_shot_push:
-      return inboxes(p2p::buffer_groups(ceil_div(flat, world), grid_threads), 2, 0);
     case Kernel::one_shot_push_rms_norm:
     case Kernel::one_shot_push_add_rms_norm:
-    case Kernel::one_shot_push_add_attn_res_rms_norm: return inboxes(all_rows, 1, 0);
-    case Kernel::two_shot_push_rms_norm: return inboxes(owned_rows, 2, 0);
+    case Kernel::one_shot_push_add_attn_res_rms_norm:
+    case Kernel::one_shot_push_rms_norm_gemm_add: return all;
+    case Kernel::two_shot_push:
+    case Kernel::two_shot_push_rms_norm:
+    case Kernel::two_shot_push_rms_norm_gemm_add: return push(2, 0);
     case Kernel::two_shot_push_add_rms_norm:
-    case Kernel::two_shot_push_add_attn_res_rms_norm: return inboxes(owned_rows, 2, 1);
-    case Kernel::one_shot_push_rms_norm_gemm_add:
-      return inboxes(all_rows, 1, 0) + rows * packs * 16;
-    case Kernel::two_shot_push_rms_norm_gemm_add:
-      return inboxes(owned_rows, 2, 0) + rows * packs * 16;
+    case Kernel::two_shot_push_add_attn_res_rms_norm: return push(2, 1);
     default: return 0;
   }
 }
@@ -466,9 +463,14 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Forced& for
 void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Forced& forced,
                                   torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
                                   torch::Tensor& norm_weight, double eps,
-                                  torch::Tensor& gemm_weight) {
+                                  torch::Tensor& gemm_weight, torch::Tensor& workspace) {
   TORCH_CHECK(inp.dim() == 2 && inp.is_contiguous(), "inp must be contiguous 2-D");
   const int64_t rows = inp.size(0), hidden = inp.size(1);
+  // The normed rows, which the GEMM reads over and over; inp's shape and dtype.
+  TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous() &&
+                  workspace.sizes() == inp.sizes() &&
+                  workspace.scalar_type() == inp.scalar_type(),
+              "workspace must be a contiguous device tensor of inp's shape and dtype");
   TORCH_CHECK(gemm_weight.dim() == 2 && gemm_weight.size(1) == hidden &&
                   gemm_weight.stride(1) == 1 && gemm_weight.stride(0) == hidden,
               "gemm_weight must be [N, hidden] with contiguous rows");
@@ -498,7 +500,7 @@ void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Forced& forced,
 #define GEMM_ADD_ARGS(T)                                                                 \
   p, norm_weight.data_ptr<T>(), static_cast<float>(eps), gemm_weight.data_ptr<T>(),      \
       static_cast<int>(n_cols), out.data_ptr<T>(), out.stride(0),                        \
-      static_cast<int>(out_col0), static_cast<int>(rows), packs
+      static_cast<int>(out_col0), workspace.data_ptr<T>(), static_cast<int>(rows), packs
 #define GEMM_ADD_SHOT(T, NG, LPC)                                                        \
   switch (l.kernel) {                                                                    \
     CASE_PULL(one_shot_pull_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
@@ -692,13 +694,13 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
     fptr_t comms, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
-    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight, int64_t kernel,
-    int64_t launch_blocks, int64_t launch_threads, int64_t gemm_lanes_per_col,
-    int64_t quant_bits) {
+    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
+    torch::Tensor& workspace, int64_t kernel, int64_t launch_blocks, int64_t launch_threads,
+    int64_t gemm_lanes_per_col, int64_t quant_bits) {
   const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
                                            gemm_lanes_per_col, quant_bits);
   hip_comms::all_reduce_rms_norm_gemm_add(comms_of(comms), forced, out, out_col0, inp,
-                                          norm_weight, eps, gemm_weight);
+                                          norm_weight, eps, gemm_weight, workspace);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

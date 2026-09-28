@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot all-reduce.
+// One-shot pull all-reduce: every rank sums every rank's input over the whole buffer.
 
 #pragma once
 
@@ -10,17 +10,20 @@
 
 namespace hip_comms {
 
-// ONE-SHOT: every rank sums every peer's input over the whole buffer into its own output.
-// Moves ngpus x the bytes of two-shot and needs no barrier between phases, so it wins while
-// the barrier, not the bytes, dominates.
+// Moves ngpus x the bytes of two-shot and has no barrier between phases, so it wins while
+// the barrier, not the bytes, dominates. Peers read this rank's input to the end: close.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
-  using V      = typename traits<T>::V;
-  const auto w = p2p::start<T, ngpus>(p);
-  V* dst       = reinterpret_cast<V*>(out);
-  p2p::pull::reduce_buffer(w, 0, size,
-                           [&](int at, const V& v) { store_global(dst + at, v); });
+  using V           = typename traits<T>::V;
+  const auto w      = p2p::start<T, ngpus>(p);
+  const auto tiling = tiles::buffer_rows(size);
+  V* dst            = reinterpret_cast<V*>(out);
+  for (int row = blockIdx.x; row < tiling.rows; row += gridDim.x) {
+    V v[kMaxRowPacks];
+    p2p::pull::reduce(w, tiling, row, v);
+    tiles::store_row(dst, tiling, row, v);
+  }
   p2p::close(w);
 }
 

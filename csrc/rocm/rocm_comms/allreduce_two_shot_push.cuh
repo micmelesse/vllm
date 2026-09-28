@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Two-shot all-reduce, push: reduce-scatter, then all-gather, every transfer a store into
-// a peer's inbox, encoded by kBits' Codec (16: T itself; 8, 4: QuickReduce's scheme).
+// Two-shot push all-reduce: reduce-scatter, then all-gather, every transfer a store into
+// a peer's slot, encoded by kBits' codec (16: T itself; 8, 4: QuickReduce's scheme).
 
 #pragma once
 
@@ -11,39 +11,36 @@
 
 namespace hip_comms {
 
-// PUSH, NOT PULL: a rank reads only its own input and its own inbox, so its input is never
-// read remotely (no close), and a sender can encode what it sends.
-//
-//   phase 1  my input's slice for every owner d, encoded, into d's inbox (region 0)
-//   peer_block_barrier
-//   phase 2  my slice from every source, decoded and summed in fp32 in rank order, rounded
-//            to T, encoded once and pushed into every rank's region 1 (mine too, so every
-//            rank decodes the same bytes and all hold identical output)
-//   peer_block_barrier
-//   phase 3  every owner's slice decoded into `out`
-//
-// Two barriers against the pull kernel's one, and the same bytes on the links at kBits 16.
+// A rank reads only its own input and its own slots, so a sender can encode what it
+// sends and the input is never read remotely (no close). Two barriers against the pull
+// kernel's one; the same bytes on the links at kBits 16. Every rank decodes the same
+// bytes, so every rank holds the same output.
 template <typename T, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_push(p2p::Peers p, T* __restrict__ out, int size) {
-  using V            = typename traits<T>::V;
-  using C            = p2p::Codec<T, kBits>;
-  const auto w       = p2p::start<T, ngpus>(p);
-  const int chunk    = (size + ngpus - 1) / ngpus;
-  const auto box_in  = p2p::push::buffer_inbox<C>(w, chunk);
-  const auto box_out = p2p::push::buffer_inbox<C>(w, chunk, box_in.end());
-  V* dst             = reinterpret_cast<V*>(out);
+  using V           = typename traits<T>::V;
+  const auto w      = p2p::start<T, ngpus>(p);
+  const auto tiling = tiles::buffer_rows(size);
+  const auto mine   = tiles::owned(tiling, p.rank, ngpus);
+  const auto in     = p2p::push::slot<kBits>(w, tiling, p2p::To::owners);
+  const auto sum    = p2p::push::slot<kBits>(w, tiling, p2p::To::owners, in);
+  V* dst            = reinterpret_cast<V*>(out);
 
-  p2p::push::scatter_buffer(w, box_in, chunk, size);
+  p2p::push::scatter(w, in, tiling);
 
-  p2p::peer_block_barrier(w);
+  p2p::peer_barrier(w);
 
-  p2p::push::reduce_broadcast_slice(w, box_in, box_out, chunk, size);
+  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+    V v[kMaxRowPacks];
+    p2p::push::reduce(w, in, tiling, row, v);
+    p2p::push::share(w, sum, tiling, row, v);
+  }
 
-  p2p::peer_block_barrier(w);
+  p2p::peer_barrier(w);
 
-  p2p::push::gather_buffer(w, box_out, chunk, size,
-                           [&](int at, const V& v) { store_global(dst + at, v); });
+  p2p::push::gather(w, sum, tiling, [&](int row, int i, const V& v) {
+    store_global(dst + row * tiling.packs + i, v);
+  });
 }
 
 }  // namespace hip_comms

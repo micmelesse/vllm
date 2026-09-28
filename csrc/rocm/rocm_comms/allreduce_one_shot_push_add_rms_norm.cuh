@@ -13,35 +13,33 @@
 
 namespace hip_comms {
 
-// PUSH (see allreduce_one_shot_push.cuh): every rank's rows, encoded by kBits' Codec, into
-// every rank's inbox; one barrier; each block reduces its rows out of its own inbox and
-// norms them as the pull kernel does. A block owns a row in both phases.
-// `residual` and `residual_out` are unused (null) unless kAdd.
-// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
+// Every rank's rows, encoded by kBits' codec, into every rank's slot; one barrier; each
+// block reduces its rows out of its own slot and norms them as the pull kernel does.
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
 DINLINE void one_shot_push_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
-  using V          = typename traits<T>::V;
-  using C          = p2p::Codec<T, kBits>;
-  constexpr int NL = traits<T>::N;
-  namespace fusion = fusions::add_rms_norm;
-  const auto w     = p2p::start<T, ngpus>(p);
-  const auto box   = p2p::push::row_inbox<C>(w, rows);
-  p2p::push::broadcast_rows(w, box, rows, packs);
-
-  p2p::peer_block_barrier(w);
-
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::add_rms_norm;
+  const auto w           = p2p::start<T, ngpus>(p);
+  const auto tiling      = tiles::rows_of(rows, packs);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+  const auto slot        = p2p::push::slot<kBits>(w, tiling, p2p::To::all);
+
+  p2p::push::scatter(w, slot, tiling);
+
+  p2p::peer_barrier(w);
+
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::push::reduce_row(w, box, row, packs, sum);
+    p2p::push::reduce(w, slot, tiling, row, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },

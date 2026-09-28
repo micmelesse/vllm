@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Two-shot all-reduce, then RMSNorm, then a GEMM whose result is added into an output: the
-// tail of Kimi-K3's latent MoE (`fused_all_reduce.latent_tail`).
+// Two-shot pull all-reduce, then RMSNorm, then a GEMM whose result is added into an
+// output: the tail of Kimi-K3's latent MoE (`fused_all_reduce.latent_tail`).
 
 #pragma once
 
@@ -12,51 +12,49 @@
 
 namespace hip_comms {
 
-// Each rank owns ceil(rows/ngpus) whole rows: it reduces and norms them into its own
-// scratch, and after the world barrier every rank reads every normed row from its owner's
-// scratch for the GEMM, kRows rows per pass. The same roundings as the one-shot
-// kernel.
-// kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
+// Each rank reduces and norms the rows it owns and shares them; after the barrier every
+// rank gathers every normed row into `workspace` ([rows, packs] of its own); a grid
+// barrier; the GEMM over every row, fusion::kRows per pass. The input is read only
+// before the barrier, so no close.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
-    int packs) {
-  using V          = typename traits<T>::V;
-  constexpr int NL = traits<T>::N;
-  namespace fusion = fusions::rms_norm_gemm_add;
-  const auto w     = p2p::start<T, ngpus>(p);
-  const int rank   = p.rank;
-  const int chunk  = (rows + ngpus - 1) / ngpus;
+    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    T* __restrict__ workspace, int rows, int packs) {
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::rms_norm_gemm_add;
+  const auto w           = p2p::start<T, ngpus>(p);
+  const auto tiling      = tiles::rows_of(rows, packs);
+  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+  const V* weight        = reinterpret_cast<const V*>(norm_w);
+  V* normed              = reinterpret_cast<V*>(workspace);
+  const auto mine        = tiles::owned(tiling, p.rank, ngpus);
+  const auto slot        = p2p::pull::slot(w, tiling);
 
-  {
-    const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-    const int begin        = rank * chunk;
-    const int end          = min(begin + chunk, rows);
-    for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
-      const int local = (row - begin) * packs;
-      V sum[kMaxRowPacks];
-      p2p::pull::sum_row(w, row * packs, packs, sum);
-      fusion::norm_row<T>(sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-                          [&](int, int i, const V& v) {
-                            p2p::put(w, rank, local + i, v);
-                          });
-    }
+  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+    V sum[kMaxRowPacks];
+    p2p::pull::reduce(w, tiling, row, sum);
+    V n[kMaxRowPacks] = {};
+    fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
+                        [&](int k, int, const V& v) { n[k] = v; });
+    p2p::pull::share(w, slot, tiling, row, n);
   }
 
-  p2p::world_barrier(w);
+  p2p::peer_barrier(w);
+
+  p2p::pull::gather(w, slot, tiling, [&](int row, int i, const V& v) {
+    store_global(normed + row * packs + i, v);
+  });
+
+  // The GEMM reads rows other blocks of this rank gathered.
+  p2p::grid_barrier(w);
 
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
-    fusion::gemm<kLanesPerCol, T>(
-        [&](int r) {
-          const int row   = r0 + r;
-          const int owner = row / chunk;
-          return p2p::ptr(w, owner, (row - owner * chunk) * packs, packs);
-        },
-        min(fusion::kRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
-        out_stride, out_col0);
+    fusion::gemm<kLanesPerCol, T>([&](int r) { return normed + (r0 + r) * packs; },
+                                  min(fusion::kRows, rows - r0), gemm_w, n_cols, packs,
+                                  out + r0 * out_stride, out_stride, out_col0);
   }
-  p2p::close(w);
 }
 
 }  // namespace hip_comms

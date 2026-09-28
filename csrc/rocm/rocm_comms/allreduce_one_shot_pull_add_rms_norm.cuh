@@ -13,13 +13,11 @@
 
 namespace hip_comms {
 
-// The sum is already in registers when one-shot is about to store it, so normalising there
-// saves an HBM round trip and a launch against an all-reduce followed by a norm kernel.
-//
-// A BLOCK OWNS A ROW, because the variance needs the whole row: one block per row,
-// striding over rows, where plain one-shot is grid-stride over the flat buffer.
-// `residual` and `residual_out` are unused (null) unless kAdd.
-// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
+// Every rank reduces every row and norms it where the sum lands in registers, saving an
+// HBM round trip and a launch against an all-reduce then a norm kernel. A block owns a
+// row. `residual` and `residual_out` are unused (null) unless kAdd; `weight` is in its
+// own dtype W, T or fp32 (see `fusion::row`). Peers read this rank's input to the end:
+// close.
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void one_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
@@ -30,15 +28,15 @@ DINLINE void one_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_rms_norm;
   const auto w           = p2p::start<T, ngpus>(p);
+  const auto tiling      = tiles::rows_of(rows, packs);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  // Uniform across the block, so every `__syncthreads` inside is reached by every thread.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::pull::sum_row(w, row * packs, packs, sum);
+    p2p::pull::reduce(w, tiling, row, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
@@ -52,8 +50,8 @@ template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_norm(
     p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  one_shot_pull_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps,
-                                                      rows, packs);
+  one_shot_pull_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr,
+                                                      weight, eps, rows, packs);
 }
 
 template <typename T, typename W, int ngpus>
@@ -61,8 +59,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_add_rm
     p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  one_shot_pull_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual, weight,
-                                                     eps, rows, packs);
+  one_shot_pull_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual,
+                                                     weight, eps, rows, packs);
 }
 
 }  // namespace hip_comms

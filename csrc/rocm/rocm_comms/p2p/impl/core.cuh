@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p's primitives, behind p2p.cuh: `World`, `start`, `put`, `ptr`, the barriers, and in
-// `impl` what they and the patterns are made of. A wait that outlives the timeout
+// p2p's primitives, behind p2p.cuh: `World`, `start`, the barriers, and in `impl` what
+// they and the phases are made of. A wait that outlives the timeout
 // prints where it was and traps, so a hang is an error. Checked, every index is
 // bounds-checked and every wait is skewed by a random per-block delay, so a race shows on
 // every run. Indices are in 16-byte packs of T.
@@ -60,7 +60,7 @@ DINLINE void check(const Peers& p, bool ok, const char* what, int peer, int64_t 
 }
 
 // Checked only: up to ~32 x 8K cycles, different per rank, block and peer barrier (the
-// block's sequence number, which start, peer_block_barrier and close advance).
+// block's sequence number, which start, peer_barrier and close advance).
 DINLINE void skew(const Peers& p) {
   if (!p.checked) return;
   uint32_t h = static_cast<uint32_t>(p.rank) * 73856093u ^ blockIdx.x * 19349663u ^
@@ -111,7 +111,7 @@ DINLINE void wait(const Peers& p, const uint32_t* flag, uint32_t want, const cha
 // where it says "every peer has launched" or "every peer is done reading me", and not
 // enough between phases, which is what `world_barrier` is for. kOrdered: the store
 // releases and the wait acquires, so what the block put before is visible to its peers'
-// same-numbered block after (a peer_block_barrier). Unordered, it only says when
+// same-numbered block after (a peer_barrier). Unordered, it only says when
 // (start: every peer has launched; close: every peer is done reading us).
 template <int ngpus, bool kOrdered>
 DINLINE void pair_blocks(const Peers& p, bool start) {
@@ -247,6 +247,23 @@ DINLINE float get_float(const World<T, ngpus>& w, int peer, int64_t idx) {
                                                           __MEMORY_SCOPE_SYSTEM));
 }
 
+template <typename T, int ngpus>
+DINLINE void put(const World<T, ngpus>& w, int peer, int64_t idx,
+                 const typename traits<T>::V& v) {
+  check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put",
+                peer, idx, w.peers.scratch_packs);
+  store_global(scratch(w, peer) + idx, v);
+}
+
+// A direct pointer to n packs of peer's scratch, checked once, for a hot loop.
+template <typename T, int ngpus>
+DINLINE const typename traits<T>::V* ptr(const World<T, ngpus>& w, int peer, int64_t idx,
+                                         int64_t n) {
+  check(w.peers, peer >= 0 && peer < ngpus && idx + n <= w.peers.scratch_packs,
+                "ptr", peer, idx + n, w.peers.scratch_packs);
+  return scratch(w, peer) + idx;
+}
+
 }  // namespace impl
 
 // =================================================================================
@@ -265,31 +282,13 @@ DINLINE World<T, ngpus> start(const Peers& p) {
   return w;
 }
 
-template <typename T, int ngpus>
-DINLINE void put(const World<T, ngpus>& w, int peer, int64_t idx,
-                 const typename traits<T>::V& v) {
-  impl::check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put",
-                peer, idx, w.peers.scratch_packs);
-  store_global(impl::scratch(w, peer) + idx, v);
-}
-
-// SHMEM's `shmem_ptr`: a hot loop reads through this rather than paying a check on every
-// load, which keeps the loads free to issue back to back.
-template <typename T, int ngpus>
-DINLINE const typename traits<T>::V* ptr(const World<T, ngpus>& w, int peer, int64_t idx,
-                                         int64_t n) {
-  impl::check(w.peers, peer >= 0 && peer < ngpus && idx + n <= w.peers.scratch_packs,
-                "ptr", peer, idx + n, w.peers.scratch_packs);
-  return impl::scratch(w, peer) + idx;
-}
-
-// This block and the same-numbered block on every peer, and no other block: one peer
-// write each, where `world_barrier` waits for the whole grid. A read after it may see
-// ONLY what the same-numbered block on that peer wrote, so both phases must give each
-// block the same indices (vLLM's custom all-reduce, and the rule its two-stage kernel
+// This block and the same block on every peer (every rank, block b with block b), and no
+// other block: one flag per peer, where `world_barrier` waits for the whole grid. A read
+// after it may see ONLY what the same block on that peer wrote, so both phases must give
+// each block the same rows (vLLM's custom all-reduce, and the rule its two-stage kernel
 // states).
 template <typename T, int ngpus>
-DINLINE void peer_block_barrier(const World<T, ngpus>& w) {
+DINLINE void peer_barrier(const World<T, ngpus>& w) {
   impl::skew(w.peers);
   impl::pair_blocks<ngpus, true>(w.peers, false);
 }

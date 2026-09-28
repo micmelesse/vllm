@@ -147,7 +147,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm_gemm_add(int comms, Tensor! out, int out_col0, "
-      "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, "
+      "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, "
       "int kernel, int launch_blocks, int launch_threads, int gemm_lanes_per_col, "
       "int quant_bits) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm_add", torch::kCUDA,

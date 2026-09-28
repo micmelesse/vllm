@@ -315,6 +315,8 @@ class HipCommunicator(Communicator):
             norm_weight,
             eps,
             gemm_weight,
+            # The normed rows, which the GEMM reads over and over.
+            torch.empty_like(inp),
             *launch_wire(launch),
         )
 

@@ -3,52 +3,44 @@
 //
 // P2P, THE PEER LAYER'S ONE INTERFACE: the only p2p header anything includes, and below,
 // the whole of what a caller may use. Its parts (impl/) refuse to be included any other
-// way, and what they keep in `p2p::impl` is theirs. `w` is the `World` `start` returns;
-// T and the world size ride on it, so no call spells them. Indices are in 16-byte packs
-// of T; a store callback is `store(position, v)` unless noted.
+// way, and what they keep in `p2p::impl` is theirs.
 //
-// TYPES
-//   Peers                  what a launch passes its kernel, by value
-//   World<T, ngpus>        a kernel's view: the Peers and every rank's input
-//   Codec<T, kBits>        a push group on the wire: 16 (T itself), 8, 4 bits
-//   Inbox<C, ngpus>        a push kernel's inbox; made by push::*_inbox, `.end()` where the
-//                          next may start
+// A kernel works in ROWS (tiles::Rows, utils.cuh): a block takes rows b, b + grid, ...,
+// a thread its packs t + k x blockDim of each, v[k]. A two-shot splits the rows among the
+// ranks (tiles::owned). `w` is the World `start` returns; T and the world size ride on
+// it. A SLOT is where a phase leaves data for a later one: made by `slot`, passed back,
+// never looked into; slots are laid end to end (`slot(w, rows, ..., previous_slot)`).
 //
-// p2p::                    every kernel
+// p2p::                      every kernel
 //   start<T, ngpus>(p)             first; returns w once every peer has launched
-//   put(w, peer, idx, v)           a pack into peer's scratch (a pull kernel's own)
-//   ptr(w, peer, idx, n)           n packs of peer's scratch, checked once, for hot loops
-//   peer_block_barrier(w)          this block and its same-numbered peer blocks: what
+//   peer_barrier(w)                this block and the same block on every peer: what
 //                                  each wrote before is visible to the others after
-//   world_barrier(w)               the same for every block of every rank
-//   grid_barrier(w)                every block of this rank, its own scratch only
-//   close(w)                       last, where peers read this rank's input late
+//   grid_barrier(w)                every block of this rank
+//   world_barrier(w)               every block of every rank
+//   close(w)                       last, in a kernel whose peers read its input late
 //
-// p2p::pull::              a rank reads its peers
-//   reduce_buffer(w, begin, end, store)            a range of the buffer summed over ranks
-//   gather_buffer(w, chunk, size, store)           every rank's slice, after the barrier
-//   sum_row(w, base, packs, v)                     this thread's share of a row, summed
-//   gather_rows<k>(w, chunk, rows, packs, region_packs, store(region, row, i, v))
+// p2p::pull::                a rank reads its peers
+//   reduce(w, rows, row, v)            this thread's share of a row, summed over ranks
+//   slot(w, rows[, prev])              this rank's rows of a two-shot, in its scratch
+//   share(w, slot, rows, row, v)       an owned row's result into the slot
+//   gather(w, slot, rows, store)       after a peer_barrier, every owner's shared rows
 //
-// p2p::push::              a rank writes into its peers' inboxes
-//   buffer_inbox<C>(w, span[, base]) / row_inbox<C>(w, rows[, base])
-//   broadcast_buffer(w, box, size)                 one-shot phase 1
-//   reduce_buffer(w, box, size, store)             one-shot phase 2
-//   scatter_buffer(w, box, chunk, size)            two-shot phase 1
-//   reduce_broadcast_slice(w, in, out, chunk, size)  two-shot phase 2
-//   gather_buffer(w, box, chunk, size, store)      two-shot phase 3
-//   broadcast_rows(w, box, rows, packs)            one-shot phase 1 of a row op
-//   scatter_rows(w, box, chunk, rows, packs)       two-shot phase 1 of a row op
-//   reduce_row(w, box, row, packs, sum)            a row's share out of the inbox
-//   broadcast_row(w, box, row, packs, v)           two-shot phase 2 of a row op
-//   gather_rows(w, box, chunk, rows, packs, store(row, i, v))  two-shot phase 3
+// p2p::push::                a rank writes into its peers' slots
+//   slot<kBits>(w, rows, To, [prev])   To::owners (two-shot) or To::all (one-shot);
+//                                      kBits 16 (T itself), 8 or 4
+//   scatter(w, slot, rows)             this rank's input rows into the slot
+//   reduce(w, slot, rows, row, v)      after a peer_barrier, a row summed out of the slot
+//   share(w, slot, rows, row, v)       an owned row's result into every rank's slot
+//   gather(w, slot, rows, store)       after a peer_barrier, every owner's shared rows
 //
-// p2p::host::              the host code (rocm_comms.cu)
+//   store(row, pack within the row, v)
+//
+// p2p::host::                the host code (rocm_comms.cu)
 //   Group                          the one lifetime object: maps the peers' memory,
 //                                  registers buffers, `peers(input)` per launch
 //   Handle, handle_and_offset(ptr) a tensor's IPC handle
-// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks, buffer_groups,
-// inbox_packs.
+// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks, pull_slot_packs,
+// push_slot_packs.
 
 #pragma once
 
