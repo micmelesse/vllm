@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -21,15 +21,18 @@ namespace hip_comms {
 // `residual` and `residual_out` are unused (null) unless kAdd.
 // `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd>
-DINLINE void one_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
+DINLINE void one_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::add_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
+  core::start(p);
+  const auto in          = core::inputs(p);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
@@ -38,19 +41,19 @@ DINLINE void one_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   // Uniform across the block, so every `__syncthreads` inside is reached by every thread.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    c.sum_row(row * packs, packs, sum);
+    pull::sum_row(p, in, row * packs, packs, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, w, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  c.close();
+  core::close(p);
 }
 
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_norm(
-    ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   one_shot_pull_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps,
                                                       rows, packs);
@@ -58,7 +61,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_no
 
 template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_add_rms_norm(
-    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   one_shot_pull_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual, weight,

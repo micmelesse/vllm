@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "ipc.cuh"
+#include "p2p/push.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -25,45 +25,48 @@ namespace hip_comms {
 // Two barriers against the pull kernel's one, and the same bytes on the links at kBits 16.
 template <typename T, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_two_shot_push(ipc::Peers p, T* __restrict__ out, int size) {
-  using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank  = c.rank();
+    allreduce_two_shot_push(p2p::Peers p, T* __restrict__ out, int size) {
+  using V    = typename traits<T>::V;
+  using C    = p2p::Codec<T, kBits>;
+  using core = p2p::Core<T, ngpus>;
+  using push = p2p::Push<T, ngpus, C>;
+  core::start(p);
+  const auto in   = core::inputs(p);
+  const int rank  = p.rank;
   const int chunk = (size + ngpus - 1) / ngpus;
-  const auto grp  = ipc::Groups::flat(chunk);
-  const ipc::Inbox<C, ngpus> box(grp.count(), 2);
+  const auto grp  = p2p::Groups::flat(chunk);
+  const p2p::Inbox<C, ngpus> box(grp.count(), 2);
 
   for (int j = 0; j < grp.iters; ++j) {
     for (int d = 0; d < ngpus; ++d) {
       float x[C::kVals];
-      c.template mine_group<C>(grp, j, d * chunk, size, x);
-      c.template send<C>(d, box, 0, grp.id(j), grp.members(j, d * chunk, size), x);
+      push::mine_group(p, in, grp, j, d * chunk, size, x);
+      push::send(p, d, box, 0, grp.id(j), grp.members(j, d * chunk, size), x);
     }
   }
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   for (int j = 0; j < grp.iters; ++j) {
     const int n = grp.members(j, rank * chunk, size);
     float acc[C::kVals];
-    c.template reduce_inbox<C>(box, 0, grp.id(j), n, acc);
+    push::reduce_inbox(p, box, 0, grp.id(j), n, acc);
     // Rounded to T first, as the unquantized sum lands.
 #pragma unroll
     for (int i = 0; i < C::kVals; ++i) acc[i] = static_cast<float>(static_cast<T>(acc[i]));
-    c.template broadcast<C>(box, 1, grp.id(j), n, acc);
+    push::broadcast(p, box, 1, grp.id(j), n, acc);
   }
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   V* dst = reinterpret_cast<V*>(out);
   for (int j = 0; j < grp.iters; ++j) {
     for (int src = 0; src < ngpus; ++src) {
       const int n = grp.members(j, src * chunk, size);
       float x[C::kVals];
-      c.template read_inbox<C>(box, 1, src, grp.id(j), n, x);
+      push::read_inbox(p, box, 1, src, grp.id(j), n, x);
       V v[kSumBatch];
-      packs_of<T>(x, v);
+      p2p::packs_of<T>(x, v);
 #pragma unroll
       for (int u = 0; u < kSumBatch; ++u)
         if (u < n) store_global(dst + src * chunk + grp.at(j, u), v[u]);

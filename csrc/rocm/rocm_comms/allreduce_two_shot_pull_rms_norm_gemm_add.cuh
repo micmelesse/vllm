@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -19,14 +19,17 @@ namespace hip_comms {
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_norm_gemm_add(
-    ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::rms_norm_gemm_add;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank  = c.rank();
+  core::start(p);
+  const auto in   = core::inputs(p);
+  const int rank  = p.rank;
   const int chunk = (rows + ngpus - 1) / ngpus;
 
   {
@@ -36,25 +39,27 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
-      c.sum_row(row * packs, packs, sum);
+      pull::sum_row(p, in, row * packs, packs, sum);
       fusion::norm_row<T>(sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-                          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
+                          [&](int, int i, const V& v) {
+                            core::put(p, rank, local + i, v);
+                          });
     }
   }
 
-  c.world_barrier();
+  core::world_barrier(p);
 
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
     fusion::gemm<kLanesPerCol, T>(
         [&](int r) {
           const int row   = r0 + r;
           const int owner = row / chunk;
-          return c.ptr(owner, (row - owner * chunk) * packs, packs);
+          return core::ptr(p, owner, (row - owner * chunk) * packs, packs);
         },
         min(fusion::kRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
         out_stride, out_col0);
   }
-  c.close();
+  core::close(p);
 }
 
 }  // namespace hip_comms

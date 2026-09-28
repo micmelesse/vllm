@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/push.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -19,20 +19,23 @@ namespace hip_comms {
 // `residual` and `residual_out` are unused (null) unless kAdd.
 // `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
-DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
+DINLINE void one_shot_push_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
+  using C          = p2p::Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using push       = p2p::Push<T, ngpus, C>;
   namespace fusion = fusions::add_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
-  const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
-  c.template broadcast_rows<C>(box, rows, packs);
+  core::start(p);
+  const auto in = core::inputs(p);
+  const p2p::Inbox<C, ngpus> box(rows * blockDim.x);
+  push::broadcast_rows(p, in, box, rows, packs);
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
@@ -41,7 +44,7 @@ DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    c.template reduce_row<C>(box, row, packs, sum);
+    push::reduce_row(p, box, row, packs, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, w, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
@@ -52,7 +55,7 @@ DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_norm(
-    ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   one_shot_push_add_rms_norm_body<T, W, ngpus, kBits, false>(p, out, nullptr, nullptr,
                                                              weight, eps, rows, packs);
@@ -60,7 +63,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_no
 
 template <typename T, typename W, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_add_rms_norm(
-    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   one_shot_push_add_rms_norm_body<T, W, ngpus, kBits, true>(p, out, residual_out, residual,

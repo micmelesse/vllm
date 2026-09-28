@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "ipc.cuh"
+#include "p2p/push.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -19,37 +19,40 @@ namespace hip_comms {
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kBits, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_norm_gemm_add(
-    ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
   using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
+  using C          = p2p::Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using push       = p2p::Push<T, ngpus, C>;
   namespace fusion = fusions::rms_norm_gemm_add;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank = c.rank();
-  const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
+  core::start(p);
+  const auto in  = core::inputs(p);
+  const int rank = p.rank;
+  const p2p::Inbox<C, ngpus> box(rows * blockDim.x);
   // The normed rows, plain, after the inbox.
   const int normed = box.end();
-  c.template broadcast_rows<C>(box, rows, packs);
+  push::broadcast_rows(p, in, box, rows, packs);
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    c.template reduce_row<C>(box, row, packs, sum);
+    push::reduce_row(p, box, row, packs, sum);
     fusion::norm_row<T>(
         sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { c.put(rank, normed + row * packs + i, v); });
+        [&](int, int i, const V& v) { core::put(p, rank, normed + row * packs + i, v); });
   }
 
   // The GEMM reads rows other blocks of this rank wrote, in our own scratch.
-  c.grid_barrier();
+  core::grid_barrier(p);
 
   fusion::gemm<kLanesPerCol, T>(
-      [&](int r) { return c.ptr(rank, normed + r * packs, packs); }, rows, gemm_w, n_cols,
-      packs, out, out_stride, out_col0);
+      [&](int r) { return core::ptr(p, rank, normed + r * packs, packs); }, rows, gemm_w,
+      n_cols, packs, out, out_stride, out_col0);
 }
 
 }  // namespace hip_comms

@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/push.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -28,26 +28,30 @@ namespace hip_comms {
 // so a codec's error would accumulate over depth.
 // `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
-DINLINE void two_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
+DINLINE void two_shot_push_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
-  using R          = Codec<T, 16>;
+  using C          = p2p::Codec<T, kBits>;
+  using R          = p2p::Codec<T, 16>;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using push       = p2p::Push<T, ngpus, C>;
+  using push_res   = p2p::Push<T, ngpus, R>;
   namespace fusion = fusions::add_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank   = c.rank();
+  core::start(p);
+  const auto in    = core::inputs(p);
+  const int rank   = p.rank;
   const int chunk  = (rows + ngpus - 1) / ngpus;
   const int groups = chunk * blockDim.x;
-  const ipc::Inbox<C, ngpus> box_in(groups);
-  const ipc::Inbox<C, ngpus> box_out(groups, 1, box_in.end());
-  const ipc::Inbox<R, ngpus> box_res(groups, 1, box_out.end());
-  c.template scatter_rows<C>(box_in, chunk, rows, packs);
+  const p2p::Inbox<C, ngpus> box_in(groups);
+  const p2p::Inbox<C, ngpus> box_out(groups, 1, box_in.end());
+  const p2p::Inbox<R, ngpus> box_res(groups, 1, box_out.end());
+  push::scatter_rows(p, in, box_in, chunk, rows, packs);
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   {
     const V* res_in        = reinterpret_cast<const V*>(residual);
@@ -57,37 +61,33 @@ DINLINE void two_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       V sum[kMaxRowPacks];
-      c.template reduce_row<C>(box_in, row - begin, packs, sum);
+      push::reduce_row(p, box_in, row - begin, packs, sum);
       V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
       fusion::row<T, W, kAdd>(
           sum, res_in, w, row, packs, inv_hidden, eps,
           [&](int k, int, const V& v) { res[k] = v; },
           [&](int k, int, const V& v) { normed[k] = v; });
-      c.template broadcast_row<C>(box_out, row - begin, packs, normed);
-      if constexpr (kAdd) c.template broadcast_row<R>(box_res, row - begin, packs, res);
+      push::broadcast_row(p, box_out, row - begin, packs, normed);
+      if constexpr (kAdd) push_res::broadcast_row(p, box_res, row - begin, packs, res);
     }
   }
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   V* o = reinterpret_cast<V*>(out);
-  c.template gather_inbox_rows<C>(box_out, chunk, rows, packs,
-                                  [&](int row, int i, const V& v) {
-                                    store_global(o + row * packs + i, v);
-                                  });
+  push::gather_inbox_rows(p, box_out, chunk, rows, packs,
+      [&](int row, int i, const V& v) { store_global(o + row * packs + i, v); });
   if constexpr (kAdd) {
     V* res_out = reinterpret_cast<V*>(residual_out);
-    c.template gather_inbox_rows<R>(box_res, chunk, rows, packs,
-                                    [&](int row, int i, const V& v) {
-                                      store_global(res_out + row * packs + i, v);
-                                    });
+    push_res::gather_inbox_rows(p, box_res, chunk, rows, packs,
+        [&](int row, int i, const V& v) { store_global(res_out + row * packs + i, v); });
   }
 }
 
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_push_rms_norm(
-    ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   two_shot_push_add_rms_norm_body<T, W, ngpus, kBits, false>(p, out, nullptr, nullptr,
                                                              weight, eps, rows, packs);
@@ -95,7 +95,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_push_rms_no
 
 template <typename T, typename W, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_push_add_rms_norm(
-    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   two_shot_push_add_rms_norm_body<T, W, ngpus, kBits, true>(p, out, residual_out, residual,

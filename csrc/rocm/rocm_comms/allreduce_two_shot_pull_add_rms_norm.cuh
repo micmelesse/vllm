@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -27,16 +27,19 @@ namespace hip_comms {
 // still reach every barrier.
 // `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd>
-DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
+DINLINE void two_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::add_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank  = c.rank();
+  core::start(p);
+  const auto in   = core::inputs(p);
+  const int rank  = p.rank;
   const int chunk = (rows + ngpus - 1) / ngpus;
   // Where the residual half starts in a rank's scratch, in packs.
   const int half = chunk * packs;
@@ -50,22 +53,22 @@ DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
-      c.sum_row(row * packs, packs, sum);
+      pull::sum_row(p, in, row * packs, packs, sum);
       fusion::row<T, W, kAdd>(
           sum, res_in, w, row, packs, inv_hidden, eps,
-          [&](int, int i, const V& v) { c.put(rank, half + local + i, v); },
-          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
+          [&](int, int i, const V& v) { core::put(p, rank, half + local + i, v); },
+          [&](int, int i, const V& v) { core::put(p, rank, local + i, v); });
     }
   }
 
   // The gather below gives each block the local rows it wrote above, so the same-numbered
   // blocks are all it must wait for; the input is read only above, so no close.
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   V* o       = reinterpret_cast<V*>(out);
   V* res_out = reinterpret_cast<V*>(residual_out);
-  c.template gather_rows<kAdd ? 2 : 1>(
-      chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
+  pull::template gather_rows<kAdd ? 2 : 1>(
+      p, chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
         store_global((region == 0 ? o : res_out) + row * packs + k, v);
       });
 }
@@ -73,7 +76,7 @@ DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_norm(
-    ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   two_shot_pull_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps,
                                                       rows, packs);
@@ -81,7 +84,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
 
 template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_add_rms_norm(
-    ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   two_shot_pull_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual, weight,

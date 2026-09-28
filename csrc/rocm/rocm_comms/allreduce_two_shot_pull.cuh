@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -19,23 +19,26 @@ namespace hip_comms {
 // still reaches every barrier.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_two_shot_pull(ipc::Peers p, T* __restrict__ out, int size) {
-  using V = typename traits<T>::V;
-  ipc::Comm<T, ngpus> c(p);
-  const int chunk  = (size + ngpus - 1) / ngpus;
-  const int rank   = c.rank();
+    allreduce_two_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
+  using V    = typename traits<T>::V;
+  using core = p2p::Core<T, ngpus>;
+  using pull = p2p::Pull<T, ngpus>;
+  core::start(p);
+  const auto in   = core::inputs(p);
+  const int chunk = (size + ngpus - 1) / ngpus;
+  const int rank  = p.rank;
 
   const int mine_begin = rank * chunk;
   const int mine_end   = min(mine_begin + chunk, size);
-  c.reduce_flat(mine_begin, mine_end,
-                [&](int at, const V& v) { c.put(rank, at - mine_begin, v); });
+  pull::reduce_flat(p, in, mine_begin, mine_end,
+                    [&](int at, const V& v) { core::put(p, rank, at - mine_begin, v); });
 
   // The gather below gives each thread the positions it wrote above, so the same-numbered
   // blocks are all it must wait for; the input is read only above, so no close.
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   V* dst = reinterpret_cast<V*>(out);
-  c.gather_flat(chunk, size, [&](int at, const V& v) { store_global(dst + at, v); });
+  pull::gather_flat(p, chunk, size, [&](int at, const V& v) { store_global(dst + at, v); });
 }
 
 }  // namespace hip_comms

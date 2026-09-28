@@ -59,8 +59,8 @@ namespace hip_comms {
 // is a compile error, not a kernel that overruns its signal slots or register arrays.
 constexpr bool table_fits() {
   for (const OpTuning& t : kGfx950) {
-    if (t.one_shot_blocks < 1 || t.one_shot_blocks > ipc::kMaxBlocks) return false;
-    if (t.two_shot_blocks < 1 || t.two_shot_blocks > ipc::kMaxBlocks) return false;
+    if (t.one_shot_blocks < 1 || t.one_shot_blocks > p2p::kMaxBlocks) return false;
+    if (t.two_shot_blocks < 1 || t.two_shot_blocks > p2p::kMaxBlocks) return false;
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
   }
@@ -108,15 +108,15 @@ int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
 // The scratch a launch needs on each rank, in bytes. `packs` is a row's, `flat` the whole
 // buffer's (plain all-reduce). The push kernels' inboxes are laid out as the kernels lay
-// them (ipc::Inbox): a row kernel's hold a group per thread per row, the residual and
+// them (p2p::Inbox): a row kernel's hold a group per thread per row, the residual and
 // prefix inboxes are unquantized, and the GEMM tail's plain normed rows come last.
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
   const int q = l.quant_bits;
   // Inboxes of `groups` groups: `n` of the launch's codec, then `plain` unquantized.
   auto inboxes = [&](int64_t groups, int n, int plain) {
-    return (n * ipc::inbox_packs(q, 1, world, groups) +
-            plain * ipc::inbox_packs(16, 1, world, groups)) * 16;
+    return (n * p2p::inbox_packs(q, 1, world, groups) +
+            plain * p2p::inbox_packs(16, 1, world, groups)) * 16;
   };
   const int64_t grid_threads = int64_t{l.grid} * l.threads;
   const int64_t all_rows     = rows * l.threads;
@@ -129,9 +129,9 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
       return 2 * ceil_div(rows, world) * packs * 16;
     case Kernel::one_shot_pull_rms_norm_gemm_add: return rows * packs * 16;
     case Kernel::two_shot_pull_rms_norm_gemm_add: return ceil_div(rows, world) * packs * 16;
-    case Kernel::one_shot_push: return inboxes(ipc::flat_groups(flat, grid_threads), 1, 0);
+    case Kernel::one_shot_push: return inboxes(p2p::flat_groups(flat, grid_threads), 1, 0);
     case Kernel::two_shot_push:
-      return inboxes(ipc::flat_groups(ceil_div(flat, world), grid_threads), 2, 0);
+      return inboxes(p2p::flat_groups(ceil_div(flat, world), grid_threads), 2, 0);
     case Kernel::one_shot_push_rms_norm:
     case Kernel::one_shot_push_add_rms_norm:
     case Kernel::one_shot_push_add_attn_res_rms_norm: return inboxes(all_rows, 1, 0);
@@ -230,7 +230,7 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
   const Launch l =
       checked_launch(comms, Op::all_reduce, 1, inp.numel(), inp.element_size());
   const int n    = static_cast<int>(inp.numel() * inp.element_size() / 16);
-  const ipc::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ALL_REDUCE_ARGS(T) p, out.data_ptr<T>(), n
@@ -301,7 +301,7 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
   const int packs = static_cast<int>(inp.size(1) / lanes);
   const Launch l  = checked_launch(comms, add ? Op::add_rms_norm : Op::rms_norm, rows,
                                    inp.size(1), inp.element_size());
-  const ipc::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   const float feps   = static_cast<float>(eps);
 
@@ -401,7 +401,7 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
   const int packs = static_cast<int>(hidden / lanes);
   const Launch l  = checked_launch(comms, Op::add_attn_res_rms_norm, rows, hidden,
                                    inp.element_size());
-  const ipc::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ATTN_RES_ARGS(T)                                                                 \
@@ -472,7 +472,7 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
       checked_launch(comms, Op::rms_norm_gemm_add, rows, hidden, inp.element_size());
   TORCH_CHECK(l.threads % kWaveSize == 0, "the GEMM phase needs whole waves; threads ",
               l.threads);
-  const ipc::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: the GEMM phase spreads the columns over the whole grid.
 
@@ -581,8 +581,8 @@ void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks
   }
   TORCH_CHECK(kernel < hip_comms::kNumKernels,
               "hip_comms: no kernel ", kernel);
-  TORCH_CHECK(blocks > 0 && blocks <= hip_comms::ipc::kMaxBlocks, "blocks must be in [1, ",
-              hip_comms::ipc::kMaxBlocks, "]");
+  TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
+              hip_comms::p2p::kMaxBlocks, "]");
   TORCH_CHECK(threads > 0 && threads <= hip_comms::kMaxThreads &&
                   threads % hip_comms::kWaveSize == 0,
               "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
@@ -694,10 +694,10 @@ std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t p
 // checks a world size and a launch against. Constants of the kernel, so they are asked for
 // rather than restated.
 std::vector<int64_t> rocm_comms_sizes() {
-  return {static_cast<int64_t>(sizeof(hip_comms::ipc::Signal)),
-          static_cast<int64_t>(sizeof(hip_comms::ipc::PeerPtrs)),
-          static_cast<int64_t>(hip_comms::ipc::kMaxBlocks),
-          static_cast<int64_t>(hip_comms::ipc::kMaxRanks),
+  return {static_cast<int64_t>(sizeof(hip_comms::p2p::Signal)),
+          static_cast<int64_t>(sizeof(hip_comms::p2p::PeerPtrs)),
+          static_cast<int64_t>(hip_comms::p2p::kMaxBlocks),
+          static_cast<int64_t>(hip_comms::p2p::kMaxRanks),
           static_cast<int64_t>(sizeof(hip_comms::ipc::Handle)),
           static_cast<int64_t>(hip_comms::kMaxRowPacks)};
 }

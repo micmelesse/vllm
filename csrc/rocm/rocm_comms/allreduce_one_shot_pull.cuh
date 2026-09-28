@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -15,12 +15,15 @@ namespace hip_comms {
 // the barrier, not the bytes, dominates.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_one_shot_pull(ipc::Peers p, T* __restrict__ out, int size) {
-  using V = typename traits<T>::V;
-  ipc::Comm<T, ngpus> c(p);
-  V* dst = reinterpret_cast<V*>(out);
-  c.reduce_flat(0, size, [&](int at, const V& v) { store_global(dst + at, v); });
-  c.close();
+    allreduce_one_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
+  using V    = typename traits<T>::V;
+  using core = p2p::Core<T, ngpus>;
+  using pull = p2p::Pull<T, ngpus>;
+  core::start(p);
+  const auto in = core::inputs(p);
+  V* dst        = reinterpret_cast<V*>(out);
+  pull::reduce_flat(p, in, 0, size, [&](int at, const V& v) { store_global(dst + at, v); });
+  core::close(p);
 }
 
 }  // namespace hip_comms

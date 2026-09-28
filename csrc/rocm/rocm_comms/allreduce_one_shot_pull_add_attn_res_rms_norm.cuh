@@ -6,7 +6,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -17,24 +17,27 @@ namespace hip_comms {
 template <typename T, int ngpus, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot_pull_add_attn_res_rms_norm(
-    ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
+    p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
     int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
     const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
     float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::add_attn_res_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
+  core::start(p);
+  const auto in          = core::inputs(p);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const T* row_blocks = blocks + row * block_stride_m;
-    V* dst = write_idx >= 0 ? reinterpret_cast<V*>(const_cast<T*>(row_blocks) +
+    V* dst              = write_idx >= 0 ? reinterpret_cast<V*>(const_cast<T*>(row_blocks) +
                                                    write_idx * block_stride_r)
                             : nullptr;
     V sum[kMaxRowPacks];
-    c.sum_row(row * packs, packs, sum);
+    pull::sum_row(p, in, row * packs, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
@@ -45,7 +48,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  c.close();
+  core::close(p);
 }
 
 }  // namespace hip_comms

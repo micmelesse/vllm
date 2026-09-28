@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "ipc.cuh"
+#include "p2p/pull.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -21,31 +21,35 @@ namespace hip_comms {
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_norm_gemm_add(
-    ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::rms_norm_gemm_add;
-  ipc::Comm<T, ngpus> c(p);
-  const int rank = c.rank();
+  core::start(p);
+  const auto in  = core::inputs(p);
+  const int rank = p.rank;
 
   // PHASE 1 -- this block's rows, reduced and normed, into our own scratch.
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    c.sum_row(row * packs, packs, sum);
+    pull::sum_row(p, in, row * packs, packs, sum);
     fusion::norm_row<T>(
         sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { c.put(rank, row * packs + i, v); });
+        [&](int, int i, const V& v) { core::put(p, rank, row * packs + i, v); });
   }
 
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
-  c.grid_barrier();
+  core::grid_barrier(p);
 
-  fusion::gemm<kLanesPerCol, T>([&](int r) { return c.ptr(rank, r * packs, packs); }, rows,
-                                gemm_w, n_cols, packs, out, out_stride, out_col0);
-  c.close();
+  fusion::gemm<kLanesPerCol, T>(
+      [&](int r) { return core::ptr(p, rank, r * packs, packs); }, rows, gemm_w, n_cols,
+      packs, out, out_stride, out_col0);
+  core::close(p);
 }
 
 }  // namespace hip_comms

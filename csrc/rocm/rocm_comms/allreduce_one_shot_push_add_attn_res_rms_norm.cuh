@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "ipc.cuh"
+#include "p2p/push.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -19,30 +19,33 @@ namespace hip_comms {
 template <typename T, int ngpus, int kBits, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot_push_add_attn_res_rms_norm(
-        ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
+        p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
         int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
+  using C          = p2p::Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  using core       = p2p::Core<T, ngpus>;
+  using push       = p2p::Push<T, ngpus, C>;
   namespace fusion = fusions::add_attn_res_rms_norm;
-  ipc::Comm<T, ngpus> c(p);
-  const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
-  c.template broadcast_rows<C>(box, rows, packs);
+  core::start(p);
+  const auto in = core::inputs(p);
+  const p2p::Inbox<C, ngpus> box(rows * blockDim.x);
+  push::broadcast_rows(p, in, box, rows, packs);
 
-  c.peer_block_barrier();
+  core::peer_block_barrier(p);
 
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const T* row_blocks = blocks + row * block_stride_m;
-    V* dst = write_idx >= 0 ? reinterpret_cast<V*>(const_cast<T*>(row_blocks) +
+    V* dst              = write_idx >= 0 ? reinterpret_cast<V*>(const_cast<T*>(row_blocks) +
                                                    write_idx * block_stride_r)
                             : nullptr;
     V sum[kMaxRowPacks];
-    c.template reduce_row<C>(box, row, packs, sum);
+    push::reduce_row(p, box, row, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
