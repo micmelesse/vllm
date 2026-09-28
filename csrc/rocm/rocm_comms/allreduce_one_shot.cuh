@@ -21,7 +21,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
   V* dst           = reinterpret_cast<V*>(out);
-  for (int idx = tid; idx < size; idx += stride) dst[idx] = c.sum(idx);
+  // kSumBatch packs a thread, all loaded before any is stored.
+  for (int idx = tid; idx < size; idx += stride * kSumBatch) {
+    V v[kSumBatch];
+    c.template sum<kSumBatch>(idx, stride, size, v);
+#pragma unroll
+    for (int u = 0; u < kSumBatch; ++u)
+      if (idx + u * stride < size) store_global(dst + idx + u * stride, v[u]);
+  }
   c.close();
 }
 

@@ -133,34 +133,51 @@ class Comm {
   DINLINE int rank() const { return p_.rank_; }
 
   DINLINE V sum(int64_t idx) const {
-    check(idx < p_.input_packs_, "sum", -1, idx, p_.input_packs_);
+    V out[1];
+    sum<1>(idx, 0, idx + 1, out);
+    return out[0];
+  }
+
+  // kBatch packs at once, idx + u * stride for u < kBatch (those at or past `limit` are
+  // skipped): every load from every peer is issued before any is added, so kBatch x ngpus are
+  // in flight rather than ngpus.
+  template <int kBatch>
+  DINLINE void sum(int64_t idx, int64_t stride, int64_t limit, V (&out)[kBatch]) const {
     constexpr int N = traits<T>::N;
-    float acc[N];
-    const V v0 = in_[0][idx];
+    V raw[kBatch][ngpus];
 #pragma unroll
-    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(v0.d[j]);
+    for (int u = 0; u < kBatch; ++u) {
+      const int64_t at = idx + u * stride;
+      if (at < limit) {
+        check(at < p_.input_packs_, "sum", -1, at, p_.input_packs_);
 #pragma unroll
-    for (int i = 1; i < ngpus; ++i) {
-      const V v = in_[i][idx];
-#pragma unroll
-      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(v.d[j]);
+        for (int i = 0; i < ngpus; ++i) raw[u][i] = load_global(in_[i] + at);
+      }
     }
-    V out;
 #pragma unroll
-    for (int j = 0; j < N; ++j) out.d[j] = static_cast<T>(acc[j]);
-    return out;
+    for (int u = 0; u < kBatch; ++u) {
+      float acc[N];
+#pragma unroll
+      for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[u][0].d[j]);
+#pragma unroll
+      for (int i = 1; i < ngpus; ++i)
+#pragma unroll
+        for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[u][i].d[j]);
+#pragma unroll
+      for (int j = 0; j < N; ++j) out[u].d[j] = static_cast<T>(acc[j]);
+    }
   }
 
   DINLINE void put(int peer, int64_t idx, const V& v) const {
     check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "put", peer, idx,
           p_.scratch_packs_);
-    scratch_of(peer)[idx] = v;
+    store_global(scratch_of(peer) + idx, v);
   }
 
   DINLINE V get(int peer, int64_t idx) const {
     check(peer >= 0 && peer < ngpus && idx < p_.scratch_packs_, "get", peer, idx,
           p_.scratch_packs_);
-    return scratch_of(peer)[idx];
+    return load_global(scratch_of(peer) + idx);
   }
 
   // SHMEM's `shmem_ptr`: a hot loop reads through this rather than paying `get`'s check on

@@ -29,8 +29,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   const int mine_begin = rank * chunk;
   const int mine_end   = min(mine_begin + chunk, size);
-  for (int idx = mine_begin + tid; idx < mine_end; idx += stride)
-    c.put(rank, idx - mine_begin, c.sum(idx));
+  // kSumBatch packs a thread in both phases, all loaded before any is stored.
+  for (int idx = mine_begin + tid; idx < mine_end; idx += stride * kSumBatch) {
+    V v[kSumBatch];
+    c.template sum<kSumBatch>(idx, stride, mine_end, v);
+#pragma unroll
+    for (int u = 0; u < kSumBatch; ++u)
+      if (idx + u * stride < mine_end) c.put(rank, idx + u * stride - mine_begin, v[u]);
+  }
 
   c.world_barrier();
 
@@ -38,7 +44,15 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   for (int i = 0; i < ngpus; ++i) {
     const int begin = i * chunk;
     const int end   = min(begin + chunk, size);
-    for (int idx = begin + tid; idx < end; idx += stride) dst[idx] = c.get(i, idx - begin);
+    for (int idx = begin + tid; idx < end; idx += stride * kSumBatch) {
+      V g[kSumBatch];
+#pragma unroll
+      for (int u = 0; u < kSumBatch; ++u)
+        if (idx + u * stride < end) g[u] = c.get(i, idx + u * stride - begin);
+#pragma unroll
+      for (int u = 0; u < kSumBatch; ++u)
+        if (idx + u * stride < end) store_global(dst + idx + u * stride, g[u]);
+    }
   }
   c.close();
 }
