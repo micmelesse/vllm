@@ -32,7 +32,7 @@
 namespace hip_comms::ipc {
 
 constexpr int kMaxRanks  = 8;
-constexpr int kMaxBlocks = 36;
+constexpr int kMaxBlocks = 64;
 
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
 // the bytes after the struct.

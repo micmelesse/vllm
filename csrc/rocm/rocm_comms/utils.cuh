@@ -313,11 +313,16 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kGemmRows = 16;
+// The K-chunk of x staged in LDS at a time, in packs: kGemmRows x 96 x 16 B = 24 KB, so
+// with the widest reduce tile (32 KB) a block stays inside gfx942's 64 KB.
+constexpr int kGemmChunk = 96;
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
-// wherever it lives; the hot loop reads through those pointers with no branch, and a row
-// past `rows` reads row 0 into sums that are never stored.
+// wherever it lives.
+//
+// x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
+// loop's row reads are LDS reads, not a global round trip per K-step.
 //
 // A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
 // kLanesPerCol lanes of a column (tuned in launch.cuh) and over the waves of the
@@ -334,6 +339,7 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   constexpr int kTile = kWaveSize / kLanesPerCol;
   static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
   __shared__ float partial[kMaxWaves][kGemmRows][kTile];
+  __shared__ V xs[kGemmRows][kGemmChunk];
   const int lane   = threadIdx.x % kWaveSize;
   const int wave   = threadIdx.x / kWaveSize;
   const int waves  = blockDim.x / kWaveSize;
@@ -342,27 +348,32 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   const int split  = wave * kLanesPerCol + lane / kTile;
   const V* wv      = reinterpret_cast<const V*>(gemm_w);
   const int tiles  = (n_cols + kTile - 1) / kTile;
-  const V* x[kGemmRows];
-#pragma unroll
-  for (int r = 0; r < kGemmRows; ++r) x[r] = row(r < rows ? r : 0);
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
     const int n   = tile * kTile + column;
     const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
     float acc[kGemmRows];
 #pragma unroll
     for (int r = 0; r < kGemmRows; ++r) acc[r] = 0.0f;
-#pragma unroll 2
-    for (int k = split; k < packs; k += splits) {
-      const V wx = wrow[k];
-      float w[NL];
+    for (int k0 = 0; k0 < packs; k0 += kGemmChunk) {
+      const int chunk = min(kGemmChunk, packs - k0);
+      // Rows past `rows` are never staged; their sums read stale LDS and are never stored.
+      for (int i = threadIdx.x; i < rows * chunk; i += blockDim.x)
+        xs[i / chunk][i % chunk] = row(i / chunk)[k0 + i % chunk];
+      __syncthreads();
+      for (int k = split; k < chunk; k += splits) {
+        const V wx = wrow[k0 + k];
+        float w[NL];
 #pragma unroll
-      for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
+        for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
 #pragma unroll
-      for (int r = 0; r < kGemmRows; ++r) {
-        const V xr = x[r][k];
+        for (int r = 0; r < kGemmRows; ++r) {
+          const V xr = xs[r][k];
 #pragma unroll
-        for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
+          for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
+        }
       }
+      // Before the next chunk overwrites `xs`.
+      __syncthreads();
     }
     // A column's lanes are kTile apart in the wave.
 #pragma unroll

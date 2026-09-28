@@ -60,7 +60,8 @@ constexpr bool is_two_shot(Kernel k) { return static_cast<int>(k) % 2 == 1; }
 //                        16 x 7168; two-shot wins by 3.67 MB)
 //   fused_max_bytes      declined above, so the caller runs the unfused ops (kNever: never
 //                        declined; kAlways: always)
-//   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks
+//   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks;
+//                        the GEMM tail wants one block per 16-column tile (56 at Kimi-K3)
 //   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
 struct OpTuning {
   int64_t one_shot_max_bytes;
@@ -83,7 +84,7 @@ constexpr OpTuning kGfx950[] = {
     /* rms_norm              */ {512 * kKiB, kNever, 16, 36, 512, 0},
     /* add_rms_norm          */ {512 * kKiB, kNever, 16, 36, 512, 0},
     /* add_attn_res_rms_norm */ {512 * kKiB, 512 * kKiB, 16, 36, 512, 0},
-    /* rms_norm_gemm_add     */ {512 * kKiB, kAlways, 16, 36, 512, 4},
+    /* rms_norm_gemm_add     */ {512 * kKiB, kAlways, 56, 56, 512, 4},
 };
 
 constexpr const OpTuning& tuning(Op op) { return kGfx950[static_cast<int>(op)]; }
