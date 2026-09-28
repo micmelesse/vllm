@@ -29,9 +29,10 @@ struct traits {
   using V = vec<T, N>;
 };
 
-// PEER MEMORY THROUGH GLOBAL INSTRUCTIONS. A pointer read out of a struct has no address space
-// the compiler can prove, so it emits `flat_load`, which checks the aperture and waits on both
-// counters; casting to address space 1 gives `global_load_dwordx4` / `global_store_dwordx4`.
+// PEER MEMORY THROUGH GLOBAL INSTRUCTIONS. A pointer read out of a struct has no address
+// space the compiler can prove, so it emits `flat_load`, which checks the aperture and
+// waits on both counters; casting to address space 1 gives `global_load_dwordx4` /
+// `global_store_dwordx4`.
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
@@ -52,8 +53,8 @@ DINLINE void store_global(V* p, const V& v) {
   *(global_u32x4*)(p) = raw;
 }
 
-// PACKS PER PEER A THREAD HAS IN FLIGHT in a batched `sum`: bandwidth is bytes in flight over
-// latency, and one pack per peer per wait left the one-shot at a quarter of aiter's.
+// PACKS PER PEER A THREAD HAS IN FLIGHT in a batched `sum`: bandwidth is bytes in flight
+// over latency, and one pack per peer per wait left the one-shot at a quarter of aiter's.
 constexpr int kSumBatch = 4;
 
 // THE HARDWARE, named once: gfx9 runs 64-lane waves, and every kernel here is built for at

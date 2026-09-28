@@ -139,8 +139,8 @@ class Comm {
   }
 
   // kBatch packs at once, idx + u * stride for u < kBatch (those at or past `limit` are
-  // skipped): every load from every peer is issued before any is added, so kBatch x ngpus are
-  // in flight rather than ngpus.
+  // skipped): every load from every peer is issued before any is added, so kBatch x ngpus
+  // are in flight rather than ngpus.
   template <int kBatch>
   DINLINE void sum(int64_t idx, int64_t stride, int64_t limit, V (&out)[kBatch]) const {
     constexpr int N = traits<T>::N;
