@@ -313,9 +313,14 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kGemmRows = 16;
-// The K-chunk of x staged in LDS at a time, in packs: kGemmRows x 96 x 16 B = 24 KB, so
-// with the widest reduce tile (32 KB) a block stays inside gfx942's 64 KB.
+// The K-chunk of x staged in LDS at a time, in packs. gfx950 has 160 KB of LDS, so all of
+// Kimi-K3's latent K (448 packs, 112 KB) goes in at once: one staging pass and one barrier
+// pair per tile. gfx942 has 64 KB: 96 packs (24 KB) beside the widest reduce tile (32 KB).
+#if defined(__gfx950__)
+constexpr int kGemmChunk = 448;
+#else
 constexpr int kGemmChunk = 96;
+#endif
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
