@@ -36,13 +36,11 @@ from vllm.distributed.device_communicators.rocm_comms import (
     Communicator,
     make_communicator,
 )
-from vllm.distributed.device_communicators.rocm_comms.hip import (
-    HipCommunicator,
-    Kernel,
-)
+from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
 )
+from vllm.distributed.device_communicators.rocm_comms.launch import Kernel, Launch
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.device_communicators.rocm_comms.tunables import Tunables
 from vllm.distributed.parallel_state import (
@@ -316,14 +314,8 @@ def _build_communicator(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
     device: torch.device,
-    kernel: Kernel | None = None,
-    quant_bits: int = 0,
 ) -> Communicator:
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
-    if kernel is not None:
-        if not isinstance(comm, HipCommunicator):
-            raise RuntimeError(f"kernel={kernel!r} is hip's; {backend} has one kernel")
-        comm.set_launch_override(kernel, quant_bits=quant_bits)
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
     # remember to extend when a backend is added.
@@ -424,7 +416,11 @@ def _chunks(
 
 
 def declined(
-    comm: Communicator, op_name: str, shape: tuple[int, ...], dtype: torch.dtype
+    comm: Communicator,
+    op_name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    launch: Launch | None,
 ) -> str | None:
     """Why the communicator will not take `shape`, or None if it will.
 
@@ -434,7 +430,7 @@ def declined(
     could not; this one was asked a question.
     """
     one = torch.empty(shape, dtype=dtype)
-    if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
+    if not getattr(comm, f"should_{op_name.replace('_', '')}")(one, launch):
         return "declined by the communicator"
     return None
 
@@ -487,6 +483,7 @@ def run_collective(
     op_name: str,
     mine: Sequence[Sequence[torch.Tensor]],
     sched: Schedule,
+    launch: Launch | None,
 ) -> list[list[torch.Tensor]]:
     """One output per (shape, SLOT): `mine[s][j]` in, the result out. Slot j is replay
     `j // buffers`
@@ -523,7 +520,7 @@ def run_collective(
     # the communicator enforces its own envelope and raises, so a check here would
     # restate what the callee guarantees.
     ops = [
-        [partial(getattr(comm, op_name), st[: sh[0]]) for st in statics]
+        [partial(getattr(comm, op_name), st[: sh[0]], launch=launch) for st in statics]
         for sh in shapes
     ]
 
@@ -678,7 +675,8 @@ def exercise(
     # inside, where `del` only releases if nothing else holds a reference -- and a
     # failing cell's traceback holds the frames that hold the communicator, so `del`
     # fails exactly when it matters.
-    with _build_communicator(backend, cpu_group, group, device, kernel) as comm:
+    launch = None if kernel is None else Launch(kernel)
+    with _build_communicator(backend, cpu_group, group, device) as comm:
         for op_name, dtype_name in product(OPS, DTYPES):
             dtype = D_DTYPES[dtype_name]
             atol = _atol(op_name, dtype)
@@ -688,7 +686,7 @@ def exercise(
                 # ones that were admitted.
                 shapes = []
                 for sh in chunk:
-                    why = declined(comm, op_name, sh, dtype)
+                    why = declined(comm, op_name, sh, dtype, launch)
                     if why is None:
                         shapes.append(sh)
                     else:
@@ -719,7 +717,7 @@ def exercise(
                         gen_inputs(sh, dtype, world, slots, device) for sh in shapes
                     ]
                     got = run_collective(
-                        comm, op_name, [i[rank] for i in inputs], sched
+                        comm, op_name, [i[rank] for i in inputs], sched, launch
                     )
                     expected = [expected_outputs(op_name, i, slots) for i in inputs]
                     return [
@@ -1053,19 +1051,25 @@ def run_fused_rank(
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
         residual = _one_input(world, 1, shape, dtype)
         weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-        kernel = cast(Kernel, f"{shot}_{form}")
-        with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
+        launch = Launch(cast(Kernel, f"{shot}_{form}"))
+        with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
             if form == "rms_norm":
-                if not comm.should_allreduce_rms_norm(mine):
+                if not comm.should_allreduce_rms_norm(mine, launch):
                     return False, NO_FUSED_KERNEL
-                got = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS)
+                got = comm.all_reduce_rms_norm(
+                    mine, weight.to(device), FUSED_EPS, launch=launch
+                )
                 got_residual = None
             else:
-                if not comm.should_allreduce_add_rms_norm(mine):
+                if not comm.should_allreduce_add_rms_norm(mine, launch):
                     return False, NO_FUSED_KERNEL
                 got, got_residual = comm.all_reduce_add_rms_norm(
-                    mine, residual.to(device), weight.to(device), FUSED_EPS
+                    mine,
+                    residual.to(device),
+                    weight.to(device),
+                    FUSED_EPS,
+                    launch=launch,
                 )
         want, want_residual = _fused_reference(form, inputs, residual, weight)
         atol, rtol = _fused_tolerance(dtype)
@@ -1254,10 +1258,10 @@ def run_add_attn_res_rms_norm_rank(
         )
         torch.cuda.synchronize()
 
-        kernel = cast(Kernel, f"{shot}_add_attn_res_rms_norm")
-        with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
+        launch = Launch(cast(Kernel, f"{shot}_add_attn_res_rms_norm"))
+        with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce_add_attn_res_rms_norm(mine):
+            if not comm.should_allreduce_add_attn_res_rms_norm(mine, launch):
                 return False, NO_FUSED_KERNEL
             got_blocks = blocks.to(device).clone()
             got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
@@ -1271,6 +1275,7 @@ def run_add_attn_res_rms_norm_rank(
                 write_idx,
                 1e-6,
                 1e-5,
+                launch=launch,
             )
             torch.cuda.synchronize()
         atol, rtol = _fused_tolerance(dtype)
@@ -1394,14 +1399,14 @@ def run_rms_norm_gemm_add_rank(
         want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
         torch.cuda.synchronize()
 
-        kernel = cast(Kernel, f"{shot}_rms_norm_gemm_add")
-        with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
+        launch = Launch(cast(Kernel, f"{shot}_rms_norm_gemm_add"))
+        with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce_rms_norm_gemm_add(mine):
+            if not comm.should_allreduce_rms_norm_gemm_add(mine, launch):
                 return False, NO_FUSED_KERNEL
             got = shared.clone()
             comm.all_reduce_rms_norm_gemm_add(
-                mine, norm_w, FUSED_EPS, gemm_w, got, col0
+                mine, norm_w, FUSED_EPS, gemm_w, got, col0, launch=launch
             )
             torch.cuda.synchronize()
         atol, rtol = _fused_tolerance(dtype)
@@ -1493,13 +1498,12 @@ def run_quantized_rank(
     torch.cuda.synchronize()
     try:
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        with _build_communicator(
-            "hip", cpu_group, group, device, kernel, quant_bits=bits
-        ) as comm:
+        launch = Launch(kernel, quant_bits=bits)
+        with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce(mine):
+            if not comm.should_allreduce(mine, launch):
                 return None, None, NO_FUSED_KERNEL
-            got = comm.all_reduce(mine).cpu().to(torch.float32)
+            got = comm.all_reduce(mine, launch=launch).cpu().to(torch.float32)
         want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
         rel = ((got - want).norm() / want.norm()).item()
         digest = hash(got.numpy().tobytes())

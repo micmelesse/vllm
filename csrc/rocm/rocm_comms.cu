@@ -6,8 +6,8 @@
 //
 // THE CALLER NAMES AN OP; THIS PICKS THE KERNEL. Which kernel runs and how wide is decided
 // once, in launch.cuh, for gfx950: Python never sees an algorithm or a geometry. The
-// one way to force a choice is `rocm_comms_set_launch_override`, which the sweep uses.
-// No getenv.
+// one way to force a choice is the launch every op takes last, which the sweep and the
+// tests pass and the model leaves at the table's. No getenv.
 //
 // Compile-time vs runtime is the one distinction that shapes everything. `ngpus` and the
 // dtype must be constexpr to unroll and vectorize, so they are template parameters and
@@ -16,9 +16,11 @@
 // the wrong thing.
 //
 // rocm_comms/ holds the layers as headers, all included here so the device code stays in
-// this one translation unit and needs no -fgpu-rdc: ipc.cuh (peer memory and sync),
-// launch.cuh (the picker), utils.cuh (what the kernels share), then one allreduce_*.cuh
-// per kernel.
+// this one translation unit and needs no -fgpu-rdc: ipc.cuh (host setup), p2p/ (the
+// device layer: core primitives, pull and push patterns), fusions/ (what a fused op
+// computes), launch.cuh (the picker), utils.cuh (what everything shares), then one
+// allreduce_<shot>_<pull|push>[_<op>].cuh per kernel. Design rules: CONTEXT.md, "Code
+// design".
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/BFloat16.h>
@@ -76,8 +78,9 @@ constexpr bool table_fits() {
 }
 static_assert(table_fits(), "launch.cuh's table exceeds a kernel capability");
 
-// The launch the sweep forces: a kernel, its geometry, the GEMM tail's lanes per column and
-// a push kernel's codec bits (each 0: the table's).
+// A CALLER'S LAUNCH, passed with every call (the sweep's and the tests'; the model passes
+// none): a kernel, its geometry, the GEMM tail's lanes per column and a push kernel's
+// codec bits (each 0: the table's). `kernel` none: the table picks everything.
 struct Forced {
   Kernel kernel;
   int blocks;
@@ -86,16 +89,25 @@ struct Forced {
   int quant_bits;
 };
 
-// What Python holds: the peers, and the launch the sweep forces, if any.
-struct Comms {
-  template <typename... A>
-  explicit Comms(A&&... a) : group(std::forward<A>(a)...) {}
-  ipc::Group group;
-  Forced forced{Kernel::none, 0, 0, 0, 0};
-};
+// The five integers every op takes, checked. Kernel -1 is none.
+Forced forced_of(int64_t kernel, int64_t blocks, int64_t threads,
+                 int64_t gemm_lanes_per_col, int64_t quant_bits) {
+  if (kernel < 0) return {Kernel::none, 0, 0, 0, 0};
+  TORCH_CHECK(kernel < kNumKernels, "hip_comms: no kernel ", kernel);
+  TORCH_CHECK(blocks > 0 && blocks <= p2p::kMaxBlocks, "blocks must be in [1, ",
+              p2p::kMaxBlocks, "]");
+  TORCH_CHECK(threads > 0 && threads <= kMaxThreads && threads % kWaveSize == 0,
+              "threads must be a multiple of ", kWaveSize, " up to ", kMaxThreads);
+  const int64_t lpc = gemm_lanes_per_col;
+  TORCH_CHECK(lpc == 0 || lpc == 1 || lpc == 2 || lpc == 4 || lpc == 8,
+              "gemm_lanes_per_col must be 0 (the table's), 1, 2, 4 or 8");
+  TORCH_CHECK(quant_bits == 0 || quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
+              "quant_bits must be 0 (the table's), 16, 8 or 4");
+  return {static_cast<Kernel>(kernel), static_cast<int>(blocks), static_cast<int>(threads),
+          static_cast<int>(lpc), static_cast<int>(quant_bits)};
+}
 
-Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
-  const Forced& f = comms.forced;
+Launch launch_for(const Forced& f, Op op, int64_t rows, int64_t bytes) {
   if (f.kernel == Kernel::none) return pick(op, rows, bytes);
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
@@ -149,26 +161,27 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
 // Whether `op` over [rows, hidden] of this element size runs a kernel here: something
 // was picked, a row fits in registers at the picked width, and its scratch fits.
 // Python asks this before every fused call and runs the unfused ops on a no.
-bool admits(const Comms& comms, Op op, int64_t rows, int64_t hidden, int64_t elem) {
+bool admits(const ipc::Group& group, const Forced& forced, Op op, int64_t rows,
+            int64_t hidden, int64_t elem) {
   const int64_t lanes = 16 / elem;
   if (hidden % lanes != 0) return false;
   const int64_t packs = hidden / lanes;
-  const Launch l      = launch_for(comms, op, rows, rows * hidden * elem);
+  const Launch l      = launch_for(forced, op, rows, rows * hidden * elem);
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
   if (op == Op::rms_norm_gemm_add && !is_two_shot(l.kernel) && rows > kGemmTailOneShotRows)
     return false;
-  return scratch_need(l, rows, packs, rows * packs, comms.group.world_size()) <=
-         comms.group.scratch_bytes();
+  return scratch_need(l, rows, packs, rows * packs, group.world_size()) <=
+         group.scratch_bytes();
 }
 
 // The picked launch for a call, refused where `admits` would have said no.
-Launch checked_launch(const Comms& comms, Op op, int64_t rows, int64_t hidden,
-                      int64_t elem) {
-  TORCH_CHECK(admits(comms, op, rows, hidden, elem), "hip_comms: op ",
+Launch checked_launch(const ipc::Group& group, const Forced& forced, Op op, int64_t rows,
+                      int64_t hidden, int64_t elem) {
+  TORCH_CHECK(admits(group, forced, op, rows, hidden, elem), "hip_comms: op ",
               static_cast<int>(op), " over [", rows, ", ", hidden,
               "] is declined here; ask admits first");
-  return launch_for(comms, op, rows, rows * hidden * elem);
+  return launch_for(forced, op, rows, rows * hidden * elem);
 }
 
 #define BY_NGPUS(world, LAUNCH)                                                          \
@@ -222,15 +235,16 @@ void by_bits(int bits, F&& f) {
     break;
 
 // PLAIN ALL-REDUCE over the flat buffer.
-void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
+void all_reduce(ipc::Group& group, const Forced& forced, torch::Tensor& out,
+                torch::Tensor& inp) {
   TORCH_CHECK(out.is_cuda() && inp.is_cuda(), "out and inp must be on device");
   TORCH_CHECK(out.is_contiguous() && inp.is_contiguous(), "out and inp must be contiguous");
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
   const Launch l =
-      checked_launch(comms, Op::all_reduce, 1, inp.numel(), inp.element_size());
+      checked_launch(group, forced, Op::all_reduce, 1, inp.numel(), inp.element_size());
   const int n    = static_cast<int>(inp.numel() * inp.element_size() / 16);
-  const p2p::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ALL_REDUCE_ARGS(T) p, out.data_ptr<T>(), n
@@ -246,12 +260,12 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 #define ALL_REDUCE_BF16(NG) LAUNCH_ALL_REDUCE(at::BFloat16, NG)
 
   switch (out.scalar_type()) {
-    case at::ScalarType::Half: BY_NGPUS(comms.group.world_size(), ALL_REDUCE_HALF) break;
+    case at::ScalarType::Half: BY_NGPUS(group.world_size(), ALL_REDUCE_HALF) break;
     case at::ScalarType::BFloat16:
-      BY_NGPUS(comms.group.world_size(), ALL_REDUCE_BF16) break;
+      BY_NGPUS(group.world_size(), ALL_REDUCE_BF16) break;
     default: dtype_not_built();
   }
-  not_built(comms.group.world_size());
+  not_built(group.world_size());
 #undef ALL_REDUCE_BF16
 #undef ALL_REDUCE_HALF
 #undef LAUNCH_ALL_REDUCE
@@ -261,9 +275,10 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
 // given (and then `residual_out` too). Exact to those ops' roundings; see
 // `fusions::add_rms_norm::row`.
-void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* residual_out,
-                             torch::Tensor& inp, const torch::Tensor* residual,
-                             torch::Tensor& weight, double eps) {
+void all_reduce_add_rms_norm(ipc::Group& group, const Forced& forced, torch::Tensor& out,
+                             torch::Tensor* residual_out, torch::Tensor& inp,
+                             const torch::Tensor* residual, torch::Tensor& weight,
+                             double eps) {
   const bool add = residual != nullptr;
   TORCH_CHECK(add == (residual_out != nullptr),
               "residual and residual_out come together or not at all");
@@ -299,9 +314,9 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
               "weight must be aligned to ", weight_pack, " bytes");
   const int rows  = static_cast<int>(inp.size(0));
   const int packs = static_cast<int>(inp.size(1) / lanes);
-  const Launch l  = checked_launch(comms, add ? Op::add_rms_norm : Op::rms_norm, rows,
-                                   inp.size(1), inp.element_size());
-  const p2p::Peers p = comms.group.peers(inp);
+  const Launch l  = checked_launch(group, forced, add ? Op::add_rms_norm : Op::rms_norm,
+                                   rows, inp.size(1), inp.element_size());
+  const p2p::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   const float feps   = static_cast<float>(eps);
 
@@ -326,7 +341,7 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
 #define NORM_BF16(NG) LAUNCH_NORM(at::BFloat16, at::BFloat16, NG)
 #define NORM_BF16_F32(NG) LAUNCH_NORM(at::BFloat16, float, NG)
 
-  const int world = comms.group.world_size();
+  const int world = group.world_size();
   switch (inp.scalar_type()) {
     case at::ScalarType::Half:
       if (fp32_weight) {
@@ -357,8 +372,9 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
 // FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm
 // on each row (see `fusions::add_attn_res_rms_norm::row`). With `has_prefix` the sum is
 // added to `prefix` in place; without, the sum IS the new prefix and is written there.
-void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
-                                      torch::Tensor& out, torch::Tensor& inp,
+void all_reduce_add_attn_res_rms_norm(ipc::Group& group, const Forced& forced,
+                                      torch::Tensor& prefix, torch::Tensor& out,
+                                      torch::Tensor& inp,
                                       torch::Tensor& blocks, torch::Tensor& norm_weight,
                                       torch::Tensor& qk_weight,
                                       const torch::Tensor* out_norm_weight,
@@ -399,9 +415,9 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
               "blocks must be 16-byte aligned in every row and source");
   const int rows  = static_cast<int>(inp.size(0));
   const int packs = static_cast<int>(hidden / lanes);
-  const Launch l  = checked_launch(comms, Op::add_attn_res_rms_norm, rows, hidden,
+  const Launch l  = checked_launch(group, forced, Op::add_attn_res_rms_norm, rows, hidden,
                                    inp.element_size());
-  const p2p::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ATTN_RES_ARGS(T)                                                                 \
@@ -429,7 +445,7 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
 #define ATTN_RES_HALF(NG) ATTN_RES_BY_PREFIX(at::Half, NG)
 #define ATTN_RES_BF16(NG) ATTN_RES_BY_PREFIX(at::BFloat16, NG)
 
-  const int world = comms.group.world_size();
+  const int world = group.world_size();
   switch (inp.scalar_type()) {
     case at::ScalarType::Half: BY_NGPUS(world, ATTN_RES_HALF) break;
     case at::ScalarType::BFloat16: BY_NGPUS(world, ATTN_RES_BF16) break;
@@ -446,9 +462,10 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
 // FUSED: all-reduce, then RMSNorm, then `out[:, col0:col0+N] += normed @ gemm_w^T` -- the
 // latent MoE tail. The normed rows go in scratch, and a sync separates the norm from the
 // GEMM (see the kernels).
-void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_col0,
-                                  torch::Tensor& inp, torch::Tensor& norm_weight,
-                                  double eps, torch::Tensor& gemm_weight) {
+void all_reduce_rms_norm_gemm_add(ipc::Group& group, const Forced& forced,
+                                  torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+                                  torch::Tensor& norm_weight, double eps,
+                                  torch::Tensor& gemm_weight) {
   TORCH_CHECK(inp.dim() == 2 && inp.is_contiguous(), "inp must be contiguous 2-D");
   const int64_t rows = inp.size(0), hidden = inp.size(1);
   TORCH_CHECK(gemm_weight.dim() == 2 && gemm_weight.size(1) == hidden &&
@@ -469,10 +486,11 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
   const int lanes = 16 / static_cast<int>(inp.element_size());
   const int packs = static_cast<int>(hidden / lanes);
   const Launch l =
-      checked_launch(comms, Op::rms_norm_gemm_add, rows, hidden, inp.element_size());
+      checked_launch(group, forced, Op::rms_norm_gemm_add, rows, hidden,
+                     inp.element_size());
   TORCH_CHECK(l.threads % kWaveSize == 0, "the GEMM phase needs whole waves; threads ",
               l.threads);
-  const p2p::Peers p = comms.group.peers(inp);
+  const p2p::Peers p = group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: the GEMM phase spreads the columns over the whole grid.
 
@@ -500,7 +518,7 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
 #define GEMM_ADD_HALF(NG) LAUNCH_GEMM_ADD(at::Half, NG)
 #define GEMM_ADD_BF16(NG) LAUNCH_GEMM_ADD(at::BFloat16, NG)
 
-  const int world = comms.group.world_size();
+  const int world = group.world_size();
   switch (inp.scalar_type()) {
     case at::ScalarType::Half: BY_NGPUS(world, GEMM_ADD_HALF) break;
     case at::ScalarType::BFloat16: BY_NGPUS(world, GEMM_ADD_BF16) break;
@@ -530,6 +548,10 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
+// EVERY OP TAKES ITS LAUNCH, the same five integers last: kernel, launch_blocks,
+// launch_threads, gemm_lanes_per_col, quant_bits (see `hip_comms::Forced`); -1 and zeros
+// for the table's, which is what the model passes.
+
 namespace {
 std::string bytes_of(const std::vector<int64_t>& xs) {
   std::string out;
@@ -547,8 +569,8 @@ std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) 
 }  // namespace
 
 namespace {
-hip_comms::Comms& comms_of(fptr_t comms) {
-  return *reinterpret_cast<hip_comms::Comms*>(comms);
+hip_comms::ipc::Group& comms_of(fptr_t comms) {
+  return *reinterpret_cast<hip_comms::ipc::Group*>(comms);
 }
 }  // namespace
 
@@ -557,7 +579,7 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
                        int64_t peer_slab_bytes, int64_t scratch_bytes,
                        double sync_timeout_s) {
-  auto* comms = new hip_comms::Comms(
+  auto* comms = new hip_comms::ipc::Group(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
       static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes, sync_timeout_s);
@@ -565,45 +587,20 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
 }
 
 void rocm_comms_set_checked(fptr_t comms, bool checked) {
-  comms_of(comms).group.set_checked(checked);
-}
-
-// THE SWEEP'S ONE HANDLE: every later launch of that kernel's op runs `kernel` at this
-// geometry, GEMM lanes per column and codec bits (each 0: the table's), and a launch of
-// any other op is refused. `kernel` -1 clears it.
-void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
-                                    int64_t threads, int64_t gemm_lanes_per_col,
-                                    int64_t quant_bits) {
-  using hip_comms::Kernel;
-  if (kernel < 0) {
-    comms_of(comms).forced = {Kernel::none, 0, 0, 0, 0};
-    return;
-  }
-  TORCH_CHECK(kernel < hip_comms::kNumKernels,
-              "hip_comms: no kernel ", kernel);
-  TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
-              hip_comms::p2p::kMaxBlocks, "]");
-  TORCH_CHECK(threads > 0 && threads <= hip_comms::kMaxThreads &&
-                  threads % hip_comms::kWaveSize == 0,
-              "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
-              hip_comms::kMaxThreads);
-  const int64_t lpc = gemm_lanes_per_col;
-  TORCH_CHECK(lpc == 0 || lpc == 1 || lpc == 2 || lpc == 4 || lpc == 8,
-              "gemm_lanes_per_col must be 0 (the table's), 1, 2, 4 or 8");
-  TORCH_CHECK(quant_bits == 0 || quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
-              "quant_bits must be 0 (the table's), 16, 8 or 4");
-  comms_of(comms).forced = {static_cast<Kernel>(kernel), static_cast<int>(blocks),
-                            static_cast<int>(threads), static_cast<int>(lpc),
-                            static_cast<int>(quant_bits)};
+  comms_of(comms).set_checked(checked);
 }
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
-                       int64_t element_size) {
+                       int64_t element_size, int64_t kernel, int64_t launch_blocks,
+                       int64_t launch_threads, int64_t gemm_lanes_per_col,
+                       int64_t quant_bits) {
   TORCH_CHECK(op >= 0 && op <= static_cast<int64_t>(hip_comms::Op::rms_norm_gemm_add),
               "hip_comms: no op ", op);
   TORCH_CHECK(element_size == 2, "hip_comms: only 2-byte dtypes are built");
-  return hip_comms::admits(comms_of(comms), static_cast<hip_comms::Op>(op), rows, hidden,
-                           element_size);
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
+  return hip_comms::admits(comms_of(comms), forced, static_cast<hip_comms::Op>(op), rows,
+                           hidden, element_size);
 }
 
 void rocm_comms_dispose(fptr_t comms) { delete &comms_of(comms); }
@@ -611,12 +608,12 @@ void rocm_comms_dispose(fptr_t comms) { delete &comms_of(comms); }
 void rocm_comms_register_buffer(fptr_t comms,
                                 const std::vector<std::vector<int64_t>>& handles,
                                 const std::vector<int64_t>& offsets, int64_t self_ptr) {
-  comms_of(comms).group.register_buffer(bytes_of(handles), offsets,
+  comms_of(comms).register_buffer(bytes_of(handles), offsets,
                                         static_cast<uintptr_t>(self_ptr));
 }
 
 std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms) {
-  auto pending = comms_of(comms).group.pending_graph_buffers();
+  auto pending = comms_of(comms).pending_graph_buffers();
   return std::vector<int64_t>(pending.begin(), pending.end());
 }
 
@@ -640,48 +637,67 @@ void rocm_comms_register_graph_buffers(
       per_rank.push_back(all.substr(at, stride));
     bytes.push_back(std::move(per_rank));
   }
-  comms_of(comms).group.register_graph_buffers(bytes, offsets);
+  comms_of(comms).register_graph_buffers(bytes, offsets);
 }
 
 int64_t rocm_comms_pending_count(fptr_t comms) {
-  return comms_of(comms).group.pending_count();
+  return comms_of(comms).pending_count();
 }
 
-void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp) {
-  hip_comms::all_reduce(comms_of(comms), out, inp);
+void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
+                           int64_t kernel, int64_t launch_blocks, int64_t launch_threads,
+                           int64_t gemm_lanes_per_col, int64_t quant_bits) {
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
+  hip_comms::all_reduce(comms_of(comms), forced, out, inp);
 }
 
 void rocm_comms_all_reduce_rms_norm(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
-                                    torch::Tensor& weight, double eps) {
-  hip_comms::all_reduce_add_rms_norm(comms_of(comms), out, nullptr, inp, nullptr, weight,
-                                     eps);
+                                    torch::Tensor& weight, double eps, int64_t kernel,
+                                    int64_t launch_blocks, int64_t launch_threads,
+                                    int64_t gemm_lanes_per_col, int64_t quant_bits) {
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
+  hip_comms::all_reduce_add_rms_norm(comms_of(comms), forced, out, nullptr, inp, nullptr,
+                                     weight, eps);
 }
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t comms, torch::Tensor& out,
                                         torch::Tensor& residual_out, torch::Tensor& inp,
                                         torch::Tensor& residual, torch::Tensor& weight,
-                                        double eps) {
-  hip_comms::all_reduce_add_rms_norm(comms_of(comms), out, &residual_out, inp, &residual,
-                                     weight, eps);
+                                        double eps, int64_t kernel, int64_t launch_blocks,
+                                        int64_t launch_threads, int64_t gemm_lanes_per_col,
+                                        int64_t quant_bits) {
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
+  hip_comms::all_reduce_add_rms_norm(comms_of(comms), forced, out, &residual_out, inp,
+                                     &residual, weight, eps);
 }
 
 void rocm_comms_all_reduce_add_attn_res_rms_norm(
     fptr_t comms, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
-    int64_t write_idx, double eps, double out_eps, bool has_prefix) {
+    int64_t write_idx, double eps, double out_eps, bool has_prefix, int64_t kernel,
+    int64_t launch_blocks, int64_t launch_threads, int64_t gemm_lanes_per_col,
+    int64_t quant_bits) {
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
   hip_comms::all_reduce_add_attn_res_rms_norm(
-      comms_of(comms), prefix, out, inp, blocks, norm_weight, qk_weight,
+      comms_of(comms), forced, prefix, out, inp, blocks, norm_weight, qk_weight,
       out_norm_weight ? &*out_norm_weight : nullptr, num_blocks, write_idx, eps, out_eps,
       has_prefix);
 }
 
-void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t comms, torch::Tensor& out,
-                                             int64_t out_col0, torch::Tensor& inp,
-                                             torch::Tensor& norm_weight, double eps,
-                                             torch::Tensor& gemm_weight) {
-  hip_comms::all_reduce_rms_norm_gemm_add(comms_of(comms), out, out_col0, inp, norm_weight,
-                                          eps, gemm_weight);
+void rocm_comms_all_reduce_rms_norm_gemm_add(
+    fptr_t comms, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight, int64_t kernel,
+    int64_t launch_blocks, int64_t launch_threads, int64_t gemm_lanes_per_col,
+    int64_t quant_bits) {
+  const auto forced = hip_comms::forced_of(kernel, launch_blocks, launch_threads,
+                                           gemm_lanes_per_col, quant_bits);
+  hip_comms::all_reduce_rms_norm_gemm_add(comms_of(comms), forced, out, out_col0, inp,
+                                          norm_weight, eps, gemm_weight);
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

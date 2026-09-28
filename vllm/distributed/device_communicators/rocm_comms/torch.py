@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from .base import Communicator
+from .launch import Launch
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ class TorchCommunicator(Communicator):
     neither -- see `base.__init__`. A control is only wanted where the backends run.
     """
 
-    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(
+        self, inp: torch.Tensor, launch: Launch | None = None
+    ) -> torch.Tensor:
+        self._refuse_launch(launch)
         out = inp.clone()
         dist.all_reduce(out, group=self.device_group)  # SUM
         return out

@@ -38,7 +38,6 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, replace
-from functools import partial
 from itertools import product
 from typing import cast, get_args
 
@@ -51,10 +50,8 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.rocm_comms import make_communicator
 from vllm.distributed.device_communicators.rocm_comms.base import FusedOp
-from vllm.distributed.device_communicators.rocm_comms.hip import (
-    HipCommunicator,
-    Kernel,
-)
+from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
+from vllm.distributed.device_communicators.rocm_comms.launch import Kernel, Launch
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -179,11 +176,15 @@ def _tail(op: str, summed: torch.Tensor, t: Inputs) -> torch.Tensor:
     return t.shared
 
 
-def _fused(comm: HipCommunicator, op: FusedOp, t: Inputs) -> torch.Tensor:
+def _fused(
+    comm: HipCommunicator, op: FusedOp, t: Inputs, launch: Launch | None = None
+) -> torch.Tensor:
     if op == "rms_norm":
-        return comm.all_reduce_rms_norm(t.x, t.weight, EPS)
+        return comm.all_reduce_rms_norm(t.x, t.weight, EPS, launch=launch)
     if op == "add_rms_norm":
-        return comm.all_reduce_add_rms_norm(t.x, t.residual, t.weight, EPS)[0]
+        return comm.all_reduce_add_rms_norm(
+            t.x, t.residual, t.weight, EPS, launch=launch
+        )[0]
     if op == "add_attn_res_rms_norm":
         return comm.all_reduce_add_attn_res_rms_norm(
             t.x,
@@ -196,34 +197,28 @@ def _fused(comm: HipCommunicator, op: FusedOp, t: Inputs) -> torch.Tensor:
             -1,
             EPS,
             EPS,
+            launch=launch,
         )[1]
-    comm.all_reduce_rms_norm_gemm_add(t.x, t.weight, EPS, t.up_proj, t.shared, t.col0)
+    comm.all_reduce_rms_norm_gemm_add(
+        t.x, t.weight, EPS, t.up_proj, t.shared, t.col0, launch=launch
+    )
     return t.shared
 
 
-def _admitted(comm: HipCommunicator, op: FusedOp, x: torch.Tensor) -> bool:
-    return getattr(comm, f"should_allreduce_{op}")(x)
-
-
-def _forced(
-    comm: HipCommunicator,
-    kernel: Kernel,
-    blocks: int,
-    threads: int,
-    lanes: int,
-    bits: int,
-    fn,
+def _run(
+    comm: HipCommunicator, op: str, launch: Launch | None
 ) -> Callable[[Inputs], torch.Tensor]:
-    """`fn` with `kernel` forced for its call, so a capture records that kernel."""
+    """Our op over the inputs, at `launch` (None: as C++ picks)."""
+    if op == "all_reduce":
+        return lambda t: comm.all_reduce(t.x, launch=launch)
+    return lambda t: _fused(comm, cast(FusedOp, op), t, launch)
 
-    def call(t: Inputs) -> torch.Tensor:
-        comm.set_launch_override(kernel, blocks, threads, lanes, bits)
-        try:
-            return fn(t)
-        finally:
-            comm.set_launch_override(None)
 
-    return call
+def _admitted(
+    comm: HipCommunicator, op: str, x: torch.Tensor, launch: Launch | None
+) -> bool:
+    name = "should_allreduce" if op == "all_reduce" else f"should_allreduce_{op}"
+    return getattr(comm, name)(x, launch)
 
 
 def _unfused_case(arm: str, op: str, all_reduce: AllReduce, capture) -> Case:
@@ -249,26 +244,14 @@ def _hip_cases(
     for shot in ("one_shot", "two_shot"):
         kernels.append((cast(Kernel, f"{shot}_pull{suffix}"), 0))
         kernels += [(cast(Kernel, f"{shot}_push{suffix}"), q) for q in quant_bits]
-    if op == "all_reduce":
-        run = lambda t: comm.all_reduce(t.x)  # noqa: E731
-        admitted = comm.should_allreduce
-    else:
-        fop = cast(FusedOp, op)
-        run = lambda t: _fused(comm, fop, t)  # noqa: E731
-        admitted = partial(_admitted, comm, fop)
-        if admitted(x):
-            cases.append(Case("hip-fused", run, comm.capture))
+    if op != "all_reduce" and _admitted(comm, op, x, None):
+        cases.append(Case("hip-fused", _run(comm, op, None), comm.capture))
     for (kernel, q), b, tr, v in product(kernels, blocks, threads, lanes_per_col):
-        comm.set_launch_override(kernel, b, tr, v, q)
-        try:
-            ok = admitted(x)
-        finally:
-            comm.set_launch_override(None)
-        if ok:
+        launch = Launch(kernel, b, tr, v, q)
+        if _admitted(comm, op, x, launch):
             arm = f"hip-{kernel}" + (f"-b{b}-t{tr}" if sweep else "")
             arm += (f"-l{v}" if v else "") + (f"-q{q}" if q else "")
-            forced = _forced(comm, kernel, b, tr, v, q, run)
-            cases.append(Case(arm, forced, comm.capture, b, tr))
+            cases.append(Case(arm, _run(comm, op, launch), comm.capture, b, tr))
     return cases
 
 

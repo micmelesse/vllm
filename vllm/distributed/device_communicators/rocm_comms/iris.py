@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from .base import Communicator
+from .launch import Launch
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,10 @@ class IrisCommunicator(Communicator):
             self._workspace = None
         return self._input_buf
 
-    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(
+        self, inp: torch.Tensor, launch: Launch | None = None
+    ) -> torch.Tensor:
+        self._refuse_launch(launch)
         assert self._shmem is not None
         try:
             out = torch.empty_like(inp)

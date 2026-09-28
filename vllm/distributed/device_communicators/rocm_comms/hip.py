@@ -5,8 +5,8 @@
 memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch geometry
-(`csrc/rocm/rocm_comms/launch.cuh`); `set_launch_override` is the one way to force one,
-for the sweep and the tests.
+(`csrc/rocm/rocm_comms/launch.cuh`); a `Launch` passed with a call is the one way to
+force one, for the sweep and the tests.
 
 TWO MEMORY PATHS, split by lifetime. A captured buffer is held by vLLM for the graph's
 life, so it is registered once at capture exit and read in place. An eager input is
@@ -28,39 +28,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .base import AdmitOp, Communicator
+from .launch import Launch, launch_wire
 
 logger = logging.getLogger(__name__)
-
-
-# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh), named
-# by shot, direction (pull reads peers, push writes into them) and what it fuses. Named
-# only to force one through `set_launch_override`; nothing else picks.
-Kernel = Literal[
-    "one_shot_pull",
-    "one_shot_push",
-    "two_shot_pull",
-    "two_shot_push",
-    "one_shot_pull_rms_norm",
-    "one_shot_push_rms_norm",
-    "two_shot_pull_rms_norm",
-    "two_shot_push_rms_norm",
-    "one_shot_pull_add_rms_norm",
-    "one_shot_push_add_rms_norm",
-    "two_shot_pull_add_rms_norm",
-    "two_shot_push_add_rms_norm",
-    "one_shot_pull_add_attn_res_rms_norm",
-    "one_shot_push_add_attn_res_rms_norm",
-    "two_shot_pull_add_attn_res_rms_norm",
-    "two_shot_push_add_attn_res_rms_norm",
-    "one_shot_pull_rms_norm_gemm_add",
-    "one_shot_push_rms_norm_gemm_add",
-    "two_shot_pull_rms_norm_gemm_add",
-    "two_shot_push_rms_norm_gemm_add",
-]
-_KERNEL_WIRE: Mapping[Kernel, int] = {
-    k: i
-    for i, k in enumerate(Kernel.__args__)  # type: ignore[attr-defined]
-}
 
 # The ops as C++ numbers them (`enum class Op`).
 _OP_WIRE: Mapping[AdmitOp, int] = {
@@ -246,23 +216,6 @@ class HipCommunicator(Communicator):
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
 
-    def set_launch_override(
-        self,
-        kernel: Kernel | None,
-        blocks: int = 16,
-        threads: int = 512,
-        gemm_lanes_per_col: int = 0,
-        quant_bits: int = 0,
-    ) -> None:
-        """Force `kernel` at this geometry, the GEMM tail's lanes per column and a push
-        kernel's codec bits (16: unquantized, 8, 4; each 0: the table's), for every
-        later launch of its op, refusing any other op, until cleared with None. The
-        sweep's and the tests' handle; the model never calls it."""
-        wire = -1 if kernel is None else _KERNEL_WIRE[kernel]
-        torch.ops._rocm_C.rocm_comms_set_launch_override(
-            self._handle, wire, blocks, threads, gemm_lanes_per_col, quant_bits
-        )
-
     def set_checked(self, checked: bool) -> None:
         """Bounds checks and random skew in every later kernel: the tests' mode, which
         turns a race into a failure on every run."""
@@ -299,13 +252,19 @@ class HipCommunicator(Communicator):
         staged.copy_(inp)
         return staged
 
-    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(
+        self, inp: torch.Tensor, launch: Launch | None = None
+    ) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         out = torch.empty_like(inp)
-        torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, self._as_input(inp))
+        torch.ops._rocm_C.rocm_comms_all_reduce(
+            self._handle, out, self._as_input(inp), *launch_wire(launch)
+        )
         return out
 
-    def _admits(self, op: AdmitOp, inp: torch.Tensor) -> bool:
+    def _admits(
+        self, op: AdmitOp, inp: torch.Tensor, launch: Launch | None = None
+    ) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits
         in registers at that kernel's width, and its scratch fits (a push kernel holds
         every rank's slice). The plain all-reduce is one flat row, as C++ launches
@@ -317,15 +276,24 @@ class HipCommunicator(Communicator):
         else:
             return False
         return torch.ops._rocm_C.rocm_comms_admits(
-            self._handle, _OP_WIRE[op], rows, hidden, inp.element_size()
+            self._handle,
+            _OP_WIRE[op],
+            rows,
+            hidden,
+            inp.element_size(),
+            *launch_wire(launch),
         )
 
     def _all_reduce_rms_norm(
-        self, inp: torch.Tensor, weight: torch.Tensor, eps: float
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        launch: Launch | None = None,
     ) -> torch.Tensor:
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
-            self._handle, out, self._as_input(inp), weight, eps
+            self._handle, out, self._as_input(inp), weight, eps, *launch_wire(launch)
         )
         return out
 
@@ -337,6 +305,7 @@ class HipCommunicator(Communicator):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
+        launch: Launch | None = None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
@@ -346,6 +315,7 @@ class HipCommunicator(Communicator):
             norm_weight,
             eps,
             gemm_weight,
+            *launch_wire(launch),
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -360,6 +330,7 @@ class HipCommunicator(Communicator):
         write_idx: int,
         eps: float,
         out_eps: float,
+        launch: Launch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         started = prefix is None
         prefix_out = torch.empty_like(inp) if started else prefix
@@ -378,6 +349,7 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             not started,
+            *launch_wire(launch),
         )
         return prefix_out, out
 
@@ -387,12 +359,20 @@ class HipCommunicator(Communicator):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        launch: Launch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns the normed result, then the sum plus residual."""
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
-            self._handle, out, residual_out, self._as_input(inp), residual, weight, eps
+            self._handle,
+            out,
+            residual_out,
+            self._as_input(inp),
+            residual,
+            weight,
+            eps,
+            *launch_wire(launch),
         )
         return out, residual_out
 
