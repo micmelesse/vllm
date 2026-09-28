@@ -50,37 +50,23 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_add_attn_re
     }
   }
 
-  c.world_barrier();
+  // The gather below gives each block the local rows it wrote above, so the same-numbered
+  // blocks are all it must wait for; the input is read only above, so no close.
+  c.peer_block_barrier();
 
   V* o             = reinterpret_cast<V*>(out);
   V* pre           = reinterpret_cast<V*>(prefix);
-  const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = gridDim.x * blockDim.x;
-  // THE GATHER READS EVERY PEER AT ONCE: index outer, peer inner, so each thread has a
-  // load on every link in flight. Peer outer read one rank at a time over one link (919
-  // vs 262 us for aiter at 58 MB, 2026-09-28).
-  for (int k = tid; k < half; k += stride) {
-    V g[ngpus], u[ngpus];
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) {
-      if (i * chunk + k / packs < rows) {
-        g[i] = c.get(i, k);
-        u[i] = c.get(i, half + k);
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) {
-      const int row = i * chunk + k / packs;
-      if (row < rows) {
-        store_global(o + i * half + k, g[i]);
-        store_global(pre + i * half + k, u[i]);
+  c.template gather_rows<2>(
+      chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
+        if (region == 0) {
+          store_global(o + row * packs + k, v);
+          return;
+        }
+        store_global(pre + row * packs + k, v);
         if (write_idx >= 0)
-          reinterpret_cast<V*>(blocks + row * block_stride_m +
-                               write_idx * block_stride_r)[k % packs] = u[i];
-      }
-    }
-  }
-  c.close();
+          store_global(reinterpret_cast<V*>(blocks + row * block_stride_m +
+                                            write_idx * block_stride_r) + k, v);
+      });
 }
 
 }  // namespace hip_comms

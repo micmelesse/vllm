@@ -54,34 +54,16 @@ DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
     }
   }
 
-  c.world_barrier();
+  // The gather below gives each block the local rows it wrote above, so the same-numbered
+  // blocks are all it must wait for; the input is read only above, so no close.
+  c.peer_block_barrier();
 
   V* o       = reinterpret_cast<V*>(out);
   V* res_out = reinterpret_cast<V*>(residual_out);
-  const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = gridDim.x * blockDim.x;
-  // THE GATHER READS EVERY PEER AT ONCE: index outer, peer inner, so each thread has a
-  // load on every link in flight. Peer outer read one rank at a time over one link (919
-  // vs 262 us for aiter at 58 MB, 2026-09-28).
-  for (int k = tid; k < half; k += stride) {
-    V g[ngpus];
-    [[maybe_unused]] V r[ngpus];
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) {
-      if (i * chunk + k / packs < rows) {
-        g[i] = c.get(i, k);
-        if constexpr (kAdd) r[i] = c.get(i, half + k);
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i) {
-      if (i * chunk + k / packs < rows) {
-        store_global(o + i * half + k, g[i]);
-        if constexpr (kAdd) store_global(res_out + i * half + k, r[i]);
-      }
-    }
-  }
-  c.close();
+  c.template gather_rows<kAdd ? 2 : 1>(
+      chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
+        store_global((region == 0 ? o : res_out) + row * packs + k, v);
+      });
 }
 
 // THE KERNELS, one per op, both the body above.

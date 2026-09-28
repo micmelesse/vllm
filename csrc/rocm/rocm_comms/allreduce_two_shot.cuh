@@ -23,37 +23,19 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   using V = typename traits<T>::V;
   ipc::Comm<T, ngpus> c(p);
   const int chunk  = (size + ngpus - 1) / ngpus;
-  const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = gridDim.x * blockDim.x;
   const int rank   = c.rank();
 
   const int mine_begin = rank * chunk;
   const int mine_end   = min(mine_begin + chunk, size);
-  // kSumBatch packs a thread in both phases, all loaded before any is stored.
-  for (int idx = mine_begin + tid; idx < mine_end; idx += stride * kSumBatch) {
-    V v[kSumBatch];
-    c.template sum<kSumBatch>(idx, stride, mine_end, v);
-#pragma unroll
-    for (int u = 0; u < kSumBatch; ++u)
-      if (idx + u * stride < mine_end) c.put(rank, idx + u * stride - mine_begin, v[u]);
-  }
+  c.reduce_flat(mine_begin, mine_end,
+                [&](int at, const V& v) { c.put(rank, at - mine_begin, v); });
 
-  c.world_barrier();
+  // The gather below gives each thread the positions it wrote above, so the same-numbered
+  // blocks are all it must wait for; the input is read only above, so no close.
+  c.peer_block_barrier();
 
-  // THE GATHER READS EVERY PEER AT ONCE: index outer, peer inner, so each thread has a
-  // load on every link in flight. Peer outer read one rank at a time over one link (919
-  // vs 262 us for aiter at 58 MB, 2026-09-28).
   V* dst = reinterpret_cast<V*>(out);
-  for (int k = tid; k < chunk; k += stride) {
-    V g[ngpus];
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i)
-      if (i * chunk + k < size) g[i] = c.get(i, k);
-#pragma unroll
-    for (int i = 0; i < ngpus; ++i)
-      if (i * chunk + k < size) store_global(dst + i * chunk + k, g[i]);
-  }
-  c.close();
+  c.gather_flat(chunk, size, [&](int at, const V& v) { store_global(dst + at, v); });
 }
 
 }  // namespace hip_comms

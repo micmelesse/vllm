@@ -104,9 +104,13 @@ class Peers {
 //   c.ptr(peer, idx, n)    a direct pointer to n packs of it, checked once, for hot loops
 //   c.world_barrier()      every put before it, by any block of any rank, is visible to
 //                          every get after it
+//   c.peer_block_barrier() the same between this block and its same-numbered peers only
+//   c.reduce_flat          a flat range summed over ranks, batched, handed to a store
+//   c.gather_flat/_rows    after a peer_block_barrier, read back what those peers put
 //   c.grid_barrier()       the same for the blocks of this rank and its own scratch
 //   c.block_barrier()      the threads of this block
-//   c.close()              last; after it this rank's input may be reused
+//   c.close()              last; after it this rank's input may be reused (unneeded when
+//                          the input is last read before a peer_block_barrier)
 //
 // A wait that outlives the timeout prints where it was and traps, so a hang is an error.
 // Checked (the tests), every index is bounds-checked and every wait is skewed by a
@@ -127,7 +131,7 @@ class Comm {
       scratch_[i] = reinterpret_cast<V*>(p.signals_.s[i] + 1);
     }
     skew();
-    pair_blocks(true);
+    pair_blocks<false>(true);
   }
 
   DINLINE int rank() const { return p_.rank_; }
@@ -197,9 +201,82 @@ class Comm {
   // The threads of this block.
   DINLINE void block_barrier() const { __syncthreads(); }
 
+  // THE FLAT REDUCE: positions [begin, end) summed over ranks, grid-strided, kSumBatch
+  // packs a thread all loaded before any is stored. store(position, v). A gather_flat after
+  // a peer_block_barrier reads back exactly these positions, thread for thread.
+  template <typename Store>
+  DINLINE void reduce_flat(int begin, int end, Store store) const {
+    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (int idx = begin + tid; idx < end; idx += stride * kSumBatch) {
+      V v[kSumBatch];
+      sum<kSumBatch>(idx, stride, end, v);
+#pragma unroll
+      for (int u = 0; u < kSumBatch; ++u)
+        if (idx + u * stride < end) store(idx + u * stride, v[u]);
+    }
+  }
+
+  // THE TWO-SHOT GATHERS, after a peer_block_barrier: each reads back exactly what the
+  // same-numbered block on every peer put, every peer at once (index outer, peer inner,
+  // so a load is in flight on every link), and hands each pack to `store`.
+  //
+  // gather_flat: a flat buffer sliced `chunk` packs per rank; each thread takes the
+  // positions tid, tid + grid, ... it reduced. store(position in the whole buffer, v).
+  template <typename Store>
+  DINLINE void gather_flat(int chunk, int size, Store store) const {
+    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (int k = tid; k < chunk; k += stride) {
+      V g[ngpus];
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+        if (i * chunk + k < size) g[i] = get(i, k);
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+        if (i * chunk + k < size) store(i * chunk + k, g[i]);
+    }
+  }
+
+  // gather_rows: `chunk` whole rows per rank; block b takes local rows b, b + grid, ...
+  // as it reduced them. kRegions regions, region_packs apart in the scratch.
+  // store(region, row, pack within the row, v).
+  template <int kRegions, typename Store>
+  DINLINE void gather_rows(int chunk, int rows, int packs, int region_packs,
+                           Store store) const {
+    for (int lr = blockIdx.x; lr < chunk; lr += gridDim.x) {
+      for (int k = threadIdx.x; k < packs; k += blockDim.x) {
+        const int at = lr * packs + k;
+        V g[kRegions][ngpus];
+#pragma unroll
+        for (int i = 0; i < ngpus; ++i)
+          if (i * chunk + lr < rows)
+#pragma unroll
+            for (int r = 0; r < kRegions; ++r)
+              g[r][i] = get(i, r * region_packs + at);
+#pragma unroll
+        for (int i = 0; i < ngpus; ++i)
+          if (i * chunk + lr < rows)
+#pragma unroll
+            for (int r = 0; r < kRegions; ++r)
+              store(r, i * chunk + lr, k, g[r][i]);
+      }
+    }
+  }
+
+  // This block and the same-numbered block on every peer, and no other block: one peer
+  // write each, where `world_barrier` waits for the whole grid. A get after it may read
+  // ONLY what the same-numbered block on that peer put, so both phases must give each
+  // block the same indices (vLLM's custom all-reduce, and the rule its two-stage kernel
+  // states).
+  DINLINE void peer_block_barrier() {
+    skew();
+    pair_blocks<true>(false);
+  }
+
   DINLINE void close() {
     skew();
-    pair_blocks(false);
+    pair_blocks<false>(false);
   }
 
  private:
@@ -266,7 +343,11 @@ class Comm {
 
   // Block b waits for block b on every rank, and for no other block: enough at the ends,
   // where it says "every peer has launched" or "every peer is done reading me", and not
-  // enough between phases, which is what `world_barrier` is for.
+  // enough between phases, which is what `world_barrier` is for. kOrdered: the store
+  // releases and the wait acquires, so what the block put before is visible to its peers'
+  // same-numbered block after (a peer_block_barrier). Unordered, it only says when
+  // (start: every peer has launched; close: every peer is done reading us).
+  template <bool kOrdered>
   DINLINE void pair_blocks(bool start) const {
     if (!start) __syncthreads();
     Signal* self     = p_.self_;
@@ -276,8 +357,10 @@ class Comm {
                                : &p_.signals_.s[threadIdx.x]->end[blockIdx.x][p_.rank_];
       uint32_t* mine   = start ? &self->start[blockIdx.x][threadIdx.x]
                                : &self->end[blockIdx.x][threadIdx.x];
-      __scoped_atomic_store_n(theirs, f, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      wait<false, __MEMORY_SCOPE_DEVICE>(mine, f, start ? "start" : "close", threadIdx.x);
+      __scoped_atomic_store_n(theirs, f, kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
+                              __MEMORY_SCOPE_SYSTEM);
+      wait<kOrdered, __MEMORY_SCOPE_DEVICE>(mine, f, start ? "start" : "peer barrier",
+                                            threadIdx.x);
     }
     __syncthreads();
     if (threadIdx.x == 0) self->seq[blockIdx.x] = f;
