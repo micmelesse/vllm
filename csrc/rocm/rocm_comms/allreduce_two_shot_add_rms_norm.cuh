@@ -60,12 +60,25 @@ DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
   V* res_out = reinterpret_cast<V*>(residual_out);
   const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
-  for (int i = 0; i < ngpus; ++i) {
-    const int begin = i * chunk;
-    const int n     = (min(begin + chunk, rows) - begin) * packs;
-    for (int k = tid; k < n; k += stride) {
-      o[begin * packs + k] = c.get(i, k);
-      if constexpr (kAdd) res_out[begin * packs + k] = c.get(i, half + k);
+  // THE GATHER READS EVERY PEER AT ONCE: index outer, peer inner, so each thread has a
+  // load on every link in flight. Peer outer read one rank at a time over one link (919
+  // vs 262 us for aiter at 58 MB, 2026-09-28).
+  for (int k = tid; k < half; k += stride) {
+    V g[ngpus];
+    [[maybe_unused]] V r[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) {
+      if (i * chunk + k / packs < rows) {
+        g[i] = c.get(i, k);
+        if constexpr (kAdd) r[i] = c.get(i, half + k);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) {
+      if (i * chunk + k / packs < rows) {
+        store_global(o + i * half + k, g[i]);
+        if constexpr (kAdd) store_global(res_out + i * half + k, r[i]);
+      }
     }
   }
   c.close();

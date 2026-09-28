@@ -40,19 +40,18 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   c.world_barrier();
 
+  // THE GATHER READS EVERY PEER AT ONCE: index outer, peer inner, so each thread has a
+  // load on every link in flight. Peer outer read one rank at a time over one link (919
+  // vs 262 us for aiter at 58 MB, 2026-09-28).
   V* dst = reinterpret_cast<V*>(out);
-  for (int i = 0; i < ngpus; ++i) {
-    const int begin = i * chunk;
-    const int end   = min(begin + chunk, size);
-    for (int idx = begin + tid; idx < end; idx += stride * kSumBatch) {
-      V g[kSumBatch];
+  for (int k = tid; k < chunk; k += stride) {
+    V g[ngpus];
 #pragma unroll
-      for (int u = 0; u < kSumBatch; ++u)
-        if (idx + u * stride < end) g[u] = c.get(i, idx + u * stride - begin);
+    for (int i = 0; i < ngpus; ++i)
+      if (i * chunk + k < size) g[i] = c.get(i, k);
 #pragma unroll
-      for (int u = 0; u < kSumBatch; ++u)
-        if (idx + u * stride < end) store_global(dst + idx + u * stride, g[u]);
-    }
+    for (int i = 0; i < ngpus; ++i)
+      if (i * chunk + k < size) store_global(dst + i * chunk + k, g[i]);
   }
   c.close();
 }
