@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "fusions/add_rms_norm.cuh"
+#include "fusions/gemm_add.cuh"
 #include "ipc.cuh"
 #include "utils.cuh"
 

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "fusions/add_rms_norm.cuh"
 #include "ipc.cuh"
 #include "utils.cuh"
 

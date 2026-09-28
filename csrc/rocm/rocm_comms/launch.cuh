@@ -10,6 +10,7 @@
 #include <climits>
 #include <cstdint>
 
+#include "fusions/gemm_add.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
