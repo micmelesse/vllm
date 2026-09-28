@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE PUSH PATTERNS: a rank reads only its own input and its own scratch, and what
-// crosses a link is a store into a peer's INBOX, encoded by a Codec (16 bits: T itself;
-// 8, 4: QuickReduce's integers). Built on core.cuh; `Push<T, ngpus, C>` holds nothing.
+// PART OF THE DEVICE SIDE (included through device.cuh): the push patterns. A rank reads
+// only its own input and its own scratch, and what crosses a link is a store into a
+// peer's INBOX, encoded by a Codec (16 bits: T itself; 8, 4: QuickReduce's integers).
+// `Push<T, ngpus, C>` holds nothing.
 
 #pragma once
+
+#ifndef HIP_COMMS_P2P_DEVICE
+#error "kernels include p2p/device.cuh, the device side's one interface, not its parts"
+#endif
 
 #include "core.cuh"
 
@@ -169,35 +174,9 @@ struct Inbox {
   DINLINE int end() const { return base + regions * ngpus * slot; }
 };
 
-// The host's side of the same layout, in packs: a flat span's groups at a grid of
-// `grid_threads`, and the packs of an Inbox of `groups` groups at kbits (16: T itself).
-inline int64_t flat_groups(int64_t span, int64_t grid_threads) {
-  return (span + grid_threads * kSumBatch - 1) / (grid_threads * kSumBatch) * grid_threads;
-}
-
-inline int64_t inbox_packs(int kbits, int regions, int world, int64_t groups) {
-  const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
-  const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
-  return int64_t{regions} * world * (groups * payload + scales);
-}
-
-// =================================================================================
-//   mine_group(p, in, grp, j, base, end, x)  this rank's input over one group, as floats
-//   send(p, peer, box, region, g, n, x)      a group encoded into peer's inbox, in this
-//                                            rank's slot
-//   broadcast(p, box, region, g, n, x)       the same, encoded once, into every rank's
-//   read_inbox(p, box, region, src, g, n, x) a group of one source from this rank's inbox
-//   reduce_inbox(p, box, region, g, n, acc)  a group summed over every source, rank order
-// and their row shapes, the fused push kernels' phases:
-//   broadcast_rows    one-shot phase 1: every input row into every rank's inbox
-//   scatter_rows      two-shot phase 1: each input row into its owner's inbox
-//   reduce_row        a row's share reduced out of the inbox (push's `Pull::sum_row`)
-//   broadcast_row     two-shot phase 2: an owned row's result into every inbox
-//   gather_inbox_rows two-shot phase 3: every owner's rows out of this inbox
-// =================================================================================
-
 template <typename T, int ngpus, class C>
 struct Push {
+ public:
   using core   = Core<T, ngpus>;
   using V      = typename core::V;
   using Inputs = typename core::Inputs;
@@ -336,10 +315,7 @@ struct Push {
     }
   }
 
-  // ---------------------------------------------------------------------------------
-  // The pattern's own.
-  // ---------------------------------------------------------------------------------
-
+ private:
   // The payload packs that cover a group's first n members.
   static DINLINE int payload_packs(int n) {
     return (n * C::kPayloadPacks + kSumBatch - 1) / kSumBatch;

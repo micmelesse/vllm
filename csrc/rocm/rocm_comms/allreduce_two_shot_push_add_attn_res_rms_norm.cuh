@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "p2p/push.cuh"
+#include "p2p/device.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {

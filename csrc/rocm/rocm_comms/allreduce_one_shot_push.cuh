@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "p2p/push.cuh"
+#include "p2p/device.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {

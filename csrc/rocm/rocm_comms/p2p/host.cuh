@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE HOST SETUP over HIP IPC: `Group` maps every peer's signal block, scratch and
-// registered buffers once, and hands a launch the `p2p::Peers` it passes to its kernel.
-// The one object with a lifetime, on purpose: the mappings must outlive every launch.
+// THE HOST SIDE of the peer layer: `Group` maps every peer's signal block, scratch and
+// registered buffers once over HIP IPC handles, and hands a launch the `Peers` it passes
+// to its kernel (peers.cuh). The one object with a lifetime, on purpose: the mappings
+// must outlive every launch.
 
 #pragma once
 
@@ -18,7 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "p2p/core.cuh"
+#include "peers.cuh"
 
 #define HIP_CHECK(expr)                                                             \
   do {                                                                              \
@@ -29,18 +30,7 @@
     }                                                                               \
   } while (0)
 
-namespace hip_comms::ipc {
-
-using p2p::kMaxRanks;
-using p2p::Peers;
-using p2p::PeerPtrs;
-using p2p::PeerSignals;
-using p2p::Signal;
-
-// =================================================================================
-// HOST SIDE. Maps the peers' memory once, registers buffers, and turns an input
-// pointer into the `Peers` a launch passes.
-// =================================================================================
+namespace hip_comms::p2p {
 
 using Handle = hipIpcMemHandle_t;
 
@@ -237,4 +227,4 @@ class Group {
   std::unordered_map<std::string, void*> opened_;
 };
 
-}  // namespace hip_comms::ipc
+}  // namespace hip_comms::p2p

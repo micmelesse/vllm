@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "p2p/pull.cuh"
+#include "p2p/device.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {

@@ -16,11 +16,11 @@
 // the wrong thing.
 //
 // rocm_comms/ holds the layers as headers, all included here so the device code stays in
-// this one translation unit and needs no -fgpu-rdc: ipc.cuh (host setup), p2p/ (the
-// device layer: core primitives, pull and push patterns), fusions/ (what a fused op
-// computes), launch.cuh (the picker), utils.cuh (what everything shares), then one
-// allreduce_<shot>_<pull|push>[_<op>].cuh per kernel. Design rules: CONTEXT.md, "Code
-// design".
+// this one translation unit and needs no -fgpu-rdc: p2p/ (the peer layer; this file
+// includes its host side, p2p/host.cuh, and every kernel its device side, p2p/device.cuh),
+// fusions/ (what a fused op computes), launch.cuh (the picker), utils.cuh (what everything
+// shares), then one allreduce_<shot>_<pull|push>[_<op>].cuh per kernel. Design rules:
+// CONTEXT.md, "Code design".
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/BFloat16.h>
@@ -52,7 +52,7 @@
 #include "rocm_comms/allreduce_two_shot_push_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot_push_add_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot_push_rms_norm_gemm_add.cuh"
-#include "rocm_comms/ipc.cuh"
+#include "rocm_comms/p2p/host.cuh"
 #include "rocm_comms/launch.cuh"
 
 namespace hip_comms {
@@ -161,7 +161,7 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
 // Whether `op` over [rows, hidden] of this element size runs a kernel here: something
 // was picked, a row fits in registers at the picked width, and its scratch fits.
 // Python asks this before every fused call and runs the unfused ops on a no.
-bool admits(const ipc::Group& group, const Forced& forced, Op op, int64_t rows,
+bool admits(const p2p::Group& group, const Forced& forced, Op op, int64_t rows,
             int64_t hidden, int64_t elem) {
   const int64_t lanes = 16 / elem;
   if (hidden % lanes != 0) return false;
@@ -176,7 +176,7 @@ bool admits(const ipc::Group& group, const Forced& forced, Op op, int64_t rows,
 }
 
 // The picked launch for a call, refused where `admits` would have said no.
-Launch checked_launch(const ipc::Group& group, const Forced& forced, Op op, int64_t rows,
+Launch checked_launch(const p2p::Group& group, const Forced& forced, Op op, int64_t rows,
                       int64_t hidden, int64_t elem) {
   TORCH_CHECK(admits(group, forced, op, rows, hidden, elem), "hip_comms: op ",
               static_cast<int>(op), " over [", rows, ", ", hidden,
@@ -235,7 +235,7 @@ void by_bits(int bits, F&& f) {
     break;
 
 // PLAIN ALL-REDUCE over the flat buffer.
-void all_reduce(ipc::Group& group, const Forced& forced, torch::Tensor& out,
+void all_reduce(p2p::Group& group, const Forced& forced, torch::Tensor& out,
                 torch::Tensor& inp) {
   TORCH_CHECK(out.is_cuda() && inp.is_cuda(), "out and inp must be on device");
   TORCH_CHECK(out.is_contiguous() && inp.is_contiguous(), "out and inp must be contiguous");
@@ -275,7 +275,7 @@ void all_reduce(ipc::Group& group, const Forced& forced, torch::Tensor& out,
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
 // given (and then `residual_out` too). Exact to those ops' roundings; see
 // `fusions::add_rms_norm::row`.
-void all_reduce_add_rms_norm(ipc::Group& group, const Forced& forced, torch::Tensor& out,
+void all_reduce_add_rms_norm(p2p::Group& group, const Forced& forced, torch::Tensor& out,
                              torch::Tensor* residual_out, torch::Tensor& inp,
                              const torch::Tensor* residual, torch::Tensor& weight,
                              double eps) {
@@ -372,7 +372,7 @@ void all_reduce_add_rms_norm(ipc::Group& group, const Forced& forced, torch::Ten
 // FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm
 // on each row (see `fusions::add_attn_res_rms_norm::row`). With `has_prefix` the sum is
 // added to `prefix` in place; without, the sum IS the new prefix and is written there.
-void all_reduce_add_attn_res_rms_norm(ipc::Group& group, const Forced& forced,
+void all_reduce_add_attn_res_rms_norm(p2p::Group& group, const Forced& forced,
                                       torch::Tensor& prefix, torch::Tensor& out,
                                       torch::Tensor& inp,
                                       torch::Tensor& blocks, torch::Tensor& norm_weight,
@@ -462,7 +462,7 @@ void all_reduce_add_attn_res_rms_norm(ipc::Group& group, const Forced& forced,
 // FUSED: all-reduce, then RMSNorm, then `out[:, col0:col0+N] += normed @ gemm_w^T` -- the
 // latent MoE tail. The normed rows go in scratch, and a sync separates the norm from the
 // GEMM (see the kernels).
-void all_reduce_rms_norm_gemm_add(ipc::Group& group, const Forced& forced,
+void all_reduce_rms_norm_gemm_add(p2p::Group& group, const Forced& forced,
                                   torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
                                   torch::Tensor& norm_weight, double eps,
                                   torch::Tensor& gemm_weight) {
@@ -539,7 +539,7 @@ void all_reduce_rms_norm_gemm_add(ipc::Group& group, const Forced& forced,
 }  // namespace hip_comms
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. `ipc::Group` is a stateful C++ object and a torch op is a free
+// THE TORCH OP BOUNDARY. `p2p::Group` is a stateful C++ object and a torch op is a free
 // function over schema types, so the object crosses as an opaque handle -- the same
 // `fptr_t = int64_t` vLLM's custom all-reduce and quick-reduce use. IPC handles cross
 // as `int[]` for the same reason they do there: a schema has no bytes type.
@@ -569,8 +569,8 @@ std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) 
 }  // namespace
 
 namespace {
-hip_comms::ipc::Group& comms_of(fptr_t comms) {
-  return *reinterpret_cast<hip_comms::ipc::Group*>(comms);
+hip_comms::p2p::Group& comms_of(fptr_t comms) {
+  return *reinterpret_cast<hip_comms::p2p::Group*>(comms);
 }
 }  // namespace
 
@@ -579,7 +579,7 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
                        int64_t peer_slab_bytes, int64_t scratch_bytes,
                        double sync_timeout_s) {
-  auto* comms = new hip_comms::ipc::Group(
+  auto* comms = new hip_comms::p2p::Group(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
       static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes, sync_timeout_s);
@@ -623,7 +623,7 @@ std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms) {
 void rocm_comms_register_graph_buffers(
     fptr_t comms, const std::vector<std::vector<int64_t>>& handles,
     const std::vector<std::vector<int64_t>>& offsets) {
-  const size_t stride = sizeof(hip_comms::ipc::Handle);
+  const size_t stride = sizeof(hip_comms::p2p::Handle);
   std::vector<std::vector<std::string>> bytes;
   bytes.reserve(handles.size());
   for (const auto& joined : handles) {
@@ -701,7 +701,7 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
-  auto [handle, offset] = hip_comms::ipc::handle_and_offset(static_cast<uintptr_t>(ptr));
+  auto [handle, offset] = hip_comms::p2p::handle_and_offset(static_cast<uintptr_t>(ptr));
   std::vector<int64_t> bytes(handle.begin(), handle.end());
   return std::make_tuple(bytes, offset);
 }
@@ -714,6 +714,6 @@ std::vector<int64_t> rocm_comms_sizes() {
           static_cast<int64_t>(sizeof(hip_comms::p2p::PeerPtrs)),
           static_cast<int64_t>(hip_comms::p2p::kMaxBlocks),
           static_cast<int64_t>(hip_comms::p2p::kMaxRanks),
-          static_cast<int64_t>(sizeof(hip_comms::ipc::Handle)),
+          static_cast<int64_t>(sizeof(hip_comms::p2p::Handle)),
           static_cast<int64_t>(hip_comms::kMaxRowPacks)};
 }

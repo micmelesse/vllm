@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE PULL PATTERNS: a rank reads its peers' buffers (their inputs, or scratch they
-// filled) and writes only its own. Free functions over `Peers` and the kernel's `Inputs`,
-// built on core.cuh; `Pull<T, ngpus>` holds nothing.
+// PART OF THE DEVICE SIDE (included through device.cuh): the pull patterns. A rank reads
+// its peers' buffers (their inputs, or scratch they filled) and writes only its own.
+// `Pull<T, ngpus>` holds nothing.
 
 #pragma once
+
+#ifndef HIP_COMMS_P2P_DEVICE
+#error "kernels include p2p/device.cuh, the device side's one interface, not its parts"
+#endif
 
 #include "core.cuh"
 
 namespace hip_comms::p2p {
 
-//   reduce_flat(p, in, begin, end, store)   a flat range summed over ranks, batched
-//   sum_row(p, in, base, packs, v)          this thread's share of a row, summed, batched
-//   gather_flat(p, chunk, size, store)      after a peer_block_barrier: every rank's slice
-//   gather_rows<k>(p, chunk, rows, ...)     the same, whole rows, k regions
 template <typename T, int ngpus>
 struct Pull {
   using core   = Core<T, ngpus>;

@@ -1,87 +1,40 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE DEVICE LAYER'S PRIMITIVES: peer memory, the rank's own input, and the barriers that
-// order them. Free functions over the `Peers` a launch passes; `Core<T, ngpus>` only names
-// the element type and the world size once, and holds nothing. The pull and push patterns
-// (pull.cuh, push.cuh) are built on these.
+// PART OF THE DEVICE SIDE (included through device.cuh): the primitives, peer memory,
+// the rank's own input and the barriers that order them. Free functions over the `Peers`
+// a launch passes; `Core<T, ngpus>` only names the element type and world size once and
+// holds nothing.
 
 #pragma once
+
+#ifndef HIP_COMMS_P2P_DEVICE
+#error "kernels include p2p/device.cuh, the device side's one interface, not its parts"
+#endif
 
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 
 #include "../utils.cuh"
+#include "peers.cuh"
 
 namespace hip_comms::p2p {
 
-constexpr int kMaxRanks  = 8;
-constexpr int kMaxBlocks = 64;
-
-// One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
-// the bytes after the struct.
-//
-// TWO counter arrays, not one. A peer block can reach the second barrier while this one
-// is still at the first, and with a single array the peer would write counter+1 while we
-// busy-wait on counter. `seq` is the per-block monotonic sequence number.
-//
-// The barriers use the rest: `peer[r]` is the last world barrier rank r posted here,
-// `arrive` and `gen` the grid barrier on this device, `epoch` the syncs this rank has
-// completed.
-struct Signal {
-  alignas(128) uint32_t start[kMaxBlocks][kMaxRanks];
-  alignas(128) uint32_t end[kMaxBlocks][kMaxRanks];
-  alignas(128) uint32_t seq[kMaxBlocks];
-  alignas(128) uint32_t peer[kMaxRanks];
-  alignas(128) uint32_t arrive;
-  alignas(128) uint32_t gen;
-  alignas(128) uint32_t epoch;
-};
-
-struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
-struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
-
-// WHAT A LAUNCH PASSES, by value: every rank's input (through a slot of the peer-pointer
-// slab), every rank's signal block and scratch, and this launch's limits. Plain fields;
-// `ipc::Group::peers` fills one per launch.
-struct Peers {
-  int rank;
-  bool checked;                // bounds checks and random skew: the tests' mode
-  const PeerPtrs* inputs;      // device memory: every rank's input for this launch
-  PeerSignals signals;         // every rank's signal block; its scratch follows it
-  Signal* self;                // this rank's
-  int64_t input_packs;         // 16-byte packs of the input
-  int64_t scratch_packs;       // of each rank's scratch
-  uint64_t timeout_ticks;      // a wait longer than this traps
-};
-
-// =================================================================================
-// THE PRIMITIVES. Indices are in 16-byte packs of T.
-//
-//   start(p)                   first; returns once every peer has launched this kernel
-//   inputs(p)                  every rank's input pointer, rotated by rank: a value the
-//                              kernel holds and passes to what reads inputs
-//   sum<k>(p, in, idx, ...)    input packs summed over ranks, fp32, rounded once, batched
-//   mine(p, in, idx)           this rank's own input pack
-//   put / get (p, peer, idx)   a pack into / out of peer's scratch
-//   ptr(p, peer, idx, n)       a direct pointer to n packs of it, checked once
-//   get_pushed(p, idx)         a pack peers pushed here, read past the caches
-//   put_float / get_float      a float of peer's scratch (a codec's scales)
-//   peer_block_barrier(p)      this block and its same-numbered peer blocks: what each put
-//                              before is visible to the others after
-//   world_barrier(p)           the same for every block of every rank
-//   grid_barrier(p)            every block of this rank, its own scratch only
-//   close(p)                   last; after it this rank's input may be reused (unneeded
-//                              when the input is last read before a peer_block_barrier)
-//
-// A wait that outlives the timeout prints where it was and traps, so a hang is an error.
+// What a kernel may call is listed in device.cuh; the private members are what the
+// patterns (pull.cuh, push.cuh) are built on. Indices are in 16-byte packs of T. A wait
+// that outlives the timeout prints where it was and traps, so a hang is an error.
 // Checked, every index is bounds-checked and every wait is skewed by a random per-block
 // delay, so a race shows on every run.
-// =================================================================================
+
+template <typename T, int ngpus>
+struct Pull;
+template <typename T, int ngpus, class C>
+struct Push;
 
 template <typename T, int ngpus>
 struct Core {
+ public:
   using V = typename traits<T>::V;
 
   // Every rank's input, index 0 this rank's. ROTATED by rank, so the ranks do not all read
@@ -103,6 +56,48 @@ struct Core {
       in.p[i] = reinterpret_cast<const V*>(p.inputs->p[(p.rank + i) % ngpus]);
     return in;
   }
+
+  static DINLINE void put(const Peers& p, int peer, int64_t idx, const V& v) {
+    check(p, peer >= 0 && peer < ngpus && idx < p.scratch_packs, "put", peer, idx,
+          p.scratch_packs);
+    store_global(scratch(p, peer) + idx, v);
+  }
+
+  // SHMEM's `shmem_ptr`: a hot loop reads through this rather than paying `get`'s check on
+  // every load, which keeps the loads free to issue back to back.
+  static DINLINE const V* ptr(const Peers& p, int peer, int64_t idx, int64_t n) {
+    check(p, peer >= 0 && peer < ngpus && idx + n <= p.scratch_packs, "ptr", peer, idx + n,
+          p.scratch_packs);
+    return scratch(p, peer) + idx;
+  }
+
+  // This block and the same-numbered block on every peer, and no other block: one peer
+  // write each, where `world_barrier` waits for the whole grid. A get after it may read
+  // ONLY what the same-numbered block on that peer put, so both phases must give each
+  // block the same indices (vLLM's custom all-reduce, and the rule its two-stage kernel
+  // states).
+  static DINLINE void peer_block_barrier(const Peers& p) {
+    skew(p);
+    pair_blocks<true>(p, false);
+  }
+
+  static DINLINE void world_barrier(const Peers& p) { barrier<true>(p); }
+
+  // Every block of THIS rank's kernel: puts to our own scratch before it are visible to our
+  // own gets after it. Cheaper than `world_barrier`, and wrong for anything a peer put.
+  static DINLINE void grid_barrier(const Peers& p) { barrier<false>(p); }
+
+  static DINLINE void close(const Peers& p) {
+    skew(p);
+    pair_blocks<false>(p, false);
+  }
+
+ private:
+  // The patterns (pull.cuh, push.cuh) are built on what follows; kernels are not.
+  template <typename, int>
+  friend struct Pull;
+  template <typename, int, class>
+  friend struct Push;
 
   // kBatch packs at once, idx + u * stride for u < kBatch (those at or past `limit` are
   // skipped): every load from every peer is issued before any is added, so kBatch x ngpus
@@ -140,24 +135,10 @@ struct Core {
     return load_global(in.p[0] + idx);
   }
 
-  static DINLINE void put(const Peers& p, int peer, int64_t idx, const V& v) {
-    check(p, peer >= 0 && peer < ngpus && idx < p.scratch_packs, "put", peer, idx,
-          p.scratch_packs);
-    store_global(scratch(p, peer) + idx, v);
-  }
-
   static DINLINE V get(const Peers& p, int peer, int64_t idx) {
     check(p, peer >= 0 && peer < ngpus && idx < p.scratch_packs, "get", peer, idx,
           p.scratch_packs);
     return load_global(scratch(p, peer) + idx);
-  }
-
-  // SHMEM's `shmem_ptr`: a hot loop reads through this rather than paying `get`'s check on
-  // every load, which keeps the loads free to issue back to back.
-  static DINLINE const V* ptr(const Peers& p, int peer, int64_t idx, int64_t n) {
-    check(p, peer >= 0 && peer < ngpus && idx + n <= p.scratch_packs, "ptr", peer, idx + n,
-          p.scratch_packs);
-    return scratch(p, peer) + idx;
   }
 
   static DINLINE V get_pushed(const Peers& p, int64_t idx) {
@@ -181,31 +162,6 @@ struct Core {
     return __builtin_bit_cast(float, __scoped_atomic_load_n(at, __ATOMIC_RELAXED,
                                                             __MEMORY_SCOPE_SYSTEM));
   }
-
-  // This block and the same-numbered block on every peer, and no other block: one peer
-  // write each, where `world_barrier` waits for the whole grid. A get after it may read
-  // ONLY what the same-numbered block on that peer put, so both phases must give each
-  // block the same indices (vLLM's custom all-reduce, and the rule its two-stage kernel
-  // states).
-  static DINLINE void peer_block_barrier(const Peers& p) {
-    skew(p);
-    pair_blocks<true>(p, false);
-  }
-
-  static DINLINE void world_barrier(const Peers& p) { barrier<true>(p); }
-
-  // Every block of THIS rank's kernel: puts to our own scratch before it are visible to our
-  // own gets after it. Cheaper than `world_barrier`, and wrong for anything a peer put.
-  static DINLINE void grid_barrier(const Peers& p) { barrier<false>(p); }
-
-  static DINLINE void close(const Peers& p) {
-    skew(p);
-    pair_blocks<false>(p, false);
-  }
-
-  // ---------------------------------------------------------------------------------
-  // The layer's own: what the primitives above are made of.
-  // ---------------------------------------------------------------------------------
 
   // Rank `peer`'s scratch, the bytes after its signal block. BY SELECT, NOT an index into
   // the pointer array: a runtime index into a register array moves it to scratch memory.
