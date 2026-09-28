@@ -6,8 +6,7 @@
 
 #pragma once
 
-#include "fusions/add_rms_norm.cuh"
-#include "fusions/gemm_add.cuh"
+#include "fusions/rms_norm_gemm_add.cuh"
 #include "ipc.cuh"
 #include "utils.cuh"
 
@@ -16,7 +15,7 @@ namespace hip_comms {
 // PUSH (see allreduce_one_shot_push.cuh): every rank's rows, encoded by kBits' Codec, into
 // every rank's inbox; one barrier; each block reduces and norms its rows out of its own
 // inbox into our scratch after the inbox; a grid barrier; the GEMM over every row, as the
-// pull kernel does. At most kGemmRows rows: one GEMM pass.
+// pull kernel does. At most kRows rows: one GEMM pass.
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kBits, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_norm_gemm_add(
@@ -26,6 +25,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_no
   using V          = typename traits<T>::V;
   using C          = Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::rms_norm_gemm_add;
   ipc::Comm<T, ngpus> c(p);
   const int rank = c.rank();
   const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
@@ -39,16 +39,15 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_no
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
     c.template reduce_row<C>(box, row, packs, sum);
-    add_rms_norm_row<T, T, false>(
-        sum, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
-        [](int, int, const V&) {},
+    fusion::norm_row<T>(
+        sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
         [&](int, int i, const V& v) { c.put(rank, normed + row * packs + i, v); });
   }
 
   // The GEMM reads rows other blocks of this rank wrote, in our own scratch.
   c.grid_barrier();
 
-  gemm_add_rows<kLanesPerCol, T>(
+  fusion::gemm<kLanesPerCol, T>(
       [&](int r) { return c.ptr(rank, normed + r * packs, packs); }, rows, gemm_w, n_cols,
       packs, out, out_stride, out_col0);
 }

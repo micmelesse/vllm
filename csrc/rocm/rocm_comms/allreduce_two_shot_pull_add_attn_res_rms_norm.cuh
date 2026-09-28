@@ -30,6 +30,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_attn_res_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const int rank  = c.rank();
   const int chunk = (rows + ngpus - 1) / ngpus;
@@ -44,7 +45,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
       c.sum_row(row * packs, packs, sum);
-      add_attn_res_rms_norm_row<T, kPrefix>(
+      fusion::row<T, kPrefix>(
           sum, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
           block_stride_r, reinterpret_cast<const V*>(norm_w),
           reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),

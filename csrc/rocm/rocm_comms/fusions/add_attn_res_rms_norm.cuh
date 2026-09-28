@@ -8,7 +8,7 @@
 
 #include "../utils.cuh"
 
-namespace hip_comms {
+namespace hip_comms::fusions::add_attn_res_rms_norm {
 
 // ONE ROW of all-reduce + AttnRes by the whole block, matching
 // `vllm/models/kimi_k3/amd/ops/attn_res.py` rounding for rounding:
@@ -23,19 +23,16 @@ namespace hip_comms {
 //
 // The prefix and the mix stay in registers across the sources, so only the stored blocks
 // are read back. The sums run in a different order than Triton's, so a result agrees to
-// the rounding of the last few bits, not bitwise. Direction-free as `add_rms_norm_row`:
+// the rounding of the last few bits, not bitwise. Direction-free as `add_rms_norm::row`:
 // `sum` is this thread's share of the reduced row, the new prefix leaves through
 // `store_prefix(k, i, v)` and the output through `store_out(k, i, v)`.
 template <typename T, bool kPrefix, typename StorePrefix, typename StoreOut>
-DINLINE void add_attn_res_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
-                                       const typename traits<T>::V* prefix,
-                                       const T* blocks, int64_t block_stride_r,
-                                       const typename traits<T>::V* norm_w,
-                                       const typename traits<T>::V* qk_w,
-                                       const typename traits<T>::V* out_norm_w,
-                                       int num_blocks, int row, int packs,
-                                       float inv_hidden, float eps, float out_eps,
-                                       StorePrefix store_prefix, StoreOut store_out) {
+DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+                 const typename traits<T>::V* prefix, const T* blocks,
+                 int64_t block_stride_r, const typename traits<T>::V* norm_w,
+                 const typename traits<T>::V* qk_w, const typename traits<T>::V* out_norm_w,
+                 int num_blocks, int row, int packs, float inv_hidden, float eps,
+                 float out_eps, StorePrefix store_prefix, StoreOut store_out) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
@@ -159,4 +156,4 @@ DINLINE void add_attn_res_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRo
   __syncthreads();
 }
 
-}  // namespace hip_comms
+}  // namespace hip_comms::fusions::add_attn_res_rms_norm

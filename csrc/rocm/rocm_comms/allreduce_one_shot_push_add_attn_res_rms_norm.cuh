@@ -26,6 +26,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   using V          = typename traits<T>::V;
   using C          = Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_attn_res_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
   c.template broadcast_rows<C>(box, rows, packs);
@@ -42,7 +43,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                             : nullptr;
     V sum[kMaxRowPacks];
     c.template reduce_row<C>(box, row, packs, sum);
-    add_attn_res_rms_norm_row<T, kPrefix>(
+    fusion::row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
         num_blocks, row, packs, inv_hidden, eps, out_eps,

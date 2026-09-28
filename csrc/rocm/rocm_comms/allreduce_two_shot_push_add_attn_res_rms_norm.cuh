@@ -37,6 +37,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   using C          = Codec<T, kBits>;
   using R          = Codec<T, 16>;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_attn_res_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const int rank   = c.rank();
   const int chunk  = (rows + ngpus - 1) / ngpus;
@@ -56,7 +57,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       V sum[kMaxRowPacks];
       c.template reduce_row<C>(box_in, row - begin, packs, sum);
       V mixed[kMaxRowPacks] = {}, pre[kMaxRowPacks] = {};
-      add_attn_res_rms_norm_row<T, kPrefix>(
+      fusion::row<T, kPrefix>(
           sum, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
           block_stride_r, reinterpret_cast<const V*>(norm_w),
           reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),

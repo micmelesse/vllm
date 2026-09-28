@@ -156,7 +156,7 @@ bool admits(const Comms& comms, Op op, int64_t rows, int64_t hidden, int64_t ele
   const Launch l      = launch_for(comms, op, rows, rows * hidden * elem);
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
-  if (op == Op::rms_norm_gemm_add && !is_two_shot(l.kernel) && rows > kGemmRows)
+  if (op == Op::rms_norm_gemm_add && !is_two_shot(l.kernel) && rows > kGemmTailOneShotRows)
     return false;
   return scratch_need(l, rows, packs, rows * packs, comms.group.world_size()) <=
          comms.group.scratch_bytes();
@@ -260,7 +260,7 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
 // given (and then `residual_out` too). Exact to those ops' roundings; see
-// `add_rms_norm_row`.
+// `fusions::add_rms_norm::row`.
 void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* residual_out,
                              torch::Tensor& inp, const torch::Tensor* residual,
                              torch::Tensor& weight, double eps) {
@@ -355,8 +355,8 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
 }
 
 // FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm
-// on each row (see `add_attn_res_rms_norm_row`). With `has_prefix` the sum is added to
-// `prefix` in place; without, the sum IS the new prefix and is written there.
+// on each row (see `fusions::add_attn_res_rms_norm::row`). With `has_prefix` the sum is
+// added to `prefix` in place; without, the sum IS the new prefix and is written there.
 void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
                                       torch::Tensor& out, torch::Tensor& inp,
                                       torch::Tensor& blocks, torch::Tensor& norm_weight,

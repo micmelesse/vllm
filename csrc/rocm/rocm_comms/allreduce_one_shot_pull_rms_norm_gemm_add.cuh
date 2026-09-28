@@ -6,8 +6,7 @@
 
 #pragma once
 
-#include "fusions/add_rms_norm.cuh"
-#include "fusions/gemm_add.cuh"
+#include "fusions/rms_norm_gemm_add.cuh"
 #include "ipc.cuh"
 #include "utils.cuh"
 
@@ -15,10 +14,10 @@ namespace hip_comms {
 
 // Matching the model's ops rounding for rounding where they round:
 //
-//   n   = rms_norm(T(sum over ranks), norm_w, eps)   `add_rms_norm_row`, landing as T
-//   out[:, col0:col0+N] = T(float(out) + n @ W^T)   `gemm_add_rows`
+//   n   = rms_norm(T(sum over ranks), norm_w, eps)   `norm_row`, landing as T
+//   out[:, col0:col0+N] = T(float(out) + n @ W^T)   `gemm`
 //
-// At most kGemmRows rows: one GEMM pass.
+// At most kRows rows: one GEMM pass.
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_norm_gemm_add(
@@ -27,6 +26,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_no
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::rms_norm_gemm_add;
   ipc::Comm<T, ngpus> c(p);
   const int rank = c.rank();
 
@@ -35,17 +35,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_no
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
     c.sum_row(row * packs, packs, sum);
-    add_rms_norm_row<T, T, false>(
-        sum, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
-        [](int, int, const V&) {},
+    fusion::norm_row<T>(
+        sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
         [&](int, int i, const V& v) { c.put(rank, row * packs + i, v); });
   }
 
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
   c.grid_barrier();
 
-  gemm_add_rows<kLanesPerCol, T>([&](int r) { return c.ptr(rank, r * packs, packs); },
-                                 rows, gemm_w, n_cols, packs, out, out_stride, out_col0);
+  fusion::gemm<kLanesPerCol, T>([&](int r) { return c.ptr(rank, r * packs, packs); }, rows,
+                                gemm_w, n_cols, packs, out, out_stride, out_col0);
   c.close();
 }
 

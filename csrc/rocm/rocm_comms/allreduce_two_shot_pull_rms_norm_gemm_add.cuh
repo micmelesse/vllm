@@ -6,8 +6,7 @@
 
 #pragma once
 
-#include "fusions/add_rms_norm.cuh"
-#include "fusions/gemm_add.cuh"
+#include "fusions/rms_norm_gemm_add.cuh"
 #include "ipc.cuh"
 #include "utils.cuh"
 
@@ -15,7 +14,7 @@ namespace hip_comms {
 
 // Each rank owns ceil(rows/ngpus) whole rows: it reduces and norms them into its own
 // scratch, and after the world barrier every rank reads every normed row from its owner's
-// scratch for the GEMM, kGemmRows rows per pass. The same roundings as the one-shot
+// scratch for the GEMM, kRows rows per pass. The same roundings as the one-shot
 // kernel.
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
@@ -25,6 +24,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::rms_norm_gemm_add;
   ipc::Comm<T, ngpus> c(p);
   const int rank  = c.rank();
   const int chunk = (rows + ngpus - 1) / ngpus;
@@ -37,23 +37,21 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
       c.sum_row(row * packs, packs, sum);
-      add_rms_norm_row<T, T, false>(
-          sum, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
-          [](int, int, const V&) {},
-          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
+      fusion::norm_row<T>(sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
+                          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
     }
   }
 
   c.world_barrier();
 
-  for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
-    gemm_add_rows<kLanesPerCol, T>(
+  for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
+    fusion::gemm<kLanesPerCol, T>(
         [&](int r) {
           const int row   = r0 + r;
           const int owner = row / chunk;
           return c.ptr(owner, (row - owner * chunk) * packs, packs);
         },
-        min(kGemmRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
+        min(fusion::kRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
         out_stride, out_col0);
   }
   c.close();

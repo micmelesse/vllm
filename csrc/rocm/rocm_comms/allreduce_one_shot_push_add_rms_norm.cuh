@@ -17,7 +17,7 @@ namespace hip_comms {
 // every rank's inbox; one barrier; each block reduces its rows out of its own inbox and
 // norms them as the pull kernel does. A block owns a row in both phases.
 // `residual` and `residual_out` are unused (null) unless kAdd.
-// `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
+// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
 DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
@@ -27,6 +27,7 @@ DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   using V          = typename traits<T>::V;
   using C          = Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
   c.template broadcast_rows<C>(box, rows, packs);
@@ -41,7 +42,7 @@ DINLINE void one_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
     c.template reduce_row<C>(box, row, packs, sum);
-    add_rms_norm_row<T, W, kAdd>(
+    fusion::row<T, W, kAdd>(
         sum, res_in, w, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });

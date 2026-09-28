@@ -1,28 +1,75 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE GEMM PHASE of the latent MoE tail, `out[:, col0:col0+N] += x @ W^T` over normed
-// rows wherever they live: every rms_norm_gemm_add kernel, pull or push.
+// THE COMPUTATION of all-reduce + RMSNorm + GEMM-add, the tail of Kimi-K3's latent MoE
+// (`fused_all_reduce.latent_tail`), in its two stages: `norm_row` on a row already reduced
+// over ranks, then (after the kernel's barrier: the GEMM reads every normed row) `gemm`.
+// Every rms_norm_gemm_add kernel, pull or push.
 
 #pragma once
 
 #include "../utils.cuh"
 
-namespace hip_comms {
+namespace hip_comms::fusions::rms_norm_gemm_add {
 
+// STAGE 1: one row RMSNormed by the whole block, matching vLLM's `rms_norm`
+// (`vllm/ir/ops/layernorm.py`) rounding for rounding, the weight in T:
+//
+//   s   = float(T(sum over ranks))        the all-reduce output, as it would land
+//   out = T(T(s * rsqrt(mean(s^2) + eps)) * float(w))
+//
+// `sum` is this thread's share of the row, sum[k] the pack threadIdx.x + k * blockDim.x;
+// the normed packs leave through `store(k, i, v)`, i the pack within the row.
+template <typename T, typename Store>
+DINLINE void norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+                      const typename traits<T>::V* weight, int packs, float inv_hidden,
+                      float eps, Store store) {
+  using V          = typename traits<T>::V;
+  constexpr int NL = traits<T>::N;
+  float s[kMaxRowPacks][NL];
+  float acc = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+#pragma unroll
+    for (int j = 0; j < NL; ++j) {
+      s[k][j] = static_cast<float>(sum[k].d[j]);
+      acc += s[k][j] * s[k][j];
+    }
+  }
+  const float scale = rsqrtf(block_sum(acc) * inv_hidden + eps);
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    const int i = threadIdx.x + k * blockDim.x;
+    if (i >= packs) break;
+    const V w = weight[i];
+    V o;
+#pragma unroll
+    for (int j = 0; j < NL; ++j) {
+      const float x = static_cast<float>(static_cast<T>(s[k][j] * scale));
+      o.d[j]        = static_cast<T>(x * static_cast<float>(w.d[j]));
+    }
+    store(k, i, o);
+  }
+  // Before the next row reuses `block_sum`'s shared slots.
+  __syncthreads();
+}
+
+// STAGE 2, THE GEMM.
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
-constexpr int kGemmRows = 16;
+constexpr int kRows = 16;
 // The K-chunk of x staged in LDS at a time, in packs. gfx950 has 160 KB of LDS, so all of
 // Kimi-K3's latent K (448 packs, 112 KB) goes in at once: one staging pass and one barrier
 // pair per tile. gfx942 has 64 KB: 96 packs (24 KB) beside the widest reduce tile (32 KB).
 #if defined(__gfx950__)
-constexpr int kGemmChunk = 448;
+constexpr int kChunk = 448;
 #else
-constexpr int kGemmChunk = 96;
+constexpr int kChunk = 96;
 #endif
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
-// rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
+// rows <= kRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
 // wherever it lives.
 //
 // x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
@@ -35,15 +82,14 @@ constexpr int kGemmChunk = 96;
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
 template <int kLanesPerCol, typename T, typename Row>
-DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int n_cols,
-                           int packs, T* __restrict__ out, int64_t out_stride,
-                           int out_col0) {
+DINLINE void gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
+                  T* __restrict__ out, int64_t out_stride, int out_col0) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   constexpr int kTile = kWaveSize / kLanesPerCol;
   static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
-  __shared__ float partial[kMaxWaves][kGemmRows][kTile];
-  __shared__ V xs[kGemmRows][kGemmChunk];
+  __shared__ float partial[kMaxWaves][kRows][kTile];
+  __shared__ V xs[kRows][kChunk];
   const int lane   = threadIdx.x % kWaveSize;
   const int wave   = threadIdx.x / kWaveSize;
   const int waves  = blockDim.x / kWaveSize;
@@ -55,11 +101,11 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
     const int n   = tile * kTile + column;
     const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
-    float acc[kGemmRows];
+    float acc[kRows];
 #pragma unroll
-    for (int r = 0; r < kGemmRows; ++r) acc[r] = 0.0f;
-    for (int k0 = 0; k0 < packs; k0 += kGemmChunk) {
-      const int chunk = min(kGemmChunk, packs - k0);
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.0f;
+    for (int k0 = 0; k0 < packs; k0 += kChunk) {
+      const int chunk = min(kChunk, packs - k0);
       // Rows past `rows` are never staged; their sums read stale LDS and are never stored.
       for (int i = threadIdx.x; i < rows * chunk; i += blockDim.x)
         xs[i / chunk][i % chunk] = row(i / chunk)[k0 + i % chunk];
@@ -70,7 +116,7 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
 #pragma unroll
         for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
 #pragma unroll
-        for (int r = 0; r < kGemmRows; ++r) {
+        for (int r = 0; r < kRows; ++r) {
           const V xr = xs[r][k];
 #pragma unroll
           for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
@@ -81,16 +127,16 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
     }
     // A column's lanes are kTile apart in the wave.
 #pragma unroll
-    for (int r = 0; r < kGemmRows; ++r)
+    for (int r = 0; r < kRows; ++r)
 #pragma unroll
       for (int s = kTile; s < kWaveSize; s <<= 1)
         acc[r] += __shfl_xor(acc[r], s, kWaveSize);
     if (lane < kTile) {
 #pragma unroll
-      for (int r = 0; r < kGemmRows; ++r) partial[wave][r][column] = acc[r];
+      for (int r = 0; r < kRows; ++r) partial[wave][r][column] = acc[r];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < kGemmRows * kTile; i += blockDim.x) {
+    for (int i = threadIdx.x; i < kRows * kTile; i += blockDim.x) {
       const int r   = i / kTile;
       const int col = tile * kTile + i % kTile;
       if (r < rows && col < n_cols) {
@@ -105,4 +151,4 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   }
 }
 
-}  // namespace hip_comms
+}  // namespace hip_comms::fusions::rms_norm_gemm_add

@@ -26,7 +26,7 @@ namespace hip_comms {
 //
 // THE RESIDUAL IS NEVER QUANTIZED (Codec 16 whatever kBits): it is rewritten every layer,
 // so a codec's error would accumulate over depth.
-// `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
+// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
 DINLINE void two_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
@@ -37,6 +37,7 @@ DINLINE void two_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   using C          = Codec<T, kBits>;
   using R          = Codec<T, 16>;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const int rank   = c.rank();
   const int chunk  = (rows + ngpus - 1) / ngpus;
@@ -58,7 +59,7 @@ DINLINE void two_shot_push_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
       V sum[kMaxRowPacks];
       c.template reduce_row<C>(box_in, row - begin, packs, sum);
       V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
-      add_rms_norm_row<T, W, kAdd>(
+      fusion::row<T, W, kAdd>(
           sum, res_in, w, row, packs, inv_hidden, eps,
           [&](int k, int, const V& v) { res[k] = v; },
           [&](int k, int, const V& v) { normed[k] = v; });

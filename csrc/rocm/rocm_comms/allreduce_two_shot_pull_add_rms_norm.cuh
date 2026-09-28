@@ -25,7 +25,7 @@ namespace hip_comms {
 // Every output element is computed by exactly one rank, so all ranks hold identical bytes.
 // Fewer rows than ranks is correct and unbalanced: the ranks past the end own nothing and
 // still reach every barrier.
-// `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
+// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
@@ -34,6 +34,7 @@ DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const int rank  = c.rank();
   const int chunk = (rows + ngpus - 1) / ngpus;
@@ -50,7 +51,7 @@ DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
       c.sum_row(row * packs, packs, sum);
-      add_rms_norm_row<T, W, kAdd>(
+      fusion::row<T, W, kAdd>(
           sum, res_in, w, row, packs, inv_hidden, eps,
           [&](int, int i, const V& v) { c.put(rank, half + local + i, v); },
           [&](int, int i, const V& v) { c.put(rank, local + i, v); });

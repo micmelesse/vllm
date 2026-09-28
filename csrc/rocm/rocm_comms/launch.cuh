@@ -10,7 +10,7 @@
 #include <climits>
 #include <cstdint>
 
-#include "fusions/gemm_add.cuh"
+#include "fusions/rms_norm_gemm_add.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -53,6 +53,9 @@ enum class Kernel : int {
   two_shot_pull_rms_norm_gemm_add     = 18,
   two_shot_push_rms_norm_gemm_add     = 19,
 };
+
+// The GEMM tail's one-shot kernel takes one GEMM pass: at most this many rows.
+constexpr int kGemmTailOneShotRows = fusions::rms_norm_gemm_add::kRows;
 
 // What each kernel is, in Kernel's order.
 struct KernelInfo {
@@ -169,8 +172,8 @@ constexpr int grid_of(Kernel k, int blocks, int64_t rows) {
 inline Launch pick(Op op, int64_t rows, int64_t bytes) {
   const OpTuning& t = tuning(op);
   if (bytes > t.fused_max_bytes) return {Kernel::none, 0, 0, 0, 0};
-  const bool one_shot =
-      bytes <= t.one_shot_max_bytes && !(op == Op::rms_norm_gemm_add && rows > kGemmRows);
+  const bool one_shot = bytes <= t.one_shot_max_bytes &&
+                        !(op == Op::rms_norm_gemm_add && rows > kGemmTailOneShotRows);
   const Kernel k = kernel_of(op, !one_shot, one_shot ? t.one_shot_push : t.two_shot_push);
   return {k, grid_of(k, one_shot ? t.one_shot_blocks : t.two_shot_blocks, rows), t.threads,
           t.gemm_lanes_per_col, t.quant_bits};

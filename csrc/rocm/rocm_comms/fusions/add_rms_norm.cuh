@@ -9,7 +9,7 @@
 
 #include "../utils.cuh"
 
-namespace hip_comms {
+namespace hip_comms::fusions::add_rms_norm {
 
 // ONE ROW of all-reduce, then (kAdd) add, then RMSNorm by the whole block, matching vLLM's
 // reference ops (`vllm/ir/ops/layernorm.py`) rounding for rounding:
@@ -32,11 +32,10 @@ namespace hip_comms {
 // `store_out(k, i, v)`, i the pack within the row, so a kernel can land them in its
 // output, in scratch, or in registers to push.
 template <typename T, typename W, bool kAdd, typename StoreRes, typename StoreOut>
-DINLINE void add_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
-                              const typename traits<T>::V* residual,
-                              const vec<W, traits<T>::N>* weight, int row, int packs,
-                              float inv_hidden, float eps, StoreRes store_res,
-                              StoreOut store_out) {
+DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+                 const typename traits<T>::V* residual, const vec<W, traits<T>::N>* weight,
+                 int row, int packs, float inv_hidden, float eps, StoreRes store_res,
+                 StoreOut store_out) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
@@ -80,4 +79,4 @@ DINLINE void add_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
   __syncthreads();
 }
 
-}  // namespace hip_comms
+}  // namespace hip_comms::fusions::add_rms_norm

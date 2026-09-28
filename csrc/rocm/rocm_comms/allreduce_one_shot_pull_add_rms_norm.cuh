@@ -19,7 +19,7 @@ namespace hip_comms {
 // A BLOCK OWNS A ROW, because the variance needs the whole row: one block per row,
 // striding over rows, where plain one-shot is grid-stride over the flat buffer.
 // `residual` and `residual_out` are unused (null) unless kAdd.
-// `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
+// `weight` is in its own dtype W: T, or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void one_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
@@ -28,6 +28,7 @@ DINLINE void one_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
+  namespace fusion = fusions::add_rms_norm;
   ipc::Comm<T, ngpus> c(p);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
@@ -38,7 +39,7 @@ DINLINE void one_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
     c.sum_row(row * packs, packs, sum);
-    add_rms_norm_row<T, W, kAdd>(
+    fusion::row<T, W, kAdd>(
         sum, res_in, w, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
