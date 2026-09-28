@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -26,15 +26,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   using V          = typename traits<T>::V;
   using C          = p2p::Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using push       = p2p::Push<T, ngpus, C>;
   namespace fusion = fusions::add_attn_res_rms_norm;
-  core::start(p);
-  const auto in = core::inputs(p);
-  const p2p::Inbox<C, ngpus> box(rows * blockDim.x);
-  push::broadcast_rows(p, in, box, rows, packs);
+  const auto w     = p2p::start<T, ngpus>(p);
+  const auto box   = p2p::push::row_inbox<C>(w, rows);
+  p2p::push::broadcast_rows(w, box, rows, packs);
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
@@ -45,7 +42,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                    write_idx * block_stride_r)
                             : nullptr;
     V sum[kMaxRowPacks];
-    push::reduce_row(p, box, row, packs, sum);
+    p2p::push::reduce_row(w, box, row, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),

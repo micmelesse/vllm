@@ -128,7 +128,7 @@ DINLINE float2 block_sum2(float a, float b) {
 // How many 16-byte packs of one row a thread holds in registers: packs threadIdx.x +
 // k * blockDim.x, k < kMaxRowPacks. A row wider than kMaxRowPacks x blockDim is refused by
 // the host. The same as kSumBatch, so a thread's share of a row is one batched `sum` and
-// one push GROUP (p2p::Groups::row).
+// one push GROUP (a row group in p2p/impl/push.cuh).
 constexpr int kMaxRowPacks = kSumBatch;
 
 }  // namespace hip_comms

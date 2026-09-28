@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -26,30 +26,27 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_no
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::rms_norm_gemm_add;
-  core::start(p);
-  const auto in  = core::inputs(p);
-  const int rank = p.rank;
+  const auto w     = p2p::start<T, ngpus>(p);
+  const int rank   = p.rank;
 
   // PHASE 1 -- this block's rows, reduced and normed, into our own scratch.
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    pull::sum_row(p, in, row * packs, packs, sum);
+    p2p::pull::sum_row(w, row * packs, packs, sum);
     fusion::norm_row<T>(
         sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { core::put(p, rank, row * packs + i, v); });
+        [&](int, int i, const V& v) { p2p::put(w, rank, row * packs + i, v); });
   }
 
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
-  core::grid_barrier(p);
+  p2p::grid_barrier(w);
 
   fusion::gemm<kLanesPerCol, T>(
-      [&](int r) { return core::ptr(p, rank, r * packs, packs); }, rows, gemm_w, n_cols,
+      [&](int r) { return p2p::ptr(w, rank, r * packs, packs); }, rows, gemm_w, n_cols,
       packs, out, out_stride, out_col0);
-  core::close(p);
+  p2p::close(w);
 }
 
 }  // namespace hip_comms

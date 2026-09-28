@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE CONTRACT between the two sides of the peer layer: what the host (host.cuh) maps and
+// THE CONTRACT between p2p's two sides, behind p2p.cuh: what the host (host.cuh) maps and
 // fills, and what a kernel (core.cuh, pull.cuh, push.cuh) reads. Plain data only.
 
 #pragma once
+
+#ifndef HIP_COMMS_P2P_INTERFACE
+#error "include p2p/p2p.cuh, p2p's one interface, not its parts"
+#endif
 
 #include <hip/hip_runtime.h>
 
@@ -42,7 +46,7 @@ struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
 // WHAT A LAUNCH PASSES, by value: every rank's input (through a slot of the peer-pointer
 // slab), every rank's signal block and scratch, and this launch's limits. Plain fields;
-// `Group::peers` (host.cuh) fills one per launch.
+// `host::Group::peers` fills one per launch.
 struct Peers {
   int rank;
   bool checked;                // bounds checks and random skew: the tests' mode
@@ -55,10 +59,10 @@ struct Peers {
 };
 
 // THE INBOX LAYOUT'S SIZE, which the host needs to size scratch and push.cuh's `Groups`
-// and `Inbox` lay out on the device (they must agree): a flat span's groups at a grid of
+// and `Inbox` lay out on the device (they must agree): a buffer span's groups at a grid of
 // `grid_threads`, and the packs of an inbox of `groups` groups at kbits (16: T itself).
 // A group is kSumBatch packs.
-inline int64_t flat_groups(int64_t span, int64_t grid_threads) {
+inline int64_t buffer_groups(int64_t span, int64_t grid_threads) {
   const int64_t per_iter = grid_threads * kSumBatch;
   return (span + per_iter - 1) / per_iter * grid_threads;
 }

@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -27,26 +27,23 @@ DINLINE void one_shot_push_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
   using V          = typename traits<T>::V;
   using C          = p2p::Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using push       = p2p::Push<T, ngpus, C>;
   namespace fusion = fusions::add_rms_norm;
-  core::start(p);
-  const auto in = core::inputs(p);
-  const p2p::Inbox<C, ngpus> box(rows * blockDim.x);
-  push::broadcast_rows(p, in, box, rows, packs);
+  const auto w     = p2p::start<T, ngpus>(p);
+  const auto box   = p2p::push::row_inbox<C>(w, rows);
+  p2p::push::broadcast_rows(w, box, rows, packs);
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   const V* res_in        = reinterpret_cast<const V*>(residual);
-  const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
+  const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    push::reduce_row(p, box, row, packs, sum);
+    p2p::push::reduce_row(w, box, row, packs, sum);
     fusion::row<T, W, kAdd>(
-        sum, res_in, w, row, packs, inv_hidden, eps,
+        sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }

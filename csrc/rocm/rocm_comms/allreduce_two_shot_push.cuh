@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -26,52 +26,24 @@ namespace hip_comms {
 template <typename T, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_push(p2p::Peers p, T* __restrict__ out, int size) {
-  using V    = typename traits<T>::V;
-  using C    = p2p::Codec<T, kBits>;
-  using core = p2p::Core<T, ngpus>;
-  using push = p2p::Push<T, ngpus, C>;
-  core::start(p);
-  const auto in   = core::inputs(p);
-  const int rank  = p.rank;
-  const int chunk = (size + ngpus - 1) / ngpus;
-  const auto grp  = p2p::Groups::flat(chunk);
-  const p2p::Inbox<C, ngpus> box(grp.count(), 2);
+  using V            = typename traits<T>::V;
+  using C            = p2p::Codec<T, kBits>;
+  const auto w       = p2p::start<T, ngpus>(p);
+  const int chunk    = (size + ngpus - 1) / ngpus;
+  const auto box_in  = p2p::push::buffer_inbox<C>(w, chunk);
+  const auto box_out = p2p::push::buffer_inbox<C>(w, chunk, box_in.end());
+  V* dst             = reinterpret_cast<V*>(out);
 
-  for (int j = 0; j < grp.iters; ++j) {
-    for (int d = 0; d < ngpus; ++d) {
-      float x[C::kVals];
-      push::mine_group(p, in, grp, j, d * chunk, size, x);
-      push::send(p, d, box, 0, grp.id(j), grp.members(j, d * chunk, size), x);
-    }
-  }
+  p2p::push::scatter_buffer(w, box_in, chunk, size);
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
-  for (int j = 0; j < grp.iters; ++j) {
-    const int n = grp.members(j, rank * chunk, size);
-    float acc[C::kVals];
-    push::reduce_inbox(p, box, 0, grp.id(j), n, acc);
-    // Rounded to T first, as the unquantized sum lands.
-#pragma unroll
-    for (int i = 0; i < C::kVals; ++i) acc[i] = static_cast<float>(static_cast<T>(acc[i]));
-    push::broadcast(p, box, 1, grp.id(j), n, acc);
-  }
+  p2p::push::reduce_broadcast_slice(w, box_in, box_out, chunk, size);
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
-  V* dst = reinterpret_cast<V*>(out);
-  for (int j = 0; j < grp.iters; ++j) {
-    for (int src = 0; src < ngpus; ++src) {
-      const int n = grp.members(j, src * chunk, size);
-      float x[C::kVals];
-      push::read_inbox(p, box, 1, src, grp.id(j), n, x);
-      V v[kSumBatch];
-      p2p::packs_of<T>(x, v);
-#pragma unroll
-      for (int u = 0; u < kSumBatch; ++u)
-        if (u < n) store_global(dst + src * chunk + grp.at(j, u), v[u]);
-    }
-  }
+  p2p::push::gather_buffer(w, box_out, chunk, size,
+                           [&](int at, const V& v) { store_global(dst + at, v); });
 }
 
 }  // namespace hip_comms

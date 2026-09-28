@@ -7,7 +7,7 @@
 #pragma once
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -24,13 +24,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
     int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::rms_norm_gemm_add;
-  core::start(p);
-  const auto in   = core::inputs(p);
-  const int rank  = p.rank;
-  const int chunk = (rows + ngpus - 1) / ngpus;
+  const auto w     = p2p::start<T, ngpus>(p);
+  const int rank   = p.rank;
+  const int chunk  = (rows + ngpus - 1) / ngpus;
 
   {
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
@@ -39,27 +36,27 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
-      pull::sum_row(p, in, row * packs, packs, sum);
+      p2p::pull::sum_row(w, row * packs, packs, sum);
       fusion::norm_row<T>(sum, reinterpret_cast<const V*>(norm_w), packs, inv_hidden, eps,
                           [&](int, int i, const V& v) {
-                            core::put(p, rank, local + i, v);
+                            p2p::put(w, rank, local + i, v);
                           });
     }
   }
 
-  core::world_barrier(p);
+  p2p::world_barrier(w);
 
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
     fusion::gemm<kLanesPerCol, T>(
         [&](int r) {
           const int row   = r0 + r;
           const int owner = row / chunk;
-          return core::ptr(p, owner, (row - owner * chunk) * packs, packs);
+          return p2p::ptr(w, owner, (row - owner * chunk) * packs, packs);
         },
         min(fusion::kRows, rows - r0), gemm_w, n_cols, packs, out + r0 * out_stride,
         out_stride, out_col0);
   }
-  core::close(p);
+  p2p::close(w);
 }
 
 }  // namespace hip_comms

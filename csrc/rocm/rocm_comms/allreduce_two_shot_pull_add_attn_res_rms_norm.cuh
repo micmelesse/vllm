@@ -6,7 +6,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -30,13 +30,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::add_attn_res_rms_norm;
-  core::start(p);
-  const auto in   = core::inputs(p);
-  const int rank  = p.rank;
-  const int chunk = (rows + ngpus - 1) / ngpus;
+  const auto w     = p2p::start<T, ngpus>(p);
+  const int rank   = p.rank;
+  const int chunk  = (rows + ngpus - 1) / ngpus;
   // Where the prefix half starts in a rank's scratch, in packs.
   const int half = chunk * packs;
 
@@ -47,25 +44,25 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
-      pull::sum_row(p, in, row * packs, packs, sum);
+      p2p::pull::sum_row(w, row * packs, packs, sum);
       fusion::row<T, kPrefix>(
           sum, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
           block_stride_r, reinterpret_cast<const V*>(norm_w),
           reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
           num_blocks, row, packs, inv_hidden, eps, out_eps,
-          [&](int, int i, const V& v) { core::put(p, rank, half + local + i, v); },
-          [&](int, int i, const V& v) { core::put(p, rank, local + i, v); });
+          [&](int, int i, const V& v) { p2p::put(w, rank, half + local + i, v); },
+          [&](int, int i, const V& v) { p2p::put(w, rank, local + i, v); });
     }
   }
 
   // The gather below gives each block the local rows it wrote above, so the same-numbered
   // blocks are all it must wait for; the input is read only above, so no close.
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   V* o   = reinterpret_cast<V*>(out);
   V* pre = reinterpret_cast<V*>(prefix);
-  pull::template gather_rows<2>(
-      p, chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
+  p2p::pull::gather_rows<2>(
+      w, chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
         if (region == 0) {
           store_global(o + row * packs + k, v);
           return;

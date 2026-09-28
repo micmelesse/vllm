@@ -6,7 +6,7 @@
 #pragma once
 
 #include "fusions/add_attn_res_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -21,13 +21,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
     const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
     float eps, float out_eps, int rows, int packs) {
-  using V          = typename traits<T>::V;
-  constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
-  namespace fusion = fusions::add_attn_res_rms_norm;
-  core::start(p);
-  const auto in          = core::inputs(p);
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::add_attn_res_rms_norm;
+  const auto w           = p2p::start<T, ngpus>(p);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
@@ -37,7 +34,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                    write_idx * block_stride_r)
                             : nullptr;
     V sum[kMaxRowPacks];
-    pull::sum_row(p, in, row * packs, packs, sum);
+    p2p::pull::sum_row(w, row * packs, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
@@ -48,7 +45,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  core::close(p);
+  p2p::close(w);
 }
 
 }  // namespace hip_comms

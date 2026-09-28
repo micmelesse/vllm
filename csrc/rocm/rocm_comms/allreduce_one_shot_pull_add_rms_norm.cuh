@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -26,28 +26,25 @@ DINLINE void one_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
-  using V          = typename traits<T>::V;
-  constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
-  namespace fusion = fusions::add_rms_norm;
-  core::start(p);
-  const auto in          = core::inputs(p);
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  namespace fusion       = fusions::add_rms_norm;
+  const auto w           = p2p::start<T, ngpus>(p);
   const V* res_in        = reinterpret_cast<const V*>(residual);
-  const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
+  const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   // Uniform across the block, so every `__syncthreads` inside is reached by every thread.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    pull::sum_row(p, in, row * packs, packs, sum);
+    p2p::pull::sum_row(w, row * packs, packs, sum);
     fusion::row<T, W, kAdd>(
-        sum, res_in, w, row, packs, inv_hidden, eps,
+        sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  core::close(p);
+  p2p::close(w);
 }
 
 // THE KERNELS, one per op, both the body above.

@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -34,41 +34,38 @@ DINLINE void two_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using pull       = p2p::Pull<T, ngpus>;
   namespace fusion = fusions::add_rms_norm;
-  core::start(p);
-  const auto in   = core::inputs(p);
-  const int rank  = p.rank;
-  const int chunk = (rows + ngpus - 1) / ngpus;
+  const auto w     = p2p::start<T, ngpus>(p);
+  const int rank   = p.rank;
+  const int chunk  = (rows + ngpus - 1) / ngpus;
   // Where the residual half starts in a rank's scratch, in packs.
   const int half = chunk * packs;
 
   {
     const V* res_in        = reinterpret_cast<const V*>(residual);
-    const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
+    const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
     const int begin        = rank * chunk;
     const int end          = min(begin + chunk, rows);
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
       V sum[kMaxRowPacks];
-      pull::sum_row(p, in, row * packs, packs, sum);
+      p2p::pull::sum_row(w, row * packs, packs, sum);
       fusion::row<T, W, kAdd>(
-          sum, res_in, w, row, packs, inv_hidden, eps,
-          [&](int, int i, const V& v) { core::put(p, rank, half + local + i, v); },
-          [&](int, int i, const V& v) { core::put(p, rank, local + i, v); });
+          sum, res_in, wv, row, packs, inv_hidden, eps,
+          [&](int, int i, const V& v) { p2p::put(w, rank, half + local + i, v); },
+          [&](int, int i, const V& v) { p2p::put(w, rank, local + i, v); });
     }
   }
 
   // The gather below gives each block the local rows it wrote above, so the same-numbered
   // blocks are all it must wait for; the input is read only above, so no close.
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   V* o       = reinterpret_cast<V*>(out);
   V* res_out = reinterpret_cast<V*>(residual_out);
-  pull::template gather_rows<kAdd ? 2 : 1>(
-      p, chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
+  p2p::pull::gather_rows<kAdd ? 2 : 1>(
+      w, chunk, rows, packs, half, [&](int region, int row, int k, const V& v) {
         store_global((region == 0 ? o : res_out) + row * packs + k, v);
       });
 }

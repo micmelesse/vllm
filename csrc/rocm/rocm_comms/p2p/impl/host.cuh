@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE HOST SIDE of the peer layer: `Group` maps every peer's signal block, scratch and
+// p2p::host, behind p2p.cuh: `Group` maps every peer's signal block, scratch and
 // registered buffers once over HIP IPC handles, and hands a launch the `Peers` it passes
-// to its kernel (peers.cuh). The one object with a lifetime, on purpose: the mappings
-// must outlive every launch.
+// to its kernel. The one object with a lifetime, on purpose: the mappings must outlive
+// every launch.
 
 #pragma once
+
+#ifndef HIP_COMMS_P2P_INTERFACE
+#error "include p2p/p2p.cuh, p2p's one interface, not its parts"
+#endif
 
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
@@ -30,7 +34,7 @@
     }                                                                               \
   } while (0)
 
-namespace hip_comms::p2p {
+namespace hip_comms::p2p::host {
 
 using Handle = hipIpcMemHandle_t;
 
@@ -227,4 +231,4 @@ class Group {
   std::unordered_map<std::string, void*> opened_;
 };
 
-}  // namespace hip_comms::p2p
+}  // namespace hip_comms::p2p::host

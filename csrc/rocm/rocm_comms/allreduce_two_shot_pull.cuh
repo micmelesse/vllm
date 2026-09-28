@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -20,25 +20,23 @@ namespace hip_comms {
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
-  using V    = typename traits<T>::V;
-  using core = p2p::Core<T, ngpus>;
-  using pull = p2p::Pull<T, ngpus>;
-  core::start(p);
-  const auto in   = core::inputs(p);
+  using V         = typename traits<T>::V;
+  const auto w    = p2p::start<T, ngpus>(p);
   const int chunk = (size + ngpus - 1) / ngpus;
   const int rank  = p.rank;
 
   const int mine_begin = rank * chunk;
   const int mine_end   = min(mine_begin + chunk, size);
-  pull::reduce_flat(p, in, mine_begin, mine_end,
-                    [&](int at, const V& v) { core::put(p, rank, at - mine_begin, v); });
+  p2p::pull::reduce_buffer(w, mine_begin, mine_end,
+                    [&](int at, const V& v) { p2p::put(w, rank, at - mine_begin, v); });
 
   // The gather below gives each thread the positions it wrote above, so the same-numbered
   // blocks are all it must wait for; the input is read only above, so no close.
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   V* dst = reinterpret_cast<V*>(out);
-  pull::gather_flat(p, chunk, size, [&](int at, const V& v) { store_global(dst + at, v); });
+  p2p::pull::gather_buffer(w, chunk, size,
+                           [&](int at, const V& v) { store_global(dst + at, v); });
 }
 
 }  // namespace hip_comms

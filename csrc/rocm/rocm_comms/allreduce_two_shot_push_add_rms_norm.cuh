@@ -8,7 +8,7 @@
 #pragma once
 
 #include "fusions/add_rms_norm.cuh"
-#include "p2p/device.cuh"
+#include "p2p/p2p.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -33,54 +33,51 @@ DINLINE void two_shot_push_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
                                              int rows, int packs) {
-  using V          = typename traits<T>::V;
-  using C          = p2p::Codec<T, kBits>;
-  using R          = p2p::Codec<T, 16>;
-  constexpr int NL = traits<T>::N;
-  using core       = p2p::Core<T, ngpus>;
-  using push       = p2p::Push<T, ngpus, C>;
-  using push_res   = p2p::Push<T, ngpus, R>;
-  namespace fusion = fusions::add_rms_norm;
-  core::start(p);
-  const auto in    = core::inputs(p);
-  const int rank   = p.rank;
-  const int chunk  = (rows + ngpus - 1) / ngpus;
-  const int groups = chunk * blockDim.x;
-  const p2p::Inbox<C, ngpus> box_in(groups);
-  const p2p::Inbox<C, ngpus> box_out(groups, 1, box_in.end());
-  const p2p::Inbox<R, ngpus> box_res(groups, 1, box_out.end());
-  push::scatter_rows(p, in, box_in, chunk, rows, packs);
+  using V            = typename traits<T>::V;
+  using C            = p2p::Codec<T, kBits>;
+  using R            = p2p::Codec<T, 16>;
+  constexpr int NL   = traits<T>::N;
+  namespace fusion   = fusions::add_rms_norm;
+  const auto w       = p2p::start<T, ngpus>(p);
+  const int rank     = p.rank;
+  const int chunk    = (rows + ngpus - 1) / ngpus;
+  const auto box_in  = p2p::push::row_inbox<C>(w, chunk);
+  const auto box_out = p2p::push::row_inbox<C>(w, chunk, box_in.end());
+  const auto box_res = p2p::push::row_inbox<R>(w, chunk, box_out.end());
+  p2p::push::scatter_rows(w, box_in, chunk, rows, packs);
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   {
     const V* res_in        = reinterpret_cast<const V*>(residual);
-    const auto* w          = reinterpret_cast<const vec<W, NL>*>(weight);
+    const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
     const int begin        = rank * chunk;
     const int end          = min(begin + chunk, rows);
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       V sum[kMaxRowPacks];
-      push::reduce_row(p, box_in, row - begin, packs, sum);
+      p2p::push::reduce_row(w, box_in, row - begin, packs, sum);
       V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
       fusion::row<T, W, kAdd>(
-          sum, res_in, w, row, packs, inv_hidden, eps,
+          sum, res_in, wv, row, packs, inv_hidden, eps,
           [&](int k, int, const V& v) { res[k] = v; },
           [&](int k, int, const V& v) { normed[k] = v; });
-      push::broadcast_row(p, box_out, row - begin, packs, normed);
-      if constexpr (kAdd) push_res::broadcast_row(p, box_res, row - begin, packs, res);
+      p2p::push::broadcast_row(w, box_out, row - begin, packs, normed);
+      if constexpr (kAdd) p2p::push::broadcast_row(w, box_res, row - begin, packs, res);
     }
   }
 
-  core::peer_block_barrier(p);
+  p2p::peer_block_barrier(w);
 
   V* o = reinterpret_cast<V*>(out);
-  push::gather_inbox_rows(p, box_out, chunk, rows, packs,
-      [&](int row, int i, const V& v) { store_global(o + row * packs + i, v); });
+  p2p::push::gather_rows(w, box_out, chunk, rows, packs, [&](int row, int i, const V& v) {
+    store_global(o + row * packs + i, v);
+  });
   if constexpr (kAdd) {
     V* res_out = reinterpret_cast<V*>(residual_out);
-    push_res::gather_inbox_rows(p, box_res, chunk, rows, packs,
-        [&](int row, int i, const V& v) { store_global(res_out + row * packs + i, v); });
+    p2p::push::gather_rows(w, box_res, chunk, rows, packs, [&](int row, int i, const V& v) {
+      store_global(res_out + row * packs + i, v);
+    });
   }
 }
 
