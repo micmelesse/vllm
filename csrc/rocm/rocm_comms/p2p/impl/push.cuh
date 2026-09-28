@@ -3,11 +3,12 @@
 //
 // p2p::push, behind p2p.cuh: a rank reads only its own input and its own scratch, and
 // what crosses a link is a store into a peer's SLOT, encoded by a codec (16 bits: T
-// itself; 8, 4: QuickReduce's integers). Every phase is over tiles::Rows.
+// itself; 8, 4: QuickReduce's integers). Every phase takes a tiling (tiles::Rows or
+// tiles::Buffer) and a unit of it.
 //
-// A thread's share of a row is one GROUP, and crosses a link as one codec payload (and
-// one scale); group idx x blockDim + threadIdx of a slot, idx the row's index there (the
-// row itself when every rank holds every row, its local index when only its owner does).
+// A thread's share of a unit is one GROUP, and crosses a link as one codec payload (and
+// one scale); group idx x lanes + lane of a slot, idx the unit's index there (the unit
+// itself when every rank holds every unit, its local index when only its owner does).
 // Every phase gives a thread the same groups, so the same block on every peer is all a
 // phase waits for. Only the payload covering a group's existing packs is sent.
 
@@ -128,8 +129,7 @@ enum class To { owners, all };
 template <class C, int ngpus>
 struct PushSlot {
   To to;
-  int chunk;    // the rows a rank owns
-  int groups;   // per source: the rows it holds x blockDim
+  int groups;   // per source: the units it holds x lanes
   int base;     // in packs of the scratch
   int per_src;  // packs per source: every group's payload, then (scaled) their scales
   DINLINE int payload(int src, int g) const {
@@ -148,15 +148,14 @@ DINLINE int payload_packs(int n) {
   return (n * C::kPayloadPacks + kSumBatch - 1) / kSumBatch;
 }
 
-// This thread's share of `row` of this rank's input, as floats (missing packs zero).
-template <class C, typename T, int ngpus>
-DINLINE void mine_row(const World<T, ngpus>& w, const tiles::Rows& rows, int row,
-                      float (&x)[C::kVals]) {
+// This thread's share of unit u of this rank's input, as floats (missing packs zero).
+template <class C, typename T, int ngpus, typename Tiling>
+DINLINE void mine_unit(const World<T, ngpus>& w, const Tiling& t, int u,
+                       float (&x)[C::kVals]) {
   typename traits<T>::V v[kSumBatch];
 #pragma unroll
   for (int k = 0; k < kSumBatch; ++k)
-    v[k] = tiles::has(rows, row, k) ? mine(w, row * rows.packs + tiles::pack(k))
-                                    : typename traits<T>::V{};
+    v[k] = t.has(u, k) ? mine(w, t.pos(u, k)) : typename traits<T>::V{};
   floats_of<T>(v, x);
 }
 
@@ -209,105 +208,102 @@ DINLINE void read(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, int src
   C::decode(q, scale, x);
 }
 
-// This thread's group index for a row's index `idx` in a slot.
-DINLINE int group(int idx) { return idx * blockDim.x + threadIdx.x; }
+// This thread's group for a unit's index `idx` in a slot.
+template <typename Tiling>
+DINLINE int group(const Tiling& t, int idx) {
+  return idx * t.lanes() + t.lane();
+}
 
 }  // namespace impl
 
 namespace push {
 
-// A slot for `rows` at kBits, from pack `base` of the scratch.
-template <int kBits, typename T, int ngpus>
-DINLINE PushSlot<impl::Codec<T, kBits>, ngpus> slot(const World<T, ngpus>&,
-                                                    const tiles::Rows& rows, To to,
-                                                    int base = 0) {
+// A slot for the tiling's units at kBits, from pack `base` of the scratch.
+template <int kBits, typename T, int ngpus, typename Tiling>
+DINLINE PushSlot<impl::Codec<T, kBits>, ngpus> slot(const World<T, ngpus>&, const Tiling& t,
+                                                    To to, int base = 0) {
   using C          = impl::Codec<T, kBits>;
-  const int chunk  = tiles::chunk_of(rows, ngpus);
-  const int groups = (to == To::all ? rows.rows : chunk) * static_cast<int>(blockDim.x);
+  const int groups = (to == To::all ? t.units() : t.locals()) * t.lanes();
   const int per    = groups * C::kPayloadPacks + (C::kScaled ? (groups + 3) / 4 : 0);
-  return {to, chunk, groups, base, per};
+  return {to, groups, base, per};
 }
 
 // The next slot, after `prev` (any slot) in the scratch.
-template <int kBits, typename T, int ngpus, typename Prev>
+template <int kBits, typename T, int ngpus, typename Tiling, typename Prev>
 DINLINE PushSlot<impl::Codec<T, kBits>, ngpus> slot(const World<T, ngpus>& w,
-                                                    const tiles::Rows& rows, To to,
+                                                    const Tiling& t, To to,
                                                     const Prev& prev) {
-  return slot<kBits>(w, rows, to, prev.end());
+  return slot<kBits>(w, t, to, prev.end());
 }
 
-// PHASE 1: this rank's input rows into the slot: each to its owner (To::owners), or every
-// row to every rank (To::all). A block takes the rows (local rows, for owners) it will
-// reduce.
-template <class C, typename T, int ngpus>
+// PHASE 1: this rank's input units into the slot: each to its owner (To::owners), or every
+// unit to every rank (To::all). A thread takes the units (local units, for owners) it
+// will reduce.
+template <class C, typename T, int ngpus, typename Tiling>
 DINLINE void scatter(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s,
-                     const tiles::Rows& rows) {
+                     const Tiling& t) {
   if (s.to == To::all) {
-    for (int row = blockIdx.x; row < rows.rows; row += gridDim.x) {
+    for (int u = t.first(); u < t.end(); u = t.next(u)) {
       float x[C::kVals];
-      impl::mine_row<C>(w, rows, row, x);
-      impl::broadcast(w, s, impl::group(row), tiles::members(rows, row), x);
+      impl::mine_unit<C>(w, t, u, x);
+      impl::broadcast(w, s, impl::group(t, u), tiles::members(t, u), x);
     }
     return;
   }
-  for (int lr = blockIdx.x; lr < s.chunk; lr += gridDim.x) {
+  for (int l = t.first_local(); l < t.locals(); l = t.next_local(l)) {
     for (int d = 0; d < ngpus; ++d) {
-      const int row = d * s.chunk + lr;
-      if (row >= rows.rows) break;
+      const int u = t.unit(d, l);
       float x[C::kVals];
-      impl::mine_row<C>(w, rows, row, x);
-      impl::send(w, d, s, impl::group(lr), tiles::members(rows, row), x);
+      impl::mine_unit<C>(w, t, u, x);
+      impl::send(w, d, s, impl::group(t, l), tiles::members(t, u), x);
     }
   }
 }
 
-// This thread's share of `row` summed over every source in the slot, in rank order (every
-// rank the same bits), rounded to T: what `pull::reduce` gives a pull kernel.
-template <class C, typename T, int ngpus>
-DINLINE void reduce(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s,
-                    const tiles::Rows& rows, int row,
-                    typename traits<T>::V (&v)[kMaxRowPacks]) {
-  const int idx = s.to == To::all ? row : row - w.peers.rank * s.chunk;
-  const int n   = tiles::members(rows, row);
+// This thread's share of unit u summed over every source in the slot, in rank order
+// (every rank the same bits), rounded to T: what `pull::reduce` gives a pull kernel.
+template <class C, typename T, int ngpus, typename Tiling>
+DINLINE void reduce(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, const Tiling& t,
+                    int u, typename traits<T>::V (&v)[kMaxRowPacks]) {
+  const int idx = s.to == To::all ? u : t.local(u);
+  const int n   = tiles::members(t, u);
   float acc[C::kVals] = {};
   for (int src = 0; src < ngpus; ++src) {
     float x[C::kVals];
-    impl::read(w, s, src, impl::group(idx), n, x);
+    impl::read(w, s, src, impl::group(t, idx), n, x);
 #pragma unroll
     for (int i = 0; i < C::kVals; ++i) acc[i] += x[i];
   }
   impl::packs_of<T>(acc, v);
 }
 
-// This thread's share of owned `row`'s result, encoded once, into every rank's slot, for
+// This thread's share of owned unit u's result, encoded once, into every rank's slot, for
 // every rank to gather after a peer_barrier.
-template <class C, typename T, int ngpus>
-DINLINE void share(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s,
-                   const tiles::Rows& rows, int row,
-                   const typename traits<T>::V (&v)[kMaxRowPacks]) {
+template <class C, typename T, int ngpus, typename Tiling>
+DINLINE void share(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, const Tiling& t,
+                   int u, const typename traits<T>::V (&v)[kMaxRowPacks]) {
   float x[C::kVals];
   impl::floats_of<T>(v, x);
-  const int idx = row - w.peers.rank * s.chunk;
-  impl::broadcast(w, s, impl::group(idx), tiles::members(rows, row), x);
+  impl::broadcast(w, s, impl::group(t, t.local(u)), tiles::members(t, u), x);
 }
 
-// After a peer_barrier: every owner's shared rows out of this rank's slot. A block takes
-// the local rows it shared. store(row, pack within the row, v).
-template <class C, typename T, int ngpus, typename Store>
-DINLINE void gather(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s,
-                    const tiles::Rows& rows, Store store) {
-  for (int lr = blockIdx.x; lr < s.chunk; lr += gridDim.x) {
+// After a peer_barrier: every owner's shared units out of this rank's slot; a thread
+// takes the local units it shared. store(unit, k, v).
+template <class C, typename T, int ngpus, typename Tiling, typename Store>
+DINLINE void gather(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, const Tiling& t,
+                    Store store) {
+  for (int l = t.first_local(); l < t.locals(); l = t.next_local(l)) {
     for (int src = 0; src < ngpus; ++src) {
-      const int row = src * s.chunk + lr;
-      if (row >= rows.rows) break;
-      const int n = tiles::members(rows, row);
+      const int u = t.unit(src, l);
+      const int n = tiles::members(t, u);
+      if (n == 0) continue;
       float x[C::kVals];
-      impl::read(w, s, src, impl::group(lr), n, x);
+      impl::read(w, s, src, impl::group(t, l), n, x);
       typename traits<T>::V v[kSumBatch];
       impl::packs_of<T>(x, v);
 #pragma unroll
       for (int k = 0; k < kSumBatch; ++k)
-        if (k < n) store(row, tiles::pack(k), v[k]);
+        if (k < n) store(u, k, v[k]);
     }
   }
 }

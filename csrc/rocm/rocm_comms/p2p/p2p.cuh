@@ -5,11 +5,12 @@
 // the whole of what a caller may use. Its parts (impl/) refuse to be included any other
 // way, and what they keep in `p2p::impl` is theirs.
 //
-// A kernel works in ROWS (tiles::Rows, utils.cuh): a block takes rows b, b + grid, ...,
-// a thread its packs t + k x blockDim of each, v[k]. A two-shot splits the rows among the
-// ranks (tiles::owned). `w` is the World `start` returns; T and the world size ride on
-// it. A SLOT is where a phase leaves data for a later one: made by `slot`, passed back,
-// never looked into; slots are laid end to end (`slot(w, rows, ..., previous_slot)`).
+// Every phase takes a TILING `t` (utils.cuh: tiles::Rows for a fused op's rows,
+// tiles::Buffer for a plain buffer) and a UNIT `u` of it, a thread's share v[k] at a time;
+// a kernel walks its units with t.first / t.end / t.next (a two-shot, its own: rank
+// argument). `w` is the World `start` returns; T and the world size ride on it. A SLOT is
+// where a phase leaves data for a later one: made by `slot`, passed back, never looked
+// into; slots are laid end to end (`slot(w, t, ..., previous_slot)`).
 //
 // p2p::                      every kernel
 //   start<T, ngpus>(p)             first; returns w once every peer has launched
@@ -20,20 +21,20 @@
 //   close(w)                       last, in a kernel whose peers read its input late
 //
 // p2p::pull::                a rank reads its peers
-//   reduce(w, rows, row, v)            this thread's share of a row, summed over ranks
-//   slot(w, rows[, prev])              this rank's rows of a two-shot, in its scratch
-//   share(w, slot, rows, row, v)       an owned row's result into the slot
-//   gather(w, slot, rows, store)       after a peer_barrier, every owner's shared rows
+//   reduce(w, t, u, v)                 this thread's share of a unit, summed over ranks
+//   slot(w, t[, prev])                 this rank's units of a two-shot, in its scratch
+//   share(w, slot, t, u, v)            an owned unit's result into the slot
+//   gather(w, slot, t, store)          after a peer_barrier, every owner's shared units
 //
 // p2p::push::                a rank writes into its peers' slots
-//   slot<kBits>(w, rows, To, [prev])   To::owners (two-shot) or To::all (one-shot);
+//   slot<kBits>(w, t, To, [prev])      To::owners (two-shot) or To::all (one-shot);
 //                                      kBits 16 (T itself), 8 or 4
-//   scatter(w, slot, rows)             this rank's input rows into the slot
-//   reduce(w, slot, rows, row, v)      after a peer_barrier, a row summed out of the slot
-//   share(w, slot, rows, row, v)       an owned row's result into every rank's slot
-//   gather(w, slot, rows, store)       after a peer_barrier, every owner's shared rows
+//   scatter(w, slot, t)                this rank's input units into the slot
+//   reduce(w, slot, t, u, v)           after a peer_barrier, a unit summed out of the slot
+//   share(w, slot, t, u, v)            an owned unit's result into every rank's slot
+//   gather(w, slot, t, store)          after a peer_barrier, every owner's shared units
 //
-//   store(row, pack within the row, v)
+//   store(u, k, v): pack k of this thread's share of unit u, at t.pos(u, k)
 //
 // p2p::host::                the host code (rocm_comms.cu)
 //   Group                          the one lifetime object: maps the peers' memory,

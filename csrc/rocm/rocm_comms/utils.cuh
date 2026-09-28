@@ -133,74 +133,109 @@ DINLINE float2 block_sum2(float a, float b) {
 constexpr int kMaxRowPacks = kSumBatch;
 
 // =================================================================================
-// ROWS, THE ONE WORK DISTRIBUTION. Block b takes rows b, b + grid, ...; thread t of a
-// block holds packs t + k x blockDim of a row, k < kMaxRowPacks. A fused op's rows are
-// its tokens; a plain buffer is cut into rows sized to the launch (`buffer_rows`), its
-// last row short. `size` is the packs that exist. A two-shot splits the rows into ranks:
-// rank r owns rows [r x chunk, r x chunk + chunk).
+// TILINGS: who handles which packs. Two kinds, one interface, so every p2p phase is
+// written once. A thread's share of a UNIT is packs k < kMaxRowPacks (one batched load
+// per peer, one push group). A two-shot gives every unit an OWNER rank; a rank's units
+// are its LOCAL units 0, 1, ... . A kernel walks its units with
+//   for (int u = t.first(rank); u < t.end(rank); u = t.next(u))   (a two-shot's own)
+//   for (int u = t.first(); u < t.end(); u = t.next(u))           (every unit)
+// and its locals likewise (first_local, locals, next_local). A LANE is a thread's place
+// among the threads that share a unit: a slot holds, per local unit, kMaxRowPacks x lanes.
+//
+// Rows (the fused ops): a unit is a token's row of `packs` packs; block b takes rows b,
+// b + grid, ...; thread t holds packs t + k x blockDim.
+// Buffer (the plain all-reduce): `slices` slices (1: one-shot; the world: two-shot), a
+// unit is one grid-wide pass over a slice: grid thread g holds packs g + (i x
+// kMaxRowPacks + k) x (grid x threads) of it, i the pass. Every thread does every pass,
+// so every thread moves the same bytes whatever the size.
 // =================================================================================
 namespace tiles {
 
 struct Rows {
-  int rows;
-  int packs;
-  int size;
+  int rows, packs, size, chunk, threads;
+
+  __host__ __device__ int units() const { return rows; }
+  __host__ __device__ int locals() const { return chunk; }
+  __host__ __device__ int lanes() const { return threads; }
+  DINLINE int first() const { return blockIdx.x; }
+  DINLINE int end() const { return rows; }
+  DINLINE int first(int owner) const { return owner * chunk + blockIdx.x; }
+  DINLINE int end(int owner) const {
+    return owner * chunk + chunk < rows ? owner * chunk + chunk : rows;
+  }
+  DINLINE int next(int u) const { return u + gridDim.x; }
+  DINLINE int first_local() const { return blockIdx.x; }
+  DINLINE int next_local(int l) const { return l + gridDim.x; }
+  DINLINE int owner(int u) const { return u / chunk; }
+  DINLINE int local(int u) const { return u - owner(u) * chunk; }
+  DINLINE int unit(int owner, int l) const { return owner * chunk + l; }
+  DINLINE int lane() const { return threadIdx.x; }
+  // Pack k of this thread's share, within the row, and in the whole [rows, packs].
+  DINLINE int pack(int k) const { return threadIdx.x + k * blockDim.x; }
+  DINLINE int pos(int u, int k) const { return u * packs + pack(k); }
+  DINLINE bool has(int u, int k) const { return u < rows && pack(k) < packs; }
 };
 
-__host__ __device__ inline Rows rows_of(int rows, int packs) {
-  return {rows, packs, rows * packs};
-}
+struct Buffer {
+  int size, slices, chunk, stride, iters;
 
-// A buffer of `size` packs at `grid` x `threads`: rows `threads` x u packs wide, u the
-// fewest packs a thread needs (at most kMaxRowPacks) for the grid to cover the buffer in
-// one pass, so a small buffer still spreads over every block.
-__host__ __device__ inline Rows buffer_rows(int64_t size, int grid, int threads) {
-  const int64_t pass = int64_t{grid} * threads;
-  int64_t u          = (size + pass - 1) / pass;
-  u                  = u < 1 ? 1 : (u > kMaxRowPacks ? kMaxRowPacks : u);
-  const int packs    = static_cast<int>(u) * threads;
-  return {static_cast<int>((size + packs - 1) / packs), packs, static_cast<int>(size)};
-}
-
-DINLINE Rows buffer_rows(int size) { return buffer_rows(size, gridDim.x, blockDim.x); }
-
-// The rows a rank owns in a two-shot.
-__host__ __device__ inline int chunk_of(const Rows& r, int world) {
-  return (r.rows + world - 1) / world;
-}
-
-struct Owned {
-  int begin;
-  int end;
+  __host__ __device__ int units() const { return slices * iters; }
+  __host__ __device__ int locals() const { return iters; }
+  __host__ __device__ int lanes() const { return stride; }
+  DINLINE int first() const { return 0; }
+  DINLINE int end() const { return slices * iters; }
+  DINLINE int first(int owner) const { return owner * iters; }
+  DINLINE int end(int owner) const { return owner * iters + iters; }
+  DINLINE int next(int u) const { return u + 1; }
+  DINLINE int first_local() const { return 0; }
+  DINLINE int next_local(int l) const { return l + 1; }
+  DINLINE int owner(int u) const { return u / iters; }
+  DINLINE int local(int u) const { return u - owner(u) * iters; }
+  DINLINE int unit(int owner, int l) const { return owner * iters + l; }
+  DINLINE int lane() const { return blockIdx.x * blockDim.x + threadIdx.x; }
+  DINLINE int in_slice(int u, int k) const {
+    return lane() + (local(u) * kMaxRowPacks + k) * stride;
+  }
+  DINLINE int pos(int u, int k) const { return owner(u) * chunk + in_slice(u, k); }
+  DINLINE bool has(int u, int k) const {
+    return in_slice(u, k) < chunk && pos(u, k) < size;
+  }
 };
 
-__host__ __device__ inline Owned owned(const Rows& r, int rank, int world) {
-  const int chunk = chunk_of(r, world);
-  const int begin = rank * chunk;
-  return {begin, begin + chunk < r.rows ? begin + chunk : r.rows};
+__host__ __device__ inline Rows rows(int rows, int packs, int world, int threads) {
+  return {rows, packs, rows * packs, (rows + world - 1) / world, threads};
 }
 
-// This thread's pack k of a row, within the row; whether it exists; how many do (the
-// ones that exist are a prefix of k).
-DINLINE int pack(int k) { return threadIdx.x + k * blockDim.x; }
-
-DINLINE bool has(const Rows& r, int row, int k) {
-  return pack(k) < r.packs && row * r.packs + pack(k) < r.size;
+__host__ __device__ inline Buffer buffer(int64_t size, int slices, int grid, int threads) {
+  const int chunk  = static_cast<int>((size + slices - 1) / slices);
+  const int stride = grid * threads;
+  const int pass   = stride * kMaxRowPacks;
+  return {static_cast<int>(size), slices, chunk, stride, (chunk + pass - 1) / pass};
 }
 
-DINLINE int members(const Rows& r, int row) {
+// The same, at this launch's grid and block.
+DINLINE Rows rows(int rows_, int packs, int world) {
+  return rows(rows_, packs, world, blockDim.x);
+}
+DINLINE Buffer buffer(int size, int slices) {
+  return buffer(size, slices, gridDim.x, blockDim.x);
+}
+
+// How many of this thread's packs of unit u exist (a prefix of k).
+template <typename Tiling>
+DINLINE int members(const Tiling& t, int u) {
   int n = 0;
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) n += has(r, row, k) ? 1 : 0;
+  for (int k = 0; k < kMaxRowPacks; ++k) n += t.has(u, k) ? 1 : 0;
   return n;
 }
 
-// This thread's share of `row` into `dst`, a [size]-pack buffer.
-template <typename V>
-DINLINE void store_row(V* dst, const Rows& r, int row, const V (&v)[kMaxRowPacks]) {
+// This thread's share of unit u into `dst`, a buffer laid out as the tiling's positions.
+template <typename Tiling, typename V>
+DINLINE void store(V* dst, const Tiling& t, int u, const V (&v)[kMaxRowPacks]) {
 #pragma unroll
   for (int k = 0; k < kMaxRowPacks; ++k)
-    if (has(r, row, k)) store_global(dst + row * r.packs + pack(k), v[k]);
+    if (t.has(u, k)) store_global(dst + t.pos(u, k), v[k]);
 }
 
 }  // namespace tiles

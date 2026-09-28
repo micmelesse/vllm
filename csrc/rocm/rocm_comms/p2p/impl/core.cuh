@@ -174,35 +174,35 @@ DINLINE void barrier(const Peers& p) {
   __syncthreads();
 }
 
-// kBatch input packs at once, idx + u * stride for u < kBatch (those at or past `limit`
-// are skipped), summed over ranks in fp32 and rounded once: every load from every peer is
-// issued before any is added, so kBatch x ngpus are in flight rather than ngpus.
-template <int kBatch, typename T, int ngpus>
-DINLINE void sum(const World<T, ngpus>& w, int64_t idx, int64_t stride, int64_t limit,
-                 typename traits<T>::V (&out)[kBatch]) {
+// This thread's share of unit u of a tiling, summed over every rank's input in fp32 and
+// rounded once to T: every load from every peer is issued before any is added, so
+// kMaxRowPacks x ngpus are in flight rather than ngpus.
+template <typename T, int ngpus, typename Tiling>
+DINLINE void sum(const World<T, ngpus>& w, const Tiling& t, int u,
+                 typename traits<T>::V (&out)[kMaxRowPacks]) {
   using V         = typename traits<T>::V;
   constexpr int N = traits<T>::N;
-  V raw[kBatch][ngpus];
+  V raw[kMaxRowPacks][ngpus];
 #pragma unroll
-  for (int u = 0; u < kBatch; ++u) {
-    const int64_t at = idx + u * stride;
-    if (at < limit) {
+  for (int k = 0; k < kMaxRowPacks; ++k) {
+    if (t.has(u, k)) {
+      const int64_t at = t.pos(u, k);
       check(w.peers, at < w.peers.input_packs, "sum", -1, at, w.peers.input_packs);
 #pragma unroll
-      for (int i = 0; i < ngpus; ++i) raw[u][i] = load_global(w.in[i] + at);
+      for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at);
     }
   }
 #pragma unroll
-  for (int u = 0; u < kBatch; ++u) {
+  for (int k = 0; k < kMaxRowPacks; ++k) {
     float acc[N];
 #pragma unroll
-    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[u][0].d[j]);
+    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[k][0].d[j]);
 #pragma unroll
     for (int i = 1; i < ngpus; ++i)
 #pragma unroll
-      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[u][i].d[j]);
+      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[k][i].d[j]);
 #pragma unroll
-    for (int j = 0; j < N; ++j) out[u].d[j] = static_cast<T>(acc[j]);
+    for (int j = 0; j < N; ++j) out[k].d[j] = static_cast<T>(acc[j]);
   }
 }
 

@@ -117,43 +117,47 @@ Launch launch_for(const Forced& f, Op op, int64_t rows, int64_t bytes) {
 }
 
 // The scratch a launch needs on each rank, in bytes: the slots its kernel lays out, from
-// the same rows the kernel works in (a buffer's cut to the launch; see tiles::Rows) and
-// the same slot sizes (p2p's pull_slot_packs / push_slot_packs). A residual or prefix
-// slot is always 16 bits.
-int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
-                     int world) {
-  const tiles::Rows tiling =
-      op_of(l.kernel) == Op::all_reduce
-          ? tiles::buffer_rows(flat, l.grid, l.threads)
-          : tiles::rows_of(static_cast<int>(rows), static_cast<int>(packs));
-  const int64_t chunk = tiles::chunk_of(tiling, world);
-  auto pull = [&](int n) { return n * p2p::pull_slot_packs(tiling, world) * 16; };
-  // `n` owner slots at the launch's bits and `plain` at 16; `all`: one slot of every
-  // row.
-  auto push = [&](int n, int plain) {
-    return (n * p2p::push_slot_packs(l.quant_bits, chunk, l.threads, world) +
-            plain * p2p::push_slot_packs(16, chunk, l.threads, world)) * 16;
-  };
-  const int64_t all =
-      p2p::push_slot_packs(l.quant_bits, tiling.rows, l.threads, world) * 16;
-  switch (l.kernel) {
+// the same tiling the kernel works in (tiles::Buffer for the plain all-reduce, one slice
+// for a one-shot and the world for a two-shot; tiles::Rows for a fused op) and the same
+// slot sizes (p2p's pull_slot_packs / push_slot_packs). A residual or prefix slot is
+// always 16 bits.
+template <typename Tiling>
+int64_t slots_need(Kernel k, const Tiling& t, int bits, int world) {
+  const int64_t pull  = p2p::pull_slot_packs(t);
+  const int64_t own   = p2p::push_slot_packs(bits, t.locals(), t.lanes(), world);
+  const int64_t own16 = p2p::push_slot_packs(16, t.locals(), t.lanes(), world);
+  const int64_t all   = p2p::push_slot_packs(bits, t.units(), t.lanes(), world);
+  switch (k) {
     case Kernel::two_shot_pull:
     case Kernel::two_shot_pull_rms_norm:
-    case Kernel::two_shot_pull_rms_norm_gemm_add: return pull(1);
+    case Kernel::two_shot_pull_rms_norm_gemm_add: return pull * 16;
     case Kernel::two_shot_pull_add_rms_norm:
-    case Kernel::two_shot_pull_add_attn_res_rms_norm: return pull(2);
+    case Kernel::two_shot_pull_add_attn_res_rms_norm: return 2 * pull * 16;
     case Kernel::one_shot_push:
     case Kernel::one_shot_push_rms_norm:
     case Kernel::one_shot_push_add_rms_norm:
     case Kernel::one_shot_push_add_attn_res_rms_norm:
-    case Kernel::one_shot_push_rms_norm_gemm_add: return all;
+    case Kernel::one_shot_push_rms_norm_gemm_add: return all * 16;
     case Kernel::two_shot_push:
     case Kernel::two_shot_push_rms_norm:
-    case Kernel::two_shot_push_rms_norm_gemm_add: return push(2, 0);
+    case Kernel::two_shot_push_rms_norm_gemm_add: return 2 * own * 16;
     case Kernel::two_shot_push_add_rms_norm:
-    case Kernel::two_shot_push_add_attn_res_rms_norm: return push(2, 1);
+    case Kernel::two_shot_push_add_attn_res_rms_norm: return (2 * own + own16) * 16;
     default: return 0;
   }
+}
+
+int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
+                     int world) {
+  if (op_of(l.kernel) == Op::all_reduce) {
+    const int slices = is_two_shot(l.kernel) ? world : 1;
+    return slots_need(l.kernel, tiles::buffer(flat, slices, l.grid, l.threads),
+                      l.quant_bits, world);
+  }
+  return slots_need(l.kernel,
+                    tiles::rows(static_cast<int>(rows), static_cast<int>(packs), world,
+                                l.threads),
+                    l.quant_bits, world);
 }
 
 // Whether `op` over [rows, hidden] of this element size runs a kernel here: something

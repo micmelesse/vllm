@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_attn_res_rms_norm;
   const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows_of(rows, packs);
+  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
@@ -38,7 +38,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                          : reinterpret_cast<V*>(blocks + row * block_stride_m +
                                                 write_idx * block_stride_r);
   };
-  const auto mine        = tiles::owned(tiling, p.rank, ngpus);
   const auto in          = p2p::push::slot<kBits>(w, tiling, p2p::To::owners);
   const auto out_slot    = p2p::push::slot<kBits>(w, tiling, p2p::To::owners, in);
   const auto pre_slot    = p2p::push::slot<16>(w, tiling, p2p::To::owners, out_slot);
@@ -47,7 +46,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   p2p::peer_barrier(w);
 
-  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+  for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
     V sum[kMaxRowPacks];
     p2p::push::reduce(w, in, tiling, row, sum);
     V mixed[kMaxRowPacks] = {}, shared_pre[kMaxRowPacks] = {};
@@ -63,12 +62,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   p2p::peer_barrier(w);
 
-  p2p::push::gather(w, out_slot, tiling, [&](int row, int i, const V& v) {
-    store_global(o + row * packs + i, v);
+  p2p::push::gather(w, out_slot, tiling, [&](int row, int k, const V& v) {
+    store_global(o + tiling.pos(row, k), v);
   });
-  p2p::push::gather(w, pre_slot, tiling, [&](int row, int i, const V& v) {
-    store_global(pre + row * packs + i, v);
-    if (V* dst = written(row)) store_global(dst + i, v);
+  p2p::push::gather(w, pre_slot, tiling, [&](int row, int k, const V& v) {
+    store_global(pre + tiling.pos(row, k), v);
+    if (V* dst = written(row)) store_global(dst + tiling.pack(k), v);
   });
 }
 

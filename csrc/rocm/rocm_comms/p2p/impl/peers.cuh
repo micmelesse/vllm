@@ -59,16 +59,17 @@ struct Peers {
 };
 
 // THE SLOT SIZES, in packs, which the host needs to size scratch and pull.cuh / push.cuh
-// lay out on the device (they must agree). A pull slot holds this rank's rows of a
-// two-shot, plain; a push slot holds, per source rank, a group per thread per row it
-// holds (`held`: every row for a one-shot, a rank's rows for a two-shot) at kbits (16: T
-// itself), then the scales of a scaled codec.
-inline int64_t pull_slot_packs(const tiles::Rows& rows, int world) {
-  return int64_t{tiles::chunk_of(rows, world)} * rows.packs;
+// lay out on the device (they must agree). A pull slot holds this rank's local units, a
+// thread's kSumBatch packs per lane, plain; a push slot holds, per source rank, a group
+// per lane per unit it holds (`held`: every unit for To::all, the local units for
+// To::owners) at kbits (16: T itself), then the scales of a scaled codec.
+template <typename Tiling>
+inline int64_t pull_slot_packs(const Tiling& t) {
+  return int64_t{t.locals()} * kSumBatch * t.lanes();
 }
 
-inline int64_t push_slot_packs(int kbits, int64_t held, int threads, int world) {
-  const int64_t groups  = held * threads;
+inline int64_t push_slot_packs(int kbits, int64_t held, int lanes, int world) {
+  const int64_t groups  = held * lanes;
   const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
   const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
   return int64_t{world} * (groups * payload + scales);

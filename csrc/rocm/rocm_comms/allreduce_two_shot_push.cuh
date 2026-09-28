@@ -20,8 +20,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_push(p2p::Peers p, T* __restrict__ out, int size) {
   using V           = typename traits<T>::V;
   const auto w      = p2p::start<T, ngpus>(p);
-  const auto tiling = tiles::buffer_rows(size);
-  const auto mine   = tiles::owned(tiling, p.rank, ngpus);
+  const auto tiling = tiles::buffer(size, ngpus);
   const auto in     = p2p::push::slot<kBits>(w, tiling, p2p::To::owners);
   const auto sum    = p2p::push::slot<kBits>(w, tiling, p2p::To::owners, in);
   V* dst            = reinterpret_cast<V*>(out);
@@ -30,16 +29,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   p2p::peer_barrier(w);
 
-  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+  for (int u = tiling.first(p.rank); u < tiling.end(p.rank); u = tiling.next(u)) {
     V v[kMaxRowPacks];
-    p2p::push::reduce(w, in, tiling, row, v);
-    p2p::push::share(w, sum, tiling, row, v);
+    p2p::push::reduce(w, in, tiling, u, v);
+    p2p::push::share(w, sum, tiling, u, v);
   }
 
   p2p::peer_barrier(w);
 
-  p2p::push::gather(w, sum, tiling, [&](int row, int i, const V& v) {
-    store_global(dst + row * tiling.packs + i, v);
+  p2p::push::gather(w, sum, tiling, [&](int u, int k, const V& v) {
+    store_global(dst + tiling.pos(u, k), v);
   });
 }
 

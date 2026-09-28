@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_attn_res_rms_norm;
   const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows_of(rows, packs);
+  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                          : reinterpret_cast<V*>(blocks + row * block_stride_m +
                                                 write_idx * block_stride_r);
   };
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+  for (int row = tiling.first(); row < tiling.end(); row = tiling.next(row)) {
     V sum[kMaxRowPacks];
     p2p::pull::reduce(w, tiling, row, sum);
     fusion::row<T, kPrefix>(

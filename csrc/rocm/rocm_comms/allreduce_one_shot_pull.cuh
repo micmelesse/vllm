@@ -17,12 +17,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
   using V           = typename traits<T>::V;
   const auto w      = p2p::start<T, ngpus>(p);
-  const auto tiling = tiles::buffer_rows(size);
+  const auto tiling = tiles::buffer(size, 1);
   V* dst            = reinterpret_cast<V*>(out);
-  for (int row = blockIdx.x; row < tiling.rows; row += gridDim.x) {
+  for (int u = tiling.first(); u < tiling.end(); u = tiling.next(u)) {
     V v[kMaxRowPacks];
-    p2p::pull::reduce(w, tiling, row, v);
-    tiles::store_row(dst, tiling, row, v);
+    p2p::pull::reduce(w, tiling, u, v);
+    tiles::store(dst, tiling, u, v);
   }
   p2p::close(w);
 }

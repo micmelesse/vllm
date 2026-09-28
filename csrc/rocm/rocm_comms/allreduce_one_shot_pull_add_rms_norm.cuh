@@ -28,13 +28,13 @@ DINLINE void one_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_rms_norm;
   const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows_of(rows, packs);
+  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+  for (int row = tiling.first(); row < tiling.end(); row = tiling.next(row)) {
     V sum[kMaxRowPacks];
     p2p::pull::reduce(w, tiling, row, sum);
     fusion::row<T, W, kAdd>(

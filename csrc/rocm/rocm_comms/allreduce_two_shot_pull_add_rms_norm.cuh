@@ -28,17 +28,16 @@ DINLINE void two_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_rms_norm;
   const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows_of(rows, packs);
+  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const auto mine        = tiles::owned(tiling, p.rank, ngpus);
   const auto out_slot    = p2p::pull::slot(w, tiling);
   const auto res_slot    = p2p::pull::slot(w, tiling, out_slot);
 
-  for (int row = mine.begin + blockIdx.x; row < mine.end; row += gridDim.x) {
+  for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
     V sum[kMaxRowPacks];
     p2p::pull::reduce(w, tiling, row, sum);
     V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
@@ -52,12 +51,12 @@ DINLINE void two_shot_pull_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
 
   p2p::peer_barrier(w);
 
-  p2p::pull::gather(w, out_slot, tiling, [&](int row, int i, const V& v) {
-    store_global(o + row * packs + i, v);
+  p2p::pull::gather(w, out_slot, tiling, [&](int row, int k, const V& v) {
+    store_global(o + tiling.pos(row, k), v);
   });
   if constexpr (kAdd)
-    p2p::pull::gather(w, res_slot, tiling, [&](int row, int i, const V& v) {
-      store_global(res_out + row * packs + i, v);
+    p2p::pull::gather(w, res_slot, tiling, [&](int row, int k, const V& v) {
+      store_global(res_out + tiling.pos(row, k), v);
     });
 }
 
