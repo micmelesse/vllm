@@ -38,6 +38,7 @@
 #include "rocm_comms/allreduce_one_shot_add_rms_norm.cuh"
 #include "rocm_comms/allreduce_one_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/allreduce_two_shot.cuh"
+#include "rocm_comms/allreduce_two_shot_quantized.cuh"
 #include "rocm_comms/allreduce_two_shot_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot_add_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot_rms_norm_gemm_add.cuh"
@@ -54,6 +55,11 @@ constexpr bool table_fits() {
     if (t.two_shot_blocks < 1 || t.two_shot_blocks > ipc::kMaxBlocks) return false;
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
+  }
+  for (int op = 0; op < static_cast<int>(sizeof(kGfx950) / sizeof(OpTuning)); ++op) {
+    const int b = kGfx950[op].quant_bits;
+    if (b != 0 && (op != static_cast<int>(Op::all_reduce) || (b != 8 && b != 4)))
+      return false;
   }
   const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
   return v == 1 || v == 2 || v == 4 || v == 8;
@@ -88,10 +94,16 @@ Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
 
 int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
-// The scratch a kernel needs on each rank, in bytes. `packs` is a row's, `flat` the whole
+// The scratch a launch needs on each rank, in bytes. `packs` is a row's, `flat` the whole
 // buffer's (plain all-reduce).
-int64_t scratch_need(Kernel k, int64_t rows, int64_t packs, int64_t flat, int world) {
-  switch (k) {
+int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
+                     int world) {
+  const int64_t grid_threads = int64_t{l.grid} * l.threads;
+  switch (l.kernel) {
+    case Kernel::two_shot_int8:
+      return quantized_scratch_bytes(8, flat, world, grid_threads);
+    case Kernel::two_shot_int4:
+      return quantized_scratch_bytes(4, flat, world, grid_threads);
     case Kernel::two_shot: return ceil_div(flat, world) * 16;
     case Kernel::two_shot_rms_norm: return ceil_div(rows, world) * packs * 16;
     case Kernel::two_shot_add_rms_norm:
@@ -114,7 +126,7 @@ bool admits(const Comms& comms, Op op, int64_t rows, int64_t hidden, int64_t ele
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
   if (l.kernel == Kernel::one_shot_rms_norm_gemm_add && rows > kGemmRows) return false;
-  return scratch_need(l.kernel, rows, packs, rows * packs, comms.group.world_size()) <=
+  return scratch_need(l, rows, packs, rows * packs, comms.group.world_size()) <=
          comms.group.scratch_bytes();
 }
 
@@ -158,7 +170,13 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
   const bool two     = is_two_shot(l.kernel);
 
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
-  if (two)                                                                               \
+  if (l.kernel == Kernel::two_shot_int8)                                                 \
+    allreduce_two_shot_quantized<T, NG, 8>                                               \
+        <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(p, out.data_ptr<T>(), n);         \
+  else if (l.kernel == Kernel::two_shot_int4)                                            \
+    allreduce_two_shot_quantized<T, NG, 4>                                               \
+        <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(p, out.data_ptr<T>(), n);         \
+  else if (two)                                                                          \
     allreduce_two_shot<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(             \
         p, out.data_ptr<T>(), n);                                                        \
   else                                                                                   \
@@ -500,7 +518,7 @@ void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks
     comms_of(comms).forced = {Kernel::none, 0, 0, 0};
     return;
   }
-  TORCH_CHECK(kernel <= static_cast<int64_t>(Kernel::two_shot_rms_norm_gemm_add),
+  TORCH_CHECK(kernel <= static_cast<int64_t>(Kernel::two_shot_int4),
               "hip_comms: no kernel ", kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::ipc::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::ipc::kMaxBlocks, "]");

@@ -1447,3 +1447,101 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
+
+
+# ---------------------------------------------------------------------------------
+# THE QUANTIZED TWO-SHOT: lossy by design, so judged by its error against the fp32 sum
+# rather than a tolerance per element, and by every rank holding the same bits (each
+# decodes the same bytes).
+# ---------------------------------------------------------------------------------
+
+# Relative RMS error, ||got - sum|| / ||sum||, over Gaussian inputs. Each value is
+# quantized twice (the input and the reduced slice); at one scale per 32 values the
+# expected error is ~0.007 for INT8 and ~0.12 for INT4.
+QUANTIZED_MAX_REL_RMSE = {"two_shot_int8": 0.02, "two_shot_int4": 0.25}
+# Kimi-K3's decode rows, a prefill chunk, and its largest prefill; 4 rows is fewer
+# than the ranks.
+QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 7168))
+
+
+def run_quantized_rank(
+    rank: int,
+    world: int,
+    kernel: Kernel,
+    shape: tuple[int, int],
+    dtype_name: str,
+    init_method: str,
+) -> tuple[float | None, int | None, str | None]:
+    """ONE rank: the forced quantized kernel over every rank's seeded input. Returns
+    `(rel_rmse, digest, err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
+    dtype = D_DTYPES[dtype_name]
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(
+        world_size=world, rank=rank, distributed_init_method=init_method
+    )
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, 1)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+    try:
+        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+        with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
+            mine = inputs[rank].to(device)
+            if not comm.should_allreduce(mine):
+                return None, None, NO_FUSED_KERNEL
+            got = comm.all_reduce(mine).cpu().to(torch.float32)
+        want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
+        rel = ((got - want).norm() / want.norm()).item()
+        digest = hash(got.numpy().tobytes())
+        return rel, digest, None
+    except Exception as e:
+        logger.exception("rank %d failed the quantized all_reduce", rank)
+        return None, None, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            if dist.is_initialized():
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception("rank %d: teardown failed", rank)
+
+
+@pytest.mark.parametrize("dtype_name", DTYPES)
+@pytest.mark.parametrize("shape", QUANTIZED_SHAPES)
+@pytest.mark.parametrize("kernel", tuple(QUANTIZED_MAX_REL_RMSE))
+def test_quantized_two_shot_is_close_and_identical_on_every_rank(
+    kernel: Kernel,
+    shape: tuple[int, int],
+    dtype_name: str,
+    world: int,
+    rendezvous: tuple[str, int],
+) -> None:
+    """Each quantized kernel, forced: its error against the fp32 sum under the bound,
+    and every rank's output the same bits."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    init = get_distributed_init_method(addr, port)
+    pool = Pool(processes=world)
+    try:
+        rets = [
+            pool.apply_async(
+                run_quantized_rank, (r, world, kernel, shape, dtype_name, init)
+            )
+            for r in range(world)
+        ]
+        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
+    finally:
+        pool.terminate()
+    where = f"{kernel} {shape} {dtype_name}"
+    if any(err == NO_FUSED_KERNEL for _, _, err in got):
+        pytest.skip(f"hip declines {where}")
+    bad = [err for _, _, err in got if err is not None]
+    assert not bad, f"{where}: " + "; ".join(bad)
+    rels = [rel for rel, _, _ in got]
+    print(f"      => {where}: rel_rmse {max(rels):.4g}", flush=True)
+    assert max(rels) <= QUANTIZED_MAX_REL_RMSE[kernel], f"{where}: rel_rmse {rels}"
+    assert len({d for _, d, _ in got}) == 1, f"{where}: ranks hold different outputs"

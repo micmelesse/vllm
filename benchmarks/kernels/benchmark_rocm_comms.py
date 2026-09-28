@@ -230,7 +230,12 @@ def _hip_cases(
         lanes_per_col = [0]
     sweep = len(blocks) * len(threads) * len(lanes_per_col) > 1
     if op == "all_reduce":
-        kernels: list[Kernel] = ["one_shot", "two_shot"]
+        kernels: list[Kernel] = [
+            "one_shot",
+            "two_shot",
+            "two_shot_int8",
+            "two_shot_int4",
+        ]
         run = lambda t: comm.all_reduce(t.x)  # noqa: E731
     else:
         fop = cast(FusedOp, op)

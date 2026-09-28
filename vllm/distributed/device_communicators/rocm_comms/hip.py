@@ -45,6 +45,8 @@ Kernel = Literal[
     "two_shot_add_attn_res_rms_norm",
     "one_shot_rms_norm_gemm_add",
     "two_shot_rms_norm_gemm_add",
+    "two_shot_int8",
+    "two_shot_int4",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i
@@ -64,9 +66,11 @@ _OP_WIRE: Mapping[FusedOp, int] = {
 class HipTunables:
     """Every arbitrary number this backend has. One default each until measured."""
 
-    # Two-shot's scratch, after the signal block. It holds one rank's slice, so it caps
-    # a two-shot buffer at `scratch_bytes` x ngpus (268 MB at 8 ranks).
-    scratch_bytes: int = 32 << 20
+    # Two-shot's scratch, after the signal block, per rank. It holds one rank's slice,
+    # so it caps a two-shot buffer at `scratch_bytes` x ngpus (1.07 GB at 8 ranks); the
+    # INT8 two-shot holds every rank's slice at half width, padded to whole grid
+    # strides (Kimi-K3's 4096 x 7168 bf16 prefill needs 74 MB at 36 blocks).
+    scratch_bytes: int = 128 << 20
     # Peer-pointer slots, one per captured launch: capture_sizes x layers. 8 MB, the
     # size vLLM gives the same array.
     max_buffers: int = 131072

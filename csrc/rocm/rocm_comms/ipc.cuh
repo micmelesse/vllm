@@ -100,7 +100,8 @@ class Peers {
 //   Comm c(p);             returns once every peer has launched: their inputs are ready
 //   c.sum(idx)             input pack idx summed over ranks, fp32, rounded once
 //   c.put(peer, idx, v)    into peer's scratch
-//   c.get(peer, idx)       from peer's scratch
+//   c.get(peer, idx)       from peer's scratch (put/get_float: a float, idx in floats)
+//   c.mine(idx)            this rank's own input pack
 //   c.ptr(peer, idx, n)    a direct pointer to n packs of it, checked once, for hot loops
 //   c.world_barrier()      every put before it, by any block of any rank, is visible to
 //                          every get after it
@@ -170,6 +171,27 @@ class Comm {
 #pragma unroll
       for (int j = 0; j < N; ++j) out[u].d[j] = static_cast<T>(acc[j]);
     }
+  }
+
+  // This rank's own input pack: the quantized two-shot encodes it before sending it.
+  DINLINE V mine(int64_t idx) const {
+    check(idx < p_.input_packs_, "mine", -1, idx, p_.input_packs_);
+    return load_global(in_[0] + idx);
+  }
+
+  // A float in peer's scratch, `idx` in floats: the quantized two-shot's scales.
+  DINLINE void put(int peer, int64_t idx, float v) const {
+    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "put", peer, idx,
+          4 * p_.scratch_packs_);
+    __scoped_atomic_store_n(reinterpret_cast<float*>(scratch_of(peer)) + idx, v,
+                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  }
+
+  DINLINE float get_float(int peer, int64_t idx) const {
+    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "get", peer, idx,
+          4 * p_.scratch_packs_);
+    return __scoped_atomic_load_n(reinterpret_cast<const float*>(scratch_of(peer)) + idx,
+                                  __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
 
   DINLINE void put(int peer, int64_t idx, const V& v) const {

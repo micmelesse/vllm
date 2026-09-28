@@ -434,4 +434,62 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   }
 }
 
+// ---------------------------------------------------------------------------------
+// The quantized two-shot's codec (QuickReduce's scheme): symmetric kBits integers with one
+// fp32 scale per group of kSumBatch packs, one thread's batch (32 values of a 2-byte T).
+// ---------------------------------------------------------------------------------
+
+template <typename T, int kBits>
+struct QuantCodec {
+  using V                    = typename traits<T>::V;
+  static constexpr int N     = traits<T>::N;
+  static constexpr int kVals = kSumBatch * N;
+  // The payload of one group, in 16-byte packs: 32 values x kBits.
+  static constexpr int kPayloadPacks = kVals * kBits / 8 / 16;
+  static constexpr int kMax          = (1 << (kBits - 1)) - 1;
+  static_assert(kBits == 8 || kBits == 4, "INT8 and INT4 are built");
+  static_assert(kVals * kBits % 128 == 0, "a group's payload fills whole packs");
+
+  // x -> payload; returns the scale, absmax / kMax (0 for an all-zero group).
+  static DINLINE float encode(const float (&x)[kVals], V (&payload)[kPayloadPacks]) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVals; ++i) amax = fmaxf(amax, fabsf(x[i]));
+    const float scale = amax / kMax;
+    const float inv   = amax > 0.0f ? kMax / amax : 0.0f;
+    unsigned char bytes[kPayloadPacks * 16];
+#pragma unroll
+    for (int i = 0; i < kVals; ++i) {
+      const int q = static_cast<int>(fminf(fmaxf(rintf(x[i] * inv), -kMax - 1.0f), kMax));
+      if constexpr (kBits == 8) {
+        bytes[i] = static_cast<unsigned char>(q & 0xFF);
+      } else if (i % 2 == 0) {
+        bytes[i / 2] = static_cast<unsigned char>(q & 0xF);
+      } else {
+        bytes[i / 2] |= static_cast<unsigned char>((q & 0xF) << 4);
+      }
+    }
+    __builtin_memcpy(payload, bytes, sizeof(bytes));
+    return scale;
+  }
+
+  // payload, scale -> x.
+  static DINLINE void decode(const V (&payload)[kPayloadPacks], float scale,
+                             float (&x)[kVals]) {
+    unsigned char bytes[kPayloadPacks * 16];
+    __builtin_memcpy(bytes, payload, sizeof(bytes));
+#pragma unroll
+    for (int i = 0; i < kVals; ++i) {
+      int q;
+      if constexpr (kBits == 8) {
+        q = static_cast<signed char>(bytes[i]);
+      } else {
+        const int nib = (bytes[i / 2] >> (4 * (i % 2))) & 0xF;
+        q             = nib >= 8 ? nib - 16 : nib;
+      }
+      x[i] = static_cast<float>(q) * scale;
+    }
+  }
+};
+
 }  // namespace hip_comms
