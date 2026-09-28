@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Two-shot all-reduce then RMSNorm (`allreduce_two_shot_pull_rms_norm`), and all-reduce then
-// add then RMSNorm (`allreduce_two_shot_pull_add_rms_norm`): one body, a kernel per op, so a
-// trace names the op that ran.
+// Two-shot pull all-reduce then RMSNorm (`allreduce_two_shot_pull_rms_norm`), and
+// all-reduce then add then RMSNorm (`allreduce_two_shot_pull_add_rms_norm`): one body, a
+// kernel per op, so a trace names the op that ran.
 
 #pragma once
 
@@ -26,11 +26,11 @@ namespace hip_comms {
 // still reach every barrier.
 // `weight` is in its own dtype W: T, or fp32 (see `add_rms_norm_row`).
 template <typename T, typename W, int ngpus, bool kAdd>
-DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
-                                     T* __restrict__ residual_out,
-                                     const T* __restrict__ residual,
-                                     const W* __restrict__ weight, float eps, int rows,
-                                     int packs) {
+DINLINE void two_shot_pull_add_rms_norm_body(ipc::Peers p, T* __restrict__ out,
+                                             T* __restrict__ residual_out,
+                                             const T* __restrict__ residual,
+                                             const W* __restrict__ weight, float eps,
+                                             int rows, int packs) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   ipc::Comm<T, ngpus> c(p);
@@ -47,10 +47,12 @@ DINLINE void two_shot_add_rms_norm(ipc::Peers p, T* __restrict__ out,
     const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
+      V sum[kMaxRowPacks];
+      c.sum_row(row * packs, packs, sum);
       add_rms_norm_row<T, W, kAdd>(
-          c, res_in, w, row, packs, inv_hidden, eps,
-          [&](int i, const V& v) { c.put(rank, half + local + i, v); },
-          [&](int i, const V& v) { c.put(rank, local + i, v); });
+          sum, res_in, w, row, packs, inv_hidden, eps,
+          [&](int, int i, const V& v) { c.put(rank, half + local + i, v); },
+          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
     }
   }
 
@@ -71,8 +73,8 @@ template <typename T, typename W, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_norm(
     ipc::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  two_shot_add_rms_norm<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps, rows,
-                                              packs);
+  two_shot_pull_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr, weight, eps,
+                                                      rows, packs);
 }
 
 template <typename T, typename W, int ngpus>
@@ -80,8 +82,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_add_rm
     ipc::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  two_shot_add_rms_norm<T, W, ngpus, true>(p, out, residual_out, residual, weight, eps,
-                                             rows, packs);
+  two_shot_pull_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual, weight,
+                                                     eps, rows, packs);
 }
 
 }  // namespace hip_comms

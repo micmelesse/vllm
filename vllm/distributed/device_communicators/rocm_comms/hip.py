@@ -41,13 +41,21 @@ Kernel = Literal[
     "two_shot_pull",
     "two_shot_push",
     "one_shot_pull_rms_norm",
+    "one_shot_push_rms_norm",
     "two_shot_pull_rms_norm",
+    "two_shot_push_rms_norm",
     "one_shot_pull_add_rms_norm",
+    "one_shot_push_add_rms_norm",
     "two_shot_pull_add_rms_norm",
+    "two_shot_push_add_rms_norm",
     "one_shot_pull_add_attn_res_rms_norm",
+    "one_shot_push_add_attn_res_rms_norm",
     "two_shot_pull_add_attn_res_rms_norm",
+    "two_shot_push_add_attn_res_rms_norm",
     "one_shot_pull_rms_norm_gemm_add",
+    "one_shot_push_rms_norm_gemm_add",
     "two_shot_pull_rms_norm_gemm_add",
+    "two_shot_push_rms_norm_gemm_add",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i

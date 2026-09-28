@@ -28,6 +28,7 @@ enum class Op : int {
 //   PULL: a rank reads its peers' buffers (inputs, or scratch they filled)
 //   PUSH: a rank writes into its peers' inboxes and reads only its own memory; the push
 //         kernels take a Codec, so they are the quantized ones
+// Each op has all four: one- and two-shot, pull and push.
 enum class Kernel : int {
   none                                = -1,
   one_shot_pull                       = 0,
@@ -35,13 +36,21 @@ enum class Kernel : int {
   two_shot_pull                       = 2,
   two_shot_push                       = 3,
   one_shot_pull_rms_norm              = 4,
-  two_shot_pull_rms_norm              = 5,
-  one_shot_pull_add_rms_norm          = 6,
-  two_shot_pull_add_rms_norm          = 7,
-  one_shot_pull_add_attn_res_rms_norm = 8,
-  two_shot_pull_add_attn_res_rms_norm = 9,
-  one_shot_pull_rms_norm_gemm_add     = 10,
-  two_shot_pull_rms_norm_gemm_add     = 11,
+  one_shot_push_rms_norm              = 5,
+  two_shot_pull_rms_norm              = 6,
+  two_shot_push_rms_norm              = 7,
+  one_shot_pull_add_rms_norm          = 8,
+  one_shot_push_add_rms_norm          = 9,
+  two_shot_pull_add_rms_norm          = 10,
+  two_shot_push_add_rms_norm          = 11,
+  one_shot_pull_add_attn_res_rms_norm = 12,
+  one_shot_push_add_attn_res_rms_norm = 13,
+  two_shot_pull_add_attn_res_rms_norm = 14,
+  two_shot_push_add_attn_res_rms_norm = 15,
+  one_shot_pull_rms_norm_gemm_add     = 16,
+  one_shot_push_rms_norm_gemm_add     = 17,
+  two_shot_pull_rms_norm_gemm_add     = 18,
+  two_shot_push_rms_norm_gemm_add     = 19,
 };
 
 // What each kernel is, in Kernel's order.
@@ -58,13 +67,21 @@ constexpr KernelInfo kKernels[] = {
     {Kernel::two_shot_pull, Op::all_reduce, true, false},
     {Kernel::two_shot_push, Op::all_reduce, true, true},
     {Kernel::one_shot_pull_rms_norm, Op::rms_norm, false, false},
+    {Kernel::one_shot_push_rms_norm, Op::rms_norm, false, true},
     {Kernel::two_shot_pull_rms_norm, Op::rms_norm, true, false},
+    {Kernel::two_shot_push_rms_norm, Op::rms_norm, true, true},
     {Kernel::one_shot_pull_add_rms_norm, Op::add_rms_norm, false, false},
+    {Kernel::one_shot_push_add_rms_norm, Op::add_rms_norm, false, true},
     {Kernel::two_shot_pull_add_rms_norm, Op::add_rms_norm, true, false},
+    {Kernel::two_shot_push_add_rms_norm, Op::add_rms_norm, true, true},
     {Kernel::one_shot_pull_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, false},
+    {Kernel::one_shot_push_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, true},
     {Kernel::two_shot_pull_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, false},
+    {Kernel::two_shot_push_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, true},
     {Kernel::one_shot_pull_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, false},
+    {Kernel::one_shot_push_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, true},
     {Kernel::two_shot_pull_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, false},
+    {Kernel::two_shot_push_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, true},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 
@@ -106,8 +123,8 @@ struct Launch {
 //   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks;
 //                        the GEMM tail wants one block per 16-column tile (56 at Kimi-K3)
 //   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
-//   one_shot_push,       each shot's direction: the push kernel over the pull one (only
-//   two_shot_push        where the op has one)
+//   one_shot_push,       each shot's direction: the push kernel over the pull one
+//   two_shot_push
 //   quant_bits           a push kernel's codec: 16 (T itself), 8 or 4; the lossy two stay
 //                        off until the model's accuracy is checked with them
 struct OpTuning {

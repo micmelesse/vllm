@@ -83,9 +83,11 @@ DINLINE float block_sum(float v) {
   return total;
 }
 
-// How many 16-byte packs of one row a thread holds in registers. A row wider than
-// kMaxRowPacks x blockDim is refused by the host.
-constexpr int kMaxRowPacks = 4;
+// How many 16-byte packs of one row a thread holds in registers: packs threadIdx.x +
+// k * blockDim.x, k < kMaxRowPacks. A row wider than kMaxRowPacks x blockDim is refused by
+// the host. The same as kSumBatch, so a thread's share of a row is one batched `sum` and
+// one push GROUP (ipc::Groups::row).
+constexpr int kMaxRowPacks = kSumBatch;
 
 // ONE ROW of all-reduce, then (kAdd) add, then RMSNorm by the whole block, matching vLLM's
 // reference ops (`vllm/ir/ops/layernorm.py`) rounding for rounding:
@@ -102,12 +104,14 @@ constexpr int kMaxRowPacks = 4;
 // The variance is taken from `s` before any further rounding, and `s` stays in registers
 // between the two passes, so nothing is read back.
 //
-// `c` is the kernel's `ipc::Comm` (the sum comes from its `sum`); the results leave
-// through `store_res(i, v)` and `store_out(i, v)`, i the pack within the row, so a kernel
-// can land them in its output or in scratch through `put`.
-template <typename T, typename W, bool kAdd, typename C, typename StoreRes,
-          typename StoreOut>
-DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
+// DIRECTION-FREE: `sum` is this thread's share of the row already reduced over ranks and
+// rounded to T (pulled by `Comm::sum_row`, or out of a push kernel's inbox), sum[k] the
+// pack threadIdx.x + k * blockDim.x. The results leave through `store_res(k, i, v)` and
+// `store_out(k, i, v)`, i the pack within the row, so a kernel can land them in its
+// output, in scratch, or in registers to push.
+template <typename T, typename W, bool kAdd, typename StoreRes, typename StoreOut>
+DINLINE void add_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+                              const typename traits<T>::V* residual,
                               const vec<W, traits<T>::N>* weight, int row, int packs,
                               float inv_hidden, float eps, StoreRes store_res,
                               StoreOut store_out) {
@@ -120,9 +124,8 @@ DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
   for (int k = 0; k < kMaxRowPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
-    const V sum = c.sum(base + i);
 #pragma unroll
-    for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(sum.d[j]);
+    for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(sum[k].d[j]);
     if constexpr (kAdd) {
       const V r = residual[base + i];
       V rounded;
@@ -131,7 +134,7 @@ DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
         s[k][j] += static_cast<float>(r.d[j]);
         rounded.d[j] = static_cast<T>(s[k][j]);
       }
-      store_res(i, rounded);
+      store_res(k, i, rounded);
     }
 #pragma unroll
     for (int j = 0; j < NL; ++j) acc += s[k][j] * s[k][j];
@@ -149,7 +152,7 @@ DINLINE void add_rms_norm_row(const C& c, const typename traits<T>::V* residual,
       const float xw = static_cast<float>(static_cast<W>(x * static_cast<float>(w.d[j])));
       o.d[j]         = static_cast<T>(xw);
     }
-    store_out(i, o);
+    store_out(k, i, o);
   }
   // Before the next row reuses `block_sum`'s shared slots.
   __syncthreads();
@@ -199,18 +202,19 @@ DINLINE float2 block_sum2(float a, float b) {
 //
 // The prefix and the mix stay in registers across the sources, so only the stored blocks
 // are read back. The sums run in a different order than Triton's, so a result agrees to
-// the rounding of the last few bits, not bitwise. `c` is the kernel's `ipc::Comm`; the
-// new prefix leaves through `store_prefix(i, v)` and the output through `store_out(i,
-// v)`, i the pack within the row, so a kernel lands them in place or in scratch.
-template <typename T, bool kPrefix, typename C, typename StorePrefix, typename StoreOut>
-DINLINE void add_attn_res_rms_norm_row(const C& c,
-                          const typename traits<T>::V* prefix, const T* blocks,
-                          int64_t block_stride_r,
-                          const typename traits<T>::V* norm_w,
-                          const typename traits<T>::V* qk_w,
-                          const typename traits<T>::V* out_norm_w, int num_blocks, int row,
-                          int packs, float inv_hidden, float eps, float out_eps,
-                          StorePrefix store_prefix, StoreOut store_out) {
+// the rounding of the last few bits, not bitwise. Direction-free as `add_rms_norm_row`:
+// `sum` is this thread's share of the reduced row, the new prefix leaves through
+// `store_prefix(k, i, v)` and the output through `store_out(k, i, v)`.
+template <typename T, bool kPrefix, typename StorePrefix, typename StoreOut>
+DINLINE void add_attn_res_rms_norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+                                       const typename traits<T>::V* prefix,
+                                       const T* blocks, int64_t block_stride_r,
+                                       const typename traits<T>::V* norm_w,
+                                       const typename traits<T>::V* qk_w,
+                                       const typename traits<T>::V* out_norm_w,
+                                       int num_blocks, int row, int packs,
+                                       float inv_hidden, float eps, float out_eps,
+                                       StorePrefix store_prefix, StoreOut store_out) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
@@ -219,22 +223,21 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
   for (int k = 0; k < kMaxRowPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
-    const V sum = c.sum(base + i);
     V rounded;
     if constexpr (kPrefix) {
       const V p = prefix[base + i];
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         rounded.d[j] = static_cast<T>(static_cast<float>(p.d[j]) +
-                                      static_cast<float>(sum.d[j]));
+                                      static_cast<float>(sum[k].d[j]));
         u[k][j]      = static_cast<float>(rounded.d[j]);
       }
     } else {
-      rounded = sum;
+      rounded = sum[k];
 #pragma unroll
-      for (int j = 0; j < NL; ++j) u[k][j] = static_cast<float>(sum.d[j]);
+      for (int j = 0; j < NL; ++j) u[k][j] = static_cast<float>(sum[k].d[j]);
     }
-    store_prefix(i, rounded);
+    store_prefix(k, i, rounded);
   }
 
   float m[kMaxRowPacks][NL];
@@ -329,7 +332,7 @@ DINLINE void add_attn_res_rms_norm_row(const C& c,
 #pragma unroll
       for (int j = 0; j < NL; ++j) o.d[j] = static_cast<T>(m[k][j]);
     }
-    store_out(i, o);
+    store_out(k, i, o);
   }
   // Before the next row reuses the reductions' shared slots.
   __syncthreads();
@@ -434,9 +437,31 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
   }
 }
 
+// A group's kSumBatch packs as floats and back, rounding to T: what a push kernel reduces
+// and encodes in, against the packs a row helper takes.
+template <typename T>
+DINLINE void floats_of(const typename traits<T>::V (&v)[kSumBatch],
+                       float (&x)[kSumBatch * traits<T>::N]) {
+  constexpr int N = traits<T>::N;
+#pragma unroll
+  for (int u = 0; u < kSumBatch; ++u)
+#pragma unroll
+    for (int j = 0; j < N; ++j) x[u * N + j] = static_cast<float>(v[u].d[j]);
+}
+
+template <typename T>
+DINLINE void packs_of(const float (&x)[kSumBatch * traits<T>::N],
+                      typename traits<T>::V (&v)[kSumBatch]) {
+  constexpr int N = traits<T>::N;
+#pragma unroll
+  for (int u = 0; u < kSumBatch; ++u)
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[u].d[j] = static_cast<T>(x[u * N + j]);
+}
+
 // ---------------------------------------------------------------------------------
-// THE PUSH KERNELS' CODEC: what a group of kSumBatch packs (one thread's batch, 32 values of
-// a 2-byte T) looks like on the wire. kBits 16 is T itself (no scale); 8 and 4 are
+// THE PUSH KERNELS' CODEC: what a group of kSumBatch packs (one thread's batch, 32 values
+// of a 2-byte T) looks like on the wire. kBits 16 is T itself (no scale); 8 and 4 are
 // QuickReduce's symmetric integers with one fp32 scale per group.
 // ---------------------------------------------------------------------------------
 

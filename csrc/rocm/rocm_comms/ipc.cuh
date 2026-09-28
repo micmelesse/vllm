@@ -94,56 +94,78 @@ class Peers {
 
 // =================================================================================
 // THE PUSH KERNELS' UNITS. A GROUP is one thread's kSumBatch packs of a span, positions
-// tid + (j * kSumBatch + u) * stride, and it crosses a link as one Codec payload (and one
-// scale). Every phase of a push kernel gives a thread the same groups, so the
-// same-numbered peer blocks are all a phase waits for.
+// lane + (j * kSumBatch + u) * stride, and it crosses a link as one Codec payload (and
+// one scale). Every phase of a push kernel gives a thread the same groups, so the
+// same-numbered peer blocks are all a phase waits for. Members that exist are a prefix
+// (u < members), and only the payload covering them is sent.
 // =================================================================================
 
 struct Groups {
-  int span, tid, stride, iters;
-  DINLINE explicit Groups(int span)
+  int span, lane, stride, first, iters;
+  DINLINE Groups(int span, int lane, int stride, int first)
       : span(span),
-        tid(blockIdx.x * blockDim.x + threadIdx.x),
-        stride(gridDim.x * blockDim.x),
+        lane(lane),
+        stride(stride),
+        first(first),
         iters((span + stride * kSumBatch - 1) / (stride * kSumBatch)) {}
-  // Every thread's groups: j * stride + tid for j < iters.
+  // Grid-strided over a flat span: the flat kernels.
+  static DINLINE Groups flat(int span) {
+    return Groups(span, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x, 0);
+  }
+  // This thread's share of one row, the packs a row helper holds (one group, j = 0), as
+  // group local_row x blockDim + threadIdx of an inbox.
+  static DINLINE Groups row(int packs, int local_row) {
+    return Groups(packs, threadIdx.x, blockDim.x, local_row * blockDim.x);
+  }
+  // A flat span's groups, for its inbox.
   DINLINE int count() const { return iters * stride; }
-  DINLINE int id(int j) const { return j * stride + tid; }
+  DINLINE int id(int j) const { return first + j * stride + lane; }
   // Member u of group j, as a position within the span.
-  DINLINE int at(int j, int u) const { return tid + (j * kSumBatch + u) * stride; }
+  DINLINE int at(int j, int u) const { return lane + (j * kSumBatch + u) * stride; }
   // Whether it exists: inside the span, and `base + at` inside the buffer's `end`.
   DINLINE bool has(int j, int u, int base, int end) const {
     const int k = at(j, u);
     return k < span && base + k < end;
   }
+  DINLINE int members(int j, int base, int end) const {
+    int n = 0;
+#pragma unroll
+    for (int u = 0; u < kSumBatch; ++u) n += has(j, u, base, end) ? 1 : 0;
+    return n;
+  }
 };
 
-// A rank's INBOXES: kRegions regions, each a slot per source rank; a slot holds every
-// group's payload, then (a scaled codec) every group's scale. Indices in packs (payload)
-// and floats (scale) of the scratch.
+// INBOXES of one codec: `regions` regions, each a slot per source rank; a slot holds
+// every group's payload, then (a scaled codec) every group's scale. They start at pack
+// `base` of the scratch, so a kernel lays several end to end (`end`), each with its own
+// codec. Indices in packs (payload) and floats (scale).
 template <class C, int ngpus>
 struct Inbox {
-  int groups, slot;
-  DINLINE explicit Inbox(int groups)
+  int groups, regions, base, slot;
+  DINLINE Inbox(int groups, int regions = 1, int base = 0)
       : groups(groups),
+        regions(regions),
+        base(base),
         slot(groups * C::kPayloadPacks + (C::kScaled ? (groups + 3) / 4 : 0)) {}
   DINLINE int payload(int region, int src, int g) const {
-    return (region * ngpus + src) * slot + g * C::kPayloadPacks;
+    return base + (region * ngpus + src) * slot + g * C::kPayloadPacks;
   }
   DINLINE int scale(int region, int src, int g) const {
-    return 4 * ((region * ngpus + src) * slot + groups * C::kPayloadPacks) + g;
+    return 4 * (base + (region * ngpus + src) * slot + groups * C::kPayloadPacks) + g;
   }
+  DINLINE int end() const { return base + regions * ngpus * slot; }
 };
 
-// The scratch the inboxes need on each rank, in bytes: `regions` regions over a span of
-// `span` packs, at kbits (16: T itself) and a grid of `grid_threads` threads.
-inline int64_t inbox_bytes(int kbits, int regions, int world, int64_t span,
-                           int64_t grid_threads) {
-  const int64_t groups =
-      (span + grid_threads * kSumBatch - 1) / (grid_threads * kSumBatch) * grid_threads;
+// The host's side of the same layout, in packs: a flat span's groups at a grid of
+// `grid_threads`, and the packs of an Inbox of `groups` groups at kbits (16: T itself).
+inline int64_t flat_groups(int64_t span, int64_t grid_threads) {
+  return (span + grid_threads * kSumBatch - 1) / (grid_threads * kSumBatch) * grid_threads;
+}
+
+inline int64_t inbox_packs(int kbits, int regions, int world, int64_t groups) {
   const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
   const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
-  return int64_t{regions} * world * (groups * payload + scales) * 16;
+  return int64_t{regions} * world * (groups * payload + scales);
 }
 
 // =================================================================================
@@ -160,6 +182,7 @@ inline int64_t inbox_bytes(int kbits, int regions, int world, int64_t span,
 //                          every get after it
 //   c.peer_block_barrier() the same between this block and its same-numbered peers only
 //   c.reduce_flat          a flat range summed over ranks, batched, handed to a store
+//   c.sum_row              this thread's share of a row summed over ranks, batched
 //   c.gather_flat/_rows    after a peer_block_barrier, read back what those peers put
 //   c.grid_barrier()       the same for the blocks of this rank and its own scratch
 //   c.block_barrier()      the threads of this block
@@ -169,8 +192,16 @@ inline int64_t inbox_bytes(int kbits, int regions, int world, int64_t span,
 // PUSH, the other direction: a push kernel reads only its own input and its own scratch,
 // and what crosses a link is a store into a peer's inbox (see Groups and Inbox above).
 //   c.mine_group<C>        this rank's input over one group, as floats
-//   c.push<C>(peer, ...)   an encoded group into peer's inbox, in this rank's slot
-//   c.read_inbox<C>        a group from this rank's own inbox, decoded
+//   c.send<C>(peer, ...)   a group encoded into peer's inbox, in this rank's slot
+//   c.broadcast<C>         the same, encoded once, into every rank's inbox (this one's too)
+//   c.read_inbox<C>        a group of one source from this rank's own inbox, decoded
+//   c.reduce_inbox<C>      a group summed over every source, in rank order
+// and their row shapes, the fused push kernels' phases:
+//   c.broadcast_rows<C>    one-shot phase 1: every input row into every rank's inbox
+//   c.scatter_rows<C>      two-shot phase 1: each input row into its owner's inbox
+//   c.reduce_row<C>        a row's share reduced out of the inbox (push's `sum_row`)
+//   c.broadcast_row<C>     two-shot phase 2: an owned row's result into every inbox
+//   c.gather_inbox_rows<C> two-shot phase 3: every owner's rows out of this inbox
 //
 // A wait that outlives the timeout prints where it was and traps, so a hang is an error.
 // Checked (the tests), every index is bounds-checked and every wait is skewed by a
@@ -324,6 +355,12 @@ class Comm {
     }
   }
 
+  // This thread's share of row pack range [base, base + packs), summed over ranks: v[k]
+  // is pack threadIdx.x + k * blockDim.x, every peer's load issued before any is added.
+  DINLINE void sum_row(int base, int packs, V (&v)[kMaxRowPacks]) const {
+    sum<kMaxRowPacks>(base + threadIdx.x, blockDim.x, base + packs, v);
+  }
+
   // THE PUSH HELPERS. mine_group: this rank's input over group j of `grp`, the span
   // starting at pack `base`; members past `end` read as zero.
   template <class C>
@@ -339,33 +376,134 @@ class Comm {
         v[u] = load_global(in_[0] + at);
       }
     }
-#pragma unroll
-    for (int u = 0; u < kSumBatch; ++u)
-#pragma unroll
-      for (int k = 0; k < C::N; ++k) x[u * C::N + k] = static_cast<float>(v[u].d[k]);
+    floats_of<T>(v, x);
   }
 
-  // An encoded group into `peer`'s inbox: region, this rank's slot, group g.
+  // Group g encoded into `peer`'s inbox (region, this rank's slot), its first n members.
   template <class C>
-  DINLINE void push(int peer, const Inbox<C, ngpus>& box, int region, int g,
-                    const V (&q)[C::kPayloadPacks], float scale) const {
-    const int at = box.payload(region, rank(), g);
-#pragma unroll
-    for (int w = 0; w < C::kPayloadPacks; ++w) put(peer, at + w, q[w]);
-    if constexpr (C::kScaled) put_float(peer, box.scale(region, rank(), g), scale);
+  DINLINE void send(int peer, const Inbox<C, ngpus>& box, int region, int g, int n,
+                    const float (&x)[C::kVals]) const {
+    V q[C::kPayloadPacks];
+    const float s = C::encode(x, q);
+    push<C>(peer, box, region, g, n, q, s);
   }
 
-  // Group g of `src`'s slot in this rank's own inbox, decoded.
+  // The same into every rank's inbox, encoded once.
   template <class C>
-  DINLINE void read_inbox(const Inbox<C, ngpus>& box, int region, int src, int g,
+  DINLINE void broadcast(const Inbox<C, ngpus>& box, int region, int g, int n,
+                         const float (&x)[C::kVals]) const {
+    V q[C::kPayloadPacks];
+    const float s = C::encode(x, q);
+#pragma unroll
+    for (int d = 0; d < ngpus; ++d) push<C>(d, box, region, g, n, q, s);
+  }
+
+  // Group g of `src`'s slot in this rank's own inbox, its first n members, decoded (the
+  // rest are garbage and never used).
+  template <class C>
+  DINLINE void read_inbox(const Inbox<C, ngpus>& box, int region, int src, int g, int n,
                           float (&x)[C::kVals]) const {
     V q[C::kPayloadPacks];
-    const int at = box.payload(region, src, g);
+    const int at   = box.payload(region, src, g);
+    const int sent = payload_packs<C>(n);
 #pragma unroll
-    for (int w = 0; w < C::kPayloadPacks; ++w) q[w] = get(rank(), at + w);
+    for (int w = 0; w < C::kPayloadPacks; ++w) q[w] = w < sent ? get(rank(), at + w) : V{};
     float scale = 1.0f;
-    if constexpr (C::kScaled) scale = get_float(rank(), box.scale(region, src, g));
+    if constexpr (C::kScaled)
+      if (n > 0) scale = get_float(rank(), box.scale(region, src, g));
     C::decode(q, scale, x);
+  }
+
+  // Group g summed over every source's slot, in rank order: every rank that reduces the
+  // same group gets the same float bits.
+  template <class C>
+  DINLINE void reduce_inbox(const Inbox<C, ngpus>& box, int region, int g, int n,
+                            float (&acc)[C::kVals]) const {
+#pragma unroll
+    for (int i = 0; i < C::kVals; ++i) acc[i] = 0.0f;
+    for (int src = 0; src < ngpus; ++src) {
+      float x[C::kVals];
+      read_inbox<C>(box, region, src, g, n, x);
+#pragma unroll
+      for (int i = 0; i < C::kVals; ++i) acc[i] += x[i];
+    }
+  }
+
+  // THE ROW SHAPES OF PUSH. A row is one group per thread (Groups::row), group
+  // row x blockDim + threadIdx of an inbox of rows x blockDim groups; a block takes rows
+  // blockIdx.x, + gridDim.x, ... in every phase, so a peer_block_barrier covers them. The
+  // two-shot rows are local: rank r owns rows [r x chunk, r x chunk + chunk).
+
+  // One-shot phase 1: every row of this rank's input into every rank's inbox.
+  template <class C>
+  DINLINE void broadcast_rows(const Inbox<C, ngpus>& box, int rows, int packs) const {
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+      const auto grp = Groups::row(packs, row);
+      float x[C::kVals];
+      mine_group<C>(grp, 0, row * packs, (row + 1) * packs, x);
+      broadcast<C>(box, 0, grp.id(0), grp.members(0, 0, packs), x);
+    }
+  }
+
+  // Two-shot phase 1: each row of this rank's input into its owner's inbox, at its local
+  // row.
+  template <class C>
+  DINLINE void scatter_rows(const Inbox<C, ngpus>& box, int chunk, int rows,
+                            int packs) const {
+    for (int lr = blockIdx.x; lr < chunk; lr += gridDim.x) {
+      const auto grp = Groups::row(packs, lr);
+      for (int d = 0; d < ngpus; ++d) {
+        const int row = d * chunk + lr;
+        if (row >= rows) break;
+        float x[C::kVals];
+        mine_group<C>(grp, 0, row * packs, (row + 1) * packs, x);
+        send<C>(d, box, 0, grp.id(0), grp.members(0, 0, packs), x);
+      }
+    }
+  }
+
+  // Row `row` of the inbox (local, in a two-shot) summed over every source and rounded
+  // to T: what `sum_row` gives a pull kernel.
+  template <class C>
+  DINLINE void reduce_row(const Inbox<C, ngpus>& box, int row, int packs,
+                          V (&sum)[kMaxRowPacks]) const {
+    const auto grp = Groups::row(packs, row);
+    float acc[C::kVals];
+    reduce_inbox<C>(box, 0, grp.id(0), grp.members(0, 0, packs), acc);
+    packs_of<T>(acc, sum);
+  }
+
+  // Two-shot phase 2: this thread's share of owned local row `row`'s result, v[k] the
+  // pack threadIdx.x + k * blockDim.x, into every rank's inbox.
+  template <class C>
+  DINLINE void broadcast_row(const Inbox<C, ngpus>& box, int row, int packs,
+                             const V (&v)[kMaxRowPacks]) const {
+    const auto grp = Groups::row(packs, row);
+    float x[C::kVals];
+    floats_of<T>(v, x);
+    broadcast<C>(box, 0, grp.id(0), grp.members(0, 0, packs), x);
+  }
+
+  // Two-shot phase 3: every owner's rows out of this rank's inbox. store(row, i, v), i the
+  // pack within the row.
+  template <class C, typename Store>
+  DINLINE void gather_inbox_rows(const Inbox<C, ngpus>& box, int chunk, int rows,
+                                 int packs, Store store) const {
+    for (int lr = blockIdx.x; lr < chunk; lr += gridDim.x) {
+      const auto grp = Groups::row(packs, lr);
+      const int n    = grp.members(0, 0, packs);
+      for (int src = 0; src < ngpus; ++src) {
+        const int row = src * chunk + lr;
+        if (row >= rows) break;
+        float x[C::kVals];
+        read_inbox<C>(box, 0, src, grp.id(0), n, x);
+        V v[kSumBatch];
+        packs_of<T>(x, v);
+#pragma unroll
+        for (int u = 0; u < kSumBatch; ++u)
+          if (u < n) store(row, grp.at(0, u), v[u]);
+      }
+    }
   }
 
   // This block and the same-numbered block on every peer, and no other block: one peer
@@ -386,12 +524,14 @@ class Comm {
  private:
   // The grid on this device, then (kPeers) one exchange with the peers by the last block
   // to arrive, then the grid released. ONE FENCE PER BLOCK, by thread 0 after the block
-  // barrier: the barrier waits for every wave's stores, and a release writes back the whole
-  // L2, so one covers the block where one per thread wrote it back 512 times.
+  // barrier: every wave first waits for its own stores (`wait_stores`), and a release
+  // writes back the whole L2, so one covers the block where one per thread wrote it back
+  // 512 times.
   template <bool kPeers>
   DINLINE void barrier() {
     constexpr int kScope = kPeers ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
     skew();
+    wait_stores();
     __syncthreads();
     if (threadIdx.x == 0) {
       fence<__ATOMIC_RELEASE, kScope>();
@@ -421,6 +561,13 @@ class Comm {
     __syncthreads();
   }
 
+  // EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
+  // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
+  // ISA), so the releasing wave's fence would cover only its own stores, and another
+  // wave's could still be in flight when the flag lands -- a push kernel's remote stores
+  // above all.
+  static DINLINE void wait_stores() { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); }
+
   // The builtin takes the ordering as a literal, so each case is spelled out.
   template <int kOrder, int kScope>
   DINLINE void fence() const {
@@ -432,6 +579,24 @@ class Comm {
       if constexpr (system) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
       else __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
+  }
+
+  // The payload packs that cover a group's first n members.
+  template <class C>
+  static DINLINE int payload_packs(int n) {
+    return (n * C::kPayloadPacks + kSumBatch - 1) / kSumBatch;
+  }
+
+  template <class C>
+  DINLINE void push(int peer, const Inbox<C, ngpus>& box, int region, int g, int n,
+                    const V (&q)[C::kPayloadPacks], float scale) const {
+    if (n == 0) return;
+    const int at   = box.payload(region, rank(), g);
+    const int sent = payload_packs<C>(n);
+#pragma unroll
+    for (int w = 0; w < C::kPayloadPacks; ++w)
+      if (w < sent) put(peer, at + w, q[w]);
+    if constexpr (C::kScaled) put_float(peer, box.scale(region, rank(), g), scale);
   }
 
   // A float in peer's scratch, `idx` in floats: a scaled codec's scales.
@@ -470,7 +635,10 @@ class Comm {
   // (start: every peer has launched; close: every peer is done reading us).
   template <bool kOrdered>
   DINLINE void pair_blocks(bool start) const {
-    if (!start) __syncthreads();
+    if (!start) {
+      if constexpr (kOrdered) wait_stores();
+      __syncthreads();
+    }
     Signal* self     = p_.self_;
     const uint32_t f = self->seq[blockIdx.x] + 1;
     if (threadIdx.x < ngpus) {

@@ -178,17 +178,13 @@ DISABLED = {
 
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
-# hip as C++ picks, and each all_reduce kernel forced (both shots, pulled and pushed; a
-# push kernel unquantized here); the other backends have one kernel each. A SHOT names a
-# fused kernel of the op under test, `f"{shot}_{op}"`: every fused kernel pulls.
-ALL_REDUCE_KERNELS: tuple[Kernel, ...] = (
-    "one_shot_pull",
-    "one_shot_push",
-    "two_shot_pull",
-    "two_shot_push",
-)
-Shot = Literal["one_shot_pull", "two_shot_pull"]
+# hip as C++ picks, and each all_reduce kernel forced; the other backends have one
+# kernel each. A SHOT is a shot and a direction, and names every op's kernel,
+# `f"{shot}_{op}"` (the plain all_reduce's is the shot itself); a push kernel runs
+# unquantized here.
+Shot = Literal["one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
+ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
 BACKEND_KERNELS = tuple(
     pytest.param(
         name,

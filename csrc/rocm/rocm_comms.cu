@@ -30,11 +30,15 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "rocm_comms/allreduce_one_shot_pull.cuh"
 #include "rocm_comms/allreduce_one_shot_push.cuh"
+#include "rocm_comms/allreduce_one_shot_push_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_one_shot_push_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_one_shot_push_rms_norm_gemm_add.cuh"
 #include "rocm_comms/allreduce_one_shot_pull_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/allreduce_one_shot_pull_add_rms_norm.cuh"
 #include "rocm_comms/allreduce_one_shot_pull_rms_norm_gemm_add.cuh"
@@ -43,6 +47,9 @@
 #include "rocm_comms/allreduce_two_shot_pull_add_rms_norm.cuh"
 #include "rocm_comms/allreduce_two_shot_pull_rms_norm_gemm_add.cuh"
 #include "rocm_comms/allreduce_two_shot_push.cuh"
+#include "rocm_comms/allreduce_two_shot_push_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_two_shot_push_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_two_shot_push_rms_norm_gemm_add.cuh"
 #include "rocm_comms/ipc.cuh"
 #include "rocm_comms/launch.cuh"
 
@@ -100,15 +107,21 @@ Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
 int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
 // The scratch a launch needs on each rank, in bytes. `packs` is a row's, `flat` the whole
-// buffer's (plain all-reduce).
+// buffer's (plain all-reduce). The push kernels' inboxes are laid out as the kernels lay
+// them (ipc::Inbox): a row kernel's hold a group per thread per row, the residual and
+// prefix inboxes are unquantized, and the GEMM tail's plain normed rows come last.
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
+  const int q = l.quant_bits;
+  // Inboxes of `groups` groups: `n` of the launch's codec, then `plain` unquantized.
+  auto inboxes = [&](int64_t groups, int n, int plain) {
+    return (n * ipc::inbox_packs(q, 1, world, groups) +
+            plain * ipc::inbox_packs(16, 1, world, groups)) * 16;
+  };
   const int64_t grid_threads = int64_t{l.grid} * l.threads;
+  const int64_t all_rows     = rows * l.threads;
+  const int64_t owned_rows   = ceil_div(rows, world) * l.threads;
   switch (l.kernel) {
-    case Kernel::one_shot_push:
-      return ipc::inbox_bytes(l.quant_bits, 1, world, flat, grid_threads);
-    case Kernel::two_shot_push:
-      return ipc::inbox_bytes(l.quant_bits, 2, world, ceil_div(flat, world), grid_threads);
     case Kernel::two_shot_pull: return ceil_div(flat, world) * 16;
     case Kernel::two_shot_pull_rms_norm: return ceil_div(rows, world) * packs * 16;
     case Kernel::two_shot_pull_add_rms_norm:
@@ -116,6 +129,19 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
       return 2 * ceil_div(rows, world) * packs * 16;
     case Kernel::one_shot_pull_rms_norm_gemm_add: return rows * packs * 16;
     case Kernel::two_shot_pull_rms_norm_gemm_add: return ceil_div(rows, world) * packs * 16;
+    case Kernel::one_shot_push: return inboxes(ipc::flat_groups(flat, grid_threads), 1, 0);
+    case Kernel::two_shot_push:
+      return inboxes(ipc::flat_groups(ceil_div(flat, world), grid_threads), 2, 0);
+    case Kernel::one_shot_push_rms_norm:
+    case Kernel::one_shot_push_add_rms_norm:
+    case Kernel::one_shot_push_add_attn_res_rms_norm: return inboxes(all_rows, 1, 0);
+    case Kernel::two_shot_push_rms_norm: return inboxes(owned_rows, 2, 0);
+    case Kernel::two_shot_push_add_rms_norm:
+    case Kernel::two_shot_push_add_attn_res_rms_norm: return inboxes(owned_rows, 2, 1);
+    case Kernel::one_shot_push_rms_norm_gemm_add:
+      return inboxes(all_rows, 1, 0) + rows * packs * 16;
+    case Kernel::two_shot_push_rms_norm_gemm_add:
+      return inboxes(owned_rows, 2, 0) + rows * packs * 16;
     default: return 0;
   }
 }
@@ -130,7 +156,8 @@ bool admits(const Comms& comms, Op op, int64_t rows, int64_t hidden, int64_t ele
   const Launch l      = launch_for(comms, op, rows, rows * hidden * elem);
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
-  if (l.kernel == Kernel::one_shot_pull_rms_norm_gemm_add && rows > kGemmRows) return false;
+  if (op == Op::rms_norm_gemm_add && !is_two_shot(l.kernel) && rows > kGemmRows)
+    return false;
   return scratch_need(l, rows, packs, rows * packs, comms.group.world_size()) <=
          comms.group.scratch_bytes();
 }
@@ -161,6 +188,38 @@ Launch checked_launch(const Comms& comms, Op op, int64_t rows, int64_t hidden,
   throw std::runtime_error("hip_comms: dtype not built. Built: float16, bfloat16.");
 }
 
+[[noreturn]] void not_this_ops(Kernel k) {
+  throw std::runtime_error("hip_comms: kernel " + std::to_string(static_cast<int>(k)) +
+                           " is not this op's");
+}
+
+// A push kernel's codec bits as a template argument: f(std::integral_constant<int, b>).
+template <typename F>
+void by_bits(int bits, F&& f) {
+  switch (bits) {
+    case 16: f(std::integral_constant<int, 16>{}); return;
+    case 8: f(std::integral_constant<int, 8>{}); return;
+    case 4: f(std::integral_constant<int, 4>{}); return;
+    default: TORCH_CHECK(false, "hip_comms: no codec of ", bits, " bits");
+  }
+}
+
+// ONE CASE PER KERNEL: `CASE_PULL(kernel, args, template args...)` launches
+// allreduce_<kernel>; `CASE_PUSH` the same at the launch's codec bits, which the template
+// arguments name as kB. Every op's launch is one switch over its kernels.
+#define LAUNCH_CFG dim3(l.grid), dim3(l.threads), 0, stream
+#define CASE_PULL(KERNEL, ARGS, ...)                                                     \
+  case Kernel::KERNEL:                                                                   \
+    allreduce_##KERNEL<__VA_ARGS__><<<LAUNCH_CFG>>>(ARGS);                               \
+    break;
+#define CASE_PUSH(KERNEL, ARGS, ...)                                                     \
+  case Kernel::KERNEL:                                                                   \
+    by_bits(l.quant_bits, [&](auto b) {                                                  \
+      constexpr int kB = decltype(b)::value;                                             \
+      allreduce_##KERNEL<__VA_ARGS__><<<LAUNCH_CFG>>>(ARGS);                             \
+    });                                                                                  \
+    break;
+
 // PLAIN ALL-REDUCE over the flat buffer.
 void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
   TORCH_CHECK(out.is_cuda() && inp.is_cuda(), "out and inp must be on device");
@@ -173,30 +232,14 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
-#define PUSH_KERNEL(SHOT, T, NG, BITS)                                                   \
-  allreduce_##SHOT##_push<T, NG, BITS><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(    \
-      p, out.data_ptr<T>(), n)
-#define PUSH_BY_BITS(SHOT, T, NG)                                                        \
-  switch (l.quant_bits) {                                                                \
-    case 16: PUSH_KERNEL(SHOT, T, NG, 16); break;                                        \
-    case 8: PUSH_KERNEL(SHOT, T, NG, 8); break;                                          \
-    case 4: PUSH_KERNEL(SHOT, T, NG, 4); break;                                          \
-    default: TORCH_CHECK(false, "hip_comms: no codec of ", l.quant_bits, " bits");       \
-  }
+#define ALL_REDUCE_ARGS(T) p, out.data_ptr<T>(), n
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
   switch (l.kernel) {                                                                    \
-    case Kernel::one_shot_pull:                                                          \
-      allreduce_one_shot_pull<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(      \
-          p, out.data_ptr<T>(), n);                                                      \
-      break;                                                                             \
-    case Kernel::two_shot_pull:                                                          \
-      allreduce_two_shot_pull<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(      \
-          p, out.data_ptr<T>(), n);                                                      \
-      break;                                                                             \
-    case Kernel::one_shot_push: PUSH_BY_BITS(one_shot, T, NG); break;                    \
-    case Kernel::two_shot_push: PUSH_BY_BITS(two_shot, T, NG); break;                    \
-    default: TORCH_CHECK(false, "hip_comms: kernel ", static_cast<int>(l.kernel),        \
-                         " is not all_reduce's");                                        \
+    CASE_PULL(one_shot_pull, ALL_REDUCE_ARGS(T), T, NG)                                  \
+    CASE_PUSH(one_shot_push, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
+    CASE_PULL(two_shot_pull, ALL_REDUCE_ARGS(T), T, NG)                                  \
+    CASE_PUSH(two_shot_push, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
+    default: not_this_ops(l.kernel);                                                     \
   }
 #define ALL_REDUCE_HALF(NG) LAUNCH_ALL_REDUCE(at::Half, NG)
 #define ALL_REDUCE_BF16(NG) LAUNCH_ALL_REDUCE(at::BFloat16, NG)
@@ -211,8 +254,7 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 #undef ALL_REDUCE_BF16
 #undef ALL_REDUCE_HALF
 #undef LAUNCH_ALL_REDUCE
-#undef PUSH_BY_BITS
-#undef PUSH_KERNEL
+#undef ALL_REDUCE_ARGS
 }
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
@@ -260,31 +302,23 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
                                    inp.size(1), inp.element_size());
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
-  const int grid     = l.grid;
-  const bool two     = is_two_shot(l.kernel);
   const float feps   = static_cast<float>(eps);
 
+#define NORM_ARGS(T, W) p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs
+#define ADD_NORM_ARGS(T, W)                                                              \
+  p, out.data_ptr<T>(), residual_out->data_ptr<T>(), residual->data_ptr<T>(),            \
+      weight.data_ptr<W>(), feps, rows, packs
 #define LAUNCH_NORM(T, W, NG)                                                            \
-  if (add) {                                                                             \
-    if (two)                                                                             \
-      allreduce_two_shot_pull_add_rms_norm<T, W, NG>                                     \
-          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
-              p, out.data_ptr<T>(), residual_out->data_ptr<T>(),                         \
-              residual->data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);         \
-    else                                                                                 \
-      allreduce_one_shot_pull_add_rms_norm<T, W, NG>                                     \
-          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
-              p, out.data_ptr<T>(), residual_out->data_ptr<T>(),                         \
-              residual->data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);         \
-  } else {                                                                               \
-    if (two)                                                                             \
-      allreduce_two_shot_pull_rms_norm<T, W, NG>                                         \
-          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
-              p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);            \
-    else                                                                                 \
-      allreduce_one_shot_pull_rms_norm<T, W, NG>                                         \
-          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
-              p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);            \
+  switch (l.kernel) {                                                                    \
+    CASE_PULL(one_shot_pull_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
+    CASE_PUSH(one_shot_push_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
+    CASE_PULL(two_shot_pull_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
+    CASE_PUSH(two_shot_push_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
+    CASE_PULL(one_shot_pull_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
+    CASE_PUSH(one_shot_push_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
+    CASE_PULL(two_shot_pull_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
+    CASE_PUSH(two_shot_push_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
+    default: not_this_ops(l.kernel);                                                     \
   }
 #define NORM_HALF(NG) LAUNCH_NORM(at::Half, at::Half, NG)
 #define NORM_HALF_F32(NG) LAUNCH_NORM(at::Half, float, NG)
@@ -315,6 +349,8 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
 #undef NORM_HALF_F32
 #undef NORM_HALF
 #undef LAUNCH_NORM
+#undef ADD_NORM_ARGS
+#undef NORM_ARGS
 }
 
 // FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm
@@ -366,8 +402,6 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
                                    inp.element_size());
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
-  const int grid     = l.grid;
-  const bool two     = is_two_shot(l.kernel);
 
 #define ATTN_RES_ARGS(T)                                                                 \
   p, prefix.data_ptr<T>(), blocks.data_ptr<T>(), blocks.stride(0), blocks.stride(1),     \
@@ -376,12 +410,15 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
       static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps),\
       static_cast<float>(out_eps), rows, packs
 #define LAUNCH_ATTN_RES(T, NG, PRE)                                                      \
-  if (two)                                                                               \
-    allreduce_two_shot_pull_add_attn_res_rms_norm<T, NG, PRE>                            \
-        <<<dim3(grid), dim3(l.threads), 0, stream>>>(ATTN_RES_ARGS(T));                  \
-  else                                                                                   \
-    allreduce_one_shot_pull_add_attn_res_rms_norm<T, NG, PRE>                            \
-        <<<dim3(grid), dim3(l.threads), 0, stream>>>(ATTN_RES_ARGS(T))
+  switch (l.kernel) {                                                                    \
+    CASE_PULL(one_shot_pull_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
+    CASE_PUSH(one_shot_push_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
+              PRE)                                                                       \
+    CASE_PULL(two_shot_pull_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
+    CASE_PUSH(two_shot_push_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
+              PRE)                                                                       \
+    default: not_this_ops(l.kernel);                                                     \
+  }
 #define ATTN_RES_BY_PREFIX(T, NG)                                                        \
   if (has_prefix) {                                                                      \
     LAUNCH_ATTN_RES(T, NG, true);                                                        \
@@ -437,19 +474,19 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: the GEMM phase spreads the columns over the whole grid.
-  const bool two = is_two_shot(l.kernel);
 
-#define GEMM_ADD_KERNEL(SHOT, T, NG, LPC)                                                \
-  allreduce_##SHOT##_pull_rms_norm_gemm_add<T, NG, LPC>                                  \
-      <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(                                    \
-          p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                         \
-          gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),        \
-          out.stride(0), static_cast<int>(out_col0), static_cast<int>(rows), packs)
+#define GEMM_ADD_ARGS(T)                                                                 \
+  p, norm_weight.data_ptr<T>(), static_cast<float>(eps), gemm_weight.data_ptr<T>(),      \
+      static_cast<int>(n_cols), out.data_ptr<T>(), out.stride(0),                        \
+      static_cast<int>(out_col0), static_cast<int>(rows), packs
 #define GEMM_ADD_SHOT(T, NG, LPC)                                                        \
-  if (two)                                                                               \
-    GEMM_ADD_KERNEL(two_shot, T, NG, LPC);                                               \
-  else                                                                                   \
-    GEMM_ADD_KERNEL(one_shot, T, NG, LPC)
+  switch (l.kernel) {                                                                    \
+    CASE_PULL(one_shot_pull_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
+    CASE_PUSH(one_shot_push_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
+    CASE_PULL(two_shot_pull_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
+    CASE_PUSH(two_shot_push_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
+    default: not_this_ops(l.kernel);                                                     \
+  }
 #define LAUNCH_GEMM_ADD(T, NG)                                                           \
   switch (l.gemm_lanes_per_col) {                                                        \
     case 1: GEMM_ADD_SHOT(T, NG, 1); break;                                              \
@@ -473,10 +510,13 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
 #undef GEMM_ADD_HALF
 #undef LAUNCH_GEMM_ADD
 #undef GEMM_ADD_SHOT
-#undef GEMM_ADD_KERNEL
+#undef GEMM_ADD_ARGS
 }
 
 #undef BY_NGPUS
+#undef CASE_PUSH
+#undef CASE_PULL
+#undef LAUNCH_CFG
 
 }  // namespace hip_comms
 

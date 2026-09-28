@@ -33,9 +33,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_rms_no
     const int end          = min(begin + chunk, rows);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
+      V sum[kMaxRowPacks];
+      c.sum_row(row * packs, packs, sum);
       add_rms_norm_row<T, T, false>(
-          c, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
-          [](int, const V&) {}, [&](int i, const V& v) { c.put(rank, local + i, v); });
+          sum, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
+          [](int, int, const V&) {},
+          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
     }
   }
 

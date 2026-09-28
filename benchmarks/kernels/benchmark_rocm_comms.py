@@ -244,18 +244,16 @@ def _hip_cases(
         lanes_per_col = [0]
     sweep = len(blocks) * len(threads) * len(lanes_per_col) > 1
     # (kernel, codec bits): a push kernel once per --quant-bits, a pull kernel once (0).
+    suffix = "" if op == "all_reduce" else f"_{op}"
+    kernels: list[tuple[Kernel, int]] = []
+    for shot in ("one_shot", "two_shot"):
+        kernels.append((cast(Kernel, f"{shot}_pull{suffix}"), 0))
+        kernels += [(cast(Kernel, f"{shot}_push{suffix}"), q) for q in quant_bits]
     if op == "all_reduce":
-        kernels: list[tuple[Kernel, int]] = [("one_shot_pull", 0), ("two_shot_pull", 0)]
-        kernels += [
-            (k, q) for k in ("one_shot_push", "two_shot_push") for q in quant_bits
-        ]
         run = lambda t: comm.all_reduce(t.x)  # noqa: E731
         admitted = comm.should_allreduce
     else:
         fop = cast(FusedOp, op)
-        kernels = [
-            (cast(Kernel, f"{v}_{op}"), 0) for v in ("one_shot_pull", "two_shot_pull")
-        ]
         run = lambda t: _fused(comm, fop, t)  # noqa: E731
         admitted = partial(_admitted, comm, fop)
         if admitted(x):

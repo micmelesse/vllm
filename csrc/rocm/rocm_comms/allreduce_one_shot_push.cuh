@@ -23,41 +23,30 @@ namespace hip_comms {
 template <typename T, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_one_shot_push(ipc::Peers p, T* __restrict__ out, int size) {
-  using V          = typename traits<T>::V;
-  using C          = Codec<T, kBits>;
-  constexpr int NL = traits<T>::N;
-  constexpr int P  = C::kPayloadPacks;
+  using V = typename traits<T>::V;
+  using C = Codec<T, kBits>;
   ipc::Comm<T, ngpus> c(p);
-  const ipc::Groups grp(size);
+  const auto grp = ipc::Groups::flat(size);
   const ipc::Inbox<C, ngpus> box(grp.count());
 
   for (int j = 0; j < grp.iters; ++j) {
     float x[C::kVals];
     c.template mine_group<C>(grp, j, 0, size, x);
-    V q[P];
-    const float s = C::encode(x, q);
-    for (int d = 0; d < ngpus; ++d) c.template push<C>(d, box, 0, grp.id(j), q, s);
+    c.template broadcast<C>(box, 0, grp.id(j), grp.members(j, 0, size), x);
   }
 
   c.peer_block_barrier();
 
   V* dst = reinterpret_cast<V*>(out);
   for (int j = 0; j < grp.iters; ++j) {
-    float acc[C::kVals] = {};
-    for (int src = 0; src < ngpus; ++src) {
-      float x[C::kVals];
-      c.template read_inbox<C>(box, 0, src, grp.id(j), x);
+    const int n = grp.members(j, 0, size);
+    float acc[C::kVals];
+    c.template reduce_inbox<C>(box, 0, grp.id(j), n, acc);
+    V v[kSumBatch];
+    packs_of<T>(acc, v);
 #pragma unroll
-      for (int i = 0; i < C::kVals; ++i) acc[i] += x[i];
-    }
-#pragma unroll
-    for (int u = 0; u < kSumBatch; ++u) {
-      if (!grp.has(j, u, 0, size)) continue;
-      V v;
-#pragma unroll
-      for (int k = 0; k < NL; ++k) v.d[k] = static_cast<T>(acc[u * NL + k]);
-      store_global(dst + grp.at(j, u), v);
-    }
+    for (int u = 0; u < kSumBatch; ++u)
+      if (u < n) store_global(dst + grp.at(j, u), v[u]);
   }
 }
 

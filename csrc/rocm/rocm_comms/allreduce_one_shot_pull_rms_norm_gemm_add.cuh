@@ -30,10 +30,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_no
 
   // PHASE 1 -- this block's rows, reduced and normed, into our own scratch.
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  for (int row = blockIdx.x; row < rows; row += gridDim.x)
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    V sum[kMaxRowPacks];
+    c.sum_row(row * packs, packs, sum);
     add_rms_norm_row<T, T, false>(
-        c, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
-        [](int, const V&) {}, [&](int i, const V& v) { c.put(rank, row * packs + i, v); });
+        sum, nullptr, reinterpret_cast<const V*>(norm_w), row, packs, inv_hidden, eps,
+        [](int, int, const V&) {},
+        [&](int, int i, const V& v) { c.put(rank, row * packs + i, v); });
+  }
 
   // Phase 2 reads rows other blocks of this rank wrote, in our own scratch.
   c.grid_barrier();

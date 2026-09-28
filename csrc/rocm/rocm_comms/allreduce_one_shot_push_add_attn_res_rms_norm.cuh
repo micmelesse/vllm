@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot all-reduce fused with Kimi-K3's attention residual (AttnRes) and its RMSNorm.
+// One-shot push all-reduce fused with Kimi-K3's attention residual (AttnRes) and its
+// RMSNorm.
 
 #pragma once
 
@@ -10,19 +11,26 @@
 
 namespace hip_comms {
 
-// A BLOCK OWNS A ROW, striding over rows, as the fused norm does: every rank reduces every
-// row, so there is nothing to gather. `blocks` is [rows, num_sources, hidden] with row and
-// source strides in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix>
+// PUSH (see allreduce_one_shot_push.cuh): every rank's rows, encoded by kBits' Codec, into
+// every rank's inbox; one barrier; each block reduces its rows out of its own inbox and
+// runs AttnRes on them as the pull kernel does. `blocks` is [rows, num_sources, hidden]
+// with row and source strides in elements; `write_idx` < 0 writes no block.
+template <typename T, int ngpus, int kBits, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_one_shot_pull_add_attn_res_rms_norm(
-    ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
-    int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-    const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
-    float eps, float out_eps, int rows, int packs) {
+    allreduce_one_shot_push_add_attn_res_rms_norm(
+        ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
+        int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
+        const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
+        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
   using V          = typename traits<T>::V;
+  using C          = Codec<T, kBits>;
   constexpr int NL = traits<T>::N;
   ipc::Comm<T, ngpus> c(p);
+  const ipc::Inbox<C, ngpus> box(rows * blockDim.x);
+  c.template broadcast_rows<C>(box, rows, packs);
+
+  c.peer_block_barrier();
+
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
@@ -32,7 +40,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                    write_idx * block_stride_r)
                             : nullptr;
     V sum[kMaxRowPacks];
-    c.sum_row(row * packs, packs, sum);
+    c.template reduce_row<C>(box, row, packs, sum);
     add_attn_res_rms_norm_row<T, kPrefix>(
         sum, pre, row_blocks, block_stride_r, reinterpret_cast<const V*>(norm_w),
         reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
@@ -43,7 +51,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  c.close();
 }
 
 }  // namespace hip_comms

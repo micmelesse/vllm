@@ -21,7 +21,8 @@ namespace hip_comms {
 // Phase 1 reads the replicated `prefix` and `blocks`; phase 2 overwrites them, which the
 // world_barrier between makes safe. Every output element is computed by exactly one rank.
 template <typename T, int ngpus, bool kPrefix>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_add_attn_res_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1)
+    allreduce_two_shot_pull_add_attn_res_rms_norm(
     ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
     int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
     const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
@@ -40,13 +41,15 @@ __global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_pull_add_at
     const int end          = min(begin + chunk, rows);
     for (int row = begin + blockIdx.x; row < end; row += gridDim.x) {
       const int local = (row - begin) * packs;
+      V sum[kMaxRowPacks];
+      c.sum_row(row * packs, packs, sum);
       add_attn_res_rms_norm_row<T, kPrefix>(
-          c, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
+          sum, reinterpret_cast<const V*>(prefix), blocks + row * block_stride_m,
           block_stride_r, reinterpret_cast<const V*>(norm_w),
           reinterpret_cast<const V*>(qk_w), reinterpret_cast<const V*>(out_norm_w),
           num_blocks, row, packs, inv_hidden, eps, out_eps,
-          [&](int i, const V& v) { c.put(rank, half + local + i, v); },
-          [&](int i, const V& v) { c.put(rank, local + i, v); });
+          [&](int, int i, const V& v) { c.put(rank, half + local + i, v); },
+          [&](int, int i, const V& v) { c.put(rank, local + i, v); });
     }
   }
 

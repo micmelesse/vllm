@@ -28,39 +28,30 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     allreduce_two_shot_push(ipc::Peers p, T* __restrict__ out, int size) {
   using V          = typename traits<T>::V;
   using C          = Codec<T, kBits>;
-  constexpr int NL = traits<T>::N;
-  constexpr int P  = C::kPayloadPacks;
   ipc::Comm<T, ngpus> c(p);
+  const int rank  = c.rank();
   const int chunk = (size + ngpus - 1) / ngpus;
-  const ipc::Groups grp(chunk);
-  const ipc::Inbox<C, ngpus> box(grp.count());
+  const auto grp  = ipc::Groups::flat(chunk);
+  const ipc::Inbox<C, ngpus> box(grp.count(), 2);
 
   for (int j = 0; j < grp.iters; ++j) {
     for (int d = 0; d < ngpus; ++d) {
       float x[C::kVals];
       c.template mine_group<C>(grp, j, d * chunk, size, x);
-      V q[P];
-      const float s = C::encode(x, q);
-      c.template push<C>(d, box, 0, grp.id(j), q, s);
+      c.template send<C>(d, box, 0, grp.id(j), grp.members(j, d * chunk, size), x);
     }
   }
 
   c.peer_block_barrier();
 
   for (int j = 0; j < grp.iters; ++j) {
-    float acc[C::kVals] = {};
-    for (int src = 0; src < ngpus; ++src) {
-      float x[C::kVals];
-      c.template read_inbox<C>(box, 0, src, grp.id(j), x);
-#pragma unroll
-      for (int i = 0; i < C::kVals; ++i) acc[i] += x[i];
-    }
+    const int n = grp.members(j, rank * chunk, size);
+    float acc[C::kVals];
+    c.template reduce_inbox<C>(box, 0, grp.id(j), n, acc);
     // Rounded to T first, as the unquantized sum lands.
 #pragma unroll
     for (int i = 0; i < C::kVals; ++i) acc[i] = static_cast<float>(static_cast<T>(acc[i]));
-    V q[P];
-    const float s = C::encode(acc, q);
-    for (int d = 0; d < ngpus; ++d) c.template push<C>(d, box, 1, grp.id(j), q, s);
+    c.template broadcast<C>(box, 1, grp.id(j), n, acc);
   }
 
   c.peer_block_barrier();
@@ -68,16 +59,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   V* dst = reinterpret_cast<V*>(out);
   for (int j = 0; j < grp.iters; ++j) {
     for (int src = 0; src < ngpus; ++src) {
+      const int n = grp.members(j, src * chunk, size);
       float x[C::kVals];
-      c.template read_inbox<C>(box, 1, src, grp.id(j), x);
+      c.template read_inbox<C>(box, 1, src, grp.id(j), n, x);
+      V v[kSumBatch];
+      packs_of<T>(x, v);
 #pragma unroll
-      for (int u = 0; u < kSumBatch; ++u) {
-        if (!grp.has(j, u, src * chunk, size)) continue;
-        V v;
-#pragma unroll
-        for (int k = 0; k < NL; ++k) v.d[k] = static_cast<T>(x[u * NL + k]);
-        store_global(dst + src * chunk + grp.at(j, u), v);
-      }
+      for (int u = 0; u < kSumBatch; ++u)
+        if (u < n) store_global(dst + src * chunk + grp.at(j, u), v[u]);
     }
   }
 }
