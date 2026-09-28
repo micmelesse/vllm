@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, FusedOp
+from .base import AdmitOp, Communicator
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,9 @@ _KERNEL_WIRE: Mapping[Kernel, int] = {
     for i, k in enumerate(Kernel.__args__)  # type: ignore[attr-defined]
 }
 
-# The ops as C++ numbers them (`enum class Op`); the plain all-reduce is 0.
-_OP_WIRE: Mapping[FusedOp, int] = {
+# The ops as C++ numbers them (`enum class Op`).
+_OP_WIRE: Mapping[AdmitOp, int] = {
+    "all_reduce": 0,
     "rms_norm": 1,
     "add_rms_norm": 2,
     "add_attn_res_rms_norm": 3,
@@ -296,19 +297,19 @@ class HipCommunicator(Communicator):
         torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, self._as_input(inp))
         return out
 
-    def _is_supported(self, inp: torch.Tensor) -> bool:
-        """The base's shape and dtype, and the plain all-reduce C++ picks for it runs:
-        a push kernel holds every rank's slice in its inboxes, so its scratch can run
-        out where a pull kernel's would not."""
-        return super()._is_supported(inp) and torch.ops._rocm_C.rocm_comms_admits(
-            self._handle, 0, 1, inp.numel(), inp.element_size()
-        )
-
-    def _admits(self, op: FusedOp, inp: torch.Tensor) -> bool:
+    def _admits(self, op: AdmitOp, inp: torch.Tensor) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits
-        in registers at that kernel's width, and its scratch fits."""
-        return inp.dim() == 2 and torch.ops._rocm_C.rocm_comms_admits(
-            self._handle, _OP_WIRE[op], inp.shape[0], inp.shape[1], inp.element_size()
+        in registers at that kernel's width, and its scratch fits (a push kernel holds
+        every rank's slice). The plain all-reduce is one flat row, as C++ launches
+        it."""
+        if op == "all_reduce":
+            rows, hidden = 1, inp.numel()
+        elif inp.dim() == 2:
+            rows, hidden = inp.shape
+        else:
+            return False
+        return torch.ops._rocm_C.rocm_comms_admits(
+            self._handle, _OP_WIRE[op], rows, hidden, inp.element_size()
         )
 
     def _all_reduce_rms_norm(

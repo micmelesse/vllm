@@ -42,6 +42,8 @@ WorldSize = Literal[2, 4, 8]
 FusedOp = Literal[
     "rms_norm", "add_rms_norm", "add_attn_res_rms_norm", "rms_norm_gemm_add"
 ]
+# What `_admits` is asked about: the plain all-reduce, or a fused op.
+AdmitOp = Literal["all_reduce", FusedOp]
 
 # What `_rocm_C` is built for.
 SUPPORTED_ARCHS = ("gfx94", "gfx95")
@@ -181,10 +183,16 @@ class Communicator(ABC):
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
-        """Whether this backend takes `inp` -- every SIZE, because it owns the
-        collective. The only no is a tensor the kernel cannot compile for, or being
-        disabled, and a no sends the caller elsewhere, so this stays public."""
-        return not self.disabled and self._is_supported(inp)
+        """Whether this backend takes `inp` -- every SIZE its memory holds, because it
+        owns the collective. The noes are a tensor the kernel cannot compile for, being
+        disabled, and what the backend does not admit (`_admits`: hip's push kernels
+        hold every rank's slice, so their scratch can run out); a no sends the caller
+        elsewhere, so this stays public."""
+        return (
+            not self.disabled
+            and self._is_supported(inp)
+            and self._admits("all_reduce", inp)
+        )
 
     def should_allreduce_rms_norm(self, inp: torch.Tensor) -> bool:
         """Whether this backend can all-reduce then `rms_norm` `inp` in one kernel.
@@ -518,9 +526,9 @@ class Communicator(ABC):
             f"ask should_allreduce_rms_norm_gemm_add first."
         )
 
-    def _admits(self, op: FusedOp, inp: torch.Tensor) -> bool:
-        """Whether the backend runs fused `op` over `inp`. No limit unless the backend
-        has one."""
+    def _admits(self, op: AdmitOp, inp: torch.Tensor) -> bool:
+        """Whether the backend runs `op` (the plain all-reduce, or a fused op) over
+        `inp`. No limit unless the backend has one."""
         return True
 
     def widest_input_bytes(self) -> int:
