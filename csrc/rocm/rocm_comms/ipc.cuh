@@ -93,6 +93,60 @@ class Peers {
 };
 
 // =================================================================================
+// THE PUSH KERNELS' UNITS. A GROUP is one thread's kSumBatch packs of a span, positions
+// tid + (j * kSumBatch + u) * stride, and it crosses a link as one Codec payload (and one
+// scale). Every phase of a push kernel gives a thread the same groups, so the
+// same-numbered peer blocks are all a phase waits for.
+// =================================================================================
+
+struct Groups {
+  int span, tid, stride, iters;
+  DINLINE explicit Groups(int span)
+      : span(span),
+        tid(blockIdx.x * blockDim.x + threadIdx.x),
+        stride(gridDim.x * blockDim.x),
+        iters((span + stride * kSumBatch - 1) / (stride * kSumBatch)) {}
+  // Every thread's groups: j * stride + tid for j < iters.
+  DINLINE int count() const { return iters * stride; }
+  DINLINE int id(int j) const { return j * stride + tid; }
+  // Member u of group j, as a position within the span.
+  DINLINE int at(int j, int u) const { return tid + (j * kSumBatch + u) * stride; }
+  // Whether it exists: inside the span, and `base + at` inside the buffer's `end`.
+  DINLINE bool has(int j, int u, int base, int end) const {
+    const int k = at(j, u);
+    return k < span && base + k < end;
+  }
+};
+
+// A rank's INBOXES: kRegions regions, each a slot per source rank; a slot holds every
+// group's payload, then (a scaled codec) every group's scale. Indices in packs (payload)
+// and floats (scale) of the scratch.
+template <class C, int ngpus>
+struct Inbox {
+  int groups, slot;
+  DINLINE explicit Inbox(int groups)
+      : groups(groups),
+        slot(groups * C::kPayloadPacks + (C::kScaled ? (groups + 3) / 4 : 0)) {}
+  DINLINE int payload(int region, int src, int g) const {
+    return (region * ngpus + src) * slot + g * C::kPayloadPacks;
+  }
+  DINLINE int scale(int region, int src, int g) const {
+    return 4 * ((region * ngpus + src) * slot + groups * C::kPayloadPacks) + g;
+  }
+};
+
+// The scratch the inboxes need on each rank, in bytes: `regions` regions over a span of
+// `span` packs, at kbits (16: T itself) and a grid of `grid_threads` threads.
+inline int64_t inbox_bytes(int kbits, int regions, int world, int64_t span,
+                           int64_t grid_threads) {
+  const int64_t groups =
+      (span + grid_threads * kSumBatch - 1) / (grid_threads * kSumBatch) * grid_threads;
+  const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
+  const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
+  return int64_t{regions} * world * (groups * payload + scales) * 16;
+}
+
+// =================================================================================
 // THE KERNEL'S WHOLE VIEW OF ITS PEERS. Every rank's input is read only through `sum`;
 // every rank's scratch (its own included) through `put` and `get`; the barriers order it.
 // Indices are in 16-byte packs of T.
@@ -100,8 +154,7 @@ class Peers {
 //   Comm c(p);             returns once every peer has launched: their inputs are ready
 //   c.sum(idx)             input pack idx summed over ranks, fp32, rounded once
 //   c.put(peer, idx, v)    into peer's scratch
-//   c.get(peer, idx)       from peer's scratch (put/get_float: a float, idx in floats)
-//   c.mine(idx)            this rank's own input pack
+//   c.get(peer, idx)       from peer's scratch
 //   c.ptr(peer, idx, n)    a direct pointer to n packs of it, checked once, for hot loops
 //   c.world_barrier()      every put before it, by any block of any rank, is visible to
 //                          every get after it
@@ -112,6 +165,12 @@ class Peers {
 //   c.block_barrier()      the threads of this block
 //   c.close()              last; after it this rank's input may be reused (unneeded when
 //                          the input is last read before a peer_block_barrier)
+//
+// PUSH, the other direction: a push kernel reads only its own input and its own scratch,
+// and what crosses a link is a store into a peer's inbox (see Groups and Inbox above).
+//   c.mine_group<C>        this rank's input over one group, as floats
+//   c.push<C>(peer, ...)   an encoded group into peer's inbox, in this rank's slot
+//   c.read_inbox<C>        a group from this rank's own inbox, decoded
 //
 // A wait that outlives the timeout prints where it was and traps, so a hang is an error.
 // Checked (the tests), every index is bounds-checked and every wait is skewed by a
@@ -171,27 +230,6 @@ class Comm {
 #pragma unroll
       for (int j = 0; j < N; ++j) out[u].d[j] = static_cast<T>(acc[j]);
     }
-  }
-
-  // This rank's own input pack: the quantized two-shot encodes it before sending it.
-  DINLINE V mine(int64_t idx) const {
-    check(idx < p_.input_packs_, "mine", -1, idx, p_.input_packs_);
-    return load_global(in_[0] + idx);
-  }
-
-  // A float in peer's scratch, `idx` in floats: the quantized two-shot's scales.
-  DINLINE void put(int peer, int64_t idx, float v) const {
-    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "put", peer, idx,
-          4 * p_.scratch_packs_);
-    __scoped_atomic_store_n(reinterpret_cast<float*>(scratch_of(peer)) + idx, v,
-                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-  }
-
-  DINLINE float get_float(int peer, int64_t idx) const {
-    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "get", peer, idx,
-          4 * p_.scratch_packs_);
-    return __scoped_atomic_load_n(reinterpret_cast<const float*>(scratch_of(peer)) + idx,
-                                  __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
 
   DINLINE void put(int peer, int64_t idx, const V& v) const {
@@ -286,6 +324,50 @@ class Comm {
     }
   }
 
+  // THE PUSH HELPERS. mine_group: this rank's input over group j of `grp`, the span
+  // starting at pack `base`; members past `end` read as zero.
+  template <class C>
+  DINLINE void mine_group(const Groups& grp, int j, int base, int end,
+                          float (&x)[C::kVals]) const {
+    V v[kSumBatch];
+#pragma unroll
+    for (int u = 0; u < kSumBatch; ++u) {
+      const int64_t at = base + grp.at(j, u);
+      v[u]             = V{};
+      if (grp.has(j, u, base, end)) {
+        check(at < p_.input_packs_, "mine_group", -1, at, p_.input_packs_);
+        v[u] = load_global(in_[0] + at);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kSumBatch; ++u)
+#pragma unroll
+      for (int k = 0; k < C::N; ++k) x[u * C::N + k] = static_cast<float>(v[u].d[k]);
+  }
+
+  // An encoded group into `peer`'s inbox: region, this rank's slot, group g.
+  template <class C>
+  DINLINE void push(int peer, const Inbox<C, ngpus>& box, int region, int g,
+                    const V (&q)[C::kPayloadPacks], float scale) const {
+    const int at = box.payload(region, rank(), g);
+#pragma unroll
+    for (int w = 0; w < C::kPayloadPacks; ++w) put(peer, at + w, q[w]);
+    if constexpr (C::kScaled) put_float(peer, box.scale(region, rank(), g), scale);
+  }
+
+  // Group g of `src`'s slot in this rank's own inbox, decoded.
+  template <class C>
+  DINLINE void read_inbox(const Inbox<C, ngpus>& box, int region, int src, int g,
+                          float (&x)[C::kVals]) const {
+    V q[C::kPayloadPacks];
+    const int at = box.payload(region, src, g);
+#pragma unroll
+    for (int w = 0; w < C::kPayloadPacks; ++w) q[w] = get(rank(), at + w);
+    float scale = 1.0f;
+    if constexpr (C::kScaled) scale = get_float(rank(), box.scale(region, src, g));
+    C::decode(q, scale, x);
+  }
+
   // This block and the same-numbered block on every peer, and no other block: one peer
   // write each, where `world_barrier` waits for the whole grid. A get after it may read
   // ONLY what the same-numbered block on that peer put, so both phases must give each
@@ -350,6 +432,23 @@ class Comm {
       if constexpr (system) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
       else __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
+  }
+
+  // A float in peer's scratch, `idx` in floats: a scaled codec's scales.
+  DINLINE void put_float(int peer, int64_t idx, float v) const {
+    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "put_float", peer,
+          idx, 4 * p_.scratch_packs_);
+    __scoped_atomic_store_n(reinterpret_cast<uint32_t*>(scratch_of(peer)) + idx,
+                            __builtin_bit_cast(uint32_t, v), __ATOMIC_RELAXED,
+                            __MEMORY_SCOPE_SYSTEM);
+  }
+
+  DINLINE float get_float(int peer, int64_t idx) const {
+    check(peer >= 0 && peer < ngpus && idx < 4 * p_.scratch_packs_, "get_float", peer,
+          idx, 4 * p_.scratch_packs_);
+    const auto* at = reinterpret_cast<const uint32_t*>(scratch_of(peer)) + idx;
+    return __builtin_bit_cast(float, __scoped_atomic_load_n(at, __ATOMIC_RELAXED,
+                                                            __MEMORY_SCOPE_SYSTEM));
   }
 
   // BY SELECT, NOT `scratch_[peer]`: a runtime index into a register array moves the

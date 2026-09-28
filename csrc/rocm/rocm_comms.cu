@@ -33,15 +33,16 @@
 #include <utility>
 #include <vector>
 
-#include "rocm_comms/allreduce_one_shot.cuh"
-#include "rocm_comms/allreduce_one_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_rms_norm_gemm_add.cuh"
-#include "rocm_comms/allreduce_two_shot.cuh"
-#include "rocm_comms/allreduce_two_shot_quantized.cuh"
-#include "rocm_comms/allreduce_two_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_one_shot_pull.cuh"
+#include "rocm_comms/allreduce_one_shot_push.cuh"
+#include "rocm_comms/allreduce_one_shot_pull_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_one_shot_pull_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_one_shot_pull_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_two_shot_pull.cuh"
+#include "rocm_comms/allreduce_two_shot_pull_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_two_shot_pull_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_two_shot_pull_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_two_shot_push.cuh"
 #include "rocm_comms/ipc.cuh"
 #include "rocm_comms/launch.cuh"
 
@@ -56,23 +57,26 @@ constexpr bool table_fits() {
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
   }
-  for (int op = 0; op < static_cast<int>(sizeof(kGfx950) / sizeof(OpTuning)); ++op) {
-    const int b = kGfx950[op].quant_bits;
-    if (b != 0 && (op != static_cast<int>(Op::all_reduce) || (b != 8 && b != 4)))
-      return false;
+  for (int i = 0; i < static_cast<int>(sizeof(kGfx950) / sizeof(OpTuning)); ++i) {
+    const OpTuning& t = kGfx950[i];
+    const Op op       = static_cast<Op>(i);
+    if (t.one_shot_push && kernel_of(op, false, true) == Kernel::none) return false;
+    if (t.two_shot_push && kernel_of(op, true, true) == Kernel::none) return false;
+    if (t.quant_bits != 16 && t.quant_bits != 8 && t.quant_bits != 4) return false;
   }
   const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
   return v == 1 || v == 2 || v == 4 || v == 8;
 }
 static_assert(table_fits(), "launch.cuh's table exceeds a kernel capability");
 
-// The launch the sweep forces: a kernel, its geometry, and the GEMM tail's lanes per column
-// (0: the table's).
+// The launch the sweep forces: a kernel, its geometry, the GEMM tail's lanes per column and
+// a push kernel's codec bits (each 0: the table's).
 struct Forced {
   Kernel kernel;
   int blocks;
   int threads;
   int gemm_lanes_per_col;
+  int quant_bits;
 };
 
 // What Python holds: the peers, and the launch the sweep forces, if any.
@@ -80,7 +84,7 @@ struct Comms {
   template <typename... A>
   explicit Comms(A&&... a) : group(std::forward<A>(a)...) {}
   ipc::Group group;
-  Forced forced{Kernel::none, 0, 0, 0};
+  Forced forced{Kernel::none, 0, 0, 0, 0};
 };
 
 Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
@@ -89,7 +93,8 @@ Launch launch_for(const Comms& comms, Op op, int64_t rows, int64_t bytes) {
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
   return {f.kernel, grid_of(f.kernel, f.blocks, rows), f.threads,
-          f.gemm_lanes_per_col ? f.gemm_lanes_per_col : tuning(op).gemm_lanes_per_col};
+          f.gemm_lanes_per_col ? f.gemm_lanes_per_col : tuning(op).gemm_lanes_per_col,
+          f.quant_bits ? f.quant_bits : tuning(op).quant_bits};
 }
 
 int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
@@ -100,17 +105,17 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
   const int64_t grid_threads = int64_t{l.grid} * l.threads;
   switch (l.kernel) {
-    case Kernel::two_shot_int8:
-      return quantized_scratch_bytes(8, flat, world, grid_threads);
-    case Kernel::two_shot_int4:
-      return quantized_scratch_bytes(4, flat, world, grid_threads);
-    case Kernel::two_shot: return ceil_div(flat, world) * 16;
-    case Kernel::two_shot_rms_norm: return ceil_div(rows, world) * packs * 16;
-    case Kernel::two_shot_add_rms_norm:
-    case Kernel::two_shot_add_attn_res_rms_norm:
+    case Kernel::one_shot_push:
+      return ipc::inbox_bytes(l.quant_bits, 1, world, flat, grid_threads);
+    case Kernel::two_shot_push:
+      return ipc::inbox_bytes(l.quant_bits, 2, world, ceil_div(flat, world), grid_threads);
+    case Kernel::two_shot_pull: return ceil_div(flat, world) * 16;
+    case Kernel::two_shot_pull_rms_norm: return ceil_div(rows, world) * packs * 16;
+    case Kernel::two_shot_pull_add_rms_norm:
+    case Kernel::two_shot_pull_add_attn_res_rms_norm:
       return 2 * ceil_div(rows, world) * packs * 16;
-    case Kernel::one_shot_rms_norm_gemm_add: return rows * packs * 16;
-    case Kernel::two_shot_rms_norm_gemm_add: return ceil_div(rows, world) * packs * 16;
+    case Kernel::one_shot_pull_rms_norm_gemm_add: return rows * packs * 16;
+    case Kernel::two_shot_pull_rms_norm_gemm_add: return ceil_div(rows, world) * packs * 16;
     default: return 0;
   }
 }
@@ -125,7 +130,7 @@ bool admits(const Comms& comms, Op op, int64_t rows, int64_t hidden, int64_t ele
   const Launch l      = launch_for(comms, op, rows, rows * hidden * elem);
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
-  if (l.kernel == Kernel::one_shot_rms_norm_gemm_add && rows > kGemmRows) return false;
+  if (l.kernel == Kernel::one_shot_pull_rms_norm_gemm_add && rows > kGemmRows) return false;
   return scratch_need(l, rows, packs, rows * packs, comms.group.world_size()) <=
          comms.group.scratch_bytes();
 }
@@ -167,21 +172,32 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
   const int n    = static_cast<int>(inp.numel() * inp.element_size() / 16);
   const ipc::Peers p = comms.group.peers(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
-  const bool two     = is_two_shot(l.kernel);
 
+#define PUSH_KERNEL(SHOT, T, NG, BITS)                                                   \
+  allreduce_##SHOT##_push<T, NG, BITS><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(    \
+      p, out.data_ptr<T>(), n)
+#define PUSH_BY_BITS(SHOT, T, NG)                                                        \
+  switch (l.quant_bits) {                                                                \
+    case 16: PUSH_KERNEL(SHOT, T, NG, 16); break;                                        \
+    case 8: PUSH_KERNEL(SHOT, T, NG, 8); break;                                          \
+    case 4: PUSH_KERNEL(SHOT, T, NG, 4); break;                                          \
+    default: TORCH_CHECK(false, "hip_comms: no codec of ", l.quant_bits, " bits");       \
+  }
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
-  if (l.kernel == Kernel::two_shot_int8)                                                 \
-    allreduce_two_shot_quantized<T, NG, 8>                                               \
-        <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(p, out.data_ptr<T>(), n);         \
-  else if (l.kernel == Kernel::two_shot_int4)                                            \
-    allreduce_two_shot_quantized<T, NG, 4>                                               \
-        <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(p, out.data_ptr<T>(), n);         \
-  else if (two)                                                                          \
-    allreduce_two_shot<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(             \
-        p, out.data_ptr<T>(), n);                                                        \
-  else                                                                                   \
-    allreduce_one_shot<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(             \
-        p, out.data_ptr<T>(), n)
+  switch (l.kernel) {                                                                    \
+    case Kernel::one_shot_pull:                                                          \
+      allreduce_one_shot_pull<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(      \
+          p, out.data_ptr<T>(), n);                                                      \
+      break;                                                                             \
+    case Kernel::two_shot_pull:                                                          \
+      allreduce_two_shot_pull<T, NG><<<dim3(l.grid), dim3(l.threads), 0, stream>>>(      \
+          p, out.data_ptr<T>(), n);                                                      \
+      break;                                                                             \
+    case Kernel::one_shot_push: PUSH_BY_BITS(one_shot, T, NG); break;                    \
+    case Kernel::two_shot_push: PUSH_BY_BITS(two_shot, T, NG); break;                    \
+    default: TORCH_CHECK(false, "hip_comms: kernel ", static_cast<int>(l.kernel),        \
+                         " is not all_reduce's");                                        \
+  }
 #define ALL_REDUCE_HALF(NG) LAUNCH_ALL_REDUCE(at::Half, NG)
 #define ALL_REDUCE_BF16(NG) LAUNCH_ALL_REDUCE(at::BFloat16, NG)
 
@@ -195,6 +211,8 @@ void all_reduce(Comms& comms, torch::Tensor& out, torch::Tensor& inp) {
 #undef ALL_REDUCE_BF16
 #undef ALL_REDUCE_HALF
 #undef LAUNCH_ALL_REDUCE
+#undef PUSH_BY_BITS
+#undef PUSH_KERNEL
 }
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
@@ -249,22 +267,24 @@ void all_reduce_add_rms_norm(Comms& comms, torch::Tensor& out, torch::Tensor* re
 #define LAUNCH_NORM(T, W, NG)                                                            \
   if (add) {                                                                             \
     if (two)                                                                             \
-      allreduce_two_shot_add_rms_norm<T, W, NG>                                          \
+      allreduce_two_shot_pull_add_rms_norm<T, W, NG>                                     \
           <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
               p, out.data_ptr<T>(), residual_out->data_ptr<T>(),                         \
               residual->data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);         \
     else                                                                                 \
-      allreduce_one_shot_add_rms_norm<T, W, NG>                                          \
+      allreduce_one_shot_pull_add_rms_norm<T, W, NG>                                     \
           <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
               p, out.data_ptr<T>(), residual_out->data_ptr<T>(),                         \
               residual->data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);         \
   } else {                                                                               \
     if (two)                                                                             \
-      allreduce_two_shot_rms_norm<T, W, NG><<<dim3(grid), dim3(l.threads), 0, stream>>>( \
-          p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);                \
+      allreduce_two_shot_pull_rms_norm<T, W, NG>                                         \
+          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
+              p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);            \
     else                                                                                 \
-      allreduce_one_shot_rms_norm<T, W, NG><<<dim3(grid), dim3(l.threads), 0, stream>>>( \
-          p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);                \
+      allreduce_one_shot_pull_rms_norm<T, W, NG>                                         \
+          <<<dim3(grid), dim3(l.threads), 0, stream>>>(                                  \
+              p, out.data_ptr<T>(), weight.data_ptr<W>(), feps, rows, packs);            \
   }
 #define NORM_HALF(NG) LAUNCH_NORM(at::Half, at::Half, NG)
 #define NORM_HALF_F32(NG) LAUNCH_NORM(at::Half, float, NG)
@@ -353,14 +373,14 @@ void all_reduce_add_attn_res_rms_norm(Comms& comms, torch::Tensor& prefix,
   p, prefix.data_ptr<T>(), blocks.data_ptr<T>(), blocks.stride(0), blocks.stride(1),     \
       norm_weight.data_ptr<T>(), qk_weight.data_ptr<T>(),                                \
       out_norm_weight ? out_norm_weight->data_ptr<T>() : nullptr, out.data_ptr<T>(),     \
-      static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), \
+      static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps),\
       static_cast<float>(out_eps), rows, packs
 #define LAUNCH_ATTN_RES(T, NG, PRE)                                                      \
   if (two)                                                                               \
-    allreduce_two_shot_add_attn_res_rms_norm<T, NG, PRE>                                 \
+    allreduce_two_shot_pull_add_attn_res_rms_norm<T, NG, PRE>                            \
         <<<dim3(grid), dim3(l.threads), 0, stream>>>(ATTN_RES_ARGS(T));                  \
   else                                                                                   \
-    allreduce_one_shot_add_attn_res_rms_norm<T, NG, PRE>                                 \
+    allreduce_one_shot_pull_add_attn_res_rms_norm<T, NG, PRE>                            \
         <<<dim3(grid), dim3(l.threads), 0, stream>>>(ATTN_RES_ARGS(T))
 #define ATTN_RES_BY_PREFIX(T, NG)                                                        \
   if (has_prefix) {                                                                      \
@@ -420,7 +440,7 @@ void all_reduce_rms_norm_gemm_add(Comms& comms, torch::Tensor& out, int64_t out_
   const bool two = is_two_shot(l.kernel);
 
 #define GEMM_ADD_KERNEL(SHOT, T, NG, LPC)                                                \
-  allreduce_##SHOT##_rms_norm_gemm_add<T, NG, LPC>                                       \
+  allreduce_##SHOT##_pull_rms_norm_gemm_add<T, NG, LPC>                                  \
       <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(                                    \
           p, norm_weight.data_ptr<T>(), static_cast<float>(eps),                         \
           gemm_weight.data_ptr<T>(), static_cast<int>(n_cols), out.data_ptr<T>(),        \
@@ -509,16 +529,17 @@ void rocm_comms_set_checked(fptr_t comms, bool checked) {
 }
 
 // THE SWEEP'S ONE HANDLE: every later launch of that kernel's op runs `kernel` at this
-// geometry and GEMM lanes per column (0: the table's), and a launch of any other op is
-// refused. `kernel` -1 clears it.
+// geometry, GEMM lanes per column and codec bits (each 0: the table's), and a launch of
+// any other op is refused. `kernel` -1 clears it.
 void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
-                                    int64_t threads, int64_t gemm_lanes_per_col) {
+                                    int64_t threads, int64_t gemm_lanes_per_col,
+                                    int64_t quant_bits) {
   using hip_comms::Kernel;
   if (kernel < 0) {
-    comms_of(comms).forced = {Kernel::none, 0, 0, 0};
+    comms_of(comms).forced = {Kernel::none, 0, 0, 0, 0};
     return;
   }
-  TORCH_CHECK(kernel <= static_cast<int64_t>(Kernel::two_shot_int4),
+  TORCH_CHECK(kernel < hip_comms::kNumKernels,
               "hip_comms: no kernel ", kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::ipc::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::ipc::kMaxBlocks, "]");
@@ -529,8 +550,11 @@ void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks
   const int64_t lpc = gemm_lanes_per_col;
   TORCH_CHECK(lpc == 0 || lpc == 1 || lpc == 2 || lpc == 4 || lpc == 8,
               "gemm_lanes_per_col must be 0 (the table's), 1, 2, 4 or 8");
+  TORCH_CHECK(quant_bits == 0 || quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
+              "quant_bits must be 0 (the table's), 16, 8 or 4");
   comms_of(comms).forced = {static_cast<Kernel>(kernel), static_cast<int>(blocks),
-                            static_cast<int>(threads), static_cast<int>(lpc)};
+                            static_cast<int>(threads), static_cast<int>(lpc),
+                            static_cast<int>(quant_bits)};
 }
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,

@@ -19,7 +19,7 @@ namespace hip_comms {
 // still reaches every barrier.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_two_shot(ipc::Peers p, T* __restrict__ out, int size) {
+    allreduce_two_shot_pull(ipc::Peers p, T* __restrict__ out, int size) {
   using V = typename traits<T>::V;
   ipc::Comm<T, ngpus> c(p);
   const int chunk  = (size + ngpus - 1) / ngpus;

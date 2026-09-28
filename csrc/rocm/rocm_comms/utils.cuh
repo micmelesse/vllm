@@ -435,59 +435,73 @@ DINLINE void gemm_add_rows(Row row, int rows, const T* __restrict__ gemm_w, int 
 }
 
 // ---------------------------------------------------------------------------------
-// The quantized two-shot's codec (QuickReduce's scheme): symmetric kBits integers with one
-// fp32 scale per group of kSumBatch packs, one thread's batch (32 values of a 2-byte T).
+// THE PUSH KERNELS' CODEC: what a group of kSumBatch packs (one thread's batch, 32 values of
+// a 2-byte T) looks like on the wire. kBits 16 is T itself (no scale); 8 and 4 are
+// QuickReduce's symmetric integers with one fp32 scale per group.
 // ---------------------------------------------------------------------------------
 
 template <typename T, int kBits>
-struct QuantCodec {
+struct Codec {
   using V                    = typename traits<T>::V;
   static constexpr int N     = traits<T>::N;
   static constexpr int kVals = kSumBatch * N;
+  static_assert(sizeof(T) == 2, "the codec is built for 2-byte T");
+  static_assert(kBits == 16 || kBits == 8 || kBits == 4, "16 (T), INT8 and INT4 are built");
+  static constexpr bool kScaled = kBits < 16;
   // The payload of one group, in 16-byte packs: 32 values x kBits.
   static constexpr int kPayloadPacks = kVals * kBits / 8 / 16;
-  static constexpr int kMax          = (1 << (kBits - 1)) - 1;
-  static_assert(kBits == 8 || kBits == 4, "INT8 and INT4 are built");
-  static_assert(kVals * kBits % 128 == 0, "a group's payload fills whole packs");
+  static constexpr int kMax          = kScaled ? (1 << (kBits - 1)) - 1 : 0;
 
-  // x -> payload; returns the scale, absmax / kMax (0 for an all-zero group).
+  // x -> payload; returns the scale, absmax / kMax (0 for an all-zero group; unused at 16).
   static DINLINE float encode(const float (&x)[kVals], V (&payload)[kPayloadPacks]) {
-    float amax = 0.0f;
+    if constexpr (!kScaled) {
 #pragma unroll
-    for (int i = 0; i < kVals; ++i) amax = fmaxf(amax, fabsf(x[i]));
-    const float scale = amax / kMax;
-    const float inv   = amax > 0.0f ? kMax / amax : 0.0f;
-    unsigned char bytes[kPayloadPacks * 16];
+      for (int i = 0; i < kVals; ++i) payload[i / N].d[i % N] = static_cast<T>(x[i]);
+      return 1.0f;
+    } else {
+      float amax = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kVals; ++i) {
-      const int q = static_cast<int>(fminf(fmaxf(rintf(x[i] * inv), -kMax - 1.0f), kMax));
-      if constexpr (kBits == 8) {
-        bytes[i] = static_cast<unsigned char>(q & 0xFF);
-      } else if (i % 2 == 0) {
-        bytes[i / 2] = static_cast<unsigned char>(q & 0xF);
-      } else {
-        bytes[i / 2] |= static_cast<unsigned char>((q & 0xF) << 4);
+      for (int i = 0; i < kVals; ++i) amax = fmaxf(amax, fabsf(x[i]));
+      const float scale = amax / kMax;
+      const float inv   = amax > 0.0f ? kMax / amax : 0.0f;
+      unsigned char bytes[kPayloadPacks * 16];
+#pragma unroll
+      for (int i = 0; i < kVals; ++i) {
+        const int q =
+            static_cast<int>(fminf(fmaxf(rintf(x[i] * inv), -kMax - 1.0f), kMax));
+        if constexpr (kBits == 8) {
+          bytes[i] = static_cast<unsigned char>(q & 0xFF);
+        } else if (i % 2 == 0) {
+          bytes[i / 2] = static_cast<unsigned char>(q & 0xF);
+        } else {
+          bytes[i / 2] |= static_cast<unsigned char>((q & 0xF) << 4);
+        }
       }
+      __builtin_memcpy(payload, bytes, sizeof(bytes));
+      return scale;
     }
-    __builtin_memcpy(payload, bytes, sizeof(bytes));
-    return scale;
   }
 
   // payload, scale -> x.
   static DINLINE void decode(const V (&payload)[kPayloadPacks], float scale,
                              float (&x)[kVals]) {
-    unsigned char bytes[kPayloadPacks * 16];
-    __builtin_memcpy(bytes, payload, sizeof(bytes));
+    if constexpr (!kScaled) {
 #pragma unroll
-    for (int i = 0; i < kVals; ++i) {
-      int q;
-      if constexpr (kBits == 8) {
-        q = static_cast<signed char>(bytes[i]);
-      } else {
-        const int nib = (bytes[i / 2] >> (4 * (i % 2))) & 0xF;
-        q             = nib >= 8 ? nib - 16 : nib;
+      for (int i = 0; i < kVals; ++i) x[i] = static_cast<float>(payload[i / N].d[i % N]);
+    } else {
+      unsigned char bytes[kPayloadPacks * 16];
+      __builtin_memcpy(bytes, payload, sizeof(bytes));
+#pragma unroll
+      for (int i = 0; i < kVals; ++i) {
+        int q;
+        if constexpr (kBits == 8) {
+          q = static_cast<signed char>(bytes[i]);
+        } else {
+          const int nib = (bytes[i / 2] >> (4 * (i % 2))) & 0xF;
+          q             = nib >= 8 ? nib - 16 : nib;
+        }
+        x[i] = static_cast<float>(q) * scale;
       }
-      x[i] = static_cast<float>(q) * scale;
     }
   }
 };

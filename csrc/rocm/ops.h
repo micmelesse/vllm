@@ -79,7 +79,8 @@ void rocm_comms_register_graph_buffers(
 int64_t rocm_comms_pending_count(fptr_t comms);
 
 void rocm_comms_set_launch_override(fptr_t comms, int64_t kernel, int64_t blocks,
-                                    int64_t threads, int64_t gemm_lanes_per_col);
+                                    int64_t threads, int64_t gemm_lanes_per_col,
+                                    int64_t quant_bits);
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
                        int64_t element_size);

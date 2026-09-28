@@ -14,7 +14,7 @@ namespace hip_comms {
 // row, so there is nothing to gather. `blocks` is [rows, num_sources, hidden] with row and
 // source strides in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_add_attn_res_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_add_attn_res_rms_norm(
     ipc::Peers p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
     int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
     const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,

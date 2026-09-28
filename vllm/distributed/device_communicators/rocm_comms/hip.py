@@ -32,21 +32,22 @@ from .base import Communicator, FusedOp
 logger = logging.getLogger(__name__)
 
 
-# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh). Named
+# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh), named
+# by shot, direction (pull reads peers, push writes into them) and what it fuses. Named
 # only to force one through `set_launch_override`; nothing else picks.
 Kernel = Literal[
-    "one_shot",
-    "two_shot",
-    "one_shot_rms_norm",
-    "two_shot_rms_norm",
-    "one_shot_add_rms_norm",
-    "two_shot_add_rms_norm",
-    "one_shot_add_attn_res_rms_norm",
-    "two_shot_add_attn_res_rms_norm",
-    "one_shot_rms_norm_gemm_add",
-    "two_shot_rms_norm_gemm_add",
-    "two_shot_int8",
-    "two_shot_int4",
+    "one_shot_pull",
+    "one_shot_push",
+    "two_shot_pull",
+    "two_shot_push",
+    "one_shot_pull_rms_norm",
+    "two_shot_pull_rms_norm",
+    "one_shot_pull_add_rms_norm",
+    "two_shot_pull_add_rms_norm",
+    "one_shot_pull_add_attn_res_rms_norm",
+    "two_shot_pull_add_attn_res_rms_norm",
+    "one_shot_pull_rms_norm_gemm_add",
+    "two_shot_pull_rms_norm_gemm_add",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i
@@ -242,13 +243,15 @@ class HipCommunicator(Communicator):
         blocks: int = 16,
         threads: int = 512,
         gemm_lanes_per_col: int = 0,
+        quant_bits: int = 0,
     ) -> None:
-        """Force `kernel` at this geometry, and the GEMM tail's lanes per column (0: the
-        table's), for every later launch of its op, refusing any other op, until cleared
-        with None. The sweep's and the tests' handle; the model never calls it."""
+        """Force `kernel` at this geometry, the GEMM tail's lanes per column and a push
+        kernel's codec bits (16: unquantized, 8, 4; each 0: the table's), for every
+        later launch of its op, refusing any other op, until cleared with None. The
+        sweep's and the tests' handle; the model never calls it."""
         wire = -1 if kernel is None else _KERNEL_WIRE[kernel]
         torch.ops._rocm_C.rocm_comms_set_launch_override(
-            self._handle, wire, blocks, threads, gemm_lanes_per_col
+            self._handle, wire, blocks, threads, gemm_lanes_per_col, quant_bits
         )
 
     def set_checked(self, checked: bool) -> None:
@@ -292,6 +295,14 @@ class HipCommunicator(Communicator):
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, self._as_input(inp))
         return out
+
+    def _is_supported(self, inp: torch.Tensor) -> bool:
+        """The base's shape and dtype, and the plain all-reduce C++ picks for it runs:
+        a push kernel holds every rank's slice in its inboxes, so its scratch can run
+        out where a pull kernel's would not."""
+        return super()._is_supported(inp) and torch.ops._rocm_C.rocm_comms_admits(
+            self._handle, 0, 1, inp.numel(), inp.element_size()
+        )
 
     def _admits(self, op: FusedOp, inp: torch.Tensor) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits

@@ -178,9 +178,16 @@ DISABLED = {
 
 # Control FIRST, because it is the outermost pytest parameter and therefore the first
 # case to run: if torch is red, nothing after it means anything.
-# hip three ways: as C++ picks, and each plain kernel forced; the other backends have
-# one kernel each. A SHOT names a kernel of the op under test, `f"{shot}_{op}"`.
-Shot = Literal["one_shot", "two_shot"]
+# hip as C++ picks, and each all_reduce kernel forced (both shots, pulled and pushed; a
+# push kernel unquantized here); the other backends have one kernel each. A SHOT names a
+# fused kernel of the op under test, `f"{shot}_{op}"`: every fused kernel pulls.
+ALL_REDUCE_KERNELS: tuple[Kernel, ...] = (
+    "one_shot_pull",
+    "one_shot_push",
+    "two_shot_pull",
+    "two_shot_push",
+)
+Shot = Literal["one_shot_pull", "two_shot_pull"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
 BACKEND_KERNELS = tuple(
     pytest.param(
@@ -190,7 +197,7 @@ BACKEND_KERNELS = tuple(
         marks=[pytest.mark.skip(reason=DISABLED[name])] if name in DISABLED else [],
     )
     for name in _BACKEND_CLASS
-    for kernel in ((None, *SHOTS) if name == "hip" else (None,))
+    for kernel in ((None, *ALL_REDUCE_KERNELS) if name == "hip" else (None,))
 )
 
 
@@ -314,12 +321,13 @@ def _build_communicator(
     device_group: ProcessGroup,
     device: torch.device,
     kernel: Kernel | None = None,
+    quant_bits: int = 0,
 ) -> Communicator:
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
     if kernel is not None:
         if not isinstance(comm, HipCommunicator):
             raise RuntimeError(f"kernel={kernel!r} is hip's; {backend} has one kernel")
-        comm.set_launch_override(kernel)
+        comm.set_launch_override(kernel, quant_bits=quant_bits)
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
     # remember to extend when a backend is added.
@@ -1450,15 +1458,16 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
 
 
 # ---------------------------------------------------------------------------------
-# THE QUANTIZED TWO-SHOT: lossy by design, so judged by its error against the fp32 sum
-# rather than a tolerance per element, and by every rank holding the same bits (each
-# decodes the same bytes).
+# THE QUANTIZED PUSH KERNELS: lossy by design, so judged by their error against the fp32
+# sum rather than a tolerance per element, and by every rank holding the same bits (each
+# decodes the same bytes in the same order).
 # ---------------------------------------------------------------------------------
 
-# Relative RMS error, ||got - sum|| / ||sum||, over Gaussian inputs. Each value is
-# quantized twice (the input and the reduced slice); at one scale per 32 values the
-# expected error is ~0.007 for INT8 and ~0.12 for INT4.
-QUANTIZED_MAX_REL_RMSE = {"two_shot_int8": 0.02, "two_shot_int4": 0.25}
+# Relative RMS error, ||got - sum|| / ||sum||, over Gaussian inputs, by codec bits. At
+# one scale per 32 values the two-shot (quantized twice: the input, then the reduced
+# slice) expects ~0.007 for INT8 and ~0.12 for INT4; the one-shot (once) less.
+QUANTIZED_MAX_REL_RMSE = {8: 0.02, 4: 0.25}
+QUANTIZED_KERNELS: tuple[Kernel, ...] = ("one_shot_push", "two_shot_push")
 # Kimi-K3's decode rows, a prefill chunk, and its largest prefill; 4 rows is fewer
 # than the ranks.
 QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 7168))
@@ -1468,12 +1477,13 @@ def run_quantized_rank(
     rank: int,
     world: int,
     kernel: Kernel,
+    bits: int,
     shape: tuple[int, int],
     dtype_name: str,
     init_method: str,
 ) -> tuple[float | None, int | None, str | None]:
-    """ONE rank: the forced quantized kernel over every rank's seeded input. Returns
-    `(rel_rmse, digest, err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
+    """ONE rank: the forced push kernel at `bits` over every rank's seeded input.
+    Returns `(rel_rmse, digest, err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
     dtype = D_DTYPES[dtype_name]
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -1487,7 +1497,9 @@ def run_quantized_rank(
     torch.cuda.synchronize()
     try:
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        with _build_communicator("hip", cpu_group, group, device, kernel) as comm:
+        with _build_communicator(
+            "hip", cpu_group, group, device, kernel, quant_bits=bits
+        ) as comm:
             mine = inputs[rank].to(device)
             if not comm.should_allreduce(mine):
                 return None, None, NO_FUSED_KERNEL
@@ -1511,9 +1523,11 @@ def run_quantized_rank(
 
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("shape", QUANTIZED_SHAPES)
-@pytest.mark.parametrize("kernel", tuple(QUANTIZED_MAX_REL_RMSE))
-def test_quantized_two_shot_is_close_and_identical_on_every_rank(
+@pytest.mark.parametrize("bits", tuple(QUANTIZED_MAX_REL_RMSE))
+@pytest.mark.parametrize("kernel", QUANTIZED_KERNELS)
+def test_quantized_push_is_close_and_identical_on_every_rank(
     kernel: Kernel,
+    bits: int,
     shape: tuple[int, int],
     dtype_name: str,
     world: int,
@@ -1529,19 +1543,19 @@ def test_quantized_two_shot_is_close_and_identical_on_every_rank(
     try:
         rets = [
             pool.apply_async(
-                run_quantized_rank, (r, world, kernel, shape, dtype_name, init)
+                run_quantized_rank, (r, world, kernel, bits, shape, dtype_name, init)
             )
             for r in range(world)
         ]
         got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
     finally:
         pool.terminate()
-    where = f"{kernel} {shape} {dtype_name}"
+    where = f"{kernel} int{bits} {shape} {dtype_name}"
     if any(err == NO_FUSED_KERNEL for _, _, err in got):
         pytest.skip(f"hip declines {where}")
     bad = [err for _, _, err in got if err is not None]
     assert not bad, f"{where}: " + "; ".join(bad)
     rels = [rel for rel, _, _ in got]
     print(f"      => {where}: rel_rmse {max(rels):.4g}", flush=True)
-    assert max(rels) <= QUANTIZED_MAX_REL_RMSE[kernel], f"{where}: rel_rmse {rels}"
+    assert max(rels) <= QUANTIZED_MAX_REL_RMSE[bits], f"{where}: rel_rmse {rels}"
     assert len({d for _, d, _ in got}) == 1, f"{where}: ranks hold different outputs"

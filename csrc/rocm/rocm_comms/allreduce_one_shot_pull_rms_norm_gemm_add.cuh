@@ -19,7 +19,7 @@ namespace hip_comms {
 // At most kGemmRows rows: one GEMM pass.
 // kLanesPerCol is the GEMM's lanes per column, tuned in launch.cuh.
 template <typename T, int ngpus, int kLanesPerCol>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_rms_norm_gemm_add(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_pull_rms_norm_gemm_add(
     ipc::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0, int rows,
     int packs) {
