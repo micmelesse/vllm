@@ -65,12 +65,14 @@ constexpr int kRows = 16;
 // 64 KiB, 96 packs (24 KiB).
 constexpr int kChunk = kDevice.lds_bytes >= 160 * kKiB ? 448 : 96;
 
-// THE BLOCK THE DEVICE'S LDS HOLDS: the staged chunk, the block sums, and one [kRows][tile] float
-// partial per wave, tile = kWaveSize / lanes columns.
+// ITS LDS: the staged chunk and the block sums, plus one [kRows][tile] float partial per wave,
+// tile = kWaveSize / lanes columns. The device decides how many waves that allows.
+constexpr int64_t kLdsFixed = int64_t{kRows} * kChunk * kPackBytes + kBlockSumLdsBytes;
+constexpr int64_t lds_per_wave(int lanes_per_col) {
+  return int64_t{kRows} * (kWaveSize / lanes_per_col) * sizeof(float);
+}
 constexpr int max_waves(int lanes_per_col) {
-  const int64_t room = kDevice.lds_bytes - int64_t{kRows} * kChunk * kPackBytes - kBlockSumLdsBytes;
-  const int64_t per_wave = int64_t{kRows} * (kWaveSize / lanes_per_col) * sizeof(float);
-  return room / per_wave < kMaxWaves ? static_cast<int>(room / per_wave) : kMaxWaves;
+  return lds_max_waves(kDevice, kLdsFixed, lds_per_wave(lanes_per_col));
 }
 constexpr int max_threads(int lanes_per_col) { return max_waves(lanes_per_col) * kWaveSize; }
 static_assert(max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
