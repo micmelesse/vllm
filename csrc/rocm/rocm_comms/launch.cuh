@@ -2,8 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // WHICH KERNEL RUNS, AND HOW WIDE. The caller names an op; this picks one kernel from the
-// flat list and its launch geometry, for gfx950. Nothing above C++ sees an algorithm or a
-// geometry.
+// flat list and its launch geometry, from the target's table (hardware.cuh). Nothing above C++
+// sees an algorithm or a geometry.
 
 #pragma once
 
@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "fusions/rms_norm_gemm_add.cuh"
+#include "hardware.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -23,8 +24,10 @@ enum class Op : int {
   add_attn_res_rms_norm = 3,
   rms_norm_gemm_add     = 4,
 };
+static_assert(static_cast<int>(Op::rms_norm_gemm_add) + 1 == kOps,
+              "hardware.cuh's table has a row per Op");
 
-// Every `__global__` there is, once, named by its shot, its direction and what it fuses.
+// Every `__global__` there is, once, named by its direction, its shot and what it fuses.
 // `none` is a decline: the caller runs the unfused ops.
 //   PULL: a rank reads its peers' buffers (inputs, or scratch they filled)
 //   PUSH: a rank writes into its peers' inboxes and reads only its own memory; the push
@@ -118,47 +121,7 @@ struct Launch {
   int quant_bits;
 };
 
-// EVERY DECISION TUNED TO THE HARDWARE, per op, for gfx950 (8 x MI355X), from the
-// microbench sweep of 2026-09-27 at Kimi-K3's shapes:
-//   one_shot_max_bytes   one-shot at or under, two-shot above (12.9 vs 27.1 us at
-//                        16 x 7168; two-shot wins by 3.67 MB)
-//   fused_max_bytes      declined above, so the caller runs the unfused ops (kNever: never
-//                        declined; kAlways: always)
-//   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks;
-//                        the GEMM tail wants one block per 16-column tile (56 at Kimi-K3)
-//   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
-//   push_one_shot,       each shot's direction: the push kernel over the pull one
-//   push_two_shot
-//   quant_bits           a push kernel's codec: 16 (T itself), 8 or 4; the lossy two stay
-//                        off until the model's accuracy is checked with them
-struct OpTuning {
-  int64_t one_shot_max_bytes;
-  int64_t fused_max_bytes;
-  int one_shot_blocks;
-  int two_shot_blocks;
-  int threads;
-  int gemm_lanes_per_col;
-  bool push_one_shot;
-  bool push_two_shot;
-  int quant_bits;
-};
-
-constexpr int64_t kNever  = INT64_MAX;
-constexpr int64_t kAlways = -1;
-constexpr int64_t kKiB    = 1024;
-
-// Indexed by Op. AttnRes past one-shot's range loses to unfused (2143 vs 1093 us at 4096
-// rows); the GEMM tail is declined until its rewrite measures faster than unfused (37 us at
-// 16 rows).
-constexpr OpTuning kGfx950[] = {
-    /* all_reduce            */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* rms_norm              */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* add_rms_norm          */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* add_attn_res_rms_norm */ {512 * kKiB, 512 * kKiB, 16, 36, 512, 0, false, false, 16},
-    /* rms_norm_gemm_add     */ {512 * kKiB, kAlways, 56, 56, 512, 4, false, false, 16},
-};
-
-constexpr const OpTuning& tuning(Op op) { return kGfx950[static_cast<int>(op)]; }
+constexpr const OpTuning& tuning(Op op) { return kTarget.ops[static_cast<int>(op)]; }
 
 // A row op's one-shot kernel gives each block a row, so it needs no more blocks than rows;
 // everything else strides over the whole grid.

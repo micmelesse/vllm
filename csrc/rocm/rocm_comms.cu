@@ -60,14 +60,14 @@ namespace hip_comms {
 // THE TABLE STAYS WITHIN WHAT THE KERNELS WERE BUILT FOR: a tuned value past a capability
 // is a compile error, not a kernel that overruns its signal slots or register arrays.
 constexpr bool table_fits() {
-  for (const OpTuning& t : kGfx950) {
+  for (const OpTuning& t : kTarget.ops) {
     if (t.one_shot_blocks < 1 || t.one_shot_blocks > p2p::kMaxBlocks) return false;
     if (t.two_shot_blocks < 1 || t.two_shot_blocks > p2p::kMaxBlocks) return false;
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
   }
-  for (int i = 0; i < static_cast<int>(sizeof(kGfx950) / sizeof(OpTuning)); ++i) {
-    const OpTuning& t = kGfx950[i];
+  for (int i = 0; i < kOps; ++i) {
+    const OpTuning& t = kTarget.ops[i];
     const Op op       = static_cast<Op>(i);
     if (t.push_one_shot && kernel_of(op, true, false) == Kernel::none) return false;
     if (t.push_two_shot && kernel_of(op, true, true) == Kernel::none) return false;
@@ -76,7 +76,7 @@ constexpr bool table_fits() {
   const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
   return v == 1 || v == 2 || v == 4 || v == 8;
 }
-static_assert(table_fits(), "launch.cuh's table exceeds a kernel capability");
+static_assert(table_fits(), "hardware.cuh's table exceeds a kernel capability");
 
 // A CALLER'S LAUNCH, passed with every call (the sweep's and the tests'; the model passes
 // none): a kernel, its geometry, the GEMM tail's lanes per column and a push kernel's

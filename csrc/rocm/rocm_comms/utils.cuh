@@ -2,12 +2,14 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Shared by the collectives and the fusions: the 16-byte vector, global and uncached
-// loads, block sums, the hardware's sizes. The peer layer is p2p/, what a fused op
+// loads, block sums. The peer layer is p2p/, what a fused op
 // computes is fusions/.
 
 #pragma once
 
 #include <hip/hip_runtime.h>
+
+#include "hardware.cuh"
 
 #include <cmath>
 #include <cstdint>
@@ -89,11 +91,7 @@ DINLINE void store_uncached(V* p, const V& v) {
 // over latency, and one pack per peer per wait left the one-shot at a quarter of aiter's.
 constexpr int kSumBatch = 4;
 
-// THE HARDWARE, named once: gfx9 runs 64-lane waves, and every kernel here is built for at
-// most kMaxThreads per block (its __launch_bounds__), so a block holds at most kMaxWaves.
-constexpr int kWaveSize   = 64;
-constexpr int kMaxThreads = 512;
-constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
+// THE HARDWARE'S SIZES (kWaveSize, kMaxThreads, kMaxWaves) are the target's: hardware.cuh.
 
 // Sum of `v` over the block. A block wider than kMaxThreads cannot be launched, so
 // `partial` cannot be overrun.
