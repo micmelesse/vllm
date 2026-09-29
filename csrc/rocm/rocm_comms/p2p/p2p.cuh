@@ -12,7 +12,16 @@
 // where a phase leaves data for a later one: made by `slot`, passed back, never looked
 // into; slots are laid end to end (`slot(w, t, ..., previous_slot)`).
 //
-// p2p::                      every kernel
+// p2p::simple::              communication only, for a kernel that writes its algorithm out
+//                            (the API every kernel is moving to; the phases below are the old)
+//   input<T>(p, rank)              that rank's input for this launch
+//   scratch<T, ngpus>(p, rank)     that rank's scratch
+//   start_sync<ngpus>(p)           first: every peer has launched, its input ready to read
+//   end_sync<ngpus, kFinal>(p)     later: every peer has reached here; unless kFinal, what
+//                                  this block wrote before is visible to the same block on
+//                                  every peer after
+//
+// p2p::                      the phases the fused kernels compose (below)
 //   start<T, ngpus>(p)             first; returns w once every peer has launched
 //   peer_barrier(w)                this block and the same block on every peer: what
 //                                  each wrote before is visible to the others after

@@ -87,6 +87,30 @@ DINLINE void store_uncached(V* p, const V& v) {
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
+// ONE PACK SUMMED OVER `ngpus` SOURCES, in fp32 and rounded once to T. Every load before
+// any add, so the ngpus loads are in flight together; the sources in the order given, so
+// callers that give them in rank order agree bitwise.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V sum_packs(const typename traits<T>::V* const (&src)[ngpus],
+                                        int64_t i) {
+  using V         = typename traits<T>::V;
+  constexpr int N = traits<T>::N;
+  V raw[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) raw[r] = load_global(src[r] + i);
+  float acc[N];
+#pragma unroll
+  for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[0].d[j]);
+#pragma unroll
+  for (int r = 1; r < ngpus; ++r)
+#pragma unroll
+    for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[r].d[j]);
+  V out;
+#pragma unroll
+  for (int j = 0; j < N; ++j) out.d[j] = static_cast<T>(acc[j]);
+  return out;
+}
+
 // PACKS PER PEER A THREAD HAS IN FLIGHT in a batched `sum`: bandwidth is bytes in flight
 // over latency, and one pack per peer per wait left the one-shot at a quarter of aiter's.
 constexpr int kSumBatch = 4;

@@ -282,7 +282,56 @@ DINLINE const typename traits<T>::V* ptr(const World<T, ngpus>& w, int peer, int
 }  // namespace impl
 
 // =================================================================================
-// THE PRIMITIVES (listed in p2p.cuh).
+// COMMUNICATION ONLY (listed in p2p.cuh): where every rank's memory is, and the syncs. A
+// kernel built on these writes its algorithm out -- the loads, the sum, the stores and
+// where it syncs -- as vLLM's and aiter's custom all-reduce kernels do. The API every
+// kernel is moving to; the phases below are the old one.
+// =================================================================================
+
+namespace simple {
+
+// Rank `rank`'s input for this launch. Read every rank in rank order and the sum agrees
+// bitwise across ranks.
+template <typename T>
+DINLINE const typename traits<T>::V* input(const Peers& p, int rank) {
+  return reinterpret_cast<const typename traits<T>::V*>(p.inputs->p[rank]);
+}
+
+// Rank `peer`'s scratch, the bytes after its signal block. BY SELECT, NOT an index into
+// the pointer array: a runtime index into a register array moves it to scratch memory.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V* scratch(const Peers& p, int peer) {
+  using V = typename traits<T>::V;
+  V* at   = reinterpret_cast<V*>(p.signals.s[0] + 1);
+#pragma unroll
+  for (int i = 1; i < ngpus; ++i)
+    if (peer == i) at = reinterpret_cast<V*>(p.signals.s[i] + 1);
+  return at;
+}
+
+// A KERNEL'S FIRST SYNC: this block signals the same block on every rank and waits for
+// theirs, so every peer has launched and its input is ready to read.
+template <int ngpus>
+DINLINE void start_sync(const Peers& p) {
+  impl::skew(p);
+  impl::pair_blocks<ngpus, false>(p, true);
+}
+
+// A LATER SYNC, the same exchange once every thread of the block is there. kFinal: it
+// only says when (every peer is done reading this rank). Otherwise it also orders: what
+// this block wrote before is visible to the same block on every peer after, and a peer
+// may read only what that block wrote, so both sides of it must index the same data by
+// the same thread.
+template <int ngpus, bool kFinal>
+DINLINE void end_sync(const Peers& p) {
+  impl::skew(p);
+  impl::pair_blocks<ngpus, !kFinal>(p, false);
+}
+
+}  // namespace simple
+
+// =================================================================================
+// THE PHASES (listed in p2p.cuh), which the fused kernels compose.
 // =================================================================================
 
 template <typename T, int ngpus>
