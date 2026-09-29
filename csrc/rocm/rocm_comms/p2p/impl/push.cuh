@@ -168,7 +168,7 @@ DINLINE void push_payload(const World<T, ngpus>& w, int peer, const PushSlot<C, 
   const int sent = payload_packs<C>(n);
 #pragma unroll
   for (int k = 0; k < C::kPayloadPacks; ++k)
-    if (k < sent) put(w, peer, at + k, q[k]);
+    if (k < sent) put_pushed(w, peer, at + k, q[k]);
   if constexpr (C::kScaled) put_float(w, peer, s.scale(w.peers.rank, g), scale);
 }
 
