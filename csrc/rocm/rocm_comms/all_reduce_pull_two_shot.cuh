@@ -44,11 +44,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
   V* dst = reinterpret_cast<V*>(out);
   for (int i = first; i < slice_packs; i += stride) {
+    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
+    // and the peers' scratch apart, so a store between two loads holds the next load back
+    // until the store is done, and the eight owners' round trips run one after another.
+    V got[ngpus] = {};
 #pragma unroll
     for (int r = 0; r < ngpus; ++r)
       if (r * slice_packs + i < num_packs)
-        store_global(dst + r * slice_packs + i,
-                     load_global(p2p::simple::scratch<T, ngpus>(p, r) + i));
+        got[r] = load_global(p2p::simple::scratch<T, ngpus>(p, r) + i);
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r)
+      if (r * slice_packs + i < num_packs) store_global(dst + r * slice_packs + i, got[r]);
   }
 }
 

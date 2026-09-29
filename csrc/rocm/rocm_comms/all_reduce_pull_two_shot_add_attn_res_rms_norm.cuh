@@ -69,18 +69,26 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 4. Every owner's rows out of its scratch, into `out`, `prefix` and the written block. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
+    // and the peers' scratch apart, so a store between two loads holds the next load back
+    // until the store is done, and the eight owners' round trips run one after another.
+      const int64_t at = int64_t{l} * packs + i;
+      V got[ngpus] = {}, got_pre[ngpus] = {};
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) {
-      const int row = r * slice_rows + l;
-      if (row >= rows) continue;
-      const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
-      V* dst          = written(row);
-      for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-        const int64_t at = int64_t{l} * packs + i;
-        const V v        = load_global(theirs + pre_at + at);
-        store_global(o + int64_t{row} * packs + i, load_global(theirs + at));
-        store_global(pre + int64_t{row} * packs + i, v);
-        if (dst) store_global(dst + i, v);
+      for (int r = 0; r < ngpus; ++r) {
+        if (r * slice_rows + l >= rows) continue;
+        const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
+        got[r]          = load_global(theirs + at);
+        got_pre[r]      = load_global(theirs + pre_at + at);
+      }
+#pragma unroll
+      for (int r = 0; r < ngpus; ++r) {
+        const int row = r * slice_rows + l;
+        if (row >= rows) continue;
+        store_global(o + int64_t{row} * packs + i, got[r]);
+        store_global(pre + int64_t{row} * packs + i, got_pre[r]);
+        if (V* dst = written(row)) store_global(dst + i, got_pre[r]);
       }
     }
   }

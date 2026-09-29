@@ -63,16 +63,25 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
+    // and the peers' scratch apart, so a store between two loads holds the next load back
+    // until the store is done, and the eight owners' round trips run one after another.
+      const int64_t at = int64_t{l} * packs + i;
+      V got[ngpus] = {}, got_res[ngpus] = {};
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) {
-      const int row = r * slice_rows + l;
-      if (row >= rows) continue;
-      const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
-      for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-        const int64_t at = int64_t{l} * packs + i;
-        store_global(o + int64_t{row} * packs + i, load_global(theirs + at));
-        if constexpr (kAdd)
-          store_global(res_out + int64_t{row} * packs + i, load_global(theirs + res_at + at));
+      for (int r = 0; r < ngpus; ++r) {
+        if (r * slice_rows + l >= rows) continue;
+        const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
+        got[r]          = load_global(theirs + at);
+        if constexpr (kAdd) got_res[r] = load_global(theirs + res_at + at);
+      }
+#pragma unroll
+      for (int r = 0; r < ngpus; ++r) {
+        const int row = r * slice_rows + l;
+        if (row >= rows) continue;
+        store_global(o + int64_t{row} * packs + i, got[r]);
+        if constexpr (kAdd) store_global(res_out + int64_t{row} * packs + i, got_res[r]);
       }
     }
   }

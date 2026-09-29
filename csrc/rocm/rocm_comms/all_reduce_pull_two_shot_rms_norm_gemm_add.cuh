@@ -53,14 +53,20 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_n
 
   // 4. Every owner's normed rows out of its scratch, into the workspace.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
+    // and the peers' scratch apart, so a store between two loads holds the next load back
+    // until the store is done, and the eight owners' round trips run one after another.
+      V got[ngpus] = {};
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) {
-      const int row = r * slice_rows + l;
-      if (row >= rows) continue;
-      const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
-      for (int i = threadIdx.x; i < packs; i += blockDim.x)
-        store_global(normed + int64_t{row} * packs + i,
-                     load_global(theirs + int64_t{l} * packs + i));
+      for (int r = 0; r < ngpus; ++r)
+        if (r * slice_rows + l < rows)
+          got[r] = load_global(p2p::simple::scratch<T, ngpus>(p, r) + int64_t{l} * packs + i);
+#pragma unroll
+      for (int r = 0; r < ngpus; ++r) {
+        const int row = r * slice_rows + l;
+        if (row < rows) store_global(normed + int64_t{row} * packs + i, got[r]);
+      }
     }
   }
 
