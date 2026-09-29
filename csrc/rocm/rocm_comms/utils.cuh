@@ -70,19 +70,19 @@ DINLINE V load_uncached(const V* p) {
   return v;
 }
 
-// WHAT A RANK PUSHES into a peer, stored past every cache (system-scope stores): the twin of
-// `load_uncached`. A plain store to a peer's memory can be acknowledged before the peer can
-// see it, so a wave's `s_waitcnt vmcnt(0)` before the barrier did not mean the data had
-// landed, and the slowest rank's pushes arrived after its barrier flag (readers then read the
-// previous call's values). A system-scope store completes only once it is visible there.
+// WHAT A RANK PUSHES into a peer, stored past every cache: one 16-byte store at system scope
+// (`sc0 sc1`, written through to the peer), the twin of `load_uncached`. A plain store to a
+// peer's memory can be acknowledged before the peer can see it, so a wave's `s_waitcnt
+// vmcnt(0)` before the barrier did not mean the data had landed, and the slowest rank's
+// pushes arrived after its barrier flag (readers read the previous call's values). With the
+// scope bits the same wait covers it. IN ASM because no builtin spells this store: a
+// system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
 template <typename V>
 DINLINE void store_uncached(V* p, const V& v) {
   static_assert(sizeof(V) == 16, "a pack is 16 bytes");
-  uint64_t raw[2];
-  __builtin_memcpy(raw, &v, 16);
-  auto* q = reinterpret_cast<uint64_t*>(p);
-  __scoped_atomic_store_n(q, raw[0], __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-  __scoped_atomic_store_n(q + 1, raw[1], __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  u32x4 raw;
+  __builtin_memcpy(&raw, &v, 16);
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
 // PACKS PER PEER A THREAD HAS IN FLIGHT in a batched `sum`: bandwidth is bytes in flight
