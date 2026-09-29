@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // WHICH KERNEL RUNS, AND HOW WIDE. The caller names an op; this picks one kernel from the
-// flat list and its launch geometry, from the target's table (hardware.cuh). Nothing above C++
+// flat list and describes its launch geometry; tune.cuh picks one for a call. Nothing above C++
 // sees an algorithm or a geometry.
 
 #pragma once
@@ -11,7 +11,6 @@
 #include <cstdint>
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "hardware.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -24,8 +23,6 @@ enum class Op : int {
   add_attn_res_rms_norm = 3,
   rms_norm_gemm_add     = 4,
 };
-static_assert(static_cast<int>(Op::rms_norm_gemm_add) + 1 == kOps,
-              "hardware.cuh's table has a row per Op");
 
 // Every `__global__` there is, once, named by its direction, its shot and what it fuses.
 // `none` is a decline: the caller runs the unfused ops.
@@ -121,8 +118,6 @@ struct Launch {
   int quant_bits;
 };
 
-constexpr const OpTuning& tuning(Op op) { return kTarget.ops[static_cast<int>(op)]; }
-
 // A row op's one-shot kernel gives each block a row, so it needs no more blocks than rows;
 // everything else strides over the whole grid.
 constexpr int grid_of(Kernel k, int blocks, int64_t rows) {
@@ -130,16 +125,6 @@ constexpr int grid_of(Kernel k, int blocks, int64_t rows) {
   const bool row_per_block =
       !is_two_shot(k) && op != Op::all_reduce && op != Op::rms_norm_gemm_add;
   return row_per_block && rows < blocks ? static_cast<int>(rows) : blocks;
-}
-
-inline Launch pick(Op op, int64_t rows, int64_t bytes) {
-  const OpTuning& t = tuning(op);
-  if (bytes > t.fused_max_bytes) return {Kernel::none, 0, 0, 0, 0};
-  const bool one_shot = bytes <= t.one_shot_max_bytes &&
-                        !(op == Op::rms_norm_gemm_add && rows > kGemmTailOneShotRows);
-  const Kernel k = kernel_of(op, one_shot ? t.push_one_shot : t.push_two_shot, !one_shot);
-  return {k, grid_of(k, one_shot ? t.one_shot_blocks : t.two_shot_blocks, rows), t.threads,
-          t.gemm_lanes_per_col, t.quant_bits};
 }
 
 }  // namespace hip_comms

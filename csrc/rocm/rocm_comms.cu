@@ -5,9 +5,9 @@
 // csrc. Built into `_rocm_C` with the other ROCm sources.
 //
 // THE CALLER NAMES AN OP; THIS PICKS THE KERNEL. Which kernel runs and how wide is decided
-// once, in launch.cuh, for gfx950: Python never sees an algorithm or a geometry. The
-// one way to force a choice is the launch every op takes last, which the sweep and the
-// tests pass and the model leaves at the table's. No getenv.
+// once, in tune.cuh, from the target's facts (hardware.cuh) and the input: Python never sees
+// an algorithm or a geometry. The one way to force a choice is the launch every op takes
+// last, which the sweep and the tests pass and the model leaves to tune.cuh. No getenv.
 //
 // Compile-time vs runtime is the one distinction that shapes everything. `ngpus` and the
 // dtype must be constexpr to unroll and vectorize, so they are template parameters and
@@ -18,8 +18,9 @@
 // rocm_comms/ holds the layers as headers, all included here so the device code stays in
 // this one translation unit and needs no -fgpu-rdc: p2p/ (the peer layer, host and
 // device, behind its one interface p2p/p2p.cuh), fusions/ (what a fused op computes),
-// launch.cuh (the picker), utils.cuh (what everything shares), then one
-// allreduce_<shot>_<pull|push>[_<op>].cuh per kernel. Design rules: CONTEXT.md, "Code
+// hardware.cuh (the target's facts), launch.cuh (the kernels there are), tune.cuh (the
+// picker), utils.cuh (what everything shares), then one
+// allreduce_<pull|push>_<shot>[_<op>].cuh per kernel. Design rules: CONTEXT.md, "Code
 // design".
 
 #include <ATen/cuda/CUDAContext.h>
@@ -54,29 +55,30 @@
 #include "rocm_comms/allreduce_push_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
 #include "rocm_comms/launch.cuh"
+#include "rocm_comms/tune.cuh"
 
 namespace hip_comms {
 
 // THE TABLE STAYS WITHIN WHAT THE KERNELS WERE BUILT FOR: a tuned value past a capability
 // is a compile error, not a kernel that overruns its signal slots or register arrays.
 constexpr bool table_fits() {
-  for (const OpTuning& t : kTarget.ops) {
+  for (const tune::Basic& t : tune::kBasic) {
     if (t.one_shot_blocks < 1 || t.one_shot_blocks > p2p::kMaxBlocks) return false;
     if (t.two_shot_blocks < 1 || t.two_shot_blocks > p2p::kMaxBlocks) return false;
     if (t.threads < kWaveSize || t.threads > kMaxThreads) return false;
     if (t.threads % kWaveSize != 0) return false;
   }
-  for (int i = 0; i < kOps; ++i) {
-    const OpTuning& t = kTarget.ops[i];
+  for (int i = 0; i < tune::kOps; ++i) {
+    const tune::Basic& t = tune::kBasic[i];
     const Op op       = static_cast<Op>(i);
     if (t.push_one_shot && kernel_of(op, true, false) == Kernel::none) return false;
     if (t.push_two_shot && kernel_of(op, true, true) == Kernel::none) return false;
     if (t.quant_bits != 16 && t.quant_bits != 8 && t.quant_bits != 4) return false;
   }
-  const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
+  const int v = tune::basic(Op::rms_norm_gemm_add).gemm_lanes_per_col;
   return v == 1 || v == 2 || v == 4 || v == 8;
 }
-static_assert(table_fits(), "hardware.cuh's table exceeds a kernel capability");
+static_assert(table_fits(), "tune.cuh's basic config exceeds a kernel capability");
 
 // A CALLER'S LAUNCH, passed with every call (the sweep's and the tests'; the model passes
 // none): a kernel, its geometry, the GEMM tail's lanes per column and a push kernel's
@@ -112,8 +114,8 @@ Launch launch_for(const Forced& f, Op op, int64_t rows, int64_t bytes) {
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
   return {f.kernel, grid_of(f.kernel, f.blocks, rows), f.threads,
-          f.gemm_lanes_per_col ? f.gemm_lanes_per_col : tuning(op).gemm_lanes_per_col,
-          f.quant_bits ? f.quant_bits : tuning(op).quant_bits};
+          f.gemm_lanes_per_col ? f.gemm_lanes_per_col : tune::basic(op).gemm_lanes_per_col,
+          f.quant_bits ? f.quant_bits : tune::basic(op).quant_bits};
 }
 
 // The scratch a launch needs on each rank, in bytes: the slots its kernel lays out, from
