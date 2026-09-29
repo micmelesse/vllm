@@ -6,6 +6,7 @@ A wrong shard offset or a dropped accumulation still runs and still produces
 plausible text, so these pin the arithmetic rather than the behaviour.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -161,9 +162,44 @@ def _check_writes_only_its_own_shard(
     torch.testing.assert_close(local[:, end:], before[:, end:], atol=0, rtol=0)
 
 
+def _check_one_all_reduce_matches_replicated(
+    device: torch.device, tp_size: int, rank: int
+) -> None:
+    """The boss's reorder: the norm's scale moved past the GEMM and one all-reduce of
+    [shared | projected | latent] must give what the two all-reduces give, and leave
+    the output reduced so its consumer does not reduce it again."""
+    os.environ["VLLM_KIMI_K3_MOE_TAIL"] = "one_all_reduce"
+    ROCmLatentMoERunner._fused_output_is_reduced = property(lambda _: False)
+    transform = _build_transform(device)
+    runner = _tail_runner(transform, tp_size)
+    object.__setattr__(runner, "_tail_shardable", True)
+    group = get_tp_group().device_group
+    assert runner.output_is_reduced
+
+    for iteration, num_tokens in enumerate((1, 5, 8, 16, 5)):
+        torch.manual_seed(100 * iteration + rank + 1)
+        routed_output, shared_output = _rank_partials(num_tokens, device)
+
+        expected = F.linear(
+            F.rms_norm(
+                _all_reduced(routed_output, group),
+                (LATENT_SIZE,),
+                transform.norm.weight,
+                EPS,
+            ),
+            transform.up_proj.weight,
+        )
+        expected.add_(_all_reduced(shared_output, group))
+
+        actual = runner._shard_up_proj_tail(routed_output, shared_output, None)
+
+        torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+
+
 _CHECKS = {
     "matches_replicated": _check_matches_replicated,
     "own_shard_only": _check_writes_only_its_own_shard,
+    "one_all_reduce_matches_replicated": _check_one_all_reduce_matches_replicated,
 }
 
 
@@ -199,6 +235,37 @@ def test_sharded_tail_tp8_matches_replicated_projection() -> None:
 @multi_gpu_test(num_gpus=4)
 def test_sharded_tail_tp4_writes_only_its_own_shard() -> None:
     _run_ranks("own_shard_only", 4)
+
+
+@multi_gpu_test(num_gpus=4)
+def test_one_all_reduce_tail_tp4_matches_replicated_projection() -> None:
+    _run_ranks("one_all_reduce_matches_replicated", 4)
+
+
+@multi_gpu_test(num_gpus=8)
+def test_one_all_reduce_tail_tp8_matches_replicated_projection() -> None:
+    _run_ranks("one_all_reduce_matches_replicated", 8)
+
+
+@pytest.mark.parametrize("tail", ["two_all_reduce", "one_all_reduce"])
+@pytest.mark.parametrize("shardable", [True, False])
+@pytest.mark.parametrize("pre_reduced", [True, False])
+def test_output_is_reduced_only_for_the_one_all_reduce_tail(
+    tail: str,
+    shardable: bool,
+    pre_reduced: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reduced output means the consumer skips its all-reduce: claimed wrongly, the
+    layer's output is off by a factor of the TP size, or never summed."""
+    monkeypatch.setenv("VLLM_KIMI_K3_MOE_TAIL", tail)
+    monkeypatch.setattr(
+        ROCmLatentMoERunner, "_fused_output_is_reduced", property(lambda _: pre_reduced)
+    )
+    runner = _runner(_tail_shardable=shardable)
+
+    expected = tail == "one_all_reduce" and shardable and not pre_reduced
+    assert runner.output_is_reduced is expected
 
 
 def _runner(**attrs) -> ROCmLatentMoERunner:
