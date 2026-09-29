@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -128,3 +129,43 @@ def latent_tail(
     # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
     # beta-add epilogue so folding in the shared partial costs no kernel.
     hidden_shard.addmm_(latent, up_proj_shard.t())
+
+
+def moe_tail_one_all_reduce() -> bool:
+    """Whether the latent-MoE tail runs as one all-reduce (`latent_tail_one_all_reduce`)
+    rather than two (`latent_tail`, then the output's)."""
+    return envs.VLLM_KIMI_K3_MOE_TAIL == "one_all_reduce"
+
+
+def latent_tail_one_all_reduce(
+    fused_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    norm: RMSNorm | None,
+    up_proj: torch.Tensor,
+) -> torch.Tensor:
+    """`all_reduce(shared_output + up_proj(norm(all_reduce(fused_output))))` in ONE
+    all-reduce, returned reduced. `up_proj` is the whole [hidden, latent] weight.
+
+    RMSNorm's only nonlinear part is a per-row scale, 1 / rms(L) with L the reduced
+    latent, so it moves past the GEMM: up(norm(L)) = ((g * L) @ W^T) / rms(L), and the
+    GEMM is linear, so (g * L) @ W^T = sum over ranks of (g * l_r) @ W^T. Each rank
+    projects its own partial latent l_r with the WHOLE up-projection (it is replicated),
+    one all-reduce carries [shared partial | projected partial | latent partial], and
+    out = S + P / rms(L) per row. The latent travels because rms(L) needs the true sum;
+    the ranks' partial sums of squares miss the cross terms."""
+    hidden = shared_output.shape[-1]
+    if norm is None:
+        return tensor_model_parallel_all_reduce(
+            torch.addmm(shared_output, fused_output, up_proj.t())
+        )
+    projected = (fused_output * norm.weight.to(fused_output.dtype)) @ up_proj.t()
+    reduced = tensor_model_parallel_all_reduce(
+        torch.cat([shared_output, projected, fused_output], dim=-1)
+    )
+    shared, proj, latent = reduced.split(
+        [hidden, hidden, fused_output.shape[-1]], dim=-1
+    )
+    inv_rms = torch.rsqrt(
+        latent.float().pow(2).mean(dim=-1, keepdim=True) + norm.variance_epsilon
+    )
+    return (shared.float() + proj.float() * inv_rms).to(shared_output.dtype)

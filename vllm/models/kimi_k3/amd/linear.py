@@ -286,6 +286,12 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+    @property
+    def output_is_reduced(self) -> bool:
+        """Whether this MoE's output leaves already all-reduced (its latent tail ran as
+        one all-reduce), so the AttnRes that consumes it must not reduce it again."""
+        return getattr(self.experts, "output_is_reduced", False)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -583,6 +589,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         prefix_delta: torch.Tensor | None = None,
+        prefix_delta_reduced: bool = False,
         **kwargs,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
@@ -591,7 +598,7 @@ class KimiDecoderLayer(nn.Module):
         if self.use_attn_residuals:
             assert residual is not None
             return self.forward_attn_residual(
-                positions, hidden_states, residual, prefix_delta
+                positions, hidden_states, residual, prefix_delta, prefix_delta_reduced
             )
 
         assert prefix_delta is None
@@ -609,12 +616,19 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    @property
+    def mlp_output_reduced(self) -> bool:
+        """Whether this layer's MLP output leaves already all-reduced; the model hands
+        that to the next layer as `prefix_delta_reduced`."""
+        return isinstance(self.mlp, KimiMoE) and self.mlp.output_is_reduced
+
     def forward_attn_residual(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
         prefix_delta: torch.Tensor | None,
+        prefix_delta_reduced: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
         prefix_sum, hidden_states = attn_res(
@@ -626,7 +640,8 @@ class KimiDecoderLayer(nn.Module):
             delta=prefix_delta,
             output_norm=self.input_layernorm,
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
-            reduce_delta=self.defer_all_reduce,
+            # The previous layer's MLP output: reduced here unless it left reduced.
+            reduce_delta=self.defer_all_reduce and not prefix_delta_reduced,
         )
 
         if self.is_block_write_layer:
@@ -808,6 +823,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
         prefix_delta = None
+        prefix_delta_reduced = False
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -818,7 +834,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 hidden_states=hidden_states,
                 residual=residual,
                 prefix_delta=prefix_delta,
+                prefix_delta_reduced=prefix_delta_reduced,
             )
+            prefix_delta_reduced = layer.mlp_output_reduced
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if layer.defer_all_reduce:
                     raise NotImplementedError(
@@ -845,7 +863,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.output_attn_res_norm,
             attn_res_block_num,
             delta=prefix_delta,
-            reduce_delta=self.layers[self.end_layer - 1].defer_all_reduce,
+            reduce_delta=(
+                self.layers[self.end_layer - 1].defer_all_reduce
+                and not prefix_delta_reduced
+            ),
         )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.

@@ -9,7 +9,11 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.models.kimi_k3.amd.fused_all_reduce import latent_tail
+from vllm.models.kimi_k3.amd.fused_all_reduce import (
+    latent_tail,
+    latent_tail_one_all_reduce,
+    moe_tail_one_all_reduce,
+)
 
 logger = init_logger(__name__)
 
@@ -55,6 +59,18 @@ class ROCmLatentMoERunner(MoERunner):
             )
         self._logged_sharded_tail = False
 
+    @property
+    def output_is_reduced(self) -> bool:
+        """ONE ALL-REDUCE, THEN THE NORM'S SCALE: the tail reduces the whole output
+        itself, so it leaves this runner reduced and its consumer must not reduce it
+        again. A property: the MoE kernel `_fused_output_is_reduced` asks is set up
+        after construction."""
+        return (
+            self._tail_shardable
+            and not self._fused_output_is_reduced
+            and moe_tail_one_all_reduce()
+        )
+
     def _shard_up_proj_tail(
         self,
         fused_output: torch.Tensor,
@@ -72,6 +88,11 @@ class ROCmLatentMoERunner(MoERunner):
 
         transform = self.routed_output_transform
         assert transform is not None
+        if self.output_is_reduced:
+            out = latent_tail_one_all_reduce(
+                fused_output, shared_output, transform.norm, transform.up_proj.weight
+            )
+            return out[..., :trunc_size] if trunc_size is not None else out
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
