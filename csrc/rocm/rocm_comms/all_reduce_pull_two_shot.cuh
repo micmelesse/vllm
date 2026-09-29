@@ -12,13 +12,13 @@
 
 namespace hip_comms {
 
-// `num_packs` packs cut into one slice of `slice_packs` per rank (the last one short), a thread a
-// pack at a time over the whole grid. THE SAME THREAD INDEXES A PACK IN BOTH PHASES: after the sync a
-// block may read only what the same block on a peer wrote.
+// `num_packs` packs cut into one slice of `slice_packs` per rank (the last one short), a thread
+// a pack at a time over the whole grid. THE SAME THREAD INDEXES A PACK IN BOTH PHASES: after the
+// sync a block may read only what the same block on a peer wrote.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
-  using V          = typename traits<T>::V;
+  using V               = typename traits<T>::V;
   const int slice_packs = (num_packs + ngpus - 1) / ngpus;
   const int first       = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride      = gridDim.x * blockDim.x;
