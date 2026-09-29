@@ -14,6 +14,7 @@ ladder, sharing one set of buffers -- replayed round-robin, with an eager fallba
 the middle.
 """
 
+import hashlib
 import logging
 import math
 import multiprocessing as mp
@@ -1482,7 +1483,7 @@ def run_quantized_rank(
     shape: tuple[int, int],
     dtype_name: str,
     init_method: str,
-) -> tuple[float | None, int | None, str | None]:
+) -> tuple[float | None, str | None, str | None]:
     """ONE rank: the forced push kernel at `bits` over every rank's seeded input.
     Returns `(rel_rmse, digest, err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
     dtype = D_DTYPES[dtype_name]
@@ -1506,7 +1507,8 @@ def run_quantized_rank(
             got = comm.all_reduce(mine, launch=launch).cpu().to(torch.float32)
         want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
         rel = ((got - want).norm() / want.norm()).item()
-        digest = hash(got.numpy().tobytes())
+        # sha256, not hash(): each rank is a spawned process with its own hash seed.
+        digest = hashlib.sha256(got.numpy().tobytes()).hexdigest()
         return rel, digest, None
     except Exception as e:
         logger.exception("rank %d failed the quantized all_reduce", rank)
