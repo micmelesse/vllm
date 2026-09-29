@@ -16,7 +16,7 @@ namespace hip_comms {
 // block reduces and norms its rows into `workspace`; a grid barrier; the GEMM over every
 // row. At most fusion::kRows rows: one GEMM pass.
 template <typename T, int ngpus, int kBits, int kLanesPerCol>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_one_shot_push_rms_norm_gemm_add(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_push_one_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {

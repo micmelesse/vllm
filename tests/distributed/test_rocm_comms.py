@@ -181,7 +181,7 @@ DISABLED = {
 # kernel each. A SHOT is a shot and a direction, and names every op's kernel,
 # `f"{shot}_{op}"` (the plain all_reduce's is the shot itself); a push kernel runs
 # unquantized here.
-Shot = Literal["one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push"]
+Shot = Literal["pull_one_shot", "push_one_shot", "pull_two_shot", "push_two_shot"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
 BACKEND_KERNELS = tuple(
@@ -1469,7 +1469,7 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
 # one scale per 32 values the two-shot (quantized twice: the input, then the reduced
 # slice) expects ~0.007 for INT8 and ~0.12 for INT4; the one-shot (once) less.
 QUANTIZED_MAX_REL_RMSE = {8: 0.02, 4: 0.25}
-QUANTIZED_KERNELS: tuple[Kernel, ...] = ("one_shot_push", "two_shot_push")
+QUANTIZED_KERNELS: tuple[Kernel, ...] = ("push_one_shot", "push_two_shot")
 # Kimi-K3's decode rows, a prefill chunk, and its largest prefill; 4 rows is fewer
 # than the ranks.
 QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 7168))

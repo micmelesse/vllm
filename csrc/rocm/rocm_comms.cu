@@ -36,22 +36,22 @@
 #include <utility>
 #include <vector>
 
-#include "rocm_comms/allreduce_one_shot_pull.cuh"
-#include "rocm_comms/allreduce_one_shot_push.cuh"
-#include "rocm_comms/allreduce_one_shot_push_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_push_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_push_rms_norm_gemm_add.cuh"
-#include "rocm_comms/allreduce_one_shot_pull_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_pull_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_one_shot_pull_rms_norm_gemm_add.cuh"
-#include "rocm_comms/allreduce_two_shot_pull.cuh"
-#include "rocm_comms/allreduce_two_shot_pull_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_pull_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_pull_rms_norm_gemm_add.cuh"
-#include "rocm_comms/allreduce_two_shot_push.cuh"
-#include "rocm_comms/allreduce_two_shot_push_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_push_add_rms_norm.cuh"
-#include "rocm_comms/allreduce_two_shot_push_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_pull_one_shot.cuh"
+#include "rocm_comms/allreduce_push_one_shot.cuh"
+#include "rocm_comms/allreduce_push_one_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_push_one_shot_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_push_one_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_pull_one_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_pull_one_shot_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_pull_one_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_pull_two_shot.cuh"
+#include "rocm_comms/allreduce_pull_two_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_pull_two_shot_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_pull_two_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/allreduce_push_two_shot.cuh"
+#include "rocm_comms/allreduce_push_two_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/allreduce_push_two_shot_add_rms_norm.cuh"
+#include "rocm_comms/allreduce_push_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
 #include "rocm_comms/launch.cuh"
 
@@ -69,8 +69,8 @@ constexpr bool table_fits() {
   for (int i = 0; i < static_cast<int>(sizeof(kGfx950) / sizeof(OpTuning)); ++i) {
     const OpTuning& t = kGfx950[i];
     const Op op       = static_cast<Op>(i);
-    if (t.one_shot_push && kernel_of(op, false, true) == Kernel::none) return false;
-    if (t.two_shot_push && kernel_of(op, true, true) == Kernel::none) return false;
+    if (t.push_one_shot && kernel_of(op, true, false) == Kernel::none) return false;
+    if (t.push_two_shot && kernel_of(op, true, true) == Kernel::none) return false;
     if (t.quant_bits != 16 && t.quant_bits != 8 && t.quant_bits != 4) return false;
   }
   const int v = tuning(Op::rms_norm_gemm_add).gemm_lanes_per_col;
@@ -128,21 +128,21 @@ int64_t slots_need(Kernel k, const Tiling& t, int bits, int world) {
   const int64_t own16 = p2p::push_slot_packs(16, t.locals(), t.lanes(), world);
   const int64_t all   = p2p::push_slot_packs(bits, t.units(), t.lanes(), world);
   switch (k) {
-    case Kernel::two_shot_pull:
-    case Kernel::two_shot_pull_rms_norm:
-    case Kernel::two_shot_pull_rms_norm_gemm_add: return pull * 16;
-    case Kernel::two_shot_pull_add_rms_norm:
-    case Kernel::two_shot_pull_add_attn_res_rms_norm: return 2 * pull * 16;
-    case Kernel::one_shot_push:
-    case Kernel::one_shot_push_rms_norm:
-    case Kernel::one_shot_push_add_rms_norm:
-    case Kernel::one_shot_push_add_attn_res_rms_norm:
-    case Kernel::one_shot_push_rms_norm_gemm_add: return all * 16;
-    case Kernel::two_shot_push:
-    case Kernel::two_shot_push_rms_norm:
-    case Kernel::two_shot_push_rms_norm_gemm_add: return 2 * own * 16;
-    case Kernel::two_shot_push_add_rms_norm:
-    case Kernel::two_shot_push_add_attn_res_rms_norm: return (2 * own + own16) * 16;
+    case Kernel::pull_two_shot:
+    case Kernel::pull_two_shot_rms_norm:
+    case Kernel::pull_two_shot_rms_norm_gemm_add: return pull * 16;
+    case Kernel::pull_two_shot_add_rms_norm:
+    case Kernel::pull_two_shot_add_attn_res_rms_norm: return 2 * pull * 16;
+    case Kernel::push_one_shot:
+    case Kernel::push_one_shot_rms_norm:
+    case Kernel::push_one_shot_add_rms_norm:
+    case Kernel::push_one_shot_add_attn_res_rms_norm:
+    case Kernel::push_one_shot_rms_norm_gemm_add: return all * 16;
+    case Kernel::push_two_shot:
+    case Kernel::push_two_shot_rms_norm:
+    case Kernel::push_two_shot_rms_norm_gemm_add: return 2 * own * 16;
+    case Kernel::push_two_shot_add_rms_norm:
+    case Kernel::push_two_shot_add_attn_res_rms_norm: return (2 * own + own16) * 16;
     default: return 0;
   }
 }
@@ -252,10 +252,10 @@ void all_reduce(p2p::host::Group& group, const Forced& forced, torch::Tensor& ou
 #define ALL_REDUCE_ARGS(T) p, out.data_ptr<T>(), n
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
   switch (l.kernel) {                                                                    \
-    CASE_PULL(one_shot_pull, ALL_REDUCE_ARGS(T), T, NG)                                  \
-    CASE_PUSH(one_shot_push, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
-    CASE_PULL(two_shot_pull, ALL_REDUCE_ARGS(T), T, NG)                                  \
-    CASE_PUSH(two_shot_push, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
+    CASE_PULL(pull_one_shot, ALL_REDUCE_ARGS(T), T, NG)                                  \
+    CASE_PUSH(push_one_shot, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
+    CASE_PULL(pull_two_shot, ALL_REDUCE_ARGS(T), T, NG)                                  \
+    CASE_PUSH(push_two_shot, ALL_REDUCE_ARGS(T), T, NG, kB)                              \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define ALL_REDUCE_HALF(NG) LAUNCH_ALL_REDUCE(at::Half, NG)
@@ -328,14 +328,14 @@ void all_reduce_add_rms_norm(p2p::host::Group& group, const Forced& forced,
       weight.data_ptr<W>(), feps, rows, packs
 #define LAUNCH_NORM(T, W, NG)                                                            \
   switch (l.kernel) {                                                                    \
-    CASE_PULL(one_shot_pull_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
-    CASE_PUSH(one_shot_push_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
-    CASE_PULL(two_shot_pull_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
-    CASE_PUSH(two_shot_push_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
-    CASE_PULL(one_shot_pull_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
-    CASE_PUSH(one_shot_push_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
-    CASE_PULL(two_shot_pull_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
-    CASE_PUSH(two_shot_push_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
+    CASE_PULL(pull_one_shot_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
+    CASE_PUSH(push_one_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
+    CASE_PULL(pull_two_shot_rms_norm, NORM_ARGS(T, W), T, W, NG)                         \
+    CASE_PUSH(push_two_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)                     \
+    CASE_PULL(pull_one_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
+    CASE_PUSH(push_one_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
+    CASE_PULL(pull_two_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG)                 \
+    CASE_PUSH(push_two_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)             \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define NORM_HALF(NG) LAUNCH_NORM(at::Half, at::Half, NG)
@@ -430,11 +430,11 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Forced& for
       static_cast<float>(out_eps), rows, packs
 #define LAUNCH_ATTN_RES(T, NG, PRE)                                                      \
   switch (l.kernel) {                                                                    \
-    CASE_PULL(one_shot_pull_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
-    CASE_PUSH(one_shot_push_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
+    CASE_PULL(pull_one_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
+    CASE_PUSH(push_one_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
               PRE)                                                                       \
-    CASE_PULL(two_shot_pull_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
-    CASE_PUSH(two_shot_push_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
+    CASE_PULL(pull_two_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, PRE)         \
+    CASE_PUSH(push_two_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB,          \
               PRE)                                                                       \
     default: not_this_ops(l.kernel);                                                     \
   }
@@ -507,10 +507,10 @@ void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Forced& forced,
       static_cast<int>(out_col0), workspace.data_ptr<T>(), static_cast<int>(rows), packs
 #define GEMM_ADD_SHOT(T, NG, LPC)                                                        \
   switch (l.kernel) {                                                                    \
-    CASE_PULL(one_shot_pull_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
-    CASE_PUSH(one_shot_push_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
-    CASE_PULL(two_shot_pull_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
-    CASE_PUSH(two_shot_push_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
+    CASE_PULL(pull_one_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
+    CASE_PUSH(push_one_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
+    CASE_PULL(pull_two_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, LPC)             \
+    CASE_PUSH(push_two_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC)         \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define LAUNCH_GEMM_ADD(T, NG)                                                           \

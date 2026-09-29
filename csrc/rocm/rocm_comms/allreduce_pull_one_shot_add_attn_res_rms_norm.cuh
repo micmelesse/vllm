@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot push all-reduce fused with Kimi-K3's attention residual (AttnRes) and its
+// One-shot pull all-reduce fused with Kimi-K3's attention residual (AttnRes) and its
 // RMSNorm.
 
 #pragma once
@@ -12,12 +12,13 @@
 
 namespace hip_comms {
 
-// Every rank's rows, encoded by kBits' codec, into every rank's slot; one barrier; each
-// block reduces its rows out of its own slot and runs AttnRes on them as the pull kernel
-// does.
-template <typename T, int ngpus, int kBits, bool kPrefix>
+// A block owns a row, as the fused norm does: every rank reduces every row, so there is
+// nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
+// in elements; `write_idx` < 0 writes no block. Peers read this rank's input to the end:
+// close.
+template <typename T, int ngpus, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_one_shot_push_add_attn_res_rms_norm(
+    allreduce_pull_one_shot_add_attn_res_rms_norm(
         p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
@@ -36,15 +37,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                          : reinterpret_cast<V*>(blocks + row * block_stride_m +
                                                 write_idx * block_stride_r);
   };
-  const auto slot        = p2p::push::slot<kBits>(w, tiling, p2p::To::all);
-
-  p2p::push::scatter(w, slot, tiling);
-
-  p2p::peer_barrier(w);
-
   for (int row = tiling.first(); row < tiling.end(); row = tiling.next(row)) {
     V sum[kMaxRowPacks];
-    p2p::push::reduce(w, slot, tiling, row, sum);
+    p2p::pull::reduce(w, tiling, row, sum);
     fusion::row<T, kPrefix>(
         sum, pre, blocks + row * block_stride_m, block_stride_r,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
@@ -55,6 +50,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
+  p2p::close(w);
 }
 
 }  // namespace hip_comms

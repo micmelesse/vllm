@@ -32,26 +32,26 @@ enum class Op : int {
 // Each op has all four: one- and two-shot, pull and push.
 enum class Kernel : int {
   none                                = -1,
-  one_shot_pull                       = 0,
-  one_shot_push                       = 1,
-  two_shot_pull                       = 2,
-  two_shot_push                       = 3,
-  one_shot_pull_rms_norm              = 4,
-  one_shot_push_rms_norm              = 5,
-  two_shot_pull_rms_norm              = 6,
-  two_shot_push_rms_norm              = 7,
-  one_shot_pull_add_rms_norm          = 8,
-  one_shot_push_add_rms_norm          = 9,
-  two_shot_pull_add_rms_norm          = 10,
-  two_shot_push_add_rms_norm          = 11,
-  one_shot_pull_add_attn_res_rms_norm = 12,
-  one_shot_push_add_attn_res_rms_norm = 13,
-  two_shot_pull_add_attn_res_rms_norm = 14,
-  two_shot_push_add_attn_res_rms_norm = 15,
-  one_shot_pull_rms_norm_gemm_add     = 16,
-  one_shot_push_rms_norm_gemm_add     = 17,
-  two_shot_pull_rms_norm_gemm_add     = 18,
-  two_shot_push_rms_norm_gemm_add     = 19,
+  pull_one_shot                       = 0,
+  push_one_shot                       = 1,
+  pull_two_shot                       = 2,
+  push_two_shot                       = 3,
+  pull_one_shot_rms_norm              = 4,
+  push_one_shot_rms_norm              = 5,
+  pull_two_shot_rms_norm              = 6,
+  push_two_shot_rms_norm              = 7,
+  pull_one_shot_add_rms_norm          = 8,
+  push_one_shot_add_rms_norm          = 9,
+  pull_two_shot_add_rms_norm          = 10,
+  push_two_shot_add_rms_norm          = 11,
+  pull_one_shot_add_attn_res_rms_norm = 12,
+  push_one_shot_add_attn_res_rms_norm = 13,
+  pull_two_shot_add_attn_res_rms_norm = 14,
+  push_two_shot_add_attn_res_rms_norm = 15,
+  pull_one_shot_rms_norm_gemm_add     = 16,
+  push_one_shot_rms_norm_gemm_add     = 17,
+  pull_two_shot_rms_norm_gemm_add     = 18,
+  push_two_shot_rms_norm_gemm_add     = 19,
 };
 
 // The GEMM tail's one-shot kernel takes one GEMM pass: at most this many rows.
@@ -61,31 +61,31 @@ constexpr int kGemmTailOneShotRows = fusions::rms_norm_gemm_add::kRows;
 struct KernelInfo {
   Kernel kernel;
   Op op;
-  bool two_shot;
   bool push;
+  bool two_shot;
 };
 
 constexpr KernelInfo kKernels[] = {
-    {Kernel::one_shot_pull, Op::all_reduce, false, false},
-    {Kernel::one_shot_push, Op::all_reduce, false, true},
-    {Kernel::two_shot_pull, Op::all_reduce, true, false},
-    {Kernel::two_shot_push, Op::all_reduce, true, true},
-    {Kernel::one_shot_pull_rms_norm, Op::rms_norm, false, false},
-    {Kernel::one_shot_push_rms_norm, Op::rms_norm, false, true},
-    {Kernel::two_shot_pull_rms_norm, Op::rms_norm, true, false},
-    {Kernel::two_shot_push_rms_norm, Op::rms_norm, true, true},
-    {Kernel::one_shot_pull_add_rms_norm, Op::add_rms_norm, false, false},
-    {Kernel::one_shot_push_add_rms_norm, Op::add_rms_norm, false, true},
-    {Kernel::two_shot_pull_add_rms_norm, Op::add_rms_norm, true, false},
-    {Kernel::two_shot_push_add_rms_norm, Op::add_rms_norm, true, true},
-    {Kernel::one_shot_pull_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, false},
-    {Kernel::one_shot_push_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, true},
-    {Kernel::two_shot_pull_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, false},
-    {Kernel::two_shot_push_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, true},
-    {Kernel::one_shot_pull_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, false},
-    {Kernel::one_shot_push_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, true},
-    {Kernel::two_shot_pull_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, false},
-    {Kernel::two_shot_push_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, true},
+    {Kernel::pull_one_shot, Op::all_reduce, false, false},
+    {Kernel::push_one_shot, Op::all_reduce, true, false},
+    {Kernel::pull_two_shot, Op::all_reduce, false, true},
+    {Kernel::push_two_shot, Op::all_reduce, true, true},
+    {Kernel::pull_one_shot_rms_norm, Op::rms_norm, false, false},
+    {Kernel::push_one_shot_rms_norm, Op::rms_norm, true, false},
+    {Kernel::pull_two_shot_rms_norm, Op::rms_norm, false, true},
+    {Kernel::push_two_shot_rms_norm, Op::rms_norm, true, true},
+    {Kernel::pull_one_shot_add_rms_norm, Op::add_rms_norm, false, false},
+    {Kernel::push_one_shot_add_rms_norm, Op::add_rms_norm, true, false},
+    {Kernel::pull_two_shot_add_rms_norm, Op::add_rms_norm, false, true},
+    {Kernel::push_two_shot_add_rms_norm, Op::add_rms_norm, true, true},
+    {Kernel::pull_one_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, false},
+    {Kernel::push_one_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, false},
+    {Kernel::pull_two_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, true},
+    {Kernel::push_two_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, true},
+    {Kernel::pull_one_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, false},
+    {Kernel::push_one_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, false},
+    {Kernel::pull_two_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, true},
+    {Kernel::push_two_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, true},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 
@@ -98,11 +98,11 @@ static_assert(kernels_in_order(), "kKernels must list every Kernel in its order"
 
 constexpr const KernelInfo& info(Kernel k) { return kKernels[static_cast<int>(k)]; }
 constexpr Op op_of(Kernel k) { return info(k).op; }
-constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
 constexpr bool is_push(Kernel k) { return info(k).push; }
+constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
 
-// The op's kernel of that shot and direction; none where it has none.
-constexpr Kernel kernel_of(Op op, bool two_shot, bool push) {
+// The op's kernel of that direction and shot; none where it has none.
+constexpr Kernel kernel_of(Op op, bool push, bool two_shot) {
   for (const KernelInfo& i : kKernels)
     if (i.op == op && i.two_shot == two_shot && i.push == push) return i.kernel;
   return Kernel::none;
@@ -127,8 +127,8 @@ struct Launch {
 //   blocks, threads      decode is flat in both; two-shot gains ~13% from 16 to 36 blocks;
 //                        the GEMM tail wants one block per 16-column tile (56 at Kimi-K3)
 //   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
-//   one_shot_push,       each shot's direction: the push kernel over the pull one
-//   two_shot_push
+//   push_one_shot,       each shot's direction: the push kernel over the pull one
+//   push_two_shot
 //   quant_bits           a push kernel's codec: 16 (T itself), 8 or 4; the lossy two stay
 //                        off until the model's accuracy is checked with them
 struct OpTuning {
@@ -138,8 +138,8 @@ struct OpTuning {
   int two_shot_blocks;
   int threads;
   int gemm_lanes_per_col;
-  bool one_shot_push;
-  bool two_shot_push;
+  bool push_one_shot;
+  bool push_two_shot;
   int quant_bits;
 };
 
@@ -174,7 +174,7 @@ inline Launch pick(Op op, int64_t rows, int64_t bytes) {
   if (bytes > t.fused_max_bytes) return {Kernel::none, 0, 0, 0, 0};
   const bool one_shot = bytes <= t.one_shot_max_bytes &&
                         !(op == Op::rms_norm_gemm_add && rows > kGemmTailOneShotRows);
-  const Kernel k = kernel_of(op, !one_shot, one_shot ? t.one_shot_push : t.two_shot_push);
+  const Kernel k = kernel_of(op, one_shot ? t.push_one_shot : t.push_two_shot, !one_shot);
   return {k, grid_of(k, one_shot ? t.one_shot_blocks : t.two_shot_blocks, rows), t.threads,
           t.gemm_lanes_per_col, t.quant_bits};
 }

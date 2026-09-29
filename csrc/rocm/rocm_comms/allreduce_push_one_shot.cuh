@@ -15,7 +15,7 @@ namespace hip_comms {
 // sums the same bytes in the same order, so every rank holds the same output.
 template <typename T, int ngpus, int kBits>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_one_shot_push(p2p::Peers p, T* __restrict__ out, int size) {
+    allreduce_push_one_shot(p2p::Peers p, T* __restrict__ out, int size) {
   using V           = typename traits<T>::V;
   const auto w      = p2p::start<T, ngpus>(p);
   const auto tiling = tiles::buffer(size, 1);

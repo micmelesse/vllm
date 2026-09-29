@@ -19,7 +19,7 @@ namespace hip_comms {
 // running residual.
 template <typename T, int ngpus, int kBits, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_two_shot_push_add_attn_res_rms_norm(
+    allreduce_push_two_shot_add_attn_res_rms_norm(
         p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,

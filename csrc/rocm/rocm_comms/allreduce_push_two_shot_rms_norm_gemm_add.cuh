@@ -17,7 +17,7 @@ namespace hip_comms {
 // and shares the normed row (encoded) with every rank; barrier; every rank gathers every
 // normed row into `workspace`; a grid barrier; the GEMM, fusion::kRows rows per pass.
 template <typename T, int ngpus, int kBits, int kLanesPerCol>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_two_shot_push_rms_norm_gemm_add(
+__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_push_two_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {

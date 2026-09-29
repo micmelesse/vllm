@@ -16,7 +16,7 @@ namespace hip_comms {
 // is read only before the barrier, so no close.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_two_shot_pull(p2p::Peers p, T* __restrict__ out, int size) {
+    allreduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int size) {
   using V           = typename traits<T>::V;
   const auto w      = p2p::start<T, ngpus>(p);
   const auto tiling = tiles::buffer(size, ngpus);
