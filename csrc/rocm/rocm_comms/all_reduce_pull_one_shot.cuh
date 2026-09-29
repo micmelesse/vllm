@@ -14,7 +14,7 @@ namespace hip_comms {
 // the barrier, not the bytes, dominates. Peers read this rank's input to the end: close.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_pull_one_shot(p2p::Peers p, T* __restrict__ out, int size) {
+    all_reduce_pull_one_shot(p2p::Peers p, T* __restrict__ out, int size) {
   using V           = typename traits<T>::V;
   const auto w      = p2p::start<T, ngpus>(p);
   const auto tiling = tiles::buffer(size, 1);

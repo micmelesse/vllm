@@ -15,13 +15,14 @@
 
 namespace hip_comms {
 
-// What the caller asked for.
+// What the caller asked for: an all-reduce, alone or with what it fuses. Named as the Python
+// methods are (`comm.all_reduce_rms_norm(...)`).
 enum class Op : int {
-  all_reduce            = 0,
-  rms_norm              = 1,
-  add_rms_norm          = 2,
-  add_attn_res_rms_norm = 3,
-  rms_norm_gemm_add     = 4,
+  all_reduce                       = 0,
+  all_reduce_rms_norm              = 1,
+  all_reduce_add_rms_norm          = 2,
+  all_reduce_add_attn_res_rms_norm = 3,
+  all_reduce_rms_norm_gemm_add     = 4,
 };
 
 // Every `__global__` there is, once, named by its direction, its shot and what it fuses.
@@ -31,27 +32,27 @@ enum class Op : int {
 //         kernels take a Codec, so they are the quantized ones
 // Each op has all four: one- and two-shot, pull and push.
 enum class Kernel : int {
-  none                                = -1,
-  pull_one_shot                       = 0,
-  push_one_shot                       = 1,
-  pull_two_shot                       = 2,
-  push_two_shot                       = 3,
-  pull_one_shot_rms_norm              = 4,
-  push_one_shot_rms_norm              = 5,
-  pull_two_shot_rms_norm              = 6,
-  push_two_shot_rms_norm              = 7,
-  pull_one_shot_add_rms_norm          = 8,
-  push_one_shot_add_rms_norm          = 9,
-  pull_two_shot_add_rms_norm          = 10,
-  push_two_shot_add_rms_norm          = 11,
-  pull_one_shot_add_attn_res_rms_norm = 12,
-  push_one_shot_add_attn_res_rms_norm = 13,
-  pull_two_shot_add_attn_res_rms_norm = 14,
-  push_two_shot_add_attn_res_rms_norm = 15,
-  pull_one_shot_rms_norm_gemm_add     = 16,
-  push_one_shot_rms_norm_gemm_add     = 17,
-  pull_two_shot_rms_norm_gemm_add     = 18,
-  push_two_shot_rms_norm_gemm_add     = 19,
+  none                                           = -1,
+  all_reduce_pull_one_shot                       = 0,
+  all_reduce_push_one_shot                       = 1,
+  all_reduce_pull_two_shot                       = 2,
+  all_reduce_push_two_shot                       = 3,
+  all_reduce_pull_one_shot_rms_norm              = 4,
+  all_reduce_push_one_shot_rms_norm              = 5,
+  all_reduce_pull_two_shot_rms_norm              = 6,
+  all_reduce_push_two_shot_rms_norm              = 7,
+  all_reduce_pull_one_shot_add_rms_norm          = 8,
+  all_reduce_push_one_shot_add_rms_norm          = 9,
+  all_reduce_pull_two_shot_add_rms_norm          = 10,
+  all_reduce_push_two_shot_add_rms_norm          = 11,
+  all_reduce_pull_one_shot_add_attn_res_rms_norm = 12,
+  all_reduce_push_one_shot_add_attn_res_rms_norm = 13,
+  all_reduce_pull_two_shot_add_attn_res_rms_norm = 14,
+  all_reduce_push_two_shot_add_attn_res_rms_norm = 15,
+  all_reduce_pull_one_shot_rms_norm_gemm_add     = 16,
+  all_reduce_push_one_shot_rms_norm_gemm_add     = 17,
+  all_reduce_pull_two_shot_rms_norm_gemm_add     = 18,
+  all_reduce_push_two_shot_rms_norm_gemm_add     = 19,
 };
 
 // The GEMM tail's one-shot kernel takes one GEMM pass: at most this many rows.
@@ -66,26 +67,34 @@ struct KernelInfo {
 };
 
 constexpr KernelInfo kKernels[] = {
-    {Kernel::pull_one_shot, Op::all_reduce, false, false},
-    {Kernel::push_one_shot, Op::all_reduce, true, false},
-    {Kernel::pull_two_shot, Op::all_reduce, false, true},
-    {Kernel::push_two_shot, Op::all_reduce, true, true},
-    {Kernel::pull_one_shot_rms_norm, Op::rms_norm, false, false},
-    {Kernel::push_one_shot_rms_norm, Op::rms_norm, true, false},
-    {Kernel::pull_two_shot_rms_norm, Op::rms_norm, false, true},
-    {Kernel::push_two_shot_rms_norm, Op::rms_norm, true, true},
-    {Kernel::pull_one_shot_add_rms_norm, Op::add_rms_norm, false, false},
-    {Kernel::push_one_shot_add_rms_norm, Op::add_rms_norm, true, false},
-    {Kernel::pull_two_shot_add_rms_norm, Op::add_rms_norm, false, true},
-    {Kernel::push_two_shot_add_rms_norm, Op::add_rms_norm, true, true},
-    {Kernel::pull_one_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, false},
-    {Kernel::push_one_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, false},
-    {Kernel::pull_two_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, false, true},
-    {Kernel::push_two_shot_add_attn_res_rms_norm, Op::add_attn_res_rms_norm, true, true},
-    {Kernel::pull_one_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, false},
-    {Kernel::push_one_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, false},
-    {Kernel::pull_two_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, false, true},
-    {Kernel::push_two_shot_rms_norm_gemm_add, Op::rms_norm_gemm_add, true, true},
+    {Kernel::all_reduce_pull_one_shot, Op::all_reduce, false, false},
+    {Kernel::all_reduce_push_one_shot, Op::all_reduce, true, false},
+    {Kernel::all_reduce_pull_two_shot, Op::all_reduce, false, true},
+    {Kernel::all_reduce_push_two_shot, Op::all_reduce, true, true},
+    {Kernel::all_reduce_pull_one_shot_rms_norm, Op::all_reduce_rms_norm, false, false},
+    {Kernel::all_reduce_push_one_shot_rms_norm, Op::all_reduce_rms_norm, true, false},
+    {Kernel::all_reduce_pull_two_shot_rms_norm, Op::all_reduce_rms_norm, false, true},
+    {Kernel::all_reduce_push_two_shot_rms_norm, Op::all_reduce_rms_norm, true, true},
+    {Kernel::all_reduce_pull_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false, false},
+    {Kernel::all_reduce_push_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true, false},
+    {Kernel::all_reduce_pull_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false, true},
+    {Kernel::all_reduce_push_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true, true},
+    {Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm,
+     Op::all_reduce_add_attn_res_rms_norm, false, false},
+    {Kernel::all_reduce_push_one_shot_add_attn_res_rms_norm,
+     Op::all_reduce_add_attn_res_rms_norm, true, false},
+    {Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     Op::all_reduce_add_attn_res_rms_norm, false, true},
+    {Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm,
+     Op::all_reduce_add_attn_res_rms_norm, true, true},
+    {Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add,
+     Op::all_reduce_rms_norm_gemm_add, false, false},
+    {Kernel::all_reduce_push_one_shot_rms_norm_gemm_add,
+     Op::all_reduce_rms_norm_gemm_add, true, false},
+    {Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add,
+     Op::all_reduce_rms_norm_gemm_add, false, true},
+    {Kernel::all_reduce_push_two_shot_rms_norm_gemm_add,
+     Op::all_reduce_rms_norm_gemm_add, true, true},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 
@@ -123,7 +132,7 @@ struct Launch {
 constexpr int grid_of(Kernel k, int blocks, int64_t rows) {
   const Op op = op_of(k);
   const bool row_per_block =
-      !is_two_shot(k) && op != Op::all_reduce && op != Op::rms_norm_gemm_add;
+      !is_two_shot(k) && op != Op::all_reduce && op != Op::all_reduce_rms_norm_gemm_add;
   return row_per_block && rows < blocks ? static_cast<int>(rows) : blocks;
 }
 

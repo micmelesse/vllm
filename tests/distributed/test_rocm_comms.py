@@ -181,7 +181,12 @@ DISABLED = {
 # kernel each. A SHOT is a shot and a direction, and names every op's kernel,
 # `f"{shot}_{op}"` (the plain all_reduce's is the shot itself); a push kernel runs
 # unquantized here.
-Shot = Literal["pull_one_shot", "push_one_shot", "pull_two_shot", "push_two_shot"]
+Shot = Literal[
+    "all_reduce_pull_one_shot",
+    "all_reduce_push_one_shot",
+    "all_reduce_pull_two_shot",
+    "all_reduce_push_two_shot",
+]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
 BACKEND_KERNELS = tuple(
@@ -1403,7 +1408,7 @@ def run_rms_norm_gemm_add_rank(
         launch = Launch(cast(Kernel, f"{shot}_rms_norm_gemm_add"))
         with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce_rms_norm_gemm_add(mine, launch):
+            if not comm.should_allreduce_rms_norm_gemm_add(mine, gemm_w, launch):
                 return False, NO_FUSED_KERNEL
             got = shared.clone()
             comm.all_reduce_rms_norm_gemm_add(
@@ -1469,7 +1474,10 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
 # one scale per 32 values the two-shot (quantized twice: the input, then the reduced
 # slice) expects ~0.007 for INT8 and ~0.12 for INT4; the one-shot (once) less.
 QUANTIZED_MAX_REL_RMSE = {8: 0.02, 4: 0.25}
-QUANTIZED_KERNELS: tuple[Kernel, ...] = ("push_one_shot", "push_two_shot")
+QUANTIZED_KERNELS: tuple[Kernel, ...] = (
+    "all_reduce_push_one_shot",
+    "all_reduce_push_two_shot",
+)
 # Kimi-K3's decode rows, a prefill chunk, and its largest prefill; 4 rows is fewer
 # than the ranks.
 QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 7168))
@@ -1499,12 +1507,13 @@ def run_quantized_rank(
     torch.cuda.synchronize()
     try:
         inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        launch = Launch(kernel, quant_bits=bits)
+        launch = Launch(kernel)
         with _build_communicator("hip", cpu_group, group, device) as comm:
             mine = inputs[rank].to(device)
-            if not comm.should_allreduce(mine, launch):
+            if not comm.should_allreduce(mine, launch, quant_bits=bits):
                 return None, None, NO_FUSED_KERNEL
-            got = comm.all_reduce(mine, launch=launch).cpu().to(torch.float32)
+            got = comm.all_reduce(mine, launch=launch, quant_bits=bits)
+            got = got.cpu().to(torch.float32)
         want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
         rel = ((got - want).norm() / want.norm()).item()
         # sha256, not hash(): each rank is a spawned process with its own hash seed.

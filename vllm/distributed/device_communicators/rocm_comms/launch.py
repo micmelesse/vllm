@@ -13,26 +13,26 @@ from typing import Literal
 # by shot, direction (pull reads peers, push writes into them) and what it fuses. Named
 # only to force one through a `Launch`; nothing else picks.
 Kernel = Literal[
-    "pull_one_shot",
-    "push_one_shot",
-    "pull_two_shot",
-    "push_two_shot",
-    "pull_one_shot_rms_norm",
-    "push_one_shot_rms_norm",
-    "pull_two_shot_rms_norm",
-    "push_two_shot_rms_norm",
-    "pull_one_shot_add_rms_norm",
-    "push_one_shot_add_rms_norm",
-    "pull_two_shot_add_rms_norm",
-    "push_two_shot_add_rms_norm",
-    "pull_one_shot_add_attn_res_rms_norm",
-    "push_one_shot_add_attn_res_rms_norm",
-    "pull_two_shot_add_attn_res_rms_norm",
-    "push_two_shot_add_attn_res_rms_norm",
-    "pull_one_shot_rms_norm_gemm_add",
-    "push_one_shot_rms_norm_gemm_add",
-    "pull_two_shot_rms_norm_gemm_add",
-    "push_two_shot_rms_norm_gemm_add",
+    "all_reduce_pull_one_shot",
+    "all_reduce_push_one_shot",
+    "all_reduce_pull_two_shot",
+    "all_reduce_push_two_shot",
+    "all_reduce_pull_one_shot_rms_norm",
+    "all_reduce_push_one_shot_rms_norm",
+    "all_reduce_pull_two_shot_rms_norm",
+    "all_reduce_push_two_shot_rms_norm",
+    "all_reduce_pull_one_shot_add_rms_norm",
+    "all_reduce_push_one_shot_add_rms_norm",
+    "all_reduce_pull_two_shot_add_rms_norm",
+    "all_reduce_push_two_shot_add_rms_norm",
+    "all_reduce_pull_one_shot_add_attn_res_rms_norm",
+    "all_reduce_push_one_shot_add_attn_res_rms_norm",
+    "all_reduce_pull_two_shot_add_attn_res_rms_norm",
+    "all_reduce_push_two_shot_add_attn_res_rms_norm",
+    "all_reduce_pull_one_shot_rms_norm_gemm_add",
+    "all_reduce_push_one_shot_rms_norm_gemm_add",
+    "all_reduce_pull_two_shot_rms_norm_gemm_add",
+    "all_reduce_push_two_shot_rms_norm_gemm_add",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i
@@ -43,24 +43,16 @@ _KERNEL_WIRE: Mapping[Kernel, int] = {
 @dataclass(frozen=True)
 class Launch:
     """A FORCED LAUNCH, passed per call by the sweep and the tests (the model passes
-    None, and C++ picks): `kernel` at this grid and block, the GEMM tail's lanes per
-    column and a push kernel's codec bits (each 0: the table's)."""
+    None, and tune.cuh picks): `kernel` at this grid and block. The defaults are a
+    width every kernel admits, for a test that forces a kernel only to check it."""
 
     kernel: Kernel
     blocks: int = 16
     threads: int = 512
-    gemm_lanes_per_col: int = 0
-    quant_bits: int = 0
 
 
-def launch_wire(launch: Launch | None) -> tuple[int, int, int, int, int]:
-    """The five integers every op takes last: -1 and zeros for the table's."""
+def launch_wire(launch: Launch | None) -> tuple[int, int, int]:
+    """The launch's three integers, last on every op: -1 and zeros for tune.cuh's."""
     if launch is None:
-        return (-1, 0, 0, 0, 0)
-    return (
-        _KERNEL_WIRE[launch.kernel],
-        launch.blocks,
-        launch.threads,
-        launch.gemm_lanes_per_col,
-        launch.quant_bits,
-    )
+        return (-1, 0, 0)
+    return (_KERNEL_WIRE[launch.kernel], launch.blocks, launch.threads)

@@ -34,9 +34,10 @@ class TorchCommunicator(Communicator):
     """
 
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         self._refuse_launch(launch)
+        self._refuse_lossy(quant_bits)
         out = inp.clone()
         dist.all_reduce(out, group=self.device_group)  # SUM
         return out

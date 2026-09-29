@@ -41,7 +41,8 @@ static_assert(kMaxThreads <= kTarget.max_workgroup && kMaxThreads % kWaveSize ==
 
 // THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles are wrong.
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
-static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize, "hardware.cuh's wave size is not the compiler's");
+static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize,
+              "hardware.cuh's wave size is not the compiler's");
 #endif
 
 }  // namespace hip_comms

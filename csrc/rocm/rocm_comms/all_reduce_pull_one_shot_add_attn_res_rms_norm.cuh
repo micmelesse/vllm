@@ -18,7 +18,7 @@ namespace hip_comms {
 // close.
 template <typename T, int ngpus, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    allreduce_pull_one_shot_add_attn_res_rms_norm(
+    all_reduce_pull_one_shot_add_attn_res_rms_norm(
         p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,

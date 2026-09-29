@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 # The ops as C++ numbers them (`enum class Op`).
 _OP_WIRE: Mapping[AdmitOp, int] = {
     "all_reduce": 0,
-    "rms_norm": 1,
-    "add_rms_norm": 2,
-    "add_attn_res_rms_norm": 3,
-    "rms_norm_gemm_add": 4,
+    "all_reduce_rms_norm": 1,
+    "all_reduce_add_rms_norm": 2,
+    "all_reduce_add_attn_res_rms_norm": 3,
+    "all_reduce_rms_norm_gemm_add": 4,
 }
 
 
@@ -253,22 +253,27 @@ class HipCommunicator(Communicator):
         return staged
 
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, self._as_input(inp), *launch_wire(launch)
+            self._handle, out, self._as_input(inp), quant_bits, *launch_wire(launch)
         )
         return out
 
     def _admits(
-        self, op: AdmitOp, inp: torch.Tensor, launch: Launch | None = None
+        self,
+        op: AdmitOp,
+        inp: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+        cols: int = 0,
     ) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits
         in registers at that kernel's width, and its scratch fits (a push kernel holds
         every rank's slice). The plain all-reduce is one flat row, as C++ launches
-        it."""
+        it; `cols` is the GEMM tail's output columns, which shape its launch."""
         if op == "all_reduce":
             rows, hidden = 1, inp.numel()
         elif inp.dim() == 2:
@@ -281,6 +286,8 @@ class HipCommunicator(Communicator):
             rows,
             hidden,
             inp.element_size(),
+            cols,
+            quant_bits,
             *launch_wire(launch),
         )
 
@@ -290,10 +297,17 @@ class HipCommunicator(Communicator):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> torch.Tensor:
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
-            self._handle, out, self._as_input(inp), weight, eps, *launch_wire(launch)
+            self._handle,
+            out,
+            self._as_input(inp),
+            weight,
+            eps,
+            quant_bits,
+            *launch_wire(launch),
         )
         return out
 
@@ -306,6 +320,7 @@ class HipCommunicator(Communicator):
         out: torch.Tensor,
         out_col0: int,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
@@ -317,6 +332,7 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
+            quant_bits,
             *launch_wire(launch),
         )
 
@@ -333,6 +349,7 @@ class HipCommunicator(Communicator):
         eps: float,
         out_eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         started = prefix is None
         prefix_out = torch.empty_like(inp) if started else prefix
@@ -351,6 +368,7 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             not started,
+            quant_bits,
             *launch_wire(launch),
         )
         return prefix_out, out
@@ -362,6 +380,7 @@ class HipCommunicator(Communicator):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns the normed result, then the sum plus residual."""
         out = torch.empty_like(inp)
@@ -374,6 +393,7 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
+            quant_bits,
             *launch_wire(launch),
         )
         return out, residual_out

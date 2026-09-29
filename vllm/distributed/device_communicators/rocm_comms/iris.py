@@ -125,9 +125,10 @@ class IrisCommunicator(Communicator):
         return self._input_buf
 
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         self._refuse_launch(launch)
+        self._refuse_lossy(quant_bits)
         assert self._shmem is not None
         try:
             out = torch.empty_like(inp)

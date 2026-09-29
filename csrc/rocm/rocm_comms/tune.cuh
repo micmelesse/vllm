@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// HOW EACH CALL RUNS: which kernel, and how wide, decided from the hardware (hardware.cuh) and the
-// input. Each kernel on the critical path has its own function stating its rule; the rest run a
-// basic config until each is measured. launch.cuh says what kernels exist; this picks one.
+// WHAT RUNS FOR A CALL: `tune(op, input, hw)` splits on the op and calls that op's own
+// `tune_<op>`, which picks the kernel AND its launch config from the hardware's facts
+// (hardware.cuh) and the input, one rule in one place, with the sweep it came from written beside
+// it. An op not yet swept says so and states what it runs. launch.cuh says what kernels exist.
 
 #pragma once
 
 #include <algorithm>
-#include <climits>
 #include <cstdint>
 
 #include "hardware.cuh"
@@ -16,93 +16,112 @@
 #include "p2p/p2p.cuh"
 
 namespace hip_comms {
-namespace tune {
+
+// WHAT A CALL IS: its shape, and the precision it accepts. Tuning reads it and never changes the
+// answer.
+struct Input {
+  int64_t rows;    // tokens
+  int64_t hidden;  // a row's length, in elements
+  int elem_bytes;  // 2 for bf16 and fp16
+  int64_t cols;    // the GEMM tail's output columns (its weight is [cols, hidden]); 0 without one
+  int quant_bits;  // the precision the caller accepts on the wire: 16 (exact), 8 or 4. A push
+                   // kernel's codec, passed through untouched; the pull kernels move T itself.
+};
+
+// WHAT THE HARDWARE MOVES: to it, a plain all-reduce is only its byte count.
+constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
+
+constexpr int64_t kKiB = 1024;
+
+// THE GEMM TAIL'S LANES PER COLUMN: a column's lanes split its reduction over the hidden size, so a
+// wave covers wave / lanes columns. 4 was picked at Kimi-K3's shape and is not yet swept; it is a
+// template instantiation (1, 2, 4 or 8). Every GEMM-tail launch takes it, forced or not; no other
+// kernel has lanes.
+constexpr int kGemmLanesPerCol = 4;
+static_assert(kGemmLanesPerCol == 1 || kGemmLanesPerCol == 2 || kGemmLanesPerCol == 4 ||
+                  kGemmLanesPerCol == 8,
+              "the GEMM tail is built for 1, 2, 4 or 8 lanes per column");
+
+// `k` at `blocks` x `threads`: its grid cut to the rows where it gives each block a row, its lanes
+// if it is the GEMM tail, the call's precision passed through.
+constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
+  const int lanes = op_of(k) == Op::all_reduce_rms_norm_gemm_add ? kGemmLanesPerCol : 0;
+  return {k, grid_of(k, blocks, in.rows), threads, lanes, in.quant_bits};
+}
+
+// No kernel: the caller runs the unfused ops.
+constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0}; }
 
 // =================================================================================================
-// THE CRITICAL PATH: the plain all-reduce's pull kernels, from the launch-config sweep on n11
-// (bench, 2026-09-29T19-24-48Z: tokens 1-64 at hidden 3584 bf16, blocks 1-64, threads 64-512).
-// =================================================================================================
-
+// ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:
+// tokens 1-64 at hidden 3584 bf16, blocks 1-64, threads 64-512).
+//
 // ONE WAVE PER BLOCK, AS MANY BLOCKS AS THE SIGNAL SLOTS ALLOW. Waves in one block only add a
 // barrier inside it: at 1 token one-shot took 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and
 // 10.9 at 512. Blocks run apart, and from 16 tokens up more of them help, best at the slot cap.
-// This is within 0.1 us of the sweep's fastest config at every size from 1 to 64 tokens.
-constexpr Launch pull(Kernel k, const Hardware& hw) {
-  return {k, std::min(p2p::kMaxBlocks, hw.compute_units), hw.wave_size, 0, 16};
+// Within 0.1 us of the sweep's fastest config at every size from 1 to 64 tokens.
+//
+// PULL ONE-SHOT UP TO 128 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
+// whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. One-shot won at
+// 112 KiB (10.12 vs 10.67 us), two-shot at 224 KiB (10.96 vs 13.13); the lines cross near 135 KiB.
+// To be derived from the link's latency and bandwidth once hardware.cuh carries them. Push is
+// parked (2x pull at 1 token, BACKLOG).
+// =================================================================================================
+
+constexpr int64_t kPullOneShotMaxBytes = 128 * kKiB;
+
+constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
+  const Kernel k = bytes(in) <= kPullOneShotMaxBytes ? Kernel::all_reduce_pull_one_shot
+                                                      : Kernel::all_reduce_pull_two_shot;
+  return at(k, in, std::min(p2p::kMaxBlocks, hw.compute_units), hw.wave_size);
 }
 
-constexpr Launch pull_one_shot(const Hardware& hw) { return pull(Kernel::pull_one_shot, hw); }
-constexpr Launch pull_two_shot(const Hardware& hw) { return pull(Kernel::pull_two_shot, hw); }
-
-// ONE-SHOT UP TO HERE, TWO-SHOT PAST IT. One-shot reads every peer's whole buffer ((N-1)P) in one
-// round trip; two-shot moves less (2(N-1)/N P) in two. Measured: one-shot wins at 112 KiB (10.12
-// vs 10.67 us), two-shot at 224 KiB (10.96 vs 13.13); the lines cross near 135 KiB. To be derived
-// from the link's latency and bandwidth once hardware.cuh carries them.
-constexpr int64_t kPullOneShotMaxBytes = 128 * 1024;
-
 // =================================================================================================
-// THE BASIC CONFIG: everything else (the push kernels and the fused ops), at the values the
-// 2026-09-27 microbench chose, until each is swept.
+// THE FUSED OPS, NOT YET SWEPT: pull one-shot up to 512 KiB at 16 blocks, pull two-shot past it at
+// 36, 512 threads each, as the 2026-09-27 microbench chose (one-shot 12.9 vs two-shot 27.1 us at
+// 16 x 7168), until each is measured the way the all-reduce was.
 // =================================================================================================
 
-constexpr int kOps = 5;
-static_assert(static_cast<int>(Op::rms_norm_gemm_add) + 1 == kOps, "a basic config per Op");
+constexpr int64_t kFusedOneShotMaxBytes = 512 * kKiB;
 
-constexpr int64_t kNever  = INT64_MAX;
-constexpr int64_t kAlways = -1;
-constexpr int64_t kKiB    = 1024;
+constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in) {
+  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
+}
 
-//   one_shot_max_bytes   one-shot at or under, two-shot above
-//   fused_max_bytes      declined above, so the caller runs the unfused ops (kNever: never
-//                        declined; kAlways: always)
-//   blocks, threads      the grid and block; the GEMM tail wants one block per 16-column tile
-//                        (56 at Kimi-K3)
-//   gemm_lanes_per_col   the GEMM tail's lanes per column (a template instantiation)
-//   push_one_shot,       each shot's direction: the push kernel over the pull one
-//   push_two_shot
-//   quant_bits           a push kernel's codec: 16 (T itself), 8 or 4; the lossy two stay
-//                        off until the model's accuracy is checked with them
-struct Basic {
-  int64_t one_shot_max_bytes;
-  int64_t fused_max_bytes;
-  int one_shot_blocks;
-  int two_shot_blocks;
-  int threads;
-  int gemm_lanes_per_col;
-  bool push_one_shot;
-  bool push_two_shot;
-  int quant_bits;
-};
+constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&) {
+  return fused_untuned(Kernel::all_reduce_pull_one_shot_rms_norm,
+                       Kernel::all_reduce_pull_two_shot_rms_norm, in);
+}
 
-// Indexed by Op. AttnRes past one-shot's range loses to unfused (2143 vs 1093 us at 4096 rows);
-// the GEMM tail is declined until its rewrite measures faster than unfused (37 us at 16 rows).
-constexpr Basic kBasic[kOps] = {
-    /* all_reduce            */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* rms_norm              */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* add_rms_norm          */ {512 * kKiB, kNever, 16, 36, 512, 0, false, false, 16},
-    /* add_attn_res_rms_norm */ {512 * kKiB, 512 * kKiB, 16, 36, 512, 0, false, false, 16},
-    /* rms_norm_gemm_add     */ {512 * kKiB, kAlways, 56, 56, 512, 4, false, false, 16},
-};
+constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&) {
+  return fused_untuned(Kernel::all_reduce_pull_one_shot_add_rms_norm,
+                       Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
+}
 
-constexpr const Basic& basic(Op op) { return kBasic[static_cast<int>(op)]; }
+// PAST ONE-SHOT'S RANGE IT DECLINES: two-shot lost to unfused there (2143 vs 1093 us at 4096 rows).
+constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&) {
+  return bytes(in) <= kFusedOneShotMaxBytes
+             ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, 16, 512)
+             : declined();
+}
 
-}  // namespace tune
+// DECLINED until its rewrite measures faster than unfused (37 us at 16 rows); it runs only forced,
+// by the tests and the bench.
+constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input, const Hardware&) { return declined(); }
 
 // =================================================================================================
-// THE PICK: the plain pull all-reduce by its rules, everything else by its basic config.
+// THE ONE ENTRY: the op's own function.
 // =================================================================================================
 
-inline Launch pick(Op op, int64_t rows, int64_t bytes) {
-  const tune::Basic& t = tune::basic(op);
-  if (bytes > t.fused_max_bytes) return {Kernel::none, 0, 0, 0, 0};
-  if (op == Op::all_reduce && !t.push_one_shot && !t.push_two_shot)
-    return bytes <= tune::kPullOneShotMaxBytes ? tune::pull_one_shot(kTarget)
-                                               : tune::pull_two_shot(kTarget);
-  const bool one_shot = bytes <= t.one_shot_max_bytes &&
-                        !(op == Op::rms_norm_gemm_add && rows > kGemmTailOneShotRows);
-  const Kernel k = kernel_of(op, one_shot ? t.push_one_shot : t.push_two_shot, !one_shot);
-  return {k, grid_of(k, one_shot ? t.one_shot_blocks : t.two_shot_blocks, rows), t.threads,
-          t.gemm_lanes_per_col, t.quant_bits};
+constexpr Launch tune(Op op, Input in, const Hardware& hw) {
+  switch (op) {
+    case Op::all_reduce: return tune_all_reduce(in, hw);
+    case Op::all_reduce_rms_norm: return tune_all_reduce_rms_norm(in, hw);
+    case Op::all_reduce_add_rms_norm: return tune_all_reduce_add_rms_norm(in, hw);
+    case Op::all_reduce_add_attn_res_rms_norm: return tune_all_reduce_add_attn_res_rms_norm(in, hw);
+    case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw);
+  }
+  return declined();
 }
 
 }  // namespace hip_comms

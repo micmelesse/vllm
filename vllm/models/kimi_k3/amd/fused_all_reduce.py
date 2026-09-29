@@ -101,7 +101,7 @@ def latent_tail(
         comm is not None
         and norm is not None
         and norm.weight.dtype == fused_output.dtype
-        and comm.should_allreduce_rms_norm_gemm_add(fused_output)
+        and comm.should_allreduce_rms_norm_gemm_add(fused_output, up_proj_shard)
     ):
         comm.all_reduce_rms_norm_gemm_add(
             fused_output,

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot push all-reduce then RMSNorm (`allreduce_push_one_shot_rms_norm`), and
-// all-reduce then add then RMSNorm (`allreduce_push_one_shot_add_rms_norm`): one body, a
+// One-shot push all-reduce then RMSNorm (`all_reduce_push_one_shot_rms_norm`), and
+// all-reduce then add then RMSNorm (`all_reduce_push_one_shot_add_rms_norm`): one body, a
 // kernel per op, so a trace names the op that ran.
 
 #pragma once
@@ -16,7 +16,7 @@ namespace hip_comms {
 // Every rank's rows, encoded by kBits' codec, into every rank's slot; one barrier; each
 // block reduces its rows out of its own slot and norms them as the pull kernel does.
 template <typename T, typename W, int ngpus, int kBits, bool kAdd>
-DINLINE void push_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
+DINLINE void all_reduce_push_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                              T* __restrict__ residual_out,
                                              const T* __restrict__ residual,
                                              const W* __restrict__ weight, float eps,
@@ -49,20 +49,22 @@ DINLINE void push_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
 
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kBits>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_push_one_shot_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_push_one_shot_rms_norm(
     p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  push_one_shot_add_rms_norm_body<T, W, ngpus, kBits, false>(p, out, nullptr, nullptr,
-                                                             weight, eps, rows, packs);
+  all_reduce_push_one_shot_add_rms_norm_body<T, W, ngpus, kBits, false>(p, out, nullptr,
+                                                                        nullptr, weight, eps,
+                                                                        rows, packs);
 }
 
 template <typename T, typename W, int ngpus, int kBits>
-__global__ void __launch_bounds__(kMaxThreads, 1) allreduce_push_one_shot_add_rms_norm(
+__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_push_one_shot_add_rms_norm(
     p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  push_one_shot_add_rms_norm_body<T, W, ngpus, kBits, true>(p, out, residual_out, residual,
-                                                            weight, eps, rows, packs);
+  all_reduce_push_one_shot_add_rms_norm_body<T, W, ngpus, kBits, true>(p, out, residual_out,
+                                                                       residual, weight, eps,
+                                                                       rows, packs);
 }
 
 }  // namespace hip_comms

@@ -39,9 +39,13 @@ logger = logging.getLogger(__name__)
 # adding the instantiation is a dispatch error at launch.
 WorldSize = Literal[2, 4, 8]
 
-# THE FUSED OPS a backend may admit, by name: all-reduce then the ops named, in order.
+# THE FUSED OPS a backend may admit, named as their methods are: all-reduce then the ops
+# named, in order.
 FusedOp = Literal[
-    "rms_norm", "add_rms_norm", "add_attn_res_rms_norm", "rms_norm_gemm_add"
+    "all_reduce_rms_norm",
+    "all_reduce_add_rms_norm",
+    "all_reduce_add_attn_res_rms_norm",
+    "all_reduce_rms_norm_gemm_add",
 ]
 # What `_admits` is asked about: the plain all-reduce, or a fused op.
 AdmitOp = Literal["all_reduce", FusedOp]
@@ -185,9 +189,13 @@ class Communicator(ABC):
     #
     # Every op and every `should_*` takes `launch`, a forced kernel and geometry, per
     # call. The sweep and the tests pass one (to hip, the one backend with kernels to
-    # choose); the model passes None, the backend's own choice.
+    # choose); the model passes None, the backend's own choice. And `quant_bits`, the
+    # precision the caller accepts on the wire: 16 (exact) unless it says otherwise; a
+    # backend without lossy kernels refuses anything else.
 
-    def should_allreduce(self, inp: torch.Tensor, launch: Launch | None = None) -> bool:
+    def should_allreduce(
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
+    ) -> bool:
         """Whether this backend takes `inp` -- every SIZE its memory holds, because it
         owns the collective. The noes are a tensor the kernel cannot compile for, being
         disabled, and what the backend does not admit (`_admits`: hip's push kernels
@@ -196,11 +204,11 @@ class Communicator(ABC):
         return (
             not self.disabled
             and self._is_supported(inp)
-            and self._admits("all_reduce", inp, launch)
+            and self._admits("all_reduce", inp, launch, quant_bits)
         )
 
     def should_allreduce_rms_norm(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> bool:
         """Whether this backend can all-reduce then `rms_norm` `inp` in one kernel.
 
@@ -209,18 +217,18 @@ class Communicator(ABC):
         return (
             type(self)._all_reduce_rms_norm is not Communicator._all_reduce_rms_norm
             and self.should_allreduce(inp)
-            and self._admits("rms_norm", inp, launch)
+            and self._admits("all_reduce_rms_norm", inp, launch, quant_bits)
         )
 
     def should_allreduce_add_rms_norm(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
         return (
             type(self)._all_reduce_add_rms_norm
             is not Communicator._all_reduce_add_rms_norm
             and self.should_allreduce(inp)
-            and self._admits("add_rms_norm", inp, launch)
+            and self._admits("all_reduce_add_rms_norm", inp, launch, quant_bits)
         )
 
     def _is_supported(self, inp: torch.Tensor) -> bool:
@@ -249,7 +257,7 @@ class Communicator(ABC):
         return inp.numel() * inp.element_size() < self.tunables.small_limit
 
     def all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE.
 
@@ -263,14 +271,14 @@ class Communicator(ABC):
         the backend's, so the classification is offered and not applied.
         """
         self._check_capture("all_reduce")
-        if not self.should_allreduce(inp, launch):
+        if not self.should_allreduce(inp, launch, quant_bits):
             raise RuntimeError(self._rejected("all_reduce", "should_allreduce", inp))
         # NO BRANCH HERE. It used to fork on `_is_small` and call the same thing on
         # both sides, marking where the paths would part. They part now -- in the
         # BACKEND: one with a kernel per size asks `_is_small` itself (see `hip`), and
         # one with a single kernel never hears about it. Splitting here would mean
         # every backend carrying a parameter for one backend's benefit.
-        return self._all_reduce(inp, launch)
+        return self._all_reduce(inp, launch, quant_bits)
 
     def all_reduce_rms_norm(
         self,
@@ -278,17 +286,18 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel.
 
         A variant of the collective, so it goes through the same two doors: the capture
         check and the admission check."""
         self._check_capture("all_reduce_rms_norm")
-        if not self.should_allreduce_rms_norm(inp, launch):
+        if not self.should_allreduce_rms_norm(inp, launch, quant_bits):
             raise RuntimeError(
                 self._rejected("all_reduce_rms_norm", "should_allreduce_rms_norm", inp)
             )
-        return self._all_reduce_rms_norm(inp, weight, eps, launch)
+        return self._all_reduce_rms_norm(inp, weight, eps, launch, quant_bits)
 
     def all_reduce_add_rms_norm(
         self,
@@ -297,11 +306,12 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, then the sum plus residual."""
         self._check_capture("all_reduce_add_rms_norm")
-        if not self.should_allreduce_add_rms_norm(inp, launch):
+        if not self.should_allreduce_add_rms_norm(inp, launch, quant_bits):
             raise RuntimeError(
                 self._rejected(
                     "all_reduce_add_rms_norm",
@@ -309,17 +319,21 @@ class Communicator(ABC):
                     inp,
                 )
             )
-        return self._all_reduce_add_rms_norm(inp, residual, weight, eps, launch)
+        return self._all_reduce_add_rms_norm(
+            inp, residual, weight, eps, launch, quant_bits
+        )
 
     def should_allreduce_add_attn_res_rms_norm(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
         return (
             type(self)._all_reduce_add_attn_res_rms_norm
             is not Communicator._all_reduce_add_attn_res_rms_norm
             and self.should_allreduce(inp)
-            and self._admits("add_attn_res_rms_norm", inp, launch)
+            and self._admits(
+                "all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits
+            )
         )
 
     def all_reduce_add_attn_res_rms_norm(
@@ -335,13 +349,14 @@ class Communicator(ABC):
         eps: float,
         out_eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
         `prefix` the sum starting one. Returns the prefix (updated in place when given)
         and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
         block."""
         self._check_capture("all_reduce_add_attn_res_rms_norm")
-        if not self.should_allreduce_add_attn_res_rms_norm(inp, launch):
+        if not self.should_allreduce_add_attn_res_rms_norm(inp, launch, quant_bits):
             raise RuntimeError(
                 self._rejected(
                     "all_reduce_add_attn_res_rms_norm",
@@ -361,18 +376,30 @@ class Communicator(ABC):
             eps,
             out_eps,
             launch,
+            quant_bits,
         )
 
     def should_allreduce_rms_norm_gemm_add(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self,
+        inp: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM added
-        into an output."""
+        into an output; `gemm_weight` is [N, hidden], and its N shapes the launch."""
         return (
             type(self)._all_reduce_rms_norm_gemm_add
             is not Communicator._all_reduce_rms_norm_gemm_add
             and self.should_allreduce(inp)
-            and self._admits("rms_norm_gemm_add", inp, launch)
+            and gemm_weight.dim() == 2
+            and self._admits(
+                "all_reduce_rms_norm_gemm_add",
+                inp,
+                launch,
+                quant_bits,
+                gemm_weight.shape[0],
+            )
         )
 
     def all_reduce_rms_norm_gemm_add(
@@ -384,11 +411,14 @@ class Communicator(ABC):
         out: torch.Tensor,
         out_col0: int,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> None:
         """`out[:, out_col0:out_col0 + N] += rms_norm(all_reduce(inp), norm_weight, eps)
         @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
         self._check_capture("all_reduce_rms_norm_gemm_add")
-        if not self.should_allreduce_rms_norm_gemm_add(inp, launch):
+        if not self.should_allreduce_rms_norm_gemm_add(
+            inp, gemm_weight, launch, quant_bits
+        ):
             raise RuntimeError(
                 self._rejected(
                     "all_reduce_rms_norm_gemm_add",
@@ -397,7 +427,7 @@ class Communicator(ABC):
                 )
             )
         self._all_reduce_rms_norm_gemm_add(
-            inp, norm_weight, eps, gemm_weight, out, out_col0, launch
+            inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
         )
 
     def close(self) -> None:
@@ -491,7 +521,7 @@ class Communicator(ABC):
 
     @abstractmethod
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None
+        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         """SUM across ranks, out of place: input untouched, new tensor returned. Assume
         `inp` is admitted -- the base checked."""
@@ -505,6 +535,7 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm; "
@@ -518,6 +549,7 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm; "
@@ -537,6 +569,7 @@ class Communicator(ABC):
         eps: float,
         out_eps: float,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
@@ -552,6 +585,7 @@ class Communicator(ABC):
         out: torch.Tensor,
         out_col0: int,
         launch: Launch | None = None,
+        quant_bits: int = 16,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm + add; "
@@ -559,13 +593,28 @@ class Communicator(ABC):
         )
 
     def _admits(
-        self, op: AdmitOp, inp: torch.Tensor, launch: Launch | None = None
+        self,
+        op: AdmitOp,
+        inp: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+        cols: int = 0,
     ) -> bool:
         """Whether the backend runs `op` (the plain all-reduce, or a fused op) over
-        `inp`, at `launch` if given. No limit unless the backend has one, and no launch
-        to choose."""
+        `inp`, at `launch` if given and at `quant_bits` precision; `cols` is the GEMM
+        tail's output columns (0 for every other op). No limit unless the backend has
+        one, no launch to choose and no lossy kernel."""
         self._refuse_launch(launch)
+        self._refuse_lossy(quant_bits)
         return True
+
+    def _refuse_lossy(self, quant_bits: int) -> None:
+        """A LOSSY PRECISION is hip's push codec; a backend without one says so rather
+        than returning an exact sum the caller did not ask to time."""
+        if quant_bits != 16:
+            raise ValueError(
+                f"{type(self).__name__} runs exact only; got quant_bits={quant_bits}"
+            )
 
     def _refuse_launch(self, launch: Launch | None) -> None:
         """A LAUNCH names hip's kernels; a backend without them says so rather than
