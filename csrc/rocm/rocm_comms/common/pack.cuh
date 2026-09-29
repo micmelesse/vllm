@@ -20,9 +20,11 @@ struct __align__(sizeof(T) * N) vec {
 
 // A PACK: 16 bytes, one vector load (8 bf16), the unit every kernel loads, sums and stores in,
 // as in vLLM's and aiter's custom all-reduce and NCCL. `num_packs` counts them.
+constexpr int kPackBytes = 16;
+
 template <typename T>
 struct traits {
-  static constexpr int N = 16 / sizeof(T);
+  static constexpr int N = kPackBytes / sizeof(T);
   using V = vec<T, N>;
 };
 

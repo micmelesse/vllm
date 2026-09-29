@@ -69,7 +69,8 @@ constexpr bool fits(const Launch& l) {
 }
 constexpr bool tuned_launches_fit() {
   for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm_add); ++op)
-    for (const Input in : {Input{1, 8, 2, 0, 16}, Input{4096, 7168, 2, 0, 16}})
+    for (const Input in :
+         {Input{1, 8, 2, 0, 16, 2}, Input{4096, 7168, 2, 0, 16, p2p::kMaxRanks}})
       if (!fits(tune(static_cast<Op>(op), in, kTarget))) return false;
   return true;
 }
@@ -105,8 +106,9 @@ Request request_of(int64_t quant_bits, int64_t kernel, int64_t blocks, int64_t t
 }
 
 // THE CALL as tune.cuh reads it.
-Input input_of(const Request& req, int64_t rows, int64_t hidden, int64_t elem, int64_t cols) {
-  return {rows, hidden, static_cast<int>(elem), cols, req.quant_bits};
+Input input_of(const p2p::host::Group& group, const Request& req, int64_t rows, int64_t hidden,
+               int64_t elem, int64_t cols) {
+  return {rows, hidden, static_cast<int>(elem), cols, req.quant_bits, group.world_size()};
 }
 
 // What runs: tune.cuh's pick, or the forced kernel at the forced grid and block.
@@ -175,7 +177,7 @@ bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t ro
   const int64_t lanes = 16 / elem;
   if (hidden % lanes != 0) return false;
   const int64_t packs = hidden / lanes;
-  const Launch l      = launch_for(req, op, input_of(req, rows, hidden, elem, cols));
+  const Launch l      = launch_for(req, op, input_of(group, req, rows, hidden, elem, cols));
   if (l.kernel == Kernel::none) return false;
   if (op != Op::all_reduce && packs > kMaxRowPacks * l.threads) return false;
   if (op == Op::all_reduce_rms_norm_gemm_add && !is_two_shot(l.kernel) &&
@@ -191,7 +193,7 @@ Launch checked_launch(const p2p::host::Group& group, const Request& req, Op op,
   TORCH_CHECK(admits(group, req, op, rows, hidden, elem, cols), "hip_comms: op ",
               static_cast<int>(op), " over [", rows, ", ", hidden,
               "] is declined here; ask admits first");
-  return launch_for(req, op, input_of(req, rows, hidden, elem, cols));
+  return launch_for(req, op, input_of(group, req, rows, hidden, elem, cols));
 }
 
 #define BY_NGPUS(world, LAUNCH)                                                          \

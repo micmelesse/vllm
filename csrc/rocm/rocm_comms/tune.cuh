@@ -10,6 +10,7 @@
 
 #include <cstdint>
 
+#include "common/pack.cuh"
 #include "hardware.cuh"
 #include "launch.cuh"
 #include "p2p/p2p.cuh"
@@ -25,12 +26,11 @@ struct Input {
   int64_t cols;    // the GEMM tail's output columns (its weight is [cols, hidden]); 0 without one
   int quant_bits;  // the precision the caller accepts on the wire: 16 (exact), 8 or 4. A push
                    // kernel's codec, passed through untouched; the pull kernels move T itself.
+  int world;       // ranks in the group
 };
 
 // WHAT THE HARDWARE MOVES: to it, a plain all-reduce is only its byte count.
 constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
-
-constexpr int64_t kKiB = 1024;
 
 // THE GEMM TAIL'S LANES PER COLUMN: a column's lanes split its reduction over the hidden size, so a
 // wave covers wave / lanes columns. 4 was picked at Kimi-K3's shape and is not yet swept; it is a
@@ -55,10 +55,8 @@ constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0}; }
 // ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:
 // tokens 1-64 at hidden 3584 bf16, blocks 1-64, threads 64-512).
 //
-// ONE WAVE PER BLOCK, AS MANY BLOCKS AS THE SIGNAL SLOTS ALLOW. Waves in one block only add a
-// barrier inside it: at 1 token one-shot took 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and
-// 10.9 at 512. Blocks run apart, and from 16 tokens up more of them help, best at the slot cap.
-// Within 0.1 us of the sweep's fastest config at every size from 1 to 64 tokens.
+// ONE WAVE PER BLOCK. Waves in one block only add a barrier inside it: at 1 token one-shot took
+// 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and 10.9 at 512.
 //
 // PULL ONE-SHOT UP TO 128 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
 // whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. One-shot won at
@@ -69,11 +67,18 @@ constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0}; }
 
 constexpr int64_t kPullOneShotMaxBytes = 128 * kKiB;
 
+// A GRID THE SIZE OF THE WORK, as aiter sizes its own: every block pays for every sync, so a block
+// with no pack to move is pure cost (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64).
+// One pack per thread in one pass, up to the signal slots and the compute units.
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
-  const Kernel k = bytes(in) <= kPullOneShotMaxBytes ? Kernel::all_reduce_pull_one_shot
-                                                      : Kernel::all_reduce_pull_two_shot;
+  const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
+  const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
+  const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
+  const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
+  const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int blocks = p2p::kMaxBlocks < hw.compute_units ? p2p::kMaxBlocks : hw.compute_units;
+  const int cap    = p2p::kMaxBlocks < hw.compute_units ? p2p::kMaxBlocks : hw.compute_units;
+  const int blocks = need < cap ? static_cast<int>(need) : cap;
   return at(k, in, blocks, hw.wave_size);
 }
 
