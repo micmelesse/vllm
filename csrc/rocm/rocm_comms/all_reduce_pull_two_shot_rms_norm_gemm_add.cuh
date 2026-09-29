@@ -17,7 +17,7 @@ namespace hip_comms {
 // every rank copies every normed row into `workspace` ([rows, packs] of its own); a grid sync;
 // the GEMM over every row, fusion::kRows per pass. THE SAME BLOCK AND THREAD INDEX A PACK IN
 // BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename T, int ngpus, int kLanesPerCol>
+template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
@@ -42,7 +42,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_n
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
-    V sum[kMaxRowPacks];
+    V sum[kRowPacks];
     sum_row<T, ngpus>(in, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,

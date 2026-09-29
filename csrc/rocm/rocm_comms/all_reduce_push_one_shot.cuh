@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   p2p::peer_barrier(w);
 
   for (int u = tiling.first(); u < tiling.end(); u = tiling.next(u)) {
-    V v[kMaxRowPacks];
+    V v[p2p::kPushGroupPacks];
     p2p::push::reduce(w, slot, tiling, u, v);
     tiles::store(dst, tiling, u, v);
   }

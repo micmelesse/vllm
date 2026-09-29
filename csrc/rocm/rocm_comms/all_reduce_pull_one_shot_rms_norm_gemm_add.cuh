@@ -16,7 +16,7 @@ namespace hip_comms {
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
 // grid barrier; the GEMM over every row. At most fusion::kRows rows: one GEMM pass.
 // kLanesPerCol is the GEMM's lanes per column (tune.cuh).
-template <typename T, int ngpus, int kLanesPerCol>
+template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_n
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    V sum[kMaxRowPacks];
+    V sum[kRowPacks];
     sum_row<T, ngpus>(in, row, packs, sum);
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps, [&](int, int i, const V& v) {
       store_global(normed + row * packs + i, v);

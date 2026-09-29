@@ -117,14 +117,30 @@ constexpr Kernel kernel_of(Op op, bool push, bool two_shot) {
 }
 
 // What runs: the kernel, its grid and block, for the GEMM tail its lanes per column (0 for
-// every other kernel), and for a push kernel its codec's bits (16: T itself).
+// every other kernel), for a push kernel its codec's bits (16: T itself), and for a pull row
+// kernel the packs of its row each thread holds (0 for every other kernel).
 struct Launch {
   Kernel kernel;
   int grid;
   int threads;
   int gemm_lanes_per_col;
   int quant_bits;
+  int row_packs;
 };
+
+// A PULL ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at
+// powers of two up to 16, which holds a 7168-wide bf16 row (896 packs) at one wave per block.
+// The push kernels hold a row in push groups instead (p2p::kPushGroupPacks).
+constexpr int kRowPacksBuilt[] = {1, 2, 4, 8, 16};
+
+constexpr bool has_row_packs(Kernel k) { return op_of(k) != Op::all_reduce && !is_push(k); }
+
+// The smallest build that holds a row of `packs` over `threads`; 0 when none does.
+constexpr int row_packs_for(int64_t packs, int threads) {
+  for (const int b : kRowPacksBuilt)
+    if (int64_t{b} * threads >= packs) return b;
+  return 0;
+}
 
 // A row op's one-shot kernel gives each block a row, so it needs no more blocks than rows;
 // everything else strides over the whole grid.

@@ -18,7 +18,7 @@ namespace hip_comms {
 // HBM round trip and a launch against an all-reduce then a norm kernel. A block owns a
 // row. `residual` and `residual_out` are unused (null) unless kAdd; `weight` is in its
 // own dtype W, T or fp32 (see `fusion::row`).
-template <typename T, typename W, int ngpus, bool kAdd>
+template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
                                                         const T* __restrict__ residual,
@@ -41,7 +41,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    V sum[kMaxRowPacks];
+    V sum[kRowPacks];
     sum_row<T, ngpus>(in, row, packs, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
@@ -54,21 +54,21 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename T, typename W, int ngpus>
+template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_norm(
     p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false>(p, out, nullptr, nullptr,
-                                                                 weight, eps, rows, packs);
+  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false, kRowPacks>(
+      p, out, nullptr, nullptr, weight, eps, rows, packs);
 }
 
-template <typename T, typename W, int ngpus>
+template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_add_rms_norm(
     p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true>(p, out, residual_out, residual,
-                                                                weight, eps, rows, packs);
+  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true, kRowPacks>(
+      p, out, residual_out, residual, weight, eps, rows, packs);
 }
 
 }  // namespace hip_comms

@@ -44,12 +44,14 @@ static_assert(kGemmLanesPerCol == 1 || kGemmLanesPerCol == 2 || kGemmLanesPerCol
 // `k` at `blocks` x `threads`: its grid cut to the rows where it gives each block a row, its lanes
 // if it is the GEMM tail, the call's precision passed through.
 constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
-  const int lanes = op_of(k) == Op::all_reduce_rms_norm_gemm_add ? kGemmLanesPerCol : 0;
-  return {k, grid_of(k, blocks, in.rows), threads, lanes, in.quant_bits};
+  const int lanes     = op_of(k) == Op::all_reduce_rms_norm_gemm_add ? kGemmLanesPerCol : 0;
+  const int row_packs =
+      has_row_packs(k) ? row_packs_for(in.hidden * in.elem_bytes / kPackBytes, threads) : 0;
+  return {k, grid_of(k, blocks, in.rows), threads, lanes, in.quant_bits, row_packs};
 }
 
 // No kernel: the caller runs the unfused ops.
-constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0}; }
+constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0, 0}; }
 
 // =================================================================================================
 // ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:

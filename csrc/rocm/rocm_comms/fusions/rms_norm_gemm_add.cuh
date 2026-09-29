@@ -21,16 +21,16 @@ namespace hip_comms::fusions::rms_norm_gemm_add {
 //
 // `sum` is this thread's share of the row, sum[k] the pack threadIdx.x + k * blockDim.x;
 // the normed packs leave through `store(k, i, v)`, i the pack within the row.
-template <typename T, typename Store>
-DINLINE void norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+template <typename T, int K, typename Store>
+DINLINE void norm_row(const typename traits<T>::V (&sum)[K],
                       const typename traits<T>::V* weight, int packs, float inv_hidden,
                       float eps, Store store) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  float s[kMaxRowPacks][NL];
+  float s[K][NL];
   float acc = 0.0f;
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
 #pragma unroll
@@ -41,7 +41,7 @@ DINLINE void norm_row(const typename traits<T>::V (&sum)[kMaxRowPacks],
   }
   const float scale = rsqrtf(block_sum(acc) * inv_hidden + eps);
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
     const V w = weight[i];

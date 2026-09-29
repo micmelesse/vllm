@@ -19,7 +19,7 @@ namespace hip_comms {
 // read and then overwritten by the one block that takes it, so the order is the block's own. THE
 // SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read only what
 // the same block on a peer wrote.
-template <typename T, int ngpus, bool kPrefix>
+template <typename T, int ngpus, bool kPrefix, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
@@ -53,7 +53,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
-    V sum[kMaxRowPacks];
+    V sum[kRowPacks];
     sum_row<T, ngpus>(in, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::row<T, kPrefix>(

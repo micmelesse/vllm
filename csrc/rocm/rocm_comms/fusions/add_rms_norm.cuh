@@ -29,21 +29,21 @@ namespace hip_comms::fusions::add_rms_norm {
 //
 // DIRECTION-FREE: `sum` is this thread's share of the row already reduced over ranks and
 // rounded to T (by the kernel's `sum_row` or `p2p::push::reduce`), sum[k] the
-// pack threadIdx.x + k * blockDim.x. The results leave through `store_res(k, i, v)` and
+// pack threadIdx.x + k * blockDim.x, k < K. The results leave through `store_res(k, i, v)` and
 // `store_out(k, i, v)`, i the pack within the row, so a kernel can land them in its
 // output, in scratch, or in registers to push.
-template <typename T, typename W, bool kAdd, typename StoreRes, typename StoreOut>
-DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+template <typename T, typename W, bool kAdd, int K, typename StoreRes, typename StoreOut>
+DINLINE void row(const typename traits<T>::V (&sum)[K],
                  const typename traits<T>::V* residual, const vec<W, traits<T>::N>* weight,
                  int row, int packs, float inv_hidden, float eps, StoreRes store_res,
                  StoreOut store_out) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
-  float s[kMaxRowPacks][NL];
+  float s[K][NL];
   float acc = 0.0f;
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
 #pragma unroll
@@ -63,7 +63,7 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
   }
   const float scale = rsqrtf(block_sum(acc) * inv_hidden + eps);
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
     const vec<W, NL> w = weight[i];

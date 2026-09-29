@@ -17,19 +17,19 @@ namespace hip_comms {
 // =================================================================================
 // TILINGS, FOR THE PUSH KERNELS ONLY (and the host's sizing of their scratch): who
 // handles which packs. They go when push moves to p2p::simple. Two kinds, one interface.
-// A thread's share of a UNIT is packs k < kMaxRowPacks (one batched load per peer, one push
+// A thread's share of a UNIT is packs k < kPushGroupPacks (one batched load per peer, one push
 // group). A two-shot gives every unit an OWNER rank; a rank's units
 // are its LOCAL units 0, 1, ... . A kernel walks its units with
 //   for (int u = t.first(rank); u < t.end(rank); u = t.next(u))   (a two-shot's own)
 //   for (int u = t.first(); u < t.end(); u = t.next(u))           (every unit)
 // and its locals likewise (first_local, locals, next_local). A LANE is a thread's place
-// among the threads that share a unit: a slot holds, per local unit, kMaxRowPacks x lanes.
+// among the threads that share a unit: a slot holds, per local unit, kPushGroupPacks x lanes.
 //
 // Rows (the fused ops): a unit is a token's row of `packs` packs; block b takes rows b,
 // b + grid, ...; thread t holds packs t + k x blockDim.
 // Buffer (the plain all-reduce): `slices` slices (1: one-shot; the world: two-shot), a
 // unit is one grid-wide pass over a slice: grid thread g holds packs g + (i x
-// kMaxRowPacks + k) x (grid x threads) of it, i the pass. Every thread does every pass,
+// kPushGroupPacks + k) x (grid x threads) of it, i the pass. Every thread does every pass,
 // so every thread moves the same bytes whatever the size.
 // =================================================================================
 namespace tiles {
@@ -77,7 +77,7 @@ struct Buffer {
   DINLINE int unit(int owner, int l) const { return owner * iters + l; }
   DINLINE int lane() const { return blockIdx.x * blockDim.x + threadIdx.x; }
   DINLINE int in_slice(int u, int k) const {
-    return lane() + (local(u) * kMaxRowPacks + k) * stride;
+    return lane() + (local(u) * p2p::kPushGroupPacks + k) * stride;
   }
   DINLINE int pos(int u, int k) const { return owner(u) * chunk + in_slice(u, k); }
   DINLINE bool has(int u, int k) const {
@@ -92,7 +92,7 @@ __host__ __device__ inline Rows rows(int rows, int packs, int world, int threads
 __host__ __device__ inline Buffer buffer(int64_t size, int slices, int grid, int threads) {
   const int chunk  = static_cast<int>((size + slices - 1) / slices);
   const int stride = grid * threads;
-  const int pass   = stride * kMaxRowPacks;
+  const int pass   = stride * p2p::kPushGroupPacks;
   return {static_cast<int>(size), slices, chunk, stride, (chunk + pass - 1) / pass};
 }
 
@@ -109,15 +109,15 @@ template <typename Tiling>
 DINLINE int members(const Tiling& t, int u) {
   int n = 0;
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) n += t.has(u, k) ? 1 : 0;
+  for (int k = 0; k < p2p::kPushGroupPacks; ++k) n += t.has(u, k) ? 1 : 0;
   return n;
 }
 
 // This thread's share of unit u into `dst`, a buffer laid out as the tiling's positions.
 template <typename Tiling, typename V>
-DINLINE void store(V* dst, const Tiling& t, int u, const V (&v)[kMaxRowPacks]) {
+DINLINE void store(V* dst, const Tiling& t, int u, const V (&v)[p2p::kPushGroupPacks]) {
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k)
+  for (int k = 0; k < p2p::kPushGroupPacks; ++k)
     if (t.has(u, k)) store_global(dst + t.pos(u, k), v[k]);
 }
 

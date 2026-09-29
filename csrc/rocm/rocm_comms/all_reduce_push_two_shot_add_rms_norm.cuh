@@ -44,9 +44,9 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   p2p::peer_barrier(w);
 
   for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
-    V sum[kMaxRowPacks];
+    V sum[p2p::kPushGroupPacks];
     p2p::push::reduce(w, in, tiling, row, sum);
-    V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
+    V normed[p2p::kPushGroupPacks] = {}, res[p2p::kPushGroupPacks] = {};
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int k, int, const V& v) { res[k] = v; },

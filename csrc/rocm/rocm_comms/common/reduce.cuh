@@ -38,13 +38,13 @@ DINLINE typename traits<T>::V sum_packs(const typename traits<T>::V* const (&src
   return out;
 }
 
-// THIS THREAD'S PACKS OF ROW `row` (pack threadIdx.x + k * blockDim.x, k < kMaxRowPacks) summed
-// over the `ngpus` sources, into sum[k]. A block owns the row; its norm needs every pack.
-template <typename T, int ngpus>
+// THIS THREAD'S PACKS OF ROW `row` (pack threadIdx.x + k * blockDim.x, k < K) summed over the
+// `ngpus` sources, into sum[k]. A block owns the row; its norm needs every pack.
+template <typename T, int ngpus, int K>
 DINLINE void sum_row(const typename traits<T>::V* const (&src)[ngpus], int row, int packs,
-                     typename traits<T>::V (&sum)[kMaxRowPacks]) {
+                     typename traits<T>::V (&sum)[K]) {
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i < packs) sum[k] = sum_packs<T, ngpus>(src, int64_t{row} * packs + i);
   }

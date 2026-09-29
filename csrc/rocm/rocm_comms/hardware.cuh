@@ -85,11 +85,6 @@ constexpr int kMaxThreads = kTarget.max_workgroup;
 static_assert(vgprs_per_thread(kTarget, kMaxThreads) == 128, "1024 threads leave 128 registers");
 constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
 
-// OUR LIMIT, NOT THE HARDWARE'S: how many packs of one row a thread holds in registers, packs
-// threadIdx.x + k * blockDim.x for k < kMaxRowPacks. A row wider than kMaxRowPacks x blockDim is
-// refused by the host (`admits`); a push kernel's group is the same kMaxRowPacks packs.
-constexpr int kMaxRowPacks = 4;
-
 // THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles are wrong.
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
 static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize,

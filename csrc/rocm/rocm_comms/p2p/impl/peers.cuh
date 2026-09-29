@@ -22,6 +22,10 @@ namespace hip_comms::p2p {
 constexpr int kMaxRanks  = 8;
 constexpr int kMaxBlocks = 64;
 
+// A PUSH GROUP: the packs a push thread moves per peer between waits, and its codec's unit, 32
+// values of a 2-byte T under one fp32 scale (QuickReduce's). Push alone reads it.
+constexpr int kPushGroupPacks = 4;
+
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
 // the bytes after the struct.
 //
@@ -66,7 +70,7 @@ struct Peers {
 
 inline int64_t push_slot_packs(int kbits, int64_t held, int lanes, int world) {
   const int64_t groups  = held * lanes;
-  const int64_t payload = kMaxRowPacks * 8 * kbits / 8 / 16;
+  const int64_t payload = kPushGroupPacks * 8 * kbits / 8 / 16;
   const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
   return int64_t{world} * (groups * payload + scales);
 }

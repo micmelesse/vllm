@@ -38,9 +38,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_push_two_shot_rms_n
   p2p::peer_barrier(w);
 
   for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
-    V sum[kMaxRowPacks];
+    V sum[p2p::kPushGroupPacks];
     p2p::push::reduce(w, in, tiling, row, sum);
-    V n[kMaxRowPacks] = {};
+    V n[p2p::kPushGroupPacks] = {};
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
                         [&](int k, int, const V& v) { n[k] = v; });
     p2p::push::share(w, slot, tiling, row, n);

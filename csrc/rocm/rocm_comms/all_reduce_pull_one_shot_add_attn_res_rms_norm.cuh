@@ -16,7 +16,7 @@ namespace hip_comms {
 // A block owns a row, as the fused norm does: every rank reduces every row, so there is
 // nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
 // in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix>
+template <typename T, int ngpus, bool kPrefix, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    V sum[kMaxRowPacks];
+    V sum[kRowPacks];
     sum_row<T, ngpus>(in, row, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, blocks + row * block_stride_m, block_stride_r,

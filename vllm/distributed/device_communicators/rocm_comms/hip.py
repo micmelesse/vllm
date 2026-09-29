@@ -96,7 +96,7 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         tunables = self.hip_tunables
-        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes, _row_packs = (
+        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
         self.rank = dist.get_rank(self.cpu_group)

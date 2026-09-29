@@ -27,8 +27,8 @@ namespace hip_comms::fusions::add_attn_res_rms_norm {
 // the rounding of the last few bits, not bitwise. Direction-free as `add_rms_norm::row`:
 // `sum` is this thread's share of the reduced row, the new prefix leaves through
 // `store_prefix(k, i, v)` and the output through `store_out(k, i, v)`.
-template <typename T, bool kPrefix, typename StorePrefix, typename StoreOut>
-DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
+template <typename T, bool kPrefix, int K, typename StorePrefix, typename StoreOut>
+DINLINE void row(const typename traits<T>::V (&sum)[K],
                  const typename traits<T>::V* prefix, const T* blocks,
                  int64_t block_stride_r, const typename traits<T>::V* norm_w,
                  const typename traits<T>::V* qk_w, const typename traits<T>::V* out_norm_w,
@@ -37,9 +37,9 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   const int base   = row * packs;
-  float u[kMaxRowPacks][NL];
+  float u[K][NL];
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
     V rounded;
@@ -59,17 +59,17 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
     store_prefix(k, i, rounded);
   }
 
-  float m[kMaxRowPacks][NL];
+  float m[K][NL];
   if (num_blocks == 0) {
     // With only the prefix source, the softmax is exactly one.
 #pragma unroll
-    for (int k = 0; k < kMaxRowPacks; ++k)
+    for (int k = 0; k < K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) m[k][j] = u[k][j];
   } else {
-    float w[kMaxRowPacks][NL];
+    float w[K][NL];
 #pragma unroll
-    for (int k = 0; k < kMaxRowPacks; ++k) {
+    for (int k = 0; k < K; ++k) {
       const int i = threadIdx.x + k * blockDim.x;
 #pragma unroll
       for (int j = 0; j < NL; ++j) m[k][j] = 0.0f;
@@ -83,10 +83,10 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
     for (int s = 0; s <= num_blocks; ++s) {
       // The stored blocks first, the prefix last, as the reference orders its sources.
       const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
-      float v[kMaxRowPacks][NL];
+      float v[K][NL];
       float ss = 0.0f, dot = 0.0f;
 #pragma unroll
-      for (int k = 0; k < kMaxRowPacks; ++k) {
+      for (int k = 0; k < K; ++k) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i >= packs) break;
         if (s < num_blocks) {
@@ -111,7 +111,7 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
       denominator             = denominator * old_scale + this_scale;
       max_logit               = new_max;
 #pragma unroll
-      for (int k = 0; k < kMaxRowPacks; ++k) {
+      for (int k = 0; k < K; ++k) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i >= packs) break;
 #pragma unroll
@@ -120,7 +120,7 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
     }
     const float inv_den = 1.0f / denominator;
 #pragma unroll
-    for (int k = 0; k < kMaxRowPacks; ++k)
+    for (int k = 0; k < K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) m[k][j] *= inv_den;
   }
@@ -129,7 +129,7 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
   if (out_norm_w != nullptr) {
     float ss = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxRowPacks; ++k) {
+    for (int k = 0; k < K; ++k) {
       const int i = threadIdx.x + k * blockDim.x;
       if (i >= packs) break;
 #pragma unroll
@@ -138,7 +138,7 @@ DINLINE void row(const typename traits<T>::V (&sum)[kMaxRowPacks],
     scale = rsqrtf(block_sum2(ss, 0.0f).x * inv_hidden + out_eps);
   }
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
+  for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
     if (i >= packs) break;
     V o;
