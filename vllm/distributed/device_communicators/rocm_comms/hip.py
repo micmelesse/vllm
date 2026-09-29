@@ -100,11 +100,9 @@ class HipCommunicator(Communicator):
             torch.ops._rocm_C.rocm_comms_sizes()
         )
         self.rank = dist.get_rank(self.cpu_group)
-        # One allocation per rank: the signal block, then the scratch. UNCACHED, as
-        # vLLM's and aiter's custom all-reduce allocate theirs: flags and a two-shot's
-        # partial sums are written by one GPU and read by the others. Freed on close.
-        self._signal = torch.ops._rocm_C.rocm_comms_alloc_uncached(
-            signal_bytes + tunables.scratch_bytes
+        # One allocation per rank: the signal block, then the scratch.
+        self._signal = torch.zeros(
+            signal_bytes + tunables.scratch_bytes, dtype=torch.uint8, device=self.device
         )
         self._slab = torch.zeros(
             peer_ptrs_bytes * tunables.max_buffers,
@@ -119,11 +117,11 @@ class HipCommunicator(Communicator):
             device=self.device,
         )
 
-        handles, offsets = self._exchange(self._signal)
+        handles, offsets = self._exchange(self._signal.data_ptr())
         self._handle = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
             self.world_size,
-            self._signal,
+            self._signal.data_ptr(),
             handles,
             offsets,
             self._slab.data_ptr(),
@@ -408,4 +406,3 @@ class HipCommunicator(Communicator):
             return
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
         self._handle = None
-        torch.ops._rocm_C.rocm_comms_free(self._signal)
