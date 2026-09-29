@@ -11,12 +11,13 @@ vLLM decodes) and replayed; the reported latency is per op, the slowest rank's. 
 case is also checked once against RCCL followed by the model's own ops, so a fast wrong
 kernel shows as `ok=False`.
 
-Ops (--op), each all-reduce then the ops named, in order:
-    all_reduce               the plain collective
-    rms_norm                 then vllm.ir.ops.rms_norm
-    add_rms_norm             then vllm.ir.ops.fused_add_rms_norm
-    add_attn_res_rms_norm    then Kimi-K3's Triton attn_res, with its output norm
-    rms_norm_gemm_add        then rms_norm, then addmm_ into a 1/world column shard
+Ops (--op), named by the communicator call they time, each an all-reduce then the ops
+named, in order:
+    all_reduce                          the plain collective
+    all_reduce_rms_norm                 then vllm.ir.ops.rms_norm
+    all_reduce_add_rms_norm             then vllm.ir.ops.fused_add_rms_norm
+    all_reduce_add_attn_res_rms_norm    then Kimi-K3's Triton attn_res, with its output norm
+    all_reduce_rms_norm_gemm_add        then rms_norm, then addmm_ into a 1/world column shard
 
 Arms:
     rccl / aiter             that all-reduce, then the ops (for all_reduce, just it)
@@ -29,7 +30,7 @@ Arms:
 
 Usage (Kimi-K3's decode shapes):
     torchrun --nproc_per_node=8 benchmarks/kernels/benchmark_rocm_comms.py \\
-        --op add_attn_res_rms_norm --hidden 7168 --output attn_res.jsonl
+        --op all_reduce_add_attn_res_rms_norm --hidden 7168 --output attn_res.jsonl
 """
 
 import argparse
@@ -63,6 +64,8 @@ from vllm.distributed.parallel_state import (
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 EPS = 1e-5
 OPS = ("all_reduce", *get_args(FusedOp))
+# THE NAME AN OP IS ASKED FOR AND REPORTED BY: the communicator method it times.
+API = {op if op == "all_reduce" else f"all_reduce_{op}": op for op in OPS}
 # Decode batch sizes up to Kimi-K3's max_num_seqs, then prefill chunks up to its
 # max_num_batched_tokens.
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -310,7 +313,7 @@ def _print_table(results: list[Result]) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--op", choices=OPS, default="all_reduce")
+    p.add_argument("--op", choices=tuple(API), default="all_reduce")
     p.add_argument("--hidden", type=int, default=7168, help="Kimi-K3 is 7168")
     p.add_argument("--tokens", type=int, nargs="+", default=DEFAULT_TOKENS)
     p.add_argument("--dtype", choices=DTYPES, default="bf16")
@@ -342,7 +345,7 @@ def main() -> None:
         ensure_model_parallel_initialized(world, 1)
     cpu_group = get_tp_group().cpu_group
     dtype = DTYPES[args.dtype]
-    op = args.op
+    op = API[args.op]
 
     pynccl = PyNcclCommunicator(group=cpu_group, device=device)
     hip = make_communicator(cpu_group, get_tp_group().device_group, device, "hip")
@@ -403,7 +406,7 @@ def main() -> None:
             busbw = nbytes / (us * 1e-6) * 2 * (world - 1) / world / 1e9
             results.append(
                 Result(
-                    op,
+                    args.op,
                     case.arm,
                     tokens,
                     args.hidden,
