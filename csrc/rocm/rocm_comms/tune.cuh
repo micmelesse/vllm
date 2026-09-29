@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
 
 #include "hardware.cuh"
@@ -73,7 +72,9 @@ constexpr int64_t kPullOneShotMaxBytes = 128 * kKiB;
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const Kernel k = bytes(in) <= kPullOneShotMaxBytes ? Kernel::all_reduce_pull_one_shot
                                                       : Kernel::all_reduce_pull_two_shot;
-  return at(k, in, std::min(p2p::kMaxBlocks, hw.compute_units), hw.wave_size);
+  // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
+  const int blocks = p2p::kMaxBlocks < hw.compute_units ? p2p::kMaxBlocks : hw.compute_units;
+  return at(k, in, blocks, hw.wave_size);
 }
 
 // =================================================================================================
