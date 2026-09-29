@@ -175,23 +175,29 @@ DINLINE void barrier(const Peers& p) {
 }
 
 // This thread's share of unit u of a tiling, summed over every rank's input in fp32 and
-// rounded once to T: every load from every peer is issued before any is added, so
-// kMaxRowPacks x ngpus are in flight rather than ngpus.
+// rounded once to T. STRAIGHT-LINE LOADS: every pack's position is worked out first (a
+// missing pack reads position 0 and is dropped by the caller's `has`), checked once, and
+// then all kMaxRowPacks x ngpus loads issue back to back with no branch between them, so
+// they are in flight together and the wave waits once. A branch per pack made the
+// compiler wait for each pack's loads before the next pack's (four round trips, not one).
 template <typename T, int ngpus, typename Tiling>
 DINLINE void sum(const World<T, ngpus>& w, const Tiling& t, int u,
                  typename traits<T>::V (&out)[kMaxRowPacks]) {
   using V         = typename traits<T>::V;
   constexpr int N = traits<T>::N;
-  V raw[kMaxRowPacks][ngpus];
+  int at[kMaxRowPacks];
+  int last = 0;
 #pragma unroll
   for (int k = 0; k < kMaxRowPacks; ++k) {
-    if (t.has(u, k)) {
-      const int64_t at = t.pos(u, k);
-      check(w.peers, at < w.peers.input_packs, "sum", -1, at, w.peers.input_packs);
-#pragma unroll
-      for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at);
-    }
+    at[k] = t.has(u, k) ? t.pos(u, k) : 0;
+    last  = at[k] > last ? at[k] : last;
   }
+  check(w.peers, last < w.peers.input_packs, "sum", -1, last, w.peers.input_packs);
+  V raw[kMaxRowPacks][ngpus];
+#pragma unroll
+  for (int k = 0; k < kMaxRowPacks; ++k)
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at[k]);
 #pragma unroll
   for (int k = 0; k < kMaxRowPacks; ++k) {
     float acc[N];
@@ -253,6 +259,15 @@ DINLINE void put(const World<T, ngpus>& w, int peer, int64_t idx,
   check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put",
                 peer, idx, w.peers.scratch_packs);
   store_global(scratch(w, peer) + idx, v);
+}
+
+// A pack pushed into peer's scratch, past the caches (see `store_uncached`).
+template <typename T, int ngpus>
+DINLINE void put_pushed(const World<T, ngpus>& w, int peer, int64_t idx,
+                        const typename traits<T>::V& v) {
+  check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put_pushed",
+        peer, idx, w.peers.scratch_packs);
+  store_uncached(scratch(w, peer) + idx, v);
 }
 
 // A direct pointer to n packs of peer's scratch, checked once, for a hot loop.
