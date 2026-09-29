@@ -589,6 +589,20 @@ hip_comms::p2p::host::Group& comms_of(fptr_t comms) {
 }
 }  // namespace
 
+// UNCACHED DEVICE MEMORY for the signal block and scratch, as vLLM's and aiter's custom
+// all-reduce allocate theirs (aiter: `allocate_meta_buffer`): a flag or a two-shot's partial
+// sums are written by one GPU and read by the others, and an uncached store lands where a peer
+// reads it, with no cache in between. Zeroed; exported over IPC like any allocation; freed by
+// rocm_comms_free. Outside torch's allocator, so vLLM's memory profile does not count it.
+int64_t rocm_comms_alloc_uncached(int64_t bytes) {
+  void* p = nullptr;
+  HIP_CHECK(hipExtMallocWithFlags(&p, static_cast<size_t>(bytes), hipDeviceMallocUncached));
+  HIP_CHECK(hipMemset(p, 0, static_cast<size_t>(bytes)));
+  return reinterpret_cast<int64_t>(p);
+}
+
+void rocm_comms_free(int64_t ptr) { HIP_CHECK(hipFree(reinterpret_cast<void*>(ptr))); }
+
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,

@@ -100,6 +100,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // has nothing for the dispatcher to select a backend from -- a `kCPU` impl is then
   // unreachable and the call raises "no fallback function is registered". So they are
   // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
+  rocm_ops.def("rocm_comms_alloc_uncached", &rocm_comms_alloc_uncached);
+  rocm_ops.def("rocm_comms_free", &rocm_comms_free);
   rocm_ops.def("rocm_comms_init", &rocm_comms_init);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
   rocm_ops.def("rocm_comms_set_checked", &rocm_comms_set_checked);
