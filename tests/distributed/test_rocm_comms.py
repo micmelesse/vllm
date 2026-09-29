@@ -2,9 +2,10 @@
 # rights reserved.
 """Does each communicator backend work?
 
-One test per (backend, mode). `exercise` puts ONE communicator through the whole API --
-both collectives, both dtypes, every shape -- because that is what vLLM does. Every cell
-is four steps: gen_inputs -> run_collective -> expected_outputs -> compare.
+One test per (backend, mode) and a chosen set of dtypes and shape groups. `exercise`
+puts ONE communicator through the whole API -- every dtype and shape the case names --
+because that is what vLLM does. Every cell is four steps: gen_inputs -> run_collective
+-> expected_outputs -> compare.
 
 The modes localise a failure rather than covering different ground: `eager` asks whether
 the collective is right at all, `graph` whether capture/replay preserves that across
@@ -12,24 +13,40 @@ many replays with fresh input, `vllm` whether the real pattern works: a collecti
 layer, EVERY shape captured together under one registration -- vLLM's capture-size
 ladder, sharing one set of buffers -- replayed round-robin, with an eager fallback in
 the middle.
+
+ONE WORLD FOR THE SESSION. Bringing up eight ranks -- spawn, import, NCCL, model
+parallel -- costs 30-60 s and a case's kernels cost milliseconds, so the ranks are
+spawned once (`ranks`) and serve every case: a case is a module-level function run in
+every rank as `fn(ctx, **kwargs)`, returning that rank's `(value, err)`. A communicator
+is built the first time a case asks for its backend and kept for the world's life, as
+vLLM keeps one. A case that errors, hangs or kills a rank ends the world, and the next
+case starts a fresh one: a failed collective can leave peer state inconsistent.
+
+TWO TIERS. The default (`-m "not full"`) is what vLLM runs, at Kimi-K3's shapes, plus
+the boundaries that decide which path is taken. `full` is everything else: the push
+kernels, fp16, the other backends, eager, the remaining shapes and the kernels tune
+declines today.
 """
 
 import hashlib
 import logging
 import math
 import multiprocessing as mp
+import queue
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from functools import partial
 from itertools import product
 from multiprocessing import set_start_method
-from multiprocessing.pool import AsyncResult, Pool
-from typing import Literal, Optional, cast, get_args
+from multiprocessing.process import BaseProcess
+from multiprocessing.queues import Queue
+from typing import Concatenate, Literal, ParamSpec, TypeVar, cast, get_args
 
 import pytest
 import torch
 import torch.distributed as dist
+from _pytest.mark import ParameterSet
 from torch.distributed import ProcessGroup
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -69,6 +86,9 @@ GRAPH_REPLAYS = 200
 
 
 CASE_TIMEOUT_S = 600
+# How long a world's ranks get to tear their groups down before they are killed:
+# `destroy_process_group` is the call that has hung on us before.
+STOP_TIMEOUT_S = 60
 
 # Deterministic per-(rank, replay) seed base for the varying-input check.
 _INPUT_SEED = 20260615
@@ -175,8 +195,8 @@ DISABLED = {
     "stopped serving (all_gather raises, 2026-09-17)",
 }
 
-# Control FIRST, because it is the outermost pytest parameter and therefore the first
-# case to run: if torch is red, nothing after it means anything.
+# Control FIRST in `COMMUNICATOR_CASES`, because it is the first case to run: if torch
+# is red, nothing after it means anything.
 # hip as C++ picks, and each all_reduce kernel forced; the other backends have one
 # kernel each. A SHOT is a shot and a direction, and names every op's kernel,
 # `f"{shot}_{op}"` (the plain all_reduce's is the shot itself); a push kernel runs
@@ -188,14 +208,11 @@ Shot = Literal[
     "all_reduce_push_two_shot",
 ]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
+# The pull kernels: the fast tier forces each, whatever tune would pick.
+PULL_SHOTS: tuple[Shot, ...] = ("all_reduce_pull_one_shot", "all_reduce_pull_two_shot")
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
 BACKEND_KERNELS = tuple(
-    pytest.param(
-        name,
-        kernel,
-        id=name if kernel is None else f"{name}-{kernel}",
-        marks=[pytest.mark.skip(reason=DISABLED[name])] if name in DISABLED else [],
-    )
+    (name, kernel)
     for name in _BACKEND_CLASS
     for kernel in ((None, *ALL_REDUCE_KERNELS) if name == "hip" else (None,))
 )
@@ -209,15 +226,28 @@ DTYPES = ("fp16", "bf16")
 # admission bound, where the communicator starts declining and vLLM falls back; 4088 is
 # deliberately not a power of two.
 SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
-# They differ in the LEADING dimension only, asserted here because here is where the
-# literal is. A group of shapes shares one set of buffers sized to the tallest and each
-# reads a PREFIX (see `run_collective`), which is valid only under this. vLLM's capture
-# sizes differ in tokens and share the hidden size, so the ladder is faithful exactly
-# while this holds -- and at import, before a process is spawned or a card touched, is
-# the cheapest place to find out that it stopped.
-assert len({sh[1:] for sh in SHAPES}) == 1, (
-    f"SHAPES may differ only in the leading dim: {SHAPES}"
-)
+# Kimi-K3's rows: the latent MoE row (3584) and the hidden row (7168), at decode token
+# counts and one prefill chunk. What the fast tier runs the plain all-reduce at.
+KIMI_TOKENS = (1, 2, 8, 16, 2048)
+KIMI_WIDTHS = (3584, 7168)
+# A GROUP is the shapes one `vllm` capture covers, and a case sweeps whole groups. The
+# forced-kernel group is a small and a large shape, so a forced kernel is exercised at
+# both ends whatever tune would pick.
+SHAPE_GROUPS: dict[str, tuple[tuple[int, int], ...]] = {
+    **{f"h{w}": tuple((t, w) for t in KIMI_TOKENS) for w in KIMI_WIDTHS},
+    "h7168-ends": ((16, 7168), (2048, 7168)),
+    "h8192": SHAPES,
+}
+# Each group differs in the LEADING dimension only, asserted here because here is where
+# the literals are. A group of shapes shares one set of buffers sized to the tallest and
+# each reads a PREFIX (see `run_collective`), which is valid only under this. vLLM's
+# capture sizes differ in tokens and share the hidden size, so the ladder is faithful
+# exactly while this holds -- and at import, before a process is spawned or a card
+# touched, is the cheapest place to find out that it stopped.
+for _name, _group in SHAPE_GROUPS.items():
+    assert len({sh[1:] for sh in _group}) == 1, (
+        f"group {_name} may differ only in the leading dim: {_group}"
+    )
 
 # `vllm` is a superset of `graph`: one collective per layer, and every shape captured
 # TOGETHER -- vLLM's capture-size ladder -- rather than a capture per shape.
@@ -232,7 +262,9 @@ MEMORY_BUDGET = 0.70
 @dataclass(frozen=True)
 class Schedule:
     buffers: int  # distinct input buffers the collective is called on, per replay
-    shapes: int  # shapes sharing ONE capture; 1 gives each its own, as vLLM does not
+    # shapes sharing ONE capture; 1 gives each its own, as vLLM does not, and 0 puts the
+    # whole group under one, as vLLM does
+    shapes: int
     replays: int  # body launches, SHARED by every shape in the group
     # recorded into cudagraphs -- one per shape -- and replayed, or run eagerly
     captured: bool
@@ -254,7 +286,7 @@ SCHEDULES = {
     "eager": Schedule(buffers=1, shapes=1, replays=1, captured=False),
     "graph": Schedule(buffers=1, shapes=1, replays=GRAPH_REPLAYS, captured=True),
     "vllm": Schedule(
-        buffers=VLLM_LAYERS, shapes=len(SHAPES), replays=GRAPH_REPLAYS, captured=True
+        buffers=VLLM_LAYERS, shapes=0, replays=GRAPH_REPLAYS, captured=True
     ),
 }
 MODES = tuple(SCHEDULES)
@@ -340,38 +372,290 @@ def _build_communicator(
     return comm
 
 
-def _collect(
-    pool: Pool, rets: Sequence[AsyncResult]
-) -> tuple[list[tuple[Optional["Measurement"], str | None]] | None, str | None]:
-    """Every rank's OUTCOME, or why we could not get them all.
+# ---------------------------------------------------------------------------------
+# THE SESSION'S WORLD. Every case used to spawn its own eight ranks and bring up NCCL
+# and model parallel for a few milliseconds of kernels; now the ranks come up once and
+# serve cases until a case leaves them in doubt.
+# ---------------------------------------------------------------------------------
 
-    Each element is that rank's own `(value, err)`; this pair is about the collecting.
-    `pool.join()` cannot be used here: it waits forever, so a deadlocked rank stalls the
-    whole run with nothing printed. `terminate()` frees the GPUs for the next case.
+T = TypeVar("T")
+P = ParamSpec("P")
 
-    A rank that raised has already logged its traceback in its own process, so an error
-    here only has to name the rank -- and returning it as a value is what lets the
-    caller report EVERY rank rather than the one exception the pool happened to surface
-    first.
-    """
-    deadline = time.monotonic() + CASE_TIMEOUT_S
-    out: list[tuple[Measurement | None, str | None]] = []
-    for r, ret in enumerate(rets):
-        try:
-            out.append(ret.get(timeout=max(1.0, deadline - time.monotonic())))
-        except mp.TimeoutError:
-            pool.terminate()
-            pool.join()
-            return None, (
-                f"rank {r} still running after {CASE_TIMEOUT_S}s -- a deadlock; "
-                f"{len(out)} of {len(rets)} ranks returned"
+# Every value a case hands back, named for the wire: a sweep's worst `Measurement`, a
+# fused case's verdict, a quantized case's `(rel_rmse, digest)`. `run` gives the caller
+# back its own case's type.
+CaseValue = Measurement | bool | tuple[float, str] | None
+# To a rank: the case's sequence number, the function and its arguments. None stops it.
+Order = tuple[int, Callable[..., tuple[CaseValue, str | None]], tuple, dict] | None
+# From a rank: the sequence number it answers, the rank, and its `(value, err)`.
+Reply = tuple[int, int, tuple[CaseValue, str | None]]
+
+
+@dataclass(frozen=True)
+class RankContext:
+    """What a case gets in each rank: who it is, its groups, and the world's
+    communicators."""
+
+    rank: int
+    world: int
+    device: torch.device
+    cpu_group: ProcessGroup
+    device_group: ProcessGroup
+    # A dict in a frozen dataclass: the fields cannot be rebound, the cache still fills.
+    _comms: dict[str, Communicator] = field(default_factory=dict, init=False)
+
+    def comm(self, backend: str) -> Communicator:
+        """The world's communicator for `backend`, built the first time a case asks and
+        kept for the world's life, as vLLM keeps one.
+
+        Building is a collective, so every rank must ask in the same case -- which it
+        does, since every rank runs every case. A build that raises (not installed,
+        disabled) is not cached: the case errors, as it did when each case built its
+        own, and the error replaces the world.
+        """
+        if backend not in self._comms:
+            self._comms[backend] = _build_communicator(
+                backend, self.cpu_group, self.device_group, self.device
             )
-        except Exception as e:
-            pool.terminate()
-            pool.join()
-            return None, f"rank {r} did not come back: {type(e).__name__}: {e}"
-    pool.join()
-    return out, None
+        return self._comms[backend]
+
+    def close(self) -> None:
+        """Close every communicator this world built. Before the process group goes:
+        `close` is local, but it releases IPC handles the group exchanged."""
+        for comm in self._comms.values():
+            comm.close()
+        self._comms.clear()
+
+
+def _bring_up(rank: int, world: int, init_method: str) -> RankContext:
+    """ONE rank's process group and model parallel, once per world."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(
+        world_size=world, rank=rank, distributed_init_method=init_method
+    )
+    # A CONFIG CONTEXT, because `ensure_model_parallel_initialized` builds vLLM's device
+    # communicators and those instantiate CustomOps, which read the current config. The
+    # aiter version of this test built its groups with plain `torch.distributed` and
+    # never touched `parallel_state`; the port does, and without it every rank
+    # dies with "Current vLLM config is not set" before a single collective runs.
+    # HERE AND NOT A FIXTURE: each rank is its own process, so a parent fixture is
+    # not in scope where the config is read.
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(world, 1)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(
+        torch.zeros(1).cuda(), group=group
+    )  # force comm init before we measure
+    torch.cuda.synchronize()
+    return RankContext(rank, world, device, cpu_group, group)
+
+
+def _tear_down(ctx: RankContext) -> None:
+    """Communicators first, then the groups they were built on. Each in its OWN try, so
+    a teardown that fails cannot stop the next one -- `destroy_process_group` is exactly
+    the call that has hung on us before."""
+    try:
+        ctx.close()
+    except BaseException:
+        logger.exception("rank %d: closing the communicators failed", ctx.rank)
+    try:
+        if dist.is_initialized():
+            destroy_model_parallel()
+            destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    except BaseException:
+        logger.exception("rank %d: teardown failed", ctx.rank)
+
+
+def _serve(
+    rank: int,
+    world: int,
+    init_method: str,
+    inbox: "Queue[Order]",
+    outbox: "Queue[Reply]",
+) -> None:
+    """ONE rank of the session's world: come up once, then run every case sent until
+    told to stop.
+
+    Every rank rebuilds every rank's input from a seed, so it judges its own result and
+    only scalars cross the process boundary. `err` is set when this rank failed, and it
+    is a VALUE rather than an exception so the parent gets EVERY rank's verdict.
+    """
+    try:
+        ctx = _bring_up(rank, world, init_method)
+    except Exception as e:
+        logger.exception("rank %d failed to come up", rank)
+        outbox.put((0, rank, (None, f"did not come up: {type(e).__name__}: {e}")))
+        return
+    outbox.put((0, rank, (None, None)))
+    # FINALLY: a rank that dies with its group still up leaves its peers waiting on a
+    # socket rather than seeing a clean disconnect, turning one rank's error into
+    # everyone's 600-second timeout.
+    try:
+        while (order := inbox.get()) is not None:
+            seq, fn, args, kwargs = order
+            try:
+                outcome = fn(ctx, *args, **kwargs)
+            except Exception as e:
+                # Logged HERE, with the rank and the full traceback, before anything
+                # crosses the process boundary -- then RETURNED, not re-raised, and the
+                # rank keeps serving. Re-raising surfaces one rank to the parent and on
+                # eight ranks the one it picks is not always the informative one.
+                # `Exception`, not `BaseException`: a Ctrl-C is not this rank's verdict
+                # and has to keep unwinding.
+                logger.exception("rank %d failed %s %s", rank, fn.__name__, kwargs)
+                outcome = (None, f"{type(e).__name__}: {e}")
+            outbox.put((seq, rank, outcome))
+    finally:
+        _tear_down(ctx)
+
+
+class World:
+    """The session's ranks: started by the first case that needs them, and replaced
+    after any case that leaves them in doubt.
+
+    A case that ERRORS ends the world, even when every rank answered: a failed
+    collective can leave peer state -- a flag, a registered buffer, a half-written
+    slice -- that the next case would inherit and fail on for no reason of its own. A
+    passing, failing-on-tolerance or declined case keeps it. A rank that hangs or dies
+    ends it at once, killed rather than asked, since it will not answer.
+    """
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._procs: list[BaseProcess] = []
+        self._inboxes: list[Queue[Order]] = []
+        self._outbox: Queue[Reply] | None = None
+        self._seq = 0
+
+    def run(
+        self,
+        fn: Callable[Concatenate[RankContext, P], tuple[T, str | None]],
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> list[tuple[T | None, str | None]]:
+        """`fn(ctx, *args, **kwargs)` in every rank: each rank's `(value, err)`, in rank
+        order. A rank that did not answer has `(None, why)`, so the caller reports it
+        with the rest."""
+        if not self._procs:
+            failed = self._start()
+            if failed is not None:
+                return failed
+        self._seq += 1
+        for inbox in self._inboxes:
+            inbox.put((self._seq, fn, args, kwargs))
+        got, answered = self._collect(self._seq, stop_on_error=False)
+        if not answered:
+            self.stop(graceful=False)
+        elif any(err is not None and err != NO_FUSED_KERNEL for _, err in got):
+            self.stop(graceful=True)
+        return cast(list[tuple[T | None, str | None]], got)
+
+    def _start(self) -> list[tuple[None, str | None]] | None:
+        """Spawn the ranks and wait for every one to come up. None when they did, and
+        otherwise every rank's `(None, why)`."""
+        spawn = mp.get_context("spawn")
+        # A FRESH port per world: the worlds are sequential and each tears its group
+        # down, but two runs on a shared box must not collide.
+        init = get_distributed_init_method("127.0.0.1", get_open_port())
+        self._outbox = spawn.Queue()
+        self._inboxes = [spawn.Queue() for _ in range(self.size)]
+        self._procs = [
+            spawn.Process(
+                target=_serve,
+                args=(r, self.size, init, self._inboxes[r], self._outbox),
+                name=f"rocm-comms-rank{r}",
+                daemon=True,
+            )
+            for r in range(self.size)
+        ]
+        for p in self._procs:
+            p.start()
+        self._seq = 0
+        got, answered = self._collect(0, stop_on_error=True)
+        if answered and all(err is None for _, err in got):
+            return None
+        self.stop(graceful=False)
+        return [
+            (None, err if err is not None else f"rank {r} came up; the world did not")
+            for r, (_, err) in enumerate(got)
+        ]
+
+    def _collect(
+        self, seq: int, stop_on_error: bool
+    ) -> tuple[list[tuple[CaseValue, str | None]], bool]:
+        """Every rank's reply to `seq`, and whether every rank gave one.
+
+        Under the deadline, never an unbounded wait: a deadlocked rank would otherwise
+        stall the whole run with nothing printed. A rank whose process has exited is
+        not waited for at all. A rank that raised has already logged its traceback in
+        its own process, so a missing reply here only has to name the rank.
+        """
+        assert self._outbox is not None
+        deadline = time.monotonic() + CASE_TIMEOUT_S
+        got: dict[int, tuple[CaseValue, str | None]] = {}
+        dead: list[int] = []
+        while len(got) < self.size and time.monotonic() < deadline:
+            try:
+                s, r, outcome = self._outbox.get(timeout=1.0)
+            except queue.Empty:
+                dead = [
+                    r
+                    for r, p in enumerate(self._procs)
+                    if r not in got and not p.is_alive()
+                ]
+                if dead:
+                    break
+                continue
+            if s != seq:
+                continue  # an answer to a case already given up on
+            got[r] = outcome
+            if stop_on_error and outcome[1] is not None:
+                break
+        n = len(got)
+        for r in range(self.size):
+            if r in got:
+                continue
+            if r in dead:
+                why = f"rank {r} died (exit code {self._procs[r].exitcode})"
+            elif time.monotonic() >= deadline:
+                why = f"rank {r} still running after {CASE_TIMEOUT_S}s -- a deadlock"
+            else:
+                why = f"rank {r} not waited for: another rank failed to come up"
+            got[r] = (None, f"{why}; {n} of {self.size} ranks returned")
+        return [got[r] for r in range(self.size)], n == self.size
+
+    def stop(self, graceful: bool = True) -> None:
+        """End the world. GRACEFUL asks each rank to tear its groups down and kills
+        whichever has not within `STOP_TIMEOUT_S`; otherwise every rank is killed
+        outright, which frees the GPUs whatever state they were left in."""
+        if not self._procs:
+            return
+        if graceful:
+            for inbox in self._inboxes:
+                inbox.put(None)
+            deadline = time.monotonic() + STOP_TIMEOUT_S
+            for p in self._procs:
+                p.join(timeout=max(0.0, deadline - time.monotonic()))
+        for r, p in enumerate(self._procs):
+            if p.is_alive():
+                if graceful:
+                    logger.warning("rank %d did not stop; killing it", r)
+                p.terminate()
+        for p in self._procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+                p.join()
+        # A queue a dead rank never drained would otherwise block this process's exit
+        # on flushing it.
+        for q in (*self._inboxes, self._outbox):
+            if q is not None:
+                q.cancel_join_thread()
+                q.close()
+        self._procs, self._inboxes, self._outbox = [], [], None
 
 
 INPUT_POOL = 16
@@ -641,110 +925,102 @@ def compare(
 
 
 def exercise(
+    ctx: RankContext,
     backend: str,
-    sched: Schedule,
-    world: int,
-    rank: int,
-    device: torch.device,
-    cpu_group: ProcessGroup,
-    group: ProcessGroup,
+    mode: str,
+    groups: Sequence[str],
+    dtypes: Sequence[str],
     kernel: Kernel | None = None,
 ) -> tuple[Measurement | None, str | None]:
-    """CREATE a communicator, exercise its whole API, TEAR IT DOWN. `(worst verdict,
-    None)`, or
-    `(None, why nothing was measured)`.
+    """Exercise the world's communicator for `backend` over its whole API. `(worst
+    verdict, None)`, or `(None, why nothing was measured)`.
 
     TWO LEVELS of error track, carrying different things. A CELL's `err` means that cell
-    did not run
-    -- declined, or over budget -- which is not a failure and does not stop the sweep.
-    This function's
-    `err` means the sweep produced NO measurement at all. A cell that RAISES is neither:
-    it is a real failure and it propagates, to be logged with its traceback and turned
-    into an error track by `run_rank`.
+    did not run -- declined, or over budget -- which is not a failure and does not stop
+    the sweep. This function's `err` means the sweep produced NO measurement at all. A
+    cell that RAISES is neither: it is a real failure and it propagates, to be logged
+    with its traceback and turned into an error track by `_serve`.
 
-    It owns the lifetime because construction and teardown are two of the ways a
-    communicator fails -- building one is a collective, and teardown releases IPC
-    handles -- and owning both puts the order beyond reach. A declined shape, or a group
-    past the memory budget, is reported and skipped: declining is correct behaviour.
-    Each group is scoped so its tensors die with the frame.
+    The communicator is the WORLD's, not this case's: built on the first case that asks
+    and closed when the world ends, as vLLM holds one for its whole life. Construction
+    and teardown are still two of the ways a communicator fails -- building one is a
+    collective, and teardown releases IPC handles -- and they still run, once per world.
+    A declined shape, or a group past the memory budget, is reported and skipped:
+    declining is correct behaviour. Each group is scoped so its tensors die with the
+    frame.
 
     A GROUP is the shapes one capture covers -- one shape for `eager` and `graph`, all
     of them for `vllm`. They run together and are JUDGED APART, so the log keeps a line
     per (op, dtype, shape) whichever mode produced it.
     """
+    rank, world, device = ctx.rank, ctx.world, ctx.device
+    sched = SCHEDULES[mode]
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = Measurement(
         within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0, rtol=0.0
     )
     ran = 0
-    # `with`, so release is in the SYNTAX: `close()` runs at block exit whatever happens
-    # inside, where `del` only releases if nothing else holds a reference -- and a
-    # failing cell's traceback holds the frames that hold the communicator, so `del`
-    # fails exactly when it matters.
     launch = None if kernel is None else Launch(kernel)
-    with _build_communicator(backend, cpu_group, group, device) as comm:
-        for op_name, dtype_name in product(OPS, DTYPES):
-            dtype = D_DTYPES[dtype_name]
-            atol = _atol(op_name, dtype)
-            for chunk in _chunks(SHAPES, sched.shapes):
-                # Admission FIRST and per shape, because a group is what the capture
-                # covers: a refused shape is dropped from it, not a reason to skip the
-                # ones that were admitted.
-                shapes = []
-                for sh in chunk:
-                    why = declined(comm, op_name, sh, dtype, launch)
-                    if why is None:
-                        shapes.append(sh)
-                    else:
-                        _say(
-                            rank,
-                            f"      - {op_name:11} {dtype_name:5} {str(sh):12} {why}",
-                        )
-                if not shapes:
-                    continue
-
-                # THE LOOP VARIABLES ARE BOUND AT DEFINITION, as defaults. `cell` is
-                # called immediately below so late binding cannot bite today, but a
-                # closure over a loop variable is one edit away from doing so.
-                def cell(
-                    op_name: str = op_name,
-                    shapes: Sequence[tuple[int, int]] = shapes,
-                    dtype: torch.dtype = dtype,
-                    atol: float = atol,
-                ) -> tuple[list[Measurement] | None, str | None]:
-                    # THE ERROR TRACK is the second element, and it is the ONLY thing we
-                    # test: `err is not None` means we have an error. Never the value --
-                    # when `err` is set the value slot is not to be read.
-                    _, err = precheck(op_name, shapes, dtype, world, sched, budget)
-                    if err is not None:
-                        return None, err
-                    slots = sched.slots(len(shapes))
-                    inputs = [
-                        gen_inputs(sh, dtype, world, slots, device) for sh in shapes
-                    ]
-                    got = run_collective(
-                        comm, op_name, [i[rank] for i in inputs], sched, launch
-                    )
-                    expected = [expected_outputs(op_name, i, slots) for i in inputs]
-                    return [
-                        compare(g, e, atol, RTOL) for g, e in zip(got, expected)
-                    ], None
-
-                # Same check, same track: `err is not None` means an error, and the
-                # value is only read once we know there was none.
-                got, err = cell()
-                if err is not None:
+    comm = ctx.comm(backend)
+    for op_name, dtype_name, group in product(OPS, dtypes, groups):
+        dtype = D_DTYPES[dtype_name]
+        atol = _atol(op_name, dtype)
+        group_shapes = SHAPE_GROUPS[group]
+        for chunk in _chunks(group_shapes, sched.shapes or len(group_shapes)):
+            # Admission FIRST and per shape, because a group is what the capture
+            # covers: a refused shape is dropped from it, not a reason to skip the
+            # ones that were admitted.
+            shapes = []
+            for sh in chunk:
+                why = declined(comm, op_name, sh, dtype, launch)
+                if why is None:
+                    shapes.append(sh)
+                else:
                     _say(
                         rank,
-                        f"      - {op_name:11} {dtype_name:5} "
-                        f"{len(shapes)} shapes together  {err}",
+                        f"      - {op_name:11} {dtype_name:5} {str(sh):12} {why}",
                     )
-                    continue
-                for sh, m in zip(shapes, got):
-                    _say(rank, f"      {op_name:11} {dtype_name:5} {str(sh):12} {m}")
-                    worst = worst.worse_of(m)
-                    ran += 1
-                torch.cuda.empty_cache()
+            if not shapes:
+                continue
+
+            # THE LOOP VARIABLES ARE BOUND AT DEFINITION, as defaults. `cell` is
+            # called immediately below so late binding cannot bite today, but a
+            # closure over a loop variable is one edit away from doing so.
+            def cell(
+                op_name: str = op_name,
+                shapes: Sequence[tuple[int, int]] = shapes,
+                dtype: torch.dtype = dtype,
+                atol: float = atol,
+            ) -> tuple[list[Measurement] | None, str | None]:
+                # THE ERROR TRACK is the second element, and it is the ONLY thing we
+                # test: `err is not None` means we have an error. Never the value --
+                # when `err` is set the value slot is not to be read.
+                _, err = precheck(op_name, shapes, dtype, world, sched, budget)
+                if err is not None:
+                    return None, err
+                slots = sched.slots(len(shapes))
+                inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
+                got = run_collective(
+                    comm, op_name, [i[rank] for i in inputs], sched, launch
+                )
+                expected = [expected_outputs(op_name, i, slots) for i in inputs]
+                return [compare(g, e, atol, RTOL) for g, e in zip(got, expected)], None
+
+            # Same check, same track: `err is not None` means an error, and the
+            # value is only read once we know there was none.
+            got, err = cell()
+            if err is not None:
+                _say(
+                    rank,
+                    f"      - {op_name:11} {dtype_name:5} "
+                    f"{len(shapes)} shapes together  {err}",
+                )
+                continue
+            for sh, m in zip(shapes, got):
+                _say(rank, f"      {op_name:11} {dtype_name:5} {str(sh):12} {m}")
+                worst = worst.worse_of(m)
+                ran += 1
+            torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     # COUNTED, because the seed verdict passes: a communicator that declined everything
@@ -759,96 +1035,24 @@ def exercise(
     return worst, None
 
 
-def run_rank(
-    rank: int,
-    world: int,
-    pp: int,
-    backend: str,
-    mode: str,
-    init_method: str,
-    kernel: Kernel | None = None,
-) -> tuple[Measurement | None, str | None]:
-    """ONE per-rank worker. It owns the PROCESS GROUP; the communicator's life is
-    `exercise`'s.
-
-    Every rank rebuilds every rank's input from a seed, so it judges its own replays and
-    only scalars cross the process boundary. `err` is set when this rank failed, and it
-    is a VALUE rather than an exception so the parent gets EVERY rank's verdict.
-    """
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(
-        world_size=world, rank=rank, distributed_init_method=init_method
-    )
-    # A CONFIG CONTEXT, because `ensure_model_parallel_initialized` builds vLLM's device
-    # communicators and those instantiate CustomOps, which read the current config. The
-    # aiter version of this test built its groups with plain `torch.distributed` and
-    # never touched `parallel_state`; the port does, and without it every rank
-    # dies with "Current vLLM config is not set" before a single collective runs.
-    # HERE AND NOT A FIXTURE: each rank is its own process, so a parent fixture is
-    # not in scope where the config is read.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(world, pp)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(
-        torch.zeros(1).cuda(), group=group
-    )  # force comm init before we measure
-    torch.cuda.synchronize()
-    # FINALLY: a rank that dies with its group still up leaves its peers waiting on a
-    # socket rather than seeing a clean disconnect, turning one rank's error into
-    # everyone's 600-second timeout.
-    try:
-        return exercise(
-            backend, SCHEDULES[mode], world, rank, device, cpu_group, group, kernel
-        )
-    except Exception as e:
-        # Logged HERE, with the rank and the full traceback, before anything crosses the
-        # process boundary -- then RETURNED, not re-raised. Re-raising surfaces one rank
-        # to the parent and on eight ranks the one the pool picks is not always the
-        # informative one. `Exception`, not `BaseException`: a Ctrl-C is not this rank's
-        # verdict and has to keep unwinding.
-        logger.exception("rank %d failed exercising %s/%s", rank, backend, mode)
-        return None, f"{type(e).__name__}: {e}"
-    finally:
-        # Its OWN try, so a teardown that fails cannot replace the failure that got us
-        # here -- the diagnosis is worth more than the cleanup, and
-        # `destroy_process_group` is exactly the call that has hung on us before.
-        try:
-            if dist.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception(
-                "rank %d: teardown failed after %s/%s", rank, backend, mode
-            )
-
-
 def run_communicator(
+    ranks: World,
     backend: str,
     mode: str,
-    world: int,
-    addr: str,
-    port: int,
-    pp: int = 1,
+    groups: Sequence[str],
+    dtypes: Sequence[str],
     kernel: Kernel | None = None,
 ) -> tuple[Measurement | None, str | None]:
-    """Spawn `world` ranks, collect under a timeout, fold to the WORST rank's numbers --
-    a collective's
+    """Run `exercise` in every rank, fold to the WORST rank's numbers -- a collective's
     bug is often visible on only a subset, so it passes only if EVERY rank passed."""
-    pool = Pool(processes=world)
-    init = get_distributed_init_method(addr, port)
-    try:
-        rets = [
-            pool.apply_async(run_rank, args=(r, world, pp, backend, mode, init, kernel))
-            for r in range(world)
-        ]
-        pool.close()
-        per_rank, err = _collect(pool, rets)
-    finally:
-        pool.terminate()  # frees the GPUs whether it passed, failed or hung
-    if err is not None:
-        return None, err
+    per_rank = ranks.run(
+        exercise,
+        backend=backend,
+        mode=mode,
+        groups=groups,
+        dtypes=dtypes,
+        kernel=kernel,
+    )
 
     # EVERY failing rank, not the first: they usually fail for one reason, and the ranks
     # that did NOT fail are half of what a count like `[1,1,1,0,0,1,1,1]` tells you.
@@ -856,7 +1060,7 @@ def run_communicator(
     if failed:
         return None, "; ".join(failed)
 
-    ms = [m for m, _ in per_rank]
+    ms = [cast(Measurement, m) for m, _ in per_rank]
     # The SPREAD, whenever the ranks disagree. The cell lines above come from rank 0
     # only, and for `hip` that is the rank whose summation order matches the reference
     # -- so its `worst|diff|=0` says nothing about the other seven. A rank-rotated read
@@ -882,12 +1086,15 @@ def world() -> int:
     return torch.cuda.device_count()
 
 
-@pytest.fixture
-def rendezvous() -> tuple[str, int]:
-    """A FRESH port per case: the cases are sequential and each tears its group down,
-    but two runs
-    on a shared box must not collide."""
-    return "127.0.0.1", get_open_port()
+@pytest.fixture(scope="session")
+def ranks(world: int) -> Iterator[World]:
+    """The session's world. Nothing is spawned until a case runs, so a session whose
+    cases all skip or are deselected never pays for one."""
+    ranks = World(world)
+    try:
+        yield ranks
+    finally:
+        ranks.stop()
 
 
 def baseline_admits(nbytes: int) -> bool:
@@ -896,6 +1103,9 @@ def baseline_admits(nbytes: int) -> bool:
     return nbytes % BASELINE_ALIGNMENT == 0 and nbytes < BASELINE_MAX_SIZE
 
 
+# FULL: it spawns no ranks, but it checks a rule that moves rarely, against a baseline
+# that moves never.
+@pytest.mark.full
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_admission_matches_the_baseline(world_size: int) -> None:
     """Every backend admits exactly what vLLM's CustomAllreduce does -- the precondition
@@ -944,14 +1154,80 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             ), f"our fast path is not CustomAllreduce's: {where}"
 
 
-@pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize(("backend", "kernel"), BACKEND_KERNELS)
+def _communicator_param(
+    backend: str,
+    kernel: Kernel | None,
+    mode: str,
+    dtypes: tuple[str, ...],
+    groups: tuple[str, ...],
+    full: bool,
+) -> ParameterSet:
+    """One `test_communicator` case, marked with its tier and, for a backend known to
+    be broken, the reason it is skipped."""
+    name = backend if kernel is None else f"{backend}-{kernel}"
+    marks = [pytest.mark.full] if full else []
+    if backend in DISABLED:
+        marks.append(pytest.mark.skip(reason=DISABLED[backend]))
+    return pytest.param(
+        backend,
+        kernel,
+        mode,
+        dtypes,
+        groups,
+        id=f"{name}-{mode}-{'+'.join(dtypes)}-{'+'.join(groups)}",
+        marks=marks,
+    )
+
+
+# CHOSEN, not gridded. FAST is what vLLM runs: hip with no forced launch (tune.cuh
+# picks), captured the way vLLM captures, at Kimi-K3's widths in bf16; and each PULL
+# kernel forced at a small and a large shape, so both code paths run whatever tune
+# picks. FULL is the rest: the control and iris, every forced kernel and every mode on
+# the 8192 sweep with its admission boundaries, and hip's own choice in fp16 and eager
+# at Kimi-K3's widths. Control FIRST: the list's order is the run order, and if torch
+# is red, nothing after it means anything.
+_KIMI_GROUPS = tuple(f"h{w}" for w in KIMI_WIDTHS)
+COMMUNICATOR_CASES = (
+    *(
+        _communicator_param("torch", None, mode, DTYPES, ("h8192",), full=True)
+        for mode in MODES
+    ),
+    *(
+        _communicator_param("hip", None, mode, ("bf16",), (group,), full=False)
+        for mode in ("graph", "vllm")
+        for group in _KIMI_GROUPS
+    ),
+    *(
+        _communicator_param(
+            "hip", kernel, "graph", ("bf16",), ("h7168-ends",), full=False
+        )
+        for kernel in PULL_SHOTS
+    ),
+    *(
+        _communicator_param("hip", None, mode, ("fp16",), _KIMI_GROUPS, full=True)
+        for mode in ("graph", "vllm")
+    ),
+    _communicator_param("hip", None, "eager", DTYPES, _KIMI_GROUPS, full=True),
+    *(
+        _communicator_param(backend, kernel, mode, DTYPES, ("h8192",), full=True)
+        for backend, kernel in BACKEND_KERNELS
+        if backend != "torch"
+        for mode in MODES
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("backend", "kernel", "mode", "dtypes", "groups"), COMMUNICATOR_CASES
+)
 def test_communicator(
     backend: str,
     kernel: Kernel | None,
     mode: str,
+    dtypes: tuple[str, ...],
+    groups: tuple[str, ...],
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """Does this communicator work? One instance, its whole API, in one mode.
 
@@ -962,10 +1238,9 @@ def test_communicator(
     """
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
     name = backend if kernel is None else f"{backend}-{kernel}"
-    print(f"\n  {name} / {mode}", flush=True)
-    got, err = run_communicator(backend, mode, world, addr, port, kernel=kernel)
+    print(f"\n  {name} / {mode} / {'+'.join(dtypes)} / {'+'.join(groups)}", flush=True)
+    got, err = run_communicator(ranks, backend, mode, groups, dtypes, kernel=kernel)
     # THE ERROR TRACK, checked explicitly against None: set means the case produced no
     # measurement at all, and `got` is not to be read. Only then is there a verdict to
     # assert on.
@@ -989,7 +1264,7 @@ FUSED_EPS = 1e-5
 # all_reduce -> rms_norm, and all_reduce -> fused_add_rms_norm.
 FORMS = ("rms_norm", "add_rms_norm")
 # Kimi-K3's latent MoE row (3584) and hidden row (7168), then the sweep's 8192. Four
-# rows is fewer than the ranks, which two-shot must still get right.
+# rows is fewer than the ranks, which two-shot must still get right. The full tier's.
 FUSED_SHAPES = (
     (4, 3584),
     (128, 3584),
@@ -998,6 +1273,13 @@ FUSED_SHAPES = (
     (4088, 7168),
     (512, 8192),
 )
+# The fast tier's: Kimi-K3's decode rows at both widths. One row is fewer than the
+# ranks too.
+FUSED_FAST_SHAPES = ((1, 3584), (16, 3584), (16, 7168))
+
+
+def _shape_id(shape: tuple[int, ...]) -> str:
+    return "x".join(map(str, shape))
 
 
 def _fused_reference(
@@ -1027,128 +1309,147 @@ def _fused_tolerance(dtype: torch.dtype) -> tuple[float, float]:
 
 
 def run_fused_rank(
-    rank: int,
-    world: int,
+    ctx: RankContext,
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
     shot: Shot,
-    init_method: str,
     weight_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
     """ONE rank: run the fused op and the two ops it replaces, and say whether they
     agree. `weight_dtype` None is the input's dtype. Returns `(agreed, err)`; `err`
     is `NO_FUSED_KERNEL` when this backend has none, which is a skip and not a
     failure."""
+    rank, world, device = ctx.rank, ctx.world, ctx.device
     dtype = D_DTYPES[dtype_name]
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(
-        world_size=world, rank=rank, distributed_init_method=init_method
-    )
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(world, 1)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
-    try:
-        # Every rank rebuilds every rank's input from the seed, as the sweep above does,
-        # so the reference is computed locally and no tensor crosses a process boundary.
-        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        residual = _one_input(world, 1, shape, dtype)
-        weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-        launch = Launch(cast(Kernel, f"{shot}_{form}"))
-        with _build_communicator("hip", cpu_group, group, device) as comm:
-            mine = inputs[rank].to(device)
-            if form == "rms_norm":
-                if not comm.should_allreduce_rms_norm(mine, launch):
-                    return False, NO_FUSED_KERNEL
-                got = comm.all_reduce_rms_norm(
-                    mine, weight.to(device), FUSED_EPS, launch=launch
-                )
-                got_residual = None
-            else:
-                if not comm.should_allreduce_add_rms_norm(mine, launch):
-                    return False, NO_FUSED_KERNEL
-                got, got_residual = comm.all_reduce_add_rms_norm(
-                    mine,
-                    residual.to(device),
-                    weight.to(device),
-                    FUSED_EPS,
-                    launch=launch,
-                )
-        want, want_residual = _fused_reference(form, inputs, residual, weight)
-        atol, rtol = _fused_tolerance(dtype)
-        checks = [("out", got.cpu(), want, atol)]
-        if got_residual is not None:
-            # The residual is the raw sum plus the incoming residual, unnormalised, so
-            # it gets the raw reduce's tolerance and not the normed one.
-            checks.append(
-                (
-                    "residual",
-                    got_residual.cpu(),
-                    want_residual,
-                    _atol("all_reduce", dtype),
-                )
+    # Every rank rebuilds every rank's input from the seed, as the sweep above does,
+    # so the reference is computed locally and no tensor crosses a process boundary.
+    inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+    residual = _one_input(world, 1, shape, dtype)
+    weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
+    launch = Launch(cast(Kernel, f"{shot}_{form}"))
+    comm = ctx.comm("hip")
+    mine = inputs[rank].to(device)
+    if form == "rms_norm":
+        if not comm.should_allreduce_rms_norm(mine, launch):
+            return False, NO_FUSED_KERNEL
+        got = comm.all_reduce_rms_norm(
+            mine, weight.to(device), FUSED_EPS, launch=launch
+        )
+        got_residual = None
+    else:
+        if not comm.should_allreduce_add_rms_norm(mine, launch):
+            return False, NO_FUSED_KERNEL
+        got, got_residual = comm.all_reduce_add_rms_norm(
+            mine,
+            residual.to(device),
+            weight.to(device),
+            FUSED_EPS,
+            launch=launch,
+        )
+    want, want_residual = _fused_reference(form, inputs, residual, weight)
+    atol, rtol = _fused_tolerance(dtype)
+    checks = [("out", got.cpu(), want, atol)]
+    if got_residual is not None:
+        # The residual is the raw sum plus the incoming residual, unnormalised, so
+        # it gets the raw reduce's tolerance and not the normed one.
+        checks.append(
+            (
+                "residual",
+                got_residual.cpu(),
+                want_residual,
+                _atol("all_reduce", dtype),
             )
-        for name, a, b, tol in checks:
-            worst = (a.to(torch.float32) - b.to(torch.float32)).abs().max().item()
-            if not torch.allclose(
-                a.to(torch.float32), b.to(torch.float32), atol=tol, rtol=rtol
-            ):
-                return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
-        return True, None
-    except Exception as e:
-        logger.exception("rank %d failed the fused all_reduce_%s", rank, form)
-        return False, f"{type(e).__name__}: {e}"
-    finally:
-        try:
-            if dist.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception("rank %d: teardown failed", rank)
+        )
+    for name, a, b, tol in checks:
+        worst = (a.to(torch.float32) - b.to(torch.float32)).abs().max().item()
+        if not torch.allclose(
+            a.to(torch.float32), b.to(torch.float32), atol=tol, rtol=rtol
+        ):
+            return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
+    return True, None
 
 
-# Both kernels at every shape, forced: what C++ would pick is one of them.
-@pytest.mark.parametrize("shot", SHOTS)
-@pytest.mark.parametrize("dtype_name", DTYPES)
-@pytest.mark.parametrize("shape", FUSED_SHAPES)
-@pytest.mark.parametrize("form", FORMS)
+def _fused_param(
+    form: str, shape: tuple[int, int], dtype_name: str, shot: Shot, full: bool
+) -> ParameterSet:
+    return pytest.param(
+        form,
+        shape,
+        dtype_name,
+        shot,
+        id=f"{form}-{_shape_id(shape)}-{dtype_name}-{shot}",
+        marks=[pytest.mark.full] if full else [],
+    )
+
+
+# FAST: the pull kernels at Kimi-K3's decode shapes in bf16. FULL: both kernels of each
+# direction at every shape, forced: what C++ would pick is one of them.
+FUSED_CASES = (
+    *(
+        _fused_param(form, shape, "bf16", shot, full=False)
+        for form in FORMS
+        for shape in FUSED_FAST_SHAPES
+        for shot in PULL_SHOTS
+    ),
+    *(
+        _fused_param(form, shape, dtype_name, shot, full=True)
+        for form in FORMS
+        for shape in FUSED_SHAPES
+        for dtype_name in DTYPES
+        for shot in SHOTS
+    ),
+)
+
+
+@pytest.mark.parametrize(("form", "shape", "dtype_name", "shot"), FUSED_CASES)
 def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
     shot: Shot,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """Each fused op against all_reduce then the `vllm.ir.ops` norm it replaces.
 
     Enumerated, not property-generated: a shrinking framework cannot drive across
     spawned ranks, and each candidate is a full eight-process run.
     """
-    _fused_case(form, shape, dtype_name, shot, None, world, rendezvous)
+    _fused_case(form, shape, dtype_name, shot, None, world, ranks)
 
 
 # AN FP32 WEIGHT, in its own dtype: the reference rounds the normed row to the WEIGHT's
 # dtype, so this is a different rounding from a weight in the input's, not the same one
 # with a cast. Kimi-K3's latent row and its hidden row, both kernels: the rounding is
-# per element, so more shapes would say nothing new.
-@pytest.mark.parametrize("shot", SHOTS)
-@pytest.mark.parametrize("dtype_name", DTYPES)
-@pytest.mark.parametrize("shape", ((4, 3584), (128, 7168)))
-@pytest.mark.parametrize("form", FORMS)
+# per element, so more shapes would say nothing new. FAST is one case per form, the
+# pull one-shot at the latent row in bf16; FULL is the rest.
+FP32_WEIGHT_FAST = ((4, 3584), "bf16", "all_reduce_pull_one_shot")
+FP32_WEIGHT_CASES = tuple(
+    _fused_param(
+        form,
+        shape,
+        dtype_name,
+        shot,
+        full=(shape, dtype_name, shot) != FP32_WEIGHT_FAST,
+    )
+    for form in FORMS
+    for shape in ((4, 3584), (128, 7168))
+    for dtype_name in DTYPES
+    for shot in SHOTS
+)
+
+
+@pytest.mark.parametrize(("form", "shape", "dtype_name", "shot"), FP32_WEIGHT_CASES)
 def test_all_reduce_rms_norm_takes_an_fp32_weight(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
     shot: Shot,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
-    _fused_case(form, shape, dtype_name, shot, torch.float32, world, rendezvous)
+    _fused_case(form, shape, dtype_name, shot, torch.float32, world, ranks)
 
 
 def _fused_case(
@@ -1158,25 +1459,19 @@ def _fused_case(
     shot: Shot,
     weight_dtype: torch.dtype | None,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """One fused case across every rank, judged by `run_fused_rank`."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
-    init = get_distributed_init_method(addr, port)
-    pool = Pool(processes=world)
-    try:
-        rets = [
-            pool.apply_async(
-                run_fused_rank,
-                (r, world, form, shape, dtype_name, shot, init, weight_dtype),
-            )
-            for r in range(world)
-        ]
-        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
-    finally:
-        pool.terminate()
+    got = ranks.run(
+        run_fused_rank,
+        form=form,
+        shape=shape,
+        dtype_name=dtype_name,
+        shot=shot,
+        weight_dtype=weight_dtype,
+    )
     where = f"{form} {shot} {shape} {dtype_name} weight={weight_dtype or dtype_name}"
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip has no fused all_reduce_{form} for {where}")
@@ -1194,7 +1489,7 @@ def _fused_case(
 # full eight-process run, so the cases are the ones Kimi-K3 runs -- decode rows, 0 to 9
 # stored blocks, the block-write layer where the sum starts the prefix, with and without
 # the output norm -- plus prefill-sized row counts, a block-write one among them, that
-# the two-shot kernel is for. Each case runs on both kernels.
+# the two-shot kernel is for. Each case runs on every kernel.
 ADD_ATTN_RES_RMS_NORM_CASES = (
     ((4, 7168), True, 0, -1, True),
     ((16, 7168), True, 4, -1, True),
@@ -1204,139 +1499,113 @@ ADD_ATTN_RES_RMS_NORM_CASES = (
     ((100, 7168), False, 4, 4, True),
 )
 ATTN_RES_SOURCES = 10
+# FAST: the decode cases on the pull one-shot, the kernel decode runs. FULL: the
+# prefill-sized cases, and every case on the other kernels.
+ATTN_RES_FAST_MAX_ROWS = 16
+ATTN_RES_PARAMS = tuple(
+    pytest.param(
+        case,
+        shot,
+        id=f"case{i}-{shot}",
+        marks=[]
+        if shot == "all_reduce_pull_one_shot" and case[0][0] <= ATTN_RES_FAST_MAX_ROWS
+        else [pytest.mark.full],
+    )
+    for i, case in enumerate(ADD_ATTN_RES_RMS_NORM_CASES)
+    for shot in SHOTS
+)
 
 
 def run_add_attn_res_rms_norm_rank(
-    rank: int,
-    world: int,
+    ctx: RankContext,
     case: tuple[tuple[int, int], bool, int, int, bool],
     shot: Shot,
-    init_method: str,
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against the two it replaces, on every output it writes."""
     from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 
+    rank, world, device = ctx.rank, ctx.world, ctx.device
     shape, has_prefix, num_blocks, write_idx, output_norm = case
     dtype = torch.bfloat16
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(
-        world_size=world, rank=rank, distributed_init_method=init_method
+    rows, hidden = shape
+    inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+    prefix = _one_input(world, 1, shape, dtype)
+    blocks = torch.stack(
+        [_one_input(world + 2 + s, 3, shape, dtype) for s in range(ATTN_RES_SOURCES)],
+        dim=1,
+    ).contiguous()
+    norm_w = _one_input(world + 20, 4, (hidden,), dtype)
+    qk_w = _one_input(world + 21, 5, (hidden,), dtype)
+    out_w = _one_input(world + 22, 6, (hidden,), dtype) if output_norm else None
+
+    # THE REFERENCE: the sum as an all-reduce lands it, then the model's kernel.
+    acc = torch.zeros(shape, dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    summed = acc.to(dtype).to(device)
+    ref_prefix = prefix.to(device).clone() if has_prefix else summed.clone()
+    ref_blocks = blocks.to(device).clone()
+    want = attn_res(
+        ref_prefix,
+        summed if has_prefix else None,
+        ref_blocks,
+        norm_w.to(device),
+        qk_w.to(device),
+        None if out_w is None else out_w.to(device),
+        num_blocks,
+        write_idx,
+        1e-6,
+        1e-5,
     )
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(world, 1)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
-    try:
-        rows, hidden = shape
-        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        prefix = _one_input(world, 1, shape, dtype)
-        blocks = torch.stack(
-            [
-                _one_input(world + 2 + s, 3, shape, dtype)
-                for s in range(ATTN_RES_SOURCES)
-            ],
-            dim=1,
-        ).contiguous()
-        norm_w = _one_input(world + 20, 4, (hidden,), dtype)
-        qk_w = _one_input(world + 21, 5, (hidden,), dtype)
-        out_w = _one_input(world + 22, 6, (hidden,), dtype) if output_norm else None
 
-        # THE REFERENCE: the sum as an all-reduce lands it, then the model's kernel.
-        acc = torch.zeros(shape, dtype=torch.float32)
-        for x in inputs:
-            acc += x.to(torch.float32)
-        summed = acc.to(dtype).to(device)
-        ref_prefix = prefix.to(device).clone() if has_prefix else summed.clone()
-        ref_blocks = blocks.to(device).clone()
-        want = attn_res(
-            ref_prefix,
-            summed if has_prefix else None,
-            ref_blocks,
-            norm_w.to(device),
-            qk_w.to(device),
-            None if out_w is None else out_w.to(device),
-            num_blocks,
-            write_idx,
-            1e-6,
-            1e-5,
-        )
-        torch.cuda.synchronize()
-
-        launch = Launch(cast(Kernel, f"{shot}_add_attn_res_rms_norm"))
-        with _build_communicator("hip", cpu_group, group, device) as comm:
-            mine = inputs[rank].to(device)
-            if not comm.should_allreduce_add_attn_res_rms_norm(mine, launch):
-                return False, NO_FUSED_KERNEL
-            got_blocks = blocks.to(device).clone()
-            got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
-                mine,
-                prefix.to(device).clone() if has_prefix else None,
-                got_blocks,
-                norm_w.to(device),
-                qk_w.to(device),
-                None if out_w is None else out_w.to(device),
-                num_blocks,
-                write_idx,
-                1e-6,
-                1e-5,
-                launch=launch,
-            )
-            torch.cuda.synchronize()
-        atol, rtol = _fused_tolerance(dtype)
-        sum_tol = _atol("all_reduce", dtype)
-        checks = [
-            ("out", got, want, atol),
-            ("prefix", got_prefix, ref_prefix, sum_tol),
-            ("blocks", got_blocks, ref_blocks, sum_tol),
-        ]
-        for name, a, b, tol in checks:
-            a32, b32 = a.float().cpu(), b.float().cpu()
-            if not torch.allclose(a32, b32, atol=tol, rtol=rtol):
-                worst = (a32 - b32).abs().max().item()
-                return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
-        return True, None
-    except Exception as e:
-        logger.exception(
-            "rank %d failed the fused all_reduce_add_attn_res_rms_norm", rank
-        )
-        return False, f"{type(e).__name__}: {e}"
-    finally:
-        try:
-            if dist.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception("rank %d: teardown failed", rank)
+    launch = Launch(cast(Kernel, f"{shot}_add_attn_res_rms_norm"))
+    comm = ctx.comm("hip")
+    mine = inputs[rank].to(device)
+    if not comm.should_allreduce_add_attn_res_rms_norm(mine, launch):
+        return False, NO_FUSED_KERNEL
+    got_blocks = blocks.to(device).clone()
+    got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
+        mine,
+        prefix.to(device).clone() if has_prefix else None,
+        got_blocks,
+        norm_w.to(device),
+        qk_w.to(device),
+        None if out_w is None else out_w.to(device),
+        num_blocks,
+        write_idx,
+        1e-6,
+        1e-5,
+        launch=launch,
+    )
+    torch.cuda.synchronize()
+    atol, rtol = _fused_tolerance(dtype)
+    sum_tol = _atol("all_reduce", dtype)
+    checks = [
+        ("out", got, want, atol),
+        ("prefix", got_prefix, ref_prefix, sum_tol),
+        ("blocks", got_blocks, ref_blocks, sum_tol),
+    ]
+    for name, a, b, tol in checks:
+        a32, b32 = a.float().cpu(), b.float().cpu()
+        if not torch.allclose(a32, b32, atol=tol, rtol=rtol):
+            worst = (a32 - b32).abs().max().item()
+            return False, f"{name} differs: worst|diff|={worst:.4g} atol={tol}"
+    return True, None
 
 
-@pytest.mark.parametrize("shot", SHOTS)
-@pytest.mark.parametrize("case", ADD_ATTN_RES_RMS_NORM_CASES)
+@pytest.mark.parametrize(("case", "shot"), ATTN_RES_PARAMS)
 def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     case: tuple[tuple[int, int], bool, int, int, bool],
     shot: Shot,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """The fused op against all_reduce then Kimi-K3's `attn_res`: the output, the prefix
     it updates or starts, and the block it writes."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
-    init = get_distributed_init_method(addr, port)
-    pool = Pool(processes=world)
-    try:
-        rets = [
-            pool.apply_async(
-                run_add_attn_res_rms_norm_rank, (r, world, case, shot, init)
-            )
-            for r in range(world)
-        ]
-        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
-    finally:
-        pool.terminate()
+    got = ranks.run(run_add_attn_res_rms_norm_rank, case=case, shot=shot)
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip declines {shot} all_reduce_add_attn_res_rms_norm at {case}")
     bad = [err for _, err in got if err is not None]
@@ -1347,7 +1616,8 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
 # ---------------------------------------------------------------------------------
 # ALL-REDUCE + RMSNORM + GEMM + ADD, judged against the three ops Kimi-K3's latent MoE
 # tail runs: the all-reduce, `vllm.ir.ops.rms_norm`, and `addmm_` into this rank's
-# column shard of the shared output.
+# column shard of the shared output. FULL only: tune declines it today, so only a
+# forced launch reaches it.
 # ---------------------------------------------------------------------------------
 
 # (rows, latent, hidden, shard). Example-based: each case is a full eight-process run,
@@ -1365,98 +1635,66 @@ RMS_NORM_GEMM_ADD_CASES = (
 
 
 def run_rms_norm_gemm_add_rank(
-    rank: int,
-    world: int,
+    ctx: RankContext,
     case: tuple[int, int, int, int],
     shot: Shot,
-    init_method: str,
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against the three it replaces, over the whole output."""
     import vllm.ir.ops
 
+    rank, world, device = ctx.rank, ctx.world, ctx.device
     rows, latent, hidden, shard = case
     dtype = torch.bfloat16
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(
-        world_size=world, rank=rank, distributed_init_method=init_method
+    inputs = [_one_input(r, 0, (rows, latent), dtype) for r in range(world)]
+    norm_w = _one_input(world, 1, (latent,), dtype).to(device)
+    # A NARROWED VIEW of the full weight, as the model passes its up_proj shard.
+    full_w = (_one_input(world + 1, 2, (hidden, latent), dtype) / latent**0.5).to(
+        device
     )
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(world, 1)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    col0 = (rank * shard) % (hidden - shard + 1)
+    gemm_w = full_w.narrow(0, col0, shard)
+    shared = _one_input(world + 2, 3, (rows, hidden), dtype).to(device)
+
+    acc = torch.zeros((rows, latent), dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    normed = vllm.ir.ops.rms_norm(acc.to(dtype).to(device), norm_w, FUSED_EPS)
+    want = shared.clone()
+    want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
     torch.cuda.synchronize()
-    try:
-        inputs = [_one_input(r, 0, (rows, latent), dtype) for r in range(world)]
-        norm_w = _one_input(world, 1, (latent,), dtype).to(device)
-        # A NARROWED VIEW of the full weight, as the model passes its up_proj shard.
-        full_w = (_one_input(world + 1, 2, (hidden, latent), dtype) / latent**0.5).to(
-            device
-        )
-        col0 = (rank * shard) % (hidden - shard + 1)
-        gemm_w = full_w.narrow(0, col0, shard)
-        shared = _one_input(world + 2, 3, (rows, hidden), dtype).to(device)
 
-        acc = torch.zeros((rows, latent), dtype=torch.float32)
-        for x in inputs:
-            acc += x.to(torch.float32)
-        normed = vllm.ir.ops.rms_norm(acc.to(dtype).to(device), norm_w, FUSED_EPS)
-        want = shared.clone()
-        want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
-        torch.cuda.synchronize()
-
-        launch = Launch(cast(Kernel, f"{shot}_rms_norm_gemm_add"))
-        with _build_communicator("hip", cpu_group, group, device) as comm:
-            mine = inputs[rank].to(device)
-            if not comm.should_allreduce_rms_norm_gemm_add(mine, gemm_w, launch):
-                return False, NO_FUSED_KERNEL
-            got = shared.clone()
-            comm.all_reduce_rms_norm_gemm_add(
-                mine, norm_w, FUSED_EPS, gemm_w, got, col0, launch=launch
-            )
-            torch.cuda.synchronize()
-        atol, rtol = _fused_tolerance(dtype)
-        a32, b32 = got.float().cpu(), want.float().cpu()
-        if not torch.allclose(a32, b32, atol=atol, rtol=rtol):
-            worst = (a32 - b32).abs().max().item()
-            return False, f"out differs: worst|diff|={worst:.4g} atol={atol}"
-        return True, None
-    except Exception as e:
-        logger.exception("rank %d failed the fused all_reduce_rms_norm_gemm_add", rank)
-        return False, f"{type(e).__name__}: {e}"
-    finally:
-        try:
-            if dist.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception("rank %d: teardown failed", rank)
+    launch = Launch(cast(Kernel, f"{shot}_rms_norm_gemm_add"))
+    comm = ctx.comm("hip")
+    mine = inputs[rank].to(device)
+    if not comm.should_allreduce_rms_norm_gemm_add(mine, gemm_w, launch):
+        return False, NO_FUSED_KERNEL
+    got = shared.clone()
+    comm.all_reduce_rms_norm_gemm_add(
+        mine, norm_w, FUSED_EPS, gemm_w, got, col0, launch=launch
+    )
+    torch.cuda.synchronize()
+    atol, rtol = _fused_tolerance(dtype)
+    a32, b32 = got.float().cpu(), want.float().cpu()
+    if not torch.allclose(a32, b32, atol=atol, rtol=rtol):
+        worst = (a32 - b32).abs().max().item()
+        return False, f"out differs: worst|diff|={worst:.4g} atol={atol}"
+    return True, None
 
 
+@pytest.mark.full
 @pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("case", RMS_NORM_GEMM_ADD_CASES)
 def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
     case: tuple[int, int, int, int],
     shot: Shot,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """The fused op against all_reduce, rms_norm and addmm_ into a column shard: the
     shard gets the GEMM added, every other column is left as it was."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
-    init = get_distributed_init_method(addr, port)
-    pool = Pool(processes=world)
-    try:
-        rets = [
-            pool.apply_async(run_rms_norm_gemm_add_rank, (r, world, case, shot, init))
-            for r in range(world)
-        ]
-        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
-    finally:
-        pool.terminate()
+    got = ranks.run(run_rms_norm_gemm_add_rank, case=case, shot=shot)
     if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip declines {shot} all_reduce_rms_norm_gemm_add at {case}")
     bad = [err for _, err in got if err is not None]
@@ -1467,7 +1705,7 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
 # ---------------------------------------------------------------------------------
 # THE QUANTIZED PUSH KERNELS: lossy by design, so judged by their error against the fp32
 # sum rather than a tolerance per element, and by every rank holding the same bits (each
-# decodes the same bytes in the same order).
+# decodes the same bytes in the same order). FULL only: the push kernels are.
 # ---------------------------------------------------------------------------------
 
 # Relative RMS error, ||got - sum|| / ||sum||, over Gaussian inputs, by codec bits. At
@@ -1484,54 +1722,32 @@ QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 716
 
 
 def run_quantized_rank(
-    rank: int,
-    world: int,
+    ctx: RankContext,
     kernel: Kernel,
     bits: int,
     shape: tuple[int, int],
     dtype_name: str,
-    init_method: str,
-) -> tuple[float | None, str | None, str | None]:
+) -> tuple[tuple[float, str] | None, str | None]:
     """ONE rank: the forced push kernel at `bits` over every rank's seeded input.
-    Returns `(rel_rmse, digest, err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
+    Returns `((rel_rmse, digest), err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
+    rank, world, device = ctx.rank, ctx.world, ctx.device
     dtype = D_DTYPES[dtype_name]
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(
-        world_size=world, rank=rank, distributed_init_method=init_method
-    )
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(world, 1)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
-    try:
-        inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-        launch = Launch(kernel)
-        with _build_communicator("hip", cpu_group, group, device) as comm:
-            mine = inputs[rank].to(device)
-            if not comm.should_allreduce(mine, launch, quant_bits=bits):
-                return None, None, NO_FUSED_KERNEL
-            got = comm.all_reduce(mine, launch=launch, quant_bits=bits)
-            got = got.cpu().to(torch.float32)
-        want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
-        rel = ((got - want).norm() / want.norm()).item()
-        # sha256, not hash(): each rank is a spawned process with its own hash seed.
-        digest = hashlib.sha256(got.numpy().tobytes()).hexdigest()
-        return rel, digest, None
-    except Exception as e:
-        logger.exception("rank %d failed the quantized all_reduce", rank)
-        return None, None, f"{type(e).__name__}: {e}"
-    finally:
-        try:
-            if dist.is_initialized():
-                destroy_model_parallel()
-                destroy_distributed_environment()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception("rank %d: teardown failed", rank)
+    inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+    launch = Launch(kernel)
+    comm = ctx.comm("hip")
+    mine = inputs[rank].to(device)
+    if not comm.should_allreduce(mine, launch, quant_bits=bits):
+        return None, NO_FUSED_KERNEL
+    got = comm.all_reduce(mine, launch=launch, quant_bits=bits)
+    got = got.cpu().to(torch.float32)
+    want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
+    rel = ((got - want).norm() / want.norm()).item()
+    # sha256, not hash(): each rank is a spawned process with its own hash seed.
+    digest = hashlib.sha256(got.numpy().tobytes()).hexdigest()
+    return (rel, digest), None
 
 
+@pytest.mark.full
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("shape", QUANTIZED_SHAPES)
 @pytest.mark.parametrize("bits", tuple(QUANTIZED_MAX_REL_RMSE))
@@ -1542,31 +1758,26 @@ def test_quantized_push_is_close_and_identical_on_every_rank(
     shape: tuple[int, int],
     dtype_name: str,
     world: int,
-    rendezvous: tuple[str, int],
+    ranks: World,
 ) -> None:
     """Each quantized kernel, forced: its error against the fp32 sum under the bound,
     and every rank's output the same bits."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
-    init = get_distributed_init_method(addr, port)
-    pool = Pool(processes=world)
-    try:
-        rets = [
-            pool.apply_async(
-                run_quantized_rank, (r, world, kernel, bits, shape, dtype_name, init)
-            )
-            for r in range(world)
-        ]
-        got = [r.get(timeout=CASE_TIMEOUT_S) for r in rets]
-    finally:
-        pool.terminate()
+    got = ranks.run(
+        run_quantized_rank,
+        kernel=kernel,
+        bits=bits,
+        shape=shape,
+        dtype_name=dtype_name,
+    )
     where = f"{kernel} int{bits} {shape} {dtype_name}"
-    if any(err == NO_FUSED_KERNEL for _, _, err in got):
+    if any(err == NO_FUSED_KERNEL for _, err in got):
         pytest.skip(f"hip declines {where}")
-    bad = [err for _, _, err in got if err is not None]
+    bad = [err for _, err in got if err is not None]
     assert not bad, f"{where}: " + "; ".join(bad)
-    rels = [rel for rel, _, _ in got]
+    measured = [cast(tuple[float, str], value) for value, _ in got]
+    rels = [rel for rel, _ in measured]
     print(f"      => {where}: rel_rmse {max(rels):.4g}", flush=True)
     assert max(rels) <= QUANTIZED_MAX_REL_RMSE[bits], f"{where}: rel_rmse {rels}"
-    assert len({d for _, d, _ in got}) == 1, f"{where}: ranks hold different outputs"
+    assert len({d for _, d in measured}) == 1, f"{where}: ranks hold different outputs"

@@ -128,6 +128,7 @@ markers = [
     "split: run this test as part of a split",
     "distributed: run this test only in distributed GPU tests",
     "optional: optional tests that are automatically skipped, include --optional to run them",
+    "full: full-tier cases, deselected in the dev loop with -m 'not full'",
 ]
 
 [tool.ty.src]
