@@ -24,30 +24,30 @@ namespace hip_comms::p2p {
 
 namespace impl {
 
-// A group's kSumBatch packs as floats and back, rounding to T: what a push kernel reduces
+// A group's kMaxRowPacks packs as floats and back, rounding to T: what a push kernel reduces
 // and encodes in, against the packs a row helper takes.
 template <typename T>
-DINLINE void floats_of(const typename traits<T>::V (&v)[kSumBatch],
-                       float (&x)[kSumBatch * traits<T>::N]) {
+DINLINE void floats_of(const typename traits<T>::V (&v)[kMaxRowPacks],
+                       float (&x)[kMaxRowPacks * traits<T>::N]) {
   constexpr int N = traits<T>::N;
 #pragma unroll
-  for (int u = 0; u < kSumBatch; ++u)
+  for (int u = 0; u < kMaxRowPacks; ++u)
 #pragma unroll
     for (int j = 0; j < N; ++j) x[u * N + j] = static_cast<float>(v[u].d[j]);
 }
 
 template <typename T>
-DINLINE void packs_of(const float (&x)[kSumBatch * traits<T>::N],
-                      typename traits<T>::V (&v)[kSumBatch]) {
+DINLINE void packs_of(const float (&x)[kMaxRowPacks * traits<T>::N],
+                      typename traits<T>::V (&v)[kMaxRowPacks]) {
   constexpr int N = traits<T>::N;
 #pragma unroll
-  for (int u = 0; u < kSumBatch; ++u)
+  for (int u = 0; u < kMaxRowPacks; ++u)
 #pragma unroll
     for (int j = 0; j < N; ++j) v[u].d[j] = static_cast<T>(x[u * N + j]);
 }
 
 // ---------------------------------------------------------------------------------
-// THE PUSH KERNELS' CODEC: what a group of kSumBatch packs (one thread's batch, 32 values
+// THE PUSH KERNELS' CODEC: what a group of kMaxRowPacks packs (one thread's batch, 32 values
 // of a 2-byte T) looks like on the wire. kBits 16 is T itself (no scale); 8 and 4 are
 // QuickReduce's symmetric integers with one fp32 scale per group.
 // ---------------------------------------------------------------------------------
@@ -56,7 +56,7 @@ template <typename T, int kBits>
 struct Codec {
   using V                    = typename traits<T>::V;
   static constexpr int N     = traits<T>::N;
-  static constexpr int kVals = kSumBatch * N;
+  static constexpr int kVals = kMaxRowPacks * N;
   static_assert(sizeof(T) == 2, "the codec is built for 2-byte T");
   static_assert(kBits == 16 || kBits == 8 || kBits == 4, "16 (T), INT8 and INT4 are built");
   static constexpr bool kScaled = kBits < 16;
@@ -147,16 +147,16 @@ namespace impl {
 
 template <class C>
 DINLINE int payload_packs(int n) {
-  return (n * C::kPayloadPacks + kSumBatch - 1) / kSumBatch;
+  return (n * C::kPayloadPacks + kMaxRowPacks - 1) / kMaxRowPacks;
 }
 
 // This thread's share of unit u of this rank's input, as floats (missing packs zero).
 template <class C, typename T, int ngpus, typename Tiling>
 DINLINE void mine_unit(const World<T, ngpus>& w, const Tiling& t, int u,
                        float (&x)[C::kVals]) {
-  typename traits<T>::V v[kSumBatch];
+  typename traits<T>::V v[kMaxRowPacks];
 #pragma unroll
-  for (int k = 0; k < kSumBatch; ++k)
+  for (int k = 0; k < kMaxRowPacks; ++k)
     v[k] = t.has(u, k) ? mine(w, t.pos(u, k)) : typename traits<T>::V{};
   floats_of<T>(v, x);
 }
@@ -299,10 +299,10 @@ DINLINE void gather(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, const
       if (n == 0) continue;
       float x[C::kVals];
       impl::read(w, s, src, impl::group(t, l), n, x);
-      typename traits<T>::V v[kSumBatch];
+      typename traits<T>::V v[kMaxRowPacks];
       impl::packs_of<T>(x, v);
 #pragma unroll
-      for (int k = 0; k < kSumBatch; ++k)
+      for (int k = 0; k < kMaxRowPacks; ++k)
         if (k < n) store(u, k, v[k]);
     }
   }

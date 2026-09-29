@@ -36,6 +36,11 @@ constexpr int kWaveSize = kTarget.wave_size;
 // kTarget.max_workgroup.
 constexpr int kMaxThreads = 512;
 constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
+
+// OUR LIMIT TOO: how many packs of one row a thread holds in registers, packs threadIdx.x +
+// k * blockDim.x for k < kMaxRowPacks. A row wider than kMaxRowPacks x blockDim is refused by
+// the host (`admits`); a push kernel's group is the same kMaxRowPacks packs.
+constexpr int kMaxRowPacks = 4;
 static_assert(kMaxThreads <= kTarget.max_workgroup && kMaxThreads % kWaveSize == 0,
               "the kernels' block limit must be whole waves the device can launch");
 

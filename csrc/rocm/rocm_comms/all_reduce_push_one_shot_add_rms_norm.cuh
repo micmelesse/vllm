@@ -9,7 +9,8 @@
 
 #include "fusions/add_rms_norm.cuh"
 #include "p2p/p2p.cuh"
-#include "utils.cuh"
+#include "common/memory.cuh"
+#include "hardware.cuh"
 
 namespace hip_comms {
 

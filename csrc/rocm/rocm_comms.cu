@@ -16,10 +16,10 @@
 // the wrong thing.
 //
 // rocm_comms/ holds the layers as headers, all included here so the device code stays in
-// this one translation unit and needs no -fgpu-rdc: p2p/ (the peer layer, host and
-// device, behind its one interface p2p/p2p.cuh), fusions/ (what a fused op computes),
-// hardware.cuh (the target's facts), launch.cuh (the kernels there are), tune.cuh (the
-// picker), utils.cuh (what everything shares), then one
+// this one translation unit and needs no -fgpu-rdc: common/ (what everything uses: the
+// pack, how it is loaded and stored, the sums), p2p/ (the peer layer, host and device,
+// behind its one interface p2p/p2p.cuh), fusions/ (what a fused op computes), hardware.cuh
+// (the target's facts), launch.cuh (the kernels there are), tune.cuh (the picker), then one
 // all_reduce_<pull|push>_<shot>[_<fusion>].cuh per kernel, named as its Kernel is. Design
 // rules: CONTEXT.md, "Code design".
 

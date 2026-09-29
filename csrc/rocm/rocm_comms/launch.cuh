@@ -11,7 +11,6 @@
 #include <cstdint>
 
 #include "fusions/rms_norm_gemm_add.cuh"
-#include "utils.cuh"
 
 namespace hip_comms {
 

@@ -14,7 +14,8 @@
 
 #include <cstdint>
 
-#include "../../utils.cuh"
+#include "../../common/pack.cuh"
+#include "../../hardware.cuh"
 
 namespace hip_comms::p2p {
 
@@ -65,7 +66,7 @@ struct Peers {
 
 inline int64_t push_slot_packs(int kbits, int64_t held, int lanes, int world) {
   const int64_t groups  = held * lanes;
-  const int64_t payload = kSumBatch * 8 * kbits / 8 / 16;
+  const int64_t payload = kMaxRowPacks * 8 * kbits / 8 / 16;
   const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
   return int64_t{world} * (groups * payload + scales);
 }

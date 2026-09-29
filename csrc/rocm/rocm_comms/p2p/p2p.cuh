@@ -5,7 +5,7 @@
 // the whole of what a caller may use. Its parts (impl/) refuse to be included any other
 // way, and what they keep in `p2p::impl` is theirs.
 //
-// Every phase takes a TILING `t` (utils.cuh: tiles::Rows for a fused op's rows,
+// Every phase takes a TILING `t` (impl/tiles.cuh, push only: tiles::Rows for a fused op's rows,
 // tiles::Buffer for a plain buffer) and a UNIT `u` of it, a thread's share v[k] at a time;
 // a kernel walks its units with t.first / t.end / t.next (a two-shot, its own: rank
 // argument). `w` is the World `start` returns; T and the world size ride on it. A SLOT is
@@ -52,6 +52,7 @@
 #define HIP_COMMS_P2P_INTERFACE
 #include "impl/peers.cuh"
 #include "impl/core.cuh"
+#include "impl/tiles.cuh"
 #include "impl/push.cuh"
 #include "impl/host.cuh"
 #undef HIP_COMMS_P2P_INTERFACE

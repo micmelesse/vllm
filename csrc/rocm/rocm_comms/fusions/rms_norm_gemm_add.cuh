@@ -8,7 +8,8 @@
 
 #pragma once
 
-#include "../utils.cuh"
+#include "../common/memory.cuh"
+#include "../common/reduce.cuh"
 
 namespace hip_comms::fusions::rms_norm_gemm_add {
 

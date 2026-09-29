@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-#include "../../utils.cuh"
+#include "../../common/memory.cuh"
 #include "peers.cuh"
 
 namespace hip_comms::p2p {

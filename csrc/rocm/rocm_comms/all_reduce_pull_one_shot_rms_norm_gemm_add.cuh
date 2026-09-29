@@ -8,7 +8,8 @@
 
 #include "fusions/rms_norm_gemm_add.cuh"
 #include "p2p/p2p.cuh"
-#include "utils.cuh"
+#include "common/memory.cuh"
+#include "common/reduce.cuh"
 
 namespace hip_comms {
 
