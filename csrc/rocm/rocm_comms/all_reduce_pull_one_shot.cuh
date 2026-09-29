@@ -11,10 +11,10 @@
 
 namespace hip_comms {
 
-// `packs` 16-byte packs, a thread a pack at a time over the whole grid.
+// `num_packs` packs, a thread a pack at a time over the whole grid.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    all_reduce_pull_one_shot(p2p::Peers p, T* __restrict__ out, int packs) {
+    all_reduce_pull_one_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
   using V = typename traits<T>::V;
 
   // 1. Every rank's input is in memory its peers can read (registered, or staged); wait
@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
   V* dst = reinterpret_cast<V*>(out);
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < packs; i += gridDim.x * blockDim.x)
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_packs; i += gridDim.x * blockDim.x)
     store_global(dst + i, sum_packs<T, ngpus>(in, i));
 
   // 3. No rank may overwrite its input until every peer has read it.

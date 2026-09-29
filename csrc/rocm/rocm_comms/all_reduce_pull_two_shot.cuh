@@ -12,16 +12,16 @@
 
 namespace hip_comms {
 
-// `packs` 16-byte packs cut into one slice per rank (the last one short), a thread a pack at a
-// time over the whole grid. THE SAME THREAD INDEXES A PACK IN BOTH PHASES: after the sync a
+// `num_packs` packs cut into one slice of `slice_packs` per rank (the last one short), a thread a
+// pack at a time over the whole grid. THE SAME THREAD INDEXES A PACK IN BOTH PHASES: after the sync a
 // block may read only what the same block on a peer wrote.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    all_reduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int packs) {
+    all_reduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
   using V          = typename traits<T>::V;
-  const int slice  = (packs + ngpus - 1) / ngpus;
-  const int first  = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = gridDim.x * blockDim.x;
+  const int slice_packs = (num_packs + ngpus - 1) / ngpus;
+  const int first       = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride      = gridDim.x * blockDim.x;
 
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::simple::start_sync<ngpus>(p);
@@ -31,8 +31,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const V* in[ngpus];
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
-  const int base = p.rank * slice;
-  const int mine = min(slice, packs - base);
+  const int base = p.rank * slice_packs;
+  const int mine = min(slice_packs, num_packs - base);
   V* sums        = p2p::simple::scratch<T, ngpus>(p, p.rank);
   for (int i = first; i < mine; i += stride)
     store_global(sums + i, sum_packs<T, ngpus>(in, base + i));
@@ -43,11 +43,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 4. All-gather: every rank's slice out of its scratch, at its place in the output. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
   V* dst = reinterpret_cast<V*>(out);
-  for (int i = first; i < slice; i += stride) {
+  for (int i = first; i < slice_packs; i += stride) {
 #pragma unroll
     for (int r = 0; r < ngpus; ++r)
-      if (r * slice + i < packs)
-        store_global(dst + r * slice + i, load_global(p2p::simple::scratch<T, ngpus>(p, r) + i));
+      if (r * slice_packs + i < num_packs)
+        store_global(dst + r * slice_packs + i,
+                     load_global(p2p::simple::scratch<T, ngpus>(p, r) + i));
   }
 }
 
