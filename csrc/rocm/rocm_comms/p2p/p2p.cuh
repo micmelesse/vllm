@@ -20,20 +20,16 @@
 //   end_sync<ngpus, kFinal>(p)     later: every peer has reached here; unless kFinal, what
 //                                  this block wrote before is visible to the same block on
 //                                  every peer after
+//   grid_sync<ngpus>(p)            every block of this rank: what any wrote before is
+//                                  visible to all after
 //
-// p2p::                      the phases the fused kernels compose (below)
+// p2p::                      the phases the push kernels compose (below)
 //   start<T, ngpus>(p)             first; returns w once every peer has launched
 //   peer_barrier(w)                this block and the same block on every peer: what
 //                                  each wrote before is visible to the others after
 //   grid_barrier(w)                every block of this rank
 //   world_barrier(w)               every block of every rank
 //   close(w)                       last, in a kernel whose peers read its input late
-//
-// p2p::pull::                a rank reads its peers
-//   reduce(w, t, u, v)                 this thread's share of a unit, summed over ranks
-//   slot(w, t[, prev])                 this rank's units of a two-shot, in its scratch
-//   share(w, slot, t, u, v)            an owned unit's result into the slot
-//   gather(w, slot, t, store)          after a peer_barrier, every owner's shared units
 //
 // p2p::push::                a rank writes into its peers' slots
 //   slot<kBits>(w, t, To, [prev])      To::owners (two-shot) or To::all (one-shot);
@@ -49,15 +45,13 @@
 //   Group                          the one lifetime object: maps the peers' memory,
 //                                  registers buffers, `peers(input)` per launch
 //   Handle, handle_and_offset(ptr) a tensor's IPC handle
-// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks, pull_slot_packs,
-// push_slot_packs.
+// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks, push_slot_packs.
 
 #pragma once
 
 #define HIP_COMMS_P2P_INTERFACE
 #include "impl/peers.cuh"
 #include "impl/core.cuh"
-#include "impl/pull.cuh"
 #include "impl/push.cuh"
 #include "impl/host.cuh"
 #undef HIP_COMMS_P2P_INTERFACE

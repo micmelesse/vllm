@@ -118,23 +118,16 @@ Launch launch_for(const Request& req, Op op, Input in) {
   return at(f.kernel, in, f.blocks, f.threads);
 }
 
-// The scratch a launch needs on each rank, in bytes: the slots its kernel lays out, from
-// the same tiling the kernel works in (tiles::Buffer for the plain all-reduce, one slice
-// for a one-shot and the world for a two-shot; tiles::Rows for a fused op) and the same
-// slot sizes (p2p's pull_slot_packs / push_slot_packs). A residual or prefix slot is
-// always 16 bits.
+// A PUSH KERNEL'S SCRATCH, in bytes: the slots it lays out, from the same tiling it works
+// in (tiles::Buffer for the plain all-reduce, one slice for a one-shot and the world for a
+// two-shot; tiles::Rows for a fused op) and the same slot sizes (p2p's push_slot_packs). A
+// residual or prefix slot is always 16 bits.
 template <typename Tiling>
 int64_t slots_need(Kernel k, const Tiling& t, int bits, int world) {
-  const int64_t pull  = p2p::pull_slot_packs(t);
   const int64_t own   = p2p::push_slot_packs(bits, t.locals(), t.lanes(), world);
   const int64_t own16 = p2p::push_slot_packs(16, t.locals(), t.lanes(), world);
   const int64_t all   = p2p::push_slot_packs(bits, t.units(), t.lanes(), world);
   switch (k) {
-    case Kernel::all_reduce_pull_two_shot:
-    case Kernel::all_reduce_pull_two_shot_rms_norm:
-    case Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add: return pull * 16;
-    case Kernel::all_reduce_pull_two_shot_add_rms_norm:
-    case Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm: return 2 * pull * 16;
     case Kernel::all_reduce_push_one_shot:
     case Kernel::all_reduce_push_one_shot_rms_norm:
     case Kernel::all_reduce_push_one_shot_add_rms_norm:
@@ -151,6 +144,18 @@ int64_t slots_need(Kernel k, const Tiling& t, int bits, int world) {
 
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
+  // A PULL KERNEL'S SCRATCH is this rank's slice, row-major: the plain two-shot's packs, a
+  // fused two-shot's rows, twice where it leaves two results (out and the residual or the
+  // prefix). A one-shot reads the inputs and keeps nothing.
+  if (!is_push(l.kernel)) {
+    if (!is_two_shot(l.kernel)) return 0;
+    const Op op         = op_of(l.kernel);
+    const int64_t slice = op == Op::all_reduce ? (flat + world - 1) / world
+                                               : (rows + world - 1) / world * packs;
+    const bool two      = op == Op::all_reduce_add_rms_norm ||
+                     op == Op::all_reduce_add_attn_res_rms_norm;
+    return slice * (two ? 2 : 1) * 16;
+  }
   if (op_of(l.kernel) == Op::all_reduce) {
     const int slices = is_two_shot(l.kernel) ? world : 1;
     return slots_need(l.kernel, tiles::buffer(flat, slices, l.grid, l.threads),

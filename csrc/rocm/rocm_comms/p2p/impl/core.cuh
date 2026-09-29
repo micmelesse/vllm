@@ -174,44 +174,6 @@ DINLINE void barrier(const Peers& p) {
   __syncthreads();
 }
 
-// This thread's share of unit u of a tiling, summed over every rank's input in fp32 and
-// rounded once to T. EVERY LOAD BEFORE ANY SUM: positions are worked out and checked once,
-// then all of the thread's packs x ngpus loads issue with no check between them, so they
-// are in flight together. A check per pack (a printf path) made the compiler wait for each
-// pack's loads before the next pack's: four round trips, not one.
-template <typename T, int ngpus, typename Tiling>
-DINLINE void sum(const World<T, ngpus>& w, const Tiling& t, int u,
-                 typename traits<T>::V (&out)[kMaxRowPacks]) {
-  using V         = typename traits<T>::V;
-  constexpr int N = traits<T>::N;
-  // A thread's packs of a unit are a prefix of k; one with none loads nothing (at a small
-  // size most of the grid has none, and loading anyway multiplied the traffic).
-  const int n = tiles::members(t, u);
-  if (n == 0) return;
-  int at[kMaxRowPacks];
-#pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) at[k] = k < n ? t.pos(u, k) : 0;
-  check(w.peers, at[n - 1] < w.peers.input_packs, "sum", -1, at[n - 1], w.peers.input_packs);
-  V raw[kMaxRowPacks][ngpus];
-#pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k)
-    if (k < n)
-#pragma unroll
-      for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at[k]);
-#pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
-    float acc[N];
-#pragma unroll
-    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[k][0].d[j]);
-#pragma unroll
-    for (int i = 1; i < ngpus; ++i)
-#pragma unroll
-      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[k][i].d[j]);
-#pragma unroll
-    for (int j = 0; j < N; ++j) out[k].d[j] = static_cast<T>(acc[j]);
-  }
-}
-
 // This rank's own input pack.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V mine(const World<T, ngpus>& w, int64_t idx) {
@@ -253,14 +215,6 @@ DINLINE float get_float(const World<T, ngpus>& w, int peer, int64_t idx) {
                                                           __MEMORY_SCOPE_SYSTEM));
 }
 
-template <typename T, int ngpus>
-DINLINE void put(const World<T, ngpus>& w, int peer, int64_t idx,
-                 const typename traits<T>::V& v) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put",
-                peer, idx, w.peers.scratch_packs);
-  store_global(scratch(w, peer) + idx, v);
-}
-
 // A pack pushed into peer's scratch, past the caches (see `store_uncached`).
 template <typename T, int ngpus>
 DINLINE void put_pushed(const World<T, ngpus>& w, int peer, int64_t idx,
@@ -268,15 +222,6 @@ DINLINE void put_pushed(const World<T, ngpus>& w, int peer, int64_t idx,
   check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put_pushed",
         peer, idx, w.peers.scratch_packs);
   store_uncached(scratch(w, peer) + idx, v);
-}
-
-// A direct pointer to n packs of peer's scratch, checked once, for a hot loop.
-template <typename T, int ngpus>
-DINLINE const typename traits<T>::V* ptr(const World<T, ngpus>& w, int peer, int64_t idx,
-                                         int64_t n) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx + n <= w.peers.scratch_packs,
-                "ptr", peer, idx + n, w.peers.scratch_packs);
-  return scratch(w, peer) + idx;
 }
 
 }  // namespace impl
@@ -328,10 +273,17 @@ DINLINE void end_sync(const Peers& p) {
   impl::pair_blocks<ngpus, !kFinal>(p, false);
 }
 
+// EVERY BLOCK OF THIS RANK, and no peer: what any block of this rank wrote before is visible
+// to every block of it after. For a phase that reads rows other blocks wrote.
+template <int ngpus>
+DINLINE void grid_sync(const Peers& p) {
+  impl::barrier<ngpus, false>(p);
+}
+
 }  // namespace simple
 
 // =================================================================================
-// THE PHASES (listed in p2p.cuh), which the fused kernels compose.
+// THE PHASES (listed in p2p.cuh), which the push kernels compose.
 // =================================================================================
 
 template <typename T, int ngpus>

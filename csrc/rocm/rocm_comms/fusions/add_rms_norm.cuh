@@ -27,7 +27,7 @@ namespace hip_comms::fusions::add_rms_norm {
 // between the two passes, so nothing is read back.
 //
 // DIRECTION-FREE: `sum` is this thread's share of the row already reduced over ranks and
-// rounded to T (by `p2p::pull::reduce` or `p2p::push::reduce`), sum[k] the
+// rounded to T (by the kernel's `sum_row` or `p2p::push::reduce`), sum[k] the
 // pack threadIdx.x + k * blockDim.x. The results leave through `store_res(k, i, v)` and
 // `store_out(k, i, v)`, i the pack within the row, so a kernel can land them in its
 // output, in scratch, or in registers to push.

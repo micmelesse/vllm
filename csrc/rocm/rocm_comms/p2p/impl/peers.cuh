@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE CONTRACT between p2p's two sides, behind p2p.cuh: what the host (host.cuh) maps and
-// fills, and what a kernel (core.cuh, pull.cuh, push.cuh) reads. Plain data only.
+// fills, and what a kernel (core.cuh, push.cuh) reads. Plain data only.
 
 #pragma once
 
@@ -58,15 +58,10 @@ struct Peers {
   uint64_t timeout_ticks;      // a wait longer than this traps
 };
 
-// THE SLOT SIZES, in packs, which the host needs to size scratch and pull.cuh / push.cuh
-// lay out on the device (they must agree). A pull slot holds this rank's local units, a
-// thread's kSumBatch packs per lane, plain; a push slot holds, per source rank, a group
+// THE SLOT SIZE, in packs, which the host needs to size scratch and push.cuh lays out on
+// the device (they must agree). A push slot holds, per source rank, a group
 // per lane per unit it holds (`held`: every unit for To::all, the local units for
 // To::owners) at kbits (16: T itself), then the scales of a scaled codec.
-template <typename Tiling>
-inline int64_t pull_slot_packs(const Tiling& t) {
-  return int64_t{t.locals()} * kSumBatch * t.lanes();
-}
 
 inline int64_t push_slot_packs(int kbits, int64_t held, int lanes, int world) {
   const int64_t groups  = held * lanes;

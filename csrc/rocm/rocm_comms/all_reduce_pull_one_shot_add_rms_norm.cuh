@@ -16,33 +16,40 @@ namespace hip_comms {
 // Every rank reduces every row and norms it where the sum lands in registers, saving an
 // HBM round trip and a launch against an all-reduce then a norm kernel. A block owns a
 // row. `residual` and `residual_out` are unused (null) unless kAdd; `weight` is in its
-// own dtype W, T or fp32 (see `fusion::row`). Peers read this rank's input to the end:
-// close.
+// own dtype W, T or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
-                                             T* __restrict__ residual_out,
-                                             const T* __restrict__ residual,
-                                             const W* __restrict__ weight, float eps,
-                                             int rows, int packs) {
+                                                        T* __restrict__ residual_out,
+                                                        const T* __restrict__ residual,
+                                                        const W* __restrict__ weight, float eps,
+                                                        int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_rms_norm;
-  const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  for (int row = tiling.first(); row < tiling.end(); row = tiling.next(row)) {
+
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::simple::start_sync<ngpus>(p);
+
+  // 2. Each of this block's rows: read it from every rank in rank order, sum, norm.
+  const V* in[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::pull::reduce(w, tiling, row, sum);
+    sum_row<T, ngpus>(in, row, packs, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  p2p::close(w);
+
+  // 3. No rank may overwrite its input until every peer has read it.
+  p2p::simple::end_sync<ngpus, true>(p);
 }
 
 // THE KERNELS, one per op, both the body above.

@@ -12,10 +12,10 @@
 
 namespace hip_comms {
 
-// Each rank reduces and norms the rows it owns and shares them; after the barrier every
-// rank gathers every normed row into `workspace` ([rows, packs] of its own); a grid
-// barrier; the GEMM over every row, fusion::kRows per pass. The input is read only
-// before the barrier, so no close.
+// Each rank reduces and norms the rows it owns into its scratch, row-major; after the sync
+// every rank copies every normed row into `workspace` ([rows, packs] of its own); a grid sync;
+// the GEMM over every row, fusion::kRows per pass. THE SAME BLOCK AND THREAD INDEX A PACK IN
+// BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, int ngpus, int kLanesPerCol>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
@@ -24,31 +24,50 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_n
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::rms_norm_gemm_add;
-  const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
-  const auto slot        = p2p::pull::slot(w, tiling);
+  const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
-  for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::simple::start_sync<ngpus>(p);
+
+  // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
+  //    scratch.
+  const V* in[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  V* mine         = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const int first = p.rank * slice_rows;
+  const int last  = min(first + slice_rows, rows);
+  for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::pull::reduce(w, tiling, row, sum);
-    V n[kMaxRowPacks] = {};
+    sum_row<T, ngpus>(in, row, packs, sum);
+    const int64_t at = int64_t{row - first} * packs;
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
-                        [&](int k, int, const V& v) { n[k] = v; });
-    p2p::pull::share(w, slot, tiling, row, n);
+                        [&](int, int i, const V& v) { store_global(mine + at + i, v); });
   }
 
-  p2p::peer_barrier(w);
+  // 3. Every rank's normed rows are visible to its peers.
+  p2p::simple::end_sync<ngpus, false>(p);
 
-  p2p::pull::gather(w, slot, tiling, [&](int row, int k, const V& v) {
-    store_global(normed + tiling.pos(row, k), v);
-  });
+  // 4. Every owner's normed rows out of its scratch, into the workspace.
+  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) {
+      const int row = r * slice_rows + l;
+      if (row >= rows) continue;
+      const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
+      for (int i = threadIdx.x; i < packs; i += blockDim.x)
+        store_global(normed + int64_t{row} * packs + i,
+                     load_global(theirs + int64_t{l} * packs + i));
+    }
+  }
 
-  // The GEMM reads rows other blocks of this rank gathered.
-  p2p::grid_barrier(w);
+  // 5. The GEMM reads rows other blocks of this rank copied.
+  p2p::simple::grid_sync<ngpus>(p);
 
+  // 6. The GEMM over every row, fusion::kRows per pass.
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
     fusion::gemm<kLanesPerCol, T>([&](int r) { return normed + (r0 + r) * packs; },
                                   min(fusion::kRows, rows - r0), gemm_w, n_cols, packs,

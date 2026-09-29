@@ -14,8 +14,7 @@ namespace hip_comms {
 
 // A block owns a row, as the fused norm does: every rank reduces every row, so there is
 // nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
-// in elements; `write_idx` < 0 writes no block. Peers read this rank's input to the end:
-// close.
+// in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
@@ -26,8 +25,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_attn_res_rms_norm;
-  const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
@@ -37,9 +34,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                          : reinterpret_cast<V*>(blocks + row * block_stride_m +
                                                 write_idx * block_stride_r);
   };
-  for (int row = tiling.first(); row < tiling.end(); row = tiling.next(row)) {
+
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::simple::start_sync<ngpus>(p);
+
+  // 2. Each of this block's rows: read it from every rank in rank order, sum, AttnRes.
+  const V* in[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::pull::reduce(w, tiling, row, sum);
+    sum_row<T, ngpus>(in, row, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, blocks + row * block_stride_m, block_stride_r,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
@@ -50,7 +55,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         },
         [&](int, int i, const V& v) { o[row * packs + i] = v; });
   }
-  p2p::close(w);
+
+  // 3. No rank may overwrite its input until every peer has read it.
+  p2p::simple::end_sync<ngpus, true>(p);
 }
 
 }  // namespace hip_comms

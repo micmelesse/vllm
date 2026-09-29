@@ -261,7 +261,7 @@ DINLINE void scatter(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s,
 }
 
 // This thread's share of unit u summed over every source in the slot, in rank order
-// (every rank the same bits), rounded to T: what `pull::reduce` gives a pull kernel.
+// (every rank the same bits), rounded to T: what `sum_row` gives a pull kernel.
 template <class C, typename T, int ngpus, typename Tiling>
 DINLINE void reduce(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, const Tiling& t,
                     int u, typename traits<T>::V (&v)[kMaxRowPacks]) {

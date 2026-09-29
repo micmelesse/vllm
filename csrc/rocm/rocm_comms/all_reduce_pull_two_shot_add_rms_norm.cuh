@@ -13,51 +13,69 @@
 
 namespace hip_comms {
 
-// THE SLICE IS ROWS: each rank owns whole rows, so it finishes the norm alone. It
-// reduces its rows, (kAdd: adds the replicated residual,) norms them and shares the out
-// row and (kAdd) the residual row in its scratch; after the barrier every rank gathers
-// every owner's rows. Every output element is computed by one rank, so every rank holds
-// the same bytes. The input is read only before the barrier, so no close.
+// THE SLICE IS ROWS: each rank owns whole rows, so it finishes the norm alone. It reduces
+// its rows, (kAdd: adds the replicated residual,) norms them and leaves the out rows and
+// (kAdd) the residual rows in its scratch, row-major; after the sync every rank copies every
+// owner's rows out. Every output element is computed by one rank, so every rank holds the same
+// bytes. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read
+// only what the same block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
-                                             T* __restrict__ residual_out,
-                                             const T* __restrict__ residual,
-                                             const W* __restrict__ weight, float eps,
-                                             int rows, int packs) {
+                                                        T* __restrict__ residual_out,
+                                                        const T* __restrict__ residual,
+                                                        const W* __restrict__ weight, float eps,
+                                                        int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   namespace fusion       = fusions::add_rms_norm;
-  const auto w           = p2p::start<T, ngpus>(p);
-  const auto tiling      = tiles::rows(rows, packs, ngpus);
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const auto out_slot    = p2p::pull::slot(w, tiling);
-  const auto res_slot    = p2p::pull::slot(w, tiling, out_slot);
+  const int slice_rows   = (rows + ngpus - 1) / ngpus;
+  const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
 
-  for (int row = tiling.first(p.rank); row < tiling.end(p.rank); row = tiling.next(row)) {
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::simple::start_sync<ngpus>(p);
+
+  // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
+  //    result in this rank's scratch.
+  const V* in[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  V* mine          = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const int first  = p.rank * slice_rows;
+  const int last   = min(first + slice_rows, rows);
+  for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     V sum[kMaxRowPacks];
-    p2p::pull::reduce(w, tiling, row, sum);
-    V normed[kMaxRowPacks] = {}, res[kMaxRowPacks] = {};
+    sum_row<T, ngpus>(in, row, packs, sum);
+    const int64_t at = int64_t{row - first} * packs;
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
-        [&](int k, int, const V& v) { res[k] = v; },
-        [&](int k, int, const V& v) { normed[k] = v; });
-    p2p::pull::share(w, out_slot, tiling, row, normed);
-    if constexpr (kAdd) p2p::pull::share(w, res_slot, tiling, row, res);
+        [&](int, int i, const V& v) { store_global(mine + res_at + at + i, v); },
+        [&](int, int i, const V& v) { store_global(mine + at + i, v); });
   }
 
-  p2p::peer_barrier(w);
+  // 3. Every rank's rows are visible to its peers.
+  p2p::simple::end_sync<ngpus, false>(p);
 
-  p2p::pull::gather(w, out_slot, tiling, [&](int row, int k, const V& v) {
-    store_global(o + tiling.pos(row, k), v);
-  });
-  if constexpr (kAdd)
-    p2p::pull::gather(w, res_slot, tiling, [&](int row, int k, const V& v) {
-      store_global(res_out + tiling.pos(row, k), v);
-    });
+  // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
+  //    first sync keeps a rank from overwriting its scratch while it is read.
+  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) {
+      const int row = r * slice_rows + l;
+      if (row >= rows) continue;
+      const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
+      for (int i = threadIdx.x; i < packs; i += blockDim.x) {
+        const int64_t at = int64_t{l} * packs + i;
+        store_global(o + int64_t{row} * packs + i, load_global(theirs + at));
+        if constexpr (kAdd)
+          store_global(res_out + int64_t{row} * packs + i, load_global(theirs + res_at + at));
+      }
+    }
+  }
 }
 
 // THE KERNELS, one per op, both the body above.
