@@ -61,27 +61,30 @@ DINLINE void share(const World<T, ngpus>& w, const PullSlot& s, const Tiling& t,
 
 // After a peer_barrier: every owner's shared units out of its `slot`, every owner at once
 // (a load in flight on every link); a thread takes the local units it shared.
-// store(unit, k, v). STRAIGHT-LINE, as `impl::sum`: a local unit's packs from every owner
-// are loaded with no branch between them (a missing one reads the slot's first pack and
-// is not stored), so they are in flight together.
+// store(unit, k, v). Every load before any store, as `impl::sum`, so a local unit's packs
+// from every owner are in flight together.
 template <typename T, int ngpus, typename Tiling, typename Store>
 DINLINE void gather(const World<T, ngpus>& w, const PullSlot& s, const Tiling& t,
                     Store store) {
   using V = typename traits<T>::V;
   for (int l = t.first_local(); l < t.locals(); l = t.next_local(l)) {
+    // Owner 0's unit is the fullest, so its packs bound every owner's; a thread with none
+    // loads nothing. A later owner's missing pack still reads inside the slot, unstored.
+    const int n = tiles::members(t, t.unit(0, l));
+    if (n == 0) continue;
     V g[kMaxRowPacks][ngpus];
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const V* from = impl::ptr(w, i, s.at(l, 0, 0), s.end() - s.at(l, 0, 0));
 #pragma unroll
       for (int k = 0; k < kMaxRowPacks; ++k)
-        g[k][i] = load_global(from + (s.at(l, k, t.lane()) - s.at(l, 0, 0)));
+        if (k < n) g[k][i] = load_global(from + (s.at(l, k, t.lane()) - s.at(l, 0, 0)));
     }
 #pragma unroll
     for (int k = 0; k < kMaxRowPacks; ++k)
 #pragma unroll
       for (int i = 0; i < ngpus; ++i)
-        if (t.has(t.unit(i, l), k)) store(t.unit(i, l), k, g[k][i]);
+        if (k < n && t.has(t.unit(i, l), k)) store(t.unit(i, l), k, g[k][i]);
   }
 }
 

@@ -175,29 +175,29 @@ DINLINE void barrier(const Peers& p) {
 }
 
 // This thread's share of unit u of a tiling, summed over every rank's input in fp32 and
-// rounded once to T. STRAIGHT-LINE LOADS: every pack's position is worked out first (a
-// missing pack reads position 0 and is dropped by the caller's `has`), checked once, and
-// then all kMaxRowPacks x ngpus loads issue back to back with no branch between them, so
-// they are in flight together and the wave waits once. A branch per pack made the
-// compiler wait for each pack's loads before the next pack's (four round trips, not one).
+// rounded once to T. EVERY LOAD BEFORE ANY SUM: positions are worked out and checked once,
+// then all of the thread's packs x ngpus loads issue with no check between them, so they
+// are in flight together. A check per pack (a printf path) made the compiler wait for each
+// pack's loads before the next pack's: four round trips, not one.
 template <typename T, int ngpus, typename Tiling>
 DINLINE void sum(const World<T, ngpus>& w, const Tiling& t, int u,
                  typename traits<T>::V (&out)[kMaxRowPacks]) {
   using V         = typename traits<T>::V;
   constexpr int N = traits<T>::N;
+  // A thread's packs of a unit are a prefix of k; one with none loads nothing (at a small
+  // size most of the grid has none, and loading anyway multiplied the traffic).
+  const int n = tiles::members(t, u);
+  if (n == 0) return;
   int at[kMaxRowPacks];
-  int last = 0;
 #pragma unroll
-  for (int k = 0; k < kMaxRowPacks; ++k) {
-    at[k] = t.has(u, k) ? t.pos(u, k) : 0;
-    last  = at[k] > last ? at[k] : last;
-  }
-  check(w.peers, last < w.peers.input_packs, "sum", -1, last, w.peers.input_packs);
+  for (int k = 0; k < kMaxRowPacks; ++k) at[k] = k < n ? t.pos(u, k) : 0;
+  check(w.peers, at[n - 1] < w.peers.input_packs, "sum", -1, at[n - 1], w.peers.input_packs);
   V raw[kMaxRowPacks][ngpus];
 #pragma unroll
   for (int k = 0; k < kMaxRowPacks; ++k)
+    if (k < n)
 #pragma unroll
-    for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at[k]);
+      for (int i = 0; i < ngpus; ++i) raw[k][i] = load_global(w.in[i] + at[k]);
 #pragma unroll
   for (int k = 0; k < kMaxRowPacks; ++k) {
     float acc[N];
