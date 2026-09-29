@@ -132,8 +132,10 @@ struct PushSlot {
   int groups;   // per source: the units it holds x lanes
   int base;     // in packs of the scratch
   int per_src;  // packs per source: every group's payload, then (scaled) their scales
-  DINLINE int payload(int src, int g) const {
-    return base + src * per_src + g * C::kPayloadPacks;
+  // PACK-MAJOR: pack k of every group, then pack k+1, so the lanes of one store (or load)
+  // touch one contiguous run and whole lines, not 16 bytes of each of 64 lines.
+  DINLINE int payload(int src, int g, int k) const {
+    return base + src * per_src + k * groups + g;
   }
   DINLINE int scale(int src, int g) const {
     return 4 * (base + src * per_src + groups * C::kPayloadPacks) + g;
@@ -164,11 +166,10 @@ DINLINE void push_payload(const World<T, ngpus>& w, int peer, const PushSlot<C, 
                           int g, int n, const typename traits<T>::V (&q)[C::kPayloadPacks],
                           float scale) {
   if (n == 0) return;
-  const int at   = s.payload(w.peers.rank, g);
   const int sent = payload_packs<C>(n);
 #pragma unroll
   for (int k = 0; k < C::kPayloadPacks; ++k)
-    if (k < sent) put_pushed(w, peer, at + k, q[k]);
+    if (k < sent) put_pushed(w, peer, s.payload(w.peers.rank, g, k), q[k]);
   if constexpr (C::kScaled) put_float(w, peer, s.scale(w.peers.rank, g), scale);
 }
 
@@ -197,11 +198,10 @@ template <class C, typename T, int ngpus>
 DINLINE void read(const World<T, ngpus>& w, const PushSlot<C, ngpus>& s, int src, int g,
                   int n, float (&x)[C::kVals]) {
   typename traits<T>::V q[C::kPayloadPacks];
-  const int at   = s.payload(src, g);
   const int sent = payload_packs<C>(n);
 #pragma unroll
   for (int k = 0; k < C::kPayloadPacks; ++k)
-    q[k] = k < sent ? get_pushed(w, at + k) : typename traits<T>::V{};
+    q[k] = k < sent ? get_pushed(w, s.payload(src, g, k)) : typename traits<T>::V{};
   float scale = 1.0f;
   if constexpr (C::kScaled)
     if (n > 0) scale = get_float(w, w.peers.rank, s.scale(src, g));
