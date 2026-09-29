@@ -18,7 +18,8 @@ namespace hip_comms {
 // the GEMM over every row, fusion::kRows per pass. THE SAME BLOCK AND THREAD INDEX A PACK IN
 // BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_norm_gemm_add(
+__global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanesPerCol), 1)
+    all_reduce_pull_two_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {

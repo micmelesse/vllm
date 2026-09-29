@@ -50,6 +50,9 @@ DINLINE void sum_row(const typename traits<T>::V* const (&src)[ngpus], int row, 
   }
 }
 
+// The LDS `block_sum` and `block_sum2` take between them, for a kernel budgeting the rest.
+constexpr int64_t kBlockSumLdsBytes = (kMaxWaves + 1) * (sizeof(float) + sizeof(float2));
+
 // Sum of `v` over the block. A block wider than kMaxThreads cannot be launched, so
 // `partial` cannot be overrun.
 DINLINE float block_sum(float v) {

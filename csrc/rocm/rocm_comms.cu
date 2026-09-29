@@ -183,6 +183,9 @@ bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t ro
   if (has_row_packs(l.kernel) && l.row_packs == 0) return false;
   if (is_push(l.kernel) && op != Op::all_reduce && packs > p2p::kPushGroupPacks * l.threads)
     return false;
+  if (op == Op::all_reduce_rms_norm_gemm_add &&
+      l.threads > fusions::rms_norm_gemm_add::max_threads(l.gemm_lanes_per_col))
+    return false;
   if (op == Op::all_reduce_rms_norm_gemm_add && !is_two_shot(l.kernel) &&
       rows > kGemmTailOneShotRows)
     return false;

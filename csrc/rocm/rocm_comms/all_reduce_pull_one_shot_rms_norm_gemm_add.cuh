@@ -17,7 +17,8 @@ namespace hip_comms {
 // grid barrier; the GEMM over every row. At most fusion::kRows rows: one GEMM pass.
 // kLanesPerCol is the GEMM's lanes per column (tune.cuh).
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_norm_gemm_add(
+__global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanesPerCol), 1)
+    all_reduce_pull_one_shot_rms_norm_gemm_add(
     p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {

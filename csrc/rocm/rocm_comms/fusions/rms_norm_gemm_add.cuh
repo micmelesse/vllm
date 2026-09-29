@@ -60,14 +60,20 @@ DINLINE void norm_row(const typename traits<T>::V (&sum)[K],
 // STAGE 2, THE GEMM.
 // The most rows one pass takes: a lane holds one output column's sums for each of them.
 constexpr int kRows = 16;
-// The K-chunk of x staged in LDS at a time, in packs. gfx950 has 160 KB of LDS, so all of
-// Kimi-K3's latent K (448 packs, 112 KB) goes in at once: one staging pass and one barrier
-// pair per tile. gfx942 has 64 KB: 96 packs (24 KB) beside the widest reduce tile (32 KB).
-#if defined(__gfx950__)
-constexpr int kChunk = 448;
-#else
-constexpr int kChunk = 96;
-#endif
+// The K-chunk of x staged in LDS at a time, in packs. With 160 KiB of LDS all of Kimi-K3's latent
+// K (448 packs, 112 KiB) goes in at once: one staging pass and one barrier pair per tile. With
+// 64 KiB, 96 packs (24 KiB).
+constexpr int kChunk = kDevice.lds_bytes >= 160 * kKiB ? 448 : 96;
+
+// THE BLOCK THE DEVICE'S LDS HOLDS: the staged chunk, the block sums, and one [kRows][tile] float
+// partial per wave, tile = kWaveSize / lanes columns.
+constexpr int max_waves(int lanes_per_col) {
+  const int64_t room = kDevice.lds_bytes - int64_t{kRows} * kChunk * kPackBytes - kBlockSumLdsBytes;
+  const int64_t per_wave = int64_t{kRows} * (kWaveSize / lanes_per_col) * sizeof(float);
+  return room / per_wave < kMaxWaves ? static_cast<int>(room / per_wave) : kMaxWaves;
+}
+constexpr int max_threads(int lanes_per_col) { return max_waves(lanes_per_col) * kWaveSize; }
+static_assert(max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
@@ -89,7 +95,7 @@ DINLINE void gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, i
   constexpr int NL = traits<T>::N;
   constexpr int kTile = kWaveSize / kLanesPerCol;
   static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
-  __shared__ float partial[kMaxWaves][kRows][kTile];
+  __shared__ float partial[max_waves(kLanesPerCol)][kRows][kTile];
   __shared__ V xs[kRows][kChunk];
   const int lane   = threadIdx.x % kWaveSize;
   const int wave   = threadIdx.x / kWaveSize;

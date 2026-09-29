@@ -64,6 +64,30 @@ constexpr Hardware kGfx950 = {
 };
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0, "every XCD has the same CUs");
 
+// gfx942, AMD Instinct MI300X (MI325X is the same but for 256 GiB). Sources: ROCm's GPU hardware
+// specifications table for the compute units, register files, caches and LDS; ROCm's MI300 page
+// for the XCDs and HBM; AMD's MI300X data sheet for the fabric (7 links, 896 GB/s in all).
+constexpr Hardware kGfx942 = {
+    64,                  // wave_size
+    1024,                // max_workgroup
+    304,                 // compute_units (38 active per XCD)
+    32,                  // max_waves_per_cu
+    8,                   // xcds
+    4,                   // simds_per_cu
+    512 * kKiB,          // vgpr_file_bytes
+    12800,               // sgpr_file_bytes (12.5 KiB)
+    64 * kKiB,           // lds_bytes
+    32 * kKiB,           // l1_bytes
+    128,                 // cache_line_bytes
+    4 * kMiB,            // l2_bytes_per_xcd
+    256 * kMiB,          // infinity_cache_bytes
+    192 * kGiB,          // hbm_bytes
+    5300.0,              // hbm_gbytes_per_s
+    7,                   // xgmi_links
+    64.0,                // xgmi_gbytes_per_s_a_way
+};
+static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
+
 // Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's
 // __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block puts there, and
 // at most 512 (256 architectural + 256 accumulation).
@@ -75,14 +99,22 @@ constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
   return static_cast<int>(v < 512 ? v : 512);
 }
 
-// THE TARGET THIS BUILD IS FOR, and the sizes the device code compiles against.
+// THE TARGET THE HOST TUNES FOR.
 constexpr const Hardware& kTarget = kGfx950;
-constexpr int kWaveSize = kTarget.wave_size;
+
+// THE DEVICE THIS COMPILE PASS IS FOR: a build compiles the device code once per offload arch
+// (gfx942 and gfx950), each against its own facts; the host pass sees the tuning target.
+#if defined(__gfx942__)
+constexpr const Hardware& kDevice = kGfx942;
+#else
+constexpr const Hardware& kDevice = kTarget;
+#endif
+constexpr int kWaveSize = kDevice.wave_size;
 
 // THE DEVICE'S BLOCK LIMIT is every kernel's __launch_bounds__; the ISA report says whether a
 // kernel spills at the registers that leaves it.
-constexpr int kMaxThreads = kTarget.max_workgroup;
-static_assert(vgprs_per_thread(kTarget, kMaxThreads) == 128, "1024 threads leave 128 registers");
+constexpr int kMaxThreads = kDevice.max_workgroup;
+static_assert(vgprs_per_thread(kDevice, kMaxThreads) == 128, "1024 threads leave 128 registers");
 constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
 
 // THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles are wrong.
