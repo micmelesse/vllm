@@ -1,53 +1,41 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// WHAT RUNS FOR A CALL: `tune(op, input, hw, cal)` splits on the op and calls that op's own
-// `tune_<op>`, which picks the kernel AND its launch config from the input, the hardware's
-// documented facts and what was measured on it (hardware.cuh's Hardware and Calibration), one
-// rule in one place, with the sweep it came from written beside it. An op not yet swept says so
-// and states what it runs. launch.cuh says what kernels exist.
+// SELECT, THE ONLY CHOICE: `tune(op, input, hw, cal)` splits on the op and calls its own
+// `tune_<op>`, which picks the kernel AND its grid and block from the input, the hardware's
+// documented facts and what was measured on it (target/hardware.cuh), one rule in one place, with
+// the sweep it came from written beside it. `select` is tune, or the caller's forced spec.
 
 #pragma once
 
+#ifndef HIP_COMMS_INTERFACE
+#error "include rocm_comms.cuh, the one interface, not its parts"
+#endif
+
 #include <cstdint>
 
-#include "../common/common.cuh"
-#include "../target/hardware.cuh"
-#include "kernels.cuh"
-#include "../p2p/p2p.cuh"
-
 namespace hip_comms {
-
-// WHAT A CALL IS: its shape, and the precision it accepts. Tuning reads it and never changes the
-// answer.
-struct Input {
-  int64_t rows;    // tokens
-  int64_t hidden;  // a row's length, in elements
-  int elem_bytes;  // 2 for bf16 and fp16
-  int64_t cols;    // the GEMM tail's output columns (its weight is [cols, hidden]); 0 without one
-  int quant_bits;  // the precision the caller accepts on the wire: 16 (exact), 8 or 4. No kernel
-                   // quantizes yet (p2p's Codec is the format one will use), so only 16 runs.
-  int world;       // ranks in the group
-};
 
 // WHAT THE HARDWARE MOVES: to it, a plain all-reduce is only its byte count.
 constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
 
-static_assert(kTargetCalibration.gemm_lanes_per_col == 1 ||
-                  kTargetCalibration.gemm_lanes_per_col == 2 ||
-                  kTargetCalibration.gemm_lanes_per_col == 4 ||
-                  kTargetCalibration.gemm_lanes_per_col == 8,
-              "the GEMM tail is built for 1, 2, 4 or 8 lanes per column");
-
-// `k` at `blocks` x `threads`: its grid cut to the rows where it gives each block a row, `lanes`
-// for the GEMM tail (0 for any other), the call's precision passed through.
-constexpr Launch at(Kernel k, Input in, int blocks, int threads, int lanes = 0) {
-  const int row_packs =
-      has_row_packs(k) ? row_packs_for(op_of(k), in.hidden * in.elem_bytes / kPackBytes, threads)
-                       : 0;
-  return {k, grid_of(k, blocks, in.rows, in.world), threads, lanes, in.quant_bits, row_packs};
+// A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
+// and the norms' two-shot all of them (the norms' two-shot slices columns), AttnRes's two-shot its
+// rank's slice. An idle block still pays every barrier (each pairs with its
+// twin on every peer): the norms' two-shot at 32 tokens ran 36 blocks for 4 rows a rank. The GEMM
+// tail's GEMM strides over column tiles, and the plain all-reduce over packs, so both keep theirs.
+constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
+  const Op op = op_of(k);
+  if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
+  const bool row_slice = is_two_shot(k) && op == Op::all_reduce_add_attn_res_rms_norm;
+  const int64_t mine   = row_slice ? (rows + world - 1) / world : rows;
+  return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
+// `k` at `blocks` x `threads`, its grid cut to the rows where it gives each block a row.
+constexpr KernelSpec spec_of(Kernel k, Input in, int blocks, int threads) {
+  return {k, grid_of(k, blocks, in.rows, in.world), threads};
+}
 
 // =================================================================================================
 // ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:
@@ -79,7 +67,7 @@ constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, in
   return blocks < hw.compute_units ? blocks : hw.compute_units;
 }
 
-constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
+constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
   const bool one_shot = bytes(in) <= cal.one_shot_max_bytes;
   const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
   const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
@@ -95,7 +83,7 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
   const int64_t even   = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
   const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
-  return at(k, in, blocks, threads);
+  return spec_of(k, in, blocks, threads);
 }
 
 // =================================================================================================
@@ -108,48 +96,50 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 // one-shot wins (7.46 against 10.00 us at 1 token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z);
 // the two-shot still loses, at 32-64 tokens by 0.2-0.6 us and at prefill by up to 5.5 at its 36
 // blocks (88 lost more: 169.3 against 148.9 at 4096), so it is the one being worked on.
-constexpr Launch fused_norm(Kernel one_shot, Kernel two_shot, Input in, const Calibration& cal) {
+constexpr KernelSpec fused_norm(Kernel one_shot, Kernel two_shot, Input in,
+                                const Calibration& cal) {
   return bytes(in) <= cal.fused_one_shot_max_bytes
-             ? at(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads)
-             : at(two_shot, in, cal.norm_two_shot_blocks, cal.fused_threads);
+             ? spec_of(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads)
+             : spec_of(two_shot, in, cal.norm_two_shot_blocks, cal.fused_threads);
 }
 
-constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
+constexpr KernelSpec tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
                     Kernel::all_reduce_pull_two_shot_rms_norm, in, cal);
 }
 
-constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration& cal) {
+constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
+                                                  const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
                     Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal);
 }
 
-// AttnRes as the norms: a block a row, never more blocks than rows (launch.cuh's grid_of).
-constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
+// AttnRes as the norms: a block a row, never more blocks than rows (grid_of).
+constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
                                                         const Calibration& cal) {
   return bytes(in) <= cal.fused_one_shot_max_bytes
-             ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
-                  cal.fused_one_shot_blocks, cal.fused_threads)
-             : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
-                  cal.attn_res_two_shot_blocks, cal.fused_threads);
+             ? spec_of(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
+                       cal.fused_one_shot_blocks, cal.fused_threads)
+             : spec_of(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
+                       cal.attn_res_two_shot_blocks, cal.fused_threads);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
 // 512 threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
-constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
+constexpr KernelSpec tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
                                                    const Calibration& cal) {
   const Kernel k = in.rows <= cal.gemm_one_shot_max_rows
                        ? Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add
                        : Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add;
-  return at(k, in, cal.gemm_tail_blocks, cal.fused_threads, cal.gemm_lanes_per_col);
+  return spec_of(k, in, cal.gemm_tail_blocks, cal.fused_threads);
 }
 
 // =================================================================================================
 // THE ONE ENTRY: the op's own function.
 // =================================================================================================
 
-constexpr Launch tune(Op op, Input in, const Hardware& hw, const Calibration& cal) {
+constexpr KernelSpec tune(Op op, Input in, const Hardware& hw, const Calibration& cal) {
   switch (op) {
     case Op::all_reduce: return tune_all_reduce(in, hw, cal);
     case Op::all_reduce_rms_norm: return tune_all_reduce_rms_norm(in, hw, cal);
@@ -159,6 +149,61 @@ constexpr Launch tune(Op op, Input in, const Hardware& hw, const Calibration& ca
     case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw, cal);
   }
   __builtin_unreachable();  // every Op is a case above
+}
+
+// EVERY TUNED SPEC IS A KERNEL THAT FITS, for every op at the smallest input and a large one: a
+// tune_<op> never declines (a fusion that is on runs its fused op), and a spec past a capability is
+// a compile error, not a kernel that overruns its signal slots or register arrays.
+constexpr bool fits(const KernelSpec& k, Input in) {
+  if (k.kernel == Kernel::none) return false;
+  if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
+  if (has_row_packs(k.kernel) &&
+      row_packs_for(op_of(k.kernel), in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
+    return false;
+  return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
+}
+constexpr bool tuned_specs_fit() {
+  for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm_add); ++op)
+    for (const Input in : {Input{1, 8, 2, 0, 2}, Input{4096, 7168, 2, 0, p2p::kMaxRanks}})
+      if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration), in)) return false;
+  return true;
+}
+static_assert(tuned_specs_fit(), "a tune_<op> declines, or exceeds a kernel capability");
+
+constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
+
+// EACH OP'S ARGS AS THE OP AND THE INPUT that select and validate read.
+constexpr Op op_of(const AllReduceArgs&) { return Op::all_reduce; }
+constexpr Op op_of(const NormArgs& a) {
+  return a.residual ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
+}
+constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
+constexpr Op op_of(const GemmTailArgs&) { return Op::all_reduce_rms_norm_gemm_add; }
+
+inline Input input_of(const Handle& h, const AllReduceArgs& a) {
+  const int e = elem_bytes(a.dtype);
+  return {1, a.bytes / e, e, 0, h.world_size()};
+}
+inline Input input_of(const Handle& h, const NormArgs& a) {
+  return {a.rows, a.hidden, elem_bytes(a.dtype), 0, h.world_size()};
+}
+inline Input input_of(const Handle& h, const AttnResArgs& a) {
+  return {a.rows, a.hidden, elem_bytes(a.dtype), 0, h.world_size()};
+}
+inline Input input_of(const Handle& h, const GemmTailArgs& a) {
+  return {a.rows, a.hidden, elem_bytes(a.dtype), a.n_cols, h.world_size()};
+}
+
+// What runs: tune's spec, or the forced kernel at the forced grid and block.
+inline KernelSpec select(Op op, Input in, const Options& o) {
+  const KernelSpec& f = o.forced;
+  if (f.kernel == Kernel::none) return tune(op, in, kTarget, kTargetCalibration);
+  return spec_of(f.kernel, in, f.grid, f.threads);
+}
+
+template <typename Args>
+KernelSpec select(const Handle& h, const Args& a, const Options& o) {
+  return select(op_of(a), input_of(h, a), o);
 }
 
 }  // namespace hip_comms

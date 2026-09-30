@@ -2,7 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE LINK'S ROUND TRIP, as the p2p layer pays it: one thread on each rank of a pair, flags back
-// and forth over p2p flags. A measurement, not a collective; hardware.cuh records its answer.
+// and forth over p2p flags. A measurement, not a collective; target/hardware.cuh records its
+// answer.
 
 #pragma once
 

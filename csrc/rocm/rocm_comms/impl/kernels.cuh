@@ -1,46 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// WHICH KERNEL RUNS, AND HOW WIDE. The caller names an op; this picks one kernel from the
-// flat list and describes its launch geometry; tune.cuh picks one for a call. Nothing above C++
-// sees an algorithm or a geometry.
+// THE CATALOG: what each Kernel is (its op, its shot) and the row builds each op has.
 
 #pragma once
 
-#include <climits>
+#ifndef HIP_COMMS_INTERFACE
+#error "include rocm_comms.cuh, the one interface, not its parts"
+#endif
+
 #include <cstdint>
 
-#include "../common/common.cuh"
-#include "../target/build.cuh"
-
 namespace hip_comms {
-
-// What the caller asked for: an all-reduce, alone or with what it fuses. Named as the Python
-// methods are (`comm.all_reduce_rms_norm(...)`).
-enum class Op : int {
-  all_reduce                       = 0,
-  all_reduce_rms_norm              = 1,
-  all_reduce_add_rms_norm          = 2,
-  all_reduce_add_attn_res_rms_norm = 3,
-  all_reduce_rms_norm_gemm_add     = 4,
-};
-
-// Every `__global__` there is, once, named by its shot and what it fuses; all of them pull (a rank
-// reads its peers' buffers: their inputs, or scratch they filled). `none` is no kernel named: a
-// launch not forced, which tune.cuh picks. Each op has a one-shot and a two-shot.
-enum class Kernel : int {
-  none                                           = -1,
-  all_reduce_pull_one_shot                       = 0,
-  all_reduce_pull_two_shot                       = 1,
-  all_reduce_pull_one_shot_rms_norm              = 2,
-  all_reduce_pull_two_shot_rms_norm              = 3,
-  all_reduce_pull_one_shot_add_rms_norm          = 4,
-  all_reduce_pull_two_shot_add_rms_norm          = 5,
-  all_reduce_pull_one_shot_add_attn_res_rms_norm = 6,
-  all_reduce_pull_two_shot_add_attn_res_rms_norm = 7,
-  all_reduce_pull_one_shot_rms_norm_gemm_add     = 8,
-  all_reduce_pull_two_shot_rms_norm_gemm_add     = 9,
-};
 
 // What each kernel is, in Kernel's order.
 struct KernelInfo {
@@ -76,21 +47,9 @@ constexpr const KernelInfo& info(Kernel k) { return kKernels[static_cast<int>(k)
 constexpr Op op_of(Kernel k) { return info(k).op; }
 constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
 
-// What runs: the kernel, its grid and block, for the GEMM tail its lanes per column (0 for
-// every other kernel), the precision the caller accepts (16: T itself; no kernel quantizes yet),
-// and for a row kernel the packs of its row each thread holds (0 for every other kernel).
-struct Launch {
-  Kernel kernel;
-  int grid;
-  int threads;
-  int gemm_lanes_per_col;
-  int quant_bits;
-  int row_packs;
-};
-
-// A ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at powers
-// of two up to what the op fits without spilling (build.cuh derives it). A build past that would
-// only ever run slower, so it is not built.
+// A ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at
+// powers of two up to what the op fits without spilling (target/build.cuh derives it). A build
+// past that would only ever run slower, so it is not built.
 constexpr int max_row_packs(Op op) {
   switch (op) {
     case Op::all_reduce: return 0;
@@ -106,19 +65,6 @@ constexpr int row_packs_for(Op op, int64_t packs, int threads) {
   for (int b = 1; b <= max_row_packs(op); b *= 2)
     if (int64_t{b} * threads >= packs) return b;
   return 0;
-}
-
-// A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
-// and the norms' two-shot all of them (the norms' two-shot slices columns), AttnRes's two-shot its
-// rank's slice. An idle block still pays every barrier (each pairs with its
-// twin on every peer): the norms' two-shot at 32 tokens ran 36 blocks for 4 rows a rank. The GEMM
-// tail's GEMM strides over column tiles, and the plain all-reduce over packs, so both keep theirs.
-constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
-  const Op op = op_of(k);
-  if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
-  const bool row_slice = is_two_shot(k) && op == Op::all_reduce_add_attn_res_rms_norm;
-  const int64_t mine   = row_slice ? (rows + world - 1) / world : rows;
-  return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
 }  // namespace hip_comms

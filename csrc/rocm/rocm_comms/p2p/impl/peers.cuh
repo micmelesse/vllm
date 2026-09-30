@@ -21,7 +21,7 @@ namespace hip_comms::p2p {
 
 constexpr int kMaxRanks  = kMaxPeers;
 // ONE SIGNAL SLOT PER COMPUTE UNIT on any target built: the signal block never rules out a grid.
-// Which grid is fast is the tuner's (tune.cuh).
+// Which grid is fast is select's (impl/select.cuh).
 constexpr int kMaxBlocks = kMaxComputeUnits;
 
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply

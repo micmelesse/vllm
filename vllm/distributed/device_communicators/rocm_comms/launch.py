@@ -2,14 +2,14 @@
 # rights reserved.
 
 """WHICH KERNEL, AND HOW WIDE, when a caller forces it: the Python mirror of
-`csrc/rocm/rocm_comms/launch.cuh`. The model never forces one; the sweep and the tests
+`csrc/rocm/rocm_comms/rocm_comms.cuh`. The model never forces one; the sweep and the tests
 pass a `Launch` with a call."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh), named
+# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in rocm_comms.cuh), named
 # by shot and what it fuses; all of them pull (a rank reads its peers). Named only to
 # force one through a `Launch`; nothing else picks.
 Kernel = Literal[
@@ -33,7 +33,7 @@ _KERNEL_WIRE: Mapping[Kernel, int] = {
 @dataclass(frozen=True)
 class Launch:
     """A FORCED LAUNCH, passed per call by the sweep and the tests (the model passes
-    None, and tune.cuh picks): `kernel` at this grid and block. The defaults are a
+    None, and select picks): `kernel` at this grid and block. The defaults are a
     width every kernel admits, for a test that forces a kernel only to check it."""
 
     kernel: Kernel
@@ -42,7 +42,7 @@ class Launch:
 
 
 def launch_wire(launch: Launch | None) -> tuple[int, int, int]:
-    """The launch's three integers, last on every op: -1 and zeros for tune.cuh's."""
+    """The launch's three integers, last on every op: -1 and zeros for select's."""
     if launch is None:
         return (-1, 0, 0)
     return (_KERNEL_WIRE[launch.kernel], launch.blocks, launch.threads)

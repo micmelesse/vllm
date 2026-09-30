@@ -2,8 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE BUILD: every number fixed at compile time, derived from the device's `Hardware` and its
-// `Calibration` (hardware.cuh) and nothing else; what depends on the input is tune.cuh's, at run
-// time. A number neither gives is a policy: one named line in `derive`, saying why.
+// `Calibration` (hardware.cuh) and nothing else; what depends on the input is select's
+// (impl/select.cuh), at run time. A number neither gives is a policy: one named line in `derive`.
 
 #pragma once
 
@@ -38,9 +38,10 @@ struct Build {
   int attn_res_row_packs;   // AttnRes's, at most
   int gemm_rows;            // the GEMM tail's rows a pass
   int gemm_chunk;           // the GEMM tail's K-chunk staged in LDS, in packs
+  int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
 };
 
-constexpr Build derive(const Hardware& hw, const Calibration&) {
+constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   Build b{};
   // A PACK IS THE WIDEST LOAD, as in vLLM's and aiter's custom all-reduce and NCCL.
   b.pack_bytes = hw.max_load_bytes;
@@ -76,6 +77,9 @@ constexpr Build derive(const Hardware& hw, const Calibration&) {
   const int64_t reduce      = (int64_t{waves} + 1) * 4;
   b.gemm_chunk =
       static_cast<int>((hw.lds_bytes - partials - reduce) / (int64_t{b.gemm_rows} * b.pack_bytes));
+
+  // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
+  b.gemm_lanes = cal.gemm_lanes_per_col;
   return b;
 }
 
@@ -90,8 +94,11 @@ constexpr int kGemmChunk = kBuild.gemm_chunk;
 
 static_assert(kMaxThreads <= kDevice.max_workgroup && kMaxThreads % kWaveSize == 0,
               "the block limit must be whole waves the device can launch");
+static_assert(kBuild.gemm_lanes == 1 || kBuild.gemm_lanes == 2 || kBuild.gemm_lanes == 4 ||
+                  kBuild.gemm_lanes == 8,
+              "the GEMM tail splits a wave's lanes over its columns: 1, 2, 4 or 8");
 static_assert(kBuild.norm_row_packs <= 8 && kBuild.attn_res_row_packs <= 8,
-              "rocm_comms.cu's by_row_packs builds up to 8 packs a thread");
+              "impl/launch.cuh builds up to 8 packs a thread");
 
 // Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
 // device's LDS holds, and no more than the block limit.

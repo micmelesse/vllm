@@ -32,7 +32,7 @@ class Tunables:
     """What `base` asks of every backend uniformly."""
 
     # Where a collective stops being small: iris switches algorithms here (hip picks in
-    # C++, launch.cuh). CustomAllreduce's `max_size`, where vLLM stops using its
+    # C++, rocm_comms.cuh). CustomAllreduce's `max_size`, where vLLM stops using its
     # small-message collective; unmeasured for us.
     small_limit: int = 8 * 1024 * 1024
 

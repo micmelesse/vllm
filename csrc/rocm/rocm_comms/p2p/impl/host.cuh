@@ -12,7 +12,6 @@
 #error "include p2p/p2p.cuh, p2p's one interface, not its parts"
 #endif
 
-#include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -36,14 +35,14 @@
 
 namespace hip_comms::p2p::host {
 
-using Handle = hipIpcMemHandle_t;
+using IpcHandle = hipIpcMemHandle_t;
 
-inline Handle handle_from(const std::string& bytes) {
-  if (bytes.size() != sizeof(Handle))
+inline IpcHandle handle_from(const std::string& bytes) {
+  if (bytes.size() != sizeof(IpcHandle))
     throw std::runtime_error("hip_comms: ipc handle is " + std::to_string(bytes.size()) +
-                             " bytes, expected " + std::to_string(sizeof(Handle)));
-  Handle h;
-  std::memcpy(&h, bytes.data(), sizeof(Handle));
+                             " bytes, expected " + std::to_string(sizeof(IpcHandle)));
+  IpcHandle h;
+  std::memcpy(&h, bytes.data(), sizeof(IpcHandle));
   return h;
 }
 
@@ -54,9 +53,9 @@ inline std::pair<std::string, int64_t> handle_and_offset(uintptr_t ptr) {
   void* base = nullptr;
   HIP_CHECK(hipPointerGetAttribute(&base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
                                    reinterpret_cast<hipDeviceptr_t>(ptr)));
-  Handle h;
+  IpcHandle h;
   HIP_CHECK(hipIpcGetMemHandle(&h, base));
-  return {std::string(reinterpret_cast<const char*>(&h), sizeof(Handle)),
+  return {std::string(reinterpret_cast<const char*>(&h), sizeof(IpcHandle)),
           reinterpret_cast<char*>(ptr) - static_cast<char*>(base)};
 }
 
@@ -158,11 +157,11 @@ class Group {
     pending_slots_.clear();
   }
 
-  // What a launch over `input` passes to its kernel.
-  DevComm dev_comm(const torch::Tensor& input) {
-    DevComm p       = dev_comm();
-    p.inputs      = slot_for(input.data_ptr());
-    p.input_packs = input.numel() * input.element_size() / 16;
+  // What a launch over `input` (`bytes` long) on `stream` passes to its kernel.
+  DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream) {
+    DevComm p     = dev_comm();
+    p.inputs      = slot_for(const_cast<void*>(input), stream);
+    p.input_packs = bytes / 16;
     return p;
   }
 
@@ -180,9 +179,9 @@ class Group {
   }
 
  private:
-  PeerPtrs* slot_for(void* input) {
+  PeerPtrs* slot_for(void* input, hipStream_t stream) {
     hipStreamCaptureStatus status;
-    HIP_CHECK(hipStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &status));
+    HIP_CHECK(hipStreamIsCapturing(stream, &status));
     if (status == hipStreamCaptureStatusActive) {
       // A fresh slot ALWAYS, even for an address `registered_` already knows: a graph's
       // buffers are freed with the graph and the allocator hands the same address back.

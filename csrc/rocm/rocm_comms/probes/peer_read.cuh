@@ -3,7 +3,7 @@
 //
 // THE LINKS' ACHIEVABLE BANDWIDTH, as the p2p layer reads: every thread streams its share of a
 // peer's buffer (or every peer's at once) over p2p::read_input. A measurement, not a collective;
-// hardware.cuh's Calibration records its answer.
+// target/hardware.cuh's Calibration records its answer.
 
 #pragma once
 

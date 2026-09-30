@@ -2,8 +2,9 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Two-shot all-reduce (the reduce-scatter pulled, the all-gather pushed) then RMSNorm
-// (`all_reduce_pull_two_shot_rms_norm`), and all-reduce then add then RMSNorm (`all_reduce_pull_two_shot_add_rms_norm`): one body, a
-// kernel per op, so a trace names the op that ran.
+// (`all_reduce_pull_two_shot_rms_norm`), and all-reduce then add then RMSNorm
+// (`all_reduce_pull_two_shot_add_rms_norm`): one body, a kernel per op, so a trace names the op
+// that ran.
 
 #pragma once
 

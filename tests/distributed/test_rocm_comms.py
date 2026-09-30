@@ -1170,7 +1170,7 @@ def _communicator_param(
     )
 
 
-# CHOSEN, not gridded. FAST is what vLLM runs: hip with no forced launch (tune.cuh
+# CHOSEN, not gridded. FAST is what vLLM runs: hip with no forced launch (select
 # picks), captured the way vLLM captures, at Kimi-K3's widths in bf16; and each PULL
 # kernel forced at a small and a large shape, so both code paths run whatever tune
 # picks. FULL is the rest: the control and iris, every forced kernel and every mode on

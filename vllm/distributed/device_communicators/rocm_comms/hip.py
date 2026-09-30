@@ -5,7 +5,7 @@
 memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch geometry
-(`csrc/rocm/rocm_comms/launch.cuh`); a `Launch` passed with a call is the one way to
+(`csrc/rocm/rocm_comms/rocm_comms.cuh`); a `Launch` passed with a call is the one way to
 force one, for the sweep and the tests.
 
 TWO MEMORY PATHS, split by lifetime. A captured buffer is held by vLLM for the graph's

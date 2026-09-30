@@ -25,10 +25,10 @@
 //                              QuickReduce's integers (8, 4) under one fp32 scale; for the
 //                              quantized kernel that will use it
 //
-// p2p::host::                the host code (rocm_comms.cu)
+// p2p::host::                the host code (the ops, rocm_comms.cuh)
 //   Group                          the one lifetime object: maps the peers' memory,
-//                                  registers buffers, `dev_comm(input)` per launch
-//   Handle, handle_and_offset(ptr) a tensor's IPC handle
+//                                  registers buffers, `dev_comm(input, bytes, stream)` per launch
+//   IpcHandle, handle_and_offset(ptr)  a buffer's IPC handle
 // and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks.
 
 #pragma once

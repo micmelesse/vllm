@@ -32,7 +32,7 @@ DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const F
   return d;
 }
 
-// kGemmRows and kGemmChunk, the rows a pass and the K-chunk staged in LDS, are build.cuh's.
+// kGemmRows and kGemmChunk, the rows a pass and the K-chunk staged in LDS, are target/build.cuh's.
 // Its LDS: the staged chunk and a norm's block_reduce, plus one [kGemmRows][tile] float partial per
 // wave, tile = kWaveSize / lanes columns. The device decides how many waves that allows.
 constexpr int64_t kGemmLdsFixed =
@@ -47,7 +47,8 @@ constexpr int gemm_max_waves(int lanes_per_col) {
 constexpr int gemm_max_threads(int lanes_per_col) {
   return gemm_max_waves(lanes_per_col) * kWaveSize;
 }
-static_assert(gemm_max_waves(1) >= kMaxWaves, "the GEMM tail holds the widest block at every lane split");
+static_assert(gemm_max_waves(1) >= kMaxWaves,
+              "the GEMM tail holds the widest block at every lane split");
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
@@ -57,7 +58,7 @@ static_assert(gemm_max_waves(1) >= kMaxWaves, "the GEMM tail holds the widest bl
 // loop's row reads are LDS reads, not a global round trip per K-step.
 //
 // A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
-// kLanesPerCol lanes of a column (tuned in launch.cuh) and over the waves of the
+// kLanesPerCol lanes of a column (the build's gemm_lanes) and over the waves of the
 // block; shuffles and an LDS pass add the splits; blocks stride over tiles of
 // kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of

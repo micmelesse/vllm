@@ -3,8 +3,8 @@
 //
 // THE HARDWARE: each target's facts, as the device and AMD's docs report them, and what was
 // measured on it (`Calibration`). No decision lives here: build.cuh derives what a build is from
-// them, tune.cuh a launch from them and the input. A new target is one more `Hardware`; `kTarget`
-// is the one the host tunes for.
+// them, impl/select.cuh a launch from them and the input. A new target is one more `Hardware`;
+// `kTarget` is the one the host tunes for.
 
 #pragma once
 

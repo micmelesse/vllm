@@ -13,7 +13,7 @@ namespace hip_comms {
 
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
 // grid barrier; the GEMM over every row, kGemmRows a pass.
-// kLanesPerCol is the GEMM's lanes per column (tune.cuh).
+// kLanesPerCol is the GEMM's lanes per column (the build's gemm_lanes).
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     all_reduce_pull_one_shot_rms_norm_gemm_add(
