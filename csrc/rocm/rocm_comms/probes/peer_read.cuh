@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include "hardware.cuh"
-#include "p2p/p2p.cuh"
+#include "../hardware.cuh"
+#include "../p2p/p2p.cuh"
 
 namespace hip_comms {
 
