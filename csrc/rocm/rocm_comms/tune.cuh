@@ -61,13 +61,13 @@ constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0, 0}; }
 // ONE WAVE PER BLOCK. Waves in one block only add a barrier inside it: at 1 token one-shot took
 // 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and 10.9 at 512.
 //
-// PULL ONE-SHOT UP TO 128 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
-// whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. One-shot won at
-// 112 KiB (10.12 vs 10.67 us), two-shot at 224 KiB (10.96 vs 13.13); the lines cross near 135 KiB.
+// PULL ONE-SHOT UP TO 64 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
+// whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. With the
+// scratch uncached, one-shot won at 56 KiB (7.12 vs 7.83 us), two-shot at 112 KiB (7.87 vs 8.19).
 // To be derived from the link's latency and bandwidth once hardware.cuh carries them.
 // =================================================================================================
 
-constexpr int64_t kPullOneShotMaxBytes = 128 * kKiB;
+constexpr int64_t kPullOneShotMaxBytes = 64 * kKiB;
 
 // A GRID THE SIZE OF THE WORK, as aiter sizes its own: every block pays for every sync, so a block
 // with no pack to move is pure cost (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64).
