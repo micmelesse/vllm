@@ -113,11 +113,11 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 
 constexpr int64_t kFusedOneShotMaxBytes = 128 * kKiB;
 
-// THE NORMS CROSS AT THE ALL-REDUCE'S OWN POINT, kPullOneShotMaxBytes: the stamps put their
-// one-shot at 2.60 us of peer reads at 115 KB where the two-shot's reduce-scatter and gather took
-// 2.24 (2026-09-30T20-55-13Z).
+// THE NORMS STAY ONE-SHOT TO 128 KiB, past the all-reduce's 64: moved to 64, the fused norm lost at
+// 16 tokens (11.43 against 10.56 us, 2026-09-30T21-06-57Z); its two-shot's untuned 36-block grid
+// and middle barrier cost more than the one-shot's extra reads saved.
 constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in) {
-  return bytes(in) <= kPullOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
+  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
 }
 
 constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration&) {
