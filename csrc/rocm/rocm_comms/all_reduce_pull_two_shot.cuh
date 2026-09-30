@@ -1,62 +1,80 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Two-shot pull all-reduce: reduce-scatter, then all-gather. Modelled on aiter's
-// `cross_device_reduce_2stage`: sync, sum this rank's slice from every peer into its scratch,
-// sync, copy every rank's summed slice out of its scratch.
+// Two-shot pull all-reduce: reduce-scatter, then all-gather. aiter's `cross_device_reduce_2stage`
+// as written: sync, sum this rank's slice from every peer into its scratch, sync, copy every
+// rank's summed slice out of its scratch.
 
 #pragma once
 
 #include "p2p/p2p.cuh"
 #include "common/memory.cuh"
-#include "common/reduce.cuh"
 
 namespace hip_comms {
 
-// `num_packs` packs cut into one slice of `slice_packs` per rank (the last one short), a thread
-// a pack at a time over the whole grid. THE SAME THREAD INDEXES A PACK IN BOTH PHASES: after the
-// sync a block may read only what the same block on a peer wrote.
+// A BLOCK IS ONE WAVE PER PEER. `num_packs` packs cut into one slice of `slice_packs` per rank
+// (the last one short); a block's wave w works with peer (rank + w) % ngpus, and its lane l with
+// pack blockIdx.x x lanes + l of the slice (then every grid's worth after it). ROTATED, SO THE
+// RANKS SPREAD OVER THE LINKS: at any moment the eight GPUs read eight different peers, where in
+// rank order every GPU reads rank 0 first. The sum's order differs by rank, which is harmless:
+// each slice is summed by one rank, so every rank copies the same bytes.
+//
+// THE SAME BLOCK AND LANE INDEX A PACK IN BOTH PHASES: wave 0's lane l writes it, the peers' wave
+// w lane l of the same block read it, after that block's sync.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
   using V               = typename traits<T>::V;
+  constexpr int N       = traits<T>::N;
+  const int lanes       = blockDim.x / ngpus;  // host: blockDim is ngpus whole waves
+  const int wave        = threadIdx.x / lanes;
+  const int lane        = threadIdx.x % lanes;
+  const int peer        = (p.rank + wave) % ngpus;
   const int slice_packs = (num_packs + ngpus - 1) / ngpus;
-  const int first       = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride      = gridDim.x * blockDim.x;
+  const int first       = blockIdx.x * lanes + lane;
+  const int stride      = gridDim.x * lanes;
+  __shared__ V got[kMaxThreads];
 
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::simple::start_sync<ngpus>(p);
 
-  // 2. Reduce-scatter: this rank's slice, read from every rank in rank order and summed,
-  //    into this rank's scratch.
-  const V* in[ngpus];
+  // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
+  //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
+  //    lane's packs, so they leave the loop together and the barriers inside it match.
+  const V* theirs = p2p::simple::input<T>(p, peer);
+  V* sums         = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const int base  = p.rank * slice_packs;
+  const int mine  = min(slice_packs, num_packs - base);
+  for (int i = first; i < mine; i += stride) {
+    got[threadIdx.x] = load_global(theirs + base + i);
+    __syncthreads();
+    if (wave == 0) {
+      float acc[N];
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
-  const int base = p.rank * slice_packs;
-  const int mine = min(slice_packs, num_packs - base);
-  V* sums        = p2p::simple::scratch<T, ngpus>(p, p.rank);
-  for (int i = first; i < mine; i += stride)
-    store_global(sums + i, sum_packs<T, ngpus>(in, base + i));
+      for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(got[lane].d[j]);
+#pragma unroll
+      for (int w = 1; w < ngpus; ++w)
+#pragma unroll
+        for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(got[w * lanes + lane].d[j]);
+      V s;
+#pragma unroll
+      for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
+      store_global(sums + i, s);
+    }
+    __syncthreads();
+  }
 
   // 3. Every rank's sums are visible to its peers.
   p2p::simple::end_sync<ngpus, false>(p);
 
-  // 4. All-gather: every rank's slice out of its scratch, at its place in the output. The
-  //    next call's first sync keeps a rank from overwriting its scratch while it is read.
-  V* dst = reinterpret_cast<V*>(out);
-  for (int i = first; i < slice_packs; i += stride) {
-    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
-    // and the peers' scratch apart, so a store between two loads holds the next load back
-    // until the store is done, and the eight owners' round trips run one after another.
-    V got[ngpus] = {};
-#pragma unroll
-    for (int r = 0; r < ngpus; ++r)
-      if (r * slice_packs + i < num_packs)
-        got[r] = load_global(p2p::simple::scratch<T, ngpus>(p, r) + i);
-#pragma unroll
-    for (int r = 0; r < ngpus; ++r)
-      if (r * slice_packs + i < num_packs) store_global(dst + r * slice_packs + i, got[r]);
-  }
+  // 4. All-gather: wave w copies its peer's slice out of that peer's scratch, at its place in the
+  //    output. The next call's first sync keeps a rank from overwriting its scratch while it is
+  //    read.
+  const V* owned = p2p::simple::scratch<T, ngpus>(p, peer);
+  V* dst         = reinterpret_cast<V*>(out);
+  for (int i = first; i < slice_packs; i += stride)
+    if (peer * slice_packs + i < num_packs)
+      store_global(dst + peer * slice_packs + i, load_global(owned + i));
 }
 
 }  // namespace hip_comms

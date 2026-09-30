@@ -181,6 +181,10 @@ bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t ro
   const Launch l      = launch_for(req, op, input_of(group, req, rows, hidden, elem, cols));
   if (l.kernel == Kernel::none) return false;
   if (has_row_packs(l.kernel) && l.row_packs == 0) return false;
+  // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
+  if (l.kernel == Kernel::all_reduce_pull_two_shot &&
+      l.threads % (group.world_size() * kWaveSize) != 0)
+    return false;
   if (is_push(l.kernel) && op != Op::all_reduce && packs > p2p::kPushGroupPacks * l.threads)
     return false;
   if (op == Op::all_reduce_rms_norm_gemm_add &&
