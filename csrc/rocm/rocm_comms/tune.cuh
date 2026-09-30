@@ -93,9 +93,15 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
   const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   const int threads = one_shot ? hw.wave_size : hw.wave_size * in.world;
+  // AT LEAST THE LINK-FILLING GRID A PASS, AND EVERY PASS FULL: as many passes as keep each one
+  // filling the links, the work spread evenly over them. A cap alone left a near-empty last pass,
+  // a whole round trip for a sliver (3.7 MB at 88 blocks: 5.09 passes, 23.78 us, against 90 blocks
+  // in 5 full ones; the sweep's 80 was 22.99).
+  const int fill       = link_filling_blocks(hw, cal, threads);
+  const int64_t passes = need > fill ? need / fill : 1;
+  const int64_t even   = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int cap     = link_filling_blocks(hw, cal, threads);
-  const int blocks  = need < cap ? static_cast<int>(need) : cap;
+  const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
   return at(k, in, blocks, threads);
 }
 
