@@ -169,7 +169,7 @@ def _check_one_all_reduce_matches_replicated(
     """The boss's reorder: the norm's scale moved past the GEMM and one all-reduce of
     [shared | projected | latent] must give what the two all-reduces give, and leave
     the output reduced so its consumer does not reduce it again."""
-    os.environ["VLLM_KIMI_K3_MOE_TAIL"] = "one_all_reduce"
+    os.environ["VLLM_KIMI_K3_FUSION"] = "one_all_reduce"
     ROCmLatentMoERunner._fused_output_is_reduced = property(lambda _: False)
     transform = _build_transform(device)
     runner = _tail_runner(transform, tp_size)
@@ -247,24 +247,26 @@ def test_one_all_reduce_tail_tp8_matches_replicated_projection() -> None:
     _run_ranks("one_all_reduce_matches_replicated", 8)
 
 
-@pytest.mark.parametrize("tail", ["two_all_reduce", "one_all_reduce"])
+@pytest.mark.parametrize(
+    "fusion", ["none", "rms_norm", "one_all_reduce", "attn_res+one_all_reduce"]
+)
 @pytest.mark.parametrize("shardable", [True, False])
 @pytest.mark.parametrize("pre_reduced", [True, False])
 def test_output_is_reduced_only_for_the_one_all_reduce_tail(
-    tail: str,
+    fusion: str,
     shardable: bool,
     pre_reduced: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reduced output means the consumer skips its all-reduce: claimed wrongly, the
     layer's output is off by a factor of the TP size, or never summed."""
-    monkeypatch.setenv("VLLM_KIMI_K3_MOE_TAIL", tail)
+    monkeypatch.setenv("VLLM_KIMI_K3_FUSION", fusion)
     monkeypatch.setattr(
         ROCmLatentMoERunner, "_fused_output_is_reduced", property(lambda _: pre_reduced)
     )
     runner = _runner(_tail_shardable=shardable)
 
-    expected = tail == "one_all_reduce" and shardable and not pre_reduced
+    expected = "one_all_reduce" in fusion and shardable and not pre_reduced
     assert runner.output_is_reduced is expected
 
 

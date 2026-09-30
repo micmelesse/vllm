@@ -31,6 +31,12 @@ def _comm() -> Any | None:
     return None if comm is None or comm.disabled else comm
 
 
+def fused(name: str) -> bool:
+    """Whether `VLLM_KIMI_K3_FUSION` turns on this fusion: attn_res, rms_norm, gemm_add
+    or one_all_reduce. The comms ones also need the backend live (`_comm`)."""
+    return name in envs.VLLM_KIMI_K3_FUSION.split("+")
+
+
 def fusion_enabled() -> bool:
     """Whether a layer should leave its outputs unreduced for `attn_res` to reduce:
     the backend live and no pipeline split, whose stage boundary needs the sum."""
@@ -60,7 +66,11 @@ def attn_res(
     out_eps = 0.0 if output_norm is None else output_norm.variance_epsilon
     if reduce_delta and delta is not None:
         comm = _comm()
-        if comm is not None and comm.should_allreduce_add_attn_res_rms_norm(delta):
+        if (
+            comm is not None
+            and fused("attn_res")
+            and comm.should_allreduce_add_attn_res_rms_norm(delta)
+        ):
             return comm.all_reduce_add_attn_res_rms_norm(
                 delta,
                 prefix_sum,
@@ -100,6 +110,7 @@ def latent_tail(
     comm = _comm()
     if (
         comm is not None
+        and fused("gemm_add")
         and norm is not None
         and norm.weight.dtype == fused_output.dtype
         and comm.should_allreduce_rms_norm_gemm_add(fused_output, up_proj_shard)
@@ -115,6 +126,7 @@ def latent_tail(
         return
     if (
         comm is not None
+        and fused("rms_norm")
         and norm is not None
         and comm.should_allreduce_rms_norm(fused_output)
     ):
@@ -134,7 +146,7 @@ def latent_tail(
 def moe_tail_one_all_reduce() -> bool:
     """Whether the latent-MoE tail runs as one all-reduce (`latent_tail_one_all_reduce`)
     rather than two (`latent_tail`, then the output's)."""
-    return envs.VLLM_KIMI_K3_MOE_TAIL == "one_all_reduce"
+    return fused("one_all_reduce")
 
 
 def latent_tail_one_all_reduce(
