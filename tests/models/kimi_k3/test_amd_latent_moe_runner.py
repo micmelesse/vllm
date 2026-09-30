@@ -68,6 +68,7 @@ def _tail_runner(
     attrs = {
         "routed_output_transform": transform,
         "_up_proj_shard_size": HIDDEN_SIZE // tp_size,
+        "_tail_shardable": True,
         "_logged_sharded_tail": False,
         "moe_config": SimpleNamespace(
             tp_size=tp_size,
@@ -172,7 +173,6 @@ def _check_one_all_reduce_matches_replicated(
     ROCmLatentMoERunner._fused_output_is_reduced = property(lambda _: False)
     transform = _build_transform(device)
     runner = _tail_runner(transform, tp_size)
-    object.__setattr__(runner, "_tail_shardable", True)
     group = get_tp_group().device_group
     assert runner.output_is_reduced
 

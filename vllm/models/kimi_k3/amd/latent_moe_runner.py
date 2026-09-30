@@ -66,9 +66,9 @@ class ROCmLatentMoERunner(MoERunner):
         again. A property: the MoE kernel `_fused_output_is_reduced` asks is set up
         after construction."""
         return (
-            self._tail_shardable
+            moe_tail_one_all_reduce()
+            and self._tail_shardable
             and not self._fused_output_is_reduced
-            and moe_tail_one_all_reduce()
         )
 
     def _shard_up_proj_tail(
