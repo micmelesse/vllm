@@ -14,7 +14,8 @@
 //   read_scratch(peer, i)          pack i of what it left in its scratch
 //   write_scratch(self, i, v)      pack i of this rank's scratch, for its peers to read
 //   barrier<ngpus, Among, Ensure>(p)   Among::peers (this block and the same block on every
-//                                  rank) or Among::grid (every block of this rank); Ensure::
+//                                  rank), Among::grid (every block of this rank) or Among::world
+//                                  (every block of every rank); Ensure::
 //                                  launched (every peer's input is ready), visible (what was
 //                                  written before is seen after), read (every peer is done
 //                                  reading this rank)

@@ -111,10 +111,14 @@ constexpr int row_packs_for(Op op, int64_t packs, int threads) {
 // A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot all
 // of them, a two-shot its rank's slice. An idle block still pays every barrier (each pairs with its
 // twin on every peer): the norms' two-shot at 32 tokens ran 36 blocks for 4 rows a rank. The GEMM
-// tail's GEMM strides over column tiles, and the plain all-reduce over packs, so both keep theirs.
+// tail's GEMM strides over column tiles, the plain all-reduce over packs, and the norms' two-shot
+// gather over the slice's packs behind a world barrier, so they keep theirs.
 constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
-  if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
+  const bool strides = op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add ||
+                       k == Kernel::all_reduce_pull_two_shot_rms_norm ||
+                       k == Kernel::all_reduce_pull_two_shot_add_rms_norm;
+  if (strides) return blocks;
   const int64_t mine = is_two_shot(k) ? (rows + world - 1) / world : rows;
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }

@@ -16,8 +16,8 @@ namespace hip_comms {
 // its rows, (kAdd: adds the replicated residual,) norms them and leaves the out rows and
 // (kAdd) the residual rows in its scratch, row-major; after the sync every rank copies every
 // owner's rows out. Every output element is computed by one rank, so every rank holds the same
-// bytes. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read
-// only what the same block on a peer wrote.
+// bytes. A ROW A BLOCK in the first phase (its norm is a block reduction), THE WHOLE GRID in the
+// second: the sync is a world barrier, so a block may read what any block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
@@ -88,31 +88,32 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   }
 
   block_stamp(4);
-  // 3. Every rank's rows are visible to its peers.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  // 3. Every rank's rows are visible to its peers, to every block of theirs.
+  p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
   block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
-  //    first sync keeps a rank from overwriting its scratch while it is read. EVERY OWNER'S PACK
-  //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
-  //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
-  //    load under an `if`, made the eight owners' round trips run one after another.
-  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-      const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus], got_res[ngpus];
+  //    first sync keeps a rank from overwriting its scratch while it is read (a peer's next
+  //    kernel starts only once this one has finished). The grid strides over the slice's packs.
+  //    EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's
+  //    scratch holds slice_rows rows, so a slot past the last row is real): a store between two
+  //    loads, or a load under an `if`, made the eight owners' round trips run one after another.
+  const int64_t slice = int64_t{slice_rows} * packs;
+  for (int64_t at = int64_t{blockIdx.x} * blockDim.x + threadIdx.x; at < slice;
+       at += int64_t{gridDim.x} * blockDim.x) {
+    V got[ngpus], got_res[ngpus];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        got[r] = p2p::read_scratch(peers[r], at);
-        if constexpr (kAdd) got_res[r] = p2p::read_scratch(peers[r], res_at + at);
-      }
+    for (int r = 0; r < ngpus; ++r) {
+      got[r] = p2p::read_scratch(peers[r], at);
+      if constexpr (kAdd) got_res[r] = p2p::read_scratch(peers[r], res_at + at);
+    }
+    const int64_t l = at / packs, i = at - l * packs;
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        const int row = r * slice_rows + l;
-        if (row >= rows) continue;
-        thread_store(o + int64_t{row} * packs + i, got[r]);
-        if constexpr (kAdd) thread_store(res_out + int64_t{row} * packs + i, got_res[r]);
-      }
+    for (int r = 0; r < ngpus; ++r) {
+      const int64_t row = r * slice_rows + l;
+      if (row >= rows) continue;
+      thread_store(o + row * packs + i, got[r]);
+      if constexpr (kAdd) thread_store(res_out + row * packs + i, got_res[r]);
     }
   }
   block_stamp(6);

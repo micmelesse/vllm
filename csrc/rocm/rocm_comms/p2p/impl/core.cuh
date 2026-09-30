@@ -258,22 +258,23 @@ DINLINE void write_scratch(const Self<T, ngpus>& self, int64_t i,
   thread_store(self.scratch_ + i, v);
 }
 
-// WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this
-// rank.
-enum class Among { peers, grid };
+// WHO A BARRIER WAITS FOR: this block and the same block on every rank, every block of this rank,
+// or every block of every rank.
+enum class Among { peers, grid, world };
 // WHAT HOLDS ONCE IT IS PASSED: every peer has launched (so its input is ready to read); what this
 // side wrote before is visible to the other side after; every peer is done reading this rank (so
-// its buffers may be reused). Among the grid, only `visible` means anything.
+// its buffers may be reused). Among the grid or the world, only `visible` means anything.
 enum class Ensure { launched, visible, read };
 
 // A read after a peers barrier may see only what the SAME BLOCK on the peer wrote before it, so
-// both sides must index the same data by the same block.
+// both sides must index the same data by the same block; after a world barrier, what ANY block on
+// the peer wrote, for the grid's arrival and one exchange by its last block.
 template <int ngpus, Among kAmong, Ensure kEnsure>
 DINLINE void barrier(const DevComm& p) {
   static_assert(kAmong == Among::peers || kEnsure == Ensure::visible,
-                "a grid barrier only makes this rank's writes visible to its other blocks");
-  if constexpr (kAmong == Among::grid) {
-    impl::barrier<ngpus, false>(p);
+                "a grid or world barrier only makes writes visible");
+  if constexpr (kAmong != Among::peers) {
+    impl::barrier<ngpus, kAmong == Among::world>(p);
   } else {
     impl::skew(p);
     impl::pair_blocks<ngpus, kEnsure == Ensure::visible>(p, kEnsure == Ensure::launched);
