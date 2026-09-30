@@ -113,23 +113,23 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 
 constexpr int64_t kFusedOneShotMaxBytes = 128 * kKiB;
 
-// THE NORMS FUSE ONLY IN THE ONE-SHOT RANGE (up to kFusedOneShotMaxBytes), where the fused kernel
-// beats the unfused path: 7.46 against 10.00 us at 1 token, 9.95 against 10.34 at 16
-// (2026-09-30T21-30-15Z). PAST IT THEY DECLINE, so the caller runs our all-reduce then its own
-// norm, which ties or beats the baseline at every size there (32 tokens 10.72 against 10.57, 128
-// 13.58 against 14.34, 1024 45.39 against 46.46, 4096 149.52 against 148.92), where the row-per-
-// block fused two-shot lost: at 36 blocks by up to 5.5 us, at 88 by up to 20 (2026-09-30T21-25-10Z,
-// 2026-09-30T21-30-15Z). It stays built and tested, forced only, until it is faster.
-constexpr Launch fused_norm(Kernel one_shot, Input in) {
-  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : declined();
+// THE NORMS ALWAYS RUN FUSED, one-shot up to kFusedOneShotMaxBytes and two-shot past it: a fusion
+// flag means the fused op runs, and tuning picks among fused kernels, never the unfused path. The
+// one-shot wins (7.46 against 10.00 us at 1 token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z);
+// the two-shot still loses, at 32-64 tokens by 0.2-0.6 us and at prefill by up to 5.5 at its 36
+// blocks (88 lost more: 169.3 against 148.9 at 4096), so it is the one being worked on.
+constexpr Launch fused_norm(Kernel one_shot, Kernel two_shot, Input in) {
+  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
 }
 
 constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration&) {
-  return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm, in);
+  return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
+                    Kernel::all_reduce_pull_two_shot_rms_norm, in);
 }
 
 constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration&) {
-  return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm, in);
+  return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
+                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
 }
 
 // A BLOCK A ROW, AND NO MORE BLOCKS THAN ROWS: a block does whole rows, and an idle one still pays
