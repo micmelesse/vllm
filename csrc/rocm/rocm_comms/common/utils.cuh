@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-#include "../build.cuh"
+#include "../target/build.cuh"
 
 #define DINLINE __device__ __forceinline__
 

@@ -11,10 +11,10 @@
 
 #include <cstdint>
 
-#include "common/common.cuh"
-#include "hardware.cuh"
-#include "launch.cuh"
-#include "p2p/p2p.cuh"
+#include "../common/common.cuh"
+#include "../target/hardware.cuh"
+#include "kernels.cuh"
+#include "../p2p/p2p.cuh"
 
 namespace hip_comms {
 

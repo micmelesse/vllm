@@ -15,7 +15,7 @@
 #include <cstdint>
 
 #include "../../common/common.cuh"
-#include "../../hardware.cuh"
+#include "../../target/hardware.cuh"
 
 namespace hip_comms::p2p {
 

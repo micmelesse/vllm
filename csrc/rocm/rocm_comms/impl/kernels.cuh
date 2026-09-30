@@ -10,8 +10,8 @@
 #include <climits>
 #include <cstdint>
 
-#include "common/common.cuh"
-#include "build.cuh"
+#include "../common/common.cuh"
+#include "../target/build.cuh"
 
 namespace hip_comms {
 

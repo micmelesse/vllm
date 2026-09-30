@@ -37,19 +37,19 @@
 #include <utility>
 #include <vector>
 
-#include "rocm_comms/all_reduce_pull_one_shot.cuh"
-#include "rocm_comms/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/all_reduce_pull_one_shot_add_rms_norm.cuh"
-#include "rocm_comms/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
-#include "rocm_comms/all_reduce_pull_two_shot.cuh"
-#include "rocm_comms/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/all_reduce_pull_two_shot_add_rms_norm.cuh"
-#include "rocm_comms/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_one_shot.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_two_shot.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
+#include "rocm_comms/kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
 #include "rocm_comms/probes/peer_read.cuh"
 #include "rocm_comms/probes/ping_pong.cuh"
-#include "rocm_comms/launch.cuh"
-#include "rocm_comms/tune.cuh"
+#include "rocm_comms/impl/kernels.cuh"
+#include "rocm_comms/impl/select.cuh"
 
 namespace hip_comms {
 

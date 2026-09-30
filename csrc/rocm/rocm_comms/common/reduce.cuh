@@ -14,7 +14,7 @@
 
 #include <cmath>
 
-#include "../build.cuh"
+#include "../target/build.cuh"
 #include "memory.cuh"
 #include "utils.cuh"
 
