@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// HOW A PACK IS LOADED AND STORED, each pair with who can see a store and when: the global
-// pair for this GPU's memory and a peer's read after a sync, the uncached pair for what a rank
-// writes into a peer and the peer reads back (no kernel does today; a remote write must). A store is only as visible as its pair
-// says; the loads are the stores' readers.
+// THE READS AND WRITES: how a pack is loaded and stored, each pair with who can see a store and
+// when (the global pair for this GPU's memory and a peer's read after a sync, the uncached pair for
+// what a rank writes into a peer and the peer reads back: no kernel does today, a remote write
+// must), and a Fragment's load and store.
 
 #pragma once
 
-#include "pack.cuh"
+#include "utils.cuh"
 
 namespace hip_comms {
 
@@ -64,6 +64,22 @@ DINLINE void store_uncached(V* p, const V& v) {
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
+}
+
+// A FRAGMENT'S LOAD AND STORE: every load issued (a pack past the row reads the last one; any
+// element type, an fp32 weight's pack is 32 bytes), and a store only of the packs inside the row
+// (stores do not hold up loads, so the guard costs nothing).
+template <int K, typename V>
+DINLINE void load(const V* row, const Fragment<K>& f, V (&out)[K]) {
+#pragma unroll
+  for (int k = 0; k < K; ++k) out[k] = row[f.at[k]];
+}
+
+template <int K, typename V>
+DINLINE void store(V* row, const Fragment<K>& f, const V (&v)[K]) {
+#pragma unroll
+  for (int k = 0; k < K; ++k)
+    if (f.in[k] != 0.0f) row[f.at[k]] = v[k];
 }
 
 }  // namespace hip_comms

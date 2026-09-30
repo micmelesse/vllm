@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// THE DOTS, by scope: a thread's share of a row's dot (a block_reduce finishes it), and the grid's
+// skinny GEMM, every block striding over tiles of output columns, with the LDS contract it keeps
+// (which a kernel's launch bounds and admit check read).
+
+#pragma once
+
+#include "../hardware.cuh"
+#include "reduce.cuh"
+#include "utils.cuh"
+
+namespace hip_comms {
+
+// This thread's share of dot(a, b) over the row, packs past its end counting zero: the partial a
+// block_reduce turns into the row's dot (a sum of squares is thread_dot(x, x)).
+template <int K, int N>
+DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const Fragment<K>& f) {
+  float d = 0.0f;
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    float dk = 0.0f;
+#pragma unroll
+    for (int j = 0; j < N; ++j) dk += a[k][j] * b[k][j];
+    d += f.in[k] * dk;
+  }
+  return d;
+}
+
+// The most rows one GEMM pass takes: a lane holds one output column's sum for each of them.
+constexpr int kGemmRows = 16;
+// The K-chunk of x staged in LDS at a time, in packs. With 160 KiB of LDS all of Kimi-K3's latent K
+// (448 packs, 112 KiB) goes in at once: one staging pass and one barrier pair per tile. With 64
+// KiB, 96 packs (24 KiB).
+constexpr int kGemmChunk = kDevice.lds_bytes >= 160 * kKiB ? 448 : 96;
+// Its LDS: the staged chunk and a norm's block_reduce, plus one [kGemmRows][tile] float partial per
+// wave, tile = kWaveSize / lanes columns. The device decides how many waves that allows.
+constexpr int64_t kGemmLdsFixed =
+    int64_t{kGemmRows} * kGemmChunk * kPackBytes + block_reduce_lds_bytes(1);
+constexpr int64_t gemm_lds_per_wave(int lanes_per_col) {
+  return int64_t{kGemmRows} * (kWaveSize / lanes_per_col) * sizeof(float);
+}
+constexpr int gemm_max_waves(int lanes_per_col) {
+  const int fit = lds_max_waves(kDevice, kGemmLdsFixed, gemm_lds_per_wave(lanes_per_col));
+  return fit < kMaxWaves ? fit : kMaxWaves;
+}
+constexpr int gemm_max_threads(int lanes_per_col) {
+  return gemm_max_waves(lanes_per_col) * kWaveSize;
+}
+static_assert(gemm_max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
+
+// out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
+// rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
+// wherever it lives.
+//
+// x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
+// loop's row reads are LDS reads, not a global round trip per K-step.
+//
+// A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
+// kLanesPerCol lanes of a column (tuned in launch.cuh) and over the waves of the
+// block; shuffles and an LDS pass add the splits; blocks stride over tiles of
+// kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
+// The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
+// the last bits, not bitwise.
+template <int kLanesPerCol, typename T, typename Row>
+DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
+                  T* __restrict__ out, int64_t out_stride, int out_col0) {
+  using V          = typename traits<T>::V;
+  constexpr int NL = traits<T>::N;
+  constexpr int kTile = kWaveSize / kLanesPerCol;
+  static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
+  __shared__ float partial[gemm_max_waves(kLanesPerCol)][kGemmRows][kTile];
+  __shared__ V xs[kGemmRows][kGemmChunk];
+  const int lane   = threadIdx.x % kWaveSize;
+  const int wave   = threadIdx.x / kWaveSize;
+  const int waves  = blockDim.x / kWaveSize;
+  const int column = lane % kTile;
+  const int splits = waves * kLanesPerCol;
+  const int split  = wave * kLanesPerCol + lane / kTile;
+  const V* wv      = reinterpret_cast<const V*>(gemm_w);
+  const int tiles  = (n_cols + kTile - 1) / kTile;
+  for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+    const int n   = tile * kTile + column;
+    const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
+    float acc[kGemmRows];
+#pragma unroll
+    for (int r = 0; r < kGemmRows; ++r) acc[r] = 0.0f;
+    for (int k0 = 0; k0 < packs; k0 += kGemmChunk) {
+      const int chunk = min(kGemmChunk, packs - k0);
+      // Rows past `rows` are never staged; their sums read stale LDS and are never stored.
+      for (int i = threadIdx.x; i < rows * chunk; i += blockDim.x)
+        xs[i / chunk][i % chunk] = row(i / chunk)[k0 + i % chunk];
+      __syncthreads();
+      for (int k = split; k < chunk; k += splits) {
+        const V wx = wrow[k0 + k];
+        float w[NL];
+#pragma unroll
+        for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
+#pragma unroll
+        for (int r = 0; r < kGemmRows; ++r) {
+          const V xr = xs[r][k];
+#pragma unroll
+          for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
+        }
+      }
+      // Before the next chunk overwrites `xs`.
+      __syncthreads();
+    }
+    // A column's lanes are kTile apart in the wave.
+#pragma unroll
+    for (int r = 0; r < kGemmRows; ++r)
+#pragma unroll
+      for (int s = kTile; s < kWaveSize; s <<= 1)
+        acc[r] += __shfl_xor(acc[r], s, kWaveSize);
+    if (lane < kTile) {
+#pragma unroll
+      for (int r = 0; r < kGemmRows; ++r) partial[wave][r][column] = acc[r];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < kGemmRows * kTile; i += blockDim.x) {
+      const int r   = i / kTile;
+      const int col = tile * kTile + i % kTile;
+      if (r < rows && col < n_cols) {
+        float v = 0.0f;
+        for (int q = 0; q < waves; ++q) v += partial[q][r][i % kTile];
+        T* at = out + r * out_stride + out_col0 + col;
+        *at   = static_cast<T>(static_cast<float>(*at) + v);
+      }
+    }
+    // Before the next tile overwrites `partial`.
+    __syncthreads();
+  }
+}
+
+}  // namespace hip_comms

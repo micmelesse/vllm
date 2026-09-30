@@ -8,9 +8,11 @@
 #pragma once
 
 #include "p2p/p2p.cuh"
+#include "common/utils.cuh"
 #include "common/memory.cuh"
+#include "common/dot.cuh"
+#include "common/elementwise.cuh"
 #include "common/reduce.cuh"
-#include "common/row.cuh"
 
 namespace hip_comms {
 
@@ -35,7 +37,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
-  const auto sh          = share<kRowPacks>(packs);
+  const auto f           = fragment<kRowPacks>(packs);
 
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
@@ -55,37 +57,33 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
     V sum[kRowPacks];
-    sum_row<T, ngpus>(read, row, packs, sh, sum);
+    peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    // The norm, rounding as the reference does (see the one-shot kernel):
     float s[kRowPacks][NL];
-    V res[kRowPacks];
-    if constexpr (kAdd) load(res_in + base, sh, res);
-    float ss[1] = {0.0f};
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       unpack<T>(sum[k], s[k]);
       if constexpr (kAdd) {
+        float r[NL];
+        unpack<T>(res_in[base + f.at[k]], r);
 #pragma unroll
-        for (int j = 0; j < NL; ++j) s[k][j] += static_cast<float>(res[k].d[j]);
-        res[k] = round_pack<T>(s[k]);
+        for (int j = 0; j < NL; ++j) s[k][j] += r[j];
+        if (f.in[k] != 0.0f) p2p::write_scratch(self, res_at + at + f.at[k], round_pack<T>(s[k]));
       }
-#pragma unroll
-      for (int j = 0; j < NL; ++j) ss[0] += sh.in[k] * s[k][j] * s[k][j];
     }
-    block_sum(ss);
+    float ss[1] = {thread_dot(s, s, f)};
+    block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
-    vec<W, NL> w[kRowPacks];
-    load(wv, sh, w);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
+      const vec<W, NL> w = wv[f.at[k]];
       V normed;
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
+        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
       }
-      if (sh.in[k] == 0.0f) continue;
-      p2p::write_scratch(self, at + sh.at[k], normed);
-      if constexpr (kAdd) p2p::write_scratch(self, res_at + at + sh.at[k], res[k]);
+      if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], normed);
     }
   }
 

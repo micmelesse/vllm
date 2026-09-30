@@ -10,8 +10,8 @@
 #include <climits>
 #include <cstdint>
 
-#include "common/pack.cuh"
-#include "common/reduce.cuh"
+#include "common/dot.cuh"
+#include "common/utils.cuh"
 #include "hardware.cuh"
 
 namespace hip_comms {
@@ -46,30 +46,8 @@ enum class Kernel : int {
 // THE MOST SOURCES AN AttnRes ROW MIXES: the stored blocks and the prefix (Kimi-K3: up to 9 + 1).
 constexpr int kAttnResMaxSources = 10;
 
-// THE GEMM TAIL'S GEOMETRY, which its kernels, its admit check and its launch bounds all read.
-// The most rows one GEMM pass takes (a lane holds one output column's sum for each), and the
-// one-shot kernel takes one pass.
-constexpr int kGemmRows            = 16;
+// The GEMM tail's one-shot kernel takes one GEMM pass (common/gemm.cuh): at most this many rows.
 constexpr int kGemmTailOneShotRows = kGemmRows;
-// The K-chunk of x staged in LDS at a time, in packs. With 160 KiB of LDS all of Kimi-K3's latent K
-// (448 packs, 112 KiB) goes in at once: one staging pass and one barrier pair per tile. With 64
-// KiB, 96 packs (24 KiB).
-constexpr int kGemmChunk = kDevice.lds_bytes >= 160 * kKiB ? 448 : 96;
-// Its LDS: the staged chunk and the norm's block sum, plus one [kGemmRows][tile] float partial per
-// wave, tile = kWaveSize / lanes columns. The device decides how many waves that allows.
-constexpr int64_t kGemmLdsFixed =
-    int64_t{kGemmRows} * kGemmChunk * kPackBytes + block_sum_lds_bytes(1);
-constexpr int64_t gemm_lds_per_wave(int lanes_per_col) {
-  return int64_t{kGemmRows} * (kWaveSize / lanes_per_col) * sizeof(float);
-}
-constexpr int gemm_max_waves(int lanes_per_col) {
-  const int fit = lds_max_waves(kDevice, kGemmLdsFixed, gemm_lds_per_wave(lanes_per_col));
-  return fit < kMaxWaves ? fit : kMaxWaves;
-}
-constexpr int gemm_max_threads(int lanes_per_col) {
-  return gemm_max_waves(lanes_per_col) * kWaveSize;
-}
-static_assert(gemm_max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
 
 // What each kernel is, in Kernel's order.
 struct KernelInfo {
