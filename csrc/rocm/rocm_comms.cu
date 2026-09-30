@@ -641,6 +641,21 @@ double rocm_comms_peer_read(fptr_t comms, int64_t peer, int64_t bytes, int64_t i
   return static_cast<double>(bytes) * read * iters / (ms * 1e-3) / 1e9;
 }
 
+// THE PER-PHASE STAMPS SINCE THE LAST READ, [block][phase] device clock ticks (100 MHz), zero where
+// no block stamped, then zeroed. Only a HIP_COMMS_STAMPS build writes them (block_stamp).
+torch::Tensor rocm_comms_stamps() {
+  auto out = torch::zeros({hip_comms::kStampBlocks, hip_comms::kStampPhases},
+                          torch::TensorOptions().dtype(torch::kInt64));
+  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipMemcpyFromSymbol(out.data_ptr<int64_t>(), HIP_SYMBOL(hip_comms::g_stamps),
+                                sizeof(hip_comms::g_stamps)));
+  // Zeroed after reading, so the next launch's table holds only its own blocks.
+  void* table = nullptr;
+  HIP_CHECK(hipGetSymbolAddress(&table, HIP_SYMBOL(hip_comms::g_stamps)));
+  HIP_CHECK(hipMemset(table, 0, sizeof(hip_comms::g_stamps)));
+  return out;
+}
+
 // NANOSECONDS PER ROUND TRIP to `peer`, over `iters`: both ranks of the pair call it together.
 double rocm_comms_ping_pong(fptr_t comms, int64_t peer, int64_t iters) {
   auto& group = comms_of(comms);

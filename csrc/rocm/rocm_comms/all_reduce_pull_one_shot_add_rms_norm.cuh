@@ -33,7 +33,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto peers = p2p::peers<T, ngpus>(p);
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (kAdd) add
@@ -46,6 +48,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
     peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    block_stamp(2);
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
@@ -60,6 +63,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     }
     float ss[1] = {thread_dot(s, s, f)};
     block_reduce<Sum>(ss);
+    block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
@@ -74,8 +78,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     }
   }
 
+  block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  block_stamp(5);
 }
 
 // THE KERNELS, one per op, both the body above.

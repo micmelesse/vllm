@@ -14,6 +14,8 @@
 
 #include <cstdint>
 
+#include "../hardware.cuh"
+
 #define DINLINE __device__ __forceinline__
 
 namespace hip_comms {
@@ -57,6 +59,24 @@ DINLINE Fragment<K> fragment(int len) {
     f.in[k]     = i < len ? 1.0f : 0.0f;
   }
   return f;
+}
+
+// PER-PHASE TIMESTAMPS, for finding where a kernel's time goes: thread 0 of each block records the
+// device clock (100 MHz) at a phase boundary, after the block's threads have all reached it, into a
+// device-global [block][phase] table the host reads back (rocm_comms_stamps). Built only with
+// HIP_COMMS_STAMPS, since the barrier it adds would perturb a production kernel.
+#ifndef HIP_COMMS_STAMPS
+#define HIP_COMMS_STAMPS 0
+#endif
+constexpr int kStampBlocks = kMaxComputeUnits;
+constexpr int kStampPhases = 8;
+__device__ uint64_t g_stamps[kStampBlocks][kStampPhases];
+
+DINLINE void block_stamp(int phase) {
+  if constexpr (HIP_COMMS_STAMPS) {
+    __syncthreads();
+    if (threadIdx.x == 0 && blockIdx.x < kStampBlocks) g_stamps[blockIdx.x][phase] = wall_clock64();
+  }
 }
 
 }  // namespace hip_comms

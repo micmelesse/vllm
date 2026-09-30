@@ -63,6 +63,7 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s);
 torch::Tensor rocm_comms_staging(fptr_t comms);
 double rocm_comms_ping_pong(fptr_t comms, int64_t peer, int64_t iters);
+torch::Tensor rocm_comms_stamps();
 double rocm_comms_peer_read(fptr_t comms, int64_t peer, int64_t bytes, int64_t iters);
 
 

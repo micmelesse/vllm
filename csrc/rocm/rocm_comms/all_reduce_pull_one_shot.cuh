@@ -19,16 +19,20 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto peers = p2p::peers<T, ngpus>(p);
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Read every rank's input, in rank order, and sum.
   V* dst = reinterpret_cast<V*>(out);
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_packs; i += gridDim.x * blockDim.x)
     thread_store(dst + i, peers_reduce<T, ngpus>(read, i));
+  block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  block_stamp(5);
 }
 
 }  // namespace hip_comms
