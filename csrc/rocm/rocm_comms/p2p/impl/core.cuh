@@ -201,9 +201,11 @@ class Peer {
 
  public:
   DINLINE Peer() = default;
+  // `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane,
+  // the compiler knows it, and the pointer loads are scalar rather than one per lane.
   DINLINE Peer(const Peers& p, int r)
-      : in_(impl::input_of<T, ngpus>(p, r)),
-        scratch_(impl::scratch_of<T, ngpus>(p, r)) {}
+      : in_(impl::input_of<T, ngpus>(p, __builtin_amdgcn_readfirstlane(r))),
+        scratch_(impl::scratch_of<T, ngpus>(p, __builtin_amdgcn_readfirstlane(r))) {}
 
   template <typename U, int n>
   friend DINLINE typename traits<U>::V read_input(const Peer<U, n>& peer, int64_t i);
