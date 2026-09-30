@@ -44,7 +44,10 @@ class ROCmLatentMoERunnerFused(ROCmLatentMoERunner):
         if not isinstance(norm, RMSNorm):
             raise RuntimeError(f"the fused latent tail needs an RMSNorm: {norm!r}")
         # The op raises, naming why, for an input it cannot run.
-        return comm.all_reduce_rms_norm(fused_output, norm.weight, norm.variance_epsilon)
+        return comm.all_reduce_rms_norm(
+            fused_output, norm.weight, norm.variance_epsilon
+        )
+
 
 class KimiDecoderLayerFused(KimiDecoderLayer):
     latent_runner_cls = ROCmLatentMoERunnerFused

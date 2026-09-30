@@ -96,7 +96,8 @@ struct Calibration {
 };
 
 // gfx950 on n11: dev run 2026-09-30T19-02-08Z, 28 pairs from 1274 to 1383 ns; a repeat
-// (2026-09-30T19-13-36Z) gave a 1282 median, 1049-1387, so about 5% run to run. MI300X has none yet.
+// (2026-09-30T19-13-36Z) gave a 1282 median, 1049-1387, so about 5% run to run. MI300X has
+// none yet.
 constexpr Calibration kGfx950Calibration = {
     1334.0,  // ping_pong_ns
 };
