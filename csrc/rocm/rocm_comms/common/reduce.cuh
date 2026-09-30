@@ -64,18 +64,42 @@ struct Max {
   static constexpr float kIdentity = -INFINITY;
 };
 
-// N VALUES OVER THE WAVE, in place, every lane left holding the results (butterfly shuffles).
+// ONE DPP STEP: `v` from the lane `ctrl` names, as a VALU operand, no LDS. `row_mask` picks which
+// 16-lane rows take it; the others read `identity`, which leaves them as they were.
+template <int kCtrl, int kRowMask, typename Op>
+DINLINE float dpp(float v) {
+  const int moved = __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, Op::kIdentity),
+                                                __builtin_bit_cast(int, v), kCtrl, kRowMask, 0xf,
+                                                false);
+  return __builtin_bit_cast(float, moved);
+}
+
+// N VALUES OVER THE WAVE, in place, every lane left holding the results. DPP, as rocPRIM's and
+// Composable Kernel's wave reductions do: each step is a VALU operand from another lane. The
+// butterfly __shfl_xor it replaced compiled to ds_bpermute, an LDS round trip a step, six of them
+// waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for one block_reduce).
+//   swap neighbours, swap pairs (quad_perm [1,0,3,2], [2,3,0,1]): each quad holds its sum
+//   mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror): each row holds its sum
+//   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
+//   holds the wave's, and readlane hands it to every lane.
 template <typename Op, int N>
 DINLINE void wave_reduce(float (&v)[N]) {
+  static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
 #pragma unroll
-  for (int n = 0; n < N; ++n)
-#pragma unroll
-    for (int off = kWaveSize / 2; off > 0; off >>= 1)
-      v[n] = Op::apply(v[n], __shfl_xor(v[n], off, kWaveSize));
+  for (int n = 0; n < N; ++n) {
+    float x = v[n];
+    x = Op::apply(x, dpp<0xb1, 0xf, Op>(x));   // quad_perm [1,0,3,2]
+    x = Op::apply(x, dpp<0x4e, 0xf, Op>(x));   // quad_perm [2,3,0,1]
+    x = Op::apply(x, dpp<0x141, 0xf, Op>(x));  // row_half_mirror
+    x = Op::apply(x, dpp<0x140, 0xf, Op>(x));  // row_mirror
+    x = Op::apply(x, dpp<0x142, 0xa, Op>(x));  // row_bcast15 into rows 1, 3
+    x = Op::apply(x, dpp<0x143, 0xc, Op>(x));  // row_bcast31 into rows 2, 3
+    v[n] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), 63));
+  }
 }
 
 // N VALUES OVER THE BLOCK, in place: each wave reduces its N, one wave combines the waves' partials
-// with shuffles (not every thread reading every partial: that was N x waves LDS reads a thread),
+// the same way (not every thread reading every partial: that was N x waves LDS reads a thread),
 // and the N totals are broadcast through LDS once.
 template <typename Op, int N>
 DINLINE void block_reduce(float (&v)[N]) {
@@ -93,11 +117,9 @@ DINLINE void block_reduce(float (&v)[N]) {
   if (wave == 0) {
 #pragma unroll
     for (int n = 0; n < N; ++n) {
-      float x = lane < waves ? partial[lane][n] : Op::kIdentity;
-#pragma unroll
-      for (int off = kMaxWaves / 2; off > 0; off >>= 1)
-        x = Op::apply(x, __shfl_xor(x, off, kWaveSize));
-      if (lane == 0) total[n] = x;
+      float x[1] = {lane < waves ? partial[lane][n] : Op::kIdentity};
+      wave_reduce<Op>(x);
+      if (lane == 0) total[n] = x[0];
     }
   }
   __syncthreads();
