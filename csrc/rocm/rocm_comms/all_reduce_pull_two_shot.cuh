@@ -38,7 +38,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto self = p2p::self<T, ngpus>(p);
   const auto them = p2p::peer<T, ngpus>(p, peer);
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
 
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
   //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
@@ -64,8 +66,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     __syncthreads();
   }
 
+  block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  block_stamp(3);
 
   // 4. All-gather: wave w copies its peer's slice out of that peer's scratch, at its place in the
   //    output. The next call's first sync keeps a rank from overwriting its scratch while it is
@@ -74,6 +78,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   for (int i = first; i < slice_packs; i += stride)
     if (peer * slice_packs + i < num_packs)
       thread_store(dst + peer * slice_packs + i, p2p::read_scratch(them, i));
+  block_stamp(5);
 }
 
 }  // namespace hip_comms

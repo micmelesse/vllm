@@ -74,6 +74,8 @@ __device__ uint64_t g_stamps[kStampBlocks][kStampPhases];
 
 DINLINE void block_stamp(int phase) {
   if constexpr (HIP_COMMS_STAMPS) {
+    // Every outstanding load landed first, so a phase owns its own memory latency.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
     if (threadIdx.x == 0 && blockIdx.x < kStampBlocks) g_stamps[blockIdx.x][phase] = wall_clock64();
   }
