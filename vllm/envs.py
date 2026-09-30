@@ -151,16 +151,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_COMMS_BACKEND: Literal["hip", "iris", "torch"] | None = None
-    VLLM_KIMI_K3_FUSION: Literal[
-    "none",
-    "attn_res",
-    "rms_norm",
-    "gemm_add",
-    "one_all_reduce",
-    "attn_res+rms_norm",
-    "attn_res+gemm_add",
-    "attn_res+one_all_reduce",
-    ] = "none"
+    VLLM_KIMI_K3_FUSED_ATTN_RES: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1367,23 +1358,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Which ROCm TP collective backend handles small all-reduce, or unset for none.
     # The set of names is `rocm_comms.Backend`.
     "VLLM_ROCM_COMMS_BACKEND": lambda: os.getenv("VLLM_ROCM_COMMS_BACKEND") or None,
-    # Which of Kimi-K3's all-reduce fusions run, one of a fixed list: none, each alone,
-    # and the combinations that can run together (`fused_all_reduce.fused`). The latent
-    # tail's all-reduce is consumed one way only (rms_norm, gemm_add, or the tail as
-    # one_all_reduce); AttnRes is on another all-reduce and combines with any.
-    "VLLM_KIMI_K3_FUSION": env_with_choices(
-        "VLLM_KIMI_K3_FUSION",
-        "none",
-        [
-            "none",
-            "attn_res",
-            "rms_norm",
-            "gemm_add",
-            "one_all_reduce",
-            "attn_res+rms_norm",
-            "attn_res+gemm_add",
-            "attn_res+one_all_reduce",
-        ],
+    # Whether Kimi-K3 fuses each AttnRes with the all-reduce that feeds it (rocm_comms
+    # backend only). By default is disabled.
+    "VLLM_KIMI_K3_FUSED_ATTN_RES": lambda: (
+        os.getenv("VLLM_KIMI_K3_FUSED_ATTN_RES", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

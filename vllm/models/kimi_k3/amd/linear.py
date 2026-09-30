@@ -61,7 +61,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.kimi_k3.amd.fused_all_reduce import attn_res, fusion_enabled
+from vllm.models.kimi_k3.amd.fused_all_reduce import attn_res, fused_attn_res
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
@@ -286,12 +286,6 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
-    def output_is_reduced(self, num_tokens: int) -> bool:
-        """Whether this MoE's output leaves already all-reduced (its latent tail ran as
-        one all-reduce), so the AttnRes that consumes it must not reduce it again."""
-        reduced = getattr(self.experts, "output_is_reduced", None)
-        return reduced is not None and reduced(num_tokens)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -465,8 +459,8 @@ class KimiDecoderLayer(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         # Left unreduced for the AttnRes that consumes each output to reduce.
-        self.defer_all_reduce = config.attn_res_block_size is not None and (
-            fusion_enabled()
+        self.defer_all_reduce = (
+            config.attn_res_block_size is not None and fused_attn_res()
         )
         reduce_results = not self.defer_all_reduce
 
@@ -589,7 +583,6 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         prefix_delta: torch.Tensor | None = None,
-        prefix_delta_reduced: bool = False,
         **kwargs,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
@@ -598,7 +591,7 @@ class KimiDecoderLayer(nn.Module):
         if self.use_attn_residuals:
             assert residual is not None
             return self.forward_attn_residual(
-                positions, hidden_states, residual, prefix_delta, prefix_delta_reduced
+                positions, hidden_states, residual, prefix_delta
             )
 
         assert prefix_delta is None
@@ -616,18 +609,12 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-    def mlp_output_reduced(self, num_tokens: int) -> bool:
-        """Whether this layer's MLP output leaves already all-reduced; the model hands
-        that to the next layer as `prefix_delta_reduced`."""
-        return isinstance(self.mlp, KimiMoE) and self.mlp.output_is_reduced(num_tokens)
-
     def forward_attn_residual(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
         prefix_delta: torch.Tensor | None,
-        prefix_delta_reduced: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
         prefix_sum, hidden_states = attn_res(
@@ -639,8 +626,8 @@ class KimiDecoderLayer(nn.Module):
             delta=prefix_delta,
             output_norm=self.input_layernorm,
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
-            # The previous layer's MLP output: reduced here unless it left reduced.
-            reduce_delta=self.defer_all_reduce and not prefix_delta_reduced,
+            # The previous layer's MLP output, left unreduced when deferred.
+            reduce_delta=self.defer_all_reduce,
         )
 
         if self.is_block_write_layer:
@@ -822,7 +809,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
         prefix_delta = None
-        prefix_delta_reduced = False
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -833,9 +819,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 hidden_states=hidden_states,
                 residual=residual,
                 prefix_delta=prefix_delta,
-                prefix_delta_reduced=prefix_delta_reduced,
             )
-            prefix_delta_reduced = layer.mlp_output_reduced(hidden_states.size(0))
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if layer.defer_all_reduce:
                     raise NotImplementedError(
@@ -862,10 +846,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.output_attn_res_norm,
             attn_res_block_num,
             delta=prefix_delta,
-            reduce_delta=(
-                self.layers[self.end_layer - 1].defer_all_reduce
-                and not prefix_delta_reduced
-            ),
+            reduce_delta=self.layers[self.end_layer - 1].defer_all_reduce,
         )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.

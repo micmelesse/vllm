@@ -4,17 +4,12 @@ from typing import cast
 
 import torch
 
-from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.models.kimi_k3.amd.fused_all_reduce import (
-    latent_tail,
-    latent_tail_one_all_reduce,
-    moe_tail_one_all_reduce,
-)
 
 logger = init_logger(__name__)
 
@@ -40,12 +35,6 @@ class ROCmLatentMoERunner(MoERunner):
         up_proj = getattr(transform, "up_proj", None)
         tp_size = self.moe_config.tp_size
 
-        # THE ONE-ALL-REDUCE TAIL IS FOR DECODE: its all-reduce is 2.5x the hidden
-        # row and its up-projection the whole replicated weight (8x the sharded
-        # GEMM's FLOPs), which a prefill batch pays in full; at the 4096-token
-        # profile batch its 147 MB collective overran the 128 MiB eager staging.
-        scheduler = get_current_vllm_config().scheduler_config
-        self._one_all_reduce_max_tokens = scheduler.max_num_seqs
         self._up_proj_shard_size = 0
         self._tail_shardable = (
             up_proj is not None
@@ -66,19 +55,6 @@ class ROCmLatentMoERunner(MoERunner):
             )
         self._logged_sharded_tail = False
 
-    def output_is_reduced(self, num_tokens: int) -> bool:
-        """ONE ALL-REDUCE, THEN THE NORM'S SCALE: the tail reduces the whole output
-        itself, so it leaves this runner reduced and its consumer must not reduce it
-        again. Asked per batch, since only a decode batch takes that tail; not at
-        construction, since the MoE kernel `_fused_output_is_reduced` asks is set up
-        after it."""
-        return (
-            moe_tail_one_all_reduce()
-            and num_tokens <= self._one_all_reduce_max_tokens
-            and self._tail_shardable
-            and not self._fused_output_is_reduced
-        )
-
     def _shard_up_proj_tail(
         self,
         fused_output: torch.Tensor,
@@ -96,18 +72,19 @@ class ROCmLatentMoERunner(MoERunner):
 
         transform = self.routed_output_transform
         assert transform is not None
-        if self.output_is_reduced(fused_output.shape[0]):
-            out = latent_tail_one_all_reduce(
-                fused_output, shared_output, transform.norm, transform.up_proj.weight
-            )
-            return out[..., :trunc_size] if trunc_size is not None else out
+
+        latent = tensor_model_parallel_all_reduce(fused_output)
+        if transform.norm is not None:
+            latent = transform.norm(latent)
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
         up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
-        latent_tail(
-            fused_output, shared_output, transform.norm, up_proj_shard, shard_start
-        )
+        hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
+
+        # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
+        # beta-add epilogue so folding in the shared partial costs no kernel.
+        hidden_shard.addmm_(latent, up_proj_shard.t())
 
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
