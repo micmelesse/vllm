@@ -5,7 +5,7 @@
 // `impl` what the barriers are made of. Indices are in 16-byte packs of T.
 //
 // HIP_COMMS_DEBUG=1 BUILDS THE TESTS' MACHINERY IN: a wait that outlives the timeout prints where
-// it was and traps, so a hang is an error, and checked, every wait is skewed by a random per-block
+// it was and traps, so a hang is an error, and every wait is skewed by a random per-block
 // delay, so a race shows on every run. Off (the default), none of it is in the kernels: a clock
 // read on every poll and a printf path in every kernel are not free.
 
@@ -30,10 +30,10 @@ namespace hip_comms::p2p {
 
 namespace impl {
 
-// Checked only: up to ~32 x 8K cycles, different per rank, block and peer barrier (the
+// Debug builds only: up to ~32 x 8K cycles, different per rank, block and peer barrier (the
 // block's sequence number, which start, peer_barrier and close advance).
 DINLINE void skew(const Peers& p) {
-  if (!HIP_COMMS_DEBUG || !p.checked) return;
+  if (!HIP_COMMS_DEBUG) return;
   uint32_t h = static_cast<uint32_t>(p.rank) * 73856093u ^ blockIdx.x * 19349663u ^
                p.self->seq[blockIdx.x] * 83492791u;
   h ^= h >> 13;

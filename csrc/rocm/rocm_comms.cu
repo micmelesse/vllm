@@ -577,9 +577,6 @@ torch::Tensor rocm_comms_staging(fptr_t comms) {
                               torch::kCUDA, c10::cuda::current_device()));
 }
 
-void rocm_comms_set_checked(fptr_t comms, bool checked) {
-  comms_of(comms).set_checked(checked);
-}
 
 bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
                        int64_t element_size, int64_t cols, int64_t quant_bits, int64_t kernel,
@@ -596,12 +593,6 @@ bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
 
 void rocm_comms_dispose(fptr_t comms) { delete &comms_of(comms); }
 
-void rocm_comms_register_buffer(fptr_t comms,
-                                const std::vector<std::vector<int64_t>>& handles,
-                                const std::vector<int64_t>& offsets, int64_t self_ptr) {
-  comms_of(comms).register_buffer(bytes_of(handles), offsets,
-                                        static_cast<uintptr_t>(self_ptr));
-}
 
 std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms) {
   auto pending = comms_of(comms).pending_graph_buffers();
@@ -631,9 +622,6 @@ void rocm_comms_register_graph_buffers(
   comms_of(comms).register_graph_buffers(bytes, offsets);
 }
 
-int64_t rocm_comms_pending_count(fptr_t comms) {
-  return comms_of(comms).pending_count();
-}
 
 void rocm_comms_all_reduce(fptr_t comms, torch::Tensor& out, torch::Tensor& inp,
                            int64_t quant_bits, int64_t kernel, int64_t launch_blocks,

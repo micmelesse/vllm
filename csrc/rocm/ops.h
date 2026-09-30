@@ -63,13 +63,9 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s);
 torch::Tensor rocm_comms_staging(fptr_t comms);
 
-void rocm_comms_set_checked(fptr_t comms, bool checked);
 
 void rocm_comms_dispose(fptr_t comms);
 
-void rocm_comms_register_buffer(fptr_t comms,
-                                const std::vector<std::vector<int64_t>>& handles,
-                                const std::vector<int64_t>& offsets, int64_t self_ptr);
 
 std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms);
 
@@ -77,7 +73,6 @@ void rocm_comms_register_graph_buffers(
     fptr_t comms, const std::vector<std::vector<int64_t>>& handles,
     const std::vector<std::vector<int64_t>>& offsets);
 
-int64_t rocm_comms_pending_count(fptr_t comms);
 
 // Every op takes the same four integers last: quant_bits, the precision it accepts (16:
 // exact), then its launch: kernel, launch_blocks, launch_threads (-1 and zeros: tune.cuh's).

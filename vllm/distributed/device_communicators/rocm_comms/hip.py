@@ -134,36 +134,6 @@ class HipCommunicator(Communicator):
         gathered = _all_gather_object(self.cpu_group, mine)
         return [h for h, _ in gathered], [o for _, o in gathered]
 
-    def _register(self, tensor: torch.Tensor) -> None:
-        """Make `tensor` usable as a collective input, permanently.
-
-        A collective. Only called at startup (`_open`) and after a capture
-        (`_flush_pending`), which every rank reaches in the same order.
-        """
-        ptr = tensor.data_ptr()
-        if len(self._registered) >= self.hip_tunables.max_buffers:
-            raise RuntimeError(
-                f"hip_comms: {len(self._registered)} registered buffers hits the "
-                f"{self.hip_tunables.max_buffers} limit; raise max_buffers."
-            )
-        # The same gather checks that the ranks are registering the same thing.
-        mine = torch.ops._rocm_C.rocm_comms_handle_and_offset(ptr)
-        signature = (tensor.numel() * tensor.element_size(), str(tensor.dtype))
-        gathered = _all_gather_object(self.cpu_group, (mine, signature))
-        seen = {sig for _, sig in gathered}
-        if len(seen) != 1:
-            raise RuntimeError(
-                f"hip_comms: ranks registered different tensors ({sorted(seen)}); "
-                f"every rank must register in the same order with the same shapes."
-            )
-        torch.ops._rocm_C.rocm_comms_register_buffer(
-            self._handle,
-            [h for (h, _), _ in gathered],
-            [o for (_, o), _ in gathered],
-            ptr,
-        )
-        self._registered.add(ptr)
-
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
         """Wrap a cudagraph capture; buffers used inside are registered on exit.
@@ -203,11 +173,6 @@ class HipCommunicator(Communicator):
             [[b for g in gathered for b in g[i][0]] for i in range(len(pending))],
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
-
-    def set_checked(self, checked: bool) -> None:
-        """Bounds checks and random skew in every later kernel: the tests' mode, which
-        turns a race into a failure on every run."""
-        torch.ops._rocm_C.rocm_comms_set_checked(self._handle, checked)
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
         """`inp` if the peers can read it, otherwise a copy in the staging buffer.

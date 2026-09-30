@@ -50,7 +50,6 @@ struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 // `host::Group::peers` fills one per launch.
 struct Peers {
   int rank;
-  bool checked;                // bounds checks and random skew: the tests' mode
   const PeerPtrs* inputs;      // device memory: every rank's input for this launch
   PeerSignals signals;         // every rank's signal block; its scratch follows it
   Signal* self;                // this rank's

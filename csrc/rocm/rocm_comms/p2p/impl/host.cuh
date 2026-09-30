@@ -121,23 +121,12 @@ class Group {
   }
 
   int world_size() const { return world_size_; }
-  // Bounds checks and random skew in every kernel launched after this. The tests' mode.
-  void set_checked(bool checked) { checked_ = checked; }
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it holds.
   void* staging() const {
     return reinterpret_cast<char*>(self_signal_) + sizeof(Signal) + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
-
-  // A buffer whose address is known ahead of time. The eager path.
-  void register_buffer(const std::vector<std::string>& handles,
-                       const std::vector<int64_t>& offsets, uintptr_t self_ptr) {
-    auto ptrs = open_peers(handles, offsets, self_ptr);
-    PeerPtrs* slot = next_slot();
-    write_slot(slot, ptrs);
-    registered_[reinterpret_cast<void*>(self_ptr)] = slot;
-  }
 
   // The CAPTURE path, in two halves. During capture the input address is not registered
   // yet, so `peers` reserves a slab slot and remembers the pointer; afterwards Python
@@ -169,12 +158,9 @@ class Group {
     pending_slots_.clear();
   }
 
-  int64_t pending_count() const { return static_cast<int64_t>(pending_.size()); }
-
   // What a launch over `input` passes to its kernel.
   Peers peers(const torch::Tensor& input) {
     return Peers{rank_,
-                 checked_,
                  slot_for(input.data_ptr()),
                  signals_,
                  self_signal_,
@@ -251,7 +237,6 @@ class Group {
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
   uint64_t timeout_ticks_ = 0;
-  bool checked_           = false;
   PeerSignals signals_{};
   PeerPtrs* slab_     = nullptr;
   PeerPtrs* slab_end_ = nullptr;
