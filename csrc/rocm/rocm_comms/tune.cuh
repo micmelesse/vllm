@@ -49,7 +49,7 @@ constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
   const int row_packs =
       has_row_packs(k) ? row_packs_for(op_of(k), in.hidden * in.elem_bytes / kPackBytes, threads)
                        : 0;
-  return {k, grid_of(k, blocks, in.rows), threads, lanes, in.quant_bits, row_packs};
+  return {k, grid_of(k, blocks, in.rows, in.world), threads, lanes, in.quant_bits, row_packs};
 }
 
 // No kernel: the caller runs the unfused ops.

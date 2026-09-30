@@ -126,13 +126,15 @@ constexpr int row_packs_for(Op op, int64_t packs, int threads) {
   return 0;
 }
 
-// A row op's one-shot kernel gives each block a row, so it needs no more blocks than rows;
-// everything else strides over the whole grid.
-constexpr int grid_of(Kernel k, int blocks, int64_t rows) {
+// A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot all
+// of them, a two-shot its rank's slice. An idle block still pays every barrier (each pairs with its
+// twin on every peer): the norms' two-shot at 32 tokens ran 36 blocks for 4 rows a rank. The GEMM
+// tail's GEMM strides over column tiles, and the plain all-reduce over packs, so both keep theirs.
+constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
-  const bool row_per_block =
-      !is_two_shot(k) && op != Op::all_reduce && op != Op::all_reduce_rms_norm_gemm_add;
-  return row_per_block && rows < blocks ? static_cast<int>(rows) : blocks;
+  if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
+  const int64_t mine = is_two_shot(k) ? (rows + world - 1) / world : rows;
+  return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
 }  // namespace hip_comms
