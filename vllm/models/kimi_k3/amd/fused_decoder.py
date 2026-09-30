@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3's decoder layer with its all-reduces fused into the ops that consume
 them, chosen over `KimiDecoderLayer` when VLLM_KIMI_K3_FUSED_DECODER is set and the
-rocm_comms backend is live. Today it fuses the latent MoE tail's all-reduce with its RMSNorm. A fusion
-always runs its fused op; an input the backend cannot run is an error, not a quiet
-fallback. Here and not in a fusion pass: Kimi-K3 is not torch.compiled.
+rocm_comms backend is live. Today it fuses the latent MoE tail's all-reduce with its
+RMSNorm. A fusion always runs its fused op; an input the backend cannot run is an
+error, not a quiet fallback. Here and not in a fusion pass: Kimi-K3 is not
+torch.compiled.
 """
 
 from typing import Any
@@ -32,8 +33,8 @@ def enabled() -> bool:
 
 
 class ROCmLatentMoERunnerFused(ROCmLatentMoERunner):
-    """The latent tail's all-reduce and RMSNorm in one kernel, always: with the fused
-    decoder on, the fused op runs or the call fails, never the unfused ops in its place."""
+    """The latent tail's all-reduce and RMSNorm in one kernel, always: with the
+    fused decoder on, the fused op runs or the call fails, never the unfused ops."""
 
     def _all_reduce_norm(
         self, fused_output: torch.Tensor, norm: torch.nn.Module | None
