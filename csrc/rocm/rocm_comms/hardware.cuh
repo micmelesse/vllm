@@ -116,6 +116,12 @@ constexpr int kWaveSize = kDevice.wave_size;
 constexpr int kMaxComputeUnits =
     kGfx950.compute_units > kGfx942.compute_units ? kGfx950.compute_units : kGfx942.compute_units;
 
+// THE MOST GPUS THAT CAN READ EACH OTHER'S MEMORY DIRECTLY: a link to every peer (the full xGMI
+// mesh of one node), so a peer group is at most the links plus one. Beyond it there is no load
+// path, only a network collective.
+constexpr int kMaxPeers = (kGfx950.xgmi_links > kGfx942.xgmi_links ? kGfx950.xgmi_links
+                                                                    : kGfx942.xgmi_links) + 1;
+
 // THE WIDEST BLOCK WE LAUNCH, and every kernel's __launch_bounds__: a bound is a register trade,
 // so it is the widest tuned launch (the fused ops' 512), not the device's 1024. At 1024 a thread
 // gets 128 registers and the row kernels spill (AttnRes at 2 packs a thread, the GEMM tail at

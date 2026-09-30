@@ -19,7 +19,7 @@
 
 namespace hip_comms::p2p {
 
-constexpr int kMaxRanks  = 8;
+constexpr int kMaxRanks  = kMaxPeers;
 // ONE SIGNAL SLOT PER COMPUTE UNIT on any target built: the signal block never rules out a grid.
 // Which grid is fast is the tuner's (tune.cuh).
 constexpr int kMaxBlocks = kMaxComputeUnits;
