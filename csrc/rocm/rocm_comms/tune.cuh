@@ -111,7 +111,7 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 constexpr Launch fused_norm(Kernel one_shot, Kernel two_shot, Input in, const Calibration& cal) {
   return bytes(in) <= cal.fused_one_shot_max_bytes
              ? at(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads)
-             : at(two_shot, in, cal.fused_two_shot_blocks, cal.fused_threads);
+             : at(two_shot, in, cal.norm_two_shot_blocks, cal.fused_threads);
 }
 
 constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
@@ -131,7 +131,7 @@ constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&
              ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
                   cal.fused_one_shot_blocks, cal.fused_threads)
              : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
-                  cal.fused_two_shot_blocks, cal.fused_threads);
+                  cal.attn_res_two_shot_blocks, cal.fused_threads);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
