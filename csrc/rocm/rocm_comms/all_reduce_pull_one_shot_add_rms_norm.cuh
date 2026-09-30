@@ -19,7 +19,7 @@ namespace hip_comms {
 // row. `residual` and `residual_out` are unused (null) unless kAdd; `weight` is in its
 // own dtype W, T or fp32 (see `fusion::row`).
 template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
-DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
+DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
                                                         const T* __restrict__ residual,
                                                         const W* __restrict__ weight, float eps,
@@ -33,14 +33,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
-
-  // 1. Wait until every peer has launched, so its input is ready.
+  // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
+  const auto peers = p2p::peers<T, ngpus>(p);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
@@ -59,7 +55,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_norm(
-    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::DevComm p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false, kRowPacks>(
       p, out, nullptr, nullptr, weight, eps, rows, packs);
@@ -67,7 +63,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_n
 
 template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_add_rms_norm(
-    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::DevComm p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true, kRowPacks>(

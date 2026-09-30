@@ -46,6 +46,7 @@
 #include "rocm_comms/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
+#include "rocm_comms/ping_pong.cuh"
 #include "rocm_comms/launch.cuh"
 #include "rocm_comms/tune.cuh"
 
@@ -226,7 +227,7 @@ void all_reduce(p2p::host::Group& group, const Request& req, torch::Tensor& out,
   const Launch l =
       checked_launch(group, req, Op::all_reduce, 1, inp.numel(), inp.element_size(), 0);
   const int n    = static_cast<int>(inp.numel() * inp.element_size() / 16);
-  const p2p::Peers p = group.peers(inp);
+  const p2p::DevComm p = group.dev_comm(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ALL_REDUCE_ARGS(T) p, out.data_ptr<T>(), n
@@ -296,7 +297,7 @@ void all_reduce_add_rms_norm(p2p::host::Group& group, const Request& req,
   const int packs = static_cast<int>(inp.size(1) / lanes);
   const Op op     = add ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
   const Launch l  = checked_launch(group, req, op, rows, inp.size(1), inp.element_size(), 0);
-  const p2p::Peers p = group.peers(inp);
+  const p2p::DevComm p = group.dev_comm(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   const float feps   = static_cast<float>(eps);
 
@@ -395,7 +396,7 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Request& re
   const int packs = static_cast<int>(hidden / lanes);
   const Launch l  = checked_launch(group, req, Op::all_reduce_add_attn_res_rms_norm, rows, hidden,
                                    inp.element_size(), 0);
-  const p2p::Peers p = group.peers(inp);
+  const p2p::DevComm p = group.dev_comm(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
 
 #define ATTN_RES_ARGS(T)                                                                 \
@@ -471,7 +472,7 @@ void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Request& req,
                      inp.element_size(), n_cols);
   TORCH_CHECK(l.threads % kWaveSize == 0, "the GEMM phase needs whole waves; threads ",
               l.threads);
-  const p2p::Peers p = group.peers(inp);
+  const p2p::DevComm p = group.dev_comm(inp);
   auto stream        = at::cuda::getCurrentCUDAStream();
   // EVERY BLOCK, not one per row: the GEMM phase spreads the columns over the whole grid.
 
@@ -592,6 +593,27 @@ bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
 }
 
 void rocm_comms_dispose(fptr_t comms) { delete &comms_of(comms); }
+
+// NANOSECONDS PER ROUND TRIP to `peer`, over `iters`: both ranks of the pair call it together.
+double rocm_comms_ping_pong(fptr_t comms, int64_t peer, int64_t iters) {
+  auto& group = comms_of(comms);
+  TORCH_CHECK(peer >= 0 && peer < group.world_size() && peer != group.rank(),
+              "peer must be another rank");
+  TORCH_CHECK(iters > 0, "iters must be positive");
+  auto ticks  = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(
+                                     torch::kCUDA, c10::cuda::current_device()));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const uint32_t base =
+      group.take_flags(static_cast<int>(peer), hip_comms::ping_pong_flags(static_cast<int>(iters)));
+  hip_comms::ping_pong<<<dim3(1), dim3(64), 0, stream>>>(
+      group.dev_comm(), static_cast<int>(peer), base, static_cast<int>(iters),
+      reinterpret_cast<uint64_t*>(ticks.data_ptr<int64_t>()));
+  const double t = static_cast<double>(ticks.item<int64_t>());
+  int device = 0, khz = 0;
+  HIP_CHECK(hipGetDevice(&device));
+  HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
+  return t * 1e6 / khz / static_cast<double>(iters);
+}
 
 
 std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t comms) {

@@ -15,18 +15,13 @@ namespace hip_comms {
 // `num_packs` packs, a thread a pack at a time over the whole grid.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    all_reduce_pull_one_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
+    all_reduce_pull_one_shot(p2p::DevComm p, T* __restrict__ out, int num_packs) {
   using V = typename traits<T>::V;
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
-
-  // 1. Every rank's input is in memory its peers can read (registered, or staged); wait
-  //    until every peer has launched, so its input is ready.
+  // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
+  const auto peers = p2p::peers<T, ngpus>(p);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Read every rank's input, in rank order, and sum.
   V* dst = reinterpret_cast<V*>(out);

@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // p2p::host, behind p2p.cuh: `Group` maps every peer's signal block, scratch and
-// registered buffers once over HIP IPC handles, and hands a launch the `Peers` it passes
+// registered buffers once over HIP IPC handles, and hands a launch the `DevComm` it passes
 // to its kernel. The one object with a lifetime, on purpose: the mappings must outlive
 // every launch.
 
@@ -129,7 +129,7 @@ class Group {
   int64_t staging_bytes() const { return staging_bytes_; }
 
   // The CAPTURE path, in two halves. During capture the input address is not registered
-  // yet, so `peers` reserves a slab slot and remembers the pointer; afterwards Python
+  // yet, so `dev_comm` reserves a slab slot and remembers the pointer; afterwards Python
   // gathers handles for everything remembered and this fills the slots in. Sound because
   // a captured address is fixed for the graph's life -- the kernel reads a PeerPtrs
   // populated AFTER the capture that recorded the launch.
@@ -159,14 +159,24 @@ class Group {
   }
 
   // What a launch over `input` passes to its kernel.
-  Peers peers(const torch::Tensor& input) {
-    return Peers{rank_,
-                 slot_for(input.data_ptr()),
-                 signals_,
-                 self_signal_,
-                 input.numel() * input.element_size() / 16,
-                 scratch_bytes_ / 16,
-                 timeout_ticks_};
+  DevComm dev_comm(const torch::Tensor& input) {
+    DevComm p       = dev_comm();
+    p.inputs      = slot_for(input.data_ptr());
+    p.input_packs = input.numel() * input.element_size() / 16;
+    return p;
+  }
+
+  // A launch with no input: only the signals, for a kernel that moves no data.
+  DevComm dev_comm() const {
+    return DevComm{rank_, nullptr, signals_, self_signal_, 0, scratch_bytes_ / 16, timeout_ticks_};
+  }
+  int rank() const { return rank_; }
+  // The first of `n` flag values for `peer`, the rest reserved: flags only grow, so each use starts
+  // past the last (p2p::write_flag).
+  uint32_t take_flags(int peer, uint32_t n) {
+    const uint32_t base = flags_used_[peer];
+    flags_used_[peer] += n;
+    return base;
   }
 
  private:
@@ -245,6 +255,7 @@ class Group {
   std::vector<void*> pending_;
   std::vector<PeerPtrs*> pending_slots_;
   std::unordered_map<std::string, void*> opened_;
+  uint32_t flags_used_[kMaxRanks] = {};
 };
 
 }  // namespace hip_comms::p2p::host

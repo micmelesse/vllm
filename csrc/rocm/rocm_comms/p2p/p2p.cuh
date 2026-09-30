@@ -6,8 +6,10 @@
 // way, and what they keep in `p2p::impl` is theirs.
 //
 // p2p::                     all one GPU does with another; a peer's address never leaves it
-//   peer<T, ngpus>(p, r)           rank r's buffers, read-only (every rank: an unrolled array)
-//   self<T, ngpus>(p)              this rank's own, the only buffer a pull kernel writes
+//   self<T, ngpus>(p)              this rank's own buffers, the only ones a pull kernel writes
+//   peers<T, ngpus>(p)             every rank's, read-only: with self, how a pull kernel begins,
+//                                  before its start barrier
+//   peer<T, ngpus>(p, r)           rank r's alone, r chosen at run time and the same across the wave
 //   read_input(peer, i)            pack i of that rank's input
 //   read_scratch(peer, i)          pack i of what it left in its scratch
 //   write_scratch(self, i, v)      pack i of this rank's scratch, for its peers to read
@@ -16,6 +18,8 @@
 //                                  launched (every peer's input is ready), visible (what was
 //                                  written before is seen after), read (every peer is done
 //                                  reading this rank)
+//   write_flag(p, peer, v)         v into `peer`'s signal slot for this rank
+//   wait_flag(p, peer, v)          until `peer`'s flag here reaches v
 //
 // p2p::impl::Codec<T, kBits>   a group of kCodecGroupPacks packs on the wire: T itself (16) or
 //                              QuickReduce's integers (8, 4) under one fp32 scale; for the
@@ -23,7 +27,7 @@
 //
 // p2p::host::                the host code (rocm_comms.cu)
 //   Group                          the one lifetime object: maps the peers' memory,
-//                                  registers buffers, `peers(input)` per launch
+//                                  registers buffers, `dev_comm(input)` per launch
 //   Handle, handle_and_offset(ptr) a tensor's IPC handle
 // and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks.
 

@@ -39,6 +39,8 @@ struct Signal {
   alignas(128) uint32_t end[kMaxBlocks][kMaxRanks];
   alignas(128) uint32_t seq[kMaxBlocks];
   alignas(128) uint32_t peer[kMaxRanks];
+  // `flag[r]`: the last flag rank r wrote here (p2p::write_flag).
+  alignas(128) uint32_t flag[kMaxRanks];
   alignas(128) uint32_t arrive;
   alignas(128) uint32_t gen;
   alignas(128) uint32_t epoch;
@@ -47,10 +49,10 @@ struct Signal {
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
 struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
-// WHAT A LAUNCH PASSES, by value: every rank's input (through a slot of the peer-pointer
-// slab), every rank's signal block and scratch, and this launch's limits. Plain fields;
-// `host::Group::peers` fills one per launch.
-struct Peers {
+// THE DEVICE COMMUNICATOR, what a launch passes by value (NCCL's ncclDevComm): every rank's input
+// (through a slot of the peer-pointer slab), every rank's signal block and scratch, and this
+// launch's limits. Plain fields; `host::Group::dev_comm` fills one per launch.
+struct DevComm {
   int rank;
   const PeerPtrs* inputs;      // device memory: every rank's input for this launch
   PeerSignals signals;         // every rank's signal block; its scratch follows it

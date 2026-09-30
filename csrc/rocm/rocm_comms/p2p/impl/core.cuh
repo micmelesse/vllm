@@ -17,6 +17,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstdint>
 
 #include "../../common/memory.cuh"
@@ -32,7 +33,7 @@ namespace impl {
 
 // Debug builds only: up to ~32 x 8K cycles, different per rank, block and peer barrier (the
 // block's sequence number, which start, peer_barrier and close advance).
-DINLINE void skew(const Peers& p) {
+DINLINE void skew(const DevComm& p) {
   if (!HIP_COMMS_DEBUG) return;
   uint32_t h = static_cast<uint32_t>(p.rank) * 73856093u ^ blockIdx.x * 19349663u ^
                p.self->seq[blockIdx.x] * 83492791u;
@@ -64,7 +65,7 @@ DINLINE void fence() {
 // Spins relaxed and acquires once, after: an acquire per poll would invalidate the
 // caches on every iteration of every spinning block.
 template <bool kAcquire, int kScope>
-DINLINE void wait(const Peers& p, const uint32_t* flag, uint32_t want, const char* what,
+DINLINE void wait(const DevComm& p, const uint32_t* flag, uint32_t want, const char* what,
                   int peer) {
 #if HIP_COMMS_DEBUG
   const uint64_t t0 = wall_clock64();
@@ -91,7 +92,7 @@ DINLINE void wait(const Peers& p, const uint32_t* flag, uint32_t want, const cha
 // same-numbered block after (a peer_barrier). Unordered, it only says when
 // (start: every peer has launched; close: every peer is done reading us).
 template <int ngpus, bool kOrdered>
-DINLINE void pair_blocks(const Peers& p, bool start) {
+DINLINE void pair_blocks(const DevComm& p, bool start) {
   if (!start) {
     if constexpr (kOrdered) wait_stores();
     __syncthreads();
@@ -118,7 +119,7 @@ DINLINE void pair_blocks(const Peers& p, bool start) {
 // writes back the whole L2, so one covers the block where one per thread wrote it back
 // 512 times.
 template <int ngpus, bool kPeers>
-DINLINE void barrier(const Peers& p) {
+DINLINE void barrier(const DevComm& p) {
   constexpr int kScope = kPeers ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
   skew(p);
   wait_stores();
@@ -164,7 +165,7 @@ namespace impl {
 // SELECT, never an index, since a runtime index into a pointer array puts the array in scratch
 // memory (seen in the ISA: 152 bytes a lane and a scratch load per read).
 template <typename T, int ngpus>
-DINLINE typename traits<T>::V* scratch_of(const Peers& p, int r) {
+DINLINE typename traits<T>::V* scratch_of(const DevComm& p, int r) {
   using V = typename traits<T>::V;
   V* at   = reinterpret_cast<V*>(p.signals.s[0] + 1);
 #pragma unroll
@@ -176,7 +177,7 @@ DINLINE typename traits<T>::V* scratch_of(const Peers& p, int r) {
 // Rank r's input for this launch, the same way: each rank's pointer by a constant index, so the
 // loads are scalar and issue together (a runtime index made them one dependent vector load).
 template <typename T, int ngpus>
-DINLINE const typename traits<T>::V* input_of(const Peers& p, int r) {
+DINLINE const typename traits<T>::V* input_of(const DevComm& p, int r) {
   using V     = typename traits<T>::V;
   const V* at = reinterpret_cast<const V*>(p.inputs->p[0]);
 #pragma unroll
@@ -188,11 +189,10 @@ DINLINE const typename traits<T>::V* input_of(const Peers& p, int r) {
 }  // namespace impl
 
 // ONE RANK'S BUFFERS FOR THIS LAUNCH, read-only, held for the kernel and never handed out. Made
-// before the loops that read it: one `peer(p, r)` for a rank chosen at run time, or for every rank
-//   Peer<T, ngpus> all[ngpus];
-//   for (int r = 0; r < ngpus; ++r) all[r] = peer<T, ngpus>(p, r);   // unrolled: r a constant
-// so the pointers stay in registers. Nothing takes a runtime index into a set of ranks: that is
-// what put them in scratch memory (152 B a lane, +4 us at 1.8 MB).
+// before the loops that read it, by `peers` for every rank or `peer` for one chosen at run time
+// (built from the kernel's arguments, never picked out of `peers`: a select over a local array
+// compiles to an index and puts it in scratch, 144 B a lane). Nothing takes a runtime index into
+// a set of ranks.
 template <typename T, int ngpus>
 class Peer {
   using V = typename traits<T>::V;
@@ -203,7 +203,7 @@ class Peer {
   DINLINE Peer() = default;
   // `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane,
   // the compiler knows it, and the pointer loads are scalar rather than one per lane.
-  DINLINE Peer(const Peers& p, int r)
+  DINLINE Peer(const DevComm& p, int r)
       : in_(impl::input_of<T, ngpus>(p, __builtin_amdgcn_readfirstlane(r))),
         scratch_(impl::scratch_of<T, ngpus>(p, __builtin_amdgcn_readfirstlane(r))) {}
 
@@ -222,7 +222,7 @@ class Self {
   V* scratch_;
 
  public:
-  explicit DINLINE Self(const Peers& p) : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)) {}
+  explicit DINLINE Self(const DevComm& p) : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)) {}
 
   template <typename U, int n>
   friend DINLINE void write_scratch(const Self<U, n>& self, int64_t i,
@@ -230,12 +230,12 @@ class Self {
 };
 
 template <typename T, int ngpus>
-DINLINE Peer<T, ngpus> peer(const Peers& p, int r) {
+DINLINE Peer<T, ngpus> peer(const DevComm& p, int r) {
   return Peer<T, ngpus>(p, r);
 }
 
 template <typename T, int ngpus>
-DINLINE Self<T, ngpus> self(const Peers& p) {
+DINLINE Self<T, ngpus> self(const DevComm& p) {
   return Self<T, ngpus>(p);
 }
 
@@ -269,7 +269,7 @@ enum class Ensure { launched, visible, read };
 // A read after a peers barrier may see only what the SAME BLOCK on the peer wrote before it, so
 // both sides must index the same data by the same block.
 template <int ngpus, Among kAmong, Ensure kEnsure>
-DINLINE void barrier(const Peers& p) {
+DINLINE void barrier(const DevComm& p) {
   static_assert(kAmong == Among::peers || kEnsure == Ensure::visible,
                 "a grid barrier only makes this rank's writes visible to its other blocks");
   if constexpr (kAmong == Among::grid) {
@@ -278,6 +278,44 @@ DINLINE void barrier(const Peers& p) {
     impl::skew(p);
     impl::pair_blocks<ngpus, kEnsure == Ensure::visible>(p, kEnsure == Ensure::launched);
   }
+}
+
+// EVERY RANK'S BUFFERS, how every pull kernel begins with `self`, before its start barrier so the
+// pointer loads hide under the wait:
+//   const auto self = p2p::self<T, ngpus>(p);
+//   const auto peers = p2p::peers<T, ngpus>(p);
+//   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+template <typename T, int ngpus>
+DINLINE std::array<Peer<T, ngpus>, ngpus> peers(const DevComm& p) {
+  std::array<Peer<T, ngpus>, ngpus> all;
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = Peer<T, ngpus>(p, r);
+  return all;
+}
+
+namespace impl {
+
+// Rank r's signal block, by select.
+DINLINE Signal* signal_of(const DevComm& p, int r) {
+  Signal* at = p.signals.s[0];
+#pragma unroll
+  for (int k = 1; k < kMaxRanks; ++k)
+    if (r == k) at = p.signals.s[k];
+  return at;
+}
+
+}  // namespace impl
+
+// A FLAG TO ONE PEER, with the barriers' own store and spin: `v` lands in `peer`'s signal block,
+// in its slot for this rank, and `wait_flag` spins until `peer`'s flag here reaches `v`. Flags only
+// grow, so a caller counts on from the last value it used.
+DINLINE void write_flag(const DevComm& p, int peer, uint32_t v) {
+  __scoped_atomic_store_n(&impl::signal_of(p, peer)->flag[p.rank], v, __ATOMIC_RELAXED,
+                          __MEMORY_SCOPE_SYSTEM);
+}
+
+DINLINE void wait_flag(const DevComm& p, int peer, uint32_t v) {
+  impl::wait<false, __MEMORY_SCOPE_DEVICE>(p, &p.self->flag[peer], v, "flag", peer);
 }
 
 }  // namespace hip_comms::p2p

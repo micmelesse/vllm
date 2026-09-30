@@ -23,7 +23,7 @@ namespace hip_comms {
 // w lane l of the same block read it, after that block's sync.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    all_reduce_pull_two_shot(p2p::Peers p, T* __restrict__ out, int num_packs) {
+    all_reduce_pull_two_shot(p2p::DevComm p, T* __restrict__ out, int num_packs) {
   using V               = typename traits<T>::V;
   constexpr int N       = traits<T>::N;
   const int lanes       = blockDim.x / ngpus;  // host: blockDim is ngpus whole waves
@@ -35,11 +35,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int stride      = gridDim.x * lanes;
   __shared__ V got[kMaxThreads];
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
+  // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto self = p2p::self<T, ngpus>(p);
   const auto them = p2p::peer<T, ngpus>(p, peer);
-
-  // 1. Wait until every peer has launched, so its input is ready.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums

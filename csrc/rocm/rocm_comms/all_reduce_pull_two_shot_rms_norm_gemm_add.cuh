@@ -20,7 +20,7 @@ namespace hip_comms {
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanesPerCol), 1)
     all_reduce_pull_two_shot_rms_norm_gemm_add(
-    p2p::Peers p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {
   using V                = typename traits<T>::V;
@@ -36,10 +36,8 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
   const auto self = p2p::self<T, ngpus>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
@@ -67,7 +65,7 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
         if (r * slice_rows + l < rows)
-          got[r] = p2p::read_scratch(all[r], int64_t{l} * packs + i);
+          got[r] = p2p::read_scratch(peers[r], int64_t{l} * packs + i);
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;

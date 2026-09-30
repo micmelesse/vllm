@@ -62,6 +62,7 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
                        int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s);
 torch::Tensor rocm_comms_staging(fptr_t comms);
+double rocm_comms_ping_pong(fptr_t comms, int64_t peer, int64_t iters);
 
 
 void rocm_comms_dispose(fptr_t comms);

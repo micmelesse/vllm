@@ -19,7 +19,7 @@ namespace hip_comms {
 template <typename T, int ngpus, bool kPrefix, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
-        p2p::Peers p, T* __restrict__ prefix, T* __restrict__ blocks,
+        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
         int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
@@ -36,14 +36,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                 write_idx * block_stride_r);
   };
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
-
-  // 1. Wait until every peer has launched, so its input is ready.
+  // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
+  const auto peers = p2p::peers<T, ngpus>(p);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, AttnRes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {

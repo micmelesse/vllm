@@ -21,7 +21,7 @@ namespace hip_comms {
 // bytes. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read
 // only what the same block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
-DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restrict__ out,
+DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
                                                         const T* __restrict__ residual,
                                                         const W* __restrict__ weight, float eps,
@@ -42,10 +42,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
   const auto self = p2p::self<T, ngpus>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
@@ -77,8 +75,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         if (r * slice_rows + l >= rows) continue;
-        got[r] = p2p::read_scratch(all[r], at);
-        if constexpr (kAdd) got_res[r] = p2p::read_scratch(all[r], res_at + at);
+        got[r] = p2p::read_scratch(peers[r], at);
+        if constexpr (kAdd) got_res[r] = p2p::read_scratch(peers[r], res_at + at);
       }
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
@@ -94,7 +92,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_norm(
-    p2p::Peers p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
+    p2p::DevComm p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, false, kRowPacks>(
       p, out, nullptr, nullptr, weight, eps, rows, packs);
@@ -102,7 +100,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_n
 
 template <typename T, typename W, int ngpus, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_add_rms_norm(
-    p2p::Peers p, T* __restrict__ out, T* __restrict__ residual_out,
+    p2p::DevComm p, T* __restrict__ out, T* __restrict__ residual_out,
     const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
     int packs) {
   all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, true, kRowPacks>(
