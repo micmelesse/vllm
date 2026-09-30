@@ -61,10 +61,10 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.kimi_k3.amd.fused_all_reduce import attn_res, fused_attn_res
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
+from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
@@ -136,6 +136,31 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+def _apply_attn_res(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: ReplicatedLinear,
+    norm: RMSNorm,
+    num_valid_blocks: int,
+    *,
+    delta: torch.Tensor | None = None,
+    output_norm: RMSNorm | None = None,
+    block_write_idx: int = -1,
+) -> torch.Tensor:
+    return attn_res(
+        prefix_sum,
+        delta,
+        block_residual,
+        norm.weight,
+        proj.weight.squeeze(0),
+        None if output_norm is None else output_norm.weight,
+        num_valid_blocks,
+        block_write_idx,
+        norm.variance_epsilon,
+        0.0 if output_norm is None else output_norm.variance_epsilon,
+    )
 
 
 class KimiMoE(nn.Module):
@@ -269,9 +294,6 @@ class KimiMoE(nn.Module):
             routed_output_transform=self.routed_output_transform,
             runner_cls=ROCmLatentMoERunner if self.use_latent_moe else None,
             reduce_results=reduce_results,
-        )
-        assert reduce_results or self.experts.moe_config.skip_final_all_reduce, (
-            "reduce_results=False was not honored; the output would be reduced twice"
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -443,6 +465,10 @@ class KimiMLAAttention(nn.Module):
 
 
 class KimiDecoderLayer(nn.Module):
+    # Whether attention and the MLP all-reduce their own outputs. A subclass that
+    # reduces them itself, fused with what consumes them, sets it False.
+    reduce_results = True
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -458,11 +484,6 @@ class KimiDecoderLayer(nn.Module):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        # Left unreduced for the AttnRes that consumes each output to reduce.
-        self.defer_all_reduce = (
-            config.attn_res_block_size is not None and fused_attn_res()
-        )
-        reduce_results = not self.defer_all_reduce
 
         if config.is_kda_layer(layer_idx):
             # Kimi-K3 sets use_full_rank_gate and uses the ROCm-specific K3 KDA
@@ -474,7 +495,7 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
-                    reduce_results=reduce_results,
+                    reduce_results=self.reduce_results,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -508,7 +529,7 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
-                reduce_results=reduce_results,
+                reduce_results=self.reduce_results,
             )
 
         if (
@@ -522,7 +543,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                reduce_results=reduce_results,
+                reduce_results=self.reduce_results,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -534,7 +555,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                reduce_results=reduce_results,
+                reduce_results=self.reduce_results,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -617,7 +638,7 @@ class KimiDecoderLayer(nn.Module):
         prefix_delta: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
-        prefix_sum, hidden_states = attn_res(
+        hidden_states = _apply_attn_res(
             prefix_sum,
             block_residual,
             self.self_attention_res_proj,
@@ -626,8 +647,6 @@ class KimiDecoderLayer(nn.Module):
             delta=prefix_delta,
             output_norm=self.input_layernorm,
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
-            # The previous layer's MLP output, left unreduced when deferred.
-            reduce_delta=self.defer_all_reduce,
         )
 
         if self.is_block_write_layer:
@@ -635,13 +654,16 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self._run_self_attn(positions, hidden_states)
 
-        # A None prefix_sum (a block-write layer) is started by this delta.
-        prefix_delta = hidden_states
+        if prefix_sum is None:
+            prefix_sum = hidden_states
+            prefix_delta = None
+        else:
+            prefix_delta = hidden_states
 
         mlp_valid_blocks = self.prev_valid_blocks + (
             1 if self.is_block_write_layer else 0
         )
-        prefix_sum, hidden_states = attn_res(
+        hidden_states = _apply_attn_res(
             prefix_sum,
             block_residual,
             self.mlp_res_proj,
@@ -649,7 +671,6 @@ class KimiDecoderLayer(nn.Module):
             mlp_valid_blocks,
             delta=prefix_delta,
             output_norm=self.post_attention_layernorm,
-            reduce_delta=self.defer_all_reduce,
         )
 
         hidden_states = self.mlp(hidden_states)
@@ -675,11 +696,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         def get_layer(prefix: str):
-            return KimiDecoderLayer(
-                config,
-                vllm_config,
-                prefix,
-            )
+            # VLLM_KIMI_K3_FUSED_ATTN_RES: each AttnRes fused with the all-reduce
+            # that feeds it, in its own layer class.
+            from vllm.models.kimi_k3.amd import fused_attn_res
+
+            if fused_attn_res.enabled(config):
+                return fused_attn_res.KimiDecoderLayerFusedAttnRes(
+                    config, vllm_config, prefix
+                )
+            return KimiDecoderLayer(config, vllm_config, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -821,11 +846,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 prefix_delta=prefix_delta,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
-                if layer.defer_all_reduce:
-                    raise NotImplementedError(
-                        "aux hidden states need the reduced prefix_delta; unset "
-                        "VLLM_ROCM_COMMS_BACKEND for EAGLE"
-                    )
                 self._maybe_add_hidden_state(
                     aux_hidden_states,
                     layer_idx + 1,
@@ -839,14 +859,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        _, hidden_states = attn_res(
+        hidden_states = _apply_attn_res(
             hidden_states,
             residual,
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             attn_res_block_num,
             delta=prefix_delta,
-            reduce_delta=self.layers[self.end_layer - 1].defer_all_reduce,
         )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
