@@ -108,7 +108,10 @@ struct Calibration {
   int64_t one_shot_max_bytes;        // the all-reduce's one-shot/two-shot crossover
   int64_t fused_one_shot_max_bytes;  // the fused ops' one-shot/two-shot crossover
   int fused_one_shot_blocks;         // a fused one-shot's grid, at most (one row a block)
-  int norm_two_shot_blocks;          // the norms' fused two-shot grid, at most
+  int64_t norm_push_max_bytes;       // the norms' two-shot: the push (column) kernel up to it,
+                                     // the pull (row) kernel past it
+  int norm_push_blocks;              // the push two-shot's grid, at most
+  int norm_pull_blocks;              // the pull two-shot's grid, at most
   int attn_res_two_shot_blocks;      // AttnRes's fused two-shot grid, at most
   int fused_threads;                 // a fused kernel's block
   int gemm_tail_blocks;              // the GEMM tail's grid
@@ -129,11 +132,16 @@ constexpr Calibration kGfx950Calibration = {
     128 * kKiB,
     // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
     16,
-    // The column-slice kernel: best at 32-128 tokens, 9.9 / 10.7 / 13.3 us against 36 blocks'
-    // 11.4 at 64 and 15.8 at 128 (2026-09-30T23-10-02Z); 72 was best at 1024 and 4096, all losing.
+    // The push kernel won at 896 KiB (128 tokens of 3584 bf16: 13.3 against 13.7 us unfused) and
+    // lost at 1.75 MiB (19.4 against 18.5; 2026-09-30T23-10-02Z). Not yet swept against the pull.
+    896 * kKiB,
+    // The push kernel: best at 32-128 tokens, 9.9 / 10.7 / 13.3 us against 36 blocks' 11.4 at 64
+    // and 15.8 at 128 (2026-09-30T23-10-02Z).
     128,
-    // The row-slice kernel: 88 (the link-filling grid) lost at prefill, 169.3 against 154.5 us at
-    // 4096 tokens (2026-09-30T21-30-15Z).
+    // The pull kernel: 88 (the link-filling grid) lost at prefill, 169.3 against 154.5 us at 4096
+    // tokens (2026-09-30T21-30-15Z).
+    36,
+    // AttnRes's two-shot (a row kernel, as the pull norm), from the same sweep.
     36,
     // 256 was worse for the GEMM tail (2026-09-28); the norms and AttnRes not swept.
     512,

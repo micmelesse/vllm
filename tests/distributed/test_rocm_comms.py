@@ -204,6 +204,11 @@ SHOTS: tuple[Shot, ...] = get_args(Shot)
 # The fast tier forces each, whatever tune would pick.
 PULL_SHOTS: tuple[Shot, ...] = SHOTS
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
+# THE NORMS' SHOTS: theirs, and the push two-shot (a column split) only they have.
+NormShot = Literal[
+    "all_reduce_pull_one_shot", "all_reduce_pull_two_shot", "all_reduce_push_two_shot"
+]
+NORM_SHOTS: tuple[NormShot, ...] = get_args(NormShot)
 BACKEND_KERNELS = tuple(
     (name, kernel)
     for name in _BACKEND_CLASS
@@ -1304,7 +1309,7 @@ def run_fused_rank(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: Shot,
+    shot: NormShot,
     weight_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
     """ONE rank: run the fused op and the two ops it replaces, and say whether they
@@ -1362,7 +1367,7 @@ def run_fused_rank(
 
 
 def _fused_param(
-    form: str, shape: tuple[int, int], dtype_name: str, shot: Shot, full: bool
+    form: str, shape: tuple[int, int], dtype_name: str, shot: NormShot, full: bool
 ) -> ParameterSet:
     return pytest.param(
         form,
@@ -1381,14 +1386,14 @@ FUSED_CASES = (
         _fused_param(form, shape, "bf16", shot, full=False)
         for form in FORMS
         for shape in FUSED_FAST_SHAPES
-        for shot in PULL_SHOTS
+        for shot in NORM_SHOTS
     ),
     *(
         _fused_param(form, shape, dtype_name, shot, full=True)
         for form in FORMS
         for shape in FUSED_SHAPES
         for dtype_name in DTYPES
-        for shot in SHOTS
+        for shot in NORM_SHOTS
     ),
 )
 
@@ -1398,7 +1403,7 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: Shot,
+    shot: NormShot,
     world: int,
     ranks: World,
 ) -> None:
@@ -1427,7 +1432,7 @@ FP32_WEIGHT_CASES = tuple(
     for form in FORMS
     for shape in ((4, 3584), (128, 7168))
     for dtype_name in DTYPES
-    for shot in SHOTS
+    for shot in NORM_SHOTS
 )
 
 
@@ -1436,7 +1441,7 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: Shot,
+    shot: NormShot,
     world: int,
     ranks: World,
 ) -> None:
@@ -1447,7 +1452,7 @@ def _fused_case(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: Shot,
+    shot: NormShot,
     weight_dtype: torch.dtype | None,
     world: int,
     ranks: World,

@@ -20,14 +20,18 @@ namespace hip_comms {
 constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
 
 // A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
-// and the norms' two-shot all of them (the norms' two-shot slices columns), AttnRes's two-shot its
-// rank's slice. An idle block still pays every barrier (each pairs with its
-// twin on every peer): the norms' two-shot at 32 tokens ran 36 blocks for 4 rows a rank. The GEMM
-// tail's GEMM strides over column tiles, and the plain all-reduce over packs, so both keep theirs.
+// and the push two-shot (it slices columns) all of them, a pull two-shot its rank's slice. An idle
+// block still pays every barrier (each pairs with its twin on every peer): the pull norm at 32
+// tokens ran 36 blocks for 4 rows a rank. The GEMM tail's GEMM strides over column tiles, and the
+// plain all-reduce over packs, so both keep theirs.
+constexpr bool pushes(Kernel k) {
+  return k == Kernel::all_reduce_push_two_shot_rms_norm ||
+         k == Kernel::all_reduce_push_two_shot_add_rms_norm;
+}
 constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
   if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
-  const bool row_slice = is_two_shot(k) && op == Op::all_reduce_add_attn_res_rms_norm;
+  const bool row_slice = is_two_shot(k) && !pushes(k);
   const int64_t mine   = row_slice ? (rows + world - 1) / world : rows;
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }
@@ -91,26 +95,29 @@ constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibra
 // fused grids and block.
 // =================================================================================================
 
-// THE NORMS ALWAYS RUN FUSED, one-shot up to fused_one_shot_max_bytes and two-shot past it: a
-// fusion flag means the fused op runs, and tuning picks among fused kernels, never unfused. The
-// one-shot wins (7.46 against 10.00 us at 1 token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z);
-// the two-shot still loses, at 32-64 tokens by 0.2-0.6 us and at prefill by up to 5.5 at its 36
-// blocks (88 lost more: 169.3 against 148.9 at 4096), so it is the one being worked on.
-constexpr KernelSpec fused_norm(Kernel one_shot, Kernel two_shot, Input in,
+// THE NORMS ALWAYS RUN FUSED: a fusion flag means the fused op runs, and tuning picks among fused
+// kernels, never unfused. The one-shot up to fused_one_shot_max_bytes (7.46 against 10.00 us at 1
+// token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z); the push two-shot (aiter's column split)
+// up to norm_push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
+constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, Input in,
                                 const Calibration& cal) {
-  return bytes(in) <= cal.fused_one_shot_max_bytes
-             ? spec_of(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads)
-             : spec_of(two_shot, in, cal.norm_two_shot_blocks, cal.fused_threads);
+  if (bytes(in) <= cal.fused_one_shot_max_bytes)
+    return spec_of(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads);
+  if (bytes(in) <= cal.norm_push_max_bytes)
+    return spec_of(push, in, cal.norm_push_blocks, cal.fused_threads);
+  return spec_of(pull, in, cal.norm_pull_blocks, cal.fused_threads);
 }
 
 constexpr KernelSpec tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
+                    Kernel::all_reduce_push_two_shot_rms_norm,
                     Kernel::all_reduce_pull_two_shot_rms_norm, in, cal);
 }
 
 constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
                                                   const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
+                    Kernel::all_reduce_push_two_shot_add_rms_norm,
                     Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal);
 }
 

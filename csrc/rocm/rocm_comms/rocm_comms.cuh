@@ -55,6 +55,8 @@ enum class Kernel : int {
   all_reduce_pull_two_shot_add_attn_res_rms_norm = 7,
   all_reduce_pull_one_shot_rms_norm_gemm_add     = 8,
   all_reduce_pull_two_shot_rms_norm_gemm_add     = 9,
+  all_reduce_push_two_shot_rms_norm              = 10,
+  all_reduce_push_two_shot_add_rms_norm          = 11,
 };
 
 struct KernelSpec {

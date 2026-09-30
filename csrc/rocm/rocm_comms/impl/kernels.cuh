@@ -33,6 +33,8 @@ constexpr KernelInfo kKernels[] = {
      true},
     {Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, false},
     {Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, true},
+    {Kernel::all_reduce_push_two_shot_rms_norm, Op::all_reduce_rms_norm, true},
+    {Kernel::all_reduce_push_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 

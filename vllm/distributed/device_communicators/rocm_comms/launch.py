@@ -2,16 +2,16 @@
 # rights reserved.
 
 """WHICH KERNEL, AND HOW WIDE, when a caller forces it: the Python mirror of
-`csrc/rocm/rocm_comms/rocm_comms.cuh`. The model never forces one; the sweep and the tests
-pass a `Launch` with a call."""
+`csrc/rocm/rocm_comms/rocm_comms.cuh`. The model never forces one; the sweep and the
+tests pass a `Launch` with a call."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in rocm_comms.cuh), named
-# by shot and what it fuses; all of them pull (a rank reads its peers). Named only to
-# force one through a `Launch`; nothing else picks.
+# EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in rocm_comms.cuh),
+# named by how it moves data (pull: a rank reads its peers; push: it also writes into
+# them), its shot and what it fuses. Named only to force one through a `Launch`.
 Kernel = Literal[
     "all_reduce_pull_one_shot",
     "all_reduce_pull_two_shot",
@@ -23,6 +23,8 @@ Kernel = Literal[
     "all_reduce_pull_two_shot_add_attn_res_rms_norm",
     "all_reduce_pull_one_shot_rms_norm_gemm_add",
     "all_reduce_pull_two_shot_rms_norm_gemm_add",
+    "all_reduce_push_two_shot_rms_norm",
+    "all_reduce_push_two_shot_add_rms_norm",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i

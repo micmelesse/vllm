@@ -31,6 +31,7 @@
 #include "../kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
+#include "../kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
 
 namespace hip_comms {
 
@@ -154,6 +155,12 @@ inline void launch(Handle& h, const KernelSpec& k, const NormArgs& a, hipStream_
                                  out, res_out, res, weight, a.eps, rows, packs);
             case Kernel::all_reduce_pull_two_shot_add_rms_norm:
               return impl::start(all_reduce_pull_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
+                                 out, res_out, res, weight, a.eps, rows, packs);
+            case Kernel::all_reduce_push_two_shot_rms_norm:
+              return impl::start(all_reduce_push_two_shot_rms_norm<T, W, NG, R>, k, s, p, out,
+                                 weight, a.eps, rows, packs);
+            case Kernel::all_reduce_push_two_shot_add_rms_norm:
+              return impl::start(all_reduce_push_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
                                  out, res_out, res, weight, a.eps, rows, packs);
             default: impl::not_this_ops(k.kernel);
           }
