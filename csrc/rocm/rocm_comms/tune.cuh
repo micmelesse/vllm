@@ -114,20 +114,27 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 constexpr int64_t kFusedOneShotMaxBytes = 128 * kKiB;
 
 // THE NORMS STAY ONE-SHOT TO 128 KiB, past the all-reduce's 64: moved to 64, the fused norm lost at
-// 16 tokens (11.43 against 10.56 us, 2026-09-30T21-06-57Z); its two-shot's untuned 36-block grid
-// and middle barrier cost more than the one-shot's extra reads saved.
-constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in) {
-  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
+// 16 tokens (11.43 against 10.56 us, 2026-09-30T21-06-57Z). THE TWO-SHOT FILLS THE LINKS AS THE
+// ALL-REDUCE DOES (link_filling_blocks, 88 blocks of 512 threads), never more than the rank's rows:
+// capped at 36 it walked 14 rows a block at 4096 tokens and lost prefill by up to 3.7% (154.5
+// against 149.1 us, 2026-09-30T21-25-10Z).
+constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in, const Hardware& hw,
+                               const Calibration& cal) {
+  constexpr int kThreads = 512;
+  return bytes(in) <= kFusedOneShotMaxBytes
+             ? at(one_shot, in, 16, kThreads)
+             : at(two_shot, in, link_filling_blocks(hw, cal, kThreads), kThreads);
 }
 
-constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration&) {
+constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware& hw, const Calibration& cal) {
   return fused_untuned(Kernel::all_reduce_pull_one_shot_rms_norm,
-                       Kernel::all_reduce_pull_two_shot_rms_norm, in);
+                       Kernel::all_reduce_pull_two_shot_rms_norm, in, hw, cal);
 }
 
-constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration&) {
+constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware& hw,
+                                              const Calibration& cal) {
   return fused_untuned(Kernel::all_reduce_pull_one_shot_add_rms_norm,
-                       Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
+                       Kernel::all_reduce_pull_two_shot_add_rms_norm, in, hw, cal);
 }
 
 // A BLOCK A ROW, AND NO MORE BLOCKS THAN ROWS: a block does whole rows, and an idle one still pays
