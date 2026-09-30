@@ -111,10 +111,14 @@ constexpr const Hardware& kDevice = kTarget;
 #endif
 constexpr int kWaveSize = kDevice.wave_size;
 
-// THE DEVICE'S BLOCK LIMIT is every kernel's __launch_bounds__; the ISA report says whether a
-// kernel spills at the registers that leaves it.
-constexpr int kMaxThreads = kDevice.max_workgroup;
-static_assert(vgprs_per_thread(kDevice, kMaxThreads) == 128, "1024 threads leave 128 registers");
+// THE WIDEST BLOCK WE LAUNCH, and every kernel's __launch_bounds__: a bound is a register trade,
+// so it is the widest tuned launch (the fused ops' 512), not the device's 1024. At 1024 a thread
+// gets 128 registers and the row kernels spill (AttnRes at 2 packs a thread, the GEMM tail at
+// any; ISA 2026-09-29T23-48-40Z); at 512 it gets 256.
+constexpr int kMaxThreads = 512;
+static_assert(kMaxThreads <= kDevice.max_workgroup && kMaxThreads % kDevice.wave_size == 0,
+              "the block limit must be whole waves the device can launch");
+static_assert(vgprs_per_thread(kDevice, kMaxThreads) == 256, "512 threads leave 256 registers");
 constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
 
 // Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the

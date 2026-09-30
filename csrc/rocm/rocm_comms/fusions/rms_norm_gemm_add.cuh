@@ -72,7 +72,8 @@ constexpr int64_t lds_per_wave(int lanes_per_col) {
   return int64_t{kRows} * (kWaveSize / lanes_per_col) * sizeof(float);
 }
 constexpr int max_waves(int lanes_per_col) {
-  return lds_max_waves(kDevice, kLdsFixed, lds_per_wave(lanes_per_col));
+  const int fit = lds_max_waves(kDevice, kLdsFixed, lds_per_wave(lanes_per_col));
+  return fit < kMaxWaves ? fit : kMaxWaves;
 }
 constexpr int max_threads(int lanes_per_col) { return max_waves(lanes_per_col) * kWaveSize; }
 static_assert(max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
