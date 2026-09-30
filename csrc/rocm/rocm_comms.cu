@@ -609,12 +609,12 @@ double rocm_comms_peer_read(fptr_t comms, int64_t peer, int64_t bytes, int64_t i
   auto staging = torch::from_blob(group.staging(), {bytes},
                                   torch::TensorOptions().dtype(torch::kUInt8).device(
                                       torch::kCUDA, c10::cuda::current_device()));
-  const p2p::DevComm p = group.dev_comm(staging);
+  const hip_comms::p2p::DevComm p = group.dev_comm(staging);
   auto sink   = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt32).device(
                                      torch::kCUDA, c10::cuda::current_device()));
   auto stream = at::cuda::getCurrentCUDAStream();
   // THE WHOLE DEVICE READING, as a large all-reduce's grid would.
-  void (*kernel)(p2p::DevComm, int, int64_t, uint32_t*) = nullptr;
+  void (*kernel)(hip_comms::p2p::DevComm, int, int64_t, uint32_t*) = nullptr;
   switch (group.world_size()) {
     case 2: kernel = hip_comms::peer_read<c10::BFloat16, 2>; break;
     case 4: kernel = hip_comms::peer_read<c10::BFloat16, 4>; break;
