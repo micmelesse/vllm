@@ -97,16 +97,26 @@ struct Launch {
   int row_packs;
 };
 
-// A PULL ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at
-// powers of two up to 16, which holds a 7168-wide bf16 row (896 packs) at one wave per block.
-constexpr int kRowPacksBuilt[] = {1, 2, 4, 8, 16};
+// A ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at powers
+// of two up to what the op fits in a 512-thread block's 256 registers without spilling (ISA
+// 2026-09-30T00-13-12Z): the norms and the GEMM tail 8, AttnRes 2 (its four float arrays a pack;
+// its two-shot spills at 4). A build past that would only ever run slower, so it is not built.
+constexpr int kRowPacksBuilt[] = {1, 2, 4, 8};
+
+constexpr int max_row_packs(Op op) {
+  switch (op) {
+    case Op::all_reduce: return 0;
+    case Op::all_reduce_add_attn_res_rms_norm: return 2;
+    default: return 8;
+  }
+}
 
 constexpr bool has_row_packs(Kernel k) { return op_of(k) != Op::all_reduce; }
 
-// The smallest build that holds a row of `packs` over `threads`; 0 when none does.
-constexpr int row_packs_for(int64_t packs, int threads) {
+// The smallest build of `op` that holds a row of `packs` over `threads`; 0 when none does.
+constexpr int row_packs_for(Op op, int64_t packs, int threads) {
   for (const int b : kRowPacksBuilt)
-    if (int64_t{b} * threads >= packs) return b;
+    if (b <= max_row_packs(op) && int64_t{b} * threads >= packs) return b;
   return 0;
 }
 

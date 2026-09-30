@@ -185,18 +185,18 @@ Launch checked_launch(const p2p::host::Group& group, const Request& req, Op op,
                            " is not this op's");
 }
 
-// A pull row kernel's row packs as a template argument: f(std::integral_constant<int, k>), one
-// case per kRowPacksBuilt.
-template <typename F>
+// A row kernel's row packs as a template argument: f(std::integral_constant<int, k>), one case
+// per kRowPacksBuilt up to the op's max_row_packs, so no build past what fits is instantiated.
+template <int kMax, typename F>
 void by_row_packs(int k, F&& f) {
   switch (k) {
     case 1: f(std::integral_constant<int, 1>{}); return;
     case 2: f(std::integral_constant<int, 2>{}); return;
-    case 4: f(std::integral_constant<int, 4>{}); return;
-    case 8: f(std::integral_constant<int, 8>{}); return;
-    case 16: f(std::integral_constant<int, 16>{}); return;
-    default: TORCH_CHECK(false, "hip_comms: no row kernel built for ", k, " packs a thread");
+    case 4: if constexpr (kMax >= 4) { f(std::integral_constant<int, 4>{}); return; } break;
+    case 8: if constexpr (kMax >= 8) { f(std::integral_constant<int, 8>{}); return; } break;
+    default: break;
   }
+  TORCH_CHECK(false, "hip_comms: no row kernel built for ", k, " packs a thread");
 }
 
 // ONE CASE PER KERNEL: `CASE_PULL(kernel, args, template args...)` launches the kernel's
@@ -209,7 +209,7 @@ void by_row_packs(int k, F&& f) {
     break;
 #define CASE_PULL_ROWS(KERNEL, ARGS, ...)                                                \
   case Kernel::KERNEL:                                                                   \
-    by_row_packs(l.row_packs, [&](auto r) {                                              \
+    by_row_packs<max_row_packs(op_of(Kernel::KERNEL))>(l.row_packs, [&](auto r) {        \
       constexpr int kR = decltype(r)::value;                                             \
       KERNEL<__VA_ARGS__>                                                                \
           <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(ARGS);                          \
