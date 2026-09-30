@@ -20,7 +20,7 @@ typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
 template <typename V>
-DINLINE V load_global(const V* p) {
+DINLINE V thread_load(const V* p) {
   static_assert(sizeof(V) == 16, "a pack is 16 bytes");
   const u32x4 raw = *(const global_u32x4*)(p);
   V v;
@@ -29,7 +29,7 @@ DINLINE V load_global(const V* p) {
 }
 
 template <typename V>
-DINLINE void store_global(V* p, const V& v) {
+DINLINE void thread_store(V* p, const V& v) {
   static_assert(sizeof(V) == 16, "a pack is 16 bytes");
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
@@ -40,7 +40,7 @@ DINLINE void store_global(V* p, const V& v) {
 // QuickReduce reads what it receives: a peer's stores into this GPU's memory do not reach
 // this GPU's L2, so a plain load could return a line cached before they landed.
 template <typename V>
-DINLINE V load_uncached(const V* p) {
+DINLINE V thread_load_uncached(const V* p) {
   static_assert(sizeof(V) == 16, "a pack is 16 bytes");
   const auto* q     = reinterpret_cast<const uint64_t*>(p);
   const uint64_t raw[2] = {
@@ -52,14 +52,14 @@ DINLINE V load_uncached(const V* p) {
 }
 
 // WHAT A RANK WRITES INTO A PEER, stored past every cache: one 16-byte store at system scope
-// (`sc0 sc1`, written through to the peer), the twin of `load_uncached`. A plain store to a
+// (`sc0 sc1`, written through to the peer), the twin of `thread_load_uncached`. A plain store to a
 // peer's memory can be acknowledged before the peer can see it, so a wave's `s_waitcnt
 // vmcnt(0)` before the barrier did not mean the data had landed, and the slowest rank's
 // writes arrived after its barrier flag (readers read the previous call's values). With the
 // scope bits the same wait covers it. IN ASM because no builtin spells this store: a
 // system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
 template <typename V>
-DINLINE void store_uncached(V* p, const V& v) {
+DINLINE void thread_store_uncached(V* p, const V& v) {
   static_assert(sizeof(V) == 16, "a pack is 16 bytes");
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
@@ -70,13 +70,13 @@ DINLINE void store_uncached(V* p, const V& v) {
 // element type, an fp32 weight's pack is 32 bytes), and a store only of the packs inside the row
 // (stores do not hold up loads, so the guard costs nothing).
 template <int K, typename V>
-DINLINE void load(const V* row, const Fragment<K>& f, V (&out)[K]) {
+DINLINE void thread_load(const V* row, const Fragment<K>& f, V (&out)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) out[k] = row[f.at[k]];
 }
 
 template <int K, typename V>
-DINLINE void store(V* row, const Fragment<K>& f, const V (&v)[K]) {
+DINLINE void thread_store(V* row, const Fragment<K>& f, const V (&v)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k)
     if (f.in[k] != 0.0f) row[f.at[k]] = v[k];

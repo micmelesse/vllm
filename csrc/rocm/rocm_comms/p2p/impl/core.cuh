@@ -242,20 +242,20 @@ DINLINE Self<T, ngpus> self(const DevComm& p) {
 // Pack i of that rank's input for this launch: the pull receive.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_input(const Peer<T, ngpus>& peer, int64_t i) {
-  return load_global(peer.in_ + i);
+  return thread_load(peer.in_ + i);
 }
 
 // Pack i of what that rank left in its scratch, after a barrier that made it visible.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_scratch(const Peer<T, ngpus>& peer, int64_t i) {
-  return load_global(peer.scratch_ + i);
+  return thread_load(peer.scratch_ + i);
 }
 
 // Pack i of this rank's scratch, for its peers to read after a barrier that makes it visible.
 template <typename T, int ngpus>
 DINLINE void write_scratch(const Self<T, ngpus>& self, int64_t i,
                            const typename traits<T>::V& v) {
-  store_global(self.scratch_ + i, v);
+  thread_store(self.scratch_ + i, v);
 }
 
 // WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this

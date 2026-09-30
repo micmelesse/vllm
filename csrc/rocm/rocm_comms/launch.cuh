@@ -103,16 +103,18 @@ struct Launch {
 };
 
 // A ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at powers
-// of two up to what the op fits in a 512-thread block's 256 registers without spilling (ISA
-// 2026-09-30T00-13-12Z): the norms and the GEMM tail 8, AttnRes 2 (its four float arrays a pack;
-// its two-shot spills at 4). A build past that would only ever run slower, so it is not built.
+// of two up to what the op fits in a 512-thread block's 256 registers without spilling: the norms
+// and the GEMM tail 4 (peers_reduce keeps every pack's peer loads in flight together, so 8 packs
+// is 64 loads, the whole register file: ISA 2026-09-30T20-23-38Z), AttnRes 2 (its four float
+// arrays a pack; its two-shot spills at 4). A build past that would only ever run slower, so it is
+// not built; Kimi-K3's rows take 1 or 2 at 512 threads.
 constexpr int kRowPacksBuilt[] = {1, 2, 4, 8};
 
 constexpr int max_row_packs(Op op) {
   switch (op) {
     case Op::all_reduce: return 0;
     case Op::all_reduce_add_attn_res_rms_norm: return 2;
-    default: return 8;
+    default: return 4;
   }
 }
 

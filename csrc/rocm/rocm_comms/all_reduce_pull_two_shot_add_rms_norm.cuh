@@ -62,13 +62,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      unpack<T>(sum[k], s[k]);
+      thread_unpack<T>(sum[k], s[k]);
       if constexpr (kAdd) {
         float r[NL];
-        unpack<T>(res_in[base + f.at[k]], r);
+        thread_unpack<T>(res_in[base + f.at[k]], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.in[k] != 0.0f) p2p::write_scratch(self, res_at + at + f.at[k], round_pack<T>(s[k]));
+        if (f.in[k] != 0.0f) p2p::write_scratch(self, res_at + at + f.at[k], thread_pack<T>(s[k]));
       }
     }
     float ss[1] = {thread_dot(s, s, f)};
@@ -108,8 +108,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;
         if (row >= rows) continue;
-        store_global(o + int64_t{row} * packs + i, got[r]);
-        if constexpr (kAdd) store_global(res_out + int64_t{row} * packs + i, got_res[r]);
+        thread_store(o + int64_t{row} * packs + i, got[r]);
+        if constexpr (kAdd) thread_store(res_out + int64_t{row} * packs + i, got_res[r]);
       }
     }
   }

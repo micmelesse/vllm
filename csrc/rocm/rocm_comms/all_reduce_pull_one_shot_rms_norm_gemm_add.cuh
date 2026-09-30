@@ -46,18 +46,18 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     //   out = T(T(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(T(sum over ranks))
     float s[kRowPacks][NL];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) unpack<T>(sum[k], s[k]);
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
     float ss[1] = {thread_dot(s, s, f)};
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       float w[NL], x[NL];
-      unpack<T>(weight[f.at[k]], w);
+      thread_unpack<T>(weight[f.at[k]], w);
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];
-      if (f.in[k] != 0.0f) store_global(normed + base + f.at[k], round_pack<T>(x));
+      if (f.in[k] != 0.0f) thread_store(normed + base + f.at[k], thread_pack<T>(x));
     }
   }
 

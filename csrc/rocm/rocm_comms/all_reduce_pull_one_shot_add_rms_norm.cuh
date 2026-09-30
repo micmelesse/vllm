@@ -53,13 +53,13 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      unpack<T>(sum[k], s[k]);
+      thread_unpack<T>(sum[k], s[k]);
       if constexpr (kAdd) {
         float r[NL];
-        unpack<T>(res_in[base + f.at[k]], r);
+        thread_unpack<T>(res_in[base + f.at[k]], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.in[k] != 0.0f) res_out[base + f.at[k]] = round_pack<T>(s[k]);
+        if (f.in[k] != 0.0f) res_out[base + f.at[k]] = thread_pack<T>(s[k]);
       }
     }
     float ss[1] = {thread_dot(s, s, f)};

@@ -68,7 +68,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       } else {
         new_prefix[k] = sum[k];
       }
-      unpack<T>(new_prefix[k], u[k]);
+      thread_unpack<T>(new_prefix[k], u[k]);
       if (f.in[k] != 0.0f) {
         pre[base + f.at[k]] = new_prefix[k];
         if (V* dst = written(row)) dst[f.at[k]] = new_prefix[k];
@@ -86,8 +86,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) {
         float a[NL], b[NL];
-        unpack<T>(reinterpret_cast<const V*>(norm_w)[f.at[k]], a);
-        unpack<T>(reinterpret_cast<const V*>(qk_w)[f.at[k]], b);
+        thread_unpack<T>(reinterpret_cast<const V*>(norm_w)[f.at[k]], a);
+        thread_unpack<T>(reinterpret_cast<const V*>(qk_w)[f.at[k]], b);
 #pragma unroll
         for (int j = 0; j < NL; ++j) {
           w[k][j] = a[j] * b[j];
@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         if (src < num_blocks) {
           const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
 #pragma unroll
-          for (int k = 0; k < kRowPacks; ++k) unpack<T>(at_src[f.at[k]], v[k]);
+          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[k]);
         } else {
 #pragma unroll
           for (int k = 0; k < kRowPacks; ++k)
@@ -139,11 +139,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       V result;
       if (out_norm_w != nullptr) {
         float g[NL];
-        unpack<T>(reinterpret_cast<const V*>(out_norm_w)[f.at[k]], g);
+        thread_unpack<T>(reinterpret_cast<const V*>(out_norm_w)[f.at[k]], g);
 #pragma unroll
         for (int j = 0; j < NL; ++j) result.d[j] = static_cast<T>(m[k][j] * scale * g[j]);
       } else {
-        result = round_pack<T>(m[k]);
+        result = thread_pack<T>(m[k]);
       }
       if (f.in[k] != 0.0f) o[base + f.at[k]] = result;
     }

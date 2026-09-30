@@ -12,13 +12,13 @@ namespace hip_comms {
 
 // A pack as fp32, and fp32 rounded once back to a pack of T.
 template <typename T>
-DINLINE void unpack(const typename traits<T>::V& v, float (&x)[traits<T>::N]) {
+DINLINE void thread_unpack(const typename traits<T>::V& v, float (&x)[traits<T>::N]) {
 #pragma unroll
   for (int j = 0; j < traits<T>::N; ++j) x[j] = static_cast<float>(v.d[j]);
 }
 
 template <typename T>
-DINLINE typename traits<T>::V round_pack(const float (&x)[traits<T>::N]) {
+DINLINE typename traits<T>::V thread_pack(const float (&x)[traits<T>::N]) {
   typename traits<T>::V v;
 #pragma unroll
   for (int j = 0; j < traits<T>::N; ++j) v.d[j] = static_cast<T>(x[j]);

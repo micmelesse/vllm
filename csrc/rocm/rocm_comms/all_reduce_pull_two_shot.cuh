@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   V* dst = reinterpret_cast<V*>(out);
   for (int i = first; i < slice_packs; i += stride)
     if (peer * slice_packs + i < num_packs)
-      store_global(dst + peer * slice_packs + i, p2p::read_scratch(them, i));
+      thread_store(dst + peer * slice_packs + i, p2p::read_scratch(them, i));
 }
 
 }  // namespace hip_comms
