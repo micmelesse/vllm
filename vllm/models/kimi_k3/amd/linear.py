@@ -286,11 +286,11 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
-    @property
-    def output_is_reduced(self) -> bool:
+    def output_is_reduced(self, num_tokens: int) -> bool:
         """Whether this MoE's output leaves already all-reduced (its latent tail ran as
         one all-reduce), so the AttnRes that consumes it must not reduce it again."""
-        return getattr(self.experts, "output_is_reduced", False)
+        reduced = getattr(self.experts, "output_is_reduced", None)
+        return reduced is not None and reduced(num_tokens)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -616,11 +616,10 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-    @property
-    def mlp_output_reduced(self) -> bool:
+    def mlp_output_reduced(self, num_tokens: int) -> bool:
         """Whether this layer's MLP output leaves already all-reduced; the model hands
         that to the next layer as `prefix_delta_reduced`."""
-        return isinstance(self.mlp, KimiMoE) and self.mlp.output_is_reduced
+        return isinstance(self.mlp, KimiMoE) and self.mlp.output_is_reduced(num_tokens)
 
     def forward_attn_residual(
         self,
@@ -836,7 +835,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 prefix_delta=prefix_delta,
                 prefix_delta_reduced=prefix_delta_reduced,
             )
-            prefix_delta_reduced = layer.mlp_output_reduced
+            prefix_delta_reduced = layer.mlp_output_reduced(hidden_states.size(0))
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if layer.defer_all_reduce:
                     raise NotImplementedError(

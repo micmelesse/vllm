@@ -38,6 +38,8 @@ HIDDEN_SIZE = 7168
 LATENT_SIZE = 3584
 EPS = 1e-5
 DTYPE = torch.bfloat16
+# The one-all-reduce tail's bound, a decode batch (the scheduler's max_num_seqs).
+DECODE_MAX_TOKENS = 128
 
 
 def _build_transform(device: torch.device) -> KimiRoutedOutputTransform:
@@ -69,6 +71,7 @@ def _tail_runner(
         "routed_output_transform": transform,
         "_up_proj_shard_size": HIDDEN_SIZE // tp_size,
         "_tail_shardable": True,
+        "_one_all_reduce_max_tokens": DECODE_MAX_TOKENS,
         "_logged_sharded_tail": False,
         "moe_config": SimpleNamespace(
             tp_size=tp_size,
@@ -174,7 +177,7 @@ def _check_one_all_reduce_matches_replicated(
     transform = _build_transform(device)
     runner = _tail_runner(transform, tp_size)
     group = get_tp_group().device_group
-    assert runner.output_is_reduced
+    assert runner.output_is_reduced(1)
 
     for iteration, num_tokens in enumerate((1, 5, 8, 16, 5)):
         torch.manual_seed(100 * iteration + rank + 1)
@@ -248,26 +251,38 @@ def test_one_all_reduce_tail_tp8_matches_replicated_projection() -> None:
 
 
 @pytest.mark.parametrize(
+    "num_tokens", [1, DECODE_MAX_TOKENS, DECODE_MAX_TOKENS + 1, 4096]
+)
+@pytest.mark.parametrize(
     "fusion", ["none", "rms_norm", "one_all_reduce", "attn_res+one_all_reduce"]
 )
 @pytest.mark.parametrize("shardable", [True, False])
 @pytest.mark.parametrize("pre_reduced", [True, False])
 def test_output_is_reduced_only_for_the_one_all_reduce_tail(
     fusion: str,
+    num_tokens: int,
     shardable: bool,
     pre_reduced: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reduced output means the consumer skips its all-reduce: claimed wrongly, the
-    layer's output is off by a factor of the TP size, or never summed."""
+    layer's output is off by a factor of the TP size, or never summed. Only a decode
+    batch takes the one-all-reduce tail; a prefill batch keeps the two."""
     monkeypatch.setenv("VLLM_KIMI_K3_FUSION", fusion)
     monkeypatch.setattr(
         ROCmLatentMoERunner, "_fused_output_is_reduced", property(lambda _: pre_reduced)
     )
-    runner = _runner(_tail_shardable=shardable)
+    runner = _runner(
+        _tail_shardable=shardable, _one_all_reduce_max_tokens=DECODE_MAX_TOKENS
+    )
 
-    expected = "one_all_reduce" in fusion and shardable and not pre_reduced
-    assert runner.output_is_reduced is expected
+    expected = (
+        "one_all_reduce" in fusion
+        and num_tokens <= DECODE_MAX_TOKENS
+        and shardable
+        and not pre_reduced
+    )
+    assert runner.output_is_reduced(num_tokens) is expected
 
 
 def _runner(**attrs) -> ROCmLatentMoERunner:
