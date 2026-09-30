@@ -31,15 +31,16 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
   V* normed              = reinterpret_cast<V*>(workspace);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+
+  // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
+  // scratch (the ISA gate, 2026-09-30).
   p2p::Peer<T, ngpus> all[ngpus];
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
   const auto self = p2p::self<T, ngpus>(p);
-
-  // 1. Wait until every peer has launched, so its input is ready.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.

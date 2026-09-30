@@ -37,15 +37,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
 
-  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+
+  // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
+  // scratch (the ISA gate, 2026-09-30).
   p2p::Peer<T, ngpus> all[ngpus];
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
   const auto self = p2p::self<T, ngpus>(p);
-
-  // 1. Wait until every peer has launched, so its input is ready.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
   //    result in this rank's scratch.
