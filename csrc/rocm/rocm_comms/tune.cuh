@@ -85,12 +85,12 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
 }
 
 // =================================================================================================
-// THE FUSED OPS, NOT YET SWEPT: pull one-shot up to 512 KiB at 16 blocks, pull two-shot past it at
-// 36, 512 threads each, as the 2026-09-27 microbench chose (one-shot 12.9 vs two-shot 27.1 us at
-// 16 x 7168), until each is measured the way the all-reduce was.
+// THE FUSED OPS, NOT YET SWEPT: pull one-shot at 16 blocks, pull two-shot at 36, 512 threads each.
+// ONE-SHOT UP TO 128 KiB, as the all-reduce: the fused rms_norm's one-shot took 21.9 us at 458 KB
+// (64 x 3584) where its two-shot took 14.6 at twice that (bench 2026-09-30T00-59-06Z).
 // =================================================================================================
 
-constexpr int64_t kFusedOneShotMaxBytes = 512 * kKiB;
+constexpr int64_t kFusedOneShotMaxBytes = 128 * kKiB;
 
 constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in) {
   return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
