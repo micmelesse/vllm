@@ -7,11 +7,7 @@
 #pragma once
 
 #include "p2p/p2p.cuh"
-#include "common/dot.cuh"
-#include "common/elementwise.cuh"
-#include "common/memory.cuh"
-#include "common/reduce.cuh"
-#include "common/utils.cuh"
+#include "common/common.cuh"
 #include "launch.cuh"
 
 namespace hip_comms {
@@ -52,7 +48,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     // The AttnRes, rounding as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
     //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
     //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u
-    //   m = softmax(logits) . sources, online, one source at a time; out = T(m), or
+    //   m = softmax(logits) . sources, online, four sources a tile; out = T(m), or
     //   T(m * rsqrt(mean(m^2) + out_eps) * out_w)
     const T* row_blocks = blocks + int64_t{row} * block_stride_m;
     float u[kRowPacks][NL];
@@ -94,32 +90,62 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
           m[k][j] = 0.0f;
         }
       }
+      // THE SOURCES FOUR AT A TIME (Triton's tile): every load of a tile issued together, one
+      // block_reduce for the tile's eight sums, an online softmax across tiles. One reduction a
+      // source was ten passes for ten sources; all ten at once held too many registers.
+      constexpr int kTile = 4;
+      const int last      = num_blocks - 1;  // num_blocks > 0 here
       float max_logit = -INFINITY, denominator = 0.0f;
-      for (int src = 0; src <= num_blocks; ++src) {
-        // The stored blocks first, the prefix last, as the reference orders its sources.
-        float v[kRowPacks][NL];
-        if (src < num_blocks) {
-          const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
+      for (int t0 = 0; t0 <= num_blocks; t0 += kTile) {
+        // The stored blocks first, the prefix last (source num_blocks), as the reference orders
+        // them. A slot past the prefix reads the last block again and counts zero.
+        float v[kTile][kRowPacks][NL];
 #pragma unroll
-          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[k]);
-        } else {
+        for (int s = 0; s < kTile; ++s) {
+          const int src      = t0 + s;
+          const int slot     = src < last ? src : last;
+          const V* at_src    = reinterpret_cast<const V*>(row_blocks + slot * block_stride_r);
+          const bool block   = src < num_blocks;
+          const bool prefix  = src == num_blocks;
 #pragma unroll
-          for (int k = 0; k < kRowPacks; ++k)
+          for (int k = 0; k < kRowPacks; ++k) {
+            float x[NL];
+            thread_unpack<T>(thread_load(at_src + f.at[k]), x);
 #pragma unroll
-            for (int j = 0; j < NL; ++j) v[k][j] = u[k][j];
+            for (int j = 0; j < NL; ++j) v[s][k][j] = block ? x[j] : (prefix ? u[k][j] : 0.0f);
+          }
         }
-        float sums[2] = {thread_dot(v, v, f), thread_dot(v, w, f)};
+        float sums[2 * kTile];
+#pragma unroll
+        for (int s = 0; s < kTile; ++s) {
+          sums[2 * s]     = thread_dot(v[s], v[s], f);
+          sums[2 * s + 1] = thread_dot(v[s], w, f);
+        }
         block_reduce<Sum>(sums);
-        const float logit      = sums[1] * rsqrtf(sums[0] * inv_hidden + eps);
-        const float new_max    = fmaxf(max_logit, logit);
-        const float old_scale  = __expf(max_logit - new_max);
-        const float this_scale = __expf(logit - new_max);
-        denominator            = denominator * old_scale + this_scale;
-        max_logit              = new_max;
+        float logit[kTile];
+        float tile_max = -INFINITY;
+#pragma unroll
+        for (int s = 0; s < kTile; ++s) {
+          logit[s] = sums[2 * s + 1] * rsqrtf(sums[2 * s] * inv_hidden + eps);
+          if (t0 + s <= num_blocks) tile_max = fmaxf(tile_max, logit[s]);
+        }
+        const float new_max   = fmaxf(max_logit, tile_max);
+        const float old_scale = __expf(max_logit - new_max);
+        denominator *= old_scale;
 #pragma unroll
         for (int k = 0; k < kRowPacks; ++k)
 #pragma unroll
-          for (int j = 0; j < NL; ++j) m[k][j] = m[k][j] * old_scale + this_scale * v[k][j];
+          for (int j = 0; j < NL; ++j) m[k][j] *= old_scale;
+#pragma unroll
+        for (int s = 0; s < kTile; ++s) {
+          const float e = t0 + s <= num_blocks ? __expf(logit[s] - new_max) : 0.0f;
+          denominator += e;
+#pragma unroll
+          for (int k = 0; k < kRowPacks; ++k)
+#pragma unroll
+            for (int j = 0; j < NL; ++j) m[k][j] += e * v[s][k][j];
+        }
+        max_logit = new_max;
       }
       const float inv_den = 1.0f / denominator;
 #pragma unroll

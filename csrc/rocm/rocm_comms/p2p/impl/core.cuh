@@ -20,7 +20,7 @@
 #include <array>
 #include <cstdint>
 
-#include "../../common/memory.cuh"
+#include "../../common/common.cuh"
 #include "peers.cuh"
 
 namespace hip_comms::p2p {

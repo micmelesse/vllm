@@ -8,6 +8,10 @@
 
 #pragma once
 
+#ifndef HIP_COMMS_COMMON_INTERFACE
+#error "include common/common.cuh, common's one interface, not its parts"
+#endif
+
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -66,20 +70,27 @@ DINLINE void thread_store_uncached(V* p, const V& v) {
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
-// A FRAGMENT'S LOAD AND STORE: every load issued (a pack past the row reads the last one; any
-// element type, an fp32 weight's pack is 32 bytes), and a store only of the packs inside the row
-// (stores do not hold up loads, so the guard costs nothing).
+// A FRAGMENT'S LOAD AND STORE: every load issued (a pack past the row reads the last one), and a
+// store only of the packs inside the row (stores do not hold up loads, so the guard costs
+// nothing). A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's
+// pack is 32 bytes and loads as the compiler chooses.
 template <int K, typename V>
 DINLINE void thread_load(const V* row, const Fragment<K>& f, V (&out)[K]) {
 #pragma unroll
-  for (int k = 0; k < K; ++k) out[k] = row[f.at[k]];
+  for (int k = 0; k < K; ++k) {
+    if constexpr (sizeof(V) == 16) out[k] = thread_load(row + f.at[k]);
+    else out[k] = row[f.at[k]];
+  }
 }
 
 template <int K, typename V>
 DINLINE void thread_store(V* row, const Fragment<K>& f, const V (&v)[K]) {
 #pragma unroll
-  for (int k = 0; k < K; ++k)
-    if (f.in[k] != 0.0f) row[f.at[k]] = v[k];
+  for (int k = 0; k < K; ++k) {
+    if (f.in[k] == 0.0f) continue;
+    if constexpr (sizeof(V) == 16) thread_store(row + f.at[k], v[k]);
+    else row[f.at[k]] = v[k];
+  }
 }
 
 }  // namespace hip_comms

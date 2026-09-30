@@ -8,11 +8,7 @@
 #pragma once
 
 #include "p2p/p2p.cuh"
-#include "common/utils.cuh"
-#include "common/memory.cuh"
-#include "common/dot.cuh"
-#include "common/elementwise.cuh"
-#include "common/reduce.cuh"
+#include "common/common.cuh"
 
 namespace hip_comms {
 

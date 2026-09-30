@@ -10,8 +10,7 @@
 #include <climits>
 #include <cstdint>
 
-#include "common/dot.cuh"
-#include "common/utils.cuh"
+#include "common/common.cuh"
 #include "hardware.cuh"
 
 namespace hip_comms {

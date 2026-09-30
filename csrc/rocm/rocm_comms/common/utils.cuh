@@ -6,6 +6,10 @@
 
 #pragma once
 
+#ifndef HIP_COMMS_COMMON_INTERFACE
+#error "include common/common.cuh, common's one interface, not its parts"
+#endif
+
 #include <hip/hip_runtime.h>
 
 #include <cstdint>

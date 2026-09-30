@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-#include "common/utils.cuh"
+#include "common/common.cuh"
 #include "hardware.cuh"
 #include "launch.cuh"
 #include "p2p/p2p.cuh"

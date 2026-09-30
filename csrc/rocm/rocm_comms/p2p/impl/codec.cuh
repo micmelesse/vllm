@@ -11,7 +11,7 @@
 #error "include p2p/p2p.cuh, p2p's one interface, not its parts"
 #endif
 
-#include "../../common/utils.cuh"
+#include "../../common/common.cuh"
 
 namespace hip_comms::p2p {
 
