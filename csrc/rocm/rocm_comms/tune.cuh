@@ -24,8 +24,8 @@ struct Input {
   int64_t hidden;  // a row's length, in elements
   int elem_bytes;  // 2 for bf16 and fp16
   int64_t cols;    // the GEMM tail's output columns (its weight is [cols, hidden]); 0 without one
-  int quant_bits;  // the precision the caller accepts on the wire: 16 (exact), 8 or 4. A push
-                   // kernel's codec, passed through untouched; the pull kernels move T itself.
+  int quant_bits;  // the precision the caller accepts on the wire: 16 (exact), 8 or 4. No kernel
+                   // quantizes yet (p2p's Codec is the format one will use), so only 16 runs.
   int world;       // ranks in the group
 };
 
@@ -63,8 +63,7 @@ constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0, 0}; }
 // PULL ONE-SHOT UP TO 128 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
 // whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. One-shot won at
 // 112 KiB (10.12 vs 10.67 us), two-shot at 224 KiB (10.96 vs 13.13); the lines cross near 135 KiB.
-// To be derived from the link's latency and bandwidth once hardware.cuh carries them. Push is
-// parked (2x pull at 1 token, BACKLOG).
+// To be derived from the link's latency and bandwidth once hardware.cuh carries them.
 // =================================================================================================
 
 constexpr int64_t kPullOneShotMaxBytes = 128 * kKiB;

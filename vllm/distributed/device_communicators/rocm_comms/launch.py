@@ -10,29 +10,19 @@ from dataclasses import dataclass
 from typing import Literal
 
 # EVERY KERNEL THERE IS, as C++ numbers them (`enum class Kernel` in launch.cuh), named
-# by shot, direction (pull reads peers, push writes into them) and what it fuses. Named
-# only to force one through a `Launch`; nothing else picks.
+# by shot and what it fuses; all of them pull (a rank reads its peers). Named only to
+# force one through a `Launch`; nothing else picks.
 Kernel = Literal[
     "all_reduce_pull_one_shot",
-    "all_reduce_push_one_shot",
     "all_reduce_pull_two_shot",
-    "all_reduce_push_two_shot",
     "all_reduce_pull_one_shot_rms_norm",
-    "all_reduce_push_one_shot_rms_norm",
     "all_reduce_pull_two_shot_rms_norm",
-    "all_reduce_push_two_shot_rms_norm",
     "all_reduce_pull_one_shot_add_rms_norm",
-    "all_reduce_push_one_shot_add_rms_norm",
     "all_reduce_pull_two_shot_add_rms_norm",
-    "all_reduce_push_two_shot_add_rms_norm",
     "all_reduce_pull_one_shot_add_attn_res_rms_norm",
-    "all_reduce_push_one_shot_add_attn_res_rms_norm",
     "all_reduce_pull_two_shot_add_attn_res_rms_norm",
-    "all_reduce_push_two_shot_add_attn_res_rms_norm",
     "all_reduce_pull_one_shot_rms_norm_gemm_add",
-    "all_reduce_push_one_shot_rms_norm_gemm_add",
     "all_reduce_pull_two_shot_rms_norm_gemm_add",
-    "all_reduce_push_two_shot_rms_norm_gemm_add",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i

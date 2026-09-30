@@ -4,7 +4,7 @@
 // THE COMPUTATION of all-reduce + RMSNorm + GEMM-add, the tail of Kimi-K3's latent MoE
 // (`fused_all_reduce.latent_tail`), in its two stages: `norm_row` on a row already reduced
 // over ranks, then (after the kernel's barrier: the GEMM reads every normed row) `gemm`.
-// Every rms_norm_gemm_add kernel, pull or push.
+// Every rms_norm_gemm_add kernel.
 
 #pragma once
 

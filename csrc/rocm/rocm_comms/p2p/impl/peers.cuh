@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE CONTRACT between p2p's two sides, behind p2p.cuh: what the host (host.cuh) maps and
-// fills, and what a kernel (core.cuh, push.cuh) reads. Plain data only.
+// fills, and what a kernel (core.cuh) reads. Plain data only.
 
 #pragma once
 
@@ -21,10 +21,6 @@ namespace hip_comms::p2p {
 
 constexpr int kMaxRanks  = 8;
 constexpr int kMaxBlocks = 64;
-
-// A PUSH GROUP: the packs a push thread moves per peer between waits, and its codec's unit, 32
-// values of a 2-byte T under one fp32 scale (QuickReduce's). Push alone reads it.
-constexpr int kPushGroupPacks = 4;
 
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
 // the bytes after the struct.
@@ -62,17 +58,5 @@ struct Peers {
   int64_t scratch_packs;       // of each rank's scratch
   uint64_t timeout_ticks;      // a wait longer than this traps
 };
-
-// THE SLOT SIZE, in packs, which the host needs to size scratch and push.cuh lays out on
-// the device (they must agree). A push slot holds, per source rank, a group
-// per lane per unit it holds (`held`: every unit for To::all, the local units for
-// To::owners) at kbits (16: T itself), then the scales of a scaled codec.
-
-inline int64_t push_slot_packs(int kbits, int64_t held, int lanes, int world) {
-  const int64_t groups  = held * lanes;
-  const int64_t payload = kPushGroupPacks * 8 * kbits / 8 / 16;
-  const int64_t scales  = kbits < 16 ? (groups + 3) / 4 : 0;
-  return int64_t{world} * (groups * payload + scales);
-}
 
 }  // namespace hip_comms::p2p

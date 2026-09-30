@@ -271,9 +271,9 @@ class HipCommunicator(Communicator):
         cols: int = 0,
     ) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits
-        in registers at that kernel's width, and its scratch fits (a push kernel holds
-        every rank's slice). The plain all-reduce is one flat row, as C++ launches
-        it; `cols` is the GEMM tail's output columns, which shape its launch."""
+        in registers at that kernel's width, and its scratch fits. The plain all-reduce
+        is one flat row, as C++ launches it; `cols` is the GEMM tail's output columns,
+        which shape its launch."""
         if op == "all_reduce":
             rows, hidden = 1, inp.numel()
         elif inp.dim() == 2:

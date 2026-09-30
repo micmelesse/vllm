@@ -2,8 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // HOW A PACK IS LOADED AND STORED, each pair with who can see a store and when: the global
-// pair for this GPU's memory and a peer's read after a sync, the uncached pair for what a push
-// kernel writes into a peer and the peer reads back. A store is only as visible as its pair
+// pair for this GPU's memory and a peer's read after a sync, the uncached pair for what a rank
+// writes into a peer and the peer reads back (no kernel does today; a remote write must). A store is only as visible as its pair
 // says; the loads are the stores' readers.
 
 #pragma once
@@ -51,11 +51,11 @@ DINLINE V load_uncached(const V* p) {
   return v;
 }
 
-// WHAT A RANK PUSHES into a peer, stored past every cache: one 16-byte store at system scope
+// WHAT A RANK WRITES INTO A PEER, stored past every cache: one 16-byte store at system scope
 // (`sc0 sc1`, written through to the peer), the twin of `load_uncached`. A plain store to a
 // peer's memory can be acknowledged before the peer can see it, so a wave's `s_waitcnt
 // vmcnt(0)` before the barrier did not mean the data had landed, and the slowest rank's
-// pushes arrived after its barrier flag (readers read the previous call's values). With the
+// writes arrived after its barrier flag (readers read the previous call's values). With the
 // scope bits the same wait covers it. IN ASM because no builtin spells this store: a
 // system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
 template <typename V>

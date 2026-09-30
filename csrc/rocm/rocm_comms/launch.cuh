@@ -24,34 +24,21 @@ enum class Op : int {
   all_reduce_rms_norm_gemm_add     = 4,
 };
 
-// Every `__global__` there is, once, named by its direction, its shot and what it fuses.
-// `none` is a decline: the caller runs the unfused ops.
-//   PULL: a rank reads its peers' buffers (inputs, or scratch they filled)
-//   PUSH: a rank writes into its peers' inboxes and reads only its own memory; the push
-//         kernels take a Codec, so they are the quantized ones
-// Each op has all four: one- and two-shot, pull and push.
+// Every `__global__` there is, once, named by its shot and what it fuses; all of them pull (a rank
+// reads its peers' buffers: their inputs, or scratch they filled). `none` is a decline: the caller
+// runs the unfused ops. Each op has a one-shot and a two-shot.
 enum class Kernel : int {
   none                                           = -1,
   all_reduce_pull_one_shot                       = 0,
-  all_reduce_push_one_shot                       = 1,
-  all_reduce_pull_two_shot                       = 2,
-  all_reduce_push_two_shot                       = 3,
-  all_reduce_pull_one_shot_rms_norm              = 4,
-  all_reduce_push_one_shot_rms_norm              = 5,
-  all_reduce_pull_two_shot_rms_norm              = 6,
-  all_reduce_push_two_shot_rms_norm              = 7,
-  all_reduce_pull_one_shot_add_rms_norm          = 8,
-  all_reduce_push_one_shot_add_rms_norm          = 9,
-  all_reduce_pull_two_shot_add_rms_norm          = 10,
-  all_reduce_push_two_shot_add_rms_norm          = 11,
-  all_reduce_pull_one_shot_add_attn_res_rms_norm = 12,
-  all_reduce_push_one_shot_add_attn_res_rms_norm = 13,
-  all_reduce_pull_two_shot_add_attn_res_rms_norm = 14,
-  all_reduce_push_two_shot_add_attn_res_rms_norm = 15,
-  all_reduce_pull_one_shot_rms_norm_gemm_add     = 16,
-  all_reduce_push_one_shot_rms_norm_gemm_add     = 17,
-  all_reduce_pull_two_shot_rms_norm_gemm_add     = 18,
-  all_reduce_push_two_shot_rms_norm_gemm_add     = 19,
+  all_reduce_pull_two_shot                       = 1,
+  all_reduce_pull_one_shot_rms_norm              = 2,
+  all_reduce_pull_two_shot_rms_norm              = 3,
+  all_reduce_pull_one_shot_add_rms_norm          = 4,
+  all_reduce_pull_two_shot_add_rms_norm          = 5,
+  all_reduce_pull_one_shot_add_attn_res_rms_norm = 6,
+  all_reduce_pull_two_shot_add_attn_res_rms_norm = 7,
+  all_reduce_pull_one_shot_rms_norm_gemm_add     = 8,
+  all_reduce_pull_two_shot_rms_norm_gemm_add     = 9,
 };
 
 // The GEMM tail's one-shot kernel takes one GEMM pass: at most this many rows.
@@ -61,39 +48,22 @@ constexpr int kGemmTailOneShotRows = fusions::rms_norm_gemm_add::kRows;
 struct KernelInfo {
   Kernel kernel;
   Op op;
-  bool push;
   bool two_shot;
 };
 
 constexpr KernelInfo kKernels[] = {
-    {Kernel::all_reduce_pull_one_shot, Op::all_reduce, false, false},
-    {Kernel::all_reduce_push_one_shot, Op::all_reduce, true, false},
-    {Kernel::all_reduce_pull_two_shot, Op::all_reduce, false, true},
-    {Kernel::all_reduce_push_two_shot, Op::all_reduce, true, true},
-    {Kernel::all_reduce_pull_one_shot_rms_norm, Op::all_reduce_rms_norm, false, false},
-    {Kernel::all_reduce_push_one_shot_rms_norm, Op::all_reduce_rms_norm, true, false},
-    {Kernel::all_reduce_pull_two_shot_rms_norm, Op::all_reduce_rms_norm, false, true},
-    {Kernel::all_reduce_push_two_shot_rms_norm, Op::all_reduce_rms_norm, true, true},
-    {Kernel::all_reduce_pull_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false, false},
-    {Kernel::all_reduce_push_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true, false},
-    {Kernel::all_reduce_pull_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false, true},
-    {Kernel::all_reduce_push_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true, true},
-    {Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     Op::all_reduce_add_attn_res_rms_norm, false, false},
-    {Kernel::all_reduce_push_one_shot_add_attn_res_rms_norm,
-     Op::all_reduce_add_attn_res_rms_norm, true, false},
-    {Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     Op::all_reduce_add_attn_res_rms_norm, false, true},
-    {Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     Op::all_reduce_add_attn_res_rms_norm, true, true},
-    {Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     Op::all_reduce_rms_norm_gemm_add, false, false},
-    {Kernel::all_reduce_push_one_shot_rms_norm_gemm_add,
-     Op::all_reduce_rms_norm_gemm_add, true, false},
-    {Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     Op::all_reduce_rms_norm_gemm_add, false, true},
-    {Kernel::all_reduce_push_two_shot_rms_norm_gemm_add,
-     Op::all_reduce_rms_norm_gemm_add, true, true},
+    {Kernel::all_reduce_pull_one_shot, Op::all_reduce, false},
+    {Kernel::all_reduce_pull_two_shot, Op::all_reduce, true},
+    {Kernel::all_reduce_pull_one_shot_rms_norm, Op::all_reduce_rms_norm, false},
+    {Kernel::all_reduce_pull_two_shot_rms_norm, Op::all_reduce_rms_norm, true},
+    {Kernel::all_reduce_pull_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false},
+    {Kernel::all_reduce_pull_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true},
+    {Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
+     false},
+    {Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
+     true},
+    {Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, false},
+    {Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, true},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 
@@ -106,19 +76,18 @@ static_assert(kernels_in_order(), "kKernels must list every Kernel in its order"
 
 constexpr const KernelInfo& info(Kernel k) { return kKernels[static_cast<int>(k)]; }
 constexpr Op op_of(Kernel k) { return info(k).op; }
-constexpr bool is_push(Kernel k) { return info(k).push; }
 constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
 
 // The op's kernel of that direction and shot; none where it has none.
-constexpr Kernel kernel_of(Op op, bool push, bool two_shot) {
+constexpr Kernel kernel_of(Op op, bool two_shot) {
   for (const KernelInfo& i : kKernels)
-    if (i.op == op && i.two_shot == two_shot && i.push == push) return i.kernel;
+    if (i.op == op && i.two_shot == two_shot) return i.kernel;
   return Kernel::none;
 }
 
 // What runs: the kernel, its grid and block, for the GEMM tail its lanes per column (0 for
-// every other kernel), for a push kernel its codec's bits (16: T itself), and for a pull row
-// kernel the packs of its row each thread holds (0 for every other kernel).
+// every other kernel), the precision the caller accepts (16: T itself; no kernel quantizes yet),
+// and for a row kernel the packs of its row each thread holds (0 for every other kernel).
 struct Launch {
   Kernel kernel;
   int grid;
@@ -130,10 +99,9 @@ struct Launch {
 
 // A PULL ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at
 // powers of two up to 16, which holds a 7168-wide bf16 row (896 packs) at one wave per block.
-// The push kernels hold a row in push groups instead (p2p::kPushGroupPacks).
 constexpr int kRowPacksBuilt[] = {1, 2, 4, 8, 16};
 
-constexpr bool has_row_packs(Kernel k) { return op_of(k) != Op::all_reduce && !is_push(k); }
+constexpr bool has_row_packs(Kernel k) { return op_of(k) != Op::all_reduce; }
 
 // The smallest build that holds a row of `packs` over `threads`; 0 when none does.
 constexpr int row_packs_for(int64_t packs, int threads) {

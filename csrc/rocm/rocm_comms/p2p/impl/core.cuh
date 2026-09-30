@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p's primitives, behind p2p.cuh: `World`, `start`, the barriers, and in `impl` what
-// they and the phases are made of. A wait that outlives the timeout
+// p2p's primitives, behind p2p.cuh: `simple`, and in `impl` what its syncs are made of. A
+// wait that outlives the timeout
 // prints where it was and traps, so a hang is an error. Checked, every index is
 // bounds-checked and every wait is skewed by a random per-block delay, so a race shows on
 // every run. Indices are in 16-byte packs of T.
@@ -22,31 +22,8 @@
 
 namespace hip_comms::p2p {
 
-// A KERNEL'S VIEW OF THE WORLD, returned by `start`: the launch's `Peers` and every rank's
-// input, index 0 this rank's. Plain values; every p2p function takes it, which is how
-// T and the world size reach them without being spelled at each call. ROTATED by rank,
-// so the ranks do not all read rank 0 first; each then sums in a different order, so a
-// pulled sum agrees across ranks to one ULP of T, not bitwise.
-template <typename T, int ngpus>
-struct World {
-  using V = typename traits<T>::V;
-  Peers peers;
-  const V* in[ngpus];
-};
-
 namespace impl {
 
-// Rank `peer`'s scratch, the bytes after its signal block. BY SELECT, NOT an index into
-// the pointer array: a runtime index into a register array moves it to scratch memory.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V* scratch(const World<T, ngpus>& w, int peer) {
-  using V = typename traits<T>::V;
-  V* at   = reinterpret_cast<V*>(w.peers.signals.s[0] + 1);
-#pragma unroll
-  for (int i = 1; i < ngpus; ++i)
-    if (peer == i) at = reinterpret_cast<V*>(w.peers.signals.s[i] + 1);
-  return at;
-}
 
 DINLINE void check(const Peers& p, bool ok, const char* what, int peer, int64_t idx,
                    int64_t limit) {
@@ -73,7 +50,7 @@ DINLINE void skew(const Peers& p) {
 // EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
 // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
 // ISA), so the releasing wave's fence would cover only its own stores, and another
-// wave's could still be in flight when the flag lands -- a push kernel's remote stores
+// wave's could still be in flight when the flag lands -- a remote store
 // above all.
 DINLINE void wait_stores() { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); }
 
@@ -174,63 +151,12 @@ DINLINE void barrier(const Peers& p) {
   __syncthreads();
 }
 
-// This rank's own input pack.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V mine(const World<T, ngpus>& w, int64_t idx) {
-  check(w.peers, idx < w.peers.input_packs, "mine", -1, idx, w.peers.input_packs);
-  return load_global(w.in[0] + idx);
-}
-
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V get(const World<T, ngpus>& w, int peer, int64_t idx) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "get", peer, idx,
-        w.peers.scratch_packs);
-  return load_global(scratch(w, peer) + idx);
-}
-
-// A pack peers pushed into this rank's scratch (see `load_uncached`).
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V get_pushed(const World<T, ngpus>& w, int64_t idx) {
-  check(w.peers, idx < w.peers.scratch_packs, "get_pushed", w.peers.rank, idx,
-        w.peers.scratch_packs);
-  return load_uncached(scratch(w, w.peers.rank) + idx);
-}
-
-// A float of peer's scratch, `idx` in floats: a codec's scales.
-template <typename T, int ngpus>
-DINLINE void put_float(const World<T, ngpus>& w, int peer, int64_t idx, float v) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx < 4 * w.peers.scratch_packs, "put_float",
-        peer, idx, 4 * w.peers.scratch_packs);
-  __scoped_atomic_store_n(reinterpret_cast<uint32_t*>(scratch(w, peer)) + idx,
-                          __builtin_bit_cast(uint32_t, v), __ATOMIC_RELAXED,
-                          __MEMORY_SCOPE_SYSTEM);
-}
-
-template <typename T, int ngpus>
-DINLINE float get_float(const World<T, ngpus>& w, int peer, int64_t idx) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx < 4 * w.peers.scratch_packs, "get_float",
-        peer, idx, 4 * w.peers.scratch_packs);
-  const auto* at = reinterpret_cast<const uint32_t*>(scratch(w, peer)) + idx;
-  return __builtin_bit_cast(float, __scoped_atomic_load_n(at, __ATOMIC_RELAXED,
-                                                          __MEMORY_SCOPE_SYSTEM));
-}
-
-// A pack pushed into peer's scratch, past the caches (see `store_uncached`).
-template <typename T, int ngpus>
-DINLINE void put_pushed(const World<T, ngpus>& w, int peer, int64_t idx,
-                        const typename traits<T>::V& v) {
-  check(w.peers, peer >= 0 && peer < ngpus && idx < w.peers.scratch_packs, "put_pushed",
-        peer, idx, w.peers.scratch_packs);
-  store_uncached(scratch(w, peer) + idx, v);
-}
-
 }  // namespace impl
 
 // =================================================================================
 // COMMUNICATION ONLY (listed in p2p.cuh): where every rank's memory is, and the syncs. A
 // kernel built on these writes its algorithm out -- the loads, the sum, the stores and
-// where it syncs -- as vLLM's and aiter's custom all-reduce kernels do. The API every
-// kernel is moving to; the phases below are the old one.
+// where it syncs -- as vLLM's and aiter's custom all-reduce kernels do.
 // =================================================================================
 
 namespace simple {
@@ -281,50 +207,5 @@ DINLINE void grid_sync(const Peers& p) {
 }
 
 }  // namespace simple
-
-// =================================================================================
-// THE PHASES (listed in p2p.cuh), which the push kernels compose.
-// =================================================================================
-
-template <typename T, int ngpus>
-DINLINE World<T, ngpus> start(const Peers& p) {
-  impl::skew(p);
-  impl::pair_blocks<ngpus, false>(p, true);
-  World<T, ngpus> w{p, {}};
-#pragma unroll
-  for (int i = 0; i < ngpus; ++i)
-    w.in[i] = reinterpret_cast<const typename traits<T>::V*>(
-        p.inputs->p[(p.rank + i) % ngpus]);
-  return w;
-}
-
-// This block and the same block on every peer (every rank, block b with block b), and no
-// other block: one flag per peer, where `world_barrier` waits for the whole grid. A read
-// after it may see ONLY what the same block on that peer wrote, so both phases must give
-// each block the same rows (vLLM's custom all-reduce, and the rule its two-stage kernel
-// states).
-template <typename T, int ngpus>
-DINLINE void peer_barrier(const World<T, ngpus>& w) {
-  impl::skew(w.peers);
-  impl::pair_blocks<ngpus, true>(w.peers, false);
-}
-
-template <typename T, int ngpus>
-DINLINE void world_barrier(const World<T, ngpus>& w) {
-  impl::barrier<ngpus, true>(w.peers);
-}
-
-// Every block of THIS rank's kernel: puts to our own scratch before it are visible to our
-// own reads after it. Cheaper than `world_barrier`, and wrong for anything a peer put.
-template <typename T, int ngpus>
-DINLINE void grid_barrier(const World<T, ngpus>& w) {
-  impl::barrier<ngpus, false>(w.peers);
-}
-
-template <typename T, int ngpus>
-DINLINE void close(const World<T, ngpus>& w) {
-  impl::skew(w.peers);
-  impl::pair_blocks<ngpus, false>(w.peers, false);
-}
 
 }  // namespace hip_comms::p2p

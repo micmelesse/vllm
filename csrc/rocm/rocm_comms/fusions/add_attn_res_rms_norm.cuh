@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE COMPUTATION of all-reduce + Kimi-K3's attention residual (AttnRes) + its RMSNorm,
-// on a row already reduced over ranks: every AttnRes kernel, pull or push.
+// on a row already reduced over ranks: every AttnRes kernel.
 
 #pragma once
 

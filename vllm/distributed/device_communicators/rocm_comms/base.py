@@ -198,8 +198,8 @@ class Communicator(ABC):
     ) -> bool:
         """Whether this backend takes `inp` -- every SIZE its memory holds, because it
         owns the collective. The noes are a tensor the kernel cannot compile for, being
-        disabled, and what the backend does not admit (`_admits`: hip's push kernels
-        hold every rank's slice, so their scratch can run out); a no sends the caller
+        disabled, and what the backend does not admit (`_admits`: a two-shot's scratch
+        can run out, and no kernel quantizes yet); a no sends the caller
         elsewhere, so this stays public."""
         return (
             not self.disabled
@@ -609,8 +609,8 @@ class Communicator(ABC):
         return True
 
     def _refuse_lossy(self, quant_bits: int) -> None:
-        """A LOSSY PRECISION is hip's push codec; a backend without one says so rather
-        than returning an exact sum the caller did not ask to time."""
+        """A LOSSY PRECISION has no kernel yet; a backend that cannot run one says so
+        rather than returning an exact sum the caller did not ask to time."""
         if quant_bits != 16:
             raise ValueError(
                 f"{type(self).__name__} runs exact only; got quant_bits={quant_bits}"

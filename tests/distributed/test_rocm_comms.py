@@ -23,12 +23,11 @@ vLLM keeps one. A case that errors, hangs or kills a rank ends the world, and th
 case starts a fresh one: a failed collective can leave peer state inconsistent.
 
 TWO TIERS. The default (`-m "not full"`) is what vLLM runs, at Kimi-K3's shapes, plus
-the boundaries that decide which path is taken. `full` is everything else: the push
-kernels, fp16, the other backends, eager, the remaining shapes and the kernels tune
+the boundaries that decide which path is taken. `full` is everything else: fp16, the
+other backends, eager, the remaining shapes and the kernels tune
 declines today.
 """
 
-import hashlib
 import logging
 import math
 import multiprocessing as mp
@@ -198,18 +197,12 @@ DISABLED = {
 # Control FIRST in `COMMUNICATOR_CASES`, because it is the first case to run: if torch
 # is red, nothing after it means anything.
 # hip as C++ picks, and each all_reduce kernel forced; the other backends have one
-# kernel each. A SHOT is a shot and a direction, and names every op's kernel,
-# `f"{shot}_{op}"` (the plain all_reduce's is the shot itself); a push kernel runs
-# unquantized here.
-Shot = Literal[
-    "all_reduce_pull_one_shot",
-    "all_reduce_push_one_shot",
-    "all_reduce_pull_two_shot",
-    "all_reduce_push_two_shot",
-]
+# kernel each. A SHOT names every op's kernel, `f"{shot}_{op}"` (the plain
+# all_reduce's is the shot itself).
+Shot = Literal["all_reduce_pull_one_shot", "all_reduce_pull_two_shot"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
-# The pull kernels: the fast tier forces each, whatever tune would pick.
-PULL_SHOTS: tuple[Shot, ...] = ("all_reduce_pull_one_shot", "all_reduce_pull_two_shot")
+# The fast tier forces each, whatever tune would pick.
+PULL_SHOTS: tuple[Shot, ...] = SHOTS
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
 BACKEND_KERNELS = tuple(
     (name, kernel)
@@ -382,7 +375,7 @@ T = TypeVar("T")
 P = ParamSpec("P")
 
 # Every value a case hands back, named for the wire: a sweep's worst `Measurement`, a
-# fused case's verdict, a quantized case's `(rel_rmse, digest)`. `run` gives the caller
+# fused case's verdict. `run` gives the caller
 # back its own case's type.
 CaseValue = Measurement | bool | tuple[float, str] | None
 # To a rank: the case's sequence number, the function and its arguments. None stops it.
@@ -1700,84 +1693,3 @@ def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
-
-
-# ---------------------------------------------------------------------------------
-# THE QUANTIZED PUSH KERNELS: lossy by design, so judged by their error against the fp32
-# sum rather than a tolerance per element, and by every rank holding the same bits (each
-# decodes the same bytes in the same order). FULL only: the push kernels are.
-# ---------------------------------------------------------------------------------
-
-# Relative RMS error, ||got - sum|| / ||sum||, over Gaussian inputs, by codec bits. At
-# one scale per 32 values the two-shot (quantized twice: the input, then the reduced
-# slice) expects ~0.007 for INT8 and ~0.12 for INT4; the one-shot (once) less.
-QUANTIZED_MAX_REL_RMSE = {8: 0.02, 4: 0.25}
-QUANTIZED_KERNELS: tuple[Kernel, ...] = (
-    "all_reduce_push_one_shot",
-    "all_reduce_push_two_shot",
-)
-# Kimi-K3's decode rows, a prefill chunk, and its largest prefill; 4 rows is fewer
-# than the ranks.
-QUANTIZED_SHAPES = ((4, 7168), (16, 7168), (128, 7168), (1000, 3584), (4096, 7168))
-
-
-def run_quantized_rank(
-    ctx: RankContext,
-    kernel: Kernel,
-    bits: int,
-    shape: tuple[int, int],
-    dtype_name: str,
-) -> tuple[tuple[float, str] | None, str | None]:
-    """ONE rank: the forced push kernel at `bits` over every rank's seeded input.
-    Returns `((rel_rmse, digest), err)`, `err` `NO_FUSED_KERNEL` when it is declined."""
-    rank, world, device = ctx.rank, ctx.world, ctx.device
-    dtype = D_DTYPES[dtype_name]
-    inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
-    launch = Launch(kernel)
-    comm = ctx.comm("hip")
-    mine = inputs[rank].to(device)
-    if not comm.should_allreduce(mine, launch, quant_bits=bits):
-        return None, NO_FUSED_KERNEL
-    got = comm.all_reduce(mine, launch=launch, quant_bits=bits)
-    got = got.cpu().to(torch.float32)
-    want = torch.stack([x.to(torch.float32) for x in inputs]).sum(0)
-    rel = ((got - want).norm() / want.norm()).item()
-    # sha256, not hash(): each rank is a spawned process with its own hash seed.
-    digest = hashlib.sha256(got.numpy().tobytes()).hexdigest()
-    return (rel, digest), None
-
-
-@pytest.mark.full
-@pytest.mark.parametrize("dtype_name", DTYPES)
-@pytest.mark.parametrize("shape", QUANTIZED_SHAPES)
-@pytest.mark.parametrize("bits", tuple(QUANTIZED_MAX_REL_RMSE))
-@pytest.mark.parametrize("kernel", QUANTIZED_KERNELS)
-def test_quantized_push_is_close_and_identical_on_every_rank(
-    kernel: Kernel,
-    bits: int,
-    shape: tuple[int, int],
-    dtype_name: str,
-    world: int,
-    ranks: World,
-) -> None:
-    """Each quantized kernel, forced: its error against the fp32 sum under the bound,
-    and every rank's output the same bits."""
-    if world < 2:
-        pytest.skip("a collective needs at least two ranks")
-    got = ranks.run(
-        run_quantized_rank,
-        kernel=kernel,
-        bits=bits,
-        shape=shape,
-        dtype_name=dtype_name,
-    )
-    where = f"{kernel} int{bits} {shape} {dtype_name}"
-    if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip declines {where}")
-    bad = [err for _, err in got if err is not None]
-    assert not bad, f"{where}: " + "; ".join(bad)
-    measured = [cast(tuple[float, str], value) for value, _ in got]
-    rels = [rel for rel, _ in measured]
-    print(f"      => {where}: rel_rmse {max(rels):.4g}", flush=True)
-    assert max(rels) <= QUANTIZED_MAX_REL_RMSE[bits], f"{where}: rel_rmse {rels}"
-    assert len({d for _, d in measured}) == 1, f"{where}: ranks hold different outputs"

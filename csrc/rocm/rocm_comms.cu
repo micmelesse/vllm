@@ -20,7 +20,7 @@
 // pack, how it is loaded and stored, the sums), p2p/ (the peer layer, host and device,
 // behind its one interface p2p/p2p.cuh), fusions/ (what a fused op computes), hardware.cuh
 // (the target's facts), launch.cuh (the kernels there are), tune.cuh (the picker), then one
-// all_reduce_<pull|push>_<shot>[_<fusion>].cuh per kernel, named as its Kernel is. Design
+// all_reduce_pull_<shot>[_<fusion>].cuh per kernel, named as its Kernel is. Design
 // rules: CONTEXT.md, "Code design".
 
 #include <ATen/cuda/CUDAContext.h>
@@ -38,10 +38,6 @@
 #include <vector>
 
 #include "rocm_comms/all_reduce_pull_one_shot.cuh"
-#include "rocm_comms/all_reduce_push_one_shot.cuh"
-#include "rocm_comms/all_reduce_push_one_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/all_reduce_push_one_shot_add_rms_norm.cuh"
-#include "rocm_comms/all_reduce_push_one_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_one_shot_add_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
@@ -49,10 +45,6 @@
 #include "rocm_comms/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
-#include "rocm_comms/all_reduce_push_two_shot.cuh"
-#include "rocm_comms/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
-#include "rocm_comms/all_reduce_push_two_shot_add_rms_norm.cuh"
-#include "rocm_comms/all_reduce_push_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
 #include "rocm_comms/launch.cuh"
 #include "rocm_comms/tune.cuh"
@@ -121,53 +113,18 @@ Launch launch_for(const Request& req, Op op, Input in) {
   return at(f.kernel, in, f.blocks, f.threads);
 }
 
-// A PUSH KERNEL'S SCRATCH, in bytes: the slots it lays out, from the same tiling it works
-// in (tiles::Buffer for the plain all-reduce, one slice for a one-shot and the world for a
-// two-shot; tiles::Rows for a fused op) and the same slot sizes (p2p's push_slot_packs). A
-// residual or prefix slot is always 16 bits.
-template <typename Tiling>
-int64_t slots_need(Kernel k, const Tiling& t, int bits, int world) {
-  const int64_t own   = p2p::push_slot_packs(bits, t.locals(), t.lanes(), world);
-  const int64_t own16 = p2p::push_slot_packs(16, t.locals(), t.lanes(), world);
-  const int64_t all   = p2p::push_slot_packs(bits, t.units(), t.lanes(), world);
-  switch (k) {
-    case Kernel::all_reduce_push_one_shot:
-    case Kernel::all_reduce_push_one_shot_rms_norm:
-    case Kernel::all_reduce_push_one_shot_add_rms_norm:
-    case Kernel::all_reduce_push_one_shot_add_attn_res_rms_norm:
-    case Kernel::all_reduce_push_one_shot_rms_norm_gemm_add: return all * 16;
-    case Kernel::all_reduce_push_two_shot:
-    case Kernel::all_reduce_push_two_shot_rms_norm:
-    case Kernel::all_reduce_push_two_shot_rms_norm_gemm_add: return 2 * own * 16;
-    case Kernel::all_reduce_push_two_shot_add_rms_norm:
-    case Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm: return (2 * own + own16) * 16;
-    default: return 0;
-  }
-}
-
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
-  // A PULL KERNEL'S SCRATCH is this rank's slice, row-major: the plain two-shot's packs, a
-  // fused two-shot's rows, twice where it leaves two results (out and the residual or the
-  // prefix). A one-shot reads the inputs and keeps nothing.
-  if (!is_push(l.kernel)) {
-    if (!is_two_shot(l.kernel)) return 0;
-    const Op op         = op_of(l.kernel);
-    const int64_t slice = op == Op::all_reduce ? (flat + world - 1) / world
-                                               : (rows + world - 1) / world * packs;
-    const bool two      = op == Op::all_reduce_add_rms_norm ||
-                     op == Op::all_reduce_add_attn_res_rms_norm;
-    return slice * (two ? 2 : 1) * 16;
-  }
-  if (op_of(l.kernel) == Op::all_reduce) {
-    const int slices = is_two_shot(l.kernel) ? world : 1;
-    return slots_need(l.kernel, tiles::buffer(flat, slices, l.grid, l.threads),
-                      l.quant_bits, world);
-  }
-  return slots_need(l.kernel,
-                    tiles::rows(static_cast<int>(rows), static_cast<int>(packs), world,
-                                l.threads),
-                    l.quant_bits, world);
+  // A KERNEL'S SCRATCH is this rank's slice, row-major: the plain two-shot's packs, a fused
+  // two-shot's rows, twice where it leaves two results (out and the residual or the prefix). A
+  // one-shot reads the inputs and keeps nothing.
+  if (!is_two_shot(l.kernel)) return 0;
+  const Op op         = op_of(l.kernel);
+  const int64_t slice = op == Op::all_reduce ? (flat + world - 1) / world
+                                             : (rows + world - 1) / world * packs;
+  const bool two      = op == Op::all_reduce_add_rms_norm ||
+                   op == Op::all_reduce_add_attn_res_rms_norm;
+  return slice * (two ? 2 : 1) * 16;
 }
 
 // Whether `op` over [rows, hidden] of this element size runs a kernel here: something
@@ -185,8 +142,8 @@ bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t ro
   if (l.kernel == Kernel::all_reduce_pull_two_shot &&
       l.threads % (group.world_size() * kWaveSize) != 0)
     return false;
-  if (is_push(l.kernel) && op != Op::all_reduce && packs > p2p::kPushGroupPacks * l.threads)
-    return false;
+  // NO KERNEL QUANTIZES YET: a call that accepts fewer bits runs exact elsewhere, not here.
+  if (l.quant_bits != 16) return false;
   if (op == Op::all_reduce_rms_norm_gemm_add &&
       l.threads > fusions::rms_norm_gemm_add::max_threads(l.gemm_lanes_per_col))
     return false;
@@ -228,17 +185,6 @@ Launch checked_launch(const p2p::host::Group& group, const Request& req, Op op,
                            " is not this op's");
 }
 
-// A push kernel's codec bits as a template argument: f(std::integral_constant<int, b>).
-template <typename F>
-void by_bits(int bits, F&& f) {
-  switch (bits) {
-    case 16: f(std::integral_constant<int, 16>{}); return;
-    case 8: f(std::integral_constant<int, 8>{}); return;
-    case 4: f(std::integral_constant<int, 4>{}); return;
-    default: TORCH_CHECK(false, "hip_comms: no codec of ", bits, " bits");
-  }
-}
-
 // A pull row kernel's row packs as a template argument: f(std::integral_constant<int, k>), one
 // case per kRowPacksBuilt.
 template <typename F>
@@ -254,9 +200,8 @@ void by_row_packs(int k, F&& f) {
 }
 
 // ONE CASE PER KERNEL: `CASE_PULL(kernel, args, template args...)` launches the kernel's
-// function, named as its Kernel is; `CASE_PUSH` the same at the launch's codec bits, which
-// the template arguments name as kB; `CASE_PULL_ROWS` at the launch's row packs, named kR. Every
-// op's launch is one switch over its kernels. The launch
+// function, named as its Kernel is; `CASE_PULL_ROWS` the same at the launch's row packs, which
+// the template arguments name as kR. Every op's launch is one switch over its kernels. The launch
 // configuration is spelled out: hipify parses `<<<...>>>` as text.
 #define CASE_PULL(KERNEL, ARGS, ...)                                                     \
   case Kernel::KERNEL:                                                                   \
@@ -266,14 +211,6 @@ void by_row_packs(int k, F&& f) {
   case Kernel::KERNEL:                                                                   \
     by_row_packs(l.row_packs, [&](auto r) {                                              \
       constexpr int kR = decltype(r)::value;                                             \
-      KERNEL<__VA_ARGS__>                                                                \
-          <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(ARGS);                          \
-    });                                                                                  \
-    break;
-#define CASE_PUSH(KERNEL, ARGS, ...)                                                     \
-  case Kernel::KERNEL:                                                                   \
-    by_bits(l.quant_bits, [&](auto b) {                                                  \
-      constexpr int kB = decltype(b)::value;                                             \
       KERNEL<__VA_ARGS__>                                                                \
           <<<dim3(l.grid), dim3(l.threads), 0, stream>>>(ARGS);                          \
     });                                                                                  \
@@ -296,9 +233,7 @@ void all_reduce(p2p::host::Group& group, const Request& req, torch::Tensor& out,
 #define LAUNCH_ALL_REDUCE(T, NG)                                                         \
   switch (l.kernel) {                                                                    \
     CASE_PULL(all_reduce_pull_one_shot, ALL_REDUCE_ARGS(T), T, NG)                       \
-    CASE_PUSH(all_reduce_push_one_shot, ALL_REDUCE_ARGS(T), T, NG, kB)                   \
     CASE_PULL(all_reduce_pull_two_shot, ALL_REDUCE_ARGS(T), T, NG)                       \
-    CASE_PUSH(all_reduce_push_two_shot, ALL_REDUCE_ARGS(T), T, NG, kB)                   \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define ALL_REDUCE_HALF(NG) LAUNCH_ALL_REDUCE(at::Half, NG)
@@ -372,15 +307,11 @@ void all_reduce_add_rms_norm(p2p::host::Group& group, const Request& req,
 #define LAUNCH_NORM(T, W, NG)                                                            \
   switch (l.kernel) {                                                                    \
     CASE_PULL_ROWS(all_reduce_pull_one_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kR)     \
-    CASE_PUSH(all_reduce_push_one_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)          \
     CASE_PULL_ROWS(all_reduce_pull_two_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kR)     \
-    CASE_PUSH(all_reduce_push_two_shot_rms_norm, NORM_ARGS(T, W), T, W, NG, kB)          \
     CASE_PULL_ROWS(all_reduce_pull_one_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W,     \
               NG, kR)                                                                    \
-    CASE_PUSH(all_reduce_push_one_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)  \
     CASE_PULL_ROWS(all_reduce_pull_two_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W,     \
               NG, kR)                                                                    \
-    CASE_PUSH(all_reduce_push_two_shot_add_rms_norm, ADD_NORM_ARGS(T, W), T, W, NG, kB)  \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define NORM_HALF(NG) LAUNCH_NORM(at::Half, at::Half, NG)
@@ -477,12 +408,8 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Request& re
   switch (l.kernel) {                                                                    \
     CASE_PULL_ROWS(all_reduce_pull_one_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG,\
               PRE, kR)                                                                   \
-    CASE_PUSH(all_reduce_push_one_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB, \
-              PRE)                                                                       \
     CASE_PULL_ROWS(all_reduce_pull_two_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG,\
               PRE, kR)                                                                   \
-    CASE_PUSH(all_reduce_push_two_shot_add_attn_res_rms_norm, ATTN_RES_ARGS(T), T, NG, kB, \
-              PRE)                                                                       \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define ATTN_RES_BY_PREFIX(T, NG)                                                        \
@@ -556,10 +483,8 @@ void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Request& req,
   switch (l.kernel) {                                                                    \
     CASE_PULL_ROWS(all_reduce_pull_one_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG,  \
               LPC, kR)                                                                   \
-    CASE_PUSH(all_reduce_push_one_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC) \
     CASE_PULL_ROWS(all_reduce_pull_two_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG,  \
               LPC, kR)                                                                   \
-    CASE_PUSH(all_reduce_push_two_shot_rms_norm_gemm_add, GEMM_ADD_ARGS(T), T, NG, kB, LPC) \
     default: not_this_ops(l.kernel);                                                     \
   }
 #define LAUNCH_GEMM_ADD(T, NG)                                                           \
@@ -589,7 +514,6 @@ void all_reduce_rms_norm_gemm_add(p2p::host::Group& group, const Request& req,
 }
 
 #undef BY_NGPUS
-#undef CASE_PUSH
 #undef CASE_PULL
 
 }  // namespace hip_comms

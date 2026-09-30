@@ -2,8 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE COMPUTATION of all-reduce + RMSNorm and all-reduce + add + RMSNorm, on a row already
-// reduced over ranks: every rms_norm and add_rms_norm kernel, and the GEMM tail's norm,
-// pull or push.
+// reduced over ranks: every rms_norm and add_rms_norm kernel, and the GEMM tail's norm.
 
 #pragma once
 
@@ -28,10 +27,10 @@ namespace hip_comms::fusions::add_rms_norm {
 // between the two passes, so nothing is read back.
 //
 // DIRECTION-FREE: `sum` is this thread's share of the row already reduced over ranks and
-// rounded to T (by the kernel's `sum_row` or `p2p::push::reduce`), sum[k] the
+// rounded to T (by the kernel's `sum_row`), sum[k] the
 // pack threadIdx.x + k * blockDim.x, k < K. The results leave through `store_res(k, i, v)` and
 // `store_out(k, i, v)`, i the pack within the row, so a kernel can land them in its
-// output, in scratch, or in registers to push.
+// output or in scratch.
 template <typename T, typename W, bool kAdd, int K, typename StoreRes, typename StoreOut>
 DINLINE void row(const typename traits<T>::V (&sum)[K],
                  const typename traits<T>::V* residual, const vec<W, traits<T>::N>* weight,
