@@ -46,6 +46,7 @@
 #include "rocm_comms/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "rocm_comms/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
 #include "rocm_comms/p2p/p2p.cuh"
+#include "rocm_comms/peer_read.cuh"
 #include "rocm_comms/ping_pong.cuh"
 #include "rocm_comms/launch.cuh"
 #include "rocm_comms/tune.cuh"
@@ -596,6 +597,49 @@ bool rocm_comms_admits(fptr_t comms, int64_t op, int64_t rows, int64_t hidden,
 }
 
 void rocm_comms_dispose(fptr_t comms) { delete &comms_of(comms); }
+
+// GB/S INTO THIS RANK reading `bytes` of every peer's staging (`peer` -1) or one peer's, `iters`
+// times: every rank calls it together, as an all-reduce reads.
+double rocm_comms_peer_read(fptr_t comms, int64_t peer, int64_t bytes, int64_t iters) {
+  auto& group = comms_of(comms);
+  TORCH_CHECK(peer == -1 || (peer >= 0 && peer < group.world_size() && peer != group.rank()),
+              "peer must be another rank, or -1 for every other rank");
+  TORCH_CHECK(iters > 0 && bytes >= 16, "iters must be positive and bytes at least a pack");
+  bytes = std::min<int64_t>(bytes, group.staging_bytes()) / 16 * 16;
+  auto staging = torch::from_blob(group.staging(), {bytes},
+                                  torch::TensorOptions().dtype(torch::kUInt8).device(
+                                      torch::kCUDA, c10::cuda::current_device()));
+  const p2p::DevComm p = group.dev_comm(staging);
+  auto sink   = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt32).device(
+                                     torch::kCUDA, c10::cuda::current_device()));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // THE WHOLE DEVICE READING, as a large all-reduce's grid would.
+  void (*kernel)(p2p::DevComm, int, int64_t, uint32_t*) = nullptr;
+  switch (group.world_size()) {
+    case 2: kernel = hip_comms::peer_read<c10::BFloat16, 2>; break;
+    case 4: kernel = hip_comms::peer_read<c10::BFloat16, 4>; break;
+    case 8: kernel = hip_comms::peer_read<c10::BFloat16, 8>; break;
+    default: TORCH_CHECK(false, "world size must be 2, 4 or 8");
+  }
+  const dim3 grid(hip_comms::kTarget.compute_units), block(hip_comms::kMaxThreads);
+  uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
+  const int who = static_cast<int>(peer);
+  auto launch   = [&]() { kernel<<<grid, block, 0, stream>>>(p, who, bytes / 16, s); };
+  launch();  // untimed: the first touch
+  hipEvent_t start, stop;
+  HIP_CHECK(hipEventCreate(&start));
+  HIP_CHECK(hipEventCreate(&stop));
+  HIP_CHECK(hipEventRecord(start, stream));
+  for (int64_t i = 0; i < iters; ++i) launch();
+  HIP_CHECK(hipEventRecord(stop, stream));
+  HIP_CHECK(hipEventSynchronize(stop));
+  float ms = 0.0f;
+  HIP_CHECK(hipEventElapsedTime(&ms, start, stop));
+  HIP_CHECK(hipEventDestroy(start));
+  HIP_CHECK(hipEventDestroy(stop));
+  const int64_t read = peer >= 0 ? 1 : group.world_size() - 1;
+  return static_cast<double>(bytes) * read * iters / (ms * 1e-3) / 1e9;
+}
 
 // NANOSECONDS PER ROUND TRIP to `peer`, over `iters`: both ranks of the pair call it together.
 double rocm_comms_ping_pong(fptr_t comms, int64_t peer, int64_t iters) {

@@ -104,6 +104,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_init", &rocm_comms_init);
   rocm_ops.def("rocm_comms_staging", &rocm_comms_staging);
   rocm_ops.def("rocm_comms_ping_pong", &rocm_comms_ping_pong);
+  rocm_ops.def("rocm_comms_peer_read", &rocm_comms_peer_read);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
   rocm_ops.def("rocm_comms_admits", &rocm_comms_admits);
   rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);

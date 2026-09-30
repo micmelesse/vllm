@@ -92,7 +92,7 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 // stale when the driver, firmware or p2p changes, so each value names its probe and its run. A
 // field is named for the probe that produced it.
 struct Calibration {
-  double ping_pong_ns;  // ping_pong.py: a p2p flag to a peer and back, median of every pair
+  double ping_pong_ns;  // calibrate.py: a p2p flag to a peer and back, median of every pair
 };
 
 // gfx950 on n11: dev run 2026-09-30T19-02-08Z, 28 pairs from 1274 to 1383 ns; a repeat
