@@ -52,9 +52,6 @@ constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
   return {k, grid_of(k, blocks, in.rows, in.world), threads, lanes, in.quant_bits, row_packs};
 }
 
-// No kernel: only for an input no kernel can run (admits, at run time); a tune_<op> never returns
-// it (rocm_comms.cu's static_assert).
-constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0, 0}; }
 
 // =================================================================================================
 // ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:
@@ -135,7 +132,7 @@ constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const C
 
 // A BLOCK A ROW, AND NO MORE BLOCKS THAN ROWS: a block does whole rows, and an idle one still pays
 // every barrier. One-shot up to kFusedOneShotMaxBytes, every rank's rows; two-shot past it, each
-// rank's slice of them (was declined there before the uncached scratch and the batched sources).
+// rank's slice of them.
 constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
                                                         const Calibration&) {
   const bool one_shot = bytes(in) <= kFusedOneShotMaxBytes;
@@ -146,9 +143,9 @@ constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&
                   : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, blocks, 512);
 }
 
-// ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of 512
-// threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68 against
-// 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
+// ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
+// 512 threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68
+// against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
 constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&, const Calibration&) {
   return in.rows <= kGemmTailOneShotRows
              ? at(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, in, 56, 512)
@@ -168,7 +165,7 @@ constexpr Launch tune(Op op, Input in, const Hardware& hw, const Calibration& ca
       return tune_all_reduce_add_attn_res_rms_norm(in, hw, cal);
     case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw, cal);
   }
-  return declined();
+  __builtin_unreachable();  // every Op is a case above
 }
 
 }  // namespace hip_comms

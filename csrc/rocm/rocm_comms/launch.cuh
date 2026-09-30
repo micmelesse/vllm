@@ -26,8 +26,8 @@ enum class Op : int {
 };
 
 // Every `__global__` there is, once, named by its shot and what it fuses; all of them pull (a rank
-// reads its peers' buffers: their inputs, or scratch they filled). `none` is a decline: the caller
-// runs the unfused ops. Each op has a one-shot and a two-shot.
+// reads its peers' buffers: their inputs, or scratch they filled). `none` is no kernel named: a
+// launch not forced, which tune.cuh picks. Each op has a one-shot and a two-shot.
 enum class Kernel : int {
   none                                           = -1,
   all_reduce_pull_one_shot                       = 0,
@@ -81,13 +81,6 @@ static_assert(kernels_in_order(), "kKernels must list every Kernel in its order"
 constexpr const KernelInfo& info(Kernel k) { return kKernels[static_cast<int>(k)]; }
 constexpr Op op_of(Kernel k) { return info(k).op; }
 constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
-
-// The op's kernel of that direction and shot; none where it has none.
-constexpr Kernel kernel_of(Op op, bool two_shot) {
-  for (const KernelInfo& i : kKernels)
-    if (i.op == op && i.two_shot == two_shot) return i.kernel;
-  return Kernel::none;
-}
 
 // What runs: the kernel, its grid and block, for the GEMM tail its lanes per column (0 for
 // every other kernel), the precision the caller accepts (16: T itself; no kernel quantizes yet),

@@ -88,8 +88,8 @@ struct Request {
   int quant_bits;
 };
 
-// The four integers every op takes last, checked: the precision, then the launch (kernel -1 is
-// none).
+// The four integers every op takes last, checked: the precision, then the launch (kernel -1: not
+// forced, tune.cuh picks).
 Request request_of(int64_t quant_bits, int64_t kernel, int64_t blocks, int64_t threads) {
   TORCH_CHECK(quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
               "quant_bits must be 16 (exact), 8 or 4");
@@ -132,39 +132,45 @@ int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
   return slice * (two ? 2 : 1) * 16;
 }
 
-// Whether `op` over [rows, hidden] of this element size runs a kernel here: something
-// was picked, a row fits in registers at the picked width, and its scratch fits.
-// Python asks this before every fused call and runs the unfused ops on a no.
-bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t rows,
-            int64_t hidden, int64_t elem, int64_t cols) {
+// WHY `op` over [rows, hidden] of this element size CANNOT RUN here, or empty when it can: every
+// reason is a capability (a kernel that cannot take the input), never "the unfused ops would be
+// faster" -- a tune_<op> never declines. The ops raise with it; `admits` is it as a yes or no, for
+// vLLM's choice of all-reduce backend.
+std::string why_not(const p2p::host::Group& group, const Request& req, Op op, int64_t rows,
+                    int64_t hidden, int64_t elem, int64_t cols) {
   const int64_t lanes = 16 / elem;
-  if (hidden % lanes != 0) return false;
+  if (hidden % lanes != 0) return "the row is not a whole number of 16-byte packs";
   const int64_t packs = hidden / lanes;
   const Launch l      = launch_for(req, op, input_of(group, req, rows, hidden, elem, cols));
-  if (l.kernel == Kernel::none) return false;
-  if (has_row_packs(l.kernel) && l.row_packs == 0) return false;
+  if (has_row_packs(l.kernel) && l.row_packs == 0)
+    return "the row is wider than the op's widest build holds at this block (max_row_packs)";
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (l.kernel == Kernel::all_reduce_pull_two_shot &&
       l.threads % (group.world_size() * kWaveSize) != 0)
-    return false;
-  // NO KERNEL QUANTIZES YET: a call that accepts fewer bits runs exact elsewhere, not here.
-  if (l.quant_bits != 16) return false;
+    return "a two-shot block must be one wave per peer";
+  if (l.quant_bits != 16) return "no kernel quantizes yet";
   if (op == Op::all_reduce_rms_norm_gemm_add &&
       l.threads > gemm_max_threads(l.gemm_lanes_per_col))
-    return false;
+    return "the GEMM tail's block exceeds what its LDS holds";
   if (op == Op::all_reduce_rms_norm_gemm_add && !is_two_shot(l.kernel) &&
       rows > kGemmTailOneShotRows)
-    return false;
-  return scratch_need(l, rows, packs, rows * packs, group.world_size()) <=
-         group.scratch_bytes();
+    return "the GEMM tail's one-shot takes at most one GEMM pass of rows";
+  if (scratch_need(l, rows, packs, rows * packs, group.world_size()) > group.scratch_bytes())
+    return "its two-shot slice exceeds the scratch (raise scratch_bytes)";
+  return "";
 }
 
-// The picked launch for a call, refused where `admits` would have said no.
+bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t rows,
+            int64_t hidden, int64_t elem, int64_t cols) {
+  return why_not(group, req, op, rows, hidden, elem, cols).empty();
+}
+
+// The launch for a call, or an error naming why it cannot run.
 Launch checked_launch(const p2p::host::Group& group, const Request& req, Op op,
                       int64_t rows, int64_t hidden, int64_t elem, int64_t cols) {
-  TORCH_CHECK(admits(group, req, op, rows, hidden, elem, cols), "hip_comms: op ",
-              static_cast<int>(op), " over [", rows, ", ", hidden,
-              "] is declined here; ask admits first");
+  const std::string why = why_not(group, req, op, rows, hidden, elem, cols);
+  TORCH_CHECK(why.empty(), "hip_comms: op ", static_cast<int>(op), " over [", rows, ", ", hidden,
+              "] cannot run: ", why);
   return launch_for(req, op, input_of(group, req, rows, hidden, elem, cols));
 }
 

@@ -40,18 +40,11 @@ class ROCmLatentMoERunnerFused(ROCmLatentMoERunner):
         self, fused_output: torch.Tensor, norm: torch.nn.Module | None
     ) -> torch.Tensor:
         comm = _comm()
+        assert comm is not None, "the fused decoder runs only with rocm_comms live"
         if not isinstance(norm, RMSNorm):
-            raise RuntimeError(f"the fused latent tail needs an RMSNorm, got {norm!r}")
-        if comm is None or not comm.should_allreduce_rms_norm(fused_output):
-            raise RuntimeError(
-                f"the fused decoder is on but rocm_comms does not admit the latent "
-                f"tail's all-reduce + RMSNorm for {tuple(fused_output.shape)} "
-                f"{fused_output.dtype}; unset VLLM_KIMI_K3_FUSED_DECODER"
-            )
-        return comm.all_reduce_rms_norm(
-            fused_output, norm.weight, norm.variance_epsilon
-        )
-
+            raise RuntimeError(f"the fused latent tail needs an RMSNorm: {norm!r}")
+        # The op raises, naming why, for an input it cannot run.
+        return comm.all_reduce_rms_norm(fused_output, norm.weight, norm.variance_epsilon)
 
 class KimiDecoderLayerFused(KimiDecoderLayer):
     latent_runner_cls = ROCmLatentMoERunnerFused
