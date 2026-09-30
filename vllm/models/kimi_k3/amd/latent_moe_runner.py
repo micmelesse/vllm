@@ -73,9 +73,7 @@ class ROCmLatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
-        latent = tensor_model_parallel_all_reduce(fused_output)
-        if transform.norm is not None:
-            latent = transform.norm(latent)
+        latent = self._all_reduce_norm(fused_output, transform.norm)
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
@@ -89,6 +87,13 @@ class ROCmLatentMoERunner(MoERunner):
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
         )
+
+    def _all_reduce_norm(
+        self, fused_output: torch.Tensor, norm: torch.nn.Module | None
+    ) -> torch.Tensor:
+        """The latent tail's all-reduce, then its norm."""
+        latent = tensor_model_parallel_all_reduce(fused_output)
+        return latent if norm is None else norm(latent)
 
     def forward(
         self,

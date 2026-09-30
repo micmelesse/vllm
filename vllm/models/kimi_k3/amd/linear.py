@@ -170,7 +170,7 @@ class KimiMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_idx: int = 0,
-        reduce_results: bool = True,
+        latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -292,8 +292,7 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
-            runner_cls=ROCmLatentMoERunner if self.use_latent_moe else None,
-            reduce_results=reduce_results,
+            runner_cls=latent_runner_cls if self.use_latent_moe else None,
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -335,7 +334,6 @@ class KimiMLAAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        reduce_results: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -406,7 +404,6 @@ class KimiMLAAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -465,9 +462,8 @@ class KimiMLAAttention(nn.Module):
 
 
 class KimiDecoderLayer(nn.Module):
-    # Whether attention and the MLP all-reduce their own outputs. A subclass that
-    # reduces them itself, fused with what consumes them, sets it False.
-    reduce_results = True
+    # The latent MoE's runner; a fused decoder layer swaps in its own.
+    latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner
 
     def __init__(
         self,
@@ -495,7 +491,6 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
-                    reduce_results=self.reduce_results,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -529,7 +524,6 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
-                reduce_results=self.reduce_results,
             )
 
         if (
@@ -543,7 +537,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                reduce_results=self.reduce_results,
+                latent_runner_cls=self.latent_runner_cls,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -555,7 +549,6 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                reduce_results=self.reduce_results,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -696,14 +689,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         def get_layer(prefix: str):
-            # VLLM_KIMI_K3_FUSED_ATTN_RES: each AttnRes fused with the all-reduce
-            # that feeds it, in its own layer class.
-            from vllm.models.kimi_k3.amd import fused_attn_res
+            # VLLM_KIMI_K3_FUSED_DECODER: the decoder layer with its all-reduces
+            # fused into the ops that consume them, in its own class.
+            from vllm.models.kimi_k3.amd import fused_decoder
 
-            if fused_attn_res.enabled(config):
-                return fused_attn_res.KimiDecoderLayerFusedAttnRes(
-                    config, vllm_config, prefix
-                )
+            if fused_decoder.enabled():
+                return fused_decoder.KimiDecoderLayerFused(config, vllm_config, prefix)
             return KimiDecoderLayer(config, vllm_config, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(

@@ -84,7 +84,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
-        reduce_results: bool = True,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -250,7 +249,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.hidden_size,
             bias=False,
             quant_config=self.quant_config,
-            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
