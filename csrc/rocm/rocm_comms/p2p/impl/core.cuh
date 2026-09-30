@@ -257,12 +257,12 @@ DINLINE typename traits<T>::V read_scratch(const Peer<T, ngpus>& peer, int64_t i
 
 // SCRATCH, EITHER SIDE: pack i of a rank's scratch, read or written through its view, `Peer` for
 // any rank or `Self` for this one. What one block writes, the same block on the other side sees
-// after a barrier that makes it visible. A write through a Peer is the push send, past every
-// cache.
+// after a barrier that makes it visible. A write through a Peer is the push send: a plain store,
+// since scratch is allocated uncached (as aiter pushes into its own).
 template <typename T, int ngpus>
 DINLINE void write_scratch(const Peer<T, ngpus>& peer, int64_t i,
                            const typename traits<T>::V& v) {
-  thread_store_uncached(peer.scratch_ + i, v);
+  thread_store(peer.scratch_ + i, v);
 }
 
 template <typename T, int ngpus>
