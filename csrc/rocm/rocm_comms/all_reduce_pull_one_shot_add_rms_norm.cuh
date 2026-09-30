@@ -34,15 +34,14 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm.
-  const V* in[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kRowPacks];
-    sum_row<T, ngpus>(in, row, packs, sum);
+    sum_row<T, ngpus>(read, row, packs, sum);
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
         [&](int, int i, const V& v) { res_out[row * packs + i] = v; },
@@ -50,7 +49,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::simple::end_sync<ngpus, true>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
 }
 
 // THE KERNELS, one per op, both the body above.

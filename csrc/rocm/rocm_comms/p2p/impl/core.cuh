@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p's primitives, behind p2p.cuh: `simple`, and in `impl` what its syncs are made of. A
+// p2p's primitives, behind p2p.cuh: `Ranks`, its reads and writes, `barrier`, and in `impl` what
+// the barriers are made of. A
 // wait that outlives the timeout
 // prints where it was and traps, so a hang is an error. Checked, every index is
 // bounds-checked and every wait is skewed by a random per-block delay, so a race shows on
@@ -154,58 +155,92 @@ DINLINE void barrier(const Peers& p) {
 }  // namespace impl
 
 // =================================================================================
-// COMMUNICATION ONLY (listed in p2p.cuh): where every rank's memory is, and the syncs. A
-// kernel built on these writes its algorithm out -- the loads, the sum, the stores and
-// where it syncs -- as vLLM's and aiter's custom all-reduce kernels do.
+// EVERYTHING ONE GPU DOES WITH ANOTHER (listed in p2p.cuh): a rank's buffers are read and
+// written only through these, and ordered only by `barrier`.
 // =================================================================================
 
-namespace simple {
-
-// Rank `rank`'s input for this launch. Read every rank in rank order and the sum agrees
-// bitwise across ranks.
-template <typename T>
-DINLINE const typename traits<T>::V* input(const Peers& p, int rank) {
-  return reinterpret_cast<const typename traits<T>::V*>(p.inputs->p[rank]);
-}
-
-// Rank `peer`'s scratch, the bytes after its signal block. BY SELECT, NOT an index into
-// the pointer array: a runtime index into a register array moves it to scratch memory.
+// EVERY RANK'S BUFFERS FOR THIS LAUNCH, held for the kernel and never handed out: made once,
+// before the loops, so the pointers stay in registers. Read and written with read_input,
+// read_scratch and write_scratch.
 template <typename T, int ngpus>
-DINLINE typename traits<T>::V* scratch(const Peers& p, int peer) {
+class Ranks {
   using V = typename traits<T>::V;
-  V* at   = reinterpret_cast<V*>(p.signals.s[0] + 1);
+  const V* in_[ngpus];
+  V* scratch_[ngpus];
+  int rank_;
+
+  // BY SELECT, NOT an index: a runtime index into a register array moves it to scratch memory.
+  template <typename P>
+  static DINLINE P pick(P const (&all)[ngpus], int r) {
+    P at = all[0];
 #pragma unroll
-  for (int i = 1; i < ngpus; ++i)
-    if (peer == i) at = reinterpret_cast<V*>(p.signals.s[i] + 1);
-  return at;
+    for (int k = 1; k < ngpus; ++k)
+      if (r == k) at = all[k];
+    return at;
+  }
+
+ public:
+  explicit DINLINE Ranks(const Peers& p) : rank_(p.rank) {
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) {
+      in_[r]      = reinterpret_cast<const V*>(p.inputs->p[r]);
+      scratch_[r] = reinterpret_cast<V*>(p.signals.s[r] + 1);  // the bytes after its signals
+    }
+  }
+
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_input(const Ranks<U, n>& ranks, int r, int64_t i);
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_scratch(const Ranks<U, n>& ranks, int r, int64_t i);
+  template <typename U, int n>
+  friend DINLINE void write_scratch(const Ranks<U, n>& ranks, int64_t i,
+                                    const typename traits<U>::V& v);
+};
+
+template <typename T, int ngpus>
+DINLINE Ranks<T, ngpus> ranks(const Peers& p) {
+  return Ranks<T, ngpus>(p);
 }
 
-// A KERNEL'S FIRST SYNC: this block signals the same block on every rank and waits for
-// theirs, so every peer has launched and its input is ready to read.
-template <int ngpus>
-DINLINE void start_sync(const Peers& p) {
-  impl::skew(p);
-  impl::pair_blocks<ngpus, false>(p, true);
+// Pack i of rank r's input for this launch: the pull receive.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_input(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
+  return load_global(Ranks<T, ngpus>::pick(ranks.in_, r) + i);
 }
 
-// A LATER SYNC, the same exchange once every thread of the block is there. kFinal: it
-// only says when (every peer is done reading this rank). Otherwise it also orders: what
-// this block wrote before is visible to the same block on every peer after, and a peer
-// may read only what that block wrote, so both sides of it must index the same data by
-// the same thread.
-template <int ngpus, bool kFinal>
-DINLINE void end_sync(const Peers& p) {
-  impl::skew(p);
-  impl::pair_blocks<ngpus, !kFinal>(p, false);
+// Pack i of what rank r left in its scratch, after a barrier that made it visible.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_scratch(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
+  return load_global(Ranks<T, ngpus>::pick(ranks.scratch_, r) + i);
 }
 
-// EVERY BLOCK OF THIS RANK, and no peer: what any block of this rank wrote before is visible
-// to every block of it after. For a phase that reads rows other blocks wrote.
-template <int ngpus>
-DINLINE void grid_sync(const Peers& p) {
-  impl::barrier<ngpus, false>(p);
+// Pack i of this rank's own scratch, for its peers to read after a barrier that makes it visible.
+template <typename T, int ngpus>
+DINLINE void write_scratch(const Ranks<T, ngpus>& ranks, int64_t i,
+                           const typename traits<T>::V& v) {
+  store_global(Ranks<T, ngpus>::pick(ranks.scratch_, ranks.rank_) + i, v);
 }
 
-}  // namespace simple
+// WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this
+// rank.
+enum class Among { peers, grid };
+// WHAT HOLDS ONCE IT IS PASSED: every peer has launched (so its input is ready to read); what this
+// side wrote before is visible to the other side after; every peer is done reading this rank (so
+// its buffers may be reused). Among the grid, only `visible` means anything.
+enum class Ensure { launched, visible, read };
+
+// A read after a peers barrier may see only what the SAME BLOCK on the peer wrote before it, so
+// both sides must index the same data by the same block.
+template <int ngpus, Among kAmong, Ensure kEnsure>
+DINLINE void barrier(const Peers& p) {
+  static_assert(kAmong == Among::peers || kEnsure == Ensure::visible,
+                "a grid barrier only makes this rank's writes visible to its other blocks");
+  if constexpr (kAmong == Among::grid) {
+    impl::barrier<ngpus, false>(p);
+  } else {
+    impl::skew(p);
+    impl::pair_blocks<ngpus, kEnsure == Ensure::visible>(p, kEnsure == Ensure::launched);
+  }
+}
 
 }  // namespace hip_comms::p2p

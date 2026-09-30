@@ -5,15 +5,16 @@
 // the whole of what a caller may use. Its parts (impl/) refuse to be included any other
 // way, and what they keep in `p2p::impl` is theirs.
 //
-// p2p::simple::              everything one GPU does with another
-//   input<T>(p, rank)              that rank's input for this launch
-//   scratch<T, ngpus>(p, rank)     that rank's scratch
-//   start_sync<ngpus>(p)           first: every peer has launched, its input ready to read
-//   end_sync<ngpus, kFinal>(p)     later: every peer has reached here; unless kFinal, what
-//                                  this block wrote before is visible to the same block on
-//                                  every peer after
-//   grid_sync<ngpus>(p)            every block of this rank: what any wrote before is
-//                                  visible to all after
+// p2p::                     all one GPU does with another; a peer's address never leaves it
+//   ranks<T, ngpus>(p)             every rank's buffers for this launch, held for the kernel
+//   read_input(ranks, r, i)        pack i of rank r's input
+//   read_scratch(ranks, r, i)      pack i of what rank r left in its scratch
+//   write_scratch(ranks, i, v)     pack i of this rank's scratch, for its peers to read
+//   barrier<ngpus, Among, Ensure>(p)   Among::peers (this block and the same block on every
+//                                  rank) or Among::grid (every block of this rank); Ensure::
+//                                  launched (every peer's input is ready), visible (what was
+//                                  written before is seen after), read (every peer is done
+//                                  reading this rank)
 //
 // p2p::impl::Codec<T, kBits>   a group of kCodecGroupPacks packs on the wire: T itself (16) or
 //                              QuickReduce's integers (8, 4) under one fp32 scale; for the

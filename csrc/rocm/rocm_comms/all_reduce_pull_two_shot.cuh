@@ -36,17 +36,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   __shared__ V got[kMaxThreads];
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
   //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
   //    lane's packs, so they leave the loop together and the barriers inside it match.
-  const V* theirs = p2p::simple::input<T>(p, peer);
-  V* sums         = p2p::simple::scratch<T, ngpus>(p, p.rank);
-  const int base  = p.rank * slice_packs;
-  const int mine  = min(slice_packs, num_packs - base);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const int base    = p.rank * slice_packs;
+  const int mine    = min(slice_packs, num_packs - base);
   for (int i = first; i < mine; i += stride) {
-    got[threadIdx.x] = load_global(theirs + base + i);
+    got[threadIdx.x] = p2p::read_input(ranks, peer, base + i);
     __syncthreads();
     if (wave == 0) {
       float acc[N];
@@ -59,22 +58,21 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       V s;
 #pragma unroll
       for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
-      store_global(sums + i, s);
+      p2p::write_scratch(ranks, i, s);
     }
     __syncthreads();
   }
 
   // 3. Every rank's sums are visible to its peers.
-  p2p::simple::end_sync<ngpus, false>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
 
   // 4. All-gather: wave w copies its peer's slice out of that peer's scratch, at its place in the
   //    output. The next call's first sync keeps a rank from overwriting its scratch while it is
   //    read.
-  const V* owned = p2p::simple::scratch<T, ngpus>(p, peer);
-  V* dst         = reinterpret_cast<V*>(out);
+  V* dst = reinterpret_cast<V*>(out);
   for (int i = first; i < slice_packs; i += stride)
     if (peer * slice_packs + i < num_packs)
-      store_global(dst + peer * slice_packs + i, load_global(owned + i));
+      store_global(dst + peer * slice_packs + i, p2p::read_scratch(ranks, peer, i));
 }
 
 }  // namespace hip_comms

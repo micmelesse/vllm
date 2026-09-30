@@ -42,30 +42,28 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   };
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, AttnRes, and leave the
   //    out and prefix rows in this rank's scratch.
-  const V* in[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
-  V* mine         = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     V sum[kRowPacks];
-    sum_row<T, ngpus>(in, row, packs, sum);
+    sum_row<T, ngpus>(read, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::row<T, kPrefix>(
         sum, pre, blocks + row * block_stride_m, block_stride_r,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
         reinterpret_cast<const V*>(out_norm_w), num_blocks, row, packs, inv_hidden, eps,
-        out_eps, [&](int, int i, const V& v) { store_global(mine + pre_at + at + i, v); },
-        [&](int, int i, const V& v) { store_global(mine + at + i, v); });
+        out_eps, [&](int, int i, const V& v) { p2p::write_scratch(ranks, pre_at + at + i, v); },
+        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
   }
 
   // 3. Every rank's rows are visible to its peers.
-  p2p::simple::end_sync<ngpus, false>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
 
   // 4. Every owner's rows out of its scratch, into `out`, `prefix` and the written block. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
@@ -79,9 +77,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         if (r * slice_rows + l >= rows) continue;
-        const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
-        got[r]          = load_global(theirs + at);
-        got_pre[r]      = load_global(theirs + pre_at + at);
+        got[r]     = p2p::read_scratch(ranks, r, at);
+        got_pre[r] = p2p::read_scratch(ranks, r, pre_at + at);
       }
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {

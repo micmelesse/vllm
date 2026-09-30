@@ -38,28 +38,26 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
   //    result in this rank's scratch.
-  const V* in[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
-  V* mine          = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
   const int first  = p.rank * slice_rows;
   const int last   = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     V sum[kRowPacks];
-    sum_row<T, ngpus>(in, row, packs, sum);
+    sum_row<T, ngpus>(read, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { store_global(mine + res_at + at + i, v); },
-        [&](int, int i, const V& v) { store_global(mine + at + i, v); });
+        [&](int, int i, const V& v) { p2p::write_scratch(ranks, res_at + at + i, v); },
+        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
   }
 
   // 3. Every rank's rows are visible to its peers.
-  p2p::simple::end_sync<ngpus, false>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read.
@@ -73,9 +71,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         if (r * slice_rows + l >= rows) continue;
-        const V* theirs = p2p::simple::scratch<T, ngpus>(p, r);
-        got[r]          = load_global(theirs + at);
-        if constexpr (kAdd) got_res[r] = load_global(theirs + res_at + at);
+        got[r] = p2p::read_scratch(ranks, r, at);
+        if constexpr (kAdd) got_res[r] = p2p::read_scratch(ranks, r, res_at + at);
       }
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {

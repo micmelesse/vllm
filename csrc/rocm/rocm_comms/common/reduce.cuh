@@ -14,17 +14,16 @@
 
 namespace hip_comms {
 
-// ONE PACK SUMMED OVER `ngpus` SOURCES, in fp32 and rounded once to T. Every load before
-// any add, so the ngpus loads are in flight together; the sources in the order given, so
-// callers that give them in rank order agree bitwise.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V sum_packs(const typename traits<T>::V* const (&src)[ngpus],
-                                        int64_t i) {
+// ONE PACK SUMMED OVER `ngpus` SOURCES, in fp32 and rounded once to T; `read(r, i)` is pack i
+// of source r. Every read before any add, so the ngpus loads are in flight together; the
+// sources in order, so callers whose sources are the ranks agree bitwise.
+template <typename T, int ngpus, typename Read>
+DINLINE typename traits<T>::V sum_packs(Read read, int64_t i) {
   using V         = typename traits<T>::V;
   constexpr int N = traits<T>::N;
   V raw[ngpus];
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r) raw[r] = load_global(src[r] + i);
+  for (int r = 0; r < ngpus; ++r) raw[r] = read(r, i);
   float acc[N];
 #pragma unroll
   for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[0].d[j]);
@@ -40,13 +39,12 @@ DINLINE typename traits<T>::V sum_packs(const typename traits<T>::V* const (&src
 
 // THIS THREAD'S PACKS OF ROW `row` (pack threadIdx.x + k * blockDim.x, k < K) summed over the
 // `ngpus` sources, into sum[k]. A block owns the row; its norm needs every pack.
-template <typename T, int ngpus, int K>
-DINLINE void sum_row(const typename traits<T>::V* const (&src)[ngpus], int row, int packs,
-                     typename traits<T>::V (&sum)[K]) {
+template <typename T, int ngpus, int K, typename Read>
+DINLINE void sum_row(Read read, int row, int packs, typename traits<T>::V (&sum)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
-    if (i < packs) sum[k] = sum_packs<T, ngpus>(src, int64_t{row} * packs + i);
+    if (i < packs) sum[k] = sum_packs<T, ngpus>(read, int64_t{row} * packs + i);
   }
 }
 

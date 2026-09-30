@@ -37,15 +37,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   };
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, AttnRes.
-  const V* in[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kRowPacks];
-    sum_row<T, ngpus>(in, row, packs, sum);
+    sum_row<T, ngpus>(read, row, packs, sum);
     fusion::row<T, kPrefix>(
         sum, pre, blocks + row * block_stride_m, block_stride_r,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
@@ -58,7 +57,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::simple::end_sync<ngpus, true>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
 }
 
 }  // namespace hip_comms

@@ -32,26 +32,24 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.
-  p2p::simple::start_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
-  const V* in[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) in[r] = p2p::simple::input<T>(p, r);
-  V* mine         = p2p::simple::scratch<T, ngpus>(p, p.rank);
+  const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     V sum[kRowPacks];
-    sum_row<T, ngpus>(in, row, packs, sum);
+    sum_row<T, ngpus>(read, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
-                        [&](int, int i, const V& v) { store_global(mine + at + i, v); });
+                        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
   }
 
   // 3. Every rank's normed rows are visible to its peers.
-  p2p::simple::end_sync<ngpus, false>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
 
   // 4. Every owner's normed rows out of its scratch, into the workspace.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
@@ -63,7 +61,7 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
         if (r * slice_rows + l < rows)
-          got[r] = load_global(p2p::simple::scratch<T, ngpus>(p, r) + int64_t{l} * packs + i);
+          got[r] = p2p::read_scratch(ranks, r, int64_t{l} * packs + i);
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;
@@ -73,7 +71,7 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
   }
 
   // 5. The GEMM reads rows other blocks of this rank copied.
-  p2p::simple::grid_sync<ngpus>(p);
+  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
 
   // 6. The GEMM over every row, fusion::kRows per pass.
   for (int r0 = 0; r0 < rows; r0 += fusion::kRows) {
