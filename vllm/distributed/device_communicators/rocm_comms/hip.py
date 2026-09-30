@@ -21,7 +21,7 @@ import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -80,7 +80,7 @@ class HipCommunicator(Communicator):
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
-    # Pointers only: owners keep the buffers alive (we hold staging, vLLM holds a
+    # Pointers only: owners keep the buffers alive (C++ holds staging, vLLM holds a
     # graph's buffers).
     _registered: set[int]
     _staging: torch.Tensor
@@ -96,38 +96,28 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         tunables = self.hip_tunables
-        _signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
-            torch.ops._rocm_C.rocm_comms_sizes()
-        )
         self.rank = dist.get_rank(self.cpu_group)
-        # One allocation per rank, the signal block then the scratch, made and owned by C++.
-        self._signal = torch.ops._rocm_C.rocm_comms_alloc_signal(tunables.scratch_bytes)
-        self._slab = torch.zeros(
-            peer_ptrs_bytes * tunables.max_buffers,
-            dtype=torch.uint8,
-            device=self.device,
+        # THIS RANK'S PEER MEMORY, made and owned by C++ (signal block, scratch,
+        # staging); Python only exchanges its handle, a process-group collective.
+        staging_bytes = self._staging_bytes()
+        memory = torch.ops._rocm_C.rocm_comms_alloc(
+            tunables.scratch_bytes, staging_bytes
         )
-        self._registered = set()
-        # Allocated once, here, so vLLM's memory profile sees it.
-        self._staging = torch.zeros(
-            self._staging_bytes(),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-
-        handles, offsets = self._exchange(self._signal)
+        handles, offsets = self._exchange(memory)
         self._handle = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
             self.world_size,
-            self._signal,
+            memory,
             handles,
             offsets,
-            self._slab.data_ptr(),
-            self._slab.numel(),
+            tunables.max_buffers,
             tunables.scratch_bytes,
+            staging_bytes,
             tunables.sync_timeout_s,
         )
-        self._register(self._staging)
+        # The staging, registered by C++ at init: a view the handle owns.
+        self._staging = torch.ops._rocm_C.rocm_comms_staging(self._handle)
+        self._registered = {self._staging.data_ptr()}
         logger.info(
             "HipCommunicator ready: rank %d/%d, staging=%dMB, %s",
             self.rank,
@@ -402,5 +392,6 @@ class HipCommunicator(Communicator):
         self.disabled = True
         if self._handle is None:
             return
+        del self._staging  # a view of memory the handle frees
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
         self._handle = None

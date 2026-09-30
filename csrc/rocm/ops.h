@@ -56,12 +56,12 @@ void paged_attention(
 // stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
 using fptr_t = int64_t;
 
-int64_t rocm_comms_alloc_signal(int64_t scratch_bytes);
-fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
+int64_t rocm_comms_alloc(int64_t scratch_bytes, int64_t staging_bytes);
+fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
-                       const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
-                       int64_t peer_slab_bytes, int64_t scratch_bytes,
-                       double sync_timeout_s);
+                       const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
+                       int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s);
+torch::Tensor rocm_comms_staging(fptr_t comms);
 
 void rocm_comms_set_checked(fptr_t comms, bool checked);
 
@@ -115,4 +115,3 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
 
-std::vector<int64_t> rocm_comms_sizes();

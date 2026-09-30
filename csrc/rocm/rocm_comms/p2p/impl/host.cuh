@@ -60,12 +60,13 @@ inline std::pair<std::string, int64_t> handle_and_offset(uintptr_t ptr) {
           reinterpret_cast<char*>(ptr) - static_cast<char*>(base)};
 }
 
-// THIS RANK'S SIGNAL BLOCK AND SCRATCH, one allocation, zeroed. UNCACHED, as aiter and vLLM's
-// custom all-reduce allocate theirs: peers read what this rank's kernel wrote, and cached, those
-// writes sit dirty in L2 for the barrier's writeback to flush. The Group it is passed to owns it.
-inline uintptr_t alloc_signal(int64_t scratch_bytes) {
+// THIS RANK'S PEER MEMORY, one allocation, zeroed: the signal block, the scratch, then the
+// staging an eager input is copied into. UNCACHED, as aiter and vLLM's custom all-reduce allocate
+// theirs: peers read what this rank wrote, and cached, those writes sit dirty in L2 for the
+// barrier's writeback to flush. The Group it is passed to owns it.
+inline uintptr_t alloc_memory(int64_t scratch_bytes, int64_t staging_bytes) {
   void* p = nullptr;
-  const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes);
+  const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes + staging_bytes);
   HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
   HIP_CHECK(hipMemset(p, 0, bytes));
   HIP_CHECK(hipDeviceSynchronize());
@@ -74,29 +75,38 @@ inline uintptr_t alloc_signal(int64_t scratch_bytes) {
 
 class Group {
  public:
-  // `signal_handles`/`signal_offsets` are the whole world's handles for their own signal
-  // allocation, gathered in PYTHON -- the collective that exchanges them belongs to the
-  // process group, which C++ has no business knowing about.
-  Group(int rank, int world_size, uintptr_t self_signal,
+  // `self_memory` is this rank's `alloc_memory`, which the Group now owns; `signal_handles` and
+  // `signal_offsets` are the whole world's handles for theirs, gathered in PYTHON -- the collective
+  // that exchanges them belongs to the process group. `max_buffers` sizes the peer-pointer slab.
+  Group(int rank, int world_size, uintptr_t self_memory,
         const std::vector<std::string>& signal_handles,
-        const std::vector<int64_t>& signal_offsets, uintptr_t peer_slab,
-        int64_t peer_slab_bytes, int64_t scratch_bytes, double sync_timeout_s)
+        const std::vector<int64_t>& signal_offsets, int64_t max_buffers, int64_t scratch_bytes,
+        int64_t staging_bytes, double sync_timeout_s)
       : rank_(rank),
         world_size_(world_size),
-        self_signal_(reinterpret_cast<Signal*>(self_signal)),
+        self_signal_(reinterpret_cast<Signal*>(self_memory)),
         scratch_bytes_(scratch_bytes),
-        slab_end_(reinterpret_cast<PeerPtrs*>(peer_slab) +
-                  peer_slab_bytes / sizeof(PeerPtrs)),
-        cursor_(reinterpret_cast<PeerPtrs*>(peer_slab)) {
+        staging_bytes_(staging_bytes) {
     if (world_size_ < 2 || world_size_ > kMaxRanks)
       throw std::runtime_error("hip_comms: world_size " + std::to_string(world_size_) +
                                " outside [2, " + std::to_string(kMaxRanks) + "]");
     if (signal_handles.size() != static_cast<size_t>(world_size_) ||
         signal_offsets.size() != static_cast<size_t>(world_size_))
       throw std::runtime_error("hip_comms: expected one signal handle+offset per rank");
-    auto opened = open_peers(signal_handles, signal_offsets, self_signal);
+    // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
+    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(max_buffers) * sizeof(PeerPtrs)));
+    slab_end_ = slab_ + max_buffers;
+    cursor_   = slab_;
+    auto opened = open_peers(signal_handles, signal_offsets, self_memory);
     for (int i = 0; i < world_size_; ++i)
       signals_.s[i] = reinterpret_cast<Signal*>(opened[i]);
+    // THE STAGING IS REGISTERED HERE: every rank's lies at the same offset in its allocation.
+    std::vector<void*> staging(world_size_);
+    for (int i = 0; i < world_size_; ++i)
+      staging[i] = static_cast<char*>(opened[i]) + sizeof(Signal) + scratch_bytes_;
+    PeerPtrs* slot = next_slot();
+    write_slot(slot, staging);
+    registered_[staging[rank_]] = slot;
     // The device wall clock is fixed-rate, in kHz; the kernels count the timeout in it.
     int device = 0, khz = 0;
     HIP_CHECK(hipGetDevice(&device));
@@ -106,6 +116,7 @@ class Group {
 
   ~Group() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
+    hipFree(slab_);
     hipFree(self_signal_);
   }
 
@@ -113,6 +124,11 @@ class Group {
   // Bounds checks and random skew in every kernel launched after this. The tests' mode.
   void set_checked(bool checked) { checked_ = checked; }
   int64_t scratch_bytes() const { return scratch_bytes_; }
+  // Where an eager input is copied for its peers to read, and how many bytes it holds.
+  void* staging() const {
+    return reinterpret_cast<char*>(self_signal_) + sizeof(Signal) + scratch_bytes_;
+  }
+  int64_t staging_bytes() const { return staging_bytes_; }
 
   // A buffer whose address is known ahead of time. The eager path.
   void register_buffer(const std::vector<std::string>& handles,
@@ -233,11 +249,13 @@ class Group {
   int world_size_;
   Signal* self_signal_;
   int64_t scratch_bytes_;
+  int64_t staging_bytes_;
   uint64_t timeout_ticks_ = 0;
   bool checked_           = false;
   PeerSignals signals_{};
-  PeerPtrs* slab_end_;
-  PeerPtrs* cursor_;
+  PeerPtrs* slab_     = nullptr;
+  PeerPtrs* slab_end_ = nullptr;
+  PeerPtrs* cursor_   = nullptr;
   std::unordered_map<void*, PeerPtrs*> registered_;
   std::vector<void*> pending_;
   std::vector<PeerPtrs*> pending_slots_;

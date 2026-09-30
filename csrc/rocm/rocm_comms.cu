@@ -554,20 +554,27 @@ hip_comms::p2p::host::Group& comms_of(fptr_t comms) {
 }
 }  // namespace
 
-int64_t rocm_comms_alloc_signal(int64_t scratch_bytes) {
-  return static_cast<int64_t>(hip_comms::p2p::host::alloc_signal(scratch_bytes));
+int64_t rocm_comms_alloc(int64_t scratch_bytes, int64_t staging_bytes) {
+  return static_cast<int64_t>(hip_comms::p2p::host::alloc_memory(scratch_bytes, staging_bytes));
 }
 
-fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
+fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
-                       const std::vector<int64_t>& signal_offsets, int64_t peer_slab,
-                       int64_t peer_slab_bytes, int64_t scratch_bytes,
-                       double sync_timeout_s) {
+                       const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
+                       int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s) {
   auto* comms = new hip_comms::p2p::host::Group(
       static_cast<int>(rank), static_cast<int>(world_size),
-      static_cast<uintptr_t>(self_signal), bytes_of(signal_handles), signal_offsets,
-      static_cast<uintptr_t>(peer_slab), peer_slab_bytes, scratch_bytes, sync_timeout_s);
+      static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets, max_buffers,
+      scratch_bytes, staging_bytes, sync_timeout_s);
   return reinterpret_cast<fptr_t>(comms);
+}
+
+// The staging as a byte tensor, a view the Group owns: Python copies an eager input into it.
+torch::Tensor rocm_comms_staging(fptr_t comms) {
+  auto& group = comms_of(comms);
+  return torch::from_blob(group.staging(), {group.staging_bytes()},
+                          torch::TensorOptions().dtype(torch::kUInt8).device(
+                              torch::kCUDA, c10::cuda::current_device()));
 }
 
 void rocm_comms_set_checked(fptr_t comms, bool checked) {
@@ -684,13 +691,3 @@ std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t p
   return std::make_tuple(bytes, offset);
 }
 
-// The sizes Python needs to allocate the signal block and the peer slab, and the bounds it
-// checks a world size and a launch against. Constants of the kernel, so they are asked for
-// rather than restated.
-std::vector<int64_t> rocm_comms_sizes() {
-  return {static_cast<int64_t>(sizeof(hip_comms::p2p::Signal)),
-          static_cast<int64_t>(sizeof(hip_comms::p2p::PeerPtrs)),
-          static_cast<int64_t>(hip_comms::p2p::kMaxBlocks),
-          static_cast<int64_t>(hip_comms::p2p::kMaxRanks),
-          static_cast<int64_t>(sizeof(hip_comms::p2p::host::Handle))};
-}
