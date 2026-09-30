@@ -36,7 +36,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const auto f           = fragment<kRowPacks>(packs);
 
   // 1. Wait until every peer has launched, so its input is ready.
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
@@ -54,6 +56,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const int64_t at   = int64_t{row - first} * packs;
     V sum[kRowPacks];
     peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
     float s[kRowPacks][NL];
 #pragma unroll
@@ -69,6 +72,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     }
     float ss[1] = {thread_dot(s, s, f)};
     block_reduce<Sum>(ss);
+    block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
@@ -83,8 +87,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     }
   }
 
+  block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read. EVERY OWNER'S PACK
@@ -109,6 +115,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       }
     }
   }
+  block_stamp(6);
 }
 
 // THE KERNELS, one per op, both the body above.
