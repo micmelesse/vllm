@@ -66,7 +66,7 @@ DINLINE Fragment<K> fragment(int len) {
 // device-global [block][phase] table the host reads back (rocm_comms_stamps). Built only with
 // HIP_COMMS_STAMPS, since the barrier it adds would perturb a production kernel.
 #ifndef HIP_COMMS_STAMPS
-#define HIP_COMMS_STAMPS 1
+#define HIP_COMMS_STAMPS 0
 #endif
 constexpr int kStampBlocks = kMaxComputeUnits;
 constexpr int kStampPhases = 8;
