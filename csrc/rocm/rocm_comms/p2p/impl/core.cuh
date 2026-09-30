@@ -173,6 +173,18 @@ DINLINE typename traits<T>::V* scratch_of(const Peers& p, int r) {
   return at;
 }
 
+// Rank r's input for this launch, the same way: each rank's pointer by a constant index, so the
+// loads are scalar and issue together (a runtime index made them one dependent vector load).
+template <typename T, int ngpus>
+DINLINE const typename traits<T>::V* input_of(const Peers& p, int r) {
+  using V     = typename traits<T>::V;
+  const V* at = reinterpret_cast<const V*>(p.inputs->p[0]);
+#pragma unroll
+  for (int k = 1; k < ngpus; ++k)
+    if (r == k) at = reinterpret_cast<const V*>(p.inputs->p[k]);
+  return at;
+}
+
 }  // namespace impl
 
 // ONE RANK'S BUFFERS FOR THIS LAUNCH, read-only, held for the kernel and never handed out. Made
@@ -190,7 +202,7 @@ class Peer {
  public:
   DINLINE Peer() = default;
   DINLINE Peer(const Peers& p, int r)
-      : in_(reinterpret_cast<const V*>(p.inputs->p[r])),
+      : in_(impl::input_of<T, ngpus>(p, r)),
         scratch_(impl::scratch_of<T, ngpus>(p, r)) {}
 
   template <typename U, int n>

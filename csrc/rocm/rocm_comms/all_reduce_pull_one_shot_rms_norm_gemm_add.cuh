@@ -29,15 +29,17 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
 
+  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
   //    workspace.
-  p2p::Peer<T, ngpus> all[ngpus];
-#pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kRowPacks];
     sum_row<T, ngpus>(read, row, packs, sum);

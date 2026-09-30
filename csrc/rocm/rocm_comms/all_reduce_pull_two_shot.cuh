@@ -35,14 +35,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int stride      = gridDim.x * lanes;
   __shared__ V got[kMaxThreads];
 
+  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
+  const auto self = p2p::self<T, ngpus>(p);
+  const auto them = p2p::peer<T, ngpus>(p, peer);
+
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
   //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
   //    lane's packs, so they leave the loop together and the barriers inside it match.
-  const auto self = p2p::self<T, ngpus>(p);
-  const auto them = p2p::peer<T, ngpus>(p, peer);
   const int base    = p.rank * slice_packs;
   const int mine    = min(slice_packs, num_packs - base);
   for (int i = first; i < mine; i += stride) {

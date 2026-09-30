@@ -33,14 +33,16 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::Peers p, T* __restr
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
 
-  // 1. Wait until every peer has launched, so its input is ready.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
-
-  // 2. Each of this block's rows: read it from every rank in rank order, sum, norm.
+  // THE RANKS' POINTERS BEFORE THE BARRIER: their loads hide under its wait.
   p2p::Peer<T, ngpus> all[ngpus];
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+
+  // 1. Wait until every peer has launched, so its input is ready.
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+
+  // 2. Each of this block's rows: read it from every rank in rank order, sum, norm.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kRowPacks];
     sum_row<T, ngpus>(read, row, packs, sum);
