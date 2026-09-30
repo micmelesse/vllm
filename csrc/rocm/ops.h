@@ -56,6 +56,7 @@ void paged_attention(
 // stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
 using fptr_t = int64_t;
 
+int64_t rocm_comms_alloc_signal(int64_t scratch_bytes);
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,

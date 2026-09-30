@@ -60,6 +60,18 @@ inline std::pair<std::string, int64_t> handle_and_offset(uintptr_t ptr) {
           reinterpret_cast<char*>(ptr) - static_cast<char*>(base)};
 }
 
+// THIS RANK'S SIGNAL BLOCK AND SCRATCH, one allocation, zeroed. UNCACHED, as aiter and vLLM's
+// custom all-reduce allocate theirs: peers read what this rank's kernel wrote, and cached, those
+// writes sit dirty in L2 for the barrier's writeback to flush. The Group it is passed to owns it.
+inline uintptr_t alloc_signal(int64_t scratch_bytes) {
+  void* p = nullptr;
+  const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes);
+  HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
+  HIP_CHECK(hipMemset(p, 0, bytes));
+  HIP_CHECK(hipDeviceSynchronize());
+  return reinterpret_cast<uintptr_t>(p);
+}
+
 class Group {
  public:
   // `signal_handles`/`signal_offsets` are the whole world's handles for their own signal
@@ -94,6 +106,7 @@ class Group {
 
   ~Group() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
+    hipFree(self_signal_);
   }
 
   int world_size() const { return world_size_; }

@@ -554,6 +554,10 @@ hip_comms::p2p::host::Group& comms_of(fptr_t comms) {
 }
 }  // namespace
 
+int64_t rocm_comms_alloc_signal(int64_t scratch_bytes) {
+  return static_cast<int64_t>(hip_comms::p2p::host::alloc_signal(scratch_bytes));
+}
+
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_signal,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t peer_slab,

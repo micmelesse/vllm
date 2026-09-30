@@ -27,8 +27,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from vllm import _custom_ops as ops
-
 from .base import AdmitOp, Communicator
 from .launch import Launch, launch_wire
 
@@ -98,16 +96,12 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         tunables = self.hip_tunables
-        signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
+        _signal_bytes, peer_ptrs_bytes, _blocks, _ranks, _handle_bytes = (
             torch.ops._rocm_C.rocm_comms_sizes()
         )
         self.rank = dist.get_rank(self.cpu_group)
-        # One allocation per rank: the signal block, then the scratch. UNCACHED, as aiter and
-        # vLLM's custom all-reduce allocate theirs: a peer reads what this rank's kernel wrote,
-        # and cached, those writes sit dirty in L2 for the barrier's writeback to flush.
-        self._signal, _ = ops.allocate_shared_buffer_and_handle(
-            signal_bytes + tunables.scratch_bytes
-        )
+        # One allocation per rank, the signal block then the scratch, made and owned by C++.
+        self._signal = torch.ops._rocm_C.rocm_comms_alloc_signal(tunables.scratch_bytes)
         self._slab = torch.zeros(
             peer_ptrs_bytes * tunables.max_buffers,
             dtype=torch.uint8,
@@ -409,5 +403,4 @@ class HipCommunicator(Communicator):
         if self._handle is None:
             return
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
-        ops.free_shared_buffer(self._signal)
         self._handle = None
