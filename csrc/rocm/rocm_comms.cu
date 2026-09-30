@@ -156,9 +156,6 @@ std::string why_not(const p2p::host::Group& group, const Request& req, Op op, in
   if (op == Op::all_reduce_rms_norm_gemm_add &&
       l.threads > gemm_max_threads(l.gemm_lanes_per_col))
     return "the GEMM tail's block exceeds what its LDS holds";
-  if (op == Op::all_reduce_rms_norm_gemm_add && !is_two_shot(l.kernel) &&
-      rows > kGemmTailOneShotRows)
-    return "the GEMM tail's one-shot takes at most one GEMM pass of rows";
   if (scratch_need(l, rows, packs, rows * packs, group.world_size()) > group.scratch_bytes())
     return "its two-shot slice exceeds the scratch (raise scratch_bytes)";
   return "";

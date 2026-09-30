@@ -45,8 +45,6 @@ enum class Kernel : int {
 // THE MOST SOURCES AN AttnRes ROW MIXES: the stored blocks and the prefix (Kimi-K3: up to 9 + 1).
 constexpr int kAttnResMaxSources = 10;
 
-// The GEMM tail's one-shot kernel takes one GEMM pass (common/gemm.cuh): at most this many rows.
-constexpr int kGemmTailOneShotRows = kGemmRows;
 
 // What each kernel is, in Kernel's order.
 struct KernelInfo {

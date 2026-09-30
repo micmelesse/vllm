@@ -101,6 +101,7 @@ struct Calibration {
   int fused_threads;                 // a fused kernel's block
   int gemm_tail_blocks;              // the GEMM tail's grid
   int gemm_lanes_per_col;            // the GEMM tail's lanes a column (a build: 1, 2, 4 or 8)
+  int64_t gemm_one_shot_max_rows;    // the GEMM tail's one-shot/two-shot crossover
 };
 
 // gfx950 on n11. MI300X has none yet.
@@ -125,6 +126,8 @@ constexpr Calibration kGfx950Calibration = {
     56,
     // Picked at Kimi-K3's shape; 1, 2 and 8 were worse at 1 row (2026-09-28).
     4,
+    // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
+    16,
 };
 
 // Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's

@@ -139,7 +139,7 @@ constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
 constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
                                                    const Calibration& cal) {
-  const Kernel k = in.rows <= kGemmTailOneShotRows
+  const Kernel k = in.rows <= cal.gemm_one_shot_max_rows
                        ? Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add
                        : Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add;
   return at(k, in, cal.gemm_tail_blocks, cal.fused_threads, cal.gemm_lanes_per_col);

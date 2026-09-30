@@ -12,7 +12,7 @@
 namespace hip_comms {
 
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
-// grid barrier; the GEMM over every row. At most kGemmRows rows: one GEMM pass.
+// grid barrier; the GEMM over every row, kGemmRows a pass.
 // kLanesPerCol is the GEMM's lanes per column (tune.cuh).
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
@@ -61,8 +61,10 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
 
   // 4. The GEMM over every row.
-  grid_gemm<kLanesPerCol, T>([&](int r) { return normed + r * packs; }, rows, gemm_w, n_cols,
-                             packs, out, out_stride, out_col0);
+  for (int r0 = 0; r0 < rows; r0 += kGemmRows)
+    grid_gemm<kLanesPerCol, T>([&](int r) { return normed + (r0 + r) * packs; },
+                               min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
+                               out + r0 * out_stride, out_stride, out_col0);
 
   // 5. No rank may overwrite its input until every peer has read it.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
