@@ -20,7 +20,10 @@
 namespace hip_comms::p2p {
 
 constexpr int kMaxRanks  = 8;
-constexpr int kMaxBlocks = 64;
+// ONE SIGNAL SLOT PER COMPUTE UNIT on any target built: the signal block never rules out a grid.
+// Which grid is fast is the tuner's (tune.cuh).
+constexpr int kMaxBlocks =
+    kGfx950.compute_units > kGfx942.compute_units ? kGfx950.compute_units : kGfx942.compute_units;
 
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
 // the bytes after the struct.

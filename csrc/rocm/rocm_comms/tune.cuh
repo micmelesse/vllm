@@ -73,6 +73,9 @@ constexpr int64_t kPullOneShotMaxBytes = 64 * kKiB;
 // with no pack to move is pure cost (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64).
 // A wave's lanes take one pack each in a pass, up to the signal slots and the compute units.
 // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER (aiter's two-stage), so it is the wave times the world.
+// THE GRID CAP, until the sweep past 64 blocks says otherwise (aiter caps its own at 80).
+constexpr int kPullMaxBlocks = 64;
+
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
   const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
@@ -80,7 +83,7 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int cap     = p2p::kMaxBlocks < hw.compute_units ? p2p::kMaxBlocks : hw.compute_units;
+  const int cap     = kPullMaxBlocks < hw.compute_units ? kPullMaxBlocks : hw.compute_units;
   const int blocks  = need < cap ? static_cast<int>(need) : cap;
   const int threads = one_shot ? hw.wave_size : hw.wave_size * in.world;
   return at(k, in, blocks, threads);
