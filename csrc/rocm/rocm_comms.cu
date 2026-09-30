@@ -16,12 +16,12 @@
 // the wrong thing.
 //
 // rocm_comms/ holds the layers as headers, all included here so the device code stays in
-// this one translation unit and needs no -fgpu-rdc: common/ (what everything uses: the
-// pack, how it is loaded and stored, the sums), p2p/ (the peer layer, host and device,
-// behind its one interface p2p/p2p.cuh), fusions/ (what a fused op computes), hardware.cuh
-// (the target's facts), launch.cuh (the kernels there are), tune.cuh (the picker), then one
-// all_reduce_pull_<shot>[_<fusion>].cuh per kernel, named as its Kernel is. Design
-// rules: CONTEXT.md, "Code design".
+// this one translation unit and needs no -fgpu-rdc: common/ (primitives: the pack, how it is
+// loaded and stored, a thread's share of a row, the sums), p2p/ (the peer layer, host and
+// device, behind its one interface p2p/p2p.cuh), hardware.cuh (the target's facts and its
+// calibration), launch.cuh (the kernels there are), tune.cuh (the picker), probes/ (the
+// calibration kernels), then one all_reduce_pull_<shot>[_<fusion>].cuh per kernel, named as
+// its Kernel is, each holding its whole algorithm. Design rules: CONTEXT.md, "Code design".
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/BFloat16.h>
@@ -147,7 +147,7 @@ bool admits(const p2p::host::Group& group, const Request& req, Op op, int64_t ro
   // NO KERNEL QUANTIZES YET: a call that accepts fewer bits runs exact elsewhere, not here.
   if (l.quant_bits != 16) return false;
   if (op == Op::all_reduce_rms_norm_gemm_add &&
-      l.threads > fusions::rms_norm_gemm_add::max_threads(l.gemm_lanes_per_col))
+      l.threads > gemm_max_threads(l.gemm_lanes_per_col))
     return false;
   if (op == Op::all_reduce_rms_norm_gemm_add && !is_two_shot(l.kernel) &&
       rows > kGemmTailOneShotRows)
@@ -256,7 +256,7 @@ void all_reduce(p2p::host::Group& group, const Request& req, torch::Tensor& out,
 
 // FUSED: all-reduce, then vLLM's `rms_norm`, or `fused_add_rms_norm` when `residual` is
 // given (and then `residual_out` too). Exact to those ops' roundings; see
-// `fusions::add_rms_norm::row`.
+// `all_reduce_pull_one_shot_add_rms_norm_body`.
 void all_reduce_add_rms_norm(p2p::host::Group& group, const Request& req,
                              torch::Tensor& out, torch::Tensor* residual_out,
                              torch::Tensor& inp, const torch::Tensor* residual,
@@ -349,9 +349,9 @@ void all_reduce_add_rms_norm(p2p::host::Group& group, const Request& req,
 #undef NORM_ARGS
 }
 
-// FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm
-// on each row (see `fusions::add_attn_res_rms_norm::row`). With `has_prefix` the sum is
-// added to `prefix` in place; without, the sum IS the new prefix and is written there.
+// FUSED: all-reduce, then add into the prefix, then Kimi-K3's AttnRes and its RMSNorm on each
+// row (the kernels spell it out). With `has_prefix` the sum is added to `prefix` in place;
+// without, the sum IS the new prefix and is written there.
 void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Request& req,
                                       torch::Tensor& prefix, torch::Tensor& out,
                                       torch::Tensor& inp,
@@ -372,8 +372,8 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Request& re
               "blocks must be [tokens, sources, hidden] with a unit hidden stride");
   TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1),
               "num_blocks must be in [0, ", blocks.size(1), "]");
-  TORCH_CHECK(num_blocks < hip_comms::fusions::add_attn_res_rms_norm::kMaxSources,
-              "num_blocks must be below ", hip_comms::fusions::add_attn_res_rms_norm::kMaxSources,
+  TORCH_CHECK(num_blocks < hip_comms::kAttnResMaxSources,
+              "num_blocks must be below ", hip_comms::kAttnResMaxSources,
               ", the most sources a row mixes");
   TORCH_CHECK(write_idx < blocks.size(1), "write_idx must be < ", blocks.size(1));
   std::vector<const torch::Tensor*> same = {&prefix, &out, &blocks, &norm_weight,

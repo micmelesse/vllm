@@ -7,10 +7,10 @@
 
 #pragma once
 
-#include "fusions/add_rms_norm.cuh"
 #include "p2p/p2p.cuh"
 #include "common/memory.cuh"
 #include "common/reduce.cuh"
+#include "common/row.cuh"
 
 namespace hip_comms {
 
@@ -28,7 +28,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
                                                         int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  namespace fusion       = fusions::add_rms_norm;
   const V* res_in        = reinterpret_cast<const V*>(residual);
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
@@ -36,6 +35,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
+  const auto sh          = share<kRowPacks>(packs);
 
   // 1. Wait until every peer has launched, so its input is ready.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
@@ -43,38 +43,66 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
   const auto peers = p2p::peers<T, ngpus>(p);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
-  const auto self = p2p::self<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  const auto self  = p2p::self<T, ngpus>(p);
 
-  // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
-  //    result in this rank's scratch.
-  const int first  = p.rank * slice_rows;
-  const int last   = min(first + slice_rows, rows);
+  // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
+  //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
+  //    and leave the out rows and (kAdd) the residual rows in this rank's scratch.
+  const int first = p.rank * slice_rows;
+  const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
+    const int64_t base = int64_t{row} * packs;
+    const int64_t at   = int64_t{row - first} * packs;
     V sum[kRowPacks];
-    sum_row<T, ngpus>(read, row, packs, sum);
-    const int64_t at = int64_t{row - first} * packs;
-    fusion::row<T, W, kAdd>(
-        sum, res_in, wv, row, packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { p2p::write_scratch(self, res_at + at + i, v); },
-        [&](int, int i, const V& v) { p2p::write_scratch(self, at + i, v); });
+    sum_row<T, ngpus>(read, row, packs, sh, sum);
+    float s[kRowPacks][NL];
+    V res[kRowPacks];
+    if constexpr (kAdd) load(res_in + base, sh, res);
+    float ss[1] = {0.0f};
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) {
+      unpack<T>(sum[k], s[k]);
+      if constexpr (kAdd) {
+#pragma unroll
+        for (int j = 0; j < NL; ++j) s[k][j] += static_cast<float>(res[k].d[j]);
+        res[k] = round_pack<T>(s[k]);
+      }
+#pragma unroll
+      for (int j = 0; j < NL; ++j) ss[0] += sh.in[k] * s[k][j] * s[k][j];
+    }
+    block_sum(ss);
+    const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    vec<W, NL> w[kRowPacks];
+    load(wv, sh, w);
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) {
+      V normed;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) {
+        const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
+        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
+      }
+      if (sh.in[k] == 0.0f) continue;
+      p2p::write_scratch(self, at + sh.at[k], normed);
+      if constexpr (kAdd) p2p::write_scratch(self, res_at + at + sh.at[k], res[k]);
+    }
   }
 
   // 3. Every rank's rows are visible to its peers.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
-  //    first sync keeps a rank from overwriting its scratch while it is read.
+  //    first sync keeps a rank from overwriting its scratch while it is read. EVERY OWNER'S PACK
+  //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
+  //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
+  //    load under an `if`, made the eight owners' round trips run one after another.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
-    // and the peers' scratch apart, so a store between two loads holds the next load back
-    // until the store is done, and the eight owners' round trips run one after another.
       const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus] = {}, got_res[ngpus] = {};
+      V got[ngpus], got_res[ngpus];
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
-        if (r * slice_rows + l >= rows) continue;
         got[r] = p2p::read_scratch(peers[r], at);
         if constexpr (kAdd) got_res[r] = p2p::read_scratch(peers[r], res_at + at);
       }
