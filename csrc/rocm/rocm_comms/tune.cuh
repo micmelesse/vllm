@@ -73,8 +73,12 @@ constexpr int64_t kPullOneShotMaxBytes = 64 * kKiB;
 // with no pack to move is pure cost (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64).
 // A wave's lanes take one pack each in a pass, up to the signal slots and the compute units.
 // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER (aiter's two-stage), so it is the wave times the world.
-// THE GRID CAP, until the sweep past 64 blocks says otherwise (aiter caps its own at 80).
-constexpr int kPullMaxBlocks = 64;
+// THE GRID CAP: enough blocks to keep the links busy, and no more, since every block syncs with
+// its partner on every peer. Filling 7 xGMI links (76.8 GB/s a way) through a ~2 us round trip
+// takes ~1 MB in flight, ~130 passes of a 512-thread block's 8 KB; the sweep's optimum is flat from
+// 80 to 128 blocks (1.8 MB: 15.42 us at 64, 14.72-14.81 at 80-128, 16.70 at 256). The round trip
+// is an estimate, not a documented fact.
+constexpr int kPullMaxBlocks = 128;
 
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
