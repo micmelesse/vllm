@@ -65,7 +65,7 @@ constexpr bool tuned_launches_fit() {
   for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm_add); ++op)
     for (const Input in :
          {Input{1, 8, 2, 0, 16, 2}, Input{4096, 7168, 2, 0, 16, p2p::kMaxRanks}})
-      if (!fits(tune(static_cast<Op>(op), in, kTarget))) return false;
+      if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration))) return false;
   return true;
 }
 static_assert(tuned_launches_fit(), "a tune_<op> in tune.cuh exceeds a kernel capability");
@@ -108,7 +108,7 @@ Input input_of(const p2p::host::Group& group, const Request& req, int64_t rows, 
 // What runs: tune.cuh's pick, or the forced kernel at the forced grid and block.
 Launch launch_for(const Request& req, Op op, Input in) {
   const Forced& f = req.forced;
-  if (f.kernel == Kernel::none) return tune(op, in, kTarget);
+  if (f.kernel == Kernel::none) return tune(op, in, kTarget, kTargetCalibration);
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
   return at(f.kernel, in, f.blocks, f.threads);

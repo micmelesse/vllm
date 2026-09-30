@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// WHAT RUNS FOR A CALL: `tune(op, input, hw)` splits on the op and calls that op's own
-// `tune_<op>`, which picks the kernel AND its launch config from the hardware's facts
-// (hardware.cuh) and the input, one rule in one place, with the sweep it came from written beside
-// it. An op not yet swept says so and states what it runs. launch.cuh says what kernels exist.
+// WHAT RUNS FOR A CALL: `tune(op, input, hw, cal)` splits on the op and calls that op's own
+// `tune_<op>`, which picks the kernel AND its launch config from the input, the hardware's
+// documented facts and what was measured on it (hardware.cuh's Hardware and Calibration), one
+// rule in one place, with the sweep it came from written beside it. An op not yet swept says so
+// and states what it runs. launch.cuh says what kernels exist.
 
 #pragma once
 
@@ -85,7 +86,7 @@ constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, in
   return blocks < hw.compute_units ? blocks : hw.compute_units;
 }
 
-constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
+constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
   const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
   const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
   const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
@@ -93,7 +94,7 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   const int threads = one_shot ? hw.wave_size : hw.wave_size * in.world;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int cap     = link_filling_blocks(hw, kTargetCalibration, threads);
+  const int cap     = link_filling_blocks(hw, cal, threads);
   const int blocks  = need < cap ? static_cast<int>(need) : cap;
   return at(k, in, blocks, threads);
 }
@@ -110,18 +111,19 @@ constexpr Launch fused_untuned(Kernel one_shot, Kernel two_shot, Input in) {
   return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
 }
 
-constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&) {
+constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration&) {
   return fused_untuned(Kernel::all_reduce_pull_one_shot_rms_norm,
                        Kernel::all_reduce_pull_two_shot_rms_norm, in);
 }
 
-constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&) {
+constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration&) {
   return fused_untuned(Kernel::all_reduce_pull_one_shot_add_rms_norm,
                        Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
 }
 
 // PAST ONE-SHOT'S RANGE IT DECLINES: two-shot lost to unfused there (2143 vs 1093 us at 4096 rows).
-constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&) {
+constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
+                                                        const Calibration&) {
   return bytes(in) <= kFusedOneShotMaxBytes
              ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, 16, 512)
              : declined();
@@ -129,19 +131,22 @@ constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&
 
 // DECLINED until its rewrite measures faster than unfused (37 us at 16 rows); it runs only forced,
 // by the tests and the bench.
-constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input, const Hardware&) { return declined(); }
+constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input, const Hardware&, const Calibration&) {
+  return declined();
+}
 
 // =================================================================================================
 // THE ONE ENTRY: the op's own function.
 // =================================================================================================
 
-constexpr Launch tune(Op op, Input in, const Hardware& hw) {
+constexpr Launch tune(Op op, Input in, const Hardware& hw, const Calibration& cal) {
   switch (op) {
-    case Op::all_reduce: return tune_all_reduce(in, hw);
-    case Op::all_reduce_rms_norm: return tune_all_reduce_rms_norm(in, hw);
-    case Op::all_reduce_add_rms_norm: return tune_all_reduce_add_rms_norm(in, hw);
-    case Op::all_reduce_add_attn_res_rms_norm: return tune_all_reduce_add_attn_res_rms_norm(in, hw);
-    case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw);
+    case Op::all_reduce: return tune_all_reduce(in, hw, cal);
+    case Op::all_reduce_rms_norm: return tune_all_reduce_rms_norm(in, hw, cal);
+    case Op::all_reduce_add_rms_norm: return tune_all_reduce_add_rms_norm(in, hw, cal);
+    case Op::all_reduce_add_attn_res_rms_norm:
+      return tune_all_reduce_add_attn_res_rms_norm(in, hw, cal);
+    case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw, cal);
   }
   return declined();
 }
