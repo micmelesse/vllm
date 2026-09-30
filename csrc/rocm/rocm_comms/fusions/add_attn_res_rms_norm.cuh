@@ -11,6 +11,9 @@
 
 namespace hip_comms::fusions::add_attn_res_rms_norm {
 
+// THE MOST SOURCES A ROW MIXES: the stored blocks and the prefix (Kimi-K3: up to 9 + 1).
+constexpr int kMaxSources = 10;
+
 // ONE ROW of all-reduce + AttnRes by the whole block, matching
 // `vllm/models/kimi_k3/amd/ops/attn_res.py` rounding for rounding:
 //
@@ -19,7 +22,7 @@ namespace hip_comms::fusions::add_attn_res_rms_norm {
 //   prefix_out = T(u); blocks[write] = T(u)          the new prefix, and the block written
 //   per source s (the stored blocks, then u):
 //       logit_s = dot(s, norm_w * qk_w) * rsqrt(mean(s^2) + eps)
-//   m   = softmax(logit) . sources                     online, one source at a time
+//   m   = softmax(logit) . sources                     every source loaded and reduced at once
 //   out = T(m), or T(m * rsqrt(mean(m^2) + out_eps) * out_norm_w)
 //
 // The prefix and the mix stay in registers across the sources, so only the stored blocks
@@ -72,57 +75,77 @@ DINLINE void row(const typename traits<T>::V (&sum)[K],
     for (int k = 0; k < K; ++k) {
       const int i = threadIdx.x + k * blockDim.x;
 #pragma unroll
-      for (int j = 0; j < NL; ++j) m[k][j] = 0.0f;
+      for (int j = 0; j < NL; ++j) w[k][j] = 0.0f;
       if (i >= packs) continue;
       const V a = norm_w[i], b = qk_w[i];
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         w[k][j] = static_cast<float>(a.d[j]) * static_cast<float>(b.d[j]);
     }
-    float max_logit = -INFINITY, denominator = 0.0f;
-    for (int s = 0; s <= num_blocks; ++s) {
-      // The stored blocks first, the prefix last, as the reference orders its sources.
+    // 1. EVERY STORED SOURCE AT ONCE: the loads are all in flight together, where one source at a
+    //    time waited on each (up to 9 dependent round trips to memory).
+    V x[kMaxSources - 1][K];
+#pragma unroll
+    for (int s = 0; s < kMaxSources - 1; ++s) {
       const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
-      float v[K][NL];
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        const int i = threadIdx.x + k * blockDim.x;
+        x[s][k]     = s < num_blocks && i < packs ? src[i] : V{};
+      }
+    }
+    // 2. EVERY SOURCE'S SUM OF SQUARES AND WEIGHTED DOT, in ONE block reduction: the stored blocks
+    //    first, the prefix last (source num_blocks), as the reference orders them.
+    float sums[2 * kMaxSources];
+#pragma unroll
+    for (int s = 0; s < kMaxSources; ++s) {
       float ss = 0.0f, dot = 0.0f;
+      if (s <= num_blocks) {
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const int i = threadIdx.x + k * blockDim.x;
-        if (i >= packs) break;
-        if (s < num_blocks) {
-          const V x = src[i];
+        for (int k = 0; k < K; ++k) {
+          const int i = threadIdx.x + k * blockDim.x;
+          if (i >= packs) break;
 #pragma unroll
-          for (int j = 0; j < NL; ++j) v[k][j] = static_cast<float>(x.d[j]);
-        } else {
-#pragma unroll
-          for (int j = 0; j < NL; ++j) v[k][j] = u[k][j];
-        }
-#pragma unroll
-        for (int j = 0; j < NL; ++j) {
-          ss += v[k][j] * v[k][j];
-          dot += v[k][j] * w[k][j];
+          for (int j = 0; j < NL; ++j) {
+            const float v = s < num_blocks ? static_cast<float>(x[s][k].d[j]) : u[k][j];
+            ss += v * v;
+            dot += v * w[k][j];
+          }
         }
       }
-      const float2 sums       = block_sum2(ss, dot);
-      const float logit       = sums.y * rsqrtf(sums.x * inv_hidden + eps);
-      const float new_max     = fmaxf(max_logit, logit);
-      const float old_scale   = __expf(max_logit - new_max);
-      const float this_scale  = __expf(logit - new_max);
-      denominator             = denominator * old_scale + this_scale;
-      max_logit               = new_max;
+      sums[2 * s]     = ss;
+      sums[2 * s + 1] = dot;
+    }
+    block_sum_n(sums);
+    // 3. THE SOFTMAX over the sources' logits, then the mix.
+    float logit[kMaxSources];
+    float max_logit = -INFINITY;
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const int i = threadIdx.x + k * blockDim.x;
-        if (i >= packs) break;
+    for (int s = 0; s < kMaxSources; ++s) {
+      logit[s] = sums[2 * s + 1] * rsqrtf(sums[2 * s] * inv_hidden + eps);
+      if (s <= num_blocks) max_logit = fmaxf(max_logit, logit[s]);
+    }
+    float denominator = 0.0f;
 #pragma unroll
-        for (int j = 0; j < NL; ++j) m[k][j] = m[k][j] * old_scale + this_scale * v[k][j];
-      }
+    for (int s = 0; s < kMaxSources; ++s) {
+      logit[s] = s <= num_blocks ? __expf(logit[s] - max_logit) : 0.0f;
+      denominator += logit[s];
     }
     const float inv_den = 1.0f / denominator;
 #pragma unroll
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < K; ++k) {
 #pragma unroll
-      for (int j = 0; j < NL; ++j) m[k][j] *= inv_den;
+      for (int j = 0; j < NL; ++j) {
+        float mix = 0.0f;
+#pragma unroll
+        for (int s = 0; s < kMaxSources; ++s) {
+          const float v = s < num_blocks ? static_cast<float>(x[s][k].d[j])
+                                         : (s == num_blocks ? u[k][j] : 0.0f);
+          mix += logit[s] * v;
+        }
+        m[k][j] = mix * inv_den;
+      }
+    }
   }
 
   float scale = 1.0f;

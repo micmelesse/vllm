@@ -97,4 +97,31 @@ DINLINE float2 block_sum2(float a, float b) {
   return total;
 }
 
+// N sums over the block in one pass, `v` in place: every wave reduces its N, then every thread adds
+// the waves' partials (at most kMaxWaves) itself. AttnRes reduces all its sources' sums at once
+// with it, one pass where a block_sum2 per source was one round each.
+template <int N>
+DINLINE void block_sum_n(float (&v)[N]) {
+  __shared__ float partial[kMaxWaves][N];
+  const int lane = threadIdx.x % kWaveSize;
+  const int warp = threadIdx.x / kWaveSize;
+#pragma unroll
+  for (int n = 0; n < N; ++n)
+    for (int off = kWaveSize / 2; off > 0; off >>= 1) v[n] += __shfl_down(v[n], off, kWaveSize);
+  if (lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) partial[warp][n] = v[n];
+  }
+  __syncthreads();
+  const int warps = (blockDim.x + kWaveSize - 1) / kWaveSize;
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    float t = 0.0f;
+    for (int w = 0; w < warps; ++w) t += partial[w][n];
+    v[n] = t;
+  }
+  // Before a later call reuses `partial`.
+  __syncthreads();
+}
+
 }  // namespace hip_comms

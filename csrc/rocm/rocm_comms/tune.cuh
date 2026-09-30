@@ -127,12 +127,17 @@ constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const C
                        Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
 }
 
-// PAST ONE-SHOT'S RANGE IT DECLINES: two-shot lost to unfused there (2143 vs 1093 us at 4096 rows).
+// A BLOCK A ROW, AND NO MORE BLOCKS THAN ROWS: a block does whole rows, and an idle one still pays
+// every barrier. One-shot up to kFusedOneShotMaxBytes, every rank's rows; two-shot past it, each
+// rank's slice of them (was declined there before the uncached scratch and the batched sources).
 constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
                                                         const Calibration&) {
-  return bytes(in) <= kFusedOneShotMaxBytes
-             ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, 16, 512)
-             : declined();
+  const bool one_shot = bytes(in) <= kFusedOneShotMaxBytes;
+  const int64_t rows  = one_shot ? in.rows : (in.rows + in.world - 1) / in.world;
+  const int cap       = one_shot ? 16 : 36;
+  const int blocks    = static_cast<int>(rows < cap ? rows : cap);
+  return one_shot ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, blocks, 512)
+                  : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, blocks, 512);
 }
 
 // DECLINED until its rewrite measures faster than unfused (37 us at 16 rows); it runs only forced,
