@@ -125,15 +125,18 @@ Launch launch_for(const Request& req, Op op, Input in) {
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,
                      int world) {
   // A KERNEL'S SCRATCH is this rank's slice, row-major: the plain two-shot's packs, a fused
-  // two-shot's rows, twice where it leaves two results (out and the residual or the prefix). A
-  // one-shot reads the inputs and keeps nothing.
+  // two-shot's rows, twice where it leaves two results (out and the residual or the prefix). The
+  // norms' two-shot holds the whole reduced tensor, pushed by every rank. A one-shot reads the
+  // inputs and keeps nothing.
   if (!is_two_shot(l.kernel)) return 0;
   const Op op         = op_of(l.kernel);
+  if (op == Op::all_reduce_rms_norm || op == Op::all_reduce_add_rms_norm)
+    return rows * packs * kPackBytes;
   const int64_t slice = op == Op::all_reduce ? (flat + world - 1) / world
                                              : (rows + world - 1) / world * packs;
   const bool two      = op == Op::all_reduce_add_rms_norm ||
                    op == Op::all_reduce_add_attn_res_rms_norm;
-  return slice * (two ? 2 : 1) * 16;
+  return slice * (two ? 2 : 1) * kPackBytes;
 }
 
 // WHY `op` over [rows, hidden] of this element size CANNOT RUN here, or empty when it can: every

@@ -14,8 +14,8 @@
 //   thread_load(row, f, out), thread_store(row, f, v)   a Fragment: every load issued, stores
 //                                               only inside the row
 //   thread_load_uncached(p), thread_store_uncached(p, v)   one pack past every cache (system
-//                                               scope); for the first kernel that writes into a
-//                                               peer, none yet
+//                                               scope); what a write into a peer is (p2p's
+//                                               write_scratch to a peer)
 // elementwise.cuh
 //   thread_unpack(v, x), thread_pack(x)         a pack to fp32 and back, rounding once
 // reduce.cuh

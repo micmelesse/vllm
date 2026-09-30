@@ -188,7 +188,8 @@ DINLINE const typename traits<T>::V* input_of(const DevComm& p, int r) {
 
 }  // namespace impl
 
-// ONE RANK'S BUFFERS FOR THIS LAUNCH, read-only, held for the kernel and never handed out. Made
+// ONE RANK'S BUFFERS FOR THIS LAUNCH, held for the kernel and never handed out: its input read,
+// its scratch read or written. Made
 // before the loops that read it, by `peers` for every rank or `peer` for one chosen at run time
 // (built from the kernel's arguments, never picked out of `peers`: a select over a local array
 // compiles to an index and puts it in scratch, 144 B a lane). Nothing takes a runtime index into
@@ -196,8 +197,8 @@ DINLINE const typename traits<T>::V* input_of(const DevComm& p, int r) {
 template <typename T, int ngpus>
 class Peer {
   using V = typename traits<T>::V;
-  const V* in_      = nullptr;
-  const V* scratch_ = nullptr;
+  const V* in_ = nullptr;
+  V* scratch_   = nullptr;
 
  public:
   DINLINE Peer() = default;
@@ -211,11 +212,12 @@ class Peer {
   friend DINLINE typename traits<U>::V read_input(const Peer<U, n>& peer, int64_t i);
   template <typename U, int n>
   friend DINLINE typename traits<U>::V read_scratch(const Peer<U, n>& peer, int64_t i);
+  template <typename U, int n>
+  friend DINLINE void write_scratch(const Peer<U, n>& peer, int64_t i,
+                                    const typename traits<U>::V& v);
 };
 
-// THIS RANK'S OWN BUFFERS: its scratch is the only thing a pull kernel writes. Writing into a
-// peer's memory is another operation, with its own visibility rule (common/memory.cuh's
-// uncached store).
+// THIS RANK'S OWN BUFFERS: its scratch, read and written here.
 template <typename T, int ngpus>
 class Self {
   using V = typename traits<T>::V;
@@ -224,6 +226,8 @@ class Self {
  public:
   explicit DINLINE Self(const DevComm& p) : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)) {}
 
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_scratch(const Self<U, n>& self, int64_t i);
   template <typename U, int n>
   friend DINLINE void write_scratch(const Self<U, n>& self, int64_t i,
                                     const typename traits<U>::V& v);
@@ -249,6 +253,21 @@ DINLINE typename traits<T>::V read_input(const Peer<T, ngpus>& peer, int64_t i) 
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_scratch(const Peer<T, ngpus>& peer, int64_t i) {
   return thread_load(peer.scratch_ + i);
+}
+
+// SCRATCH, EITHER SIDE: pack i of a rank's scratch, read or written through its view, `Peer` for
+// any rank or `Self` for this one. What one block writes, the same block on the other side sees
+// after a barrier that makes it visible. A write through a Peer is the push send, past every
+// cache.
+template <typename T, int ngpus>
+DINLINE void write_scratch(const Peer<T, ngpus>& peer, int64_t i,
+                           const typename traits<T>::V& v) {
+  thread_store_uncached(peer.scratch_ + i, v);
+}
+
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_scratch(const Self<T, ngpus>& self, int64_t i) {
+  return thread_load(self.scratch_ + i);
 }
 
 // Pack i of this rank's scratch, for its peers to read after a barrier that makes it visible.
