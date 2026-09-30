@@ -82,32 +82,25 @@ DINLINE void row(const typename traits<T>::V (&sum)[K],
       for (int j = 0; j < NL; ++j)
         w[k][j] = static_cast<float>(a.d[j]) * static_cast<float>(b.d[j]);
     }
-    // 1. EVERY STORED SOURCE AT ONCE: the loads are all in flight together, where one source at a
-    //    time waited on each (up to 9 dependent round trips to memory).
-    V x[kMaxSources - 1][K];
-#pragma unroll
-    for (int s = 0; s < kMaxSources - 1; ++s) {
-      const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
-#pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const int i = threadIdx.x + k * blockDim.x;
-        x[s][k]     = s < num_blocks && i < packs ? src[i] : V{};
-      }
-    }
-    // 2. EVERY SOURCE'S SUM OF SQUARES AND WEIGHTED DOT, in ONE block reduction: the stored blocks
-    //    first, the prefix last (source num_blocks), as the reference orders them.
+    // 1. EVERY SOURCE'S SUM OF SQUARES AND WEIGHTED DOT, the stored blocks first and the prefix
+    //    last (source num_blocks), as the reference orders them. The loads are independent, so
+    //    they are in flight together, where one source at a time waited on each; each is folded
+    //    into its sums as it lands and not kept (holding all nine spilled at 2 packs a thread).
     float sums[2 * kMaxSources];
 #pragma unroll
     for (int s = 0; s < kMaxSources; ++s) {
+      const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
       float ss = 0.0f, dot = 0.0f;
       if (s <= num_blocks) {
 #pragma unroll
         for (int k = 0; k < K; ++k) {
           const int i = threadIdx.x + k * blockDim.x;
           if (i >= packs) break;
+          V x;
+          if (s < num_blocks) x = src[i];
 #pragma unroll
           for (int j = 0; j < NL; ++j) {
-            const float v = s < num_blocks ? static_cast<float>(x[s][k].d[j]) : u[k][j];
+            const float v = s < num_blocks ? static_cast<float>(x.d[j]) : u[k][j];
             ss += v * v;
             dot += v * w[k][j];
           }
@@ -116,8 +109,9 @@ DINLINE void row(const typename traits<T>::V (&sum)[K],
       sums[2 * s]     = ss;
       sums[2 * s + 1] = dot;
     }
+    // 2. ONE block reduction for every source's sums, where each source took its own.
     block_sum_n(sums);
-    // 3. THE SOFTMAX over the sources' logits, then the mix.
+    // 3. THE SOFTMAX over the sources' logits.
     float logit[kMaxSources];
     float max_logit = -INFINITY;
 #pragma unroll
@@ -125,26 +119,32 @@ DINLINE void row(const typename traits<T>::V (&sum)[K],
       logit[s] = sums[2 * s + 1] * rsqrtf(sums[2 * s] * inv_hidden + eps);
       if (s <= num_blocks) max_logit = fmaxf(max_logit, logit[s]);
     }
-    float denominator = 0.0f;
+    // The prefix's weight picked out in the unrolled loop: `logit[num_blocks]` is a runtime index
+    // into a local array, and that puts the array in scratch.
+    float denominator = 0.0f, prefix_weight = 0.0f;
 #pragma unroll
     for (int s = 0; s < kMaxSources; ++s) {
       logit[s] = s <= num_blocks ? __expf(logit[s] - max_logit) : 0.0f;
       denominator += logit[s];
+      if (s == num_blocks) prefix_weight = logit[s];
     }
     const float inv_den = 1.0f / denominator;
+    // 4. THE MIX, the stored sources read again: just read, so from cache, and independent.
 #pragma unroll
     for (int k = 0; k < K; ++k) {
+      const int i = threadIdx.x + k * blockDim.x;
+      float mix[NL];
 #pragma unroll
-      for (int j = 0; j < NL; ++j) {
-        float mix = 0.0f;
+      for (int j = 0; j < NL; ++j) mix[j] = prefix_weight * u[k][j];
 #pragma unroll
-        for (int s = 0; s < kMaxSources; ++s) {
-          const float v = s < num_blocks ? static_cast<float>(x[s][k].d[j])
-                                         : (s == num_blocks ? u[k][j] : 0.0f);
-          mix += logit[s] * v;
-        }
-        m[k][j] = mix * inv_den;
+      for (int s = 0; s < kMaxSources - 1; ++s) {
+        if (s >= num_blocks || i >= packs) continue;
+        const V x = reinterpret_cast<const V*>(blocks + s * block_stride_r)[i];
+#pragma unroll
+        for (int j = 0; j < NL; ++j) mix[j] += logit[s] * static_cast<float>(x.d[j]);
       }
+#pragma unroll
+      for (int j = 0; j < NL; ++j) m[k][j] = mix[j] * inv_den;
     }
   }
 
