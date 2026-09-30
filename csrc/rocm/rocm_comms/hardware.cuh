@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE HARDWARE: each target's facts, as the device and AMD's docs report them. No decision lives
-// here; tune.cuh makes them from these facts and the input. A new target is one more `Hardware`;
-// `kTarget` is the one this build is for.
+// THE HARDWARE: each target's facts, as the device and AMD's docs report them, and what was
+// measured on it (`Calibration`). No decision lives here: build.cuh derives what a build is from
+// them, tune.cuh a launch from them and the input. A new target is one more `Hardware`; `kTarget`
+// is the one the host tunes for.
 
 #pragma once
 
@@ -37,6 +38,10 @@ struct Hardware {
   // The fabric to the peers.
   int xgmi_links;                  // one to each peer in an 8-GPU node
   double xgmi_gbytes_per_s_a_way;  // peak, one link, one direction
+  // The instruction set.
+  int max_load_bytes;  // the widest vector load or store a lane issues
+  int arch_vgprs;      // vector registers an instruction names (v0 up)
+  int acc_vgprs;       // accumulation registers beside them (a0 up), where the compiler spills first
 };
 
 // gfx950, AMD Instinct MI355X (MI350X is the same). Sources: `rocminfo` on n11 (2026-09-29, all 8
@@ -61,6 +66,9 @@ constexpr Hardware kGfx950 = {
     8000.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     16 * 38.4 / 8,       // xgmi_gbytes_per_s_a_way
+    16,                  // max_load_bytes (global_load_dwordx4; CDNA4 ISA guide)
+    256,                 // arch_vgprs
+    256,                 // acc_vgprs
 };
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0, "every XCD has the same CUs");
 
@@ -85,6 +93,9 @@ constexpr Hardware kGfx942 = {
     5300.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     64.0,                // xgmi_gbytes_per_s_a_way
+    16,                  // max_load_bytes (global_load_dwordx4; CDNA3 ISA guide)
+    256,                 // arch_vgprs
+    256,                 // acc_vgprs
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
 
@@ -130,17 +141,6 @@ constexpr Calibration kGfx950Calibration = {
     16,
 };
 
-// Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's
-// __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block puts there, and
-// at most 512 (256 architectural + 256 accumulation).
-constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
-  const int waves         = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane  = hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int64_t v         = per_lane / waves_on_simd;
-  return static_cast<int>(v < 512 ? v : 512);
-}
-
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.
 constexpr const Hardware& kTarget               = kGfx950;
 constexpr const Calibration& kTargetCalibration = kGfx950Calibration;
@@ -164,24 +164,6 @@ constexpr int kMaxComputeUnits =
 // path, only a network collective.
 constexpr int kMaxPeers = (kGfx950.xgmi_links > kGfx942.xgmi_links ? kGfx950.xgmi_links
                                                                     : kGfx942.xgmi_links) + 1;
-
-// THE WIDEST BLOCK WE LAUNCH, and every kernel's __launch_bounds__: a bound is a register trade,
-// so it is the widest tuned launch (the fused ops' 512), not the device's 1024. At 1024 a thread
-// gets 128 registers and the row kernels spill (AttnRes at 2 packs a thread, the GEMM tail at
-// any; ISA 2026-09-29T23-48-40Z); at 512 it gets 256.
-constexpr int kMaxThreads = 512;
-static_assert(kMaxThreads <= kDevice.max_workgroup && kMaxThreads % kDevice.wave_size == 0,
-              "the block limit must be whole waves the device can launch");
-static_assert(vgprs_per_thread(kDevice, kMaxThreads) == 256, "512 threads leave 256 registers");
-constexpr int kMaxWaves   = kMaxThreads / kWaveSize;
-
-// Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
-// device's LDS holds, and no more than the block limit.
-constexpr int lds_max_waves(const Hardware& hw, int64_t fixed, int64_t per_wave) {
-  const int64_t fit = (hw.lds_bytes - fixed) / per_wave;
-  const int64_t cap = hw.max_workgroup / hw.wave_size;
-  return static_cast<int>(fit < cap ? fit : cap);
-}
 
 // THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles are wrong.
 #if defined(__AMDGCN_WAVEFRONT_SIZE)

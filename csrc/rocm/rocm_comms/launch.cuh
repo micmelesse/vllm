@@ -11,7 +11,7 @@
 #include <cstdint>
 
 #include "common/common.cuh"
-#include "hardware.cuh"
+#include "build.cuh"
 
 namespace hip_comms {
 
@@ -41,10 +41,6 @@ enum class Kernel : int {
   all_reduce_pull_one_shot_rms_norm_gemm_add     = 8,
   all_reduce_pull_two_shot_rms_norm_gemm_add     = 9,
 };
-
-// THE MOST SOURCES AN AttnRes ROW MIXES: the stored blocks and the prefix (Kimi-K3: up to 9 + 1).
-constexpr int kAttnResMaxSources = 10;
-
 
 // What each kernel is, in Kernel's order.
 struct KernelInfo {
@@ -93,18 +89,13 @@ struct Launch {
 };
 
 // A ROW KERNEL'S BUILDS: each thread holds kRowPacks packs of its row in registers, built at powers
-// of two up to what the op fits in a 512-thread block's 256 registers without spilling: the norms
-// and the GEMM tail 4 (peers_reduce keeps every pack's peer loads in flight together, so 8 packs
-// is 64 loads, the whole register file: ISA 2026-09-30T20-23-38Z), AttnRes 2 (its four float
-// arrays a pack; its two-shot spills at 4). A build past that would only ever run slower, so it is
-// not built; Kimi-K3's rows take 1 or 2 at 512 threads.
-constexpr int kRowPacksBuilt[] = {1, 2, 4, 8};
-
+// of two up to what the op fits without spilling (build.cuh derives it). A build past that would
+// only ever run slower, so it is not built.
 constexpr int max_row_packs(Op op) {
   switch (op) {
     case Op::all_reduce: return 0;
-    case Op::all_reduce_add_attn_res_rms_norm: return 2;
-    default: return 4;
+    case Op::all_reduce_add_attn_res_rms_norm: return kBuild.attn_res_row_packs;
+    default: return kBuild.norm_row_packs;
   }
 }
 
@@ -112,8 +103,8 @@ constexpr bool has_row_packs(Kernel k) { return op_of(k) != Op::all_reduce; }
 
 // The smallest build of `op` that holds a row of `packs` over `threads`; 0 when none does.
 constexpr int row_packs_for(Op op, int64_t packs, int threads) {
-  for (const int b : kRowPacksBuilt)
-    if (b <= max_row_packs(op) && int64_t{b} * threads >= packs) return b;
+  for (int b = 1; b <= max_row_packs(op); b *= 2)
+    if (int64_t{b} * threads >= packs) return b;
   return 0;
 }
 

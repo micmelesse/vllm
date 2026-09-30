@@ -11,7 +11,7 @@
 #error "include common/common.cuh, common's one interface, not its parts"
 #endif
 
-#include "../hardware.cuh"
+#include "../build.cuh"
 #include "reduce.cuh"
 #include "utils.cuh"
 
@@ -32,12 +32,7 @@ DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const F
   return d;
 }
 
-// The most rows one GEMM pass takes: a lane holds one output column's sum for each of them.
-constexpr int kGemmRows = 16;
-// The K-chunk of x staged in LDS at a time, in packs. With 160 KiB of LDS all of Kimi-K3's latent K
-// (448 packs, 112 KiB) goes in at once: one staging pass and one barrier pair per tile. With 64
-// KiB, 96 packs (24 KiB).
-constexpr int kGemmChunk = kDevice.lds_bytes >= 160 * kKiB ? 448 : 96;
+// kGemmRows and kGemmChunk, the rows a pass and the K-chunk staged in LDS, are build.cuh's.
 // Its LDS: the staged chunk and a norm's block_reduce, plus one [kGemmRows][tile] float partial per
 // wave, tile = kWaveSize / lanes columns. The device decides how many waves that allows.
 constexpr int64_t kGemmLdsFixed =
@@ -52,7 +47,7 @@ constexpr int gemm_max_waves(int lanes_per_col) {
 constexpr int gemm_max_threads(int lanes_per_col) {
   return gemm_max_waves(lanes_per_col) * kWaveSize;
 }
-static_assert(gemm_max_waves(1) >= 8, "the GEMM tail holds 512 threads at every lane split");
+static_assert(gemm_max_waves(1) >= kMaxWaves, "the GEMM tail holds the widest block at every lane split");
 
 // out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
 // rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,

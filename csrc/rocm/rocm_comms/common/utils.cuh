@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-#include "../hardware.cuh"
+#include "../build.cuh"
 
 #define DINLINE __device__ __forceinline__
 
@@ -25,9 +25,8 @@ struct __align__(sizeof(T) * N) vec {
   T d[N];
 };
 
-// A PACK: 16 bytes, one vector load (8 bf16), the unit every kernel loads, sums and stores in,
-// as in vLLM's and aiter's custom all-reduce and NCCL. `num_packs` counts them.
-constexpr int kPackBytes = 16;
+// A PACK: kPackBytes (build.cuh: the widest load, 8 bf16), the unit every kernel loads, sums and
+// stores in. `num_packs` counts them.
 
 template <typename T>
 struct traits {

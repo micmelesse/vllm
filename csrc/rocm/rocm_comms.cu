@@ -198,7 +198,7 @@ Launch checked_launch(const p2p::host::Group& group, const Request& req, Op op,
 }
 
 // A row kernel's row packs as a template argument: f(std::integral_constant<int, k>), one case
-// per kRowPacksBuilt up to the op's max_row_packs, so no build past what fits is instantiated.
+// per power of two up to the op's max_row_packs, so no build past what fits is instantiated.
 template <int kMax, typename F>
 void by_row_packs(int k, F&& f) {
   switch (k) {
@@ -382,9 +382,6 @@ void all_reduce_add_attn_res_rms_norm(p2p::host::Group& group, const Request& re
               "blocks must be [tokens, sources, hidden] with a unit hidden stride");
   TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1),
               "num_blocks must be in [0, ", blocks.size(1), "]");
-  TORCH_CHECK(num_blocks < hip_comms::kAttnResMaxSources,
-              "num_blocks must be below ", hip_comms::kAttnResMaxSources,
-              ", the most sources a row mixes");
   TORCH_CHECK(write_idx < blocks.size(1), "write_idx must be < ", blocks.size(1));
   std::vector<const torch::Tensor*> same = {&prefix, &out, &blocks, &norm_weight,
                                             &qk_weight};
