@@ -325,8 +325,8 @@ def test_forward_shards_only_when_the_tail_is_valid(
 
 @pytest.fixture
 def build_runner(monkeypatch: pytest.MonkeyPatch, default_vllm_config):
-    """Construct through the real subclass ``__init__``, stubbing only the base. Inside
-    a vLLM config, as the model builds it: the runner reads the scheduler's batch bound."""
+    """Construct through the real subclass ``__init__``, stubbing only the base, inside
+    a vLLM config as the model builds it (the runner reads the scheduler's bound)."""
 
     def _base_init(
         self,
