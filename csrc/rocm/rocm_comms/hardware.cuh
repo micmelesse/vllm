@@ -37,6 +37,7 @@ struct Hardware {
   // The fabric to the peers.
   int xgmi_links;                  // one to each peer in an 8-GPU node
   double xgmi_gbytes_per_s_a_way;  // peak, one link, one direction
+  double xgmi_round_trip_ns;       // MEASURED, not documented: a p2p flag to a peer and back
 };
 
 // gfx950, AMD Instinct MI355X (MI350X is the same). Sources: `rocminfo` on n11 (2026-09-29, all 8
@@ -61,6 +62,8 @@ constexpr Hardware kGfx950 = {
     8000.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     16 * 38.4 / 8,       // xgmi_gbytes_per_s_a_way
+    1334.0,              // xgmi_round_trip_ns: ping_pong.py, median of all 28 pairs (1274-1383),
+                         //   dev run 2026-09-30T19-02-08Z on n11
 };
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0, "every XCD has the same CUs");
 
@@ -85,6 +88,7 @@ constexpr Hardware kGfx942 = {
     5300.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     64.0,                // xgmi_gbytes_per_s_a_way
+    0.0,                 // xgmi_round_trip_ns: not measured on MI300X
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
 
