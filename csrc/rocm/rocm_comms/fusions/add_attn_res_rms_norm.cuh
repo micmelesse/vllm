@@ -83,63 +83,82 @@ DINLINE void row(const typename traits<T>::V (&sum)[K],
         w[k][j] = static_cast<float>(a.d[j]) * static_cast<float>(b.d[j]);
     }
     // 1. EVERY SOURCE'S SUM OF SQUARES AND WEIGHTED DOT, the stored blocks first and the prefix
-    //    last (source num_blocks), as the reference orders them. The loads are independent, so
-    //    they are in flight together, where one source at a time waited on each; each is folded
-    //    into its sums as it lands and not kept (holding all nine spilled at 2 packs a thread).
+    //    last (source num_blocks), as the reference orders them. THE LOADS ARE BRANCH-FREE: a
+    //    load under `if (s < num_blocks)` cannot be hoisted past the branch, so each source waited
+    //    on its own round trip. Every address is clamped to a real slot and pack instead, all of
+    //    them load together, and a source past num_blocks (or a pack past the row) counts zero.
+    //    Each is folded into its sums as it lands and not kept (holding nine spilled).
     float sums[2 * kMaxSources];
+    const int last = num_blocks - 1;  // num_blocks > 0 here
 #pragma unroll
-    for (int s = 0; s < kMaxSources; ++s) {
-      const V* src = reinterpret_cast<const V*>(blocks + s * block_stride_r);
+    for (int s = 0; s < kMaxSources - 1; ++s) {
+      const V* src = reinterpret_cast<const V*>(blocks + (s < last ? s : last) * block_stride_r);
+      const float on = s < num_blocks ? 1.0f : 0.0f;
       float ss = 0.0f, dot = 0.0f;
-      if (s <= num_blocks) {
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
-          const int i = threadIdx.x + k * blockDim.x;
-          if (i >= packs) break;
-          V x;
-          if (s < num_blocks) x = src[i];
+      for (int k = 0; k < K; ++k) {
+        const int i     = threadIdx.x + k * blockDim.x;
+        const float in  = i < packs ? on : 0.0f;
+        const V x       = src[i < packs ? i : packs - 1];
 #pragma unroll
-          for (int j = 0; j < NL; ++j) {
-            const float v = s < num_blocks ? static_cast<float>(x.d[j]) : u[k][j];
-            ss += v * v;
-            dot += v * w[k][j];
-          }
+        for (int j = 0; j < NL; ++j) {
+          const float v = in * static_cast<float>(x.d[j]);
+          ss += v * v;
+          dot += v * w[k][j];
         }
       }
       sums[2 * s]     = ss;
       sums[2 * s + 1] = dot;
     }
+    {
+      // The prefix, source num_blocks, from registers.
+      float ss = 0.0f, dot = 0.0f;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        const float in = threadIdx.x + k * blockDim.x < packs ? 1.0f : 0.0f;
+#pragma unroll
+        for (int j = 0; j < NL; ++j) {
+          const float v = in * u[k][j];
+          ss += v * v;
+          dot += v * w[k][j];
+        }
+      }
+      sums[2 * (kMaxSources - 1)]     = ss;
+      sums[2 * (kMaxSources - 1) + 1] = dot;
+    }
     // 2. ONE block reduction for every source's sums, where each source took its own.
     block_sum_n(sums);
-    // 3. THE SOFTMAX over the sources' logits.
+    // 3. THE SOFTMAX over the sources' logits: the stored blocks in slots 0..num_blocks-1, the
+    //    prefix in the last slot; the slots between count zero.
     float logit[kMaxSources];
     float max_logit = -INFINITY;
 #pragma unroll
     for (int s = 0; s < kMaxSources; ++s) {
-      logit[s] = sums[2 * s + 1] * rsqrtf(sums[2 * s] * inv_hidden + eps);
-      if (s <= num_blocks) max_logit = fmaxf(max_logit, logit[s]);
+      const bool live = s < num_blocks || s == kMaxSources - 1;
+      logit[s]        = sums[2 * s + 1] * rsqrtf(sums[2 * s] * inv_hidden + eps);
+      if (live) max_logit = fmaxf(max_logit, logit[s]);
     }
-    // The prefix's weight picked out in the unrolled loop: `logit[num_blocks]` is a runtime index
-    // into a local array, and that puts the array in scratch.
-    float denominator = 0.0f, prefix_weight = 0.0f;
+    float denominator = 0.0f;
 #pragma unroll
     for (int s = 0; s < kMaxSources; ++s) {
-      logit[s] = s <= num_blocks ? __expf(logit[s] - max_logit) : 0.0f;
+      const bool live = s < num_blocks || s == kMaxSources - 1;
+      logit[s]        = live ? __expf(logit[s] - max_logit) : 0.0f;
       denominator += logit[s];
-      if (s == num_blocks) prefix_weight = logit[s];
     }
+    const float prefix_weight = logit[kMaxSources - 1];
     const float inv_den = 1.0f / denominator;
-    // 4. THE MIX, the stored sources read again: just read, so from cache, and independent.
+    // 4. THE MIX, the stored sources read again (just read, so from cache), branch-free as in 1:
+    //    a source past num_blocks has weight zero.
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-      const int i = threadIdx.x + k * blockDim.x;
+      const int i  = threadIdx.x + k * blockDim.x;
+      const int at = i < packs ? i : packs - 1;
       float mix[NL];
 #pragma unroll
       for (int j = 0; j < NL; ++j) mix[j] = prefix_weight * u[k][j];
 #pragma unroll
       for (int s = 0; s < kMaxSources - 1; ++s) {
-        if (s >= num_blocks || i >= packs) continue;
-        const V x = reinterpret_cast<const V*>(blocks + s * block_stride_r)[i];
+        const V x = reinterpret_cast<const V*>(blocks + (s < last ? s : last) * block_stride_r)[at];
 #pragma unroll
         for (int j = 0; j < NL; ++j) mix[j] += logit[s] * static_cast<float>(x.d[j]);
       }
