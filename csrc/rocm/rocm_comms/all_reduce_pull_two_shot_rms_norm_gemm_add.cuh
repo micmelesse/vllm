@@ -36,8 +36,11 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+  const auto self = p2p::self<T, ngpus>(p);
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
@@ -45,7 +48,7 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
     sum_row<T, ngpus>(read, row, packs, sum);
     const int64_t at = int64_t{row - first} * packs;
     fusion::norm_row<T>(sum, weight, packs, inv_hidden, eps,
-                        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
+                        [&](int, int i, const V& v) { p2p::write_scratch(self, at + i, v); });
   }
 
   // 3. Every rank's normed rows are visible to its peers.
@@ -61,7 +64,7 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
         if (r * slice_rows + l < rows)
-          got[r] = p2p::read_scratch(ranks, r, int64_t{l} * packs + i);
+          got[r] = p2p::read_scratch(all[r], int64_t{l} * packs + i);
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;

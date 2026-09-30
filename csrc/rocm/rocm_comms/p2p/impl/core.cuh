@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p's primitives, behind p2p.cuh: `Ranks`, its reads and writes, `barrier`, and in `impl` what
-// the barriers are made of. A
+// p2p's primitives, behind p2p.cuh: `Peer`, `Self`, their reads and writes, `barrier`, and in
+// `impl` what the barriers are made of. A
 // wait that outlives the timeout
 // prints where it was and traps, so a hang is an error. Checked, every index is
 // bounds-checked and every wait is skewed by a random per-block delay, so a race shows on
@@ -176,42 +176,20 @@ DINLINE typename traits<T>::V* scratch_of(const Peers& p, int r) {
 
 }  // namespace impl
 
-// EVERY RANK'S BUFFERS FOR THIS LAUNCH, held for the kernel and never handed out, for a loop over
-// every rank (`for r < ngpus`, unrolled): its rank index is a constant, so the buffers stay in
-// registers. A rank chosen at run time is a `Peer`. Made once, before the loops.
-template <typename T, int ngpus>
-class Ranks {
-  using V = typename traits<T>::V;
-  const V* in_[ngpus];
-  V* scratch_[ngpus];
-  V* mine_;  // this rank's scratch, picked once: `rank` is not a constant
-
- public:
-  explicit DINLINE Ranks(const Peers& p) : mine_(impl::scratch_of<T, ngpus>(p, p.rank)) {
-#pragma unroll
-    for (int r = 0; r < ngpus; ++r) {
-      in_[r]      = reinterpret_cast<const V*>(p.inputs->p[r]);
-      scratch_[r] = reinterpret_cast<V*>(p.signals.s[r] + 1);
-    }
-  }
-
-  template <typename U, int n>
-  friend DINLINE typename traits<U>::V read_input(const Ranks<U, n>& ranks, int r, int64_t i);
-  template <typename U, int n>
-  friend DINLINE typename traits<U>::V read_scratch(const Ranks<U, n>& ranks, int r, int64_t i);
-  template <typename U, int n>
-  friend DINLINE void write_scratch(const Ranks<U, n>& ranks, int64_t i,
-                                    const typename traits<U>::V& v);
-};
-
-// ONE RANK CHOSEN AT RUN TIME (a two-shot wave's peer), its buffers picked once.
+// ONE RANK'S BUFFERS FOR THIS LAUNCH, read-only, held for the kernel and never handed out. Made
+// before the loops that read it: one `peer(p, r)` for a rank chosen at run time, or for every rank
+//   Peer<T, ngpus> all[ngpus];
+//   for (int r = 0; r < ngpus; ++r) all[r] = peer<T, ngpus>(p, r);   // unrolled: r a constant
+// so the pointers stay in registers. Nothing takes a runtime index into a set of ranks: that is
+// what put them in scratch memory (152 B a lane, +4 us at 1.8 MB).
 template <typename T, int ngpus>
 class Peer {
   using V = typename traits<T>::V;
-  const V* in_;
-  V* scratch_;
+  const V* in_      = nullptr;
+  const V* scratch_ = nullptr;
 
  public:
+  DINLINE Peer() = default;
   DINLINE Peer(const Peers& p, int r)
       : in_(reinterpret_cast<const V*>(p.inputs->p[r])),
         scratch_(impl::scratch_of<T, ngpus>(p, r)) {}
@@ -222,44 +200,49 @@ class Peer {
   friend DINLINE typename traits<U>::V read_scratch(const Peer<U, n>& peer, int64_t i);
 };
 
+// THIS RANK'S OWN BUFFERS: its scratch is the only thing a pull kernel writes. Writing into a
+// peer's memory is another operation, with its own visibility rule (common/memory.cuh's
+// uncached store).
 template <typename T, int ngpus>
-DINLINE Ranks<T, ngpus> ranks(const Peers& p) {
-  return Ranks<T, ngpus>(p);
-}
+class Self {
+  using V = typename traits<T>::V;
+  V* scratch_;
+
+ public:
+  explicit DINLINE Self(const Peers& p) : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)) {}
+
+  template <typename U, int n>
+  friend DINLINE void write_scratch(const Self<U, n>& self, int64_t i,
+                                    const typename traits<U>::V& v);
+};
 
 template <typename T, int ngpus>
 DINLINE Peer<T, ngpus> peer(const Peers& p, int r) {
   return Peer<T, ngpus>(p, r);
 }
 
-// Pack i of rank r's input for this launch: the pull receive. `r` a constant (an unrolled loop's).
 template <typename T, int ngpus>
-DINLINE typename traits<T>::V read_input(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
-  return load_global(ranks.in_[r] + i);
+DINLINE Self<T, ngpus> self(const Peers& p) {
+  return Self<T, ngpus>(p);
 }
 
-// Pack i of what rank r left in its scratch, after a barrier that made it visible.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V read_scratch(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
-  return load_global(ranks.scratch_[r] + i);
-}
-
-// Pack i of this rank's own scratch, for its peers to read after a barrier that makes it visible.
-template <typename T, int ngpus>
-DINLINE void write_scratch(const Ranks<T, ngpus>& ranks, int64_t i,
-                           const typename traits<T>::V& v) {
-  store_global(ranks.mine_ + i, v);
-}
-
-// The same reads, from one peer.
+// Pack i of that rank's input for this launch: the pull receive.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_input(const Peer<T, ngpus>& peer, int64_t i) {
   return load_global(peer.in_ + i);
 }
 
+// Pack i of what that rank left in its scratch, after a barrier that made it visible.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_scratch(const Peer<T, ngpus>& peer, int64_t i) {
   return load_global(peer.scratch_ + i);
+}
+
+// Pack i of this rank's scratch, for its peers to read after a barrier that makes it visible.
+template <typename T, int ngpus>
+DINLINE void write_scratch(const Self<T, ngpus>& self, int64_t i,
+                           const typename traits<T>::V& v) {
+  store_global(self.scratch_ + i, v);
 }
 
 // WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this

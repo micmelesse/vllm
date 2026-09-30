@@ -41,8 +41,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
   //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
   //    lane's packs, so they leave the loop together and the barriers inside it match.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto them  = p2p::peer<T, ngpus>(p, peer);
+  const auto self = p2p::self<T, ngpus>(p);
+  const auto them = p2p::peer<T, ngpus>(p, peer);
   const int base    = p.rank * slice_packs;
   const int mine    = min(slice_packs, num_packs - base);
   for (int i = first; i < mine; i += stride) {
@@ -59,7 +59,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       V s;
 #pragma unroll
       for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
-      p2p::write_scratch(ranks, i, s);
+      p2p::write_scratch(self, i, s);
     }
     __syncthreads();
   }

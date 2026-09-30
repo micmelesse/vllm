@@ -46,8 +46,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   // 2. This rank's rows: read each from every rank in rank order, sum, AttnRes, and leave the
   //    out and prefix rows in this rank's scratch.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+  const auto self = p2p::self<T, ngpus>(p);
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
@@ -58,8 +61,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         sum, pre, blocks + row * block_stride_m, block_stride_r,
         reinterpret_cast<const V*>(norm_w), reinterpret_cast<const V*>(qk_w),
         reinterpret_cast<const V*>(out_norm_w), num_blocks, row, packs, inv_hidden, eps,
-        out_eps, [&](int, int i, const V& v) { p2p::write_scratch(ranks, pre_at + at + i, v); },
-        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
+        out_eps, [&](int, int i, const V& v) { p2p::write_scratch(self, pre_at + at + i, v); },
+        [&](int, int i, const V& v) { p2p::write_scratch(self, at + i, v); });
   }
 
   // 3. Every rank's rows are visible to its peers.
@@ -77,8 +80,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         if (r * slice_rows + l >= rows) continue;
-        got[r]     = p2p::read_scratch(ranks, r, at);
-        got_pre[r] = p2p::read_scratch(ranks, r, pre_at + at);
+        got[r]     = p2p::read_scratch(all[r], at);
+        got_pre[r] = p2p::read_scratch(all[r], pre_at + at);
       }
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {

@@ -42,8 +42,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, and leave the
   //    result in this rank's scratch.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
+  const auto self = p2p::self<T, ngpus>(p);
   const int first  = p.rank * slice_rows;
   const int last   = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
@@ -52,8 +55,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
     const int64_t at = int64_t{row - first} * packs;
     fusion::row<T, W, kAdd>(
         sum, res_in, wv, row, packs, inv_hidden, eps,
-        [&](int, int i, const V& v) { p2p::write_scratch(ranks, res_at + at + i, v); },
-        [&](int, int i, const V& v) { p2p::write_scratch(ranks, at + i, v); });
+        [&](int, int i, const V& v) { p2p::write_scratch(self, res_at + at + i, v); },
+        [&](int, int i, const V& v) { p2p::write_scratch(self, at + i, v); });
   }
 
   // 3. Every rank's rows are visible to its peers.
@@ -71,8 +74,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::Peers p, T* __restr
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         if (r * slice_rows + l >= rows) continue;
-        got[r] = p2p::read_scratch(ranks, r, at);
-        if constexpr (kAdd) got_res[r] = p2p::read_scratch(ranks, r, res_at + at);
+        got[r] = p2p::read_scratch(all[r], at);
+        if constexpr (kAdd) got_res[r] = p2p::read_scratch(all[r], res_at + at);
       }
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {

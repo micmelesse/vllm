@@ -34,8 +34,10 @@ __global__ void __launch_bounds__(fusions::rms_norm_gemm_add::max_threads(kLanes
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
   //    workspace.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     V sum[kRowPacks];
     sum_row<T, ngpus>(read, row, packs, sum);

@@ -6,11 +6,11 @@
 // way, and what they keep in `p2p::impl` is theirs.
 //
 // p2p::                     all one GPU does with another; a peer's address never leaves it
-//   ranks<T, ngpus>(p)             every rank's buffers, for a loop over the ranks (r a constant)
-//   peer<T, ngpus>(p, r)           one rank's, chosen at run time (a two-shot wave's peer)
-//   read_input(ranks, r, i), read_input(peer, i)       pack i of that rank's input
-//   read_scratch(ranks, r, i), read_scratch(peer, i)   pack i of what it left in its scratch
-//   write_scratch(ranks, i, v)     pack i of this rank's scratch, for its peers to read
+//   peer<T, ngpus>(p, r)           rank r's buffers, read-only (every rank: an unrolled array)
+//   self<T, ngpus>(p)              this rank's own, the only buffer a pull kernel writes
+//   read_input(peer, i)            pack i of that rank's input
+//   read_scratch(peer, i)          pack i of what it left in its scratch
+//   write_scratch(self, i, v)      pack i of this rank's scratch, for its peers to read
 //   barrier<ngpus, Among, Ensure>(p)   Among::peers (this block and the same block on every
 //                                  rank) or Among::grid (every block of this rank); Ensure::
 //                                  launched (every peer's input is ready), visible (what was

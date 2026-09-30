@@ -23,8 +23,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
 
   // 2. Read every rank's input, in rank order, and sum.
-  const auto ranks = p2p::ranks<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(ranks, r, i); };
+  p2p::Peer<T, ngpus> all[ngpus];
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = p2p::peer<T, ngpus>(p, r);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(all[r], i); };
   V* dst = reinterpret_cast<V*>(out);
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_packs; i += gridDim.x * blockDim.x)
     store_global(dst + i, sum_packs<T, ngpus>(read, i));
