@@ -42,10 +42,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
   //    lane's packs, so they leave the loop together and the barriers inside it match.
   const auto ranks = p2p::ranks<T, ngpus>(p);
+  const auto them  = p2p::peer<T, ngpus>(p, peer);
   const int base    = p.rank * slice_packs;
   const int mine    = min(slice_packs, num_packs - base);
   for (int i = first; i < mine; i += stride) {
-    got[threadIdx.x] = p2p::read_input(ranks, peer, base + i);
+    got[threadIdx.x] = p2p::read_input(them, base + i);
     __syncthreads();
     if (wave == 0) {
       float acc[N];
@@ -72,7 +73,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   V* dst = reinterpret_cast<V*>(out);
   for (int i = first; i < slice_packs; i += stride)
     if (peer * slice_packs + i < num_packs)
-      store_global(dst + peer * slice_packs + i, p2p::read_scratch(ranks, peer, i));
+      store_global(dst + peer * slice_packs + i, p2p::read_scratch(them, i));
 }
 
 }  // namespace hip_comms

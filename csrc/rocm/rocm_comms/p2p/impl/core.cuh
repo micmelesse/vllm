@@ -159,32 +159,39 @@ DINLINE void barrier(const Peers& p) {
 // written only through these, and ordered only by `barrier`.
 // =================================================================================
 
-// EVERY RANK'S BUFFERS FOR THIS LAUNCH, held for the kernel and never handed out: made once,
-// before the loops, so the pointers stay in registers. Read and written with read_input,
-// read_scratch and write_scratch.
+namespace impl {
+
+// Rank r's scratch, the bytes after its signal block, picked from the kernel's arguments: BY
+// SELECT, never an index, since a runtime index into a pointer array puts the array in scratch
+// memory (seen in the ISA: 152 bytes a lane and a scratch load per read).
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V* scratch_of(const Peers& p, int r) {
+  using V = typename traits<T>::V;
+  V* at   = reinterpret_cast<V*>(p.signals.s[0] + 1);
+#pragma unroll
+  for (int k = 1; k < ngpus; ++k)
+    if (r == k) at = reinterpret_cast<V*>(p.signals.s[k] + 1);
+  return at;
+}
+
+}  // namespace impl
+
+// EVERY RANK'S BUFFERS FOR THIS LAUNCH, held for the kernel and never handed out, for a loop over
+// every rank (`for r < ngpus`, unrolled): its rank index is a constant, so the buffers stay in
+// registers. A rank chosen at run time is a `Peer`. Made once, before the loops.
 template <typename T, int ngpus>
 class Ranks {
   using V = typename traits<T>::V;
   const V* in_[ngpus];
   V* scratch_[ngpus];
-  int rank_;
-
-  // BY SELECT, NOT an index: a runtime index into a register array moves it to scratch memory.
-  template <typename P>
-  static DINLINE P pick(P const (&all)[ngpus], int r) {
-    P at = all[0];
-#pragma unroll
-    for (int k = 1; k < ngpus; ++k)
-      if (r == k) at = all[k];
-    return at;
-  }
+  V* mine_;  // this rank's scratch, picked once: `rank` is not a constant
 
  public:
-  explicit DINLINE Ranks(const Peers& p) : rank_(p.rank) {
+  explicit DINLINE Ranks(const Peers& p) : mine_(impl::scratch_of<T, ngpus>(p, p.rank)) {
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) {
       in_[r]      = reinterpret_cast<const V*>(p.inputs->p[r]);
-      scratch_[r] = reinterpret_cast<V*>(p.signals.s[r] + 1);  // the bytes after its signals
+      scratch_[r] = reinterpret_cast<V*>(p.signals.s[r] + 1);
     }
   }
 
@@ -197,28 +204,62 @@ class Ranks {
                                     const typename traits<U>::V& v);
 };
 
+// ONE RANK CHOSEN AT RUN TIME (a two-shot wave's peer), its buffers picked once.
+template <typename T, int ngpus>
+class Peer {
+  using V = typename traits<T>::V;
+  const V* in_;
+  V* scratch_;
+
+ public:
+  DINLINE Peer(const Peers& p, int r)
+      : in_(reinterpret_cast<const V*>(p.inputs->p[r])),
+        scratch_(impl::scratch_of<T, ngpus>(p, r)) {}
+
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_input(const Peer<U, n>& peer, int64_t i);
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_scratch(const Peer<U, n>& peer, int64_t i);
+};
+
 template <typename T, int ngpus>
 DINLINE Ranks<T, ngpus> ranks(const Peers& p) {
   return Ranks<T, ngpus>(p);
 }
 
-// Pack i of rank r's input for this launch: the pull receive.
+template <typename T, int ngpus>
+DINLINE Peer<T, ngpus> peer(const Peers& p, int r) {
+  return Peer<T, ngpus>(p, r);
+}
+
+// Pack i of rank r's input for this launch: the pull receive. `r` a constant (an unrolled loop's).
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_input(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
-  return load_global(Ranks<T, ngpus>::pick(ranks.in_, r) + i);
+  return load_global(ranks.in_[r] + i);
 }
 
 // Pack i of what rank r left in its scratch, after a barrier that made it visible.
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_scratch(const Ranks<T, ngpus>& ranks, int r, int64_t i) {
-  return load_global(Ranks<T, ngpus>::pick(ranks.scratch_, r) + i);
+  return load_global(ranks.scratch_[r] + i);
 }
 
 // Pack i of this rank's own scratch, for its peers to read after a barrier that makes it visible.
 template <typename T, int ngpus>
 DINLINE void write_scratch(const Ranks<T, ngpus>& ranks, int64_t i,
                            const typename traits<T>::V& v) {
-  store_global(Ranks<T, ngpus>::pick(ranks.scratch_, ranks.rank_) + i, v);
+  store_global(ranks.mine_ + i, v);
+}
+
+// The same reads, from one peer.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_input(const Peer<T, ngpus>& peer, int64_t i) {
+  return load_global(peer.in_ + i);
+}
+
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_scratch(const Peer<T, ngpus>& peer, int64_t i) {
+  return load_global(peer.scratch_ + i);
 }
 
 // WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this
