@@ -37,7 +37,6 @@ struct Hardware {
   // The fabric to the peers.
   int xgmi_links;                  // one to each peer in an 8-GPU node
   double xgmi_gbytes_per_s_a_way;  // peak, one link, one direction
-  double xgmi_round_trip_ns;       // MEASURED, not documented: a p2p flag to a peer and back
 };
 
 // gfx950, AMD Instinct MI355X (MI350X is the same). Sources: `rocminfo` on n11 (2026-09-29, all 8
@@ -62,8 +61,6 @@ constexpr Hardware kGfx950 = {
     8000.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     16 * 38.4 / 8,       // xgmi_gbytes_per_s_a_way
-    1334.0,              // xgmi_round_trip_ns: ping_pong.py, median of all 28 pairs (1274-1383),
-                         //   dev run 2026-09-30T19-02-08Z on n11
 };
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0, "every XCD has the same CUs");
 
@@ -88,9 +85,20 @@ constexpr Hardware kGfx942 = {
     5300.0,              // hbm_gbytes_per_s
     7,                   // xgmi_links
     64.0,                // xgmi_gbytes_per_s_a_way
-    0.0,                 // xgmi_round_trip_ns: not measured on MI300X
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
+
+// MEASURED ON THE MACHINE, by our own probes, where `Hardware` is documented: a calibration goes
+// stale when the driver, firmware or p2p changes, so each value names its probe and its run. A
+// field is named for the probe that produced it.
+struct Calibration {
+  double ping_pong_ns;  // ping_pong.py: a p2p flag to a peer and back, median of every pair
+};
+
+// gfx950 on n11: dev run 2026-09-30T19-02-08Z, 28 pairs from 1274 to 1383 ns. MI300X has none yet.
+constexpr Calibration kGfx950Calibration = {
+    1334.0,  // ping_pong_ns
+};
 
 // Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's
 // __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block puts there, and
@@ -103,8 +111,9 @@ constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
   return static_cast<int>(v < 512 ? v : 512);
 }
 
-// THE TARGET THE HOST TUNES FOR.
-constexpr const Hardware& kTarget = kGfx950;
+// THE TARGET THE HOST TUNES FOR, and what was measured on it.
+constexpr const Hardware& kTarget               = kGfx950;
+constexpr const Calibration& kTargetCalibration = kGfx950Calibration;
 
 // THE DEVICE THIS COMPILE PASS IS FOR: a build compiles the device code once per offload arch
 // (gfx942 and gfx950), each against its own facts; the host pass sees the tuning target.

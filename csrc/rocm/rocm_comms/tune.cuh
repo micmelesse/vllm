@@ -74,16 +74,16 @@ constexpr int64_t kPullOneShotMaxBytes = 64 * kKiB;
 // A wave's lanes take one pack each in a pass, up to the signal slots and the compute units.
 // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER (aiter's two-stage), so it is the wave times the world.
 // THE GRID CAP: enough blocks to keep the links busy, and no more, since every block syncs with
-// its partner on every peer. The links' bandwidth-delay product is what must be in flight, and a
-// block moves `threads` packs a pass: 7 x 76.8 GB/s x 1334 ns = 717 KB, 88 blocks of 512 threads.
-// The sweep agrees (flat from 80 to 128; 1.8 MB: 15.42 us at 64, 14.72 at 80, 16.70 at 256).
-constexpr int link_filling_blocks(const Hardware& hw, int threads) {
-  const double in_flight = hw.xgmi_links * hw.xgmi_gbytes_per_s_a_way * hw.xgmi_round_trip_ns;
+// its partner on every peer. The links' bandwidth-delay product is what must be in flight (the
+// bandwidth documented, the round trip measured), and a block moves `threads` packs a pass:
+// 7 x 76.8 GB/s x 1334 ns = 717 KB, 88 blocks of 512 threads. The sweep agrees (flat from 80 to
+// 128; 1.8 MB: 15.42 us at 64, 14.72 at 80, 16.70 at 256).
+constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, int threads) {
+  const double in_flight = hw.xgmi_links * hw.xgmi_gbytes_per_s_a_way * cal.ping_pong_ns;
   const double per_pass  = static_cast<double>(threads) * kPackBytes;
   const int blocks       = static_cast<int>(in_flight / per_pass + 0.999);
   return blocks < hw.compute_units ? blocks : hw.compute_units;
 }
-static_assert(kTarget.xgmi_round_trip_ns > 0, "the tuning target's round trip is measured");
 
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
@@ -93,7 +93,7 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw) {
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   const int threads = one_shot ? hw.wave_size : hw.wave_size * in.world;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int cap     = link_filling_blocks(hw, threads);
+  const int cap     = link_filling_blocks(hw, kTargetCalibration, threads);
   const int blocks  = need < cap ? static_cast<int>(need) : cap;
   return at(k, in, blocks, threads);
 }
