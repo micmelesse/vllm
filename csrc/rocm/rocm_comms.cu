@@ -115,7 +115,11 @@ Launch launch_for(const Request& req, Op op, Input in) {
   if (f.kernel == Kernel::none) return tune(op, in, kTarget, kTargetCalibration);
   TORCH_CHECK(op_of(f.kernel) == op, "hip_comms: the forced kernel ",
               static_cast<int>(f.kernel), " is not one of op ", static_cast<int>(op), "'s");
-  return at(f.kernel, in, f.blocks, f.threads);
+  // A forced GEMM tail runs at the calibrated lanes a column: a launch's grid and block are forced,
+  // what is inside the kernel is not.
+  const int lanes =
+      op == Op::all_reduce_rms_norm_gemm_add ? kTargetCalibration.gemm_lanes_per_col : 0;
+  return at(f.kernel, in, f.blocks, f.threads, lanes);
 }
 
 int64_t scratch_need(const Launch& l, int64_t rows, int64_t packs, int64_t flat,

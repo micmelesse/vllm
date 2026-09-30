@@ -88,18 +88,43 @@ constexpr Hardware kGfx942 = {
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
 
-// MEASURED ON THE MACHINE, by our own probes, where `Hardware` is documented: a calibration goes
-// stale when the driver, firmware or p2p changes, so each value names its probe and its run. A
-// field is named for the probe that produced it.
+// MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
+// sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
+// kernels change. Each field is named for what it holds and cites the run that measured it; a tune
+// reads only its input, `Hardware` and `Calibration`, so every number a launch depends on is here.
 struct Calibration {
-  double ping_pong_ns;  // calibrate.py: a p2p flag to a peer and back, median of every pair
+  double ping_pong_ns;               // a p2p flag to a peer and back, median of every pair
+  int64_t one_shot_max_bytes;        // the all-reduce's one-shot/two-shot crossover
+  int64_t fused_one_shot_max_bytes;  // the fused ops' one-shot/two-shot crossover
+  int fused_one_shot_blocks;         // a fused one-shot's grid, at most (one row a block)
+  int fused_two_shot_blocks;         // a fused two-shot's grid, at most
+  int fused_threads;                 // a fused kernel's block
+  int gemm_tail_blocks;              // the GEMM tail's grid
+  int gemm_lanes_per_col;            // the GEMM tail's lanes a column (a build: 1, 2, 4 or 8)
 };
 
-// gfx950 on n11: dev run 2026-09-30T19-02-08Z, 28 pairs from 1274 to 1383 ns; a repeat
-// (2026-09-30T19-13-36Z) gave a 1282 median, 1049-1387, so about 5% run to run. MI300X has
-// none yet.
+// gfx950 on n11. MI300X has none yet.
 constexpr Calibration kGfx950Calibration = {
-    1334.0,  // ping_pong_ns
+    // calibrate.py, dev run 2026-09-30T19-02-08Z: 28 pairs 1274-1383 ns; a repeat
+    // (2026-09-30T19-13-36Z) gave 1282, so about 5% run to run.
+    1334.0,
+    // One-shot won at 56 KiB (7.12 against 7.83 us), two-shot at 112 KiB (7.87 against 8.19),
+    // uncached scratch (2026-09-30T18-00-30Z).
+    64 * kKiB,
+    // The norms: moved to 64 KiB they lost at 16 tokens, 11.43 against 10.56 us
+    // (2026-09-30T21-06-57Z).
+    128 * kKiB,
+    // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
+    16,
+    // 88 (the link-filling grid) lost at prefill, 169.3 against 154.5 us at 4096 tokens
+    // (2026-09-30T21-30-15Z).
+    36,
+    // 256 was worse for the GEMM tail (2026-09-28); the norms and AttnRes not swept.
+    512,
+    // The GEMM tail's best at 1 row, 4 lanes a column (2026-09-28, log).
+    56,
+    // Picked at Kimi-K3's shape; 1, 2 and 8 were worse at 1 row (2026-09-28).
+    4,
 };
 
 // Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's

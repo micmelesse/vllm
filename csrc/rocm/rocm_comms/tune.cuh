@@ -33,19 +33,15 @@ struct Input {
 // WHAT THE HARDWARE MOVES: to it, a plain all-reduce is only its byte count.
 constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
 
-// THE GEMM TAIL'S LANES PER COLUMN: a column's lanes split its reduction over the hidden size, so a
-// wave covers wave / lanes columns. 4 was picked at Kimi-K3's shape and is not yet swept; it is a
-// template instantiation (1, 2, 4 or 8). Every GEMM-tail launch takes it, forced or not; no other
-// kernel has lanes.
-constexpr int kGemmLanesPerCol = 4;
-static_assert(kGemmLanesPerCol == 1 || kGemmLanesPerCol == 2 || kGemmLanesPerCol == 4 ||
-                  kGemmLanesPerCol == 8,
+static_assert(kTargetCalibration.gemm_lanes_per_col == 1 ||
+                  kTargetCalibration.gemm_lanes_per_col == 2 ||
+                  kTargetCalibration.gemm_lanes_per_col == 4 ||
+                  kTargetCalibration.gemm_lanes_per_col == 8,
               "the GEMM tail is built for 1, 2, 4 or 8 lanes per column");
 
-// `k` at `blocks` x `threads`: its grid cut to the rows where it gives each block a row, its lanes
-// if it is the GEMM tail, the call's precision passed through.
-constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
-  const int lanes     = op_of(k) == Op::all_reduce_rms_norm_gemm_add ? kGemmLanesPerCol : 0;
+// `k` at `blocks` x `threads`: its grid cut to the rows where it gives each block a row, `lanes`
+// for the GEMM tail (0 for any other), the call's precision passed through.
+constexpr Launch at(Kernel k, Input in, int blocks, int threads, int lanes = 0) {
   const int row_packs =
       has_row_packs(k) ? row_packs_for(op_of(k), in.hidden * in.elem_bytes / kPackBytes, threads)
                        : 0;
@@ -63,10 +59,9 @@ constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
 // PULL ONE-SHOT UP TO 64 KiB, PULL TWO-SHOT PAST IT, at that width. One-shot reads every peer's
 // whole buffer ((N-1)P) in one round trip; two-shot moves less (2(N-1)/N P) in two. With the
 // scratch uncached, one-shot won at 56 KiB (7.12 vs 7.83 us), two-shot at 112 KiB (7.87 vs 8.19).
-// To be derived from the link's latency and bandwidth once hardware.cuh carries them.
+// Calibration's one_shot_max_bytes: the alpha-beta model's floors cross near 200 KB, but our
+// one-shot costs more a byte than the model says, so the measured crossover stands.
 // =================================================================================================
-
-constexpr int64_t kPullOneShotMaxBytes = 64 * kKiB;
 
 // A GRID THE SIZE OF THE WORK, as aiter sizes its own: every block pays for every sync, so a block
 // with no pack to move is pure cost (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64).
@@ -85,7 +80,7 @@ constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, in
 }
 
 constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
-  const bool one_shot = bytes(in) <= kPullOneShotMaxBytes;
+  const bool one_shot = bytes(in) <= cal.one_shot_max_bytes;
   const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
   const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
   const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
@@ -104,52 +99,50 @@ constexpr Launch tune_all_reduce(Input in, const Hardware& hw, const Calibration
 }
 
 // =================================================================================================
-// THE FUSED OPS, NOT YET SWEPT: pull one-shot at 16 blocks, pull two-shot at 36, 512 threads each.
-// ONE-SHOT UP TO 128 KiB, as the all-reduce: the fused rms_norm's one-shot took 21.9 us at 458 KB
-// (64 x 3584) where its two-shot took 14.6 at twice that (bench 2026-09-30T00-59-06Z).
+// THE FUSED OPS: one-shot up to Calibration's fused_one_shot_max_bytes, two-shot past it, at its
+// fused grids and block.
 // =================================================================================================
 
-constexpr int64_t kFusedOneShotMaxBytes = 128 * kKiB;
-
-// THE NORMS ALWAYS RUN FUSED, one-shot up to kFusedOneShotMaxBytes and two-shot past it: a fusion
-// flag means the fused op runs, and tuning picks among fused kernels, never the unfused path. The
+// THE NORMS ALWAYS RUN FUSED, one-shot up to fused_one_shot_max_bytes and two-shot past it: a
+// fusion flag means the fused op runs, and tuning picks among fused kernels, never unfused. The
 // one-shot wins (7.46 against 10.00 us at 1 token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z);
 // the two-shot still loses, at 32-64 tokens by 0.2-0.6 us and at prefill by up to 5.5 at its 36
 // blocks (88 lost more: 169.3 against 148.9 at 4096), so it is the one being worked on.
-constexpr Launch fused_norm(Kernel one_shot, Kernel two_shot, Input in) {
-  return bytes(in) <= kFusedOneShotMaxBytes ? at(one_shot, in, 16, 512) : at(two_shot, in, 36, 512);
+constexpr Launch fused_norm(Kernel one_shot, Kernel two_shot, Input in, const Calibration& cal) {
+  return bytes(in) <= cal.fused_one_shot_max_bytes
+             ? at(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads)
+             : at(two_shot, in, cal.fused_two_shot_blocks, cal.fused_threads);
 }
 
-constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration&) {
+constexpr Launch tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_rms_norm, in);
+                    Kernel::all_reduce_pull_two_shot_rms_norm, in, cal);
 }
 
-constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration&) {
+constexpr Launch tune_all_reduce_add_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in);
+                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal);
 }
 
-// A BLOCK A ROW, AND NO MORE BLOCKS THAN ROWS: a block does whole rows, and an idle one still pays
-// every barrier. One-shot up to kFusedOneShotMaxBytes, every rank's rows; two-shot past it, each
-// rank's slice of them.
+// AttnRes as the norms: a block a row, never more blocks than rows (launch.cuh's grid_of).
 constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
-                                                        const Calibration&) {
-  const bool one_shot = bytes(in) <= kFusedOneShotMaxBytes;
-  const int64_t rows  = one_shot ? in.rows : (in.rows + in.world - 1) / in.world;
-  const int cap       = one_shot ? 16 : 36;
-  const int blocks    = static_cast<int>(rows < cap ? rows : cap);
-  return one_shot ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, blocks, 512)
-                  : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, blocks, 512);
+                                                        const Calibration& cal) {
+  return bytes(in) <= cal.fused_one_shot_max_bytes
+             ? at(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
+                  cal.fused_one_shot_blocks, cal.fused_threads)
+             : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
+                  cal.fused_two_shot_blocks, cal.fused_threads);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
 // 512 threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
-constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&, const Calibration&) {
-  return in.rows <= kGemmTailOneShotRows
-             ? at(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, in, 56, 512)
-             : at(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, 56, 512);
+constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
+                                                   const Calibration& cal) {
+  const Kernel k = in.rows <= kGemmTailOneShotRows
+                       ? Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add
+                       : Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add;
+  return at(k, in, cal.gemm_tail_blocks, cal.fused_threads, cal.gemm_lanes_per_col);
 }
 
 // =================================================================================================
