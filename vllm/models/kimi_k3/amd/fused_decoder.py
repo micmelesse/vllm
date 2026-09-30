@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3's decoder layer with its all-reduces fused into the ops that consume
 them, chosen over `KimiDecoderLayer` when VLLM_KIMI_K3_FUSED_DECODER is set and the
-rocm_comms backend is live. Today it fuses the latent MoE tail's all-reduce with its
-RMSNorm; a fusion runs when the backend admits the input, else the all-reduce then
-the model's own op. Here and not in a fusion pass: Kimi-K3 is not torch.compiled.
+rocm_comms backend is live. Today it fuses the latent MoE tail's all-reduce with its RMSNorm. A fusion
+always runs its fused op; an input the backend cannot run is an error, not a quiet
+fallback. Here and not in a fusion pass: Kimi-K3 is not torch.compiled.
 """
 
 from typing import Any
@@ -32,21 +32,24 @@ def enabled() -> bool:
 
 
 class ROCmLatentMoERunnerFused(ROCmLatentMoERunner):
-    """The latent tail's all-reduce and RMSNorm in one kernel, when admitted."""
+    """The latent tail's all-reduce and RMSNorm in one kernel, always: with the fused
+    decoder on, the fused op runs or the call fails, never the unfused ops in its place."""
 
     def _all_reduce_norm(
         self, fused_output: torch.Tensor, norm: torch.nn.Module | None
     ) -> torch.Tensor:
         comm = _comm()
-        if (
-            comm is not None
-            and isinstance(norm, RMSNorm)
-            and comm.should_allreduce_rms_norm(fused_output)
-        ):
-            return comm.all_reduce_rms_norm(
-                fused_output, norm.weight, norm.variance_epsilon
+        if not isinstance(norm, RMSNorm):
+            raise RuntimeError(f"the fused latent tail needs an RMSNorm, got {norm!r}")
+        if comm is None or not comm.should_allreduce_rms_norm(fused_output):
+            raise RuntimeError(
+                f"the fused decoder is on but rocm_comms does not admit the latent "
+                f"tail's all-reduce + RMSNorm for {tuple(fused_output.shape)} "
+                f"{fused_output.dtype}; unset VLLM_KIMI_K3_FUSED_DECODER"
             )
-        return super()._all_reduce_norm(fused_output, norm)
+        return comm.all_reduce_rms_norm(
+            fused_output, norm.weight, norm.variance_epsilon
+        )
 
 
 class KimiDecoderLayerFused(KimiDecoderLayer):

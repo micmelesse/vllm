@@ -56,8 +56,10 @@ namespace hip_comms {
 // EVERY TUNED LAUNCH STAYS WITHIN WHAT THE KERNELS WERE BUILT FOR, for every op at the smallest
 // input and a large one: a config past a capability is a compile error, not a kernel that overruns
 // its signal slots or register arrays. A decline is fine.
+// EVERY TUNED LAUNCH IS A KERNEL THAT FITS: a tune_<op> never declines, since a fusion that is on
+// runs its fused op; the only no is admits' for an input no kernel can run.
 constexpr bool fits(const Launch& l) {
-  if (l.kernel == Kernel::none) return true;
+  if (l.kernel == Kernel::none) return false;
   if (l.grid < 1 || l.grid > p2p::kMaxBlocks) return false;
   if (has_row_packs(l.kernel) && l.row_packs == 0) return false;
   return l.threads >= kWaveSize && l.threads <= kMaxThreads && l.threads % kWaveSize == 0;
@@ -69,7 +71,8 @@ constexpr bool tuned_launches_fit() {
       if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration))) return false;
   return true;
 }
-static_assert(tuned_launches_fit(), "a tune_<op> in tune.cuh exceeds a kernel capability");
+static_assert(tuned_launches_fit(),
+              "a tune_<op> in tune.cuh declines, or exceeds a kernel capability");
 
 // A FORCED LAUNCH, passed with every call (the sweep's and the tests'; the model passes none): a
 // kernel at a grid and block. `kernel` none: tune.cuh picks everything.

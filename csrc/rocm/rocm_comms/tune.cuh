@@ -52,7 +52,8 @@ constexpr Launch at(Kernel k, Input in, int blocks, int threads) {
   return {k, grid_of(k, blocks, in.rows, in.world), threads, lanes, in.quant_bits, row_packs};
 }
 
-// No kernel: the caller runs the unfused ops.
+// No kernel: only for an input no kernel can run (admits, at run time); a tune_<op> never returns
+// it (rocm_comms.cu's static_assert).
 constexpr Launch declined() { return {Kernel::none, 0, 0, 0, 0, 0}; }
 
 // =================================================================================================
@@ -145,10 +146,13 @@ constexpr Launch tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&
                   : at(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, blocks, 512);
 }
 
-// DECLINED until its rewrite measures faster than unfused (37 us at 16 rows); it runs only forced,
-// by the tests and the bench.
-constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input, const Hardware&, const Calibration&) {
-  return declined();
+// ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of 512
+// threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68 against
+// 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
+constexpr Launch tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&, const Calibration&) {
+  return in.rows <= kGemmTailOneShotRows
+             ? at(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, in, 56, 512)
+             : at(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, 56, 512);
 }
 
 // =================================================================================================
