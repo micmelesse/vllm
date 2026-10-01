@@ -108,8 +108,9 @@ struct Calibration {
   int64_t one_shot_max_bytes;        // the all-reduce's one-shot/two-shot crossover
   int64_t fused_one_shot_max_bytes;  // the fused ops' one-shot/two-shot crossover
   int fused_one_shot_blocks;         // a fused one-shot's grid, at most (one row a block)
-  int64_t norm_push_max_bytes;       // the norms' two-shot: the push (column) kernel up to it,
+  int64_t rms_norm_push_max_bytes;   // rms_norm's two-shot: the push (column) kernel up to it,
                                      // the pull (row) kernel past it
+  int64_t add_rms_norm_push_max_bytes;  // add_rms_norm's, the same
   int norm_push_blocks;              // the push two-shot's grid, at most
   int norm_pull_blocks;              // the pull two-shot's grid, at most
   int attn_res_two_shot_blocks;      // AttnRes's fused two-shot grid, at most
@@ -132,12 +133,15 @@ constexpr Calibration kGfx950Calibration = {
     128 * kKiB,
     // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
     16,
-    // The push kernel won at 896 KiB (128 tokens of 3584 bf16: 13.3 against 13.7 us unfused) and
-    // lost at 1.75 MiB (19.4 against 18.5; 2026-09-30T23-10-02Z). Not yet swept against the pull.
-    896 * kKiB,
-    // The push kernel: best at 32-128 tokens, 9.9 / 10.7 / 13.3 us against 36 blocks' 11.4 at 64
-    // and 15.8 at 128 (2026-09-30T23-10-02Z).
-    128,
+    // rms_norm: push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
+    // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
+    1792 * kKiB,
+    // add_rms_norm: push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at
+    // 1.75 MiB (18.36 against push's 18.46; same run).
+    1344 * kKiB,
+    // The push kernel: 256 blocks the best of 48-256 at 192-256 tokens for both norms (rms 15.17
+    // and 18.04 against 15.55 and 18.11 at 128; 2026-10-01T03-26-44Z); a row a block below that.
+    256,
     // The pull kernel, pipelined: 48 the best of 36-96 for both norms at 2048-4096 tokens (add
     // 80.6 and 149.7 us against 84.3 and 154.7 at 36; rms 79.3 and 145.4 against 81.0 and 147.6),
     // within 0.8 of 36 below (2026-10-01T02-59-52Z).

@@ -98,12 +98,12 @@ constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibra
 // THE NORMS ALWAYS RUN FUSED: a fusion flag means the fused op runs, and tuning picks among fused
 // kernels, never unfused. The one-shot up to fused_one_shot_max_bytes (7.46 against 10.00 us at 1
 // token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z); the push two-shot (aiter's column split)
-// up to norm_push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
-constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, Input in,
-                                const Calibration& cal) {
+// up to the op's push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
+constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, int64_t push_max_bytes,
+                                Input in, const Calibration& cal) {
   if (bytes(in) <= cal.fused_one_shot_max_bytes)
     return spec_of(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads);
-  if (bytes(in) <= cal.norm_push_max_bytes)
+  if (bytes(in) <= push_max_bytes)
     return spec_of(push, in, cal.norm_push_blocks, cal.fused_threads);
   return spec_of(pull, in, cal.norm_pull_blocks, cal.fused_threads);
 }
@@ -111,14 +111,16 @@ constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, Input
 constexpr KernelSpec tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
                     Kernel::all_reduce_push_two_shot_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_rms_norm, in, cal);
+                    Kernel::all_reduce_pull_two_shot_rms_norm, cal.rms_norm_push_max_bytes, in,
+                    cal);
 }
 
 constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
                                                   const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
                     Kernel::all_reduce_push_two_shot_add_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal);
+                    Kernel::all_reduce_pull_two_shot_add_rms_norm,
+                    cal.add_rms_norm_push_max_bytes, in, cal);
 }
 
 // AttnRes as the norms: a block a row, never more blocks than rows (grid_of).
