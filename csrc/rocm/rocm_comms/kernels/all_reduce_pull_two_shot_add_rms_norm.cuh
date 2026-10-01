@@ -55,11 +55,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
-  // Row `row`'s packs from every rank; clamped to the last row, so the load after a block's final
-  // row is real and unconditional (a load under a runtime `if` is never hoisted).
-  const auto load = [&](int row) {
-    return peers_load<T, ngpus>(read, min(row, last - 1), packs, f);
-  };
+  // Row `row`'s packs from every rank.
+  const auto load = [&](int row) { return peers_load<T, ngpus>(read, row, packs, f); };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
   vec<W, NL> w[kRowPacks];
@@ -77,7 +74,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.at[k]];
     }
-    next = load(row + gridDim.x);
+    // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
+    // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
+    // again; at 256 tokens every block has one row: 2026-10-01T01-07-56Z).
+    if (row + static_cast<int>(gridDim.x) < last) next = load(row + gridDim.x);
     V sum[kRowPacks];
     peers_reduce(cur, sum);
     float s[kRowPacks][NL];
