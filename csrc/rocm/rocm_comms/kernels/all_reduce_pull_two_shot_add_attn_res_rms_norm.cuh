@@ -59,12 +59,22 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order, into this
-  //    rank's scratch at their place in the tensor.
-  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * cols; e += blockDim.x) {
-    const int64_t q   = e / cols;
-    const int64_t row = blockIdx.x + q * gridDim.x;
-    const int64_t i   = row * packs + col0 + (e - q * cols);
-    p2p::write_scratch(own_scratch, i, peers_reduce(peers_load<T, ngpus>(read, i)));
+  //    rank's scratch at their place in the tensor. THE (ROW, COLUMN) STEPS, NOT DIVIDED: a 64-bit
+  //    division a pack (e / cols) was a software routine on every 16 bytes.
+  if (cols > 0) {
+    int q = threadIdx.x / cols;  // this thread's row among the block's, and its column
+    int c = threadIdx.x - q * cols;
+    const int dq = blockDim.x / cols, dc = blockDim.x - dq * cols;
+    for (; q < my_rows;) {
+      const int64_t i = (int64_t{blockIdx.x} + int64_t{q} * gridDim.x) * packs + col0 + c;
+      p2p::write_scratch(own_scratch, i, peers_reduce(peers_load<T, ngpus>(read, i)));
+      q += dq;
+      c += dc;
+      if (c >= cols) {
+        c -= cols;
+        ++q;
+      }
+    }
   }
   block_stamp(2);
 
