@@ -13,12 +13,12 @@
 
 namespace hip_comms {
 
-// THE SLICE IS ROWS: each rank owns whole rows, so it finishes the norm alone. It reduces
-// its rows, (kAdd: adds the replicated residual,) norms them and leaves the out rows and
-// (kAdd) the residual rows in its scratch, row-major; after the sync every rank copies every
-// owner's rows out. Every output element is computed by one rank, so every rank holds the same
-// bytes. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read
-// only what the same block on a peer wrote.
+// THE SLICE IS ROWS: each rank owns whole rows, so it computes each row's norm alone. It reduces
+// its rows and leaves one row each in its scratch, row-major: the normed row, or (kAdd) the new
+// residual and the row's RMS scale; after the sync every rank copies every owner's rows out,
+// (kAdd) norming them by their scales as it goes. Every rank does the same arithmetic on the same
+// bytes, so every rank holds the same result. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH
+// PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
@@ -33,7 +33,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
-  const int64_t res_at   = int64_t{slice_rows} * packs;  // the residual rows, after the out rows
+  // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
+  const int64_t scale_at = int64_t{slice_rows} * packs;
   const auto f           = fragment<kRowPacks>(packs);
 
   // 1. Wait until every peer has launched, so its input is ready.
@@ -49,10 +50,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
-  //    and leave the out rows and (kAdd) the residual rows in this rank's scratch. PIPELINED: the
-  //    next row's loads go out before this row's reduction and norm, so a block's compute runs
-  //    under its next round trip instead of between them (a block had ~14 rows at 4096 tokens,
-  //    each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
+  //    and leave the normed rows or (kAdd) the residual rows and scales in this rank's scratch.
+  //    PIPELINED: the next row's loads go out before this row's reduction and norm, so a block's
+  //    compute runs under its next round trip instead of between them (a block had ~14 rows at
+  //    4096 tokens, each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   // Row `row`'s packs from every rank.
@@ -92,14 +93,24 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         thread_unpack<T>(res[k], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.in[k] != 0.0f)
-          p2p::write_scratch(self, res_at + at + f.at[k], thread_pack<T>(s[k]));
+        if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], thread_pack<T>(s[k]));
       }
     }
     float ss[1] = {thread_dot(s, s, f)};
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    // kAdd LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW: every rank norms it while
+    // gathering, so the link carries one row a row, as a plain all-reduce does (gathering both the
+    // normed row and the residual was twice that: 215.9 against 155.2 us at 4096 tokens,
+    // 2026-10-01T02-17-54Z).
+    if constexpr (kAdd) {
+      if (threadIdx.x == 0) {
+        const vec<float, 4> sc = {{scale, 0.0f, 0.0f, 0.0f}};
+        p2p::write_scratch(self, scale_at + (row - first), __builtin_bit_cast(V, sc));
+      }
+      return;
+    }
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       V normed;
@@ -132,23 +143,49 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
   //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
+  //    kAdd: the owners' rows are the new residual; each is normed here by its owner's scale,
+  //    which a row's 8 scales bring through LDS once (uncached scratch, read per pack, would
+  //    double the bytes again).
+  __shared__ float scales[ngpus];
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+    if constexpr (kAdd) {
+      if (threadIdx.x == 0) {
+        V sc[ngpus];
+#pragma unroll
+        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
+#pragma unroll
+        for (int r = 0; r < ngpus; ++r) scales[r] = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
+      }
+      __syncthreads();
+    }
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus], got_res[ngpus];
+      V got[ngpus];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        got[r] = p2p::read_scratch(peers[r], at);
-        if constexpr (kAdd) got_res[r] = p2p::read_scratch(peers[r], res_at + at);
-      }
+      for (int r = 0; r < ngpus; ++r) got[r] = p2p::read_scratch(peers[r], at);
+      vec<W, NL> w;
+      if constexpr (kAdd) w = wv[i];
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;
         if (row >= rows) continue;
-        thread_store(o + int64_t{row} * packs + i, got[r]);
-        if constexpr (kAdd) thread_store(res_out + int64_t{row} * packs + i, got_res[r]);
+        if constexpr (kAdd) {
+          thread_store(res_out + int64_t{row} * packs + i, got[r]);
+          float x[NL];
+          thread_unpack<T>(got[r], x);
+          V normed;
+#pragma unroll
+          for (int j = 0; j < NL; ++j) {
+            const float y = static_cast<float>(static_cast<W>(x[j] * scales[r]));
+            normed.d[j]   = static_cast<T>(static_cast<W>(y * static_cast<float>(w.d[j])));
+          }
+          thread_store(o + int64_t{row} * packs + i, normed);
+        } else {
+          thread_store(o + int64_t{row} * packs + i, got[r]);
+        }
       }
     }
+    if constexpr (kAdd) __syncthreads();
   }
   block_stamp(6);
 }
