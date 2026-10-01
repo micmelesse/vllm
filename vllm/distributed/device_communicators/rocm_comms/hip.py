@@ -226,13 +226,9 @@ class HipCommunicator(Communicator):
         cols: int = 0,
     ) -> bool:
         """What C++ picks for this shape runs here: it has a kernel for it, the row fits
-        in registers at that kernel's width, and its scratch fits; and an eager input
-        the peers cannot read fits the staging it is copied into (a no, where the copy
-        would raise). The plain all-reduce is one flat row, as C++ launches it; `cols`
-        is the GEMM tail's or the scale-add's output columns."""
-        nbytes = inp.numel() * inp.element_size()
-        if not self._visible_to_peers(inp) and nbytes > self._staging.numel():
-            return False
+        in registers at that kernel's width, and its scratch fits. The plain all-reduce
+        is one flat row, as C++ launches it; `cols` is the GEMM tail's or the
+        scale-add's output columns."""
         if op == "all_reduce":
             rows, hidden = 1, inp.numel()
         elif inp.dim() == 2:
