@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One row of Kimi-K3's attention residual (AttnRes) and its RMSNorm, every AttnRes kernel's.
+// One row of Kimi-K3's attention residual (AttnRes) and its RMSNorm, every AttnRes kernel's: an
+// op's row, composed of common's primitives, so it is neither a kernel nor a primitive.
 
 #pragma once
 
-#ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common.cuh, the one interface, not its parts"
-#endif
-
+#include "../common/common.cuh"
 #include "../machine/build.cuh"
-#include "utils.cuh"
-#include "elementwise.cuh"
-#include "reduce.cuh"
-#include "dot.cuh"
 
 namespace hip_comms {
 
@@ -78,7 +72,7 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
     }
     // kTile SOURCES A REDUCTION, as Triton's kernel takes them: a reduction is a block
     // sync, so a row pays one per tile, not one per source. The blocks first, the prefix last.
-    float max_logit = -INFINITY, denominator = 0.0f;
+    OnlineSoftmax softmax;
     for (int src0 = 0; src0 <= num_blocks; src0 += kTile) {
       float v[kTile][kRowPacks][NL];
       float sums[2 * kTile];
@@ -100,23 +94,13 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
       }
       block_reduce<Sum>(sums);
       float logit[kTile];
-      float new_max = max_logit;
 #pragma unroll
-      for (int t = 0; t < kTile; ++t) {
+      for (int t = 0; t < kTile; ++t)
         logit[t] = src0 + t <= num_blocks
                        ? sums[2 * t + 1] * rsqrtf(sums[2 * t] * inv_hidden + eps)
                        : -INFINITY;
-        new_max  = fmaxf(new_max, logit[t]);
-      }
-      const float old_scale = __expf(max_logit - new_max);
       float scale[kTile];
-      denominator *= old_scale;
-#pragma unroll
-      for (int t = 0; t < kTile; ++t) {
-        scale[t] = __expf(logit[t] - new_max);
-        denominator += scale[t];
-      }
-      max_logit = new_max;
+      const float old_scale = thread_softmax_fold(softmax, logit, scale);
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k)
 #pragma unroll
@@ -127,7 +111,7 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
           m[k][j] = acc;
         }
     }
-    const float inv_den = 1.0f / denominator;
+    const float inv_den = 1.0f / softmax.denominator;
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k)
 #pragma unroll

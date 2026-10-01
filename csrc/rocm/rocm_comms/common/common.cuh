@@ -29,8 +29,9 @@
 //   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride, col0)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its geometry (kGemmRows, gemm_max_threads)
-// attn_res.cuh
-//   block_attn_res_row<T, kPrefix, K>(sum, ...)  Kimi-K3's AttnRes and its RMSNorm on one row's sum
+// softmax.cuh
+//   OnlineSoftmax, thread_softmax_fold(s, logit, scale)   a softmax a tile of logits at a time,
+//                                               folded into a running weighted sum
 
 #pragma once
 
@@ -40,5 +41,5 @@
 #include "elementwise.cuh"
 #include "reduce.cuh"
 #include "dot.cuh"
-#include "attn_res.cuh"
+#include "softmax.cuh"
 #undef HIP_COMMS_COMMON_INTERFACE
