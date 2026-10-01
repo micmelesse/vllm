@@ -70,17 +70,21 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
-    V sum[kRowPacks];
-    peers_reduce(cur, sum);
-    float s[kRowPacks][NL];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
+    // DOUBLE-BUFFERED: this row's residual, then the next row's peer loads, then this row's sum,
+    // whose wait covers only its own (older) loads, so the next round trip runs under everything
+    // below.
     V res[kRowPacks];
     if constexpr (kAdd) {
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.at[k]];
     }
-    cur = load(row + gridDim.x);
+    const PeerPacks<T, ngpus, kRowPacks> next = load(row + gridDim.x);
+    V sum[kRowPacks];
+    peers_reduce(cur, sum);
+    cur = next;
+    float s[kRowPacks][NL];
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
 #pragma unroll
