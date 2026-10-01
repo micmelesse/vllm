@@ -120,7 +120,6 @@ struct NormCalibration {
   Launch one_shot;
   Launch push;
   Launch pull;
-  int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
 };
 
 // AttnRes: one-shot, then the push two-shot, then the pull two-shot (both split columns).
@@ -130,6 +129,7 @@ struct AttnResCalibration {
   Launch one_shot;
   Launch push;
   Launch pull;
+  int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
