@@ -83,6 +83,29 @@ DINLINE void thread_load(const V* row, const Fragment<K>& f, V (&out)[K]) {
   }
 }
 
+// PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
+// waits until a pack is used (peers_reduce), so loads issued here can run under other work.
+template <typename T, int ngpus, typename Read>
+DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
+  PeerPacks<T, ngpus> out;
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) out.p[r][0] = read(r, i);
+  return out;
+}
+
+// THIS THREAD'S FRAGMENT OF ROW `row` from every source: every pack's loads go out together (a pack
+// past the row reads the last one, weighted zero where it is used), where an `if (i < packs)` made
+// each pack's loads wait on the one before.
+template <typename T, int ngpus, int K, typename Read>
+DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const Fragment<K>& f) {
+  PeerPacks<T, ngpus, K> out;
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r)
+#pragma unroll
+    for (int k = 0; k < K; ++k) out.p[r][k] = read(r, int64_t{row} * packs + f.at[k]);
+  return out;
+}
+
 template <int K, typename V>
 DINLINE void thread_store(V* row, const Fragment<K>& f, const V (&v)[K]) {
 #pragma unroll

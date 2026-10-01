@@ -55,45 +55,32 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
-  V raw[ngpus][kRowPacks];
   // Row `row`'s packs from every rank; clamped to the last row, so the load after a block's final
   // row is real and unconditional (a load under a runtime `if` is never hoisted).
   const auto load = [&](int row) {
-    const int64_t base = int64_t{min(row, last - 1)} * packs;
-#pragma unroll
-    for (int r = 0; r < ngpus; ++r)
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) raw[r][k] = read(r, base + f.at[k]);
+    return peers_load<T, ngpus>(read, min(row, last - 1), packs, f);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
   vec<W, NL> w[kRowPacks];
 #pragma unroll
   for (int k = 0; k < kRowPacks; ++k) w[k] = wv[f.at[k]];
-  if (first + static_cast<int>(blockIdx.x) < last) load(first + blockIdx.x);
+  PeerPacks<T, ngpus, kRowPacks> cur;
+  if (first + static_cast<int>(blockIdx.x) < last) cur = load(first + blockIdx.x);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
-    // The sum over the ranks, in rank order in fp32, rounded once to T (as peers_reduce).
+    V sum[kRowPacks];
+    peers_reduce(cur, sum);
     float s[kRowPacks][NL];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      float acc[NL];
-#pragma unroll
-      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(raw[0][k].d[j]);
-#pragma unroll
-      for (int r = 1; r < ngpus; ++r)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(raw[r][k].d[j]);
-#pragma unroll
-      for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(static_cast<T>(acc[j]));
-    }
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
     V res[kRowPacks];
     if constexpr (kAdd) {
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.at[k]];
     }
-    load(row + gridDim.x);
+    cur = load(row + gridDim.x);
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
 #pragma unroll

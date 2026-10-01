@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 2. Read every rank's input, in rank order, and sum.
   V* dst = reinterpret_cast<V*>(out);
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_packs; i += gridDim.x * blockDim.x)
-    thread_store(dst + i, peers_reduce<T, ngpus>(read, i));
+    thread_store(dst + i, peers_reduce(peers_load<T, ngpus>(read, i)));
   block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.

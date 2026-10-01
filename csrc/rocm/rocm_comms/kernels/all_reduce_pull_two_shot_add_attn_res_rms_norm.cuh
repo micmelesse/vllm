@@ -53,7 +53,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
     V sum[kRowPacks];
-    peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
     // The AttnRes, rounding as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
     //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
     //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u

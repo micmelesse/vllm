@@ -9,18 +9,20 @@
 // utils.cuh         the helpers
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
 //   Fragment<K>, fragment<K>(len)   this thread's K packs of a row a block owns, clamped into it
+//   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions
 //   thread_load(row, f, out), thread_store(row, f, v)   a Fragment: every load issued, stores
 //                                               only inside the row
 //   thread_load_uncached(p), thread_store_uncached(p, v)   one pack past every cache (system
-//                                               scope); what a write into a peer is (p2p's
-//                                               write_scratch to a peer)
+//                                               scope); no kernel uses them now
+//   peers_load<T, ngpus>(read, i), peers_load<T, ngpus>(read, row, packs, f)   every source's
+//                                               pack (or Fragment) in flight; waits at its use
 // elementwise.cuh
 //   thread_unpack(v, x), thread_pack(x)         a pack to fp32 and back, rounding once
 // reduce.cuh
-//   peers_reduce<T, ngpus>(read, i)             one pack summed over the ranks, fp32, rank order
-//   peers_reduce<T, ngpus>(read, row, packs, f, sum)   a Fragment of a row, the same
+//   peers_reduce(packs) -> V, peers_reduce(packs, sum)   each pack summed over its sources, fp32,
+//                                               source order, rounded once
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
 //   thread_dot(a, b, f)                         this thread's share of a row's dot

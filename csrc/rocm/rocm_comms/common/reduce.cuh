@@ -20,38 +20,31 @@
 
 namespace hip_comms {
 
-// ONE PACK SUMMED OVER `ngpus` SOURCES, in fp32 and rounded once to T; `read(r, i)` is pack i
-// of source r. Every read before any add, so the ngpus loads are in flight together; the
-// sources in order, so callers whose sources are the ranks agree bitwise.
-template <typename T, int ngpus, typename Read>
-DINLINE typename traits<T>::V peers_reduce(Read read, int64_t i) {
-  using V         = typename traits<T>::V;
+// EACH PACK SUMMED OVER ITS `ngpus` SOURCES, in fp32 in source order and rounded once to T, into
+// sum[k]: callers whose sources are the ranks agree bitwise. Waits on the loads only here.
+template <typename T, int ngpus, int K>
+DINLINE void peers_reduce(const PeerPacks<T, ngpus, K>& packs, typename traits<T>::V (&sum)[K]) {
   constexpr int N = traits<T>::N;
-  V raw[ngpus];
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r) raw[r] = read(r, i);
-  float acc[N];
+  for (int k = 0; k < K; ++k) {
+    float acc[N];
 #pragma unroll
-  for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(raw[0].d[j]);
+    for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(packs.p[0][k].d[j]);
 #pragma unroll
-  for (int r = 1; r < ngpus; ++r)
+    for (int r = 1; r < ngpus; ++r)
 #pragma unroll
-    for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(raw[r].d[j]);
-  V out;
+      for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(packs.p[r][k].d[j]);
 #pragma unroll
-  for (int j = 0; j < N; ++j) out.d[j] = static_cast<T>(acc[j]);
-  return out;
+    for (int j = 0; j < N; ++j) sum[k].d[j] = static_cast<T>(acc[j]);
+  }
 }
 
-// THIS THREAD'S FRAGMENT OF ROW `row` summed over the `ngpus` sources, into sum[k]. A block owns
-// the row; its norm needs every pack. Every pack's loads go out together: a pack past the row sums
-// the last one again (weighted zero where it is used), where an `if (i < packs)` made each pack's
-// loads wait on the one before.
-template <typename T, int ngpus, int K, typename Read>
-DINLINE void peers_reduce(Read read, int row, int packs, const Fragment<K>& f,
-                          typename traits<T>::V (&sum)[K]) {
-#pragma unroll
-  for (int k = 0; k < K; ++k) sum[k] = peers_reduce<T, ngpus>(read, int64_t{row} * packs + f.at[k]);
+// One pack, the same.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V peers_reduce(const PeerPacks<T, ngpus>& packs) {
+  typename traits<T>::V sum[1];
+  peers_reduce(packs, sum);
+  return sum[0];
 }
 
 // THE OPERATIONS a wave or block reduction combines with.

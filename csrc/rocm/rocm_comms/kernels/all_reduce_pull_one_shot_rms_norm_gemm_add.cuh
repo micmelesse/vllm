@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
-    peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
     // The norm, rounding as vLLM's reference rms_norm does (weight in T):
     //   out = T(T(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(T(sum over ranks))
     float s[kRowPacks][NL];

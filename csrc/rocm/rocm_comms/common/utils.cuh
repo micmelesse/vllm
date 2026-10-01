@@ -60,6 +60,14 @@ DINLINE Fragment<K> fragment(int len) {
   return f;
 }
 
+// EVERY SOURCE'S PACKS IN REGISTERS: a pack from each of `ngpus` sources (the ranks), K of them a
+// source for a Fragment of a row. What peers_load issues and peers_reduce consumes, so a kernel
+// can start one row's loads and work on another's while they are in flight.
+template <typename T, int ngpus, int K = 1>
+struct PeerPacks {
+  typename traits<T>::V p[ngpus][K];
+};
+
 // PER-PHASE TIMESTAMPS, for finding where a kernel's time goes: thread 0 of each block records the
 // device clock (100 MHz) at a phase boundary, after the block's threads have all reached it, into a
 // device-global [block][phase] table the host reads back (rocm_comms_stamps). Built only with

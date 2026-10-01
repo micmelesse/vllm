@@ -47,7 +47,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
-    peers_reduce<T, ngpus>(read, row, packs, f, sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
     block_stamp(2);
     float s[kRowPacks][NL];
 #pragma unroll

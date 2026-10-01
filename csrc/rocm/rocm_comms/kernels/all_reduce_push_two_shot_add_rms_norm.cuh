@@ -56,7 +56,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const int64_t q   = e / cols;
     const int64_t row = blockIdx.x + q * gridDim.x;
     const int64_t i   = row * packs + col0 + (e - q * cols);
-    const V sum       = peers_reduce<T, ngpus>(read, i);
+    const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) p2p::write_scratch(peers[r], i, sum);
   }
