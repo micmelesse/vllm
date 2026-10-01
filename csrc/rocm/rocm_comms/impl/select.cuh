@@ -235,9 +235,11 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
 // loops over its (row, slice)s, since a grid wider than the GPU holds resident is refused.
 constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware& hw,
                                                const Calibration& cal) {
-  const Template t = a.rows < world ? Template::all_reduce_pull_one_shot_rms_scale_add
-                                    : Template::all_reduce_pull_two_shot_rms_scale_add;
-  return kernel_for(t, hw.compute_units, cal.rms_norm.one_shot.threads, a, world);
+  if (a.rows < world)
+    return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, hw.compute_units,
+                      cal.rms_norm.one_shot.threads, a, world);
+  return kernel_for(Template::all_reduce_pull_two_shot_rms_scale_add,
+                    cal.rms_scale_add_two_shot.blocks, cal.rms_scale_add_two_shot.threads, a, world);
 }
 
 // =================================================================================================

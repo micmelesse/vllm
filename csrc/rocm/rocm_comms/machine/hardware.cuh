@@ -148,6 +148,7 @@ struct Calibration {
   AttnResCalibration attn_res;
   GemmCalibration rms_norm_gemm;
   GemmCalibration rms_norm_gemm_add;
+  Launch rms_scale_add_two_shot;  // the one-all-reduce tail's row two-shot
 };
 
 // gfx950 on n11. MI300X has none yet. The fused kernels' 512-thread block: 256 was worse for the
@@ -225,6 +226,10 @@ constexpr Calibration kGfx950Calibration = {
         // Not swept: the one-shot's.
         .two_shot = {56, 512},
     },
+    // About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of
+    // the best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4
+    // at 256 (2026-10-01T22-07-13Z).
+    .rms_scale_add_two_shot = {32, 512},
 };
 
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.
