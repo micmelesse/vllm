@@ -328,22 +328,23 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      // The one-shot's and the two-shot's row builds are one.
-      constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
-      static_assert(max_row_packs(K) ==
-                    max_row_packs(Template::all_reduce_pull_two_shot_rms_scale_add));
-      impl::at_row_packs<K>(impl::row_build(args.row_packs), [&](auto r) {
-        constexpr int R = decltype(r)::value;
-        const auto bind = [&](const p2p::DevComm& p) {
-          return std::make_tuple(p, static_cast<T*>(a.out), a.eps, rows, hp, lp, args.splits);
-        };
-        switch (k.fn) {
-          case K: return f(all_reduce_pull_one_shot_rms_scale_add<T, NG, R>, bind);
-          case Template::all_reduce_pull_two_shot_rms_scale_add:
-            return f(all_reduce_pull_two_shot_rms_scale_add<T, NG, R>, bind);
-          default: impl::not_this_ops(k.fn);
-        }
-      });
+      const auto bind = [&](const p2p::DevComm& p) {
+        return std::make_tuple(p, static_cast<T*>(a.out), a.eps, rows, hp, lp, args.splits);
+      };
+      // Each shot up to its own row build: the two-shot holds two (row, slice)s' loads.
+      constexpr Template K1 = Template::all_reduce_pull_one_shot_rms_scale_add;
+      constexpr Template K2 = Template::all_reduce_pull_two_shot_rms_scale_add;
+      switch (k.fn) {
+        case K1:
+          return impl::at_row_packs<K1>(impl::row_build(args.row_packs), [&](auto r) {
+            f(all_reduce_pull_one_shot_rms_scale_add<T, NG, decltype(r)::value>, bind);
+          });
+        case K2:
+          return impl::at_row_packs<K2>(impl::row_build(args.row_packs), [&](auto r) {
+            f(all_reduce_pull_two_shot_rms_scale_add<T, NG, decltype(r)::value>, bind);
+          });
+        default: impl::not_this_ops(k.fn);
+      }
     });
   });
 }

@@ -230,9 +230,10 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
 }
 
 // THE ONE-ALL-REDUCE TAIL: the one-shot while there are fewer rows than ranks (the two-shot would
-// leave ranks idle), the row two-shot from a row a rank (unmeasured: the sweep sets it). The
-// one-shot norm's block; a block a (row, slice) up to one a compute unit, past that each block
-// loops over its (row, slice)s, since a grid wider than the GPU holds resident is refused.
+// leave ranks idle), the row two-shot from a row a rank. Measured at [T, 17920] bf16 x8: one-shot
+// 10.8 against two-shot 12.3 us at 1 token, two-shot 13.2 against 14.3 at 8 (2026-10-01T21-20-57Z).
+// The one-shot norm's block; a block a (row, slice) up to one a compute unit, past that each
+// block loops over its (row, slice)s, since a grid wider than the GPU holds resident is refused.
 constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware& hw,
                                                const Calibration& cal) {
   const Template t = a.rows < world ? Template::all_reduce_pull_one_shot_rms_scale_add
