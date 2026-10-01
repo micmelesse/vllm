@@ -470,7 +470,7 @@ from vllm.models.kimi_k3.amd.decoder import KimiDecoderLayer  # noqa: E402
 class KimiLinearModel(nn.Module, EagleModelMixin):
     # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant whose
     # all-reduces are fused into the ops that consume them.
-    layer_cls: type[KimiDecoderLayer] = KimiDecoderLayer
+    layer_cls: type[nn.Module] = KimiDecoderLayer
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

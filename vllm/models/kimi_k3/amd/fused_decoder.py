@@ -1,28 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3's fused decoder layers: one class per fusion path, each in its own
-file, chosen once by VLLM_KIMI_K3_FUSED_DECODER. A path never builds on another's;
-one that combines two is a class of its own. A chosen path runs its fused ops or
-raises, never the unfused ops. Not a fusion pass: Kimi-K3 is not torch.compiled.
+"""Which fused decoder layer VLLM_KIMI_K3_FUSED_DECODER names. Each path is its own
+file, a copy of decoder.py's layer with that path's change, sharing nothing with
+the others; a path that combines two is a file of its own. A chosen path runs its
+fused ops or raises, never the unfused ops. Not a fusion pass: Kimi-K3 is not
+torch.compiled.
 """
 
-from typing import Any
+from torch import nn
 
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
-from vllm.models.kimi_k3.amd.linear import KimiDecoderLayer
 
 
-def comm() -> Any | None:
-    """The rocm_comms backend, when live with TP above one; None otherwise."""
-    if get_tensor_model_parallel_world_size() <= 1:
-        return None
-    backend = getattr(get_tp_group().device_communicator, "rocm_comm", None)
-    return None if backend is None or backend.disabled else backend
-
-
-def layer_class(path: str) -> type[KimiDecoderLayer]:
-    """The fused decoder layer of the path VLLM_KIMI_K3_FUSED_DECODER names."""
-    if comm() is None:
+def layer_class(path: str) -> type[nn.Module]:
+    """The decoder layer of fusion path `path`."""
+    backend = (
+        getattr(get_tp_group().device_communicator, "rocm_comm", None)
+        if get_tensor_model_parallel_world_size() > 1
+        else None
+    )
+    if backend is None or backend.disabled:
         raise RuntimeError(
             f"VLLM_KIMI_K3_FUSED_DECODER={path} needs the rocm_comms backend live "
             "with TP above one"

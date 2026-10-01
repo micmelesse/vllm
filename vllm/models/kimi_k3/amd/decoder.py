@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3's standard decoder layer, out of linear.py beside its fused variants
-(fused_decoder_*.py) so each diffs against it. Imported through linear.py, which
-re-exports it."""
+"""Kimi-K3's standard decoder layer, out of linear.py so each fused variant
+(fused_decoder_*.py, a copy of it with its change) diffs against it. Imported
+through linear.py, which re-exports it."""
 
 import torch
 from torch import nn
@@ -14,7 +14,6 @@ from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention as KimiLinearGatedDeltaNetAttention,
 )
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
-from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.linear import (
     KimiMLAAttention,
     KimiMLP,
@@ -26,12 +25,6 @@ from vllm.utils.math_utils import cdiv
 
 
 class KimiDecoderLayer(nn.Module):
-    # The latent MoE's runner; a fused decoder layer swaps in its own.
-    latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner
-    # Whether attention and the MLP all-reduce their own outputs. A subclass that
-    # reduces them itself, fused with what consumes them, sets it False.
-    reduce_results = True
-
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -58,7 +51,6 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
-                    reduce_results=self.reduce_results,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -92,7 +84,6 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
-                reduce_results=self.reduce_results,
             )
 
         if (
@@ -106,8 +97,6 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                latent_runner_cls=self.latent_runner_cls,
-                reduce_results=self.reduce_results,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -119,7 +108,6 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                reduce_results=self.reduce_results,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
