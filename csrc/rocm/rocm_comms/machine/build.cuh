@@ -40,6 +40,7 @@ struct Build {
   int gemm_rows;            // the GEMM tail's rows a pass
   int gemm_chunk;           // the GEMM tail's K-chunk staged in LDS, in packs
   int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
+  int attn_res_sources;     // AttnRes's sources a block_reduce, the one build of it
 };
 
 constexpr Build derive(const Hardware& hw, const Calibration& cal) {
@@ -55,14 +56,15 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
 
   // A ROW KERNEL'S PACKS A THREAD: each pack keeps a load from every peer in flight at once
-  // (peers_reduce), and AttnRes four fp32 copies of it besides (the prefix, the weights, the running
-  // max and sum). Policy: a row's registers take at most half of the thread's, the rest its
+  // (peers_reduce), and AttnRes fp32 copies of it besides: the prefix, the weights, the output,
+  // and one a source of a reduction's. Policy: a row's registers take at most half of the thread's, the rest its
   // addresses, reductions and the norm. At all of them the norms spilled (8 packs of 8 peers is
   // 256 registers: ISA 2026-09-30T20-23-38Z), and AttnRes at 4.
   const int pack_vgprs  = b.pack_bytes / 4;
   const int row_budget  = hw.arch_vgprs / 2;
   const int in_flight   = (hw.xgmi_links + 1) * pack_vgprs;
-  const int attn_state  = 4 * (b.pack_bytes / 2);  // a pack of the narrowest T built (bf16) as fp32
+  // A pack of the narrowest T built (bf16) as fp32, for each copy.
+  const int attn_state  = (3 + cal.attn_res_sources_per_reduce) * (b.pack_bytes / 2);
   b.norm_row_packs      = floor_pow2(row_budget / in_flight);
   b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight + attn_state));
   // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
@@ -84,6 +86,7 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
 
   // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
   b.gemm_lanes = cal.gemm_lanes_per_col;
+  b.attn_res_sources = cal.attn_res_sources_per_reduce;
   return b;
 }
 

@@ -139,6 +139,7 @@ struct Calibration {
   double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
   int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
   int gemm_lanes_per_col;  // grid_gemm's lanes a column, a build both GEMM ops' kernels share
+  int attn_res_sources_per_reduce;  // AttnRes's sources a block_reduce, a build its kernels share
   NormCalibration rms_norm;
   NormCalibration add_rms_norm;
   AttnResCalibration attn_res;
@@ -157,6 +158,8 @@ constexpr Calibration kGfx950Calibration = {
     .all_reduce_one_shot_max_bytes = 64 * kKiB,
     // Picked at Kimi-K3's shape on the GEMM tail; 1, 2 and 8 were worse at 1 row (2026-09-28).
     .gemm_lanes_per_col = 4,
+    // Triton's AttnRes takes 4 sources a tile; not swept yet.
+    .attn_res_sources_per_reduce = 4,
     .rms_norm = {
         // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
         .one_shot_max_bytes = 128 * kKiB,

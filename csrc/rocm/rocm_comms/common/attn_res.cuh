@@ -9,6 +9,7 @@
 #error "include common.cuh, the one interface, not its parts"
 #endif
 
+#include "../machine/build.cuh"
 #include "utils.cuh"
 #include "elementwise.cuh"
 #include "reduce.cuh"
@@ -28,12 +29,13 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
                           const T* __restrict__ qk_w, const T* __restrict__ out_norm_w,
                           typename traits<T>::V* o, int num_blocks, float eps, float out_eps,
                           float inv_hidden) {
-  using V          = typename traits<T>::V;
-  constexpr int NL = traits<T>::N;
+  using V             = typename traits<T>::V;
+  constexpr int NL    = traits<T>::N;
+  constexpr int kTile = kBuild.attn_res_sources;
   // The AttnRes, rounding as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
   //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
   //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u
-  //   m = softmax(logits) . sources, online, one source at a time; out = T(m), or
+  //   m = softmax(logits) . sources, online, a tile of sources at a time; out = T(m), or
   //   T(m * rsqrt(mean(m^2) + out_eps) * out_w)
   float u[kRowPacks][NL];
   V new_prefix[kRowPacks];
@@ -74,32 +76,56 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
         m[k][j] = 0.0f;
       }
     }
+    // kTile SOURCES A REDUCTION, as Triton's kernel takes them: a reduction is a block
+    // sync, so a row pays one per tile, not one per source. The blocks first, the prefix last.
     float max_logit = -INFINITY, denominator = 0.0f;
-    for (int src = 0; src <= num_blocks; ++src) {
-      // The stored blocks first, the prefix last, as the reference orders its sources.
-      float v[kRowPacks][NL];
-      if (src < num_blocks) {
-        const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
+    for (int src0 = 0; src0 <= num_blocks; src0 += kTile) {
+      float v[kTile][kRowPacks][NL];
+      float sums[2 * kTile];
 #pragma unroll
-        for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[k]);
-      } else {
+      for (int t = 0; t < kTile; ++t) {
+        const int src = src0 + t;
+        if (src < num_blocks) {
+          const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
 #pragma unroll
-        for (int k = 0; k < kRowPacks; ++k)
+          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[t][k]);
+        } else {
 #pragma unroll
-          for (int j = 0; j < NL; ++j) v[k][j] = u[k][j];
+          for (int k = 0; k < kRowPacks; ++k)
+#pragma unroll
+            for (int j = 0; j < NL; ++j) v[t][k][j] = src == num_blocks ? u[k][j] : 0.0f;
+        }
+        sums[2 * t]     = thread_dot(v[t], v[t], f);
+        sums[2 * t + 1] = thread_dot(v[t], w, f);
       }
-      float sums[2] = {thread_dot(v, v, f), thread_dot(v, w, f)};
       block_reduce<Sum>(sums);
-      const float logit      = sums[1] * rsqrtf(sums[0] * inv_hidden + eps);
-      const float new_max    = fmaxf(max_logit, logit);
-      const float old_scale  = __expf(max_logit - new_max);
-      const float this_scale = __expf(logit - new_max);
-      denominator            = denominator * old_scale + this_scale;
-      max_logit              = new_max;
+      float logit[kTile];
+      float new_max = max_logit;
+#pragma unroll
+      for (int t = 0; t < kTile; ++t) {
+        logit[t] = src0 + t <= num_blocks
+                       ? sums[2 * t + 1] * rsqrtf(sums[2 * t] * inv_hidden + eps)
+                       : -INFINITY;
+        new_max  = fmaxf(new_max, logit[t]);
+      }
+      const float old_scale = __expf(max_logit - new_max);
+      float scale[kTile];
+      denominator *= old_scale;
+#pragma unroll
+      for (int t = 0; t < kTile; ++t) {
+        scale[t] = __expf(logit[t] - new_max);
+        denominator += scale[t];
+      }
+      max_logit = new_max;
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) m[k][j] = m[k][j] * old_scale + this_scale * v[k][j];
+        for (int j = 0; j < NL; ++j) {
+          float acc = m[k][j] * old_scale;
+#pragma unroll
+          for (int t = 0; t < kTile; ++t) acc += scale[t] * v[t][k][j];
+          m[k][j] = acc;
+        }
     }
     const float inv_den = 1.0f / denominator;
 #pragma unroll
