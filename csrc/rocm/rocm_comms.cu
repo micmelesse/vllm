@@ -32,8 +32,8 @@ using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
 // EVERY OP TAKES THE SAME FOUR INTEGERS LAST, its Options: quant_bits, the precision the caller
-// accepts (16: exact, what the model passes), then a forced spec, kernel, launch_blocks and
-// launch_threads (-1 and zeros: select's, what the model passes).
+// accepts (16: exact, what the model passes), then a forced template and its launch, kernel,
+// launch_blocks and launch_threads (-1 and zeros: select's, what the model passes).
 
 namespace {
 std::string bytes_of(const std::vector<int64_t>& xs) {
@@ -68,12 +68,12 @@ hip_comms::DType dtype_of(const torch::Tensor& t) {
 
 hip_comms::Options options_of(int64_t quant_bits, int64_t kernel, int64_t blocks,
                               int64_t threads) {
-  using hip_comms::Kernel;
+  using hip_comms::Template;
   TORCH_CHECK(quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
               "quant_bits must be 16 (exact), 8 or 4");
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (kernel < 0) return {static_cast<int>(quant_bits), std::nullopt, stream};
-  TORCH_CHECK(kernel < hip_comms::kNumKernels, "hip_comms: no kernel ", kernel);
+  TORCH_CHECK(kernel < hip_comms::kNumTemplates, "hip_comms: no template ", kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::p2p::kMaxBlocks, "]");
   TORCH_CHECK(threads > 0 && threads <= hip_comms::kMaxThreads &&
@@ -81,7 +81,7 @@ hip_comms::Options options_of(int64_t quant_bits, int64_t kernel, int64_t blocks
               "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
               hip_comms::kMaxThreads);
   return {static_cast<int>(quant_bits),
-          hip_comms::Forced{static_cast<Kernel>(kernel), static_cast<int>(blocks),
+          hip_comms::Forced{static_cast<Template>(kernel), static_cast<int>(blocks),
                             static_cast<int>(threads)},
           stream};
 }
@@ -126,12 +126,43 @@ bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidd
   TORCH_CHECK(element_size == 2, "hip_comms: only 2-byte dtypes are built");
   TORCH_CHECK(cols >= 0 && (cols > 0) == hip_comms::gemms(static_cast<hip_comms::Op>(op)),
               "hip_comms: cols is a GEMM op's output columns, and only they have them");
-  auto& handle = handle_of(handle_ptr);
-  const hip_comms::Input in{rows, hidden, static_cast<int>(element_size), cols,
-                            handle.world_size()};
-  return hip_comms::why_not(handle, static_cast<hip_comms::Op>(op), in,
-                            options_of(quant_bits, kernel, launch_blocks, launch_threads))
-      .empty();
+  // THE CALL, WITHOUT ITS TENSORS: what select reads of it, its pointers null. A norm's weight is
+  // taken in the call's dtype and AttnRes without a prefix: neither changes whether a call runs.
+  auto& h                   = handle_of(handle_ptr);
+  const auto o              = options_of(quant_bits, kernel, launch_blocks, launch_threads);
+  const auto d              = hip_comms::DType::bf16;
+  const float eps           = 0.f;
+  switch (static_cast<hip_comms::Op>(op)) {
+    case hip_comms::Op::all_reduce:
+      return hip_comms::why_not(h, hip_comms::AllReduceArgs{nullptr, nullptr,
+                                                            rows * hidden * element_size, d},
+                                o)
+          .empty();
+    case hip_comms::Op::all_reduce_rms_norm:
+    case hip_comms::Op::all_reduce_add_rms_norm: {
+      const bool add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_add_rms_norm;
+      return hip_comms::why_not(h, hip_comms::NormArgs{add, nullptr, nullptr, nullptr, d, d, rows,
+                                                       hidden, eps, nullptr, nullptr},
+                                o)
+          .empty();
+    }
+    case hip_comms::Op::all_reduce_add_attn_res_rms_norm:
+      return hip_comms::why_not(h, hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0,
+                                                          0, nullptr, nullptr, nullptr, d, rows,
+                                                          hidden, 0, -1, eps, eps, false},
+                                o)
+          .empty();
+    case hip_comms::Op::all_reduce_rms_norm_gemm:
+    case hip_comms::Op::all_reduce_rms_norm_gemm_add: {
+      const bool add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_rms_norm_gemm_add;
+      return hip_comms::why_not(h, hip_comms::GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr,
+                                                           eps, nullptr, cols, nullptr, d, rows,
+                                                           hidden},
+                                o)
+          .empty();
+    }
+  }
+  return false;
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
@@ -284,7 +315,8 @@ void all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor* r
   }
   hip_comms::all_reduce_rms_norm(
       handle_of(handle_ptr),
-      {out.data_ptr(), inp.data_ptr(), weight.data_ptr(), dtype_of(inp), dtype_of(weight),
+      {residual != nullptr, out.data_ptr(), inp.data_ptr(), weight.data_ptr(), dtype_of(inp),
+       dtype_of(weight),
        inp.size(0), inp.size(1), static_cast<float>(eps),
        residual_out ? residual_out->data_ptr() : nullptr,
        residual ? residual->data_ptr() : nullptr},

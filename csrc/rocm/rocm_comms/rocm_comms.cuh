@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ROCM_COMMS, THE ONE INTERFACE: our collectives, torch-free. Every op is
-// op(handle, args, options), and every op is the same three steps:
-//   select(handle, args, options) -> KernelSpec   the only choice, as data (impl/select.cuh)
-//   validate(handle, spec, args, options)         the only no: raises with the reason
-//   launch(handle, spec, args, stream)            runs it; decides nothing (impl/launch.cuh)
-// Both of the last two find the compiled kernel a spec names the same way (impl/instances.cuh).
+// ROCM_COMMS, THE ONE INTERFACE: our collectives, torch-free. An OP is what a caller asks for (an
+// API call); a KERNEL is what runs, one compiled instruction sequence (vllm CONTEXT's lingo). Every
+// op is op(handle, args, options), the same three steps:
+//   select(args, world, options) -> Kernel   the only choice: the template, its arguments, its
+//                                            launch (impl/select.cuh)
+//   validate(handle, kernel, args, options)  the only no: raises with the reason
+//   launch(handle, kernel, args, stream)     runs it; decides nothing (impl/launch.cuh)
+// Both of the last two find the compiled function a Kernel names the same way (impl/dispatch.cuh).
 //
 // Handle                  the state across calls: the peers' memory, mapped once (p2p's Group)
-// Input                   the workload a call is: its shape and group (machine/ says the rest)
-// AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs   one op's inputs and outputs
-// Options                 how the caller wants it run: precision, a forced kernel, the stream
-// KernelSpec              what runs: a kernel, its grid and block, its row build
+// AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs   one op's call: inputs and outputs
+// Options                 how the caller wants it run: precision, a forced template, the stream
+// Kernel                  what runs: a template, its arguments, its grid and block
 // all_reduce, all_reduce_rms_norm (and _add_), all_reduce_add_attn_res_rms_norm,
 // all_reduce_rms_norm_gemm(_add)      the ops
-// why_not(handle, op, input, options)  why a call cannot run, or empty: `admits` for vLLM
+// why_not(handle, args, options)  why a call cannot run, or empty: `admits` for vLLM
 
 #pragma once
 
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 
 #include "p2p/p2p.cuh"
 #include "machine/build.cuh"
@@ -45,8 +47,9 @@ enum class Op : int {
   all_reduce_rms_norm_gemm         = 5,
 };
 
-// Every `__global__` there is, named by its shot and what it fuses.
-enum class Kernel : int {
+// Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
+// one per set of template arguments.
+enum class Template : int {
   all_reduce_pull_one_shot                       = 0,
   all_reduce_pull_two_shot                       = 1,
   all_reduce_pull_one_shot_rms_norm              = 2,
@@ -64,18 +67,46 @@ enum class Kernel : int {
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
 };
 
-// SELECT'S RESULT: which compiled kernel runs and how. With the call's own facts (its world,
-// dtype and variant) it names exactly one instance.
-struct KernelSpec {
-  Kernel kernel;
+// A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
+// is the packs of a row a thread holds, its row build.
+struct AllReduceTemplateArgs {
+  int world;
+  DType dtype;
+};
+struct NormTemplateArgs {
+  int world;
+  DType dtype;
+  DType weight;  // dtype, or f32
+  int row_packs;
+};
+struct AttnResTemplateArgs {
+  int world;
+  DType dtype;
+  int row_packs;
+  bool prefix;
+};
+struct GemmTemplateArgs {
+  int world;
+  DType dtype;
+  int lanes;  // grid_gemm's lanes a column
+  int row_packs;
+};
+using TemplateArgs =
+    std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs, GemmTemplateArgs>;
+
+// WHAT SELECT RETURNS: one kernel, the template with its arguments decided (the compiled
+// instruction sequence), and its launch.
+struct Kernel {
+  Template fn;
+  TemplateArgs args;
   int grid;
   int threads;
-  int row_packs;  // a row kernel's packs of a row a thread holds, its build; 0 for the others
 };
 
-// A kernel the caller forces, at its grid and block (the bench's sweeps); select derives the rest.
+// A template the caller forces, at its grid and block (the bench's sweeps); select decides its
+// arguments from the call as for its own choice.
 struct Forced {
-  Kernel kernel;
+  Template fn;
   int grid;
   int threads;
 };
@@ -86,14 +117,6 @@ struct Options {
   hipStream_t stream;
 };
 
-struct Input {
-  int64_t rows;    // tokens
-  int64_t hidden;  // a row's length, in elements
-  int elem_bytes;
-  int64_t cols;    // the GEMM tail's output columns; 0 for every other op
-  int world;
-};
-
 struct AllReduceArgs {
   void* out;
   const void* inp;
@@ -101,8 +124,10 @@ struct AllReduceArgs {
   DType dtype;
 };
 
-// residual and residual_out null: rms_norm; given: fused_add_rms_norm.
+// add: fused_add_rms_norm, with residual and residual_out (written); otherwise rms_norm, the two
+// null.
 struct NormArgs {
+  bool add;
   void* out;
   const void* inp;
   const void* weight;
@@ -156,9 +181,9 @@ struct GemmTailArgs {
 }  // namespace hip_comms
 
 #define HIP_COMMS_INTERFACE
-#include "impl/kernels.cuh"
+#include "impl/templates.cuh"
 #include "impl/select.cuh"
-#include "impl/instances.cuh"
+#include "impl/dispatch.cuh"
 #include "impl/validate.cuh"
 #include "impl/launch.cuh"
 #include "impl/ops.cuh"

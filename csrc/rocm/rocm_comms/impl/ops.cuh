@@ -15,7 +15,7 @@ namespace impl {
 
 template <typename Args>
 void run(Handle& h, const Args& a, const Options& o) {
-  const KernelSpec k = select(h, a, o);
+  const Kernel k = select(a, h.world_size(), o);
   validate(h, k, a, o);
   launch(h, k, a, o.stream);
 }

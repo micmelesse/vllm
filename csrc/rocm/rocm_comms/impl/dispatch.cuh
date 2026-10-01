@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// INSTANCES, NO DECISIONS: a spec and an op's args to the one compiled kernel they name. What a
-// kernel is compiled for is constexpr, so it is a template parameter, resolved here from the call:
-// the world from the handle, T (and a norm's weight type W) from the args, a row kernel's packs a
-// thread from the spec, the GEMM tail's lanes from the build. Every combination below is compiled;
-// one that was not raises. with_kernel(h, spec, args, f) hands f the kernel and `bind`, which
-// makes the kernel's arguments from the peers' view: validate reads what the kernel uses, launch
-// runs it.
+// DISPATCH, NO DECISIONS: a Kernel (select's: the template and its arguments) to its compiled
+// function, as torch's dispatcher takes an op to its kernel. The template's arguments are
+// constexpr, so each is a template parameter, resolved here from the Kernel alone; every
+// combination below is compiled, and one that was not raises. dispatch(kernel, args, f) hands f
+// the compiled function and `bind`, which makes its arguments from the call's pointers and the
+// peers' view: validate reads what the function uses, launch runs it.
 
 #pragma once
 
@@ -20,6 +19,8 @@
 #include <hip/hip_runtime.h>
 
 #include <map>
+#include <optional>
+#include <variant>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -94,14 +95,20 @@ void by_row_packs(int k, F&& f) {
 }
 
 // A row kernel's packs a thread, up to its own build (the catalog's max_row_packs).
-template <Kernel K, typename F>
+template <Template K, typename F>
 void at_row_packs(int k, F&& f) {
   by_row_packs<max_row_packs(K)>(k, std::forward<F>(f));
 }
 
-[[noreturn]] inline void not_this_ops(Kernel k) {
-  throw std::runtime_error("hip_comms: kernel " + std::to_string(static_cast<int>(k)) +
+[[noreturn]] inline void not_this_ops(Template k) {
+  throw std::runtime_error("hip_comms: template " + std::to_string(static_cast<int>(k)) +
                            " is not this op's");
+}
+
+// A row template's build, which select left empty when none holds the row (validate refuses it).
+inline int row_build(std::optional<int> row_packs) {
+  if (!row_packs) not_built("a row build that holds the row");
+  return *row_packs;
 }
 
 }  // namespace impl
@@ -118,35 +125,38 @@ Resources resources_of(void (*kernel)(P...)) {
 }
 
 template <typename F>
-void with_kernel(const Handle& h, const KernelSpec& k, const AllReduceArgs& a, F&& f) {
-  const int n = static_cast<int>(a.bytes / kPackBytes);
-  impl::by_world(h.world_size(), [&](auto ng) {
+void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {
+  const auto& args = std::get<AllReduceTemplateArgs>(k.args);
+  const int n      = static_cast<int>(a.bytes / kPackBytes);
+  impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
-    impl::by_dtype(a.dtype, [&](auto t) {
+    impl::by_dtype(args.dtype, [&](auto t) {
       using T         = typename decltype(t)::t;
       const auto bind = [&](const p2p::DevComm& p) {
         return std::make_tuple(p, static_cast<T*>(a.out), n);
       };
-      switch (k.kernel) {
-        case Kernel::all_reduce_pull_one_shot:
+      switch (k.fn) {
+        case Template::all_reduce_pull_one_shot:
           return f(all_reduce_pull_one_shot<T, NG>, bind);
-        case Kernel::all_reduce_pull_two_shot:
+        case Template::all_reduce_pull_two_shot:
           return f(all_reduce_pull_two_shot<T, NG>, bind);
-        default: impl::not_this_ops(k.kernel);
+        default: impl::not_this_ops(k.fn);
       }
     });
   });
 }
 
 template <typename F>
-void with_kernel(const Handle& h, const KernelSpec& k, const NormArgs& a, F&& f) {
-  const int rows  = static_cast<int>(a.rows);
-  const int packs = static_cast<int>(a.hidden * elem_bytes(a.dtype) / kPackBytes);
-  impl::by_world(h.world_size(), [&](auto ng) {
+void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
+  const auto& args = std::get<NormTemplateArgs>(k.args);
+  const int rows   = static_cast<int>(a.rows);
+  const int packs  = static_cast<int>(packs_of(a));
+  const int r      = impl::row_build(args.row_packs);
+  impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
-    impl::by_dtype(a.dtype, [&](auto t) {
+    impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::by_weight<T>(a.weight_dtype, a.dtype, [&](auto w) {
+      impl::by_weight<T>(args.weight, args.dtype, [&](auto w) {
         using W         = typename decltype(w)::t;
         const auto norm = [&](const p2p::DevComm& p) {
           return std::make_tuple(p, static_cast<T*>(a.out), static_cast<const W*>(a.weight), a.eps,
@@ -158,44 +168,44 @@ void with_kernel(const Handle& h, const KernelSpec& k, const NormArgs& a, F&& f)
                                  static_cast<const W*>(a.weight), a.eps, rows, packs);
         };
         using K = Kernel;
-        switch (k.kernel) {
+        switch (k.fn) {
           case K::all_reduce_pull_one_shot_rms_norm:
             return impl::at_row_packs<K::all_reduce_pull_one_shot_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_pull_one_shot_rms_norm<T, W, NG, R>, norm);
                 });
           case K::all_reduce_pull_two_shot_rms_norm:
             return impl::at_row_packs<K::all_reduce_pull_two_shot_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_pull_two_shot_rms_norm<T, W, NG, R>, norm);
                 });
           case K::all_reduce_push_two_shot_rms_norm:
             return impl::at_row_packs<K::all_reduce_push_two_shot_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_push_two_shot_rms_norm<T, W, NG, R>, norm);
                 });
           case K::all_reduce_pull_one_shot_add_rms_norm:
             return impl::at_row_packs<K::all_reduce_pull_one_shot_add_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_pull_one_shot_add_rms_norm<T, W, NG, R>, add_norm);
                 });
           case K::all_reduce_pull_two_shot_add_rms_norm:
             return impl::at_row_packs<K::all_reduce_pull_two_shot_add_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_pull_two_shot_add_rms_norm<T, W, NG, R>, add_norm);
                 });
           case K::all_reduce_push_two_shot_add_rms_norm:
             return impl::at_row_packs<K::all_reduce_push_two_shot_add_rms_norm>(
-                k.row_packs, [&](auto rp) {
+                r, [&](auto rp) {
                   constexpr int R = decltype(rp)::value;
                   f(all_reduce_push_two_shot_add_rms_norm<T, W, NG, R>, add_norm);
                 });
-          default: impl::not_this_ops(k.kernel);
+          default: impl::not_this_ops(k.fn);
         }
       });
     });
@@ -203,28 +213,29 @@ void with_kernel(const Handle& h, const KernelSpec& k, const NormArgs& a, F&& f)
 }
 
 // AttnRes's and the GEMM tail's kernels share their row builds, so one cap serves each op's.
-static_assert(max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
-                  max_row_packs(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) &&
-              max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
-                  max_row_packs(Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) &&
-              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add) &&
-              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm) &&
-              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm),
+static_assert(max_row_packs(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
+                  max_row_packs(Template::all_reduce_pull_two_shot_add_attn_res_rms_norm) &&
+              max_row_packs(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
+                  max_row_packs(Template::all_reduce_push_two_shot_add_attn_res_rms_norm) &&
+              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Template::all_reduce_pull_two_shot_rms_norm_gemm_add) &&
+              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm) &&
+              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Template::all_reduce_pull_two_shot_rms_norm_gemm),
               "a kernel with its own row builds needs its own case");
 
 template <typename F>
-void with_kernel(const Handle& h, const KernelSpec& k, const AttnResArgs& a, F&& f) {
-  const int rows  = static_cast<int>(a.rows);
-  const int packs = static_cast<int>(a.hidden * elem_bytes(a.dtype) / kPackBytes);
-  impl::by_world(h.world_size(), [&](auto ng) {
+void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
+  const auto& args = std::get<AttnResTemplateArgs>(k.args);
+  const int rows   = static_cast<int>(a.rows);
+  const int packs  = static_cast<int>(packs_of(a));
+  impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
-    impl::by_dtype(a.dtype, [&](auto t) {
+    impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::at_row_packs<Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm>(
-          k.row_packs, [&](auto r) {
+      impl::at_row_packs<Template::all_reduce_pull_one_shot_add_attn_res_rms_norm>(
+          impl::row_build(args.row_packs), [&](auto r) {
             constexpr int R = decltype(r)::value;
             const auto bind = [&](const p2p::DevComm& p) {
               return std::make_tuple(
@@ -234,24 +245,24 @@ void with_kernel(const Handle& h, const KernelSpec& k, const AttnResArgs& a, F&&
                   static_cast<T*>(a.out), a.num_blocks, a.write_idx, a.eps, a.out_eps, rows,
                   packs);
             };
-            const bool prefix = a.has_prefix;
-            switch (k.kernel) {
-              case Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm:
+            const bool prefix = args.prefix;
+            switch (k.fn) {
+              case Template::all_reduce_pull_one_shot_add_attn_res_rms_norm:
                 return prefix
                            ? f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, R>, bind)
                            : f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, R>,
                                bind);
-              case Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm:
+              case Template::all_reduce_pull_two_shot_add_attn_res_rms_norm:
                 return prefix
                            ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, R>, bind)
                            : f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, R>,
                                bind);
-              case Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm:
+              case Template::all_reduce_push_two_shot_add_attn_res_rms_norm:
                 return prefix
                            ? f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, R>, bind)
                            : f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, R>,
                                bind);
-              default: impl::not_this_ops(k.kernel);
+              default: impl::not_this_ops(k.fn);
             }
           });
     });
@@ -259,16 +270,18 @@ void with_kernel(const Handle& h, const KernelSpec& k, const AttnResArgs& a, F&&
 }
 
 template <typename F>
-void with_kernel(const Handle& h, const KernelSpec& k, const GemmTailArgs& a, F&& f) {
-  const int rows  = static_cast<int>(a.rows);
-  const int packs = static_cast<int>(a.hidden * elem_bytes(a.dtype) / kPackBytes);
-  constexpr int L = kBuild.gemm_lanes;
-  impl::by_world(h.world_size(), [&](auto ng) {
+void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
+  const auto& args = std::get<GemmTemplateArgs>(k.args);
+  const int rows   = static_cast<int>(a.rows);
+  const int packs  = static_cast<int>(packs_of(a));
+  constexpr int L  = kBuild.gemm_lanes;  // one build of it
+  if (args.lanes != L) impl::not_built("the GEMM tail at " + std::to_string(args.lanes) + " lanes");
+  impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
-    impl::by_dtype(a.dtype, [&](auto t) {
+    impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::at_row_packs<Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add>(
-          k.row_packs, [&](auto r) {
+      impl::at_row_packs<Template::all_reduce_pull_one_shot_rms_norm_gemm_add>(
+          impl::row_build(args.row_packs), [&](auto r) {
             constexpr int R = decltype(r)::value;
             const auto bind = [&](const p2p::DevComm& p) {
               return std::make_tuple(
@@ -277,16 +290,16 @@ void with_kernel(const Handle& h, const KernelSpec& k, const GemmTailArgs& a, F&
                   static_cast<T*>(a.out), a.out_stride, a.out_col0, static_cast<T*>(a.workspace),
                   rows, packs);
             };
-            switch (k.kernel) {
-              case Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add:
+            switch (k.fn) {
+              case Template::all_reduce_pull_one_shot_rms_norm_gemm_add:
                 return f(all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, L, R>, bind);
-              case Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add:
+              case Template::all_reduce_pull_two_shot_rms_norm_gemm_add:
                 return f(all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, L, R>, bind);
-              case Kernel::all_reduce_pull_one_shot_rms_norm_gemm:
+              case Template::all_reduce_pull_one_shot_rms_norm_gemm:
                 return f(all_reduce_pull_one_shot_rms_norm_gemm<T, NG, L, R>, bind);
-              case Kernel::all_reduce_pull_two_shot_rms_norm_gemm:
+              case Template::all_reduce_pull_two_shot_rms_norm_gemm:
                 return f(all_reduce_pull_two_shot_rms_norm_gemm<T, NG, L, R>, bind);
-              default: impl::not_this_ops(k.kernel);
+              default: impl::not_this_ops(k.fn);
             }
           });
     });

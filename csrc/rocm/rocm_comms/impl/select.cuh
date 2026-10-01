@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// SELECT, THE ONLY CHOICE: `tune(op, input, hw, cal)` splits on the op and calls its own
-// `tune_<op>`, which picks the kernel AND its grid and block from the input, the hardware's
-// documented facts and what was measured on it (machine/hardware.cuh), one rule in one place, with
-// the sweep it came from written beside it. `select` is tune, or the caller's forced spec.
+// SELECT, THE ONLY CHOICE: `select(args, world, options)` is the kernel a call runs: the template,
+// its arguments, its grid and block. Each op has its own rule (tune_<op>), which picks the template
+// and the launch from the call, the hardware's documented facts and what was measured on it
+// (machine/hardware.cuh), one rule in one place with the sweep it came from beside it; a forced
+// template takes the rule's place. `kernel_for` then decides the template's arguments from the call.
 
 #pragma once
 
@@ -12,25 +13,46 @@
 #error "include rocm_comms.cuh, the one interface, not its parts"
 #endif
 
+#include <array>
 #include <cstdint>
+#include <optional>
+#include <variant>
 
 namespace hip_comms {
 
-// WHAT THE HARDWARE MOVES: to it, a plain all-reduce is only its byte count.
-constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
+constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
+
+// A CALL'S SHAPE, as the rules read it: rows (a plain all-reduce is one row), a row's elements, and
+// the bytes the hardware moves.
+constexpr int64_t rows_of(const AllReduceArgs&) { return 1; }
+constexpr int64_t rows_of(const NormArgs& a) { return a.rows; }
+constexpr int64_t rows_of(const AttnResArgs& a) { return a.rows; }
+constexpr int64_t rows_of(const GemmTailArgs& a) { return a.rows; }
+constexpr int64_t hidden_of(const AllReduceArgs& a) { return a.bytes / elem_bytes(a.dtype); }
+constexpr int64_t hidden_of(const NormArgs& a) { return a.hidden; }
+constexpr int64_t hidden_of(const AttnResArgs& a) { return a.hidden; }
+constexpr int64_t hidden_of(const GemmTailArgs& a) { return a.hidden; }
+template <typename Args>
+constexpr int64_t bytes_of(const Args& a) {
+  return rows_of(a) * hidden_of(a) * elem_bytes(a.dtype);
+}
+template <typename Args>
+constexpr int64_t packs_of(const Args& a) {
+  return hidden_of(a) * elem_bytes(a.dtype) / kPackBytes;
+}
 
 // A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
 // and a column two-shot (the pushes, and AttnRes's pull) all of them, a row two-shot its rank's. An idle
 // block still pays every barrier (each pairs with its twin on every peer): the pull norm at 32
 // tokens ran 36 blocks for 4 rows a rank. The GEMM tail's GEMM strides over column tiles, and the
 // plain all-reduce over packs, so both keep theirs.
-constexpr bool slices_columns(Kernel k) {
-  return k == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm ||
-         k == Kernel::all_reduce_push_two_shot_rms_norm ||
-         k == Kernel::all_reduce_push_two_shot_add_rms_norm ||
-         k == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm;
+constexpr bool slices_columns(Template k) {
+  return k == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm ||
+         k == Template::all_reduce_push_two_shot_rms_norm ||
+         k == Template::all_reduce_push_two_shot_add_rms_norm ||
+         k == Template::all_reduce_push_two_shot_add_attn_res_rms_norm;
 }
-constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
+constexpr int grid_of(Template k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
   if (op == Op::all_reduce || gemms(op)) return blocks;
   const bool row_slice = is_two_shot(k) && !slices_columns(k);
@@ -38,12 +60,33 @@ constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
-// `k` at `blocks` x `threads`, its grid cut to the rows where it gives each block a row, and a
-// row kernel's build the smallest that holds the row at that block.
-constexpr KernelSpec spec_of(Kernel k, Input in, int blocks, int threads) {
-  const int64_t packs = in.hidden * in.elem_bytes / kPackBytes;
-  return {k, grid_of(k, blocks, in.rows, in.world), threads,
-          has_row_packs(k) ? row_packs_for(k, packs, threads) : 0};
+// A ROW TEMPLATE'S BUILD: the smallest that holds the call's row at `threads`, or none.
+template <typename Args>
+constexpr std::optional<int> row_packs_of(Template t, const Args& a, int threads) {
+  const int r = row_packs_for(t, packs_of(a), threads);
+  return r > 0 ? std::optional<int>(r) : std::nullopt;
+}
+
+// THE KERNEL: template `t` at `blocks` x `threads` with its arguments from the call, its grid cut
+// to the rows where it gives each block a row.
+constexpr Kernel kernel_for(Template t, int blocks, int threads, const AllReduceArgs& a,
+                            int world) {
+  return {t, AllReduceTemplateArgs{world, a.dtype}, grid_of(t, blocks, rows_of(a), world),
+          threads};
+}
+constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs& a, int world) {
+  return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype, row_packs_of(t, a, threads)},
+          grid_of(t, blocks, rows_of(a), world), threads};
+}
+constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResArgs& a,
+                            int world) {
+  return {t, AttnResTemplateArgs{world, a.dtype, row_packs_of(t, a, threads), a.has_prefix},
+          grid_of(t, blocks, rows_of(a), world), threads};
+}
+constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
+                            int world) {
+  return {t, GemmTemplateArgs{world, a.dtype, kBuild.gemm_lanes, row_packs_of(t, a, threads)},
+          grid_of(t, blocks, rows_of(a), world), threads};
 }
 
 // =================================================================================================
@@ -76,13 +119,14 @@ constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, in
   return blocks < hw.compute_units ? blocks : hw.compute_units;
 }
 
-constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
-  const bool one_shot = bytes(in) <= cal.all_reduce_one_shot_max_bytes;
-  const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
-  const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
-  const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
+constexpr Kernel tune_all_reduce(const AllReduceArgs& a, int world, const Hardware& hw,
+                                 const Calibration& cal) {
+  const bool one_shot = bytes_of(a) <= cal.all_reduce_one_shot_max_bytes;
+  const Template k = one_shot ? Template::all_reduce_pull_one_shot : Template::all_reduce_pull_two_shot;
+  const int64_t packs = (bytes_of(a) + kPackBytes - 1) / kPackBytes;
+  const int64_t work  = one_shot ? packs : (packs + world - 1) / world;
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
-  const int threads = one_shot ? hw.wave_size : hw.wave_size * in.world;
+  const int threads = one_shot ? hw.wave_size : hw.wave_size * world;
   // AT LEAST THE LINK-FILLING GRID A PASS, AND EVERY PASS FULL: as many passes as keep each one
   // filling the links, the work spread evenly over them. A cap alone left a near-empty last pass,
   // a whole round trip for a sliver (3.7 MB at 88 blocks: 5.09 passes, 23.78 us, against 90 blocks
@@ -92,7 +136,7 @@ constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibra
   const int64_t even   = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
   const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
-  return spec_of(k, in, blocks, threads);
+  return kernel_for(k, blocks, threads, a, world);
 }
 
 // =================================================================================================
@@ -104,130 +148,142 @@ constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibra
 // kernels, never unfused. The one-shot up to fused_one_shot_max_bytes (7.46 against 10.00 us at 1
 // token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z); the push two-shot (aiter's column split)
 // up to the op's push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
-constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, Input in,
-                                const NormCalibration& c) {
-  if (bytes(in) <= c.one_shot_max_bytes)
-    return spec_of(one_shot, in, c.one_shot.blocks, c.one_shot.threads);
-  if (bytes(in) <= c.push_max_bytes) return spec_of(push, in, c.push.blocks, c.push.threads);
-  return spec_of(pull, in, c.pull.blocks, c.pull.threads);
+constexpr Kernel fused_norm(Template one_shot, Template push, Template pull, const NormArgs& a,
+                            int world, const NormCalibration& c) {
+  if (bytes_of(a) <= c.one_shot_max_bytes)
+    return kernel_for(one_shot, c.one_shot.blocks, c.one_shot.threads, a, world);
+  if (bytes_of(a) <= c.push_max_bytes)
+    return kernel_for(push, c.push.blocks, c.push.threads, a, world);
+  return kernel_for(pull, c.pull.blocks, c.pull.threads, a, world);
 }
 
-constexpr KernelSpec tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
-  return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
-                    Kernel::all_reduce_push_two_shot_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_rms_norm, in, cal.rms_norm);
+constexpr Kernel tune_all_reduce_rms_norm(const NormArgs& a, int world, const Hardware&,
+                                          const Calibration& cal) {
+  return fused_norm(Template::all_reduce_pull_one_shot_rms_norm,
+                    Template::all_reduce_push_two_shot_rms_norm,
+                    Template::all_reduce_pull_two_shot_rms_norm, a, world, cal.rms_norm);
 }
 
-constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
-                                                  const Calibration& cal) {
-  return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
-                    Kernel::all_reduce_push_two_shot_add_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal.add_rms_norm);
+constexpr Kernel tune_all_reduce_add_rms_norm(const NormArgs& a, int world, const Hardware&,
+                                              const Calibration& cal) {
+  return fused_norm(Template::all_reduce_pull_one_shot_add_rms_norm,
+                    Template::all_reduce_push_two_shot_add_rms_norm,
+                    Template::all_reduce_pull_two_shot_add_rms_norm, a, world, cal.add_rms_norm);
 }
 
 // AttnRes as the norms: a block a row, never more blocks than rows (grid_of).
-constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
-                                                        const Calibration& cal) {
+constexpr Kernel tune_all_reduce_add_attn_res_rms_norm(const AttnResArgs& a, int world,
+                                                       const Hardware&, const Calibration& cal) {
   const AttnResCalibration& c = cal.attn_res;
-  if (bytes(in) <= c.one_shot_max_bytes)
-    return spec_of(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, c.one_shot.blocks,
-                   c.one_shot.threads);
-  if (bytes(in) <= c.push_max_bytes)
-    return spec_of(Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm, in, c.push.blocks,
-                   c.push.threads);
-  return spec_of(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, c.pull.blocks,
-                 c.pull.threads);
+  if (bytes_of(a) <= c.one_shot_max_bytes)
+    return kernel_for(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm, c.one_shot.blocks,
+                      c.one_shot.threads, a, world);
+  if (bytes_of(a) <= c.push_max_bytes)
+    return kernel_for(Template::all_reduce_push_two_shot_add_attn_res_rms_norm, c.push.blocks,
+                      c.push.threads, a, world);
+  return kernel_for(Template::all_reduce_pull_two_shot_add_attn_res_rms_norm, c.pull.blocks,
+                    c.pull.threads, a, world);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
 // 512 threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
-constexpr KernelSpec gemm(Kernel one_shot, Kernel two_shot, Input in, const GemmCalibration& c) {
-  return in.rows <= c.one_shot_max_rows
-             ? spec_of(one_shot, in, c.one_shot.blocks, c.one_shot.threads)
-             : spec_of(two_shot, in, c.two_shot.blocks, c.two_shot.threads);
+constexpr Kernel gemm(Template one_shot, Template two_shot, const GemmTailArgs& a, int world,
+                      const GemmCalibration& c) {
+  return rows_of(a) <= c.one_shot_max_rows
+             ? kernel_for(one_shot, c.one_shot.blocks, c.one_shot.threads, a, world)
+             : kernel_for(two_shot, c.two_shot.blocks, c.two_shot.threads, a, world);
 }
 
-constexpr KernelSpec tune_all_reduce_rms_norm_gemm(Input in, const Hardware&,
-                                                   const Calibration& cal) {
-  return gemm(Kernel::all_reduce_pull_one_shot_rms_norm_gemm,
-              Kernel::all_reduce_pull_two_shot_rms_norm_gemm, in, cal.rms_norm_gemm);
+constexpr Kernel tune_all_reduce_rms_norm_gemm(const GemmTailArgs& a, int world, const Hardware&,
+                                               const Calibration& cal) {
+  return gemm(Template::all_reduce_pull_one_shot_rms_norm_gemm,
+              Template::all_reduce_pull_two_shot_rms_norm_gemm, a, world, cal.rms_norm_gemm);
 }
 
-constexpr KernelSpec tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
-                                                       const Calibration& cal) {
-  return gemm(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add,
-              Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, cal.rms_norm_gemm_add);
+constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int world,
+                                                   const Hardware&, const Calibration& cal) {
+  return gemm(Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
+              Template::all_reduce_pull_two_shot_rms_norm_gemm_add, a, world,
+              cal.rms_norm_gemm_add);
 }
 
 // =================================================================================================
-// THE ONE ENTRY: the op's own function.
+// THE ONE ENTRY: the op's own rule, or the caller's forced template, then its arguments.
 // =================================================================================================
 
-constexpr KernelSpec tune(Op op, Input in, const Hardware& hw, const Calibration& cal) {
-  switch (op) {
-    case Op::all_reduce: return tune_all_reduce(in, hw, cal);
-    case Op::all_reduce_rms_norm: return tune_all_reduce_rms_norm(in, hw, cal);
-    case Op::all_reduce_add_rms_norm: return tune_all_reduce_add_rms_norm(in, hw, cal);
-    case Op::all_reduce_add_attn_res_rms_norm:
-      return tune_all_reduce_add_attn_res_rms_norm(in, hw, cal);
-    case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw, cal);
-    case Op::all_reduce_rms_norm_gemm: return tune_all_reduce_rms_norm_gemm(in, hw, cal);
-  }
-  __builtin_unreachable();  // every Op is a case above
+constexpr Kernel rule(const AllReduceArgs& a, int world, const Hardware& hw,
+                      const Calibration& cal) {
+  return tune_all_reduce(a, world, hw, cal);
+}
+constexpr Kernel rule(const NormArgs& a, int world, const Hardware& hw, const Calibration& cal) {
+  return a.add ? tune_all_reduce_add_rms_norm(a, world, hw, cal)
+               : tune_all_reduce_rms_norm(a, world, hw, cal);
+}
+constexpr Kernel rule(const AttnResArgs& a, int world, const Hardware& hw,
+                      const Calibration& cal) {
+  return tune_all_reduce_add_attn_res_rms_norm(a, world, hw, cal);
+}
+constexpr Kernel rule(const GemmTailArgs& a, int world, const Hardware& hw,
+                      const Calibration& cal) {
+  return a.add ? tune_all_reduce_rms_norm_gemm_add(a, world, hw, cal)
+               : tune_all_reduce_rms_norm_gemm(a, world, hw, cal);
 }
 
-// EVERY TUNED SPEC IS A KERNEL THAT FITS, for every op at the smallest input and a large one: a
-// tune_<op> never declines (a fusion that is on runs its fused op), and a spec past a capability is
-// a compile error, not a kernel that overruns its signal slots or register arrays.
-constexpr bool fits(const KernelSpec& k) {
+template <typename Args>
+constexpr Kernel select(const Args& a, int world, const Options& o) {
+  if (!o.forced) return rule(a, world, kTarget, kTargetCalibration);
+  return kernel_for(o.forced->fn, o.forced->grid, o.forced->threads, a, world);
+}
+
+// A KERNEL'S ROW BUILD, for the templates with rows; none for the plain all-reduce.
+constexpr std::optional<int> row_packs_of(const TemplateArgs& args) {
+  if (const auto* n = std::get_if<NormTemplateArgs>(&args)) return n->row_packs;
+  if (const auto* r = std::get_if<AttnResTemplateArgs>(&args)) return r->row_packs;
+  if (const auto* g = std::get_if<GemmTemplateArgs>(&args)) return g->row_packs;
+  return std::nullopt;
+}
+
+// EVERY SELECTED KERNEL FITS, for every op at the smallest call and a large one: a rule never
+// declines (a fusion that is on runs its fused op), and a kernel past a capability is a compile
+// error, not one that overruns its signal slots or register arrays.
+constexpr bool fits(const Kernel& k) {
   if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
-  if (has_row_packs(k.kernel) && k.row_packs == 0) return false;
+  if (has_row_packs(k.fn) && !row_packs_of(k.args)) return false;
   return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
 }
-constexpr bool tuned_specs_fit() {
-  for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm); ++op)
-    for (const Input in : {Input{1, 8, 2, 0, 2}, Input{4096, 7168, 2, 0, p2p::kMaxRanks}})
-      if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration))) return false;
+constexpr bool selections_fit() {
+  const Options o{16, std::nullopt, nullptr};
+  constexpr DType bf = DType::bf16;
+  for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
+                                            std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {
+    const int w = static_cast<int>(call[0]);
+    const int64_t rows = call[1], hidden = call[2];
+    if (!fits(select(AllReduceArgs{nullptr, nullptr, rows * hidden * 2, bf}, w, o))) return false;
+    for (const bool add : {false, true}) {
+      if (!fits(select(NormArgs{add, nullptr, nullptr, nullptr, bf, bf, rows, hidden, 0.f,
+                                nullptr, nullptr}, w, o)))
+        return false;
+      if (!fits(select(GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr, 0.f, nullptr, 0,
+                                    nullptr, bf, rows, hidden}, w, o)))
+        return false;
+    }
+    if (!fits(select(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
+                                 nullptr, bf, rows, hidden, 0, -1, 0.f, 0.f, true}, w, o)))
+      return false;
+  }
   return true;
 }
-static_assert(tuned_specs_fit(), "a tune_<op> declines, or exceeds a kernel capability");
+static_assert(selections_fit(), "a rule declines, or exceeds a kernel capability");
 
-constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
-
-// EACH OP'S ARGS AS THE OP AND THE INPUT that select and validate read.
+// EACH OP'S CALL AS ITS OP.
 constexpr Op op_of(const AllReduceArgs&) { return Op::all_reduce; }
 constexpr Op op_of(const NormArgs& a) {
-  return a.residual ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
+  return a.add ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
 }
 constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
 constexpr Op op_of(const GemmTailArgs& a) {
   return a.add ? Op::all_reduce_rms_norm_gemm_add : Op::all_reduce_rms_norm_gemm;
-}
-
-inline Input input_of(const Handle& h, const AllReduceArgs& a) {
-  const int e = elem_bytes(a.dtype);
-  return {1, a.bytes / e, e, 0, h.world_size()};
-}
-inline Input input_of(const Handle& h, const NormArgs& a) {
-  return {a.rows, a.hidden, elem_bytes(a.dtype), 0, h.world_size()};
-}
-inline Input input_of(const Handle& h, const AttnResArgs& a) {
-  return {a.rows, a.hidden, elem_bytes(a.dtype), 0, h.world_size()};
-}
-inline Input input_of(const Handle& h, const GemmTailArgs& a) {
-  return {a.rows, a.hidden, elem_bytes(a.dtype), a.n_cols, h.world_size()};
-}
-
-// What runs: tune's spec, or the forced kernel at the forced grid and block.
-inline KernelSpec select(Op op, Input in, const Options& o) {
-  if (!o.forced) return tune(op, in, kTarget, kTargetCalibration);
-  return spec_of(o.forced->kernel, in, o.forced->grid, o.forced->threads);
-}
-
-template <typename Args>
-KernelSpec select(const Handle& h, const Args& a, const Options& o) {
-  return select(op_of(a), input_of(h, a), o);
 }
 
 }  // namespace hip_comms
