@@ -68,19 +68,17 @@ enum class Template : int {
   all_reduce_pull_one_shot_rms_norm_gemm         = 13,
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
   all_reduce_pull_one_shot_rms_scale_add         = 15,
-  // THE STAGED BUILDS: copy this rank's eager input into its staging a pass at a time and read
-  // the peers' staging, so any size runs; those above read a registered or captured input in
-  // place.
-  all_reduce_pull_one_shot_staged                = 16,
-  all_reduce_pull_two_shot_staged                = 17,
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
 // is the packs of a row a thread holds, its row build: none when no build holds the call's row
 // (validate refuses it).
+// `staged`: the build that copies an eager input into its staging a pass at a time (any size),
+// not the one that reads a registered or captured input in place; plan decides it.
 struct AllReduceTemplateArgs {
   int world;
   DType dtype;
+  bool staged;
 };
 struct NormTemplateArgs {
   int world;

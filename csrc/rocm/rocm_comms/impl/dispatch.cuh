@@ -32,12 +32,10 @@
 #include "../kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
 #include "../kernels/all_reduce_pull_one_shot_rms_scale_add.cuh"
-#include "../kernels/all_reduce_pull_one_shot_staged.cuh"
 #include "../kernels/all_reduce_pull_two_shot.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
-#include "../kernels/all_reduce_pull_two_shot_staged.cuh"
 #include "../kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
 
@@ -135,23 +133,23 @@ void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T         = typename decltype(t)::t;
-      const auto bind = [&](const p2p::DevComm& p) {
-        return std::make_tuple(p, static_cast<T*>(a.out), n);
+      // IN PLACE: the input's packs, its int. STAGED: in 64 bits, with its own input and the packs
+      // a staging holds.
+      const auto in_place = [&](const p2p::DevComm& p) {
+        return std::make_tuple(p, static_cast<T*>(a.out), n, Staged<T, false>{});
       };
-      // A staged build takes its own input and the staging's size, and counts in 64 bits.
-      const auto staged_bind = [&](const p2p::DevComm& p) {
-        return std::make_tuple(p, static_cast<T*>(a.out), static_cast<const T*>(a.inp),
-                               int64_t{a.bytes / kPackBytes}, kStagingBytes / kPackBytes);
+      const auto staged = [&](const p2p::DevComm& p) {
+        return std::make_tuple(p, static_cast<T*>(a.out), int64_t{a.bytes / kPackBytes},
+                               Staged<T, true>{static_cast<const T*>(a.inp),
+                                               kStagingBytes / kPackBytes});
       };
       switch (k.fn) {
         case Template::all_reduce_pull_one_shot:
-          return f(all_reduce_pull_one_shot<T, NG>, bind);
+          return args.staged ? f(all_reduce_pull_one_shot<T, NG, true>, staged)
+                             : f(all_reduce_pull_one_shot<T, NG, false>, in_place);
         case Template::all_reduce_pull_two_shot:
-          return f(all_reduce_pull_two_shot<T, NG>, bind);
-        case Template::all_reduce_pull_one_shot_staged:
-          return f(all_reduce_pull_one_shot_staged<T, NG>, staged_bind);
-        case Template::all_reduce_pull_two_shot_staged:
-          return f(all_reduce_pull_two_shot_staged<T, NG>, staged_bind);
+          return args.staged ? f(all_reduce_pull_two_shot<T, NG, true>, staged)
+                             : f(all_reduce_pull_two_shot<T, NG, false>, in_place);
         default: impl::not_this_ops(k.fn);
       }
     });

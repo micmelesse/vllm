@@ -74,7 +74,7 @@ constexpr std::optional<int> row_packs_of(Template t, const Args& a, int threads
 // to the rows where it gives each block a row.
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AllReduceArgs& a,
                             int world) {
-  return {t, AllReduceTemplateArgs{world, a.dtype}, grid_of(t, blocks, rows_of(a), world),
+  return {t, AllReduceTemplateArgs{world, a.dtype, false}, grid_of(t, blocks, rows_of(a), world),
           threads};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs& a, int world) {
@@ -267,6 +267,12 @@ template <typename Args>
 constexpr Kernel select(const Args& a, int world, const Options& o) {
   if (!o.forced) return rule(a, world, kTarget, kTargetCalibration);
   return kernel_for(o.forced->fn, o.forced->grid, o.forced->threads, a, world);
+}
+
+// WHETHER A KERNEL IS ITS STAGED BUILD: the plain all-reduce's, when plan found an eager input.
+constexpr bool is_staged(const Kernel& k) {
+  const auto* a = std::get_if<AllReduceTemplateArgs>(&k.args);
+  return a && a->staged;
 }
 
 // A KERNEL'S ROW BUILD, for the templates with rows; none for the plain all-reduce.

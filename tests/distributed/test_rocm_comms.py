@@ -1805,13 +1805,8 @@ def test_python_error_is_cpps_number_for_number() -> None:
 _STAGING_BYTES = 256 << 20
 
 
-StagedShot = Literal[
-    "all_reduce_pull_one_shot_staged", "all_reduce_pull_two_shot_staged"
-]
-
-
 def run_eager_beyond_staging_rank(
-    ctx: RankContext, shot: StagedShot
+    ctx: RankContext, shot: Shot
 ) -> tuple[bool, str | None]:
     """ONE rank: an eager all-reduce of two and a half stagings, forced at `shot`,
     against RCCL's fp32 sum. Each rank draws its own input on the device: the input is
@@ -1834,13 +1829,13 @@ def run_eager_beyond_staging_rank(
     return True, None
 
 
-@pytest.mark.parametrize("shot", get_args(StagedShot))
+@pytest.mark.parametrize("shot", SHOTS)
 def test_an_eager_all_reduce_wider_than_the_staging_runs_in_passes(
-    shot: StagedShot, world: int, ranks: World
+    shot: Shot, world: int, ranks: World
 ) -> None:
-    """A staged build copies an eager input into its staging a pass at a time, so an
-    input past the staging runs on our kernels, in one launch, and sums right: every
-    pass, the short last one too."""
+    """An eager input runs on the shot's staged build, which copies it into its staging
+    a pass at a time, so an input past the staging runs on our kernels, in one launch,
+    and sums right: every pass, the short last one too."""
     # example-based: the size is the point (past the staging, a partial last pass)
     if world < 2:
         pytest.skip("a collective needs at least two ranks")

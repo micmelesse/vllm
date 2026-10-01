@@ -19,12 +19,12 @@
 
 namespace hip_comms {
 
-// A KERNEL'S SCRATCH, row-major: none for a staged build (it runs in passes of what the scratch
-// holds); the plain two-shot's slice of packs; a column two-shot the whole
+// A KERNEL'S SCRATCH, row-major (a staged build needs none: it runs in passes of what the
+// scratch holds): the plain two-shot's slice of packs; a column two-shot the whole
 // reduced tensor (each rank's columns at their place); a row two-shot its rank's rows, twice where
 // it leaves two results (out and the residual). A one-shot reads the inputs and keeps nothing.
 inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
-  if (!is_two_shot(t) || is_staged(t)) return 0;
+  if (!is_two_shot(t)) return 0;
   const Op op = op_of(t);
   if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kPackBytes;
   if (slices_columns(t)) return rows * packs * kPackBytes;
@@ -56,17 +56,15 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
   if (has_row_packs(k.fn) && !row_packs_of(k.args)) return Error::row_too_wide;
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
-  if ((k.fn == Template::all_reduce_pull_two_shot ||
-       k.fn == Template::all_reduce_pull_two_shot_staged) &&
-      k.threads % (world * kWaveSize) != 0)
+  if (k.fn == Template::all_reduce_pull_two_shot && k.threads % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
   if (o.quant_bits != 16) return Error::quantized_not_built;
   if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.gemm_lanes))
     return Error::block_exceeds_lds;
-  if (scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
+  if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.
-  if (!is_staged(k.fn) && !h.reads_in_place(a.inp, o.stream) && bytes_of(a) > h.staging_bytes())
+  if (!is_staged(k) && !h.reads_in_place(a.inp, o.stream) && bytes_of(a) > h.staging_bytes())
     return Error::staging_too_small;
   if (!resident(k, a)) return Error::grid_not_resident;
   return std::nullopt;
@@ -76,9 +74,10 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
 template <typename Args>
 std::variant<Kernel, Error> plan(const Handle& h, const Args& a, const Options& o) {
   Kernel k = select(a, h.world_size(), o);
-  // THE BUILD, from what the handle knows: in place when the peers can read the input where it is,
-  // otherwise its staged build, where there is one. A forced template runs as forced.
-  if (!o.forced && !h.reads_in_place(a.inp, o.stream)) k.fn = staged_of(k.fn);
+  // THE BUILD, from what the handle knows (a forced template too): in place when the peers can
+  // read the input where it is, otherwise its staged build, where there is one.
+  if (auto* args = std::get_if<AllReduceTemplateArgs>(&k.args))
+    args->staged = !h.reads_in_place(a.inp, o.stream);
   if (const std::optional<Error> err = check(h, k, a, o)) return *err;
   return k;
 }
