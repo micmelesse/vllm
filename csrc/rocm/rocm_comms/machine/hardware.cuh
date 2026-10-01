@@ -199,16 +199,18 @@ constexpr Calibration kGfx950Calibration = {
         // against 15.18 at 8; 2026-10-01T03-57-23Z), so AttnRes starts at the push.
         .one_shot_max_bytes = 0,
         // Push won through 1.75 MiB (128 tokens of 7168 bf16: 22.82 against unfused 23.22) and
-        // lost at 3.5 MiB (34.58 against 34.10; same run).
-        .push_max_bytes = 1792 * kKiB,
+        // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
+        // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
+        .push_max_bytes = 3584 * kKiB,
         // Not swept: the norms'.
         .one_shot = {16, 512},
         // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15,
         // 159.33 at 128), a row a block below that (2026-10-01T03-57-23Z).
         .push = {256, 512},
-        // The row-split norm's grid before it was pipelined: 88 (the link-filling grid) lost at
-        // prefill, 169.3 against 154.5 us at 4096 tokens (2026-09-30T21-30-15Z).
-        .pull = {36, 512},
+        // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 within about
+        // 5% of the best of 16-256 from 512 to 4096 tokens, 4096 at 447.2 us against 1160.7 at the
+        // 36 it had (copied from the row-split norm's) (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
+        .pull = {192, 512},
     },
     .rms_norm_gemm = {
         // Not swept: rms_norm_gemm_add's.
