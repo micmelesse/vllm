@@ -143,26 +143,19 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
   //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
-  //    kAdd: the owners' rows are the new residual; each is normed here by its owner's scale,
-  //    which a row's 8 scales bring through LDS once (uncached scratch, read per pack, would
-  //    double the bytes again).
-  __shared__ float scales[ngpus];
+  //    kAdd: the owners' rows are the new residual; each is normed here by its owner's scale. Every
+  //    thread loads the 8 scales with its 8 packs, so both arrive in the one round trip (a wave's
+  //    lanes read one address, one request a wave); thread 0 bringing them through LDS behind a
+  //    barrier cost every row a second round trip (2026-10-01T02-24-09Z).
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    if constexpr (kAdd) {
-      if (threadIdx.x == 0) {
-        V sc[ngpus];
-#pragma unroll
-        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
-#pragma unroll
-        for (int r = 0; r < ngpus; ++r) scales[r] = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
-      }
-      __syncthreads();
-    }
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus];
+      V got[ngpus], sc[ngpus];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) got[r] = p2p::read_scratch(peers[r], at);
+      for (int r = 0; r < ngpus; ++r) {
+        got[r] = p2p::read_scratch(peers[r], at);
+        if constexpr (kAdd) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
+      }
       vec<W, NL> w;
       if constexpr (kAdd) w = wv[i];
 #pragma unroll
@@ -171,12 +164,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         if (row >= rows) continue;
         if constexpr (kAdd) {
           thread_store(res_out + int64_t{row} * packs + i, got[r]);
+          const float scale = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
           float x[NL];
           thread_unpack<T>(got[r], x);
           V normed;
 #pragma unroll
           for (int j = 0; j < NL; ++j) {
-            const float y = static_cast<float>(static_cast<W>(x[j] * scales[r]));
+            const float y = static_cast<float>(static_cast<W>(x[j] * scale));
             normed.d[j]   = static_cast<T>(static_cast<W>(y * static_cast<float>(w.d[j])));
           }
           thread_store(o + int64_t{row} * packs + i, normed);
@@ -185,7 +179,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         }
       }
     }
-    if constexpr (kAdd) __syncthreads();
   }
   block_stamp(6);
 }
