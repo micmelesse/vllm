@@ -187,13 +187,16 @@ constexpr Calibration kGfx950Calibration = {
         .pull = {48, 512},
     },
     .attn_res = {
-        // Not swept: the norms'.
-        .one_shot_max_bytes = 128 * kKiB,
-        // Not swept: rms_norm's.
+        // None: the push two-shot beat the one-shot from 1 token (12.89 against 13.68 us; 14.03
+        // against 15.18 at 8; 2026-10-01T03-57-23Z), so AttnRes starts at the push.
+        .one_shot_max_bytes = 0,
+        // Push won through 1.75 MiB (128 tokens of 7168 bf16: 22.82 against unfused 23.22) and
+        // lost at 3.5 MiB (34.58 against 34.10; same run).
         .push_max_bytes = 1792 * kKiB,
         // Not swept: the norms'.
         .one_shot = {16, 512},
-        // Not swept: rms_norm's.
+        // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15,
+        // 159.33 at 128), a row a block below that (2026-10-01T03-57-23Z).
         .push = {256, 512},
         // The row-split norm's grid before it was pipelined: 88 (the link-filling grid) lost at
         // prefill, 169.3 against 154.5 us at 4096 tokens (2026-09-30T21-30-15Z).
