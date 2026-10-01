@@ -167,7 +167,7 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                                  static_cast<const T*>(a.residual),
                                  static_cast<const W*>(a.weight), a.eps, rows, packs);
         };
-        using K = Kernel;
+        using K = Template;
         switch (k.fn) {
           case K::all_reduce_pull_one_shot_rms_norm:
             return impl::at_row_packs<K::all_reduce_pull_one_shot_rms_norm>(

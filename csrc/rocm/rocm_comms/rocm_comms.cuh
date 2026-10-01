@@ -68,7 +68,8 @@ enum class Template : int {
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
-// is the packs of a row a thread holds, its row build.
+// is the packs of a row a thread holds, its row build: none when no build holds the call's row
+// (validate refuses it).
 struct AllReduceTemplateArgs {
   int world;
   DType dtype;
@@ -77,19 +78,19 @@ struct NormTemplateArgs {
   int world;
   DType dtype;
   DType weight;  // dtype, or f32
-  int row_packs;
+  std::optional<int> row_packs;
 };
 struct AttnResTemplateArgs {
   int world;
   DType dtype;
-  int row_packs;
+  std::optional<int> row_packs;
   bool prefix;
 };
 struct GemmTemplateArgs {
   int world;
   DType dtype;
   int lanes;  // grid_gemm's lanes a column
-  int row_packs;
+  std::optional<int> row_packs;
 };
 using TemplateArgs =
     std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs, GemmTemplateArgs>;
