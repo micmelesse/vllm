@@ -89,6 +89,12 @@ void by_row_packs(int k, F&& f) {
   not_built("row kernel of " + std::to_string(k) + " packs a thread");
 }
 
+// A row kernel's packs a thread, up to its own build (the catalog's max_row_packs).
+template <Kernel K, typename F>
+void at_row_packs(int k, F&& f) {
+  by_row_packs<max_row_packs(K)>(k, std::forward<F>(f));
+}
+
 [[noreturn]] inline void not_this_ops(Kernel k) {
   throw std::runtime_error("hip_comms: kernel " + std::to_string(static_cast<int>(k)) +
                            " is not this op's");
@@ -102,7 +108,7 @@ void start(void (*kernel)(P...), const KernelSpec& k, hipStream_t stream, A&&...
 }
 
 inline int row_packs(const KernelSpec& k, int64_t hidden, DType d) {
-  return row_packs_for(op_of(k.kernel), hidden * elem_bytes(d) / kPackBytes, k.threads);
+  return row_packs_for(k.kernel, hidden * elem_bytes(d) / kPackBytes, k.threads);
 }
 
 }  // namespace impl
@@ -130,45 +136,68 @@ inline void launch(Handle& h, const KernelSpec& k, const NormArgs& a, hipStream_
   const p2p::DevComm p = h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s);
   const int rows       = static_cast<int>(a.rows);
   const int packs      = static_cast<int>(a.hidden * elem_bytes(a.dtype) / kPackBytes);
+  const int r          = impl::row_packs(k, a.hidden, a.dtype);
   impl::by_world(h.world_size(), [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(a.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
       impl::by_weight<T>(a.weight_dtype, a.dtype, [&](auto w) {
-        using W = typename decltype(w)::t;
-        impl::by_row_packs<kBuild.norm_row_packs>(impl::row_packs(k, a.hidden, a.dtype),
-                                                  [&](auto r) {
-          constexpr int R   = decltype(r)::value;
-          T* out            = static_cast<T*>(a.out);
-          T* res_out        = static_cast<T*>(a.residual_out);
-          const T* res      = static_cast<const T*>(a.residual);
-          const W* weight   = static_cast<const W*>(a.weight);
-          switch (k.kernel) {
-            case Kernel::all_reduce_pull_one_shot_rms_norm:
-              return impl::start(all_reduce_pull_one_shot_rms_norm<T, W, NG, R>, k, s, p, out,
-                                 weight, a.eps, rows, packs);
-            case Kernel::all_reduce_pull_two_shot_rms_norm:
-              return impl::start(all_reduce_pull_two_shot_rms_norm<T, W, NG, R>, k, s, p, out,
-                                 weight, a.eps, rows, packs);
-            case Kernel::all_reduce_pull_one_shot_add_rms_norm:
-              return impl::start(all_reduce_pull_one_shot_add_rms_norm<T, W, NG, R>, k, s, p,
-                                 out, res_out, res, weight, a.eps, rows, packs);
-            case Kernel::all_reduce_pull_two_shot_add_rms_norm:
-              return impl::start(all_reduce_pull_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
-                                 out, res_out, res, weight, a.eps, rows, packs);
-            case Kernel::all_reduce_push_two_shot_rms_norm:
-              return impl::start(all_reduce_push_two_shot_rms_norm<T, W, NG, R>, k, s, p, out,
-                                 weight, a.eps, rows, packs);
-            case Kernel::all_reduce_push_two_shot_add_rms_norm:
-              return impl::start(all_reduce_push_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
-                                 out, res_out, res, weight, a.eps, rows, packs);
-            default: impl::not_this_ops(k.kernel);
-          }
-        });
+        using W         = typename decltype(w)::t;
+        T* out          = static_cast<T*>(a.out);
+        T* res_out      = static_cast<T*>(a.residual_out);
+        const T* res    = static_cast<const T*>(a.residual);
+        const W* weight = static_cast<const W*>(a.weight);
+        using K = Kernel;
+        switch (k.kernel) {
+          case K::all_reduce_pull_one_shot_rms_norm:
+            return impl::at_row_packs<K::all_reduce_pull_one_shot_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_pull_one_shot_rms_norm<T, W, NG, R>, k, s, p, out,
+                          weight, a.eps, rows, packs);
+            });
+          case K::all_reduce_pull_two_shot_rms_norm:
+            return impl::at_row_packs<K::all_reduce_pull_two_shot_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_pull_two_shot_rms_norm<T, W, NG, R>, k, s, p, out,
+                          weight, a.eps, rows, packs);
+            });
+          case K::all_reduce_push_two_shot_rms_norm:
+            return impl::at_row_packs<K::all_reduce_push_two_shot_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_push_two_shot_rms_norm<T, W, NG, R>, k, s, p, out,
+                          weight, a.eps, rows, packs);
+            });
+          case K::all_reduce_pull_one_shot_add_rms_norm:
+            return impl::at_row_packs<K::all_reduce_pull_one_shot_add_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_pull_one_shot_add_rms_norm<T, W, NG, R>, k, s, p,
+                          out, res_out, res, weight, a.eps, rows, packs);
+            });
+          case K::all_reduce_pull_two_shot_add_rms_norm:
+            return impl::at_row_packs<K::all_reduce_pull_two_shot_add_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_pull_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
+                          out, res_out, res, weight, a.eps, rows, packs);
+            });
+          case K::all_reduce_push_two_shot_add_rms_norm:
+            return impl::at_row_packs<K::all_reduce_push_two_shot_add_rms_norm>(r, [&](auto rp) {
+              constexpr int R = decltype(rp)::value;
+              impl::start(all_reduce_push_two_shot_add_rms_norm<T, W, NG, R>, k, s, p,
+                          out, res_out, res, weight, a.eps, rows, packs);
+            });
+          default: impl::not_this_ops(k.kernel);
+        }
       });
     });
   });
 }
+
+// AttnRes's and the GEMM tail's two kernels share their row builds, so one cap serves both.
+static_assert(max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
+                  max_row_packs(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) &&
+              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add),
+              "a kernel with its own row builds needs its own case");
 
 inline void launch(Handle& h, const KernelSpec& k, const AttnResArgs& a, hipStream_t s) {
   const p2p::DevComm p = h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s);
@@ -178,8 +207,8 @@ inline void launch(Handle& h, const KernelSpec& k, const AttnResArgs& a, hipStre
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(a.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::by_row_packs<kBuild.attn_res_row_packs>(impl::row_packs(k, a.hidden, a.dtype),
-                                                    [&](auto r) {
+      impl::at_row_packs<Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm>(
+          impl::row_packs(k, a.hidden, a.dtype), [&](auto r) {
         constexpr int R = decltype(r)::value;
         const auto args = std::make_tuple(
             p, static_cast<T*>(a.prefix), static_cast<T*>(a.blocks), a.block_stride_m,
@@ -213,8 +242,8 @@ inline void launch(Handle& h, const KernelSpec& k, const GemmTailArgs& a, hipStr
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(a.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::by_row_packs<kBuild.norm_row_packs>(impl::row_packs(k, a.hidden, a.dtype),
-                                                [&](auto r) {
+      impl::at_row_packs<Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add>(
+          impl::row_packs(k, a.hidden, a.dtype), [&](auto r) {
         constexpr int R = decltype(r)::value;
         const auto args = std::make_tuple(
             p, static_cast<const T*>(a.norm_weight), a.eps, static_cast<const T*>(a.gemm_weight),

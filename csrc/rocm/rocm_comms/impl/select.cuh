@@ -165,7 +165,7 @@ constexpr bool fits(const KernelSpec& k, Input in) {
   if (k.kernel == Kernel::none) return false;
   if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
   if (has_row_packs(k.kernel) &&
-      row_packs_for(op_of(k.kernel), in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
+      row_packs_for(k.kernel, in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
     return false;
   return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
 }

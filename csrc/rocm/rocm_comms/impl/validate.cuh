@@ -40,8 +40,8 @@ inline std::string why_not(const Handle& h, Op op, const KernelSpec& k, Input in
     return "the row is not a whole number of 16-byte packs";
   if (op_of(k.kernel) != op) return "the forced kernel is not this op's";
   if (has_row_packs(k.kernel) &&
-      row_packs_for(op, in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
-    return "the row is wider than the op's widest build holds at this block (max_row_packs)";
+      row_packs_for(k.kernel, in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
+    return "the row is wider than the kernel's widest build holds at this block (max_row_packs)";
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (k.kernel == Kernel::all_reduce_pull_two_shot && k.threads % (in.world * kWaveSize) != 0)
     return "a two-shot block must be one wave per peer";
