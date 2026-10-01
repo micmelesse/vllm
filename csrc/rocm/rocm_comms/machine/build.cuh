@@ -120,8 +120,9 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
 constexpr Build kBuild = derive(kDevice, kTargetCalibration);
 
 constexpr int kPackBytes = kBuild.pack_bytes;
-// THE STAGING an eager input is copied into for its peers: policy, sized for Kimi-K3's widest row (the
-// one-all-reduce tail's 4096 x 17920 bf16, 147 MB) until the kernels take any size through it.
+// THE STAGING an eager input is copied into for its peers: policy. A staged build takes any size
+// through it a pass at a time; an in-place build on an eager input (the fused ops) needs it whole,
+// up to Kimi-K3's widest row (the one-all-reduce tail's 4096 x 17920 bf16, 147 MB).
 constexpr int64_t kStagingBytes = 256 * kMiB;
 constexpr int kMaxThreads = kBuild.max_threads;
 constexpr int kMaxWaves = kMaxThreads / kWaveSize;
