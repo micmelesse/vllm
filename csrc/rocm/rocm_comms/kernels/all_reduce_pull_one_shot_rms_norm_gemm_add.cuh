@@ -29,7 +29,9 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto peers = p2p::peers<T, ngpus>(p);
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
@@ -58,7 +60,9 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
+  block_stamp(2);
   p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
+  block_stamp(3);
 
   // 4. The GEMM over every row.
   for (int r0 = 0; r0 < rows; r0 += kGemmRows)
@@ -66,6 +70,7 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
                                min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
                                out + r0 * out_stride, out_stride, out_col0);
 
+  block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
 }

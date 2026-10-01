@@ -30,7 +30,9 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
@@ -66,7 +68,9 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   }
 
   // 3. Every rank's normed rows are visible to its peers.
+  block_stamp(2);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  block_stamp(3);
 
   // 4. Every owner's normed rows out of its scratch, into the workspace.
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
@@ -88,7 +92,9 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   }
 
   // 5. The GEMM reads rows other blocks of this rank copied.
+  block_stamp(4);
   p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
+  block_stamp(5);
 
   // 6. The GEMM over every row, kGemmRows per pass.
   for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
@@ -96,6 +102,7 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
                                min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
                                out + r0 * out_stride, out_stride, out_col0);
   }
+  block_stamp(6);
 }
 
 }  // namespace hip_comms
