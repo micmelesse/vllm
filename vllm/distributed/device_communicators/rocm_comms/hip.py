@@ -40,6 +40,7 @@ _OP_WIRE: Mapping[AdmitOp, int] = {
     "all_reduce_add_attn_res_rms_norm": 3,
     "all_reduce_rms_norm_gemm_add": 4,
     "all_reduce_rms_norm_gemm": 5,
+    "all_reduce_rms_scale_add": 6,
 }
 
 
@@ -314,6 +315,26 @@ class HipCommunicator(Communicator):
             quant_bits,
             *launch_wire(launch),
         )
+
+    def _all_reduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        latent: int,
+        eps: float,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> torch.Tensor:
+        out = inp.new_empty(inp.shape[0], (inp.shape[1] - latent) // 2)
+        torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
+            self._handle,
+            out,
+            self._as_input(inp),
+            latent,
+            eps,
+            quant_bits,
+            *launch_wire(launch),
+        )
+        return out
 
     def _all_reduce_add_attn_res_rms_norm(
         self,

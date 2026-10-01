@@ -28,6 +28,7 @@ Kernel = Literal[
     "all_reduce_push_two_shot_add_attn_res_rms_norm",
     "all_reduce_pull_one_shot_rms_norm_gemm",
     "all_reduce_pull_two_shot_rms_norm_gemm",
+    "all_reduce_pull_one_shot_rms_scale_add",
 ]
 _KERNEL_WIRE: Mapping[Kernel, int] = {
     k: i

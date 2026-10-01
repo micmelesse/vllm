@@ -121,11 +121,14 @@ torch::Tensor rocm_comms_staging(fptr_t handle_ptr) {
 bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidden,
                        int64_t element_size, int64_t cols, int64_t quant_bits, int64_t kernel,
                        int64_t launch_blocks, int64_t launch_threads) {
-  constexpr auto kLastOp = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_norm_gemm);
+  constexpr auto kLastOp = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_scale_add);
   TORCH_CHECK(op >= 0 && op <= kLastOp, "hip_comms: no op ", op);
   TORCH_CHECK(element_size == 2, "hip_comms: only 2-byte dtypes are built");
-  TORCH_CHECK(cols >= 0 && (cols > 0) == hip_comms::gemms(static_cast<hip_comms::Op>(op)),
-              "hip_comms: cols is a GEMM op's output columns, and only they have them");
+  const bool scale_add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_rms_scale_add;
+  TORCH_CHECK(cols >= 0 && (cols > 0) == (hip_comms::gemms(static_cast<hip_comms::Op>(op)) ||
+                                          scale_add),
+              "hip_comms: cols is a GEMM op's output columns or the scale-add's latent, and only "
+              "they have them");
   // THE CALL, WITHOUT ITS TENSORS: what select reads of it, its pointers null. A norm's weight is
   // taken in the call's dtype and AttnRes without a prefix: neither changes whether a call runs.
   auto& h                   = handle_of(handle_ptr);
@@ -161,6 +164,13 @@ bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidd
                                 o)
           .empty();
     }
+    // `hidden` is the row reduced, [shared | projected | latent], and `cols` the latent.
+    case hip_comms::Op::all_reduce_rms_scale_add:
+      if ((hidden - cols) % 2 != 0) return false;
+      return hip_comms::why_not(h, hip_comms::ScaleAddArgs{nullptr, nullptr, d, rows,
+                                                           (hidden - cols) / 2, cols, eps},
+                                o)
+          .empty();
   }
   return false;
 }
@@ -433,6 +443,26 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     int64_t launch_threads) {
   all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
                            workspace, options_of(quant_bits, kernel, launch_blocks, launch_threads));
+}
+
+// out = shared + projected * rsqrt(mean(latent^2) + eps), inp [rows, 2 * hidden + latent] holding
+// [shared | projected | latent] summed over the ranks first.
+void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
+                                         torch::Tensor& inp, int64_t latent, double eps,
+                                         int64_t quant_bits, int64_t kernel,
+                                         int64_t launch_blocks, int64_t launch_threads) {
+  check_device_contiguous({&out, &inp});
+  TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
+              "inp and out must be 2-D with the same rows");
+  const int64_t hidden = out.size(1);
+  TORCH_CHECK(latent > 0 && inp.size(1) == 2 * hidden + latent,
+              "inp must be [rows, 2 * hidden + latent] for out [rows, hidden]");
+  TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
+  hip_comms::all_reduce_rms_scale_add(
+      handle_of(handle_ptr),
+      {out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden, latent,
+       static_cast<float>(eps)},
+      options_of(quant_bits, kernel, launch_blocks, launch_threads));
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

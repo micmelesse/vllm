@@ -31,6 +31,7 @@
 #include "../kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
+#include "../kernels/all_reduce_pull_one_shot_rms_scale_add.cuh"
 #include "../kernels/all_reduce_pull_two_shot.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
@@ -302,6 +303,32 @@ void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
               default: impl::not_this_ops(k.fn);
             }
           });
+    });
+  });
+}
+
+template <typename F>
+void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
+  const auto& args = std::get<ScaleAddTemplateArgs>(k.args);
+  const int e      = elem_bytes(a.dtype);
+  const int rows   = static_cast<int>(a.rows);
+  const int hp     = static_cast<int>(a.hidden * e / kPackBytes);
+  const int lp     = static_cast<int>(a.latent * e / kPackBytes);
+  impl::by_world(args.world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    impl::by_dtype(args.dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
+      impl::at_row_packs<K>(impl::row_build(args.row_packs), [&](auto r) {
+        constexpr int R = decltype(r)::value;
+        const auto bind = [&](const p2p::DevComm& p) {
+          return std::make_tuple(p, static_cast<T*>(a.out), a.eps, rows, hp, lp, args.splits);
+        };
+        switch (k.fn) {
+          case K: return f(all_reduce_pull_one_shot_rms_scale_add<T, NG, R>, bind);
+          default: impl::not_this_ops(k.fn);
+        }
+      });
     });
   });
 }

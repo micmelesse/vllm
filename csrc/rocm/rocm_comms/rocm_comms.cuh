@@ -11,11 +11,11 @@
 // Both of the last two find the compiled function a Kernel names the same way (impl/dispatch.cuh).
 //
 // Handle                  the state across calls: the peers' memory, mapped once (p2p's Group)
-// AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs   one op's call: inputs and outputs
+// AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs, ScaleAddArgs   one op's call
 // Options                 how the caller wants it run: precision, a forced template, the stream
 // Kernel                  what runs: a template, its arguments, its grid and block
 // all_reduce, all_reduce_rms_norm (and _add_), all_reduce_add_attn_res_rms_norm,
-// all_reduce_rms_norm_gemm(_add)      the ops
+// all_reduce_rms_norm_gemm(_add), all_reduce_rms_scale_add      the ops
 // why_not(handle, args, options)  why a call cannot run, or empty: `admits` for vLLM
 
 #pragma once
@@ -45,6 +45,7 @@ enum class Op : int {
   all_reduce_add_attn_res_rms_norm = 3,
   all_reduce_rms_norm_gemm_add     = 4,
   all_reduce_rms_norm_gemm         = 5,
+  all_reduce_rms_scale_add         = 6,
 };
 
 // Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
@@ -65,6 +66,7 @@ enum class Template : int {
   all_reduce_push_two_shot_add_attn_res_rms_norm = 12,
   all_reduce_pull_one_shot_rms_norm_gemm         = 13,
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
+  all_reduce_pull_one_shot_rms_scale_add         = 15,
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
@@ -92,8 +94,15 @@ struct GemmTemplateArgs {
   int lanes;  // grid_gemm's lanes a column
   std::optional<int> row_packs;
 };
-using TemplateArgs =
-    std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs, GemmTemplateArgs>;
+// `splits`: the slices of a row's hidden, a block each.
+struct ScaleAddTemplateArgs {
+  int world;
+  DType dtype;
+  std::optional<int> row_packs;
+  int splits;
+};
+using TemplateArgs = std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs,
+                                  GemmTemplateArgs, ScaleAddTemplateArgs>;
 
 // WHAT SELECT RETURNS: one kernel, the template with its arguments decided (the compiled
 // instruction sequence), and its launch.
@@ -177,6 +186,18 @@ struct GemmTailArgs {
   DType dtype;
   int64_t rows;
   int64_t hidden;
+};
+
+// inp is [rows, 2 * hidden + latent], [shared | projected | latent]; out [rows, hidden] = shared +
+// projected * rsqrt(mean(latent^2) + eps), all three summed over the ranks first.
+struct ScaleAddArgs {
+  void* out;
+  const void* inp;
+  DType dtype;
+  int64_t rows;
+  int64_t hidden;
+  int64_t latent;
+  float eps;
 };
 
 }  // namespace hip_comms

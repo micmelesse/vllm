@@ -28,10 +28,13 @@ constexpr int64_t rows_of(const AllReduceArgs&) { return 1; }
 constexpr int64_t rows_of(const NormArgs& a) { return a.rows; }
 constexpr int64_t rows_of(const AttnResArgs& a) { return a.rows; }
 constexpr int64_t rows_of(const GemmTailArgs& a) { return a.rows; }
+constexpr int64_t rows_of(const ScaleAddArgs& a) { return a.rows; }
 constexpr int64_t hidden_of(const AllReduceArgs& a) { return a.bytes / elem_bytes(a.dtype); }
 constexpr int64_t hidden_of(const NormArgs& a) { return a.hidden; }
 constexpr int64_t hidden_of(const AttnResArgs& a) { return a.hidden; }
 constexpr int64_t hidden_of(const GemmTailArgs& a) { return a.hidden; }
+// The row reduced, [shared | projected | latent].
+constexpr int64_t hidden_of(const ScaleAddArgs& a) { return 2 * a.hidden + a.latent; }
 template <typename Args>
 constexpr int64_t bytes_of(const Args& a) {
   return rows_of(a) * hidden_of(a) * elem_bytes(a.dtype);
@@ -87,6 +90,22 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailA
                             int world) {
   return {t, GemmTemplateArgs{world, a.dtype, kBuild.gemm_lanes, row_packs_of(t, a, threads)},
           grid_of(t, blocks, rows_of(a), world), threads};
+}
+
+// THE ONE-ALL-REDUCE TAIL: a block holds the whole latent (its build) and a slice of the hidden
+// as wide, so a row takes `splits` blocks.
+constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddArgs& a,
+                            int world) {
+  const int e         = elem_bytes(a.dtype);
+  const int r         = row_packs_for(t, a.latent * e / kPackBytes, threads);
+  const int64_t span  = int64_t{r > 0 ? r : 1} * threads;
+  const int64_t hp    = a.hidden * e / kPackBytes;
+  const int splits    = static_cast<int>((hp + span - 1) / span);
+  const int64_t work  = a.rows * splits;
+  return {t,
+          ScaleAddTemplateArgs{world, a.dtype, r > 0 ? std::optional<int>(r) : std::nullopt,
+                               splits},
+          static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks), threads};
 }
 
 // =================================================================================================
@@ -208,6 +227,14 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
               cal.rms_norm_gemm_add);
 }
 
+// THE ONE-ALL-REDUCE TAIL: the one-shot only, at the one-shot norm's block (unmeasured for this
+// op), a block a (row, slice) up to every block the signal holds.
+constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware&,
+                                               const Calibration& cal) {
+  return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, p2p::kMaxBlocks,
+                    cal.rms_norm.one_shot.threads, a, world);
+}
+
 // =================================================================================================
 // THE ONE ENTRY: the op's own rule, or the caller's forced template, then its arguments.
 // =================================================================================================
@@ -230,6 +257,11 @@ constexpr Kernel rule(const GemmTailArgs& a, int world, const Hardware& hw,
                : tune_all_reduce_rms_norm_gemm(a, world, hw, cal);
 }
 
+constexpr Kernel rule(const ScaleAddArgs& a, int world, const Hardware& hw,
+                      const Calibration& cal) {
+  return tune_all_reduce_rms_scale_add(a, world, hw, cal);
+}
+
 template <typename Args>
 constexpr Kernel select(const Args& a, int world, const Options& o) {
   if (!o.forced) return rule(a, world, kTarget, kTargetCalibration);
@@ -241,6 +273,7 @@ constexpr std::optional<int> row_packs_of(const TemplateArgs& args) {
   if (const auto* n = std::get_if<NormTemplateArgs>(&args)) return n->row_packs;
   if (const auto* r = std::get_if<AttnResTemplateArgs>(&args)) return r->row_packs;
   if (const auto* g = std::get_if<GemmTemplateArgs>(&args)) return g->row_packs;
+  if (const auto* c = std::get_if<ScaleAddTemplateArgs>(&args)) return c->row_packs;
   return std::nullopt;
 }
 
@@ -271,6 +304,8 @@ constexpr bool selections_fit() {
     if (!fits(select(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
                                  nullptr, bf, rows, hidden, 0, -1, 0.f, 0.f, true}, w, o)))
       return false;
+    if (!fits(select(ScaleAddArgs{nullptr, nullptr, bf, rows, hidden, hidden / 2, 0.f}, w, o)))
+      return false;
   }
   return true;
 }
@@ -282,6 +317,7 @@ constexpr Op op_of(const NormArgs& a) {
   return a.add ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
 }
 constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
+constexpr Op op_of(const ScaleAddArgs&) { return Op::all_reduce_rms_scale_add; }
 constexpr Op op_of(const GemmTailArgs& a) {
   return a.add ? Op::all_reduce_rms_norm_gemm_add : Op::all_reduce_rms_norm_gemm;
 }

@@ -52,6 +52,8 @@ constexpr TemplateInfo kTemplates[] = {
      kBuild.norm_row_packs},
     {Template::all_reduce_pull_two_shot_rms_norm_gemm, Op::all_reduce_rms_norm_gemm, true,
      kBuild.norm_row_packs},
+    {Template::all_reduce_pull_one_shot_rms_scale_add, Op::all_reduce_rms_scale_add, false,
+     kBuild.scale_add_row_packs},
 };
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
 

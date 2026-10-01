@@ -47,6 +47,7 @@ FusedOp = Literal[
     "all_reduce_add_attn_res_rms_norm",
     "all_reduce_rms_norm_gemm",
     "all_reduce_rms_norm_gemm_add",
+    "all_reduce_rms_scale_add",
 ]
 # What `_admits` is asked about: the plain all-reduce, or a fused op.
 AdmitOp = Literal["all_reduce", FusedOp]
@@ -114,12 +115,14 @@ class Communicator(ABC):
         "should_allreduce_add_attn_res_rms_norm",
         "should_allreduce_rms_norm_gemm",
         "should_allreduce_rms_norm_gemm_add",
+        "should_allreduce_rms_scale_add",
         "all_reduce",
         "all_reduce_rms_norm",
         "all_reduce_add_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
         "all_reduce_rms_norm_gemm",
         "all_reduce_rms_norm_gemm_add",
+        "all_reduce_rms_scale_add",
         "capture",
         "_is_supported",
         "close",
@@ -485,6 +488,46 @@ class Communicator(ABC):
             inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
         )
 
+    def should_allreduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        latent: int,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> bool:
+        """As `should_allreduce_rms_norm`, for the one-all-reduce latent MoE tail: `inp`
+        is [rows, 2 * hidden + latent], [shared | projected | latent]."""
+        return (
+            type(self)._all_reduce_rms_scale_add
+            is not Communicator._all_reduce_rms_scale_add
+            and self.should_allreduce(inp)
+            and inp.dim() == 2
+            and 0 < latent < inp.shape[1]
+            and (inp.shape[1] - latent) % 2 == 0
+            and self._admits(
+                "all_reduce_rms_scale_add", inp, launch, quant_bits, latent
+            )
+        )
+
+    def all_reduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        latent: int,
+        eps: float,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> torch.Tensor:
+        """`s = all_reduce(inp)` split [shared | projected | latent], then `shared +
+        projected * rsqrt(mean(latent^2) + eps)` in one kernel: [rows, hidden]."""
+        self._check_capture("all_reduce_rms_scale_add")
+        if not self.should_allreduce_rms_scale_add(inp, latent, launch, quant_bits):
+            raise RuntimeError(
+                self._rejected(
+                    "all_reduce_rms_scale_add", "should_allreduce_rms_scale_add", inp
+                )
+            )
+        return self._all_reduce_rms_scale_add(inp, latent, eps, launch, quant_bits)
+
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
         disabled one.
@@ -663,6 +706,19 @@ class Communicator(ABC):
             f"ask should_allreduce_rms_norm_gemm_add first."
         )
 
+    def _all_reduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        latent: int,
+        eps: float,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no fused all-reduce + rms scale + add; "
+            f"ask should_allreduce_rms_scale_add first."
+        )
+
     def _admits(
         self,
         op: AdmitOp,
@@ -673,8 +729,8 @@ class Communicator(ABC):
     ) -> bool:
         """Whether the backend runs `op` (the plain all-reduce, or a fused op) over
         `inp`, at `launch` if given and at `quant_bits` precision; `cols` is the GEMM
-        tail's output columns (0 for every other op). No limit unless the backend has
-        one, no launch to choose and no lossy kernel."""
+        tail's output columns or the scale-add's latent (0 for every other op). No
+        limit unless the backend has one, no launch to choose and no lossy kernel."""
         self._refuse_launch(launch)
         self._refuse_lossy(quant_bits)
         return True

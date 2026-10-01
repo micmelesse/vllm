@@ -44,4 +44,10 @@ inline void all_reduce_rms_norm_gemm_add(Handle& h, const GemmTailArgs& a, const
   impl::run(h, a, o);
 }
 
+// Kimi-K3's latent MoE tail with one all-reduce: out = shared + projected * 1/rms(latent), all
+// three summed over the ranks.
+inline void all_reduce_rms_scale_add(Handle& h, const ScaleAddArgs& a, const Options& o) {
+  impl::run(h, a, o);
+}
+
 }  // namespace hip_comms

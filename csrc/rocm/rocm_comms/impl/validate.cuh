@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace hip_comms {
 
@@ -56,6 +57,9 @@ std::string why_not(const Handle& h, const Kernel& k, const Args& a, const Optio
     return "world size " + std::to_string(world) + " is not built (2, 4, 8)";
   if (e != 2) return "only 2-byte dtypes are built (float16, bfloat16)";
   if (hidden_of(a) * e % kPackBytes != 0) return "the row is not a whole number of 16-byte packs";
+  if constexpr (std::is_same_v<Args, ScaleAddArgs>)
+    if (a.hidden * e % kPackBytes != 0 || a.latent * e % kPackBytes != 0 || a.latent < 1)
+      return "the hidden and the latent must each be a whole number of 16-byte packs";
   if (op_of(k.fn) != op_of(a)) return "the forced template is not this op's";
   if (has_row_packs(k.fn) && !row_packs_of(k.args))
     return "the row is wider than the template's widest build holds at this block (max_row_packs)";

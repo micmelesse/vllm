@@ -60,6 +60,7 @@ struct Build {
   int norm_row_packs;       // a norm's (and the GEMM tail's) row packs a thread, at most
   int attn_res_row_packs;   // AttnRes's, at most
   int pipelined_row_packs;  // a pipelined row kernel's (two rows' loads in flight), at most
+  int scale_add_row_packs;  // the one-all-reduce tail's (three spans' loads in flight), at most
   int gemm_rows;            // the GEMM tail's rows a pass
   int gemm_chunk;           // the GEMM tail's K-chunk staged in LDS, in packs
   int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
@@ -93,6 +94,8 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
   // registers (the pull norm two-shot spilled at 4 packs: 2026-10-01T00-06-30Z).
   b.pipelined_row_packs = floor_pow2(row_budget / (2 * in_flight));
+  // THE ONE-ALL-REDUCE TAIL holds three spans' loads at once (shared, projected, latent).
+  b.scale_add_row_packs = floor_pow2(row_budget / (3 * in_flight));
 
   // Policy: THE GEMM TAIL SUMS 16 ROWS A PASS, one fp32 accumulator a row in each lane; more rows
   // loop over passes.

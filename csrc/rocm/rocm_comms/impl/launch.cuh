@@ -50,4 +50,8 @@ inline void launch(Handle& h, const Kernel& k, const GemmTailArgs& a, hipStream_
   impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
+inline void launch(Handle& h, const Kernel& k, const ScaleAddArgs& a, hipStream_t s) {
+  impl::run(h, k, a, h.dev_comm(a.inp, bytes_of(a), s), s);
+}
+
 }  // namespace hip_comms

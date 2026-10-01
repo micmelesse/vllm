@@ -1721,3 +1721,70 @@ def test_all_reduce_rms_norm_gemm_matches_the_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
+
+
+# (rows, hidden, latent): Kimi-K3's decode and prefill, a row wider than a block, a
+# narrow one.
+RMS_SCALE_ADD_CASES = (
+    (1, 7168, 3584),
+    (16, 7168, 3584),
+    (33, 7168, 3584),
+    (256, 7168, 3584),
+    (4, 512, 64),
+)
+RMS_SCALE_ADD_FAST = (16, 7168, 3584)
+
+
+def run_rms_scale_add_rank(
+    ctx: RankContext, case: tuple[int, int, int]
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against all_reduce then the scale and add in fp32."""
+    rank, world, device = ctx.rank, ctx.world, ctx.device
+    rows, hidden, latent = case
+    dtype = torch.bfloat16
+    width = 2 * hidden + latent
+    inputs = [_one_input(r, 0, (rows, width), dtype) for r in range(world)]
+    acc = torch.zeros((rows, width), dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    s = acc.to(dtype).float()
+    shared, proj, lat = s.split([hidden, hidden, latent], dim=-1)
+    inv_rms = torch.rsqrt(lat.pow(2).mean(dim=-1, keepdim=True) + FUSED_EPS)
+    want = (shared + proj * inv_rms).to(dtype)
+
+    comm = ctx.comm("hip")
+    mine = inputs[rank].to(device)
+    if not comm.should_allreduce_rms_scale_add(mine, latent):
+        return False, NO_FUSED_KERNEL
+    got = comm.all_reduce_rms_scale_add(mine, latent, FUSED_EPS)
+    torch.cuda.synchronize()
+    atol, rtol = _fused_tolerance(dtype)
+    a32, b32 = got.float().cpu(), want.float()
+    if not torch.allclose(a32, b32, atol=atol, rtol=rtol):
+        worst = (a32 - b32).abs().max().item()
+        return False, f"out differs: worst|diff|={worst:.4g} atol={atol}"
+    return True, None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            c, marks=[] if c == RMS_SCALE_ADD_FAST else [pytest.mark.full], id=str(c)
+        )
+        for c in RMS_SCALE_ADD_CASES
+    ],
+)
+def test_all_reduce_rms_scale_add_matches_the_ops_it_replaces(
+    case: tuple[int, int, int], world: int, ranks: World
+) -> None:
+    """The one-all-reduce latent MoE tail's epilogue against all_reduce, then shared +
+    projected * 1/rms(latent)."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_rms_scale_add_rank, case=case)
+    if any(err == NO_FUSED_KERNEL for _, err in got):
+        pytest.skip(f"hip declines rms_scale_add at {case}")
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{case}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
