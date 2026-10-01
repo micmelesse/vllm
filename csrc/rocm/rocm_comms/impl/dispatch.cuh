@@ -36,6 +36,7 @@
 #include "../kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
+#include "../kernels/all_reduce_pull_two_shot_rms_scale_add.cuh"
 #include "../kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
 
@@ -327,7 +328,10 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
+      // The one-shot's and the two-shot's row builds are one.
       constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
+      static_assert(max_row_packs(K) ==
+                    max_row_packs(Template::all_reduce_pull_two_shot_rms_scale_add));
       impl::at_row_packs<K>(impl::row_build(args.row_packs), [&](auto r) {
         constexpr int R = decltype(r)::value;
         const auto bind = [&](const p2p::DevComm& p) {
@@ -335,6 +339,8 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
         };
         switch (k.fn) {
           case K: return f(all_reduce_pull_one_shot_rms_scale_add<T, NG, R>, bind);
+          case Template::all_reduce_pull_two_shot_rms_scale_add:
+            return f(all_reduce_pull_two_shot_rms_scale_add<T, NG, R>, bind);
           default: impl::not_this_ops(k.fn);
         }
       });

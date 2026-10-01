@@ -1733,11 +1733,17 @@ RMS_SCALE_ADD_CASES = (
     (256, 7168, 3584),
     (4, 512, 64),
 )
-RMS_SCALE_ADD_FAST = (16, 7168, 3584)
+# Kimi-K3 decode, and an uneven split (the last rank has fewer rows).
+RMS_SCALE_ADD_FAST = ((16, 7168, 3584), (33, 7168, 3584))
+
+
+ScaleAddShot = Literal[
+    "all_reduce_pull_one_shot_rms_scale_add", "all_reduce_pull_two_shot_rms_scale_add"
+]
 
 
 def run_rms_scale_add_rank(
-    ctx: RankContext, case: tuple[int, int, int]
+    ctx: RankContext, case: tuple[int, int, int], shot: ScaleAddShot
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against all_reduce then the scale and add in fp32."""
     rank, world, device = ctx.rank, ctx.world, ctx.device
@@ -1756,9 +1762,10 @@ def run_rms_scale_add_rank(
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     got = torch.empty(rows, hidden, dtype=dtype, device=device)
-    if not comm.should_allreduce_rms_scale_add(mine, got):
+    launch = Launch(shot)
+    if not comm.should_allreduce_rms_scale_add(mine, got, launch):
         return False, NO_FUSED_KERNEL
-    comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS)
+    comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS, launch)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float()
@@ -1769,26 +1776,30 @@ def run_rms_scale_add_rank(
 
 
 @pytest.mark.parametrize(
-    "case",
+    ("case", "shot"),
     [
         pytest.param(
-            c, marks=[] if c == RMS_SCALE_ADD_FAST else [pytest.mark.full], id=str(c)
+            c,
+            shot,
+            marks=[] if c in RMS_SCALE_ADD_FAST else [pytest.mark.full],
+            id=f"{c}-{shot}",
         )
         for c in RMS_SCALE_ADD_CASES
+        for shot in get_args(ScaleAddShot)
     ],
 )
 def test_all_reduce_rms_scale_add_matches_the_ops_it_replaces(
-    case: tuple[int, int, int], world: int, ranks: World
+    case: tuple[int, int, int], shot: ScaleAddShot, world: int, ranks: World
 ) -> None:
-    """The one-all-reduce latent MoE tail's epilogue against all_reduce, then shared +
-    projected * 1/rms(latent)."""
+    """The one-all-reduce latent MoE tail's epilogue, each shot forced, against
+    all_reduce then shared + projected * 1/rms(latent)."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    got = ranks.run(run_rms_scale_add_rank, case=case)
+    got = ranks.run(run_rms_scale_add_rank, case=case, shot=shot)
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip declines rms_scale_add at {case}")
+        pytest.skip(f"hip declines {shot} at {case}")
     bad = [err for _, err in got if err is not None]
-    assert not bad, f"{case}: " + "; ".join(bad)
+    assert not bad, f"{case} {shot}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
 
 

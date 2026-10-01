@@ -101,7 +101,9 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddA
   const int64_t span  = int64_t{r > 0 ? r : 1} * threads;
   const int64_t hp    = a.hidden * e / kPackBytes;
   const int splits    = static_cast<int>((hp + span - 1) / span);
-  const int64_t work  = a.rows * splits;
+  // A block a (row, slice): every row's in the one-shot, this rank's in the two-shot.
+  const int64_t mine  = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
+  const int64_t work  = mine * splits;
   return {t,
           ScaleAddTemplateArgs{world, a.dtype, r > 0 ? std::optional<int>(r) : std::nullopt,
                                splits},
@@ -227,13 +229,15 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
               cal.rms_norm_gemm_add);
 }
 
-// THE ONE-ALL-REDUCE TAIL: the one-shot only, at the one-shot norm's block (unmeasured for this
-// op), a block a (row, slice) up to one a compute unit; past that each block loops over its (row,
-// slice)s, since a grid wider than the GPU holds resident is refused (512 tokens asked 1024).
+// THE ONE-ALL-REDUCE TAIL: the one-shot while there are fewer rows than ranks (the two-shot would
+// leave ranks idle), the row two-shot from a row a rank (unmeasured: the sweep sets it). The
+// one-shot norm's block; a block a (row, slice) up to one a compute unit, past that each block
+// loops over its (row, slice)s, since a grid wider than the GPU holds resident is refused.
 constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware& hw,
                                                const Calibration& cal) {
-  return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, hw.compute_units,
-                    cal.rms_norm.one_shot.threads, a, world);
+  const Template t = a.rows < world ? Template::all_reduce_pull_one_shot_rms_scale_add
+                                    : Template::all_reduce_pull_two_shot_rms_scale_add;
+  return kernel_for(t, hw.compute_units, cal.rms_norm.one_shot.threads, a, world);
 }
 
 // =================================================================================================

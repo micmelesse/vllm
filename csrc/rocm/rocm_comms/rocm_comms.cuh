@@ -68,6 +68,7 @@ enum class Template : int {
   all_reduce_pull_one_shot_rms_norm_gemm         = 13,
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
   all_reduce_pull_one_shot_rms_scale_add         = 15,
+  all_reduce_pull_two_shot_rms_scale_add         = 16,
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
