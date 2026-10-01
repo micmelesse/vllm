@@ -138,9 +138,10 @@ constexpr Calibration kGfx950Calibration = {
     // The push kernel: best at 32-128 tokens, 9.9 / 10.7 / 13.3 us against 36 blocks' 11.4 at 64
     // and 15.8 at 128 (2026-09-30T23-10-02Z).
     128,
-    // The pull kernel: 88 (the link-filling grid) lost at prefill, 169.3 against 154.5 us at 4096
-    // tokens (2026-09-30T21-30-15Z).
-    36,
+    // The pull kernel, pipelined: 48 the best of 36-96 for both norms at 2048-4096 tokens (add
+    // 80.6 and 149.7 us against 84.3 and 154.7 at 36; rms 79.3 and 145.4 against 81.0 and 147.6),
+    // within 0.8 of 36 below (2026-10-01T02-59-52Z).
+    48,
     // AttnRes's two-shot (a row kernel, as the pull norm), from the same sweep.
     36,
     // 256 was worse for the GEMM tail (2026-09-28); the norms and AttnRes not swept.
