@@ -17,6 +17,7 @@
 #include <c10/util/Half.h>
 #include <hip/hip_runtime.h>
 
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -101,10 +102,31 @@ void at_row_packs(int k, F&& f) {
                            " is not this op's");
 }
 
-// The kernel at the spec's grid and block, on the stream. hipify reads `<<<...>>>` as text, so it
-// is spelled out.
+// THE MOST BLOCKS OF `kernel` RESIDENT AT ONCE on this device at `threads`: its occupancy (from
+// its compiled registers and LDS) on every CU. A peer barrier spins until the same block on every
+// peer arrives, so a grid past it can hang. Asked once a kernel and block.
+inline int resident_blocks(const void* kernel, int threads) {
+  thread_local std::map<std::tuple<int, const void*, int>, int> known;
+  int device = 0;
+  HIP_CHECK(hipGetDevice(&device));
+  const auto key = std::make_tuple(device, kernel, threads);
+  if (const auto it = known.find(key); it != known.end()) return it->second;
+  int per_cu = 0, cus = 0;
+  HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel, threads, 0));
+  HIP_CHECK(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device));
+  return known[key] = per_cu * cus;
+}
+
+// The kernel at the spec's grid and block, on the stream, once its whole grid can be resident.
+// hipify reads `<<<...>>>` as text, so it is spelled out.
 template <typename... P, typename... A>
 void start(void (*kernel)(P...), const KernelSpec& k, hipStream_t stream, A&&... args) {
+  const int resident = resident_blocks(reinterpret_cast<const void*>(kernel), k.threads);
+  if (k.grid > resident)
+    throw std::runtime_error("hip_comms: kernel " + std::to_string(static_cast<int>(k.kernel)) +
+                             " at " + std::to_string(k.threads) + " threads holds " +
+                             std::to_string(resident) + " blocks resident, not " +
+                             std::to_string(k.grid));
   kernel<<<dim3(k.grid), dim3(k.threads), 0, stream>>>(std::forward<A>(args)...);
 }
 

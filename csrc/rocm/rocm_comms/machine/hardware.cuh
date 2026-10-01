@@ -242,6 +242,14 @@ constexpr int kWaveSize = kDevice.wave_size;
 constexpr int kMaxComputeUnits =
     kGfx950.compute_units > kGfx942.compute_units ? kGfx950.compute_units : kGfx942.compute_units;
 
+// THE MOST BLOCKS RESIDENT AT ONCE ON ANY TARGET BUILT: every CU full of one-wave blocks, so p2p's
+// signal block never rules out a grid. Whether one kernel's grid is resident is its occupancy,
+// which only the compiled kernel knows: launch asks HIP (impl::start).
+constexpr int resident_waves(const Hardware& hw) { return hw.compute_units * hw.max_waves_per_cu; }
+constexpr int kMaxResidentBlocks = resident_waves(kGfx950) > resident_waves(kGfx942)
+                                       ? resident_waves(kGfx950)
+                                       : resident_waves(kGfx942);
+
 // THE MOST GPUS THAT CAN READ EACH OTHER'S MEMORY DIRECTLY: a link to every peer (the full xGMI
 // mesh of one node), so a peer group is at most the links plus one. Beyond it there is no load
 // path, only a network collective.
