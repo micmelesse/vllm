@@ -19,7 +19,7 @@ from typing import Literal, get_args
 import torch
 from torch.distributed import ProcessGroup
 
-from .base import Communicator
+from .base import Communicator, Error
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # admits and this package does not is a type error at that call rather than a surprise.
 Backend = Literal["hip", "iris", "torch"]
 
-__all__ = ["Backend", "Communicator", "make_communicator"]
+__all__ = ["Backend", "Communicator", "Error", "make_communicator"]
 
 
 def make_communicator(

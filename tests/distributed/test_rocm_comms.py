@@ -51,6 +51,7 @@ from torch.distributed import ProcessGroup
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.rocm_comms import (
     Communicator,
+    Error,
     make_communicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
@@ -1789,3 +1790,12 @@ def test_all_reduce_rms_scale_add_matches_the_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
+
+
+def test_python_error_is_cpps_number_for_number() -> None:
+    """`rocm_comms.Error` mirrors C++'s `hip_comms::Error`: the same names in the same
+    order, so the number C++ returns names the right reason."""
+    # example-based: one fixed table against another, nothing to vary
+    import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
+
+    assert [e.name for e in Error] == list(torch.ops._rocm_C.rocm_comms_error_names())

@@ -106,7 +106,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_stamps", &rocm_comms_stamps);
   rocm_ops.def("rocm_comms_peer_read", &rocm_comms_peer_read);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
-  rocm_ops.def("rocm_comms_admits", &rocm_comms_admits);
+  rocm_ops.def(
+      "rocm_comms_check(int handle_ptr, int op, int[] shape, ScalarType dtype, bool contiguous, "
+      "int? cols, int quant_bits, int kernel, int launch_blocks, int launch_threads) -> int?",
+      &rocm_comms_check);
+  rocm_ops.def("rocm_comms_error_names() -> str[]", &rocm_comms_error_names);
   rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);
   rocm_ops.def("rocm_comms_register_graph_buffers", &rocm_comms_register_graph_buffers);
   rocm_ops.def("rocm_comms_handle_and_offset", &rocm_comms_handle_and_offset);

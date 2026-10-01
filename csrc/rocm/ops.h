@@ -78,9 +78,12 @@ void rocm_comms_register_graph_buffers(
 
 // Every op takes the same four integers last: quant_bits, the precision it accepts (16:
 // exact), then its launch: kernel, launch_blocks, launch_threads (-1 and zeros: tune.cuh's).
-bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidden,
-                       int64_t element_size, int64_t cols, int64_t quant_bits, int64_t kernel,
-                       int64_t launch_blocks, int64_t launch_threads);
+std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
+                                        const std::vector<int64_t>& shape, at::ScalarType dtype,
+                                        bool contiguous, std::optional<int64_t> cols,
+                                        int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
+                                        int64_t launch_threads);
+std::vector<std::string> rocm_comms_error_names();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            int64_t quant_bits, int64_t kernel, int64_t launch_blocks,

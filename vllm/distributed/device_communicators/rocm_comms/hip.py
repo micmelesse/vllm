@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import AdmitOp, Communicator
+from .base import AdmitOp, Communicator, Error
 from .launch import Launch, launch_wire
 
 logger = logging.getLogger(__name__)
@@ -167,34 +167,27 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    def _admits(
+    def _check(
         self,
         op: AdmitOp,
         inp: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,
-        cols: int = 0,
-    ) -> bool:
-        """What C++ picks for this shape runs here: it has a kernel for it, the row fits
-        in registers at that kernel's width, and its scratch fits. The plain all-reduce
-        is one flat row, as C++ launches it; `cols` is the GEMM tail's or the
-        scale-add's output columns."""
-        if op == "all_reduce":
-            rows, hidden = 1, inp.numel()
-        elif inp.dim() == 2:
-            rows, hidden = inp.shape
-        else:
-            return False
-        return torch.ops._rocm_C.rocm_comms_admits(
+        cols: int | None = None,
+    ) -> Error | None:
+        """C++'s answer (`hip_comms::plan`), given the call's facts: every rule about
+        what our kernels run is there, none here."""
+        err = torch.ops._rocm_C.rocm_comms_check(
             self._handle,
             _OP_WIRE[op],
-            rows,
-            hidden,
-            inp.element_size(),
+            list(inp.shape),
+            inp.dtype,
+            inp.is_contiguous(),
             cols,
             quant_bits,
             *launch_wire(launch),
         )
+        return None if err is None else Error(err)
 
     def _all_reduce_rms_norm(
         self,

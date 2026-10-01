@@ -3,12 +3,13 @@
 //
 // ROCM_COMMS, THE ONE INTERFACE: our collectives, torch-free. An OP is what a caller asks for (an
 // API call); a KERNEL is what runs, one compiled instruction sequence (vllm CONTEXT's lingo). Every
-// op is op(handle, args, options), the same three steps:
-//   select(args, world, options) -> Kernel   the only choice: the template, its arguments, its
-//                                            launch (impl/select.cuh)
-//   validate(handle, kernel, args, options)  the only no: raises with the reason
-//   launch(handle, kernel, args, stream)     runs it; decides nothing (impl/launch.cuh)
-// Both of the last two find the compiled function a Kernel names the same way (impl/dispatch.cuh).
+// op is op(handle, args, options), two steps:
+//   plan(handle, args, options) -> Kernel or Error   the only decision: select's kernel (its
+//                                     template, arguments and launch, impl/select.cuh), or the
+//                                     first Error it meets here (impl/check.cuh)
+//   launch(handle, kernel, args, stream)  runs it; decides nothing (impl/launch.cuh)
+// An op returns the kernel it launched, or the Error and launches nothing. check and launch find
+// the compiled function a Kernel names the same way (impl/dispatch.cuh).
 //
 // Handle                  the state across calls: the peers' memory, mapped once (p2p's Group)
 // AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs, ScaleAddArgs   one op's call
@@ -16,7 +17,7 @@
 // Kernel                  what runs: a template, its arguments, its grid and block
 // all_reduce, all_reduce_rms_norm (and _add_), all_reduce_add_attn_res_rms_norm,
 // all_reduce_rms_norm_gemm(_add), all_reduce_rms_scale_add      the ops
-// why_not(handle, args, options)  why a call cannot run, or empty: `admits` for vLLM
+// Error, to_string(Error)  why a call cannot run here: every reason, one list
 
 #pragma once
 
@@ -121,6 +122,60 @@ struct Forced {
   int threads;
 };
 
+// WHY A CALL CANNOT RUN, every reason there is. The numbers cross to Python (rocm_comms.Error), so
+// a reason is only ever added at the end. `disabled` and `no_such_op` are the communicator's own.
+enum class Error : int {
+  disabled                  = 0,
+  no_such_op                = 1,
+  not_contiguous            = 2,
+  not_two_d                 = 3,
+  output_not_two_d          = 4,
+  dtype_not_built           = 5,
+  world_not_built           = 6,
+  row_not_packs             = 7,
+  widths_not_packs          = 8,
+  row_not_wider_than_output = 9,
+  template_not_this_ops     = 10,
+  row_too_wide              = 11,
+  block_not_a_wave_per_peer = 12,
+  quantized_not_built       = 13,
+  block_exceeds_lds         = 14,
+  scratch_too_small         = 15,
+  grid_not_resident         = 16,
+};
+constexpr int kNumErrors = 17;
+
+constexpr const char* to_string(Error e) {
+  switch (e) {
+    case Error::disabled: return "disabled: the communicator is disabled";
+    case Error::no_such_op: return "no_such_op: the backend has no such op";
+    case Error::not_contiguous: return "not_contiguous: the input is not contiguous";
+    case Error::not_two_d: return "not_two_d: a fused op takes a 2-D input";
+    case Error::output_not_two_d: return "output_not_two_d: the output is not 2-D";
+    case Error::dtype_not_built: return "dtype_not_built: only float16 and bfloat16 are built";
+    case Error::world_not_built: return "world_not_built: the world size is not 2, 4 or 8";
+    case Error::row_not_packs: return "row_not_packs: the row is not whole 16-byte packs";
+    case Error::widths_not_packs:
+      return "widths_not_packs: the output's and the latent's widths are not whole packs";
+    case Error::row_not_wider_than_output:
+      return "row_not_wider_than_output: the input's row is not wider than twice the output's";
+    case Error::template_not_this_ops:
+      return "template_not_this_ops: the forced template is not this op's";
+    case Error::row_too_wide:
+      return "row_too_wide: the row is wider than the template's widest build holds";
+    case Error::block_not_a_wave_per_peer:
+      return "block_not_a_wave_per_peer: a two-shot block must be one wave per peer";
+    case Error::quantized_not_built: return "quantized_not_built: no kernel quantizes yet";
+    case Error::block_exceeds_lds:
+      return "block_exceeds_lds: the GEMM tail's block exceeds what its LDS holds";
+    case Error::scratch_too_small:
+      return "scratch_too_small: the two-shot scratch exceeds the scratch";
+    case Error::grid_not_resident:
+      return "grid_not_resident: the grid exceeds the blocks the GPU holds resident";
+  }
+  return "unknown";
+}
+
 struct Options {
   int quant_bits;                // the precision accepted on the wire: 16 (exact), 8 or 4
   std::optional<Forced> forced;  // none: select's
@@ -206,7 +261,7 @@ struct ScaleAddArgs {
 #include "impl/templates.cuh"
 #include "impl/select.cuh"
 #include "impl/dispatch.cuh"
-#include "impl/validate.cuh"
+#include "impl/check.cuh"
 #include "impl/launch.cuh"
 #include "impl/ops.cuh"
 #undef HIP_COMMS_INTERFACE

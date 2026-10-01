@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// CHECK, THE ONLY NO: `check(handle, kernel, args, options)` is the first Error kernel `k` meets on
+// call `a` here, or none; `plan(handle, args, options)` is select's kernel or that Error. Every
+// Error is a capability (a kernel that cannot take the input), never "the unfused ops would be
+// faster": a tune_<op> never declines.
+
+#pragma once
+
+#ifndef HIP_COMMS_INTERFACE
+#error "include rocm_comms.cuh, the one interface, not its parts"
+#endif
+
+#include <cstdint>
+#include <optional>
+#include <type_traits>
+#include <variant>
+
+namespace hip_comms {
+
+// A KERNEL'S SCRATCH, row-major: the plain two-shot's slice of packs; a column two-shot the whole
+// reduced tensor (each rank's columns at their place); a row two-shot its rank's rows, twice where
+// it leaves two results (out and the residual). A one-shot reads the inputs and keeps nothing.
+inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
+  if (!is_two_shot(t)) return 0;
+  const Op op = op_of(t);
+  if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kPackBytes;
+  if (slices_columns(t)) return rows * packs * kPackBytes;
+  const bool two = op == Op::all_reduce_add_rms_norm;
+  return (rows + world - 1) / world * packs * (two ? 2 : 1) * kPackBytes;
+}
+
+// Whether kernel `k` holds its whole grid resident: only the compiled kernel knows what it uses.
+template <typename Args>
+bool resident(const Kernel& k, const Args& a) {
+  bool fits = true;
+  dispatch(k, a, [&](auto kernel, const auto&) {
+    fits = k.grid <= resident_blocks(kTarget, resources_of(kernel), k.threads);
+  });
+  return fits;
+}
+
+// The first Error kernel `k` meets on call `a` here, in this order, or none.
+template <typename Args>
+std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, const Options& o) {
+  const int world = h.world_size();
+  const int e     = elem_bytes(a.dtype);
+  if (world != 2 && world != 4 && world != 8) return Error::world_not_built;
+  if (e != 2) return Error::dtype_not_built;
+  if (hidden_of(a) * e % kPackBytes != 0) return Error::row_not_packs;
+  if constexpr (std::is_same_v<Args, ScaleAddArgs>)
+    if (a.hidden * e % kPackBytes != 0 || a.latent * e % kPackBytes != 0 || a.latent < 1)
+      return Error::widths_not_packs;
+  if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
+  if (has_row_packs(k.fn) && !row_packs_of(k.args)) return Error::row_too_wide;
+  // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
+  if (k.fn == Template::all_reduce_pull_two_shot && k.threads % (world * kWaveSize) != 0)
+    return Error::block_not_a_wave_per_peer;
+  if (o.quant_bits != 16) return Error::quantized_not_built;
+  if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.gemm_lanes))
+    return Error::block_exceeds_lds;
+  if (scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
+    return Error::scratch_too_small;
+  if (!resident(k, a)) return Error::grid_not_resident;
+  return std::nullopt;
+}
+
+// THE ONE DECISION: select's kernel for call `a`, or the Error it meets.
+template <typename Args>
+std::variant<Kernel, Error> plan(const Handle& h, const Args& a, const Options& o) {
+  const Kernel k = select(a, h.world_size(), o);
+  if (const std::optional<Error> err = check(h, k, a, o)) return *err;
+  return k;
+}
+
+}  // namespace hip_comms

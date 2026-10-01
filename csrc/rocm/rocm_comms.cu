@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
+#include <variant>
 #include <string>
 #include <vector>
 
@@ -94,6 +96,12 @@ void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
 }
 }  // namespace
 
+// AN OP'S ERROR RAISED, at the torch boundary: a torch op can only return or raise.
+static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result) {
+  if (const hip_comms::Error* e = std::get_if<hip_comms::Error>(&result))
+    TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
+}
+
 int64_t rocm_comms_alloc(int64_t scratch_bytes) {
   return static_cast<int64_t>(
       hip_comms::p2p::host::alloc_memory(scratch_bytes, hip_comms::kStagingBytes));
@@ -112,62 +120,75 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
 
 
 
-bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidden,
-                       int64_t element_size, int64_t cols, int64_t quant_bits, int64_t kernel,
-                       int64_t launch_blocks, int64_t launch_threads) {
+// THE FIRST ERROR OUR KERNELS MEET ON THIS CALL, as its number, or none: every rule is here or in
+// `hip_comms::check`, and Python only passes the call's facts. `cols` is an output's columns, for
+// the ops that have one.
+std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
+                                        const std::vector<int64_t>& shape, at::ScalarType dtype,
+                                        bool contiguous, std::optional<int64_t> cols,
+                                        int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
+                                        int64_t launch_threads) {
+  using hip_comms::Error;
   constexpr auto kLastOp = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_scale_add);
   TORCH_CHECK(op >= 0 && op <= kLastOp, "hip_comms: no op ", op);
-  TORCH_CHECK(element_size == 2, "hip_comms: only 2-byte dtypes are built");
-  const bool scale_add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_rms_scale_add;
-  TORCH_CHECK(cols >= 0 && (cols > 0) == (hip_comms::gemms(static_cast<hip_comms::Op>(op)) ||
-                                          scale_add),
-              "hip_comms: cols is a GEMM op's or the scale-add's output columns, and only they "
-              "have them");
+  const auto which    = static_cast<hip_comms::Op>(op);
+  const bool has_cols = hip_comms::gemms(which) || which == hip_comms::Op::all_reduce_rms_scale_add;
+  TORCH_CHECK(has_cols || !cols, "hip_comms: only an op with an output's columns takes cols");
+  const auto error = [](Error e) { return std::optional<int64_t>(static_cast<int64_t>(e)); };
+  if (!contiguous) return error(Error::not_contiguous);
+  hip_comms::DType d;
+  if (dtype == at::ScalarType::Half) d = hip_comms::DType::f16;
+  else if (dtype == at::ScalarType::BFloat16) d = hip_comms::DType::bf16;
+  else if (dtype == at::ScalarType::Float) d = hip_comms::DType::f32;
+  else return error(Error::dtype_not_built);
+  int64_t numel = 1;
+  for (const int64_t n : shape) numel *= n;
+  if (which != hip_comms::Op::all_reduce && shape.size() != 2) return error(Error::not_two_d);
+  if (has_cols && !cols) return error(Error::output_not_two_d);
   // THE CALL, WITHOUT ITS TENSORS: what select reads of it, its pointers null. A norm's weight is
   // taken in the call's dtype and AttnRes without a prefix: neither changes whether a call runs.
-  auto& h                   = handle_of(handle_ptr);
-  const auto o              = options_of(quant_bits, kernel, launch_blocks, launch_threads);
-  const auto d              = hip_comms::DType::bf16;
-  const float eps           = 0.f;
-  switch (static_cast<hip_comms::Op>(op)) {
+  const int64_t rows  = which == hip_comms::Op::all_reduce ? 1 : shape[0];
+  const int64_t width = which == hip_comms::Op::all_reduce ? numel : shape[1];
+  auto& h             = handle_of(handle_ptr);
+  const auto o        = options_of(quant_bits, kernel, launch_blocks, launch_threads);
+  const float eps     = 0.f;
+  const auto of = [&](const auto& args) {
+    const std::variant<hip_comms::Kernel, Error> p = hip_comms::plan(h, args, o);
+    const Error* e = std::get_if<Error>(&p);
+    return e ? error(*e) : std::nullopt;
+  };
+  switch (which) {
     case hip_comms::Op::all_reduce:
-      return hip_comms::why_not(h, hip_comms::AllReduceArgs{nullptr, nullptr,
-                                                            rows * hidden * element_size, d},
-                                o)
-          .empty();
+      return of(hip_comms::AllReduceArgs{nullptr, nullptr, numel * hip_comms::elem_bytes(d), d});
     case hip_comms::Op::all_reduce_rms_norm:
-    case hip_comms::Op::all_reduce_add_rms_norm: {
-      const bool add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_add_rms_norm;
-      return hip_comms::why_not(h, hip_comms::NormArgs{add, nullptr, nullptr, nullptr, d, d, rows,
-                                                       hidden, eps, nullptr, nullptr},
-                                o)
-          .empty();
-    }
+    case hip_comms::Op::all_reduce_add_rms_norm:
+      return of(hip_comms::NormArgs{which == hip_comms::Op::all_reduce_add_rms_norm, nullptr,
+                                    nullptr, nullptr, d, d, rows, width, eps, nullptr, nullptr});
     case hip_comms::Op::all_reduce_add_attn_res_rms_norm:
-      return hip_comms::why_not(h, hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0,
-                                                          0, nullptr, nullptr, nullptr, d, rows,
-                                                          hidden, 0, -1, eps, eps, false},
-                                o)
-          .empty();
+      return of(hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
+                                       nullptr, d, rows, width, 0, -1, eps, eps, false});
     case hip_comms::Op::all_reduce_rms_norm_gemm:
-    case hip_comms::Op::all_reduce_rms_norm_gemm_add: {
-      const bool add = static_cast<hip_comms::Op>(op) == hip_comms::Op::all_reduce_rms_norm_gemm_add;
-      return hip_comms::why_not(h, hip_comms::GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr,
-                                                           eps, nullptr, cols, nullptr, d, rows,
-                                                           hidden},
-                                o)
-          .empty();
-    }
-    // `hidden` is the row reduced, [shared | projected | latent], and `cols` the output's width:
-    // the latent is what is left.
+    case hip_comms::Op::all_reduce_rms_norm_gemm_add:
+      return of(hip_comms::GemmTailArgs{which == hip_comms::Op::all_reduce_rms_norm_gemm_add,
+                                        nullptr, 0, 0, nullptr, nullptr, eps, nullptr, *cols,
+                                        nullptr, d, rows, width});
+    // The input's row is [shared | projected | latent], and `cols` the output's width: the
+    // latent is what is left.
     case hip_comms::Op::all_reduce_rms_scale_add:
-      if (hidden - 2 * cols < 1) return false;
-      return hip_comms::why_not(h, hip_comms::ScaleAddArgs{nullptr, nullptr, d, rows, cols,
-                                                           hidden - 2 * cols, eps},
-                                o)
-          .empty();
+      if (width - 2 * *cols < 1) return error(Error::row_not_wider_than_output);
+      return of(hip_comms::ScaleAddArgs{nullptr, nullptr, d, rows, *cols, width - 2 * *cols, eps});
   }
-  return false;
+  return error(Error::no_such_op);
+}
+
+// THE ERROR NAMES, by number: Python's mirror (rocm_comms.Error) is tested against them.
+std::vector<std::string> rocm_comms_error_names() {
+  std::vector<std::string> names;
+  for (int i = 0; i < hip_comms::kNumErrors; ++i) {
+    const std::string s = hip_comms::to_string(static_cast<hip_comms::Error>(i));
+    names.push_back(s.substr(0, s.find(':')));
+  }
+  return names;
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
@@ -284,10 +305,10 @@ void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor&
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
-  hip_comms::all_reduce(
+  ran(hip_comms::all_reduce(
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), inp.numel() * inp.element_size(), dtype_of(inp)},
-      options_of(quant_bits, kernel, launch_blocks, launch_threads));
+      options_of(quant_bits, kernel, launch_blocks, launch_threads)));
 }
 
 namespace {
@@ -318,14 +339,14 @@ void all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor* r
                     residual_out->scalar_type() == inp.scalar_type(),
                 "every tensor must share inp's dtype");
   }
-  hip_comms::all_reduce_rms_norm(
+  ran(hip_comms::all_reduce_rms_norm(
       handle_of(handle_ptr),
       {residual != nullptr, out.data_ptr(), inp.data_ptr(), weight.data_ptr(), dtype_of(inp),
        dtype_of(weight),
        inp.size(0), inp.size(1), static_cast<float>(eps),
        residual_out ? residual_out->data_ptr() : nullptr,
        residual ? residual->data_ptr() : nullptr},
-      o);
+      o));
 }
 }  // namespace
 
@@ -380,14 +401,14 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   TORCH_CHECK(blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
                   reinterpret_cast<uintptr_t>(blocks.data_ptr()) % hip_comms::kPackBytes == 0,
               "blocks must be 16-byte aligned in every row and source");
-  hip_comms::all_reduce_add_attn_res_rms_norm(
+  ran(hip_comms::all_reduce_add_attn_res_rms_norm(
       handle_of(handle_ptr),
       {prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(), blocks.stride(0),
        blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
        out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0),
        hidden, static_cast<int>(num_blocks), static_cast<int>(write_idx),
        static_cast<float>(eps), static_cast<float>(out_eps), has_prefix},
-      options_of(quant_bits, kernel, launch_blocks, launch_threads));
+      options_of(quant_bits, kernel, launch_blocks, launch_threads)));
 }
 
 namespace {
@@ -417,8 +438,8 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, i
                                   inp.data_ptr(), norm_weight.data_ptr(), static_cast<float>(eps),
                                   gemm_weight.data_ptr(), n_cols, workspace.data_ptr(),
                                   dtype_of(inp), rows, hidden};
-  if (add) hip_comms::all_reduce_rms_norm_gemm_add(handle_of(handle_ptr), a, o);
-  else hip_comms::all_reduce_rms_norm_gemm(handle_of(handle_ptr), a, o);
+  ran(add ? hip_comms::all_reduce_rms_norm_gemm_add(handle_of(handle_ptr), a, o)
+          : hip_comms::all_reduce_rms_norm_gemm(handle_of(handle_ptr), a, o));
 }
 }  // namespace
 
@@ -453,11 +474,11 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
   const int64_t latent = inp.size(1) - 2 * hidden;
   TORCH_CHECK(latent > 0, "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  hip_comms::all_reduce_rms_scale_add(
+  ran(hip_comms::all_reduce_rms_scale_add(
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden, latent,
        static_cast<float>(eps)},
-      options_of(quant_bits, kernel, launch_blocks, launch_threads));
+      options_of(quant_bits, kernel, launch_blocks, launch_threads)));
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
