@@ -128,7 +128,7 @@ Resources resources_of(void (*kernel)(P...)) {
 template <typename F>
 void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {
   const auto& args = std::get<AllReduceTemplateArgs>(k.args);
-  const int n      = static_cast<int>(a.bytes / kPackBytes);
+  const int64_t n  = a.bytes / kPackBytes;
   impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {

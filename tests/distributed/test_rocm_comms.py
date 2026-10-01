@@ -1799,3 +1799,46 @@ def test_python_error_is_cpps_number_for_number() -> None:
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     assert [e.name for e in Error] == list(torch.ops._rocm_C.rocm_comms_error_names())
+
+
+# C++'s kStagingBytes (machine/build.cuh): what one eager pass holds.
+_STAGING_BYTES = 256 << 20
+
+
+def run_eager_beyond_staging_rank(
+    ctx: RankContext, shot: Shot
+) -> tuple[bool, str | None]:
+    """ONE rank: an eager all-reduce of two and a half stagings, forced at `shot`,
+    against RCCL's fp32 sum. Each rank draws its own input on the device: the input is
+    too large to rebuild every rank's on the CPU."""
+    n = _STAGING_BYTES * 5 // 2 // 2  # bf16 elements
+    g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
+    x = torch.randn(n, generator=g, device=ctx.device).to(torch.bfloat16)
+    want = x.float()
+    dist.all_reduce(want, group=ctx.device_group)
+    comm = ctx.comm("hip")
+    launch = Launch(shot)
+    if not comm.should_allreduce(x, launch):
+        return False, f"refused: {comm.check('all_reduce', x, launch)}"
+    got = comm.all_reduce(x, launch).float()
+    torch.cuda.synchronize()
+    atol, rtol = _fused_tolerance(torch.bfloat16)
+    if not torch.allclose(got, want, atol=atol, rtol=rtol):
+        worst = (got - want).abs().max().item()
+        return False, f"out differs: worst|diff|={worst:.4g} atol={atol}"
+    return True, None
+
+
+@pytest.mark.parametrize("shot", SHOTS)
+def test_an_eager_all_reduce_wider_than_the_staging_runs_in_passes(
+    shot: Shot, world: int, ranks: World
+) -> None:
+    """The kernel stages an eager input a pass at a time, so an input past the staging
+    runs on our kernels, in one launch, and sums right: every pass, the short last one
+    too."""
+    # example-based: the size is the point (past the staging, a partial last pass)
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_eager_beyond_staging_rank, shot=shot)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shot}: " + "; ".join(bad)

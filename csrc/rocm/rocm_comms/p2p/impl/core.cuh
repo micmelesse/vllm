@@ -217,14 +217,22 @@ class Peer {
                                     const typename traits<U>::V& v);
 };
 
-// THIS RANK'S OWN BUFFERS: its scratch, read and written here.
+// THIS RANK'S OWN BUFFERS: its scratch, read and written here, and its input slot, written when
+// the kernel stages an eager input into it (DevComm::local).
 template <typename T, int ngpus>
 class Self {
   using V = typename traits<T>::V;
   V* scratch_;
+  V* in_;
 
  public:
-  explicit DINLINE Self(const DevComm& p) : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)) {}
+  explicit DINLINE Self(const DevComm& p)
+      : scratch_(impl::scratch_of<T, ngpus>(p, p.rank)),
+        in_(const_cast<V*>(impl::input_of<T, ngpus>(p, p.rank))) {}
+
+  template <typename U, int n>
+  friend DINLINE void write_input(const Self<U, n>& self, int64_t i,
+                                  const typename traits<U>::V& v);
 
   template <typename U, int n>
   friend DINLINE typename traits<U>::V read_scratch(const Self<U, n>& self, int64_t i);
@@ -268,6 +276,13 @@ DINLINE void write_scratch(const Peer<T, ngpus>& peer, int64_t i,
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V read_scratch(const Self<T, ngpus>& self, int64_t i) {
   return thread_load(self.scratch_ + i);
+}
+
+// Pack i of this rank's input slot (its staging), for its peers to read after a barrier that makes
+// it visible: the kernel staging an eager input.
+template <typename T, int ngpus>
+DINLINE void write_input(const Self<T, ngpus>& self, int64_t i, const typename traits<T>::V& v) {
+  thread_store(self.in_ + i, v);
 }
 
 // Pack i of this rank's scratch, for its peers to read after a barrier that makes it visible.

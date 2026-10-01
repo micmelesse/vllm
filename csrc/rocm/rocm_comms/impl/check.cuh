@@ -19,13 +19,15 @@
 
 namespace hip_comms {
 
-// A KERNEL'S SCRATCH, row-major: the plain two-shot's slice of packs; a column two-shot the whole
-// reduced tensor (each rank's columns at their place); a row two-shot its rank's rows, twice where
-// it leaves two results (out and the residual). A one-shot reads the inputs and keeps nothing.
+// A KERNEL'S SCRATCH, row-major: none for a one-shot (it reads the inputs and keeps nothing) or the
+// plain two-shot (in passes); a column two-shot the whole reduced tensor (each rank's columns at
+// their place); a row two-shot its rank's rows, twice where it leaves two results (out and the
+// residual).
 inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
   if (!is_two_shot(t)) return 0;
   const Op op = op_of(t);
-  if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kPackBytes;
+  // THE PLAIN TWO-SHOT RUNS IN PASSES of what the scratch holds, so any scratch takes any size.
+  if (op == Op::all_reduce) return 0;
   if (slices_columns(t)) return rows * packs * kPackBytes;
   const bool two = op == Op::all_reduce_add_rms_norm;
   return (rows + world - 1) / world * packs * (two ? 2 : 1) * kPackBytes;
