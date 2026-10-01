@@ -34,6 +34,11 @@ inline void all_reduce_add_attn_res_rms_norm(Handle& h, const AttnResArgs& a, co
   impl::run(h, a, o);
 }
 
+// RMSNorm of the sum, then out[:, col0:col0+N] = normed @ gemm_weight^T.
+inline void all_reduce_rms_norm_gemm(Handle& h, const GemmTailArgs& a, const Options& o) {
+  impl::run(h, a, o);
+}
+
 // The latent MoE tail: RMSNorm of the sum, then out[:, col0:col0+N] += normed @ gemm_weight^T.
 inline void all_reduce_rms_norm_gemm_add(Handle& h, const GemmTailArgs& a, const Options& o) {
   impl::run(h, a, o);

@@ -50,9 +50,9 @@ constexpr int gemm_max_threads(int lanes_per_col) {
 static_assert(gemm_max_waves(1) >= kMaxWaves,
               "the GEMM tail holds the widest block at every lane split");
 
-// out[r, col0 + n] = T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]) for r < rows,
-// rows <= kGemmRows, the sum in fp32 and rounded once. `row(r)` points at row r of x,
-// wherever it lives.
+// out[r, col0 + n] = T(sum_k x[r][k] * w[n][k]), or with kAccumulate
+// T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= kGemmRows, the sum
+// in fp32 and rounded once. `row(r)` points at row r of x, wherever it lives.
 //
 // x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
 // loop's row reads are LDS reads, not a global round trip per K-step.
@@ -63,7 +63,7 @@ static_assert(gemm_max_waves(1) >= kMaxWaves,
 // kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <int kLanesPerCol, typename T, typename Row>
+template <int kLanesPerCol, bool kAccumulate, typename T, typename Row>
 DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
                   T* __restrict__ out, int64_t out_stride, int out_col0) {
   using V          = typename traits<T>::V;
@@ -125,7 +125,8 @@ DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_co
         float v = 0.0f;
         for (int q = 0; q < waves; ++q) v += partial[q][r][i % kTile];
         T* at = out + r * out_stride + out_col0 + col;
-        *at   = static_cast<T>(static_cast<float>(*at) + v);
+        if constexpr (kAccumulate) *at = static_cast<T>(static_cast<float>(*at) + v);
+        else *at = static_cast<T>(v);
       }
     }
     // Before the next tile overwrites `partial`.

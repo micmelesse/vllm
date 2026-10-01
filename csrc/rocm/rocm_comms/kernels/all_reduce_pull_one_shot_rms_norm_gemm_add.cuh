@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// One-shot pull all-reduce, then RMSNorm, then a GEMM whose result is added into an
-// output: the tail of Kimi-K3's latent MoE (`fused_all_reduce.latent_tail`).
+// One-shot pull all-reduce, then RMSNorm, then a GEMM whose result is written into an output
+// (`all_reduce_pull_one_shot_rms_norm_gemm`) or added into it (`..._gemm_add`, the tail of
+// Kimi-K3's latent MoE): one body, a kernel per op, so a trace names the op that ran.
 
 #pragma once
 
@@ -14,9 +15,8 @@ namespace hip_comms {
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
 // grid barrier; the GEMM over every row, kGemmRows a pass.
 // kLanesPerCol is the GEMM's lanes per column (the build's gemm_lanes).
-template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
-__global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
-    all_reduce_pull_one_shot_rms_norm_gemm_add(
+template <typename T, int ngpus, int kLanesPerCol, int kRowPacks, bool kAdd>
+DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
     int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
     T* __restrict__ workspace, int rows, int packs) {
@@ -66,7 +66,7 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
 
   // 4. The GEMM over every row.
   for (int r0 = 0; r0 < rows; r0 += kGemmRows)
-    grid_gemm<kLanesPerCol, T>([&](int r) { return normed + (r0 + r) * packs; },
+    grid_gemm<kLanesPerCol, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
                                min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
                                out + r0 * out_stride, out_stride, out_col0);
 
@@ -74,5 +74,28 @@ __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
   // 5. No rank may overwrite its input until every peer has read it.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
 }
+
+// THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
+// added into `out` (rms_norm_gemm_add).
+template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
+__global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
+    all_reduce_pull_one_shot_rms_norm_gemm(
+    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    T* __restrict__ workspace, int rows, int packs) {
+  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, false>(
+      p, norm_w, eps, gemm_w, n_cols, out, out_stride, out_col0, workspace, rows, packs);
+}
+
+template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
+__global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
+    all_reduce_pull_one_shot_rms_norm_gemm_add(
+    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
+    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    T* __restrict__ workspace, int rows, int packs) {
+  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, true>(
+      p, norm_w, eps, gemm_w, n_cols, out, out_stride, out_col0, workspace, rows, packs);
+}
+
 
 }  // namespace hip_comms

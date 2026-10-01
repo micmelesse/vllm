@@ -128,9 +128,9 @@ struct AttnResCalibration {
   Launch pull;
 };
 
-struct GemmTailCalibration {
+// A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
+struct GemmCalibration {
   int64_t one_shot_max_rows;  // one GEMM pass of rows
-  int lanes_per_col;          // the GEMM's lanes a column (a build: 1, 2, 4 or 8)
   Launch one_shot;
   Launch two_shot;
 };
@@ -138,10 +138,12 @@ struct GemmTailCalibration {
 struct Calibration {
   double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
   int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
+  int gemm_lanes_per_col;  // grid_gemm's lanes a column, a build both GEMM ops' kernels share
   NormCalibration rms_norm;
   NormCalibration add_rms_norm;
   AttnResCalibration attn_res;
-  GemmTailCalibration gemm_tail;
+  GemmCalibration rms_norm_gemm;
+  GemmCalibration rms_norm_gemm_add;
 };
 
 // gfx950 on n11. MI300X has none yet. The fused kernels' 512-thread block: 256 was worse for the
@@ -153,6 +155,8 @@ constexpr Calibration kGfx950Calibration = {
     // One-shot won at 56 KiB (7.12 against 7.83 us), two-shot at 112 KiB (7.87 against 8.19),
     // uncached scratch (2026-09-30T18-00-30Z).
     .all_reduce_one_shot_max_bytes = 64 * kKiB,
+    // Picked at Kimi-K3's shape on the GEMM tail; 1, 2 and 8 were worse at 1 row (2026-09-28).
+    .gemm_lanes_per_col = 4,
     .rms_norm = {
         // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
         .one_shot_max_bytes = 128 * kKiB,
@@ -195,11 +199,17 @@ constexpr Calibration kGfx950Calibration = {
         // prefill, 169.3 against 154.5 us at 4096 tokens (2026-09-30T21-30-15Z).
         .pull = {36, 512},
     },
-    .gemm_tail = {
+    .rms_norm_gemm = {
+        // Not swept: rms_norm_gemm_add's.
+        .one_shot_max_rows = 16,
+        // Not swept: rms_norm_gemm_add's.
+        .one_shot = {56, 512},
+        // Not swept: rms_norm_gemm_add's.
+        .two_shot = {56, 512},
+    },
+    .rms_norm_gemm_add = {
         // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
         .one_shot_max_rows = 16,
-        // Picked at Kimi-K3's shape; 1, 2 and 8 were worse at 1 row (2026-09-28).
-        .lanes_per_col = 4,
         // The best at 1 row, 4 lanes a column (2026-09-28, log).
         .one_shot = {56, 512},
         // Not swept: the one-shot's.

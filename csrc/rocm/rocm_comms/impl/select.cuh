@@ -31,7 +31,7 @@ constexpr bool pushes(Kernel k) {
 }
 constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
-  if (op == Op::all_reduce || op == Op::all_reduce_rms_norm_gemm_add) return blocks;
+  if (op == Op::all_reduce || gemms(op)) return blocks;
   const bool row_slice = is_two_shot(k) && !pushes(k);
   const int64_t mine   = row_slice ? (rows + world - 1) / world : rows;
   return mine < blocks ? static_cast<int>(mine) : blocks;
@@ -138,14 +138,22 @@ constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardw
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
 // 512 threads (the GEMM strides over column tiles). It is slower than the unfused ops (about 68
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
-constexpr KernelSpec tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
-                                                   const Calibration& cal) {
-  const GemmTailCalibration& c = cal.gemm_tail;
+constexpr KernelSpec gemm(Kernel one_shot, Kernel two_shot, Input in, const GemmCalibration& c) {
   return in.rows <= c.one_shot_max_rows
-             ? spec_of(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, in, c.one_shot.blocks,
-                       c.one_shot.threads)
-             : spec_of(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, c.two_shot.blocks,
-                       c.two_shot.threads);
+             ? spec_of(one_shot, in, c.one_shot.blocks, c.one_shot.threads)
+             : spec_of(two_shot, in, c.two_shot.blocks, c.two_shot.threads);
+}
+
+constexpr KernelSpec tune_all_reduce_rms_norm_gemm(Input in, const Hardware&,
+                                                   const Calibration& cal) {
+  return gemm(Kernel::all_reduce_pull_one_shot_rms_norm_gemm,
+              Kernel::all_reduce_pull_two_shot_rms_norm_gemm, in, cal.rms_norm_gemm);
+}
+
+constexpr KernelSpec tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
+                                                       const Calibration& cal) {
+  return gemm(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add,
+              Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, cal.rms_norm_gemm_add);
 }
 
 // =================================================================================================
@@ -160,6 +168,7 @@ constexpr KernelSpec tune(Op op, Input in, const Hardware& hw, const Calibration
     case Op::all_reduce_add_attn_res_rms_norm:
       return tune_all_reduce_add_attn_res_rms_norm(in, hw, cal);
     case Op::all_reduce_rms_norm_gemm_add: return tune_all_reduce_rms_norm_gemm_add(in, hw, cal);
+    case Op::all_reduce_rms_norm_gemm: return tune_all_reduce_rms_norm_gemm(in, hw, cal);
   }
   __builtin_unreachable();  // every Op is a case above
 }
@@ -176,7 +185,7 @@ constexpr bool fits(const KernelSpec& k, Input in) {
   return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
 }
 constexpr bool tuned_specs_fit() {
-  for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm_add); ++op)
+  for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm); ++op)
     for (const Input in : {Input{1, 8, 2, 0, 2}, Input{4096, 7168, 2, 0, p2p::kMaxRanks}})
       if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration), in)) return false;
   return true;
@@ -191,7 +200,9 @@ constexpr Op op_of(const NormArgs& a) {
   return a.residual ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
 }
 constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
-constexpr Op op_of(const GemmTailArgs&) { return Op::all_reduce_rms_norm_gemm_add; }
+constexpr Op op_of(const GemmTailArgs& a) {
+  return a.add ? Op::all_reduce_rms_norm_gemm_add : Op::all_reduce_rms_norm_gemm;
+}
 
 inline Input input_of(const Handle& h, const AllReduceArgs& a) {
   const int e = elem_bytes(a.dtype);

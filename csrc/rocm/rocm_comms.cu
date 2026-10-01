@@ -120,11 +120,11 @@ torch::Tensor rocm_comms_staging(fptr_t handle_ptr) {
 bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidden,
                        int64_t element_size, int64_t cols, int64_t quant_bits, int64_t kernel,
                        int64_t launch_blocks, int64_t launch_threads) {
-  constexpr auto kGemmTail = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_norm_gemm_add);
-  TORCH_CHECK(op >= 0 && op <= kGemmTail, "hip_comms: no op ", op);
+  constexpr auto kLastOp = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_norm_gemm);
+  TORCH_CHECK(op >= 0 && op <= kLastOp, "hip_comms: no op ", op);
   TORCH_CHECK(element_size == 2, "hip_comms: only 2-byte dtypes are built");
-  TORCH_CHECK(cols >= 0 && (cols > 0) == (op == kGemmTail),
-              "hip_comms: cols is the GEMM tail's output columns, and only it has them");
+  TORCH_CHECK(cols >= 0 && (cols > 0) == hip_comms::gemms(static_cast<hip_comms::Op>(op)),
+              "hip_comms: cols is a GEMM op's output columns, and only they have them");
   auto& handle = handle_of(handle_ptr);
   const hip_comms::Input in{rows, hidden, static_cast<int>(element_size), cols,
                             handle.world_size()};
@@ -352,13 +352,13 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
       options_of(quant_bits, kernel, launch_blocks, launch_threads));
 }
 
-// out[:, col0:col0+N] += rms_norm(all_reduce(inp)) @ gemm_weight^T; `workspace` holds the normed
-// rows, inp's shape and dtype.
-void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
-    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
-    torch::Tensor& workspace, int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
-    int64_t launch_threads) {
+namespace {
+// out[:, col0:col0+N] = rms_norm(all_reduce(inp)) @ gemm_weight^T, or += with `add`; `workspace`
+// holds the normed rows, inp's shape and dtype.
+void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, int64_t out_col0,
+                              torch::Tensor& inp, torch::Tensor& norm_weight, double eps,
+                              torch::Tensor& gemm_weight, torch::Tensor& workspace,
+                              const hip_comms::Options& o) {
   check_device_contiguous({&inp, &norm_weight, &workspace});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D");
   const int64_t rows = inp.size(0), hidden = inp.size(1);
@@ -375,12 +375,31 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
               "norm_weight must be 1-D of hidden=", hidden);
   for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight})
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
-  hip_comms::all_reduce_rms_norm_gemm_add(
-      handle_of(handle_ptr),
-      {out.data_ptr(), out.stride(0), static_cast<int>(out_col0), inp.data_ptr(),
-       norm_weight.data_ptr(), static_cast<float>(eps), gemm_weight.data_ptr(), n_cols,
-       workspace.data_ptr(), dtype_of(inp), rows, hidden},
-      options_of(quant_bits, kernel, launch_blocks, launch_threads));
+  const hip_comms::GemmTailArgs a{add, out.data_ptr(), out.stride(0), static_cast<int>(out_col0),
+                                  inp.data_ptr(), norm_weight.data_ptr(), static_cast<float>(eps),
+                                  gemm_weight.data_ptr(), n_cols, workspace.data_ptr(),
+                                  dtype_of(inp), rows, hidden};
+  if (add) hip_comms::all_reduce_rms_norm_gemm_add(handle_of(handle_ptr), a, o);
+  else hip_comms::all_reduce_rms_norm_gemm(handle_of(handle_ptr), a, o);
+}
+}  // namespace
+
+void rocm_comms_all_reduce_rms_norm_gemm(
+    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
+    torch::Tensor& workspace, int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
+    int64_t launch_threads) {
+  all_reduce_rms_norm_gemm(handle_ptr, false, out, out_col0, inp, norm_weight, eps, gemm_weight,
+                           workspace, options_of(quant_bits, kernel, launch_blocks, launch_threads));
+}
+
+void rocm_comms_all_reduce_rms_norm_gemm_add(
+    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
+    torch::Tensor& workspace, int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
+    int64_t launch_threads) {
+  all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
+                           workspace, options_of(quant_bits, kernel, launch_blocks, launch_threads));
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

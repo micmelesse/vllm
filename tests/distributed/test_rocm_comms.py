@@ -1611,17 +1611,18 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
 
 
 # ---------------------------------------------------------------------------------
-# ALL-REDUCE + RMSNORM + GEMM + ADD, judged against the three ops Kimi-K3's latent MoE
-# tail runs: the all-reduce, `vllm.ir.ops.rms_norm`, and `addmm_` into this rank's
-# column shard of the shared output. FULL only: tune declines it today, so only a
-# forced launch reaches it.
+# ALL-REDUCE + RMSNORM + GEMM, WRITTEN OR ADDED, judged against the ops Kimi-K3's latent
+# MoE tail runs: the all-reduce, `vllm.ir.ops.rms_norm`, and `addmm_` into this rank's
+# column shard of the shared output (the add op), or the product written there (the
+# other). FAST: Kimi-K3's decode shape at 4 rows on the one-shot, each op; FULL: the
+# rest.
 # ---------------------------------------------------------------------------------
 
 # (rows, latent, hidden, shard). Example-based: each case is a full eight-process run,
 # so the cases are Kimi-K3's decode tail (latent 3584 -> hidden 7168, a 1/8 shard) at
 # 1, 4 and 16 rows, a shard that is not a multiple of the kernel's column tile, and row
 # counts past one GEMM pass that only the two-shot kernel takes (one-shot declines).
-RMS_NORM_GEMM_ADD_CASES = (
+RMS_NORM_GEMM_CASES = (
     (1, 3584, 7168, 896),
     (4, 3584, 7168, 896),
     (16, 3584, 7168, 896),
@@ -1631,12 +1632,13 @@ RMS_NORM_GEMM_ADD_CASES = (
 )
 
 
-def run_rms_norm_gemm_add_rank(
+def run_rms_norm_gemm_rank(
     ctx: RankContext,
     case: tuple[int, int, int, int],
     shot: Shot,
+    add: bool,
 ) -> tuple[bool, str | None]:
-    """ONE rank: the fused op against the three it replaces, over the whole output."""
+    """ONE rank: the fused op against the ops it replaces, over the whole output."""
     import vllm.ir.ops
 
     rank, world, device = ctx.rank, ctx.world, ctx.device
@@ -1657,18 +1659,26 @@ def run_rms_norm_gemm_add_rank(
         acc += x.to(torch.float32)
     normed = vllm.ir.ops.rms_norm(acc.to(dtype).to(device), norm_w, FUSED_EPS)
     want = shared.clone()
-    want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
+    if add:
+        want.narrow(-1, col0, shard).addmm_(normed, gemm_w.t())
+    else:
+        want.narrow(-1, col0, shard).copy_(normed @ gemm_w.t())
     torch.cuda.synchronize()
 
-    launch = Launch(cast(Kernel, f"{shot}_rms_norm_gemm_add"))
+    op = "rms_norm_gemm_add" if add else "rms_norm_gemm"
+    launch = Launch(cast(Kernel, f"{shot}_{op}"))
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
-    if not comm.should_allreduce_rms_norm_gemm_add(mine, gemm_w, launch):
+    admits = (
+        comm.should_allreduce_rms_norm_gemm_add
+        if add
+        else comm.should_allreduce_rms_norm_gemm
+    )
+    if not admits(mine, gemm_w, launch):
         return False, NO_FUSED_KERNEL
     got = shared.clone()
-    comm.all_reduce_rms_norm_gemm_add(
-        mine, norm_w, FUSED_EPS, gemm_w, got, col0, launch=launch
-    )
+    run = comm.all_reduce_rms_norm_gemm_add if add else comm.all_reduce_rms_norm_gemm
+    run(mine, norm_w, FUSED_EPS, gemm_w, got, col0, launch=launch)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float().cpu()
@@ -1678,22 +1688,36 @@ def run_rms_norm_gemm_add_rank(
     return True, None
 
 
-@pytest.mark.full
-@pytest.mark.parametrize("shot", SHOTS)
-@pytest.mark.parametrize("case", RMS_NORM_GEMM_ADD_CASES)
-def test_all_reduce_rms_norm_gemm_add_matches_the_three_ops_it_replaces(
+RMS_NORM_GEMM_FAST = ((4, 3584, 7168, 896), "all_reduce_pull_one_shot")
+RMS_NORM_GEMM_PARAMS = tuple(
+    pytest.param(
+        case,
+        shot,
+        add,
+        id=f"{'add' if add else 'write'}-{case}-{shot}",
+        marks=[] if (case, shot) == RMS_NORM_GEMM_FAST else [pytest.mark.full],
+    )
+    for add in (False, True)
+    for case in RMS_NORM_GEMM_CASES
+    for shot in SHOTS
+)
+
+
+@pytest.mark.parametrize(("case", "shot", "add"), RMS_NORM_GEMM_PARAMS)
+def test_all_reduce_rms_norm_gemm_matches_the_ops_it_replaces(
     case: tuple[int, int, int, int],
     shot: Shot,
+    add: bool,
     world: int,
     ranks: World,
 ) -> None:
-    """The fused op against all_reduce, rms_norm and addmm_ into a column shard: the
-    shard gets the GEMM added, every other column is left as it was."""
+    """The fused op against all_reduce, rms_norm and the GEMM into a column shard: the
+    shard gets the GEMM written (or added), every other column is left as it was."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    got = ranks.run(run_rms_norm_gemm_add_rank, case=case, shot=shot)
+    got = ranks.run(run_rms_norm_gemm_rank, case=case, shot=shot, add=add)
     if any(err == NO_FUSED_KERNEL for _, err in got):
-        pytest.skip(f"hip declines {shot} all_reduce_rms_norm_gemm_add at {case}")
+        pytest.skip(f"hip declines {shot} rms_norm_gemm (add={add}) at {case}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"

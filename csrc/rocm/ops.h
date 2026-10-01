@@ -98,6 +98,12 @@ void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         double eps, int64_t quant_bits, int64_t kernel,
                                         int64_t launch_blocks, int64_t launch_threads);
 
+void rocm_comms_all_reduce_rms_norm_gemm(
+    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
+    torch::Tensor& workspace, int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
+    int64_t launch_threads);
+
 void rocm_comms_all_reduce_rms_norm_gemm_add(
     fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,

@@ -46,7 +46,7 @@ inline std::string why_not(const Handle& h, Op op, const KernelSpec& k, Input in
   if (k.kernel == Kernel::all_reduce_pull_two_shot && k.threads % (in.world * kWaveSize) != 0)
     return "a two-shot block must be one wave per peer";
   if (o.quant_bits != 16) return "no kernel quantizes yet";
-  if (op == Op::all_reduce_rms_norm_gemm_add && k.threads > gemm_max_threads(kBuild.gemm_lanes))
+  if (gemms(op) && k.threads > gemm_max_threads(kBuild.gemm_lanes))
     return "the GEMM tail's block exceeds what its LDS holds";
   if (scratch_need(k.kernel, in) > h.scratch_bytes())
     return "its two-shot scratch exceeds the scratch (raise scratch_bytes)";

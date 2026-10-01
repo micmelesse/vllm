@@ -48,6 +48,10 @@ constexpr KernelInfo kKernels[] = {
      kBuild.norm_row_packs},
     {Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
      true, kBuild.attn_res_row_packs},
+    {Kernel::all_reduce_pull_one_shot_rms_norm_gemm, Op::all_reduce_rms_norm_gemm, false,
+     kBuild.norm_row_packs},
+    {Kernel::all_reduce_pull_two_shot_rms_norm_gemm, Op::all_reduce_rms_norm_gemm, true,
+     kBuild.norm_row_packs},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 
@@ -61,6 +65,10 @@ static_assert(kernels_in_order(), "kKernels must list every Kernel in its order"
 constexpr const KernelInfo& info(Kernel k) { return kKernels[static_cast<int>(k)]; }
 constexpr Op op_of(Kernel k) { return info(k).op; }
 constexpr bool is_two_shot(Kernel k) { return info(k).two_shot; }
+// A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
+constexpr bool gemms(Op op) {
+  return op == Op::all_reduce_rms_norm_gemm || op == Op::all_reduce_rms_norm_gemm_add;
+}
 
 constexpr int max_row_packs(Kernel k) { return info(k).max_row_packs; }
 constexpr bool has_row_packs(Kernel k) { return max_row_packs(k) > 0; }

@@ -13,7 +13,7 @@
 // Options                 how the caller wants it run: precision, a forced spec, the stream
 // KernelSpec              what runs: a kernel, its grid and block
 // all_reduce, all_reduce_rms_norm (and _add_), all_reduce_add_attn_res_rms_norm,
-// all_reduce_rms_norm_gemm_add        the ops
+// all_reduce_rms_norm_gemm(_add)      the ops
 // why_not(handle, op, input, options)  why a call cannot run, or empty: `admits` for vLLM
 
 #pragma once
@@ -40,6 +40,7 @@ enum class Op : int {
   all_reduce_add_rms_norm          = 2,
   all_reduce_add_attn_res_rms_norm = 3,
   all_reduce_rms_norm_gemm_add     = 4,
+  all_reduce_rms_norm_gemm         = 5,
 };
 
 // Every `__global__` there is, named by its shot and what it fuses. `none`: nothing forced.
@@ -58,6 +59,8 @@ enum class Kernel : int {
   all_reduce_push_two_shot_rms_norm              = 10,
   all_reduce_push_two_shot_add_rms_norm          = 11,
   all_reduce_push_two_shot_add_attn_res_rms_norm = 12,
+  all_reduce_pull_one_shot_rms_norm_gemm         = 13,
+  all_reduce_pull_two_shot_rms_norm_gemm         = 14,
 };
 
 struct KernelSpec {
@@ -121,7 +124,10 @@ struct AttnResArgs {
   bool has_prefix;
 };
 
+// add: out[:, col0:col0+N] += the product (rms_norm_gemm_add, Kimi-K3's latent tail); otherwise
+// it is written (rms_norm_gemm).
 struct GemmTailArgs {
+  bool add;
   void* out;
   int64_t out_stride;
   int out_col0;

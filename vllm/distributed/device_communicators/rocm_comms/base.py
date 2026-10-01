@@ -45,6 +45,7 @@ FusedOp = Literal[
     "all_reduce_rms_norm",
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
+    "all_reduce_rms_norm_gemm",
     "all_reduce_rms_norm_gemm_add",
 ]
 # What `_admits` is asked about: the plain all-reduce, or a fused op.
@@ -111,11 +112,13 @@ class Communicator(ABC):
         "should_allreduce_rms_norm",
         "should_allreduce_add_rms_norm",
         "should_allreduce_add_attn_res_rms_norm",
+        "should_allreduce_rms_norm_gemm",
         "should_allreduce_rms_norm_gemm_add",
         "all_reduce",
         "all_reduce_rms_norm",
         "all_reduce_add_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
+        "all_reduce_rms_norm_gemm",
         "all_reduce_rms_norm_gemm_add",
         "capture",
         "_is_supported",
@@ -379,6 +382,58 @@ class Communicator(ABC):
             quant_bits,
         )
 
+    def should_allreduce_rms_norm_gemm(
+        self,
+        inp: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> bool:
+        """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM
+        written into an output; `gemm_weight` is [N, hidden], and its N shapes the
+        launch."""
+        return (
+            type(self)._all_reduce_rms_norm_gemm
+            is not Communicator._all_reduce_rms_norm_gemm
+            and self.should_allreduce(inp)
+            and gemm_weight.dim() == 2
+            and self._admits(
+                "all_reduce_rms_norm_gemm",
+                inp,
+                launch,
+                quant_bits,
+                gemm_weight.shape[0],
+            )
+        )
+
+    def all_reduce_rms_norm_gemm(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
+        """`out[:, out_col0:out_col0 + N] = rms_norm(all_reduce(inp), norm_weight, eps)
+        @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
+        self._check_capture("all_reduce_rms_norm_gemm")
+        if not self.should_allreduce_rms_norm_gemm(
+            inp, gemm_weight, launch, quant_bits
+        ):
+            raise RuntimeError(
+                self._rejected(
+                    "all_reduce_rms_norm_gemm",
+                    "should_allreduce_rms_norm_gemm",
+                    inp,
+                )
+            )
+        self._all_reduce_rms_norm_gemm(
+            inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
+        )
+
     def should_allreduce_rms_norm_gemm_add(
         self,
         inp: torch.Tensor,
@@ -574,6 +629,22 @@ class Communicator(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
             f"ask should_allreduce_add_attn_res_rms_norm first."
+        )
+
+    def _all_reduce_rms_norm_gemm(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm; "
+            f"ask should_allreduce_rms_norm_gemm first."
         )
 
     def _all_reduce_rms_norm_gemm_add(

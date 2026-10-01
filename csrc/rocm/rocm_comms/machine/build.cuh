@@ -83,7 +83,7 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
       static_cast<int>((hw.lds_bytes - partials - reduce) / (int64_t{b.gemm_rows} * b.pack_bytes));
 
   // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
-  b.gemm_lanes = cal.gemm_tail.lanes_per_col;
+  b.gemm_lanes = cal.gemm_lanes_per_col;
   return b;
 }
 

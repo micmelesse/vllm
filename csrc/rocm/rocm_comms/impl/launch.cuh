@@ -199,7 +199,11 @@ static_assert(max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_no
               max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
                   max_row_packs(Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) &&
               max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add),
+                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add) &&
+              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm) &&
+              max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
+                  max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm),
               "a kernel with its own row builds needs its own case");
 
 inline void launch(Handle& h, const KernelSpec& k, const AttnResArgs& a, hipStream_t s) {
@@ -263,6 +267,10 @@ inline void launch(Handle& h, const KernelSpec& k, const GemmTailArgs& a, hipStr
             return run(all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, L, R>);
           case Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add:
             return run(all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, L, R>);
+          case Kernel::all_reduce_pull_one_shot_rms_norm_gemm:
+            return run(all_reduce_pull_one_shot_rms_norm_gemm<T, NG, L, R>);
+          case Kernel::all_reduce_pull_two_shot_rms_norm_gemm:
+            return run(all_reduce_pull_two_shot_rms_norm_gemm<T, NG, L, R>);
           default: impl::not_this_ops(k.kernel);
         }
       });

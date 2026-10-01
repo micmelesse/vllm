@@ -39,6 +39,7 @@ _OP_WIRE: Mapping[AdmitOp, int] = {
     "all_reduce_add_rms_norm": 2,
     "all_reduce_add_attn_res_rms_norm": 3,
     "all_reduce_rms_norm_gemm_add": 4,
+    "all_reduce_rms_norm_gemm": 5,
 }
 
 
@@ -263,6 +264,31 @@ class HipCommunicator(Communicator):
             *launch_wire(launch),
         )
         return out
+
+    def _all_reduce_rms_norm_gemm(
+        self,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        out_col0: int,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
+        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm(
+            self._handle,
+            out,
+            out_col0,
+            self._as_input(inp),
+            norm_weight,
+            eps,
+            gemm_weight,
+            # The normed rows, which the GEMM reads over and over.
+            torch.empty_like(inp),
+            quant_bits,
+            *launch_wire(launch),
+        )
 
     def _all_reduce_rms_norm_gemm_add(
         self,
