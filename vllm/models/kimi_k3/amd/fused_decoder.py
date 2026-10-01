@@ -8,7 +8,6 @@ raises, never the unfused ops. Not a fusion pass: Kimi-K3 is not torch.compiled.
 
 from typing import Any
 
-import vllm.envs as envs
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.models.kimi_k3.amd.linear import KimiDecoderLayer
 
@@ -21,11 +20,8 @@ def comm() -> Any | None:
     return None if backend is None or backend.disabled else backend
 
 
-def layer_class() -> type[KimiDecoderLayer]:
-    """The decoder layer VLLM_KIMI_K3_FUSED_DECODER names."""
-    path = envs.VLLM_KIMI_K3_FUSED_DECODER
-    if path == "none":
-        return KimiDecoderLayer
+def layer_class(path: str) -> type[KimiDecoderLayer]:
+    """The fused decoder layer of the path VLLM_KIMI_K3_FUSED_DECODER names."""
     if comm() is None:
         raise RuntimeError(
             f"VLLM_KIMI_K3_FUSED_DECODER={path} needs the rocm_comms backend live "

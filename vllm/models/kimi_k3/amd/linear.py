@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -699,11 +700,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # VLLM_KIMI_K3_FUSED_DECODER: a decoder layer with its all-reduces fused into
-        # the ops that consume them, one class per fusion path.
-        from vllm.models.kimi_k3.amd import fused_decoder
+        # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant
+        # whose all-reduces are fused into the ops that consume them.
+        layer_cls: type[KimiDecoderLayer] = KimiDecoderLayer
+        if envs.VLLM_KIMI_K3_FUSED_DECODER != "none":
+            from vllm.models.kimi_k3.amd import fused_decoder
 
-        layer_cls = fused_decoder.layer_class()
+            layer_cls = fused_decoder.layer_class(envs.VLLM_KIMI_K3_FUSED_DECODER)
 
         def get_layer(prefix: str):
             return layer_cls(config, vllm_config, prefix)
