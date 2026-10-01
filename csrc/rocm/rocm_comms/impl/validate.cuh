@@ -39,8 +39,7 @@ inline std::string why_not(const Handle& h, Op op, const KernelSpec& k, Input in
   if (in.hidden * in.elem_bytes % kPackBytes != 0)
     return "the row is not a whole number of 16-byte packs";
   if (op_of(k.kernel) != op) return "the forced kernel is not this op's";
-  if (has_row_packs(k.kernel) &&
-      row_packs_for(k.kernel, in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
+  if (has_row_packs(k.kernel) && k.row_packs == 0)
     return "the row is wider than the kernel's widest build holds at this block (max_row_packs)";
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (k.kernel == Kernel::all_reduce_pull_two_shot && k.threads % (in.world * kWaveSize) != 0)
@@ -58,10 +57,28 @@ inline std::string why_not(const Handle& h, Op op, Input in, const Options& o) {
   return why_not(h, op, select(op, in, o), in, o);
 }
 
+// Why the kernel `k` names for this call cannot hold its whole grid resident, or empty: only the
+// compiled kernel knows what it uses, so `why_not` before a call cannot ask.
+template <typename Args>
+std::string why_not_resident(const Handle& h, const KernelSpec& k, const Args& a) {
+  std::string why;
+  with_kernel(h, k, a, [&](auto kernel, const auto&) {
+    const Resources r  = resources_of(kernel);
+    const int resident = resident_blocks(kTarget, r, k.threads);
+    if (k.grid > resident)
+      why = "its grid of " + std::to_string(k.grid) + " exceeds the " + std::to_string(resident) +
+            " blocks it holds resident (" + std::to_string(r.vgprs) + " VGPRs, " +
+            std::to_string(r.lds_bytes) + " B of LDS at " + std::to_string(k.threads) +
+            " threads)";
+  });
+  return why;
+}
+
 template <typename Args>
 void validate(const Handle& h, const KernelSpec& k, const Args& a, const Options& o) {
-  const Input in        = input_of(h, a);
-  const std::string why = why_not(h, op_of(a), k, in, o);
+  const Input in  = input_of(h, a);
+  std::string why = why_not(h, op_of(a), k, in, o);
+  if (why.empty()) why = why_not_resident(h, k, a);
   if (!why.empty())
     throw std::runtime_error("hip_comms: op " + std::to_string(static_cast<int>(op_of(a))) +
                              " over [" + std::to_string(in.rows) + ", " +

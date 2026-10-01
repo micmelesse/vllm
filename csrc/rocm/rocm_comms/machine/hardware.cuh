@@ -42,6 +42,7 @@ struct Hardware {
   int max_load_bytes;  // the widest vector load or store a lane issues
   int arch_vgprs;      // vector registers an instruction names (v0 up)
   int acc_vgprs;       // accumulation registers beside them (a0 up), where the compiler spills first
+  int vgpr_granule;    // a wave's vector registers are allocated in multiples of it
 };
 
 // gfx950, AMD Instinct MI355X (MI350X is the same). Sources: `rocminfo` on n11 (2026-09-29, all 8
@@ -69,6 +70,7 @@ constexpr Hardware kGfx950 = {
     16,                  // max_load_bytes (global_load_dwordx4; CDNA4 ISA guide)
     256,                 // arch_vgprs
     256,                 // acc_vgprs
+    8,                   // vgpr_granule (LLVM AMDGPUUsage, gfx90a and later, wave64)
 };
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0, "every XCD has the same CUs");
 
@@ -96,6 +98,7 @@ constexpr Hardware kGfx942 = {
     16,                  // max_load_bytes (global_load_dwordx4; CDNA3 ISA guide)
     256,                 // arch_vgprs
     256,                 // acc_vgprs
+    8,                   // vgpr_granule (LLVM AMDGPUUsage, gfx90a and later, wave64)
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
 
@@ -244,7 +247,7 @@ constexpr int kMaxComputeUnits =
 
 // THE MOST BLOCKS RESIDENT AT ONCE ON ANY TARGET BUILT: every CU full of one-wave blocks, so p2p's
 // signal block never rules out a grid. Whether one kernel's grid is resident is its occupancy,
-// which only the compiled kernel knows: launch asks HIP (impl::start).
+// which only the compiled kernel knows (build.cuh's resident_blocks, checked by validate).
 constexpr int resident_waves(const Hardware& hw) { return hw.compute_units * hw.max_waves_per_cu; }
 constexpr int kMaxResidentBlocks = resident_waves(kGfx950) > resident_waves(kGfx942)
                                        ? resident_waves(kGfx950)

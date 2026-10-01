@@ -38,9 +38,12 @@ constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
-// `k` at `blocks` x `threads`, its grid cut to the rows where it gives each block a row.
+// `k` at `blocks` x `threads`, its grid cut to the rows where it gives each block a row, and a
+// row kernel's build the smallest that holds the row at that block.
 constexpr KernelSpec spec_of(Kernel k, Input in, int blocks, int threads) {
-  return {k, grid_of(k, blocks, in.rows, in.world), threads};
+  const int64_t packs = in.hidden * in.elem_bytes / kPackBytes;
+  return {k, grid_of(k, blocks, in.rows, in.world), threads,
+          has_row_packs(k) ? row_packs_for(k, packs, threads) : 0};
 }
 
 // =================================================================================================
@@ -177,18 +180,15 @@ constexpr KernelSpec tune(Op op, Input in, const Hardware& hw, const Calibration
 // EVERY TUNED SPEC IS A KERNEL THAT FITS, for every op at the smallest input and a large one: a
 // tune_<op> never declines (a fusion that is on runs its fused op), and a spec past a capability is
 // a compile error, not a kernel that overruns its signal slots or register arrays.
-constexpr bool fits(const KernelSpec& k, Input in) {
-  if (k.kernel == Kernel::none) return false;
+constexpr bool fits(const KernelSpec& k) {
   if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
-  if (has_row_packs(k.kernel) &&
-      row_packs_for(k.kernel, in.hidden * in.elem_bytes / kPackBytes, k.threads) == 0)
-    return false;
+  if (has_row_packs(k.kernel) && k.row_packs == 0) return false;
   return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
 }
 constexpr bool tuned_specs_fit() {
   for (int op = 0; op <= static_cast<int>(Op::all_reduce_rms_norm_gemm); ++op)
     for (const Input in : {Input{1, 8, 2, 0, 2}, Input{4096, 7168, 2, 0, p2p::kMaxRanks}})
-      if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration), in)) return false;
+      if (!fits(tune(static_cast<Op>(op), in, kTarget, kTargetCalibration))) return false;
   return true;
 }
 static_assert(tuned_specs_fit(), "a tune_<op> declines, or exceeds a kernel capability");
@@ -221,9 +221,8 @@ inline Input input_of(const Handle& h, const GemmTailArgs& a) {
 
 // What runs: tune's spec, or the forced kernel at the forced grid and block.
 inline KernelSpec select(Op op, Input in, const Options& o) {
-  const KernelSpec& f = o.forced;
-  if (f.kernel == Kernel::none) return tune(op, in, kTarget, kTargetCalibration);
-  return spec_of(f.kernel, in, f.grid, f.threads);
+  if (!o.forced) return tune(op, in, kTarget, kTargetCalibration);
+  return spec_of(o.forced->kernel, in, o.forced->grid, o.forced->threads);
 }
 
 template <typename Args>

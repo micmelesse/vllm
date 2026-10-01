@@ -72,7 +72,7 @@ hip_comms::Options options_of(int64_t quant_bits, int64_t kernel, int64_t blocks
   TORCH_CHECK(quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
               "quant_bits must be 16 (exact), 8 or 4");
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (kernel < 0) return {static_cast<int>(quant_bits), {Kernel::none, 0, 0}, stream};
+  if (kernel < 0) return {static_cast<int>(quant_bits), std::nullopt, stream};
   TORCH_CHECK(kernel < hip_comms::kNumKernels, "hip_comms: no kernel ", kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::p2p::kMaxBlocks, "]");
@@ -81,7 +81,8 @@ hip_comms::Options options_of(int64_t quant_bits, int64_t kernel, int64_t blocks
               "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
               hip_comms::kMaxThreads);
   return {static_cast<int>(quant_bits),
-          {static_cast<Kernel>(kernel), static_cast<int>(blocks), static_cast<int>(threads)},
+          hip_comms::Forced{static_cast<Kernel>(kernel), static_cast<int>(blocks),
+                            static_cast<int>(threads)},
           stream};
 }
 
