@@ -49,23 +49,58 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
-  //    and leave the out rows and (kAdd) the residual rows in this rank's scratch.
+  //    and leave the out rows and (kAdd) the residual rows in this rank's scratch. PIPELINED: the
+  //    next row's loads go out before this row's reduction and norm, so a block's compute runs
+  //    under its next round trip instead of between them (a block had ~14 rows at 4096 tokens,
+  //    each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
+  V raw[ngpus][kRowPacks];
+  // Row `row`'s packs from every rank; clamped to the last row, so the load after a block's final
+  // row is real and unconditional (a load under a runtime `if` is never hoisted).
+  const auto load = [&](int row) {
+    const int64_t base = int64_t{min(row, last - 1)} * packs;
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r)
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k) raw[r][k] = read(r, base + f.at[k]);
+  };
+  // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
+  // waiting on one issued after the peers' would wait on the peers' too.
+  vec<W, NL> w[kRowPacks];
+#pragma unroll
+  for (int k = 0; k < kRowPacks; ++k) w[k] = wv[f.at[k]];
+  if (first + static_cast<int>(blockIdx.x) < last) load(first + blockIdx.x);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
-    V sum[kRowPacks];
-    peers_reduce<T, ngpus>(read, row, packs, f, sum);
-    block_stamp(2);
-    // The norm, rounding as the reference does (see the one-shot kernel):
+    // The sum over the ranks, in rank order in fp32, rounded once to T (as peers_reduce).
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      thread_unpack<T>(sum[k], s[k]);
+      float acc[NL];
+#pragma unroll
+      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(raw[0][k].d[j]);
+#pragma unroll
+      for (int r = 1; r < ngpus; ++r)
+#pragma unroll
+        for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(raw[r][k].d[j]);
+#pragma unroll
+      for (int j = 0; j < NL; ++j) s[k][j] = static_cast<float>(static_cast<T>(acc[j]));
+    }
+    V res[kRowPacks];
+    if constexpr (kAdd) {
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.at[k]];
+    }
+    load(row + gridDim.x);
+    block_stamp(2);
+    // The norm, rounding as the reference does (see the one-shot kernel):
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) {
       if constexpr (kAdd) {
         float r[NL];
-        thread_unpack<T>(res_in[base + f.at[k]], r);
+        thread_unpack<T>(res[k], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
         if (f.in[k] != 0.0f)
@@ -78,12 +113,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      const vec<W, NL> w = wv[f.at[k]];
       V normed;
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
+        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
       }
       if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], normed);
     }
