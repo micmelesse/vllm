@@ -144,18 +144,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
   //    kAdd: the owners' rows are the new residual; each is normed here by its owner's scale. Every
-  //    thread loads the 8 scales with its 8 packs, so both arrive in the one round trip (a wave's
-  //    lanes read one address, one request a wave); thread 0 bringing them through LDS behind a
-  //    barrier cost every row a second round trip (2026-10-01T02-24-09Z).
+  //    thread loads the 8 scales after its 8 packs, all in flight before any wait (a wave's lanes
+  //    read one scale address: one request a wave). Left to the compiler, the scales were loaded
+  //    and waited on before the packs were issued, two round trips a row (ISA
+  //    2026-10-01T02-33-11Z).
+  const auto gathered = [&](int r, int64_t i) { return p2p::read_scratch(peers[r], i); };
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus], sc[ngpus];
+      const PeerPacks<T, ngpus> rows_of = peers_load<T, ngpus>(gathered, at);
+      V sc[ngpus];
+      if constexpr (kAdd) {
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        got[r] = p2p::read_scratch(peers[r], at);
-        if constexpr (kAdd) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
+        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
       }
+      V got[ngpus];
+#pragma unroll
+      for (int r = 0; r < ngpus; ++r) got[r] = rows_of.p[r][0];
       vec<W, NL> w;
       if constexpr (kAdd) w = wv[i];
 #pragma unroll
