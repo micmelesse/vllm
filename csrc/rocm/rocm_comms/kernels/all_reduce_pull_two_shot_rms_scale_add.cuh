@@ -58,29 +58,15 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_s
 
   // 2. This rank's rows, finished: each (row, slice) from every rank, the latent's sum of squares
   //    over the block, then the slice into this rank's scratch, at the row's place among its own.
-  //    PIPELINED: the next (row, slice)'s loads go out before this one's reduction and norm, so a
-  //    block's compute runs under its next round trip instead of between them (as the add-norm
-  //    two-shot's rows).
   const int first_row = p.rank * slice_rows;
-  const int items     = rows_of(p.rank) * splits;
-  using Packs         = PeerPacks<T, ngpus, kRowPacks>;
-  struct Loads {
-    Packs sh, pj, lt;
-  };
-  const auto load = [&](int w) {
+  for (int w = blockIdx.x; w < rows_of(p.rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
     const Fragment<kRowPacks> fh = slice_of(w);
-    return Loads{peers_load<T, ngpus>(shared, row, packs, fh),
-                 peers_load<T, ngpus>(proj, row, packs, fh),
-                 peers_load<T, ngpus>(latent, row, packs, fl)};
-  };
-  // ONE (ROW, SLICE): the next one's loads into `next`, then this one's sums (its wait covers only
-  // its own, older, loads).
-  const auto finish = [&](int w, const Loads& cur, Loads& next) {
-    if (w + static_cast<int>(gridDim.x) < items) next = load(w + gridDim.x);
-    const Fragment<kRowPacks> fh = slice_of(w);
+    const auto sh                = peers_load<T, ngpus>(shared, row, packs, fh);
+    const auto pj                = peers_load<T, ngpus>(proj, row, packs, fh);
+    const auto lt                = peers_load<T, ngpus>(latent, row, packs, fl);
     V l_sum[kRowPacks];
-    peers_reduce(cur.lt, l_sum);
+    peers_reduce(lt, l_sum);
     float l[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(l_sum[k], l[k]);
@@ -89,29 +75,19 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_s
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
     V s_sum[kRowPacks], p_sum[kRowPacks];
-    peers_reduce(cur.sh, s_sum);
-    peers_reduce(cur.pj, p_sum);
+    peers_reduce(sh, s_sum);
+    peers_reduce(pj, p_sum);
     const int64_t at = int64_t{w / splits} * hidden_packs;
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      float sv[NL], q[NL];
-      thread_unpack<T>(s_sum[k], sv);
+      float s[NL], q[NL];
+      thread_unpack<T>(s_sum[k], s);
       thread_unpack<T>(p_sum[k], q);
       V r;
 #pragma unroll
-      for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(sv[j] + q[j] * scale);
+      for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
       if (fh.in[k] != 0.0f) p2p::write_scratch(own_scratch, at + fh.at[k], r);
     }
-  };
-  // PING-PONG: two buffers that trade roles each (row, slice), so none copies its loads into the
-  // other.
-  Loads a, b;
-  int w = blockIdx.x;
-  if (w < items) a = load(w);
-  for (; w < items; w += 2 * gridDim.x) {
-    finish(w, a, b);
-    if (w + static_cast<int>(gridDim.x) >= items) break;
-    finish(w + gridDim.x, b, a);
   }
 
   block_stamp(3);
