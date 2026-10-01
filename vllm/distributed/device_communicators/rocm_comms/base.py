@@ -491,42 +491,40 @@ class Communicator(ABC):
     def should_allreduce_rms_scale_add(
         self,
         inp: torch.Tensor,
-        latent: int,
+        out: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,
     ) -> bool:
-        """As `should_allreduce_rms_norm`, for the one-all-reduce latent MoE tail: `inp`
-        is [rows, 2 * hidden + latent], [shared | projected | latent]."""
+        """As `should_allreduce_rms_norm`, for writing `out` [rows, hidden] from `inp`'s
+        row [shared | projected | latent], the widths out's, out's and the rest."""
         return (
             type(self)._all_reduce_rms_scale_add
             is not Communicator._all_reduce_rms_scale_add
             and self.should_allreduce(inp)
-            and inp.dim() == 2
-            and 0 < latent < inp.shape[1]
-            and (inp.shape[1] - latent) % 2 == 0
+            and out.dim() == 2
             and self._admits(
-                "all_reduce_rms_scale_add", inp, launch, quant_bits, latent
+                "all_reduce_rms_scale_add", inp, launch, quant_bits, out.shape[1]
             )
         )
 
     def all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
-        latent: int,
+        out: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> torch.Tensor:
-        """`s = all_reduce(inp)` split [shared | projected | latent], then `shared +
-        projected * rsqrt(mean(latent^2) + eps)` in one kernel: [rows, hidden]."""
+    ) -> None:
+        """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
+        + projected * rsqrt(mean(latent^2) + eps)` in one kernel."""
         self._check_capture("all_reduce_rms_scale_add")
-        if not self.should_allreduce_rms_scale_add(inp, latent, launch, quant_bits):
+        if not self.should_allreduce_rms_scale_add(inp, out, launch, quant_bits):
             raise RuntimeError(
                 self._rejected(
                     "all_reduce_rms_scale_add", "should_allreduce_rms_scale_add", inp
                 )
             )
-        return self._all_reduce_rms_scale_add(inp, latent, eps, launch, quant_bits)
+        self._all_reduce_rms_scale_add(inp, out, eps, launch, quant_bits)
 
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
@@ -709,11 +707,11 @@ class Communicator(ABC):
     def _all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
-        latent: int,
+        out: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> torch.Tensor:
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms scale + add; "
             f"ask should_allreduce_rms_scale_add first."
@@ -729,7 +727,7 @@ class Communicator(ABC):
     ) -> bool:
         """Whether the backend runs `op` (the plain all-reduce, or a fused op) over
         `inp`, at `launch` if given and at `quant_bits` precision; `cols` is the GEMM
-        tail's output columns or the scale-add's latent (0 for every other op). No
+        tail's or the scale-add's output columns (0 for every other op). No
         limit unless the backend has one, no launch to choose and no lossy kernel."""
         self._refuse_launch(launch)
         self._refuse_lossy(quant_bits)

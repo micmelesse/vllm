@@ -229,7 +229,7 @@ class HipCommunicator(Communicator):
         in registers at that kernel's width, and its scratch fits; and an eager input
         the peers cannot read fits the staging it is copied into (a no, where the copy
         would raise). The plain all-reduce is one flat row, as C++ launches it; `cols`
-        is the GEMM tail's output columns or the scale-add's latent."""
+        is the GEMM tail's or the scale-add's output columns."""
         nbytes = inp.numel() * inp.element_size()
         if not self._visible_to_peers(inp) and nbytes > self._staging.numel():
             return False
@@ -323,22 +323,19 @@ class HipCommunicator(Communicator):
     def _all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
-        latent: int,
+        out: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> torch.Tensor:
-        out = inp.new_empty(inp.shape[0], (inp.shape[1] - latent) // 2)
+    ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
             self._handle,
             out,
             self._as_input(inp),
-            latent,
             eps,
             quant_bits,
             *launch_wire(launch),
         )
-        return out
 
     def _all_reduce_add_attn_res_rms_norm(
         self,

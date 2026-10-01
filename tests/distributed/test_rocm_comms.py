@@ -1754,9 +1754,10 @@ def run_rms_scale_add_rank(
 
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
-    if not comm.should_allreduce_rms_scale_add(mine, latent):
+    got = torch.empty(rows, hidden, dtype=dtype, device=device)
+    if not comm.should_allreduce_rms_scale_add(mine, got):
         return False, NO_FUSED_KERNEL
-    got = comm.all_reduce_rms_scale_add(mine, latent, FUSED_EPS)
+    comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float()
