@@ -468,43 +468,43 @@ class KimiMLAAttention(nn.Module):
 from vllm.models.kimi_k3.amd.decoder import KimiDecoderLayer  # noqa: E402
 
 
+def pick_layer(fusion: str) -> type[nn.Module]:
+    """The fused decoder layer VLLM_KIMI_K3_FUSED_DECODER names: each its own
+    file, a copy of decoder.py's layer with that fusion's change. It runs its
+    fused ops or raises, never the unfused ops."""
+    backend = (
+        getattr(get_tp_group().device_communicator, "rocm_comm", None)
+        if get_tensor_model_parallel_world_size() > 1
+        else None
+    )
+    if backend is None or backend.disabled:
+        raise RuntimeError(
+            f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs the rocm_comms backend "
+            "live with TP above one"
+        )
+    if fusion == "norm":
+        from vllm.models.kimi_k3.amd.fused_decoder_norm import KimiDecoderLayerNorm
+
+        return KimiDecoderLayerNorm
+    if fusion == "attn_res":
+        from vllm.models.kimi_k3.amd.fused_decoder_attn_res import (
+            KimiDecoderLayerAttnRes,
+        )
+
+        return KimiDecoderLayerAttnRes
+    if fusion == "one_ar":
+        from vllm.models.kimi_k3.amd.fused_decoder_one_ar import (
+            KimiDecoderLayerOneAR,
+        )
+
+        return KimiDecoderLayerOneAR
+    raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={fusion} names no layer")
+
+
 class KimiLinearModel(nn.Module, EagleModelMixin):
     # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant whose
     # all-reduces are fused into the ops that consume them.
     layer_cls: type[nn.Module] = KimiDecoderLayer
-
-    @staticmethod
-    def _pick_layer(fusion: str) -> type[nn.Module]:
-        """The fused decoder layer VLLM_KIMI_K3_FUSED_DECODER names: each its own
-        file, a copy of decoder.py's layer with that fusion's change. It runs its
-        fused ops or raises, never the unfused ops."""
-        backend = (
-            getattr(get_tp_group().device_communicator, "rocm_comm", None)
-            if get_tensor_model_parallel_world_size() > 1
-            else None
-        )
-        if backend is None or backend.disabled:
-            raise RuntimeError(
-                f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs the rocm_comms backend "
-                "live with TP above one"
-            )
-        if fusion == "norm":
-            from vllm.models.kimi_k3.amd.fused_decoder_norm import KimiDecoderLayerNorm
-
-            return KimiDecoderLayerNorm
-        if fusion == "attn_res":
-            from vllm.models.kimi_k3.amd.fused_decoder_attn_res import (
-                KimiDecoderLayerAttnRes,
-            )
-
-            return KimiDecoderLayerAttnRes
-        if fusion == "one_ar":
-            from vllm.models.kimi_k3.amd.fused_decoder_one_ar import (
-                KimiDecoderLayerOneAR,
-            )
-
-            return KimiDecoderLayerOneAR
-        raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={fusion} names no layer")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -524,7 +524,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         if envs.VLLM_KIMI_K3_FUSED_DECODER != "none":
-            self.layer_cls = self._pick_layer(envs.VLLM_KIMI_K3_FUSED_DECODER)
+            self.layer_cls = pick_layer(envs.VLLM_KIMI_K3_FUSED_DECODER)
 
         def get_layer(prefix: str):
             return self.layer_cls(config, vllm_config, prefix)
