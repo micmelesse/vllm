@@ -155,9 +155,10 @@ DINLINE void barrier(const DevComm& p) {
 // against a rank's Signals (buffers.cuh); a rank's data buffers are ordered only by `barrier`.
 // =================================================================================
 
-// WHO A BARRIER WAITS FOR: this block and the same block on every rank, or every block of this
-// rank.
-enum class Among { peers, grid };
+// WHO A BARRIER WAITS FOR: this block and the same block on every rank (peers), every block of
+// this rank (grid), or every block of every rank (world: the grid, then one exchange among the
+// ranks, so after it any block may read what any block on any rank wrote before it).
+enum class Among { peers, grid, world };
 // WHAT HOLDS ONCE IT IS PASSED: every peer has launched (so its input is ready to read); what this
 // side wrote before is visible to the other side after; every peer is done reading this rank (so
 // its buffers may be reused). Among the grid, only `visible` means anything.
@@ -168,9 +169,11 @@ enum class Ensure { launched, visible, read };
 template <int ngpus, Among kAmong, Ensure kEnsure>
 DINLINE void barrier(const DevComm& p) {
   static_assert(kAmong == Among::peers || kEnsure == Ensure::visible,
-                "a grid barrier only makes this rank's writes visible to its other blocks");
+                "a grid or world barrier is a visibility barrier");
   if constexpr (kAmong == Among::grid) {
     impl::barrier<ngpus, false>(p);
+  } else if constexpr (kAmong == Among::world) {
+    impl::barrier<ngpus, true>(p);
   } else {
     impl::skew(p);
     impl::pair_blocks<ngpus, kEnsure == Ensure::visible>(p, kEnsure == Ensure::launched);

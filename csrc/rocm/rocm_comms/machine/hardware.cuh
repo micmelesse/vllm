@@ -120,6 +120,7 @@ struct NormCalibration {
   Launch one_shot;
   Launch push;
   Launch pull;
+  int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
 };
 
 // AttnRes: one-shot, then the push two-shot, then the pull two-shot (both split columns).
@@ -211,6 +212,11 @@ constexpr Calibration kGfx950Calibration = {
         // about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7
         // at the 36 it had, the row-split norm's (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
         .pull = {192, 512},
+        // ITS REDUCE-SCATTER ON FEWER: reads queue behind the links past a few dozen blocks, while
+        // AttnRes is compute a row and wants the whole grid. At 4096 tokens the reduce-scatter
+        // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
+        // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
+        .pull_reduce_blocks = 32,
     },
     .rms_norm_gemm = {
         // Not swept: rms_norm_gemm_add's.

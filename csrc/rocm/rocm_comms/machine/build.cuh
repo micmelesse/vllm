@@ -65,6 +65,7 @@ struct Build {
   int gemm_chunk;           // the GEMM tail's K-chunk staged in LDS, in packs
   int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
   int attn_res_sources;     // AttnRes's sources a block_reduce, the one build of it
+  int attn_res_reduce_blocks;  // its pull two-shot's blocks that run the reduce-scatter
 };
 
 constexpr Build derive(const Hardware& hw, const Calibration& cal) {
@@ -113,6 +114,7 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
   b.gemm_lanes = cal.gemm_lanes_per_col;
   b.attn_res_sources = cal.attn_res_sources_per_reduce;
+  b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
   return b;
 }
 
