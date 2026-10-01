@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-#include "../target/build.cuh"
+#include "../machine/build.cuh"
 
 #define DINLINE __device__ __forceinline__
 
@@ -25,7 +25,7 @@ struct __align__(sizeof(T) * N) vec {
   T d[N];
 };
 
-// A PACK: kPackBytes (target/build.cuh: the widest load, 8 bf16), the unit every kernel loads,
+// A PACK: kPackBytes (machine/build.cuh: the widest load, 8 bf16), the unit every kernel loads,
 // sums and stores in. `num_packs` counts them.
 
 template <typename T>

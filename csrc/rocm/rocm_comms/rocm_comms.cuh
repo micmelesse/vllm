@@ -8,7 +8,7 @@
 //   launch(handle, spec, args, stream)            runs it; decides nothing (impl/launch.cuh)
 //
 // Handle                  the state across calls: the peers' memory, mapped once (p2p's Group)
-// Input                   the workload a call is: its shape and group (target/ says the rest)
+// Input                   the workload a call is: its shape and group (machine/ says the rest)
 // AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs   one op's inputs and outputs
 // Options                 how the caller wants it run: precision, a forced spec, the stream
 // KernelSpec              what runs: a kernel, its grid and block
@@ -24,8 +24,8 @@
 #include <string>
 
 #include "p2p/p2p.cuh"
-#include "target/build.cuh"
-#include "target/hardware.cuh"
+#include "machine/build.cuh"
+#include "machine/hardware.cuh"
 
 namespace hip_comms {
 

@@ -3,7 +3,7 @@
 //
 // SELECT, THE ONLY CHOICE: `tune(op, input, hw, cal)` splits on the op and calls its own
 // `tune_<op>`, which picks the kernel AND its grid and block from the input, the hardware's
-// documented facts and what was measured on it (target/hardware.cuh), one rule in one place, with
+// documented facts and what was measured on it (machine/hardware.cuh), one rule in one place, with
 // the sweep it came from written beside it. `select` is tune, or the caller's forced spec.
 
 #pragma once

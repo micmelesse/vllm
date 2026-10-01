@@ -11,7 +11,7 @@
 #error "include common/common.cuh, common's one interface, not its parts"
 #endif
 
-#include "../target/build.cuh"
+#include "../machine/build.cuh"
 #include "reduce.cuh"
 #include "utils.cuh"
 
@@ -32,7 +32,7 @@ DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const F
   return d;
 }
 
-// kGemmRows and kGemmChunk, the rows a pass and the K-chunk staged in LDS, are target/build.cuh's.
+// kGemmRows and kGemmChunk, the rows a pass and the K-chunk staged in LDS, are machine/build.cuh's.
 // Its LDS: the staged chunk and a norm's block_reduce, plus one [kGemmRows][tile] float partial per
 // wave, tile = kWaveSize / lanes columns. The device decides how many waves that allows.
 constexpr int64_t kGemmLdsFixed =
