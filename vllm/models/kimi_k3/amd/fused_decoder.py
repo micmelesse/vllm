@@ -41,4 +41,8 @@ def layer_class() -> type[KimiDecoderLayer]:
         )
 
         return KimiDecoderLayerAttnRes
+    if path == "one_ar":
+        from vllm.models.kimi_k3.amd.fused_decoder_one_ar import KimiDecoderLayerOneAR
+
+        return KimiDecoderLayerOneAR
     raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={path} names no fused decoder")
