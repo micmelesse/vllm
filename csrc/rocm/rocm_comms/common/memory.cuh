@@ -98,11 +98,15 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
 // each pack's loads wait on the one before.
 template <typename T, int ngpus, int K, typename Read>
 DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const Fragment<K>& f) {
+  // A pack position at a time, every source's for it: the address is computed once a position (the
+  // other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z).
   PeerPacks<T, ngpus, K> out;
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r)
+  for (int k = 0; k < K; ++k) {
+    const int64_t i = int64_t{row} * packs + f.at[k];
 #pragma unroll
-    for (int k = 0; k < K; ++k) out.p[r][k] = read(r, int64_t{row} * packs + f.at[k]);
+    for (int r = 0; r < ngpus; ++r) out.p[r][k] = read(r, i);
+  }
   return out;
 }
 
