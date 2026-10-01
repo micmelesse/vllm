@@ -34,9 +34,8 @@ void run(Handle& h, const Kernel& k, const Args& a, const p2p::DevComm& p, hipSt
 
 }  // namespace impl
 
-// THE PLAIN ALL-REDUCE STAGES AN EAGER INPUT ITSELF, a pass at a time, so it takes any size.
 inline void launch(Handle& h, const Kernel& k, const AllReduceArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, a.bytes, s, /*stages=*/true), s);
+  impl::run(h, k, a, h.dev_comm(a.inp, a.bytes, s), s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const NormArgs& a, hipStream_t s) {

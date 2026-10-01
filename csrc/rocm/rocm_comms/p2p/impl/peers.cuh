@@ -60,10 +60,6 @@ struct DevComm {
   int64_t input_packs;         // 16-byte packs of the input
   int64_t scratch_packs;       // of each rank's scratch
   uint64_t timeout_ticks;      // a wait longer than this traps
-  // AN EAGER INPUT THE KERNEL STAGES: this rank's own, which it copies into its staging (what the
-  // peers read, `inputs`) a pass at a time; null when the peers read the input in place.
-  const void* local;
-  int64_t stage_packs;         // 16-byte packs the staging holds: a pass of a staged input
 };
 
 }  // namespace hip_comms::p2p

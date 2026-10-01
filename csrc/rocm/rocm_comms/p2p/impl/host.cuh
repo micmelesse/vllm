@@ -157,22 +157,17 @@ class Group {
     pending_slots_.clear();
   }
 
-  // What a launch over `input` (`bytes` long) on `stream` passes to its kernel. `stages`: the
-  // kernel copies an eager input into the staging itself, a pass at a time (any size); otherwise
-  // it is copied here, whole, before the launch.
-  DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream, bool stages = false) {
+  // What a launch over `input` (`bytes` long) on `stream` passes to its kernel.
+  DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream) {
     DevComm p     = dev_comm();
-    p.inputs      = slot_for(const_cast<void*>(input), bytes, stream, stages);
+    p.inputs      = slot_for(const_cast<void*>(input), bytes, stream);
     p.input_packs = bytes / 16;
-    // Read through the staging and not the staging itself: the kernel copies it in.
-    if (stages && input != staging() && p.inputs == registered_.at(staging())) p.local = input;
     return p;
   }
 
   // A launch with no input: only the signals, for a kernel that moves no data.
   DevComm dev_comm() const {
-    return DevComm{rank_,         nullptr, signals_, self_signal_, 0, scratch_bytes_ / 16,
-                   timeout_ticks_, nullptr,  staging_bytes_ / 16};
+    return DevComm{rank_, nullptr, signals_, self_signal_, 0, scratch_bytes_ / 16, timeout_ticks_};
   }
   int rank() const { return rank_; }
   // The first of `n` flag values for `peer`, the rest reserved: flags only grow, so each use starts
@@ -184,9 +179,9 @@ class Group {
   }
 
  private:
-  // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's,
-  // with the input copied in here unless the kernel stages it.
-  PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream, bool stages) {
+  // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's
+  // with the input copied in.
+  PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream) {
     hipStreamCaptureStatus status;
     HIP_CHECK(hipStreamIsCapturing(stream, &status));
     if (status == hipStreamCaptureStatusActive) {
@@ -200,10 +195,8 @@ class Group {
       return slot;
     }
     if (auto it = registered_.find(input); it != registered_.end()) return it->second;
-    // AN EAGER INPUT the peers cannot read (the caching allocator's, borrowed for the call): read
-    // through the staging, which they mapped once; staged by the kernel, or copied here on the
-    // launch's stream.
-    if (stages) return registered_.at(staging());
+    // AN EAGER INPUT the peers cannot read (the caching allocator's, borrowed for the call): copied
+    // into the staging, which they mapped once, on the launch's stream.
     if (bytes > staging_bytes_) {
       std::ostringstream os;
       os << "hip_comms: an eager " << bytes << "-byte input exceeds the " << staging_bytes_
