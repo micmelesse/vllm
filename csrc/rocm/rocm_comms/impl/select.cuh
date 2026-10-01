@@ -72,7 +72,7 @@ constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, in
 }
 
 constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibration& cal) {
-  const bool one_shot = bytes(in) <= cal.one_shot_max_bytes;
+  const bool one_shot = bytes(in) <= cal.all_reduce_one_shot_max_bytes;
   const Kernel k = one_shot ? Kernel::all_reduce_pull_one_shot : Kernel::all_reduce_pull_two_shot;
   const int64_t packs = (bytes(in) + kPackBytes - 1) / kPackBytes;
   const int64_t work  = one_shot ? packs : (packs + in.world - 1) / in.world;
@@ -99,38 +99,36 @@ constexpr KernelSpec tune_all_reduce(Input in, const Hardware& hw, const Calibra
 // kernels, never unfused. The one-shot up to fused_one_shot_max_bytes (7.46 against 10.00 us at 1
 // token, 9.95 against 10.34 at 16, 2026-09-30T21-30-15Z); the push two-shot (aiter's column split)
 // up to the op's push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
-constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, int64_t push_max_bytes,
-                                Input in, const Calibration& cal) {
-  if (bytes(in) <= cal.fused_one_shot_max_bytes)
-    return spec_of(one_shot, in, cal.fused_one_shot_blocks, cal.fused_threads);
-  if (bytes(in) <= push_max_bytes)
-    return spec_of(push, in, cal.norm_push_blocks, cal.fused_threads);
-  return spec_of(pull, in, cal.norm_pull_blocks, cal.fused_threads);
+constexpr KernelSpec fused_norm(Kernel one_shot, Kernel push, Kernel pull, Input in,
+                                const NormCalibration& c) {
+  if (bytes(in) <= c.one_shot_max_bytes)
+    return spec_of(one_shot, in, c.one_shot.blocks, c.one_shot.threads);
+  if (bytes(in) <= c.push_max_bytes) return spec_of(push, in, c.push.blocks, c.push.threads);
+  return spec_of(pull, in, c.pull.blocks, c.pull.threads);
 }
 
 constexpr KernelSpec tune_all_reduce_rms_norm(Input in, const Hardware&, const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_rms_norm,
                     Kernel::all_reduce_push_two_shot_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_rms_norm, cal.rms_norm_push_max_bytes, in,
-                    cal);
+                    Kernel::all_reduce_pull_two_shot_rms_norm, in, cal.rms_norm);
 }
 
 constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
                                                   const Calibration& cal) {
   return fused_norm(Kernel::all_reduce_pull_one_shot_add_rms_norm,
                     Kernel::all_reduce_push_two_shot_add_rms_norm,
-                    Kernel::all_reduce_pull_two_shot_add_rms_norm,
-                    cal.add_rms_norm_push_max_bytes, in, cal);
+                    Kernel::all_reduce_pull_two_shot_add_rms_norm, in, cal.add_rms_norm);
 }
 
 // AttnRes as the norms: a block a row, never more blocks than rows (grid_of).
 constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
                                                         const Calibration& cal) {
-  return bytes(in) <= cal.fused_one_shot_max_bytes
+  const AttnResCalibration& c = cal.attn_res;
+  return bytes(in) <= c.one_shot_max_bytes
              ? spec_of(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
-                       cal.fused_one_shot_blocks, cal.fused_threads)
+                       c.one_shot.blocks, c.one_shot.threads)
              : spec_of(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
-                       cal.attn_res_two_shot_blocks, cal.fused_threads);
+                       c.two_shot.blocks, c.two_shot.threads);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
@@ -138,10 +136,12 @@ constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardw
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
 constexpr KernelSpec tune_all_reduce_rms_norm_gemm_add(Input in, const Hardware&,
                                                    const Calibration& cal) {
-  const Kernel k = in.rows <= cal.gemm_one_shot_max_rows
-                       ? Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add
-                       : Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add;
-  return spec_of(k, in, cal.gemm_tail_blocks, cal.fused_threads);
+  const GemmTailCalibration& c = cal.gemm_tail;
+  return in.rows <= c.one_shot_max_rows
+             ? spec_of(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add, in, c.one_shot.blocks,
+                       c.one_shot.threads)
+             : spec_of(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add, in, c.two_shot.blocks,
+                       c.two_shot.threads);
 }
 
 // =================================================================================================

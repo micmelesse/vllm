@@ -101,61 +101,103 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 
 // MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
 // sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
-// kernels change. Each field is named for what it holds and cites the run that measured it; a tune
-// reads only its input, `Hardware` and `Calibration`, so every number a launch depends on is here.
-struct Calibration {
-  double ping_pong_ns;               // a p2p flag to a peer and back, median of every pair
-  int64_t one_shot_max_bytes;        // the all-reduce's one-shot/two-shot crossover
-  int64_t fused_one_shot_max_bytes;  // the fused ops' one-shot/two-shot crossover
-  int fused_one_shot_blocks;         // a fused one-shot's grid, at most (one row a block)
-  int64_t rms_norm_push_max_bytes;   // rms_norm's two-shot: the push (column) kernel up to it,
-                                     // the pull (row) kernel past it
-  int64_t add_rms_norm_push_max_bytes;  // add_rms_norm's, the same
-  int norm_push_blocks;              // the push two-shot's grid, at most
-  int norm_pull_blocks;              // the pull two-shot's grid, at most
-  int attn_res_two_shot_blocks;      // AttnRes's fused two-shot grid, at most
-  int fused_threads;                 // a fused kernel's block
-  int gemm_tail_blocks;              // the GEMM tail's grid
-  int gemm_lanes_per_col;            // the GEMM tail's lanes a column (a build: 1, 2, 4 or 8)
-  int64_t gemm_one_shot_max_rows;    // the GEMM tail's one-shot/two-shot crossover
+// kernels change. EACH OP HAS ITS OWN, AND EACH KERNEL ITS OWN LAUNCH: a value measured on one
+// kernel is never another's by sharing a field; one not swept says so and whose it copies. Every
+// value cites the run that measured it; a tune reads only its input, `Hardware` and `Calibration`.
+struct Launch {
+  int blocks;   // the grid, at most (a row kernel's is cut to its rows)
+  int threads;  // the block
 };
 
-// gfx950 on n11. MI300X has none yet.
+// The norms (rms_norm, add_rms_norm): one-shot, then the push two-shot (a column split), then the
+// pull two-shot (a row split), at two crossovers.
+struct NormCalibration {
+  int64_t one_shot_max_bytes;
+  int64_t push_max_bytes;
+  Launch one_shot;
+  Launch push;
+  Launch pull;
+};
+
+struct AttnResCalibration {
+  int64_t one_shot_max_bytes;
+  Launch one_shot;
+  Launch two_shot;
+};
+
+struct GemmTailCalibration {
+  int64_t one_shot_max_rows;  // one GEMM pass of rows
+  int lanes_per_col;          // the GEMM's lanes a column (a build: 1, 2, 4 or 8)
+  Launch one_shot;
+  Launch two_shot;
+};
+
+struct Calibration {
+  double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
+  int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
+  NormCalibration rms_norm;
+  NormCalibration add_rms_norm;
+  AttnResCalibration attn_res;
+  GemmTailCalibration gemm_tail;
+};
+
+// gfx950 on n11. MI300X has none yet. The fused kernels' 512-thread block: 256 was worse for the
+// GEMM tail (2026-09-28); not swept for the others, which copy it.
 constexpr Calibration kGfx950Calibration = {
     // calibrate.py, dev run 2026-09-30T19-02-08Z: 28 pairs 1274-1383 ns; a repeat
     // (2026-09-30T19-13-36Z) gave 1282, so about 5% run to run.
-    1334.0,
+    .ping_pong_ns = 1334.0,
     // One-shot won at 56 KiB (7.12 against 7.83 us), two-shot at 112 KiB (7.87 against 8.19),
     // uncached scratch (2026-09-30T18-00-30Z).
-    64 * kKiB,
-    // The norms: moved to 64 KiB they lost at 16 tokens, 11.43 against 10.56 us
-    // (2026-09-30T21-06-57Z).
-    128 * kKiB,
-    // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
-    16,
-    // rms_norm: push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
-    // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
-    1792 * kKiB,
-    // add_rms_norm: push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at
-    // 1.75 MiB (18.36 against push's 18.46; same run).
-    1344 * kKiB,
-    // The push kernel: 256 blocks the best of 48-256 at 192-256 tokens for both norms (rms 15.17
-    // and 18.04 against 15.55 and 18.11 at 128; 2026-10-01T03-26-44Z); a row a block below that.
-    256,
-    // The pull kernel, pipelined: 48 the best of 36-96 for both norms at 2048-4096 tokens (add
-    // 80.6 and 149.7 us against 84.3 and 154.7 at 36; rms 79.3 and 145.4 against 81.0 and 147.6),
-    // within 0.8 of 36 below (2026-10-01T02-59-52Z).
-    48,
-    // AttnRes's two-shot (a row kernel, as the pull norm), from the same sweep.
-    36,
-    // 256 was worse for the GEMM tail (2026-09-28); the norms and AttnRes not swept.
-    512,
-    // The GEMM tail's best at 1 row, 4 lanes a column (2026-09-28, log).
-    56,
-    // Picked at Kimi-K3's shape; 1, 2 and 8 were worse at 1 row (2026-09-28).
-    4,
-    // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
-    16,
+    .all_reduce_one_shot_max_bytes = 64 * kKiB,
+    .rms_norm = {
+        // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
+        .one_shot_max_bytes = 128 * kKiB,
+        // Push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
+        // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
+        .push_max_bytes = 1792 * kKiB,
+        // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
+        .one_shot = {16, 512},
+        // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at
+        // 128; 2026-10-01T03-26-44Z); a row a block below that.
+        .push = {256, 512},
+        // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and
+        // 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
+        .pull = {48, 512},
+    },
+    .add_rms_norm = {
+        // Not swept: rms_norm's.
+        .one_shot_max_bytes = 128 * kKiB,
+        // Push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at 1.75 MiB
+        // (18.36 against push's 18.46; 2026-10-01T03-26-44Z).
+        .push_max_bytes = 1344 * kKiB,
+        // Not swept: rms_norm's.
+        .one_shot = {16, 512},
+        // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128; 2026-10-01T03-26-44Z).
+        .push = {256, 512},
+        // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at
+        // 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
+        .pull = {48, 512},
+    },
+    .attn_res = {
+        // Not swept: the norms'.
+        .one_shot_max_bytes = 128 * kKiB,
+        // Not swept: the norms'.
+        .one_shot = {16, 512},
+        // The row-split norm's grid before it was pipelined: 88 (the link-filling grid) lost at
+        // prefill, 169.3 against 154.5 us at 4096 tokens (2026-09-30T21-30-15Z).
+        .two_shot = {36, 512},
+    },
+    .gemm_tail = {
+        // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
+        .one_shot_max_rows = 16,
+        // Picked at Kimi-K3's shape; 1, 2 and 8 were worse at 1 row (2026-09-28).
+        .lanes_per_col = 4,
+        // The best at 1 row, 4 lanes a column (2026-09-28, log).
+        .one_shot = {56, 512},
+        // Not swept: the one-shot's.
+        .two_shot = {56, 512},
+    },
 };
 
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.
