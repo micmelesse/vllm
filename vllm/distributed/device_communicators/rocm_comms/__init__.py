@@ -10,10 +10,7 @@
     torch     torch.distributed, the oracle the others are measured against
 
 WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN: this package takes process groups,
-a device and a backend name, and reads no environment variable. The one thing it asks
-vLLM for is the current config, in `hip._staging_bytes`, to size a buffer against the
-widest batch the workload declared -- a number nobody else has and a constant would get
-wrong.
+a device and a backend name, and reads no environment variable and no vLLM config.
 """
 
 import logging

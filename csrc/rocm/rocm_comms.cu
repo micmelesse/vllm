@@ -94,28 +94,22 @@ void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
 }
 }  // namespace
 
-int64_t rocm_comms_alloc(int64_t scratch_bytes, int64_t staging_bytes) {
-  return static_cast<int64_t>(hip_comms::p2p::host::alloc_memory(scratch_bytes, staging_bytes));
+int64_t rocm_comms_alloc(int64_t scratch_bytes) {
+  return static_cast<int64_t>(
+      hip_comms::p2p::host::alloc_memory(scratch_bytes, hip_comms::kStagingBytes));
 }
 
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
-                       int64_t scratch_bytes, int64_t staging_bytes, double sync_timeout_s) {
+                       int64_t scratch_bytes, double sync_timeout_s) {
   auto* handle = new hip_comms::Handle(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets, max_buffers,
-      scratch_bytes, staging_bytes, sync_timeout_s);
+      scratch_bytes, hip_comms::kStagingBytes, sync_timeout_s);
   return reinterpret_cast<fptr_t>(handle);
 }
 
-// The staging as a byte tensor, a view the Group owns: Python copies an eager input into it.
-torch::Tensor rocm_comms_staging(fptr_t handle_ptr) {
-  auto& group = handle_of(handle_ptr);
-  return torch::from_blob(group.staging(), {group.staging_bytes()},
-                          torch::TensorOptions().dtype(torch::kUInt8).device(
-                              torch::kCUDA, c10::cuda::current_device()));
-}
 
 
 bool rocm_comms_admits(fptr_t handle_ptr, int64_t op, int64_t rows, int64_t hidden,

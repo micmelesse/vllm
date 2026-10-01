@@ -160,7 +160,7 @@ class Group {
   // What a launch over `input` (`bytes` long) on `stream` passes to its kernel.
   DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream) {
     DevComm p     = dev_comm();
-    p.inputs      = slot_for(const_cast<void*>(input), stream);
+    p.inputs      = slot_for(const_cast<void*>(input), bytes, stream);
     p.input_packs = bytes / 16;
     return p;
   }
@@ -179,7 +179,9 @@ class Group {
   }
 
  private:
-  PeerPtrs* slot_for(void* input, hipStream_t stream) {
+  // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's
+  // with the input copied in.
+  PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream) {
     hipStreamCaptureStatus status;
     HIP_CHECK(hipStreamIsCapturing(stream, &status));
     if (status == hipStreamCaptureStatusActive) {
@@ -192,15 +194,18 @@ class Group {
       pending_slots_.push_back(slot);
       return slot;
     }
-    auto it = registered_.find(input);
-    if (it == registered_.end()) {
+    if (auto it = registered_.find(input); it != registered_.end()) return it->second;
+    // AN EAGER INPUT the peers cannot read (the caching allocator's, borrowed for the call): copied
+    // into the staging, which they mapped once, on the launch's stream.
+    if (bytes > staging_bytes_) {
       std::ostringstream os;
-      os << "hip_comms: buffer " << input
-         << " is not registered. Register it, or call inside a cudagraph capture (where "
-            "registration is deferred until after capture).";
+      os << "hip_comms: an eager " << bytes << "-byte input exceeds the " << staging_bytes_
+         << "-byte staging";
       throw std::runtime_error(os.str());
     }
-    return it->second;
+    HIP_CHECK(hipMemcpyAsync(staging(), input, static_cast<size_t>(bytes),
+                             hipMemcpyDeviceToDevice, stream));
+    return registered_.at(staging());
   }
 
   // Open every rank's handle into a local pointer. Our OWN handle is never opened --

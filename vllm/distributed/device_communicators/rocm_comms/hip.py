@@ -8,10 +8,10 @@ The caller names an op and C++ picks the kernel and its launch geometry
 (`csrc/rocm/rocm_comms/rocm_comms.cuh`); a `Launch` passed with a call is the one way to
 force one, for the sweep and the tests.
 
-TWO MEMORY PATHS, split by lifetime. A captured buffer is held by vLLM for the graph's
-life, so it is registered once at capture exit and read in place. An eager input is
-the caching allocator's, borrowed for the call, so it is copied into a staging buffer
-we own. See `_as_input`.
+TWO MEMORY PATHS, split by lifetime, both C++'s (`p2p::host::Group::dev_comm`). A
+captured buffer is held by vLLM for the graph's life, so it is registered once at
+capture exit and read in place. An eager input is the caching allocator's, borrowed for
+the call, so C++ copies it into a staging buffer it owns.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -56,9 +56,6 @@ class HipTunables:
     # Peer-pointer slots, one per captured launch: capture_sizes x layers. 8 MB, the
     # size vLLM gives the same array.
     max_buffers: int = 131072
-    # A floor on the eager staging buffer, for when there is no vLLM config to size it
-    # from (the correctness suite).
-    staging_floor_bytes: int = 128 << 20
     # How long a kernel waits on a peer before it prints where it was and traps.
     sync_timeout_s: float = 10.0
 
@@ -82,14 +79,6 @@ class HipCommunicator(Communicator):
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
-    # Pointers only: owners keep the buffers alive (C++ holds staging, vLLM holds a
-    # graph's buffers).
-    _registered: set[int]
-    _staging: torch.Tensor
-
-    def _staging_bytes(self) -> int:
-        """One all-reduce input at the widest batch vLLM will build, or the floor."""
-        return max(self.hip_tunables.staging_floor_bytes, self.widest_input_bytes())
 
     def _open(self) -> bool:
         """Open the peer memory. A collective, so every rank must reach it.
@@ -101,10 +90,7 @@ class HipCommunicator(Communicator):
         self.rank = dist.get_rank(self.cpu_group)
         # THIS RANK'S PEER MEMORY, made and owned by C++ (signal block, scratch,
         # staging); Python only exchanges its handle, a process-group collective.
-        staging_bytes = self._staging_bytes()
-        memory = torch.ops._rocm_C.rocm_comms_alloc(
-            tunables.scratch_bytes, staging_bytes
-        )
+        memory = torch.ops._rocm_C.rocm_comms_alloc(tunables.scratch_bytes)
         handles, offsets = self._exchange(memory)
         self._handle = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
@@ -114,17 +100,12 @@ class HipCommunicator(Communicator):
             offsets,
             tunables.max_buffers,
             tunables.scratch_bytes,
-            staging_bytes,
             tunables.sync_timeout_s,
         )
-        # The staging, registered by C++ at init: a view the handle owns.
-        self._staging = torch.ops._rocm_C.rocm_comms_staging(self._handle)
-        self._registered = {self._staging.data_ptr()}
         logger.info(
-            "HipCommunicator ready: rank %d/%d, staging=%dMB, %s",
+            "HipCommunicator ready: rank %d/%d, %s",
             self.rank,
             self.world_size,
-            self._staging.numel() >> 20,
             tunables,
         )
         return True
@@ -176,44 +157,13 @@ class HipCommunicator(Communicator):
             [[g[i][1] for g in gathered] for i in range(len(pending))],
         )
 
-    def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
-        """`inp` if the peers can read it, otherwise a copy in the staging buffer.
-
-        Registering an eager input would mean holding it (it OOMs) or letting peers
-        read recycled memory, so it is copied.
-        """
-        return inp if self._visible_to_peers(inp) else self._staged(inp)
-
-    def _visible_to_peers(self, inp: torch.Tensor) -> bool:
-        """Registered, or captured: a captured address is registered on capture exit,
-        before any replay runs."""
-        return (
-            inp.data_ptr() in self._registered
-            or torch.cuda.is_current_stream_capturing()
-        )
-
-    def _staged(self, inp: torch.Tensor) -> torch.Tensor:
-        """`inp` copied into the registered staging buffer. Eager only, so decode
-        (served from cudagraphs) never pays the copy."""
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes > self._staging.numel():
-            raise RuntimeError(
-                f"hip_comms: an eager {nbytes}-byte collective exceeds the "
-                f"{self._staging.numel()}-byte staging buffer, which was sized for the "
-                f"widest batch this workload declared. Raise staging_floor_bytes, or "
-                f"ask why a collective is larger than max_num_batched_tokens allows."
-            )
-        staged = self._staging[:nbytes].view(inp.dtype).view_as(inp)
-        staged.copy_(inp)
-        return staged
-
     def _all_reduce(
         self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
     ) -> torch.Tensor:
         """Sum `inp` across the TP ranks, out of place."""
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, self._as_input(inp), quant_bits, *launch_wire(launch)
+            self._handle, out, inp, quant_bits, *launch_wire(launch)
         )
         return out
 
@@ -258,7 +208,7 @@ class HipCommunicator(Communicator):
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
             self._handle,
             out,
-            self._as_input(inp),
+            inp,
             weight,
             eps,
             quant_bits,
@@ -281,7 +231,7 @@ class HipCommunicator(Communicator):
             self._handle,
             out,
             out_col0,
-            self._as_input(inp),
+            inp,
             norm_weight,
             eps,
             gemm_weight,
@@ -306,7 +256,7 @@ class HipCommunicator(Communicator):
             self._handle,
             out,
             out_col0,
-            self._as_input(inp),
+            inp,
             norm_weight,
             eps,
             gemm_weight,
@@ -327,7 +277,7 @@ class HipCommunicator(Communicator):
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
             self._handle,
             out,
-            self._as_input(inp),
+            inp,
             eps,
             quant_bits,
             *launch_wire(launch),
@@ -355,7 +305,7 @@ class HipCommunicator(Communicator):
             self._handle,
             prefix_out,
             out,
-            self._as_input(inp),
+            inp,
             blocks,
             norm_weight,
             qk_weight,
@@ -386,7 +336,7 @@ class HipCommunicator(Communicator):
             self._handle,
             out,
             residual_out,
-            self._as_input(inp),
+            inp,
             residual,
             weight,
             eps,
@@ -401,6 +351,5 @@ class HipCommunicator(Communicator):
         self.disabled = True
         if self._handle is None:
             return
-        del self._staging  # a view of memory the handle frees
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
         self._handle = None

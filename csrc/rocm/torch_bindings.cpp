@@ -102,7 +102,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
   rocm_ops.def("rocm_comms_alloc", &rocm_comms_alloc);
   rocm_ops.def("rocm_comms_init", &rocm_comms_init);
-  rocm_ops.def("rocm_comms_staging", &rocm_comms_staging);
   rocm_ops.def("rocm_comms_ping_pong", &rocm_comms_ping_pong);
   rocm_ops.def("rocm_comms_stamps", &rocm_comms_stamps);
   rocm_ops.def("rocm_comms_peer_read", &rocm_comms_peer_read);
