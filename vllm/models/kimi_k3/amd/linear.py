@@ -482,22 +482,24 @@ def pick_layer(fusion: str) -> type[nn.Module]:
             f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs the rocm_comms backend "
             "live with TP above one"
         )
-    if fusion == "norm":
-        from vllm.models.kimi_k3.amd.fused_decoder_norm import KimiDecoderLayerNorm
-
-        return KimiDecoderLayerNorm
-    if fusion == "attn_res":
-        from vllm.models.kimi_k3.amd.fused_decoder_attn_res import (
-            KimiDecoderLayerAttnRes,
+    if fusion == "all_reduce_rms_norm":
+        from vllm.models.kimi_k3.amd.fused_decoder_all_reduce_rms_norm import (
+            KimiDecoderLayerAllReduceRmsNorm,
         )
 
-        return KimiDecoderLayerAttnRes
-    if fusion == "one_ar":
-        from vllm.models.kimi_k3.amd.fused_decoder_one_ar import (
-            KimiDecoderLayerOneAR,
+        return KimiDecoderLayerAllReduceRmsNorm
+    if fusion == "all_reduce_add_attn_res_rms_norm":
+        from vllm.models.kimi_k3.amd import (
+            fused_decoder_all_reduce_add_attn_res_rms_norm as fused,
         )
 
-        return KimiDecoderLayerOneAR
+        return fused.KimiDecoderLayerAllReduceAddAttnResRmsNorm
+    if fusion == "rms_weight_gemm_all_reduce_rms_scale_add":
+        from vllm.models.kimi_k3.amd import (
+            fused_decoder_rms_weight_gemm_all_reduce_rms_scale_add as fused_tail,
+        )
+
+        return fused_tail.KimiDecoderLayerRmsWeightGemmAllReduceRmsScaleAdd
     raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={fusion} names no layer")
 
 

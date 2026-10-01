@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The attn_res path (VLLM_KIMI_K3_FUSED_DECODER=attn_res): decoder.py's layer
+"""The all_reduce_add_attn_res_rms_norm path
+(VLLM_KIMI_K3_FUSED_DECODER=all_reduce_add_attn_res_rms_norm): decoder.py's layer
 with each AttnRes fused with the all-reduce that feeds it and the RMSNorm after
 it. Attention and the MLP leave their outputs unreduced; each AttnRes reduces its
 delta in one kernel."""
@@ -30,7 +31,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 
-class KimiDecoderLayerAttnRes(nn.Module):
+class KimiDecoderLayerAllReduceAddAttnResRmsNorm(nn.Module):
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -39,11 +40,11 @@ class KimiDecoderLayerAttnRes(nn.Module):
     ) -> None:
         super().__init__()
         if config.attn_res_block_size is None:
-            raise ValueError("the attn_res path needs a model with AttnRes")
+            raise ValueError("this path needs a model with AttnRes")
         if get_pp_group().world_size != 1:
             raise NotImplementedError(
-                "the attn_res path needs no pipeline split: a stage boundary "
-                "passes the reduced sum"
+                "this path needs no pipeline split: a stage boundary passes the "
+                "reduced sum"
             )
         spec = vllm_config.speculative_config
         if spec is not None and spec.method == "eagle3":
@@ -278,7 +279,9 @@ def _fused_attn_res(
     `prefix_sum` is started by the reduced delta. Returns (prefix, output). The op
     raises, naming why, for an input it cannot run."""
     backend = _comm()
-    assert backend is not None, "the attn_res path runs only with rocm_comms live"
+    assert backend is not None, (
+        "the all_reduce_add_attn_res_rms_norm path runs only with rocm_comms live"
+    )
     return backend.all_reduce_add_attn_res_rms_norm(
         delta,
         prefix_sum,

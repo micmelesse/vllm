@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The one_ar path (VLLM_KIMI_K3_FUSED_DECODER=one_ar): decoder.py's layer with
-the latent MoE tail's two all-reduces as one."""
+"""The rms_weight_gemm_all_reduce_rms_scale_add path
+(VLLM_KIMI_K3_FUSED_DECODER=rms_weight_gemm_all_reduce_rms_scale_add): decoder.py's
+layer with the MoE tail's two all-reduces as one: the norm's weight, the replicated
+up-projection GEMM, one all-reduce, the norm's 1/rms scale, the add."""
 
 from collections.abc import Callable
 from typing import Any
@@ -28,7 +30,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 
-class KimiDecoderLayerOneAR(nn.Module):
+class KimiDecoderLayerRmsWeightGemmAllReduceRmsScaleAdd(nn.Module):
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -101,7 +103,7 @@ class KimiDecoderLayerOneAR(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                latent_runner_cls=ROCmLatentMoERunnerOneAR,
+                latent_runner_cls=ROCmLatentMoERunnerRmsWeightGemmAllReduceRmsScaleAdd,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -234,7 +236,7 @@ class KimiDecoderLayerOneAR(nn.Module):
         return prefix_sum, block_residual, hidden_states
 
 
-def _one_all_reduce_tail(
+def _rms_weight_gemm_all_reduce_rms_scale_add(
     reduce: Callable[[torch.Tensor], torch.Tensor],
     fused_output: torch.Tensor,
     shared_output: torch.Tensor,
@@ -263,7 +265,7 @@ def _one_all_reduce_tail(
     return (shared.float() + proj.float() * inv_rms).to(shared_output.dtype)
 
 
-class ROCmLatentMoERunnerOneAR(ROCmLatentMoERunner):
+class ROCmLatentMoERunnerRmsWeightGemmAllReduceRmsScaleAdd(ROCmLatentMoERunner):
     """The latent tail as one all-reduce on rocm_comms. A batch whose row the
     backend cannot hold (a large prefill: the row is 2.5 hidden rows) takes the two
     all-reduces."""
@@ -272,11 +274,11 @@ class ROCmLatentMoERunnerOneAR(ROCmLatentMoERunner):
         super().__init__(*args, **kwargs)
         if not self._tail_shardable:
             raise NotImplementedError(
-                "the one_ar path needs the latent tail's shared experts and "
-                "up-projection, no sequence parallelism and a unit routed scale"
+                "this path needs the latent tail's shared experts and up-projection, "
+                "no sequence parallelism and a unit routed scale"
             )
         assert not self.moe_config.skip_final_all_reduce, (
-            "the one_ar tail reduces the whole output; nothing may skip it"
+            "this tail reduces the whole output; nothing may skip it"
         )
 
     def _shard_up_proj_tail(
@@ -286,14 +288,14 @@ class ROCmLatentMoERunnerOneAR(ROCmLatentMoERunner):
         trunc_size: int | None,
     ) -> torch.Tensor:
         backend = _comm()
-        assert backend is not None, "the one_ar path runs only with rocm_comms live"
+        assert backend is not None, "this path runs only with rocm_comms live"
         width = 2 * shared_output.shape[-1] + fused_output.shape[-1]
         row = fused_output.new_empty(fused_output.shape[0], width)
         if not backend.should_allreduce(row):
             return super()._shard_up_proj_tail(fused_output, shared_output, trunc_size)
         transform = self.routed_output_transform
         assert transform is not None
-        out = _one_all_reduce_tail(
+        out = _rms_weight_gemm_all_reduce_rms_scale_add(
             backend.all_reduce,
             fused_output,
             shared_output,

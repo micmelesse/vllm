@@ -151,7 +151,12 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_COMMS_BACKEND: Literal["hip", "iris", "torch"] | None = None
-    VLLM_KIMI_K3_FUSED_DECODER: Literal["none", "norm", "attn_res", "one_ar"] = "none"
+    VLLM_KIMI_K3_FUSED_DECODER: Literal[
+        "none",
+        "all_reduce_rms_norm",
+        "all_reduce_add_attn_res_rms_norm",
+        "rms_weight_gemm_all_reduce_rms_scale_add",
+    ] = "none"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1358,12 +1363,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Which ROCm TP collective backend handles small all-reduce, or unset for none.
     # The set of names is `rocm_comms.Backend`.
     "VLLM_ROCM_COMMS_BACKEND": lambda: os.getenv("VLLM_ROCM_COMMS_BACKEND") or None,
-    # Which fused decoder layer Kimi-K3 runs (all-reduces fused into the ops that
-    # consume them; rocm_comms backend only): none, norm (the latent MoE tail's
-    # all-reduce and RMSNorm), attn_res (each AttnRes with the all-reduce feeding it)
-    # or one_ar (the latent MoE tail's two all-reduces as one). By default none.
+    # Which fused decoder layer Kimi-K3 runs, named for the ops it fuses in order
+    # (rocm_comms backend only): none, all_reduce_rms_norm (the MoE latent
+    # all-reduce and its RMSNorm), all_reduce_add_attn_res_rms_norm (each hidden
+    # all-reduce with the AttnRes and RMSNorm after it) or
+    # rms_weight_gemm_all_reduce_rms_scale_add (the MoE tail's two all-reduces as
+    # one). By default none.
     "VLLM_KIMI_K3_FUSED_DECODER": env_with_choices(
-        "VLLM_KIMI_K3_FUSED_DECODER", "none", ["none", "norm", "attn_res", "one_ar"]
+        "VLLM_KIMI_K3_FUSED_DECODER",
+        "none",
+        [
+            "none",
+            "all_reduce_rms_norm",
+            "all_reduce_add_attn_res_rms_norm",
+            "rms_weight_gemm_all_reduce_rms_scale_add",
+        ],
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

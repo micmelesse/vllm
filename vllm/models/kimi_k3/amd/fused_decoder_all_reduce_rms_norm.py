@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The norm path (VLLM_KIMI_K3_FUSED_DECODER=norm): decoder.py's layer with the
-latent MoE tail's all-reduce and RMSNorm in one kernel, the ladder grown from
-the all-reduce."""
+"""The all_reduce_rms_norm path (VLLM_KIMI_K3_FUSED_DECODER=all_reduce_rms_norm):
+decoder.py's layer with the MoE latent all-reduce and its RMSNorm in one kernel,
+the ladder grown from the all-reduce."""
 
 from typing import Any
 
@@ -32,7 +32,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 
-class KimiDecoderLayerNorm(nn.Module):
+class KimiDecoderLayerAllReduceRmsNorm(nn.Module):
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -105,7 +105,7 @@ class KimiDecoderLayerNorm(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
-                latent_runner_cls=ROCmLatentMoERunnerNorm,
+                latent_runner_cls=ROCmLatentMoERunnerAllReduceRmsNorm,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -238,7 +238,7 @@ class KimiDecoderLayerNorm(nn.Module):
         return prefix_sum, block_residual, hidden_states
 
 
-class ROCmLatentMoERunnerNorm(ROCmLatentMoERunner):
+class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
     """The latent tail with its all-reduce and RMSNorm in one kernel, always: the
     fused op runs or the call fails, never the unfused ops. Otherwise the tail as
     `ROCmLatentMoERunner` runs it."""
@@ -250,7 +250,9 @@ class ROCmLatentMoERunnerNorm(ROCmLatentMoERunner):
         trunc_size: int | None,
     ) -> torch.Tensor:
         backend = _comm()
-        assert backend is not None, "the norm path runs only with rocm_comms live"
+        assert backend is not None, (
+            "the all_reduce_rms_norm path runs only with rocm_comms live"
+        )
         transform = self.routed_output_transform
         assert transform is not None
         if not isinstance(transform.norm, RMSNorm):
