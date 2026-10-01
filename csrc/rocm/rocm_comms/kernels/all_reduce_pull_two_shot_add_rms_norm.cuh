@@ -65,23 +65,20 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   vec<W, NL> w[kRowPacks];
 #pragma unroll
   for (int k = 0; k < kRowPacks; ++k) w[k] = wv[f.at[k]];
-  PeerPacks<T, ngpus, kRowPacks> cur;
-  if (first + static_cast<int>(blockIdx.x) < last) cur = load(first + blockIdx.x);
-  for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
+  // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its wait
+  // covers only its own, older, loads), so the next round trip runs under the reduction and norm.
+  using Packs = PeerPacks<T, ngpus, kRowPacks>;
+  const auto one_row = [&](int row, const Packs& cur, Packs& next) {
     const int64_t base = int64_t{row} * packs;
     const int64_t at   = int64_t{row - first} * packs;
-    // DOUBLE-BUFFERED: this row's residual, then the next row's peer loads, then this row's sum,
-    // whose wait covers only its own (older) loads, so the next round trip runs under everything
-    // below.
     V res[kRowPacks];
     if constexpr (kAdd) {
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.at[k]];
     }
-    const PeerPacks<T, ngpus, kRowPacks> next = load(row + gridDim.x);
+    next = load(row + gridDim.x);
     V sum[kRowPacks];
     peers_reduce(cur, sum);
-    cur = next;
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
@@ -112,6 +109,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       }
       if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], normed);
     }
+  };
+  // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other
+  // (a copy cost 32 moves a row at one pack a thread: ISA 2026-10-01T00-58-37Z).
+  Packs a, b;
+  int row = first + blockIdx.x;
+  if (row < last) a = load(row);
+  for (; row < last; row += 2 * gridDim.x) {
+    one_row(row, a, b);
+    if (row + static_cast<int>(gridDim.x) >= last) break;
+    one_row(row + gridDim.x, b, a);
   }
 
   block_stamp(4);
