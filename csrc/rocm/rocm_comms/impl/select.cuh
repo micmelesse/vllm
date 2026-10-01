@@ -26,7 +26,8 @@ constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; 
 // plain all-reduce over packs, so both keep theirs.
 constexpr bool pushes(Kernel k) {
   return k == Kernel::all_reduce_push_two_shot_rms_norm ||
-         k == Kernel::all_reduce_push_two_shot_add_rms_norm;
+         k == Kernel::all_reduce_push_two_shot_add_rms_norm ||
+         k == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm;
 }
 constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
@@ -124,11 +125,14 @@ constexpr KernelSpec tune_all_reduce_add_rms_norm(Input in, const Hardware&,
 constexpr KernelSpec tune_all_reduce_add_attn_res_rms_norm(Input in, const Hardware&,
                                                         const Calibration& cal) {
   const AttnResCalibration& c = cal.attn_res;
-  return bytes(in) <= c.one_shot_max_bytes
-             ? spec_of(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in,
-                       c.one_shot.blocks, c.one_shot.threads)
-             : spec_of(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in,
-                       c.two_shot.blocks, c.two_shot.threads);
+  if (bytes(in) <= c.one_shot_max_bytes)
+    return spec_of(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm, in, c.one_shot.blocks,
+                   c.one_shot.threads);
+  if (bytes(in) <= c.push_max_bytes)
+    return spec_of(Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm, in, c.push.blocks,
+                   c.push.threads);
+  return spec_of(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm, in, c.pull.blocks,
+                 c.pull.threads);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of

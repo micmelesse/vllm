@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Two-shot all-reduce (the reduce-scatter pulled, the all-gather pushed) fused with Kimi-K3's
+// attention residual (AttnRes) and its RMSNorm: the push norm's two phases, with the one-shot
+// AttnRes's row in place of the norm.
+
+#pragma once
+
+#include "../p2p/p2p.cuh"
+#include "../common/common.cuh"
+#include "all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
+
+namespace hip_comms {
+
+// THE SLICE IS COLUMNS, as the push norm's: each rank owns packs [rank * S, rank * S + S) of every
+// row, sums them over the ranks and pushes the sums into every rank's scratch, so after the sync
+// each rank holds the whole sum locally and computes AttnRes on its rows itself: what crosses the
+// links is the sum, once, and AttnRes's two outputs (the prefix and out) are never gathered. ROW q
+// BELONGS TO BLOCK q % gridDim.x IN BOTH PHASES: after the sync a block may read only what the
+// same block on a peer wrote. `blocks` is [rows, num_sources, hidden] with row and source strides
+// in elements; `write_idx` < 0 writes no block.
+template <typename T, int ngpus, bool kPrefix, int kRowPacks>
+__global__ void __launch_bounds__(kMaxThreads, 1)
+    all_reduce_push_two_shot_add_attn_res_rms_norm(
+        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks,
+        int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
+        const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
+        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
+  using V                = typename traits<T>::V;
+  constexpr int NL       = traits<T>::N;
+  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
+  V* pre                 = reinterpret_cast<V*>(prefix);
+  V* o                   = reinterpret_cast<V*>(out);
+  const int slice        = (packs + ngpus - 1) / ngpus;
+  const int col0         = p.rank * slice;
+  const int cols         = max(0, min(slice, packs - col0));  // the last rank's may be short
+  const int my_rows      = rows > static_cast<int>(blockIdx.x)
+                               ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
+                               : 0;
+  const auto f           = fragment<kRowPacks>(packs);
+  // The block row `row` writes, or none.
+  auto written = [&](int row) -> V* {
+    return write_idx < 0 ? nullptr
+                         : reinterpret_cast<V*>(blocks + row * block_stride_m +
+                                                write_idx * block_stride_r);
+  };
+
+  // 1. Wait until every peer has launched, so its input is ready.
+  block_stamp(0);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  block_stamp(1);
+
+  // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
+  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+
+  // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
+  //    to every rank (itself too), at their place in the tensor.
+  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * cols; e += blockDim.x) {
+    const int64_t q   = e / cols;
+    const int64_t row = blockIdx.x + q * gridDim.x;
+    const int64_t i   = row * packs + col0 + (e - q * cols);
+    const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) p2p::write_scratch(peers[r], i, sum);
+  }
+  block_stamp(2);
+
+  // 3. Every rank's sums are in this rank's scratch, and every peer has read this rank's input.
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  block_stamp(3);
+
+  // 4. This block's rows: the sum out of this rank's scratch, then AttnRes, as the one-shot does.
+  //    The next call's first sync keeps a peer from pushing into this scratch while it is read (a
+  //    peer's next kernel starts only once this one has finished).
+  const auto self = p2p::self<T, ngpus>(p);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const int64_t base = int64_t{row} * packs;
+    V sum[kRowPacks];
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) sum[k] = p2p::read_scratch(self, base + f.at[k]);
+    attn_res_row<T, kPrefix, kRowPacks>(sum, base, f, pre, written(row),
+                                        blocks + int64_t{row} * block_stride_m, block_stride_r,
+                                        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps,
+                                        inv_hidden);
+  }
+  block_stamp(4);
+}
+
+}  // namespace hip_comms

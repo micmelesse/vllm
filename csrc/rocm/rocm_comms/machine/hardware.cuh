@@ -119,10 +119,13 @@ struct NormCalibration {
   Launch pull;
 };
 
+// AttnRes: one-shot, then the push two-shot (a column split), then the pull two-shot (rows).
 struct AttnResCalibration {
   int64_t one_shot_max_bytes;
+  int64_t push_max_bytes;
   Launch one_shot;
-  Launch two_shot;
+  Launch push;
+  Launch pull;
 };
 
 struct GemmTailCalibration {
@@ -182,11 +185,15 @@ constexpr Calibration kGfx950Calibration = {
     .attn_res = {
         // Not swept: the norms'.
         .one_shot_max_bytes = 128 * kKiB,
+        // Not swept: rms_norm's.
+        .push_max_bytes = 1792 * kKiB,
         // Not swept: the norms'.
         .one_shot = {16, 512},
+        // Not swept: rms_norm's.
+        .push = {256, 512},
         // The row-split norm's grid before it was pipelined: 88 (the link-filling grid) lost at
         // prefill, 169.3 against 154.5 us at 4096 tokens (2026-09-30T21-30-15Z).
-        .two_shot = {36, 512},
+        .pull = {36, 512},
     },
     .gemm_tail = {
         // Not swept: one GEMM pass, where the one-shot kernel once had to stop.

@@ -46,6 +46,8 @@ constexpr KernelInfo kKernels[] = {
      kBuild.norm_row_packs},
     {Kernel::all_reduce_push_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true,
      kBuild.norm_row_packs},
+    {Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
+     true, kBuild.attn_res_row_packs},
 };
 constexpr int kNumKernels = sizeof(kKernels) / sizeof(KernelInfo);
 

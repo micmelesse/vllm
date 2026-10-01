@@ -204,11 +204,12 @@ SHOTS: tuple[Shot, ...] = get_args(Shot)
 # The fast tier forces each, whatever tune would pick.
 PULL_SHOTS: tuple[Shot, ...] = SHOTS
 ALL_REDUCE_KERNELS: tuple[Kernel, ...] = SHOTS
-# THE NORMS' SHOTS: theirs, and the push two-shot (a column split) only they have.
-NormShot = Literal[
+# THE FUSED OPS' SHOTS: the pull shots, and the push two-shot (a column split) that the
+# norms and AttnRes have.
+FusedShot = Literal[
     "all_reduce_pull_one_shot", "all_reduce_pull_two_shot", "all_reduce_push_two_shot"
 ]
-NORM_SHOTS: tuple[NormShot, ...] = get_args(NormShot)
+FUSED_SHOTS: tuple[FusedShot, ...] = get_args(FusedShot)
 BACKEND_KERNELS = tuple(
     (name, kernel)
     for name in _BACKEND_CLASS
@@ -1309,7 +1310,7 @@ def run_fused_rank(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: NormShot,
+    shot: FusedShot,
     weight_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
     """ONE rank: run the fused op and the two ops it replaces, and say whether they
@@ -1367,7 +1368,7 @@ def run_fused_rank(
 
 
 def _fused_param(
-    form: str, shape: tuple[int, int], dtype_name: str, shot: NormShot, full: bool
+    form: str, shape: tuple[int, int], dtype_name: str, shot: FusedShot, full: bool
 ) -> ParameterSet:
     return pytest.param(
         form,
@@ -1386,14 +1387,14 @@ FUSED_CASES = (
         _fused_param(form, shape, "bf16", shot, full=False)
         for form in FORMS
         for shape in FUSED_FAST_SHAPES
-        for shot in NORM_SHOTS
+        for shot in FUSED_SHOTS
     ),
     *(
         _fused_param(form, shape, dtype_name, shot, full=True)
         for form in FORMS
         for shape in FUSED_SHAPES
         for dtype_name in DTYPES
-        for shot in NORM_SHOTS
+        for shot in FUSED_SHOTS
     ),
 )
 
@@ -1403,7 +1404,7 @@ def test_all_reduce_rms_norm_matches_the_two_ops_it_replaces(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: NormShot,
+    shot: FusedShot,
     world: int,
     ranks: World,
 ) -> None:
@@ -1432,7 +1433,7 @@ FP32_WEIGHT_CASES = tuple(
     for form in FORMS
     for shape in ((4, 3584), (128, 7168))
     for dtype_name in DTYPES
-    for shot in NORM_SHOTS
+    for shot in FUSED_SHOTS
 )
 
 
@@ -1441,7 +1442,7 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: NormShot,
+    shot: FusedShot,
     world: int,
     ranks: World,
 ) -> None:
@@ -1452,7 +1453,7 @@ def _fused_case(
     form: str,
     shape: tuple[int, int],
     dtype_name: str,
-    shot: NormShot,
+    shot: FusedShot,
     weight_dtype: torch.dtype | None,
     world: int,
     ranks: World,
@@ -1495,8 +1496,8 @@ ADD_ATTN_RES_RMS_NORM_CASES = (
     ((100, 7168), False, 4, 4, True),
 )
 ATTN_RES_SOURCES = 10
-# FAST: the decode cases on the pull one-shot, the kernel decode runs. FULL: the
-# prefill-sized cases, and every case on the other kernels.
+# FAST: the decode cases on the kernels decode runs, the pull one-shot and the push
+# two-shot. FULL: the prefill-sized cases, and every case on the pull two-shot.
 ATTN_RES_FAST_MAX_ROWS = 16
 ATTN_RES_PARAMS = tuple(
     pytest.param(
@@ -1504,18 +1505,18 @@ ATTN_RES_PARAMS = tuple(
         shot,
         id=f"case{i}-{shot}",
         marks=[]
-        if shot == "all_reduce_pull_one_shot" and case[0][0] <= ATTN_RES_FAST_MAX_ROWS
+        if shot != "all_reduce_pull_two_shot" and case[0][0] <= ATTN_RES_FAST_MAX_ROWS
         else [pytest.mark.full],
     )
     for i, case in enumerate(ADD_ATTN_RES_RMS_NORM_CASES)
-    for shot in SHOTS
+    for shot in FUSED_SHOTS
 )
 
 
 def run_add_attn_res_rms_norm_rank(
     ctx: RankContext,
     case: tuple[tuple[int, int], bool, int, int, bool],
-    shot: Shot,
+    shot: FusedShot,
 ) -> tuple[bool, str | None]:
     """ONE rank: the fused op against the two it replaces, on every output it writes."""
     from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
@@ -1593,7 +1594,7 @@ def run_add_attn_res_rms_norm_rank(
 @pytest.mark.parametrize(("case", "shot"), ATTN_RES_PARAMS)
 def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     case: tuple[tuple[int, int], bool, int, int, bool],
-    shot: Shot,
+    shot: FusedShot,
     world: int,
     ranks: World,
 ) -> None:

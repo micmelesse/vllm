@@ -31,6 +31,7 @@
 #include "../kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
 #include "../kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
+#include "../kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "../kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
 
 namespace hip_comms {
@@ -195,6 +196,8 @@ inline void launch(Handle& h, const KernelSpec& k, const NormArgs& a, hipStream_
 // AttnRes's and the GEMM tail's two kernels share their row builds, so one cap serves both.
 static_assert(max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
                   max_row_packs(Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) &&
+              max_row_packs(Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
+                  max_row_packs(Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) &&
               max_row_packs(Kernel::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
                   max_row_packs(Kernel::all_reduce_pull_two_shot_rms_norm_gemm_add),
               "a kernel with its own row builds needs its own case");
@@ -226,6 +229,9 @@ inline void launch(Handle& h, const KernelSpec& k, const AttnResArgs& a, hipStre
           case Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm:
             return prefix ? run(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, R>)
                           : run(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, R>);
+          case Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm:
+            return prefix ? run(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, R>)
+                          : run(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, R>);
           default: impl::not_this_ops(k.kernel);
         }
       });
