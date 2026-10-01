@@ -174,6 +174,12 @@ DINLINE typename traits<T>::V* scratch_of(const DevComm& p, int r) {
   return at;
 }
 
+// Rank r's staging, the same way: it follows the rank's scratch.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V* staging_of(const DevComm& p, int r) {
+  return scratch_of<T, ngpus>(p, r) + p.scratch_packs;
+}
+
 // Rank r's input for this launch, the same way: each rank's pointer by a constant index, so the
 // loads are scalar and issue together (a runtime index made them one dependent vector load).
 template <typename T, int ngpus>
@@ -232,6 +238,53 @@ class Self {
   friend DINLINE void write_scratch(const Self<U, n>& self, int64_t i,
                                     const typename traits<U>::V& v);
 };
+
+// A RANK'S STAGING, a buffer of its own: where a staged kernel copies its rank's input for the
+// peers to read. Only the staged kernels make one.
+template <typename T, int ngpus>
+class Staging {
+  using V = typename traits<T>::V;
+  V* at_ = nullptr;
+
+ public:
+  DINLINE Staging() = default;
+  // `r` the same across the wave, as a Peer's.
+  DINLINE Staging(const DevComm& p, int r)
+      : at_(impl::staging_of<T, ngpus>(p, __builtin_amdgcn_readfirstlane(r))) {}
+
+  template <typename U, int n>
+  friend DINLINE typename traits<U>::V read_staging(const Staging<U, n>& s, int64_t i);
+  template <typename U, int n>
+  friend DINLINE void write_staging(const Staging<U, n>& s, int64_t i,
+                                    const typename traits<U>::V& v);
+};
+
+// Every rank's staging, as `peers` gives every rank.
+template <typename T, int ngpus>
+DINLINE std::array<Staging<T, ngpus>, ngpus> stagings(const DevComm& p) {
+  std::array<Staging<T, ngpus>, ngpus> all;
+#pragma unroll
+  for (int r = 0; r < ngpus; ++r) all[r] = Staging<T, ngpus>(p, r);
+  return all;
+}
+
+template <typename T, int ngpus>
+DINLINE Staging<T, ngpus> staging(const DevComm& p, int r) {
+  return Staging<T, ngpus>(p, r);
+}
+
+// Pack i of a rank's staging, after a barrier that made what its kernel staged visible.
+template <typename T, int ngpus>
+DINLINE typename traits<T>::V read_staging(const Staging<T, ngpus>& s, int64_t i) {
+  return thread_load(s.at_ + i);
+}
+
+// Pack i of this rank's staging, written by its own kernel for the peers to read after a barrier
+// that makes it visible.
+template <typename T, int ngpus>
+DINLINE void write_staging(const Staging<T, ngpus>& s, int64_t i, const typename traits<T>::V& v) {
+  thread_store(s.at_ + i, v);
+}
 
 template <typename T, int ngpus>
 DINLINE Peer<T, ngpus> peer(const DevComm& p, int r) {

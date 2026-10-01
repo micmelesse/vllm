@@ -34,8 +34,11 @@ void run(Handle& h, const Kernel& k, const Args& a, const p2p::DevComm& p, hipSt
 
 }  // namespace impl
 
+// A STAGED BUILD copies the input in itself, so no peer reads it where it is.
 inline void launch(Handle& h, const Kernel& k, const AllReduceArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, a.bytes, s), s);
+  const p2p::DevComm p =
+      is_staged(k.fn) ? h.dev_comm_staged(a.bytes) : h.dev_comm(a.inp, a.bytes, s);
+  impl::run(h, k, a, p, s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const NormArgs& a, hipStream_t s) {

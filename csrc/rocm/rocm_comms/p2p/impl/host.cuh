@@ -165,6 +165,24 @@ class Group {
     return p;
   }
 
+  // What a STAGED kernel's launch passes: no peer reads its input where it is, so it needs no
+  // slot; the kernel takes its own input and the staging's size as arguments and copies it in a
+  // pass at a time, any size.
+  DevComm dev_comm_staged(int64_t bytes) const {
+    DevComm p     = dev_comm();
+    p.input_packs = bytes / 16;
+    return p;
+  }
+
+  // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is
+  // registered at capture exit, before any replay). Otherwise it goes through the staging.
+  bool reads_in_place(const void* input, hipStream_t stream) const {
+    hipStreamCaptureStatus status;
+    HIP_CHECK(hipStreamIsCapturing(stream, &status));
+    return status == hipStreamCaptureStatusActive ||
+           registered_.count(const_cast<void*>(input)) != 0;
+  }
+
   // A launch with no input: only the signals, for a kernel that moves no data.
   DevComm dev_comm() const {
     return DevComm{rank_, nullptr, signals_, self_signal_, 0, scratch_bytes_ / 16, timeout_ticks_};

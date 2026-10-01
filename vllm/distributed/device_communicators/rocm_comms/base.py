@@ -96,6 +96,7 @@ class Error(IntEnum):
     block_exceeds_lds = 14
     scratch_too_small = 15
     grid_not_resident = 16
+    staging_too_small = 17
 
 
 # EACH OP'S IMPLEMENTATION, the method a backend overrides to have it.

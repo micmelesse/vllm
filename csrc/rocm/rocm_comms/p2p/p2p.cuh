@@ -13,6 +13,10 @@
 //   read_input(peer, i)            pack i of that rank's input
 //   read_scratch(peer|self, i)     pack i of that rank's (or this rank's) scratch
 //   write_scratch(peer|self, i, v) the same, written: through a peer, the push
+//   staging<T, ngpus>(p, r), stagings<T, ngpus>(p)   a rank's (every rank's) staging, a buffer
+//                                  of its own: a staged kernel copies its rank's input there
+//   read_staging(s, i), write_staging(s, i, v)   pack i of it, read (a peer's) or written (this
+//                                  rank's own)
 //   barrier<ngpus, Among, Ensure>(p)   Among::peers (this block and the same block on every
 //                                  rank) or Among::grid (every block of this rank); Ensure::
 //                                  launched (every peer's input is ready), visible (what was
@@ -28,6 +32,7 @@
 // p2p::host::                the host code (the ops, rocm_comms.cuh)
 //   Group                          the one lifetime object: maps the peers' memory,
 //                                  registers buffers, `dev_comm(input, bytes, stream)` per launch
+//                                  (`dev_comm_staged(bytes)` for a staged kernel)
 //   IpcHandle, handle_and_offset(ptr)  a buffer's IPC handle
 // and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks.
 

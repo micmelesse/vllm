@@ -68,6 +68,11 @@ enum class Template : int {
   all_reduce_pull_one_shot_rms_norm_gemm         = 13,
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
   all_reduce_pull_one_shot_rms_scale_add         = 15,
+  // THE STAGED BUILDS: copy this rank's eager input into its staging a pass at a time and read
+  // the peers' staging, so any size runs; those above read a registered or captured input in
+  // place.
+  all_reduce_pull_one_shot_staged                = 16,
+  all_reduce_pull_two_shot_staged                = 17,
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
@@ -142,8 +147,9 @@ enum class Error : int {
   block_exceeds_lds         = 14,
   scratch_too_small         = 15,
   grid_not_resident         = 16,
+  staging_too_small         = 17,
 };
-constexpr int kNumErrors = 17;
+constexpr int kNumErrors = 18;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -172,6 +178,8 @@ constexpr const char* to_string(Error e) {
       return "scratch_too_small: the two-shot scratch exceeds the scratch";
     case Error::grid_not_resident:
       return "grid_not_resident: the grid exceeds the blocks the GPU holds resident";
+    case Error::staging_too_small:
+      return "staging_too_small: an eager input this kernel reads in place exceeds the staging";
   }
   return "unknown";
 }

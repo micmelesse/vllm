@@ -54,6 +54,8 @@ constexpr TemplateInfo kTemplates[] = {
      kBuild.norm_row_packs},
     {Template::all_reduce_pull_one_shot_rms_scale_add, Op::all_reduce_rms_scale_add, false,
      kBuild.scale_add_row_packs},
+    {Template::all_reduce_pull_one_shot_staged, Op::all_reduce, false, 0},
+    {Template::all_reduce_pull_two_shot_staged, Op::all_reduce, true, 0},
 };
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
 
@@ -73,6 +75,17 @@ constexpr bool gemms(Op op) {
 }
 
 constexpr int max_row_packs(Template k) { return info(k).max_row_packs; }
+// THE STAGED BUILDS, and each in-place build's: what `plan` runs when the peers cannot read the
+// input where it is.
+constexpr bool is_staged(Template k) {
+  return k == Template::all_reduce_pull_one_shot_staged ||
+         k == Template::all_reduce_pull_two_shot_staged;
+}
+constexpr Template staged_of(Template k) {
+  return k == Template::all_reduce_pull_one_shot   ? Template::all_reduce_pull_one_shot_staged
+         : k == Template::all_reduce_pull_two_shot ? Template::all_reduce_pull_two_shot_staged
+                                                   : k;
+}
 constexpr bool has_row_packs(Template k) { return max_row_packs(k) > 0; }
 
 // The smallest build of `k` that holds a row of `packs` over `threads`; 0 when none does.
