@@ -5,16 +5,23 @@
 
 #pragma once
 
-#include "../common/common.cuh"
+#ifndef HIP_COMMS_COMMON_INTERFACE
+#error "include common.cuh, the one interface, not its parts"
+#endif
+
+#include "utils.cuh"
+#include "elementwise.cuh"
+#include "reduce.cuh"
+#include "dot.cuh"
 
 namespace hip_comms {
 
 // ONE ROW OF ATTNRES, once the row's sum over the ranks is in `sum` (packs of this thread's
 // Fragment): the new prefix (written back, and to the block row when `written` is not null), the
 // softmax over the stored blocks and the prefix, and the output, normed when `out_norm_w` is given.
-// A block owns the row. Shared by every AttnRes kernel, so the rounding is written once.
+// A block owns the row; every AttnRes kernel computes its rows with it, so the rounding is one.
 template <typename T, bool kPrefix, int kRowPacks>
-DINLINE void attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], int64_t base,
+DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], int64_t base,
                           const Fragment<kRowPacks>& f, typename traits<T>::V* pre,
                           typename traits<T>::V* written, const T* row_blocks,
                           int64_t block_stride_r, const T* __restrict__ norm_w,

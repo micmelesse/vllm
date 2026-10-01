@@ -8,7 +8,6 @@
 
 #include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
-#include "attn_res_row.cuh"
 
 namespace hip_comms {
 
@@ -83,10 +82,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       const int owner = min(f.at[k] / slice, ngpus - 1);
       sum[k]          = p2p::read_scratch(p2p::peer<T, ngpus>(p, owner), base + f.at[k]);
     }
-    attn_res_row<T, kPrefix, kRowPacks>(sum, base, f, pre, written(row),
-                                        blocks + int64_t{row} * block_stride_m, block_stride_r,
-                                        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps,
-                                        inv_hidden);
+    block_attn_res_row<T, kPrefix, kRowPacks>(
+        sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
+        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
   block_stamp(4);
 }
