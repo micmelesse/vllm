@@ -228,10 +228,11 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
 }
 
 // THE ONE-ALL-REDUCE TAIL: the one-shot only, at the one-shot norm's block (unmeasured for this
-// op), a block a (row, slice) up to every block the signal holds.
-constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware&,
+// op), a block a (row, slice) up to one a compute unit; past that each block loops over its (row,
+// slice)s, since a grid wider than the GPU holds resident is refused (512 tokens asked 1024).
+constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware& hw,
                                                const Calibration& cal) {
-  return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, p2p::kMaxBlocks,
+  return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, hw.compute_units,
                     cal.rms_norm.one_shot.threads, a, world);
 }
 
