@@ -20,19 +20,20 @@ namespace hip_comms {
 constexpr int64_t bytes(Input in) { return in.rows * in.hidden * in.elem_bytes; }
 
 // A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
-// and the push two-shot (it slices columns) all of them, a pull two-shot its rank's slice. An idle
+// and a column two-shot (the pushes, and AttnRes's pull) all of them, a row two-shot its rank's. An idle
 // block still pays every barrier (each pairs with its twin on every peer): the pull norm at 32
 // tokens ran 36 blocks for 4 rows a rank. The GEMM tail's GEMM strides over column tiles, and the
 // plain all-reduce over packs, so both keep theirs.
-constexpr bool pushes(Kernel k) {
-  return k == Kernel::all_reduce_push_two_shot_rms_norm ||
+constexpr bool slices_columns(Kernel k) {
+  return k == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm ||
+         k == Kernel::all_reduce_push_two_shot_rms_norm ||
          k == Kernel::all_reduce_push_two_shot_add_rms_norm ||
          k == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm;
 }
 constexpr int grid_of(Kernel k, int blocks, int64_t rows, int world) {
   const Op op = op_of(k);
   if (op == Op::all_reduce || gemms(op)) return blocks;
-  const bool row_slice = is_two_shot(k) && !pushes(k);
+  const bool row_slice = is_two_shot(k) && !slices_columns(k);
   const int64_t mine   = row_slice ? (rows + world - 1) / world : rows;
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }

@@ -8,15 +8,19 @@
 
 #include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
+#include "all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 
 namespace hip_comms {
 
-// Each rank owns whole rows: it reduces them, updates the prefix, runs AttnRes and leaves the
-// out and prefix rows in its scratch, row-major; after the sync every rank copies every owner's
-// rows into `out`, `prefix` and the written block. A row's replicated `prefix` and `blocks` are
-// read and then overwritten by the one block that takes it, so the order is the block's own. THE
-// SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: after the sync a block may read only what
-// the same block on a peer wrote.
+// THE SLICE IS COLUMNS, AND BOTH HALVES PULL, as the plain two-shot all-reduce moves its bytes:
+// each rank sums its columns of every row over the ranks into its own scratch; after the sync each
+// block reads its rows' columns from their owners and computes AttnRes on them itself. So the links
+// carry what an all-reduce's do, AttnRes's two outputs (the prefix and out) are never gathered, and
+// every rank does the AttnRes the unfused path would. A SLICE IS WHOLE WAVES (64 packs), so every
+// wave's packs have one owner and p2p::peer's rank is the same across the wave. ROW q BELONGS TO
+// BLOCK q % gridDim.x IN BOTH PHASES: after the sync a block may read only what the same block on
+// a peer wrote. `blocks` is [rows, num_sources, hidden] with row and source strides in elements;
+// `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
@@ -29,8 +33,13 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
-  const int slice_rows   = (rows + ngpus - 1) / ngpus;
-  const int64_t pre_at   = int64_t{slice_rows} * packs;  // the prefix rows, after the out rows
+  const int per_rank     = (packs + ngpus - 1) / ngpus;
+  const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
+  const int col0         = min(p.rank * slice, packs);
+  const int cols         = max(0, min(slice, packs - col0));  // a late rank's may be short or none
+  const int my_rows      = rows > static_cast<int>(blockIdx.x)
+                               ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
+                               : 0;
   const auto f           = fragment<kRowPacks>(packs);
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
@@ -39,145 +48,47 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                 write_idx * block_stride_r);
   };
 
-  // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto self = p2p::self<T, ngpus>(p);
-  const auto peers = p2p::peers<T, ngpus>(p);
+  // 1. Wait until every peer has launched, so its input is ready.
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  block_stamp(1);
 
-  // 2. This rank's rows: read each from every rank in rank order, sum, AttnRes, and leave the
-  //    out and prefix rows in this rank's scratch.
-  const int first = p.rank * slice_rows;
-  const int last  = min(first + slice_rows, rows);
-  for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
-    const int64_t base = int64_t{row} * packs;
-    const int64_t at   = int64_t{row - first} * packs;
-    V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
-    // The AttnRes, rounding as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
-    //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
-    //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u
-    //   m = softmax(logits) . sources, online, one source at a time; out = T(m), or
-    //   T(m * rsqrt(mean(m^2) + out_eps) * out_w)
-    const T* row_blocks = blocks + int64_t{row} * block_stride_m;
-    float u[kRowPacks][NL];
-    V new_prefix[kRowPacks];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      if constexpr (kPrefix) {
-        const V old = pre[base + f.at[k]];
-#pragma unroll
-        for (int j = 0; j < NL; ++j)
-          new_prefix[k].d[j] =
-              static_cast<T>(static_cast<float>(old.d[j]) + static_cast<float>(sum[k].d[j]));
-      } else {
-        new_prefix[k] = sum[k];
-      }
-      thread_unpack<T>(new_prefix[k], u[k]);
-      if (f.in[k] != 0.0f) p2p::write_scratch(self, pre_at + at + f.at[k], new_prefix[k]);
-    }
-    float m[kRowPacks][NL];
-    if (num_blocks == 0) {
-      // With only the prefix source, the softmax is exactly one.
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) m[k][j] = u[k][j];
-    } else {
-      float w[kRowPacks][NL];
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        float a[NL], b[NL];
-        thread_unpack<T>(reinterpret_cast<const V*>(norm_w)[f.at[k]], a);
-        thread_unpack<T>(reinterpret_cast<const V*>(qk_w)[f.at[k]], b);
-#pragma unroll
-        for (int j = 0; j < NL; ++j) {
-          w[k][j] = a[j] * b[j];
-          m[k][j] = 0.0f;
-        }
-      }
-      float max_logit = -INFINITY, denominator = 0.0f;
-      for (int src = 0; src <= num_blocks; ++src) {
-        // The stored blocks first, the prefix last, as the reference orders its sources.
-        float v[kRowPacks][NL];
-        if (src < num_blocks) {
-          const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
-#pragma unroll
-          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[k]);
-        } else {
-#pragma unroll
-          for (int k = 0; k < kRowPacks; ++k)
-#pragma unroll
-            for (int j = 0; j < NL; ++j) v[k][j] = u[k][j];
-        }
-        float sums[2] = {thread_dot(v, v, f), thread_dot(v, w, f)};
-        block_reduce<Sum>(sums);
-        const float logit      = sums[1] * rsqrtf(sums[0] * inv_hidden + eps);
-        const float new_max    = fmaxf(max_logit, logit);
-        const float old_scale  = __expf(max_logit - new_max);
-        const float this_scale = __expf(logit - new_max);
-        denominator            = denominator * old_scale + this_scale;
-        max_logit              = new_max;
-#pragma unroll
-        for (int k = 0; k < kRowPacks; ++k)
-#pragma unroll
-          for (int j = 0; j < NL; ++j) m[k][j] = m[k][j] * old_scale + this_scale * v[k][j];
-      }
-      const float inv_den = 1.0f / denominator;
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) m[k][j] *= inv_den;
-    }
-    // The output, normed when out_norm_w is given.
-    float scale = 1.0f;
-    if (out_norm_w != nullptr) {
-      float ss[1] = {thread_dot(m, m, f)};
-      block_reduce<Sum>(ss);
-      scale = rsqrtf(ss[0] * inv_hidden + out_eps);
-    }
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      V result;
-      if (out_norm_w != nullptr) {
-        float g[NL];
-        thread_unpack<T>(reinterpret_cast<const V*>(out_norm_w)[f.at[k]], g);
-#pragma unroll
-        for (int j = 0; j < NL; ++j) result.d[j] = static_cast<T>(m[k][j] * scale * g[j]);
-      } else {
-        result = thread_pack<T>(m[k]);
-      }
-      if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], result);
-    }
+  // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
+  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  const auto self  = p2p::self<T, ngpus>(p);
+
+  // 2. This rank's columns of this block's rows, summed over the ranks in rank order, into this
+  //    rank's scratch at their place in the tensor.
+  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * cols; e += blockDim.x) {
+    const int64_t q   = e / cols;
+    const int64_t row = blockIdx.x + q * gridDim.x;
+    const int64_t i   = row * packs + col0 + (e - q * cols);
+    p2p::write_scratch(self, i, peers_reduce(peers_load<T, ngpus>(read, i)));
   }
+  block_stamp(2);
 
-  // 3. Every rank's rows are visible to its peers.
+  // 3. Every rank's columns are in its scratch, and every peer has read this rank's input.
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  block_stamp(3);
 
-  // 4. Every owner's rows out of its scratch, into `out`, `prefix` and the written block. The
-  //    next call's first sync keeps a rank from overwriting its scratch while it is read.
-  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-      // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's
-      // scratch holds slice_rows rows, so a slot past the last row is real): a store between two
-      // loads, or a load under an `if`, made the owners' round trips run one after another.
-      const int64_t at = int64_t{l} * packs + i;
-      V got[ngpus], got_pre[ngpus];
+  // 4. This block's rows: each pack from the rank that owns its columns, then AttnRes, as the
+  //    one-shot does. The next call's first sync keeps a rank from overwriting its scratch while
+  //    it is read (a peer's next kernel starts only once this one has finished).
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const int64_t base = int64_t{row} * packs;
+    V sum[kRowPacks];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        got[r]     = p2p::read_scratch(peers[r], at);
-        got_pre[r] = p2p::read_scratch(peers[r], pre_at + at);
-      }
-#pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
-        const int row = r * slice_rows + l;
-        if (row >= rows) continue;
-        thread_store(o + int64_t{row} * packs + i, got[r]);
-        thread_store(pre + int64_t{row} * packs + i, got_pre[r]);
-        if (V* dst = written(row)) thread_store(dst + i, got_pre[r]);
-      }
+    for (int k = 0; k < kRowPacks; ++k) {
+      const int owner = min(f.at[k] / slice, ngpus - 1);
+      sum[k]          = p2p::read_scratch(p2p::peer<T, ngpus>(p, owner), base + f.at[k]);
     }
+    attn_res_row<T, kPrefix, kRowPacks>(sum, base, f, pre, written(row),
+                                        blocks + int64_t{row} * block_stride_m, block_stride_r,
+                                        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps,
+                                        inv_hidden);
   }
+  block_stamp(4);
 }
 
 }  // namespace hip_comms

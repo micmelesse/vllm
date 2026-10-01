@@ -119,7 +119,7 @@ struct NormCalibration {
   Launch pull;
 };
 
-// AttnRes: one-shot, then the push two-shot (a column split), then the pull two-shot (rows).
+// AttnRes: one-shot, then the push two-shot, then the pull two-shot (both split columns).
 struct AttnResCalibration {
   int64_t one_shot_max_bytes;
   int64_t push_max_bytes;
