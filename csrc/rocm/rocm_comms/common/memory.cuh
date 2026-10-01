@@ -83,6 +83,14 @@ DINLINE void thread_load(const V* row, const Fragment<K>& f, V (&out)[K]) {
   }
 }
 
+// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no instruction is scheduled across this point, so
+// every load above it is in flight before anything below it runs. Without it the scheduler sank
+// some of a reduce's peer loads past the adds of the first ones, so their round trips ran partly
+// one after another (0.4 us at 4-16 tokens: ISA 2026-10-01T00-39-51Z).
+namespace impl {
+DINLINE void issued() { __builtin_amdgcn_sched_barrier(0); }
+}  // namespace impl
+
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
 // waits until a pack is used (peers_reduce), so loads issued here can run under other work.
 template <typename T, int ngpus, typename Read>
@@ -90,6 +98,7 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
   PeerPacks<T, ngpus> out;
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) out.p[r][0] = read(r, i);
+  impl::issued();
   return out;
 }
 
@@ -107,6 +116,7 @@ DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const F
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) out.p[r][k] = read(r, i);
   }
+  impl::issued();
   return out;
 }
 
