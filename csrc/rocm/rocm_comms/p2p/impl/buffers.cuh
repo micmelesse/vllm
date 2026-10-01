@@ -183,16 +183,24 @@ class Signals {
  public:
   explicit DINLINE Signals(Signal* s) : s_(s) {}
   // Block `block`'s pairing slot for rank `rank`, at a launch's start or at its other barriers.
-  DINLINE Counter start(int block, int rank) const { return Counter(&s_->start[block][rank]); }
-  DINLINE Counter end(int block, int rank) const { return Counter(&s_->end[block][rank]); }
+  // AN INDEX KEEPS ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as passed): an int
+  // where the caller had an unsigned costs a sign extension in every kernel.
+  template <typename R>
+  DINLINE Counter start(unsigned block, R rank) const {
+    return Counter(&s_->start[block][rank]);
+  }
+  template <typename R>
+  DINLINE Counter end(unsigned block, R rank) const {
+    return Counter(&s_->end[block][rank]);
+  }
   // The grid barrier's: rank `rank`'s epoch here, the arrivals, the generation.
   DINLINE Counter peer(int rank) const { return Counter(&s_->peer[rank]); }
   DINLINE Counter arrive() const { return Counter(&s_->arrive); }
   DINLINE Counter gen() const { return Counter(&s_->gen); }
   // The last flag rank `rank` wrote here (write_flag).
   DINLINE Counter flag(int rank) const { return Counter(&s_->flag[rank]); }
-  DINLINE uint32_t seq(int block) const { return s_->seq[block]; }
-  DINLINE void set_seq(int block, uint32_t v) const { s_->seq[block] = v; }
+  DINLINE uint32_t seq(unsigned block) const { return s_->seq[block]; }
+  DINLINE void set_seq(unsigned block, uint32_t v) const { s_->seq[block] = v; }
   DINLINE uint32_t epoch() const { return s_->epoch; }
   DINLINE void set_epoch(uint32_t v) const { s_->epoch = v; }
 };
@@ -214,6 +222,9 @@ DINLINE Signal* signal_of(const DevComm& p, int r) {
 // i's, each thread its own (a per-lane load, as the pairing barrier issues it).
 DINLINE Signals own_signals(const DevComm& p) { return Signals(p.self); }
 DINLINE Signals signals(const DevComm& p, int r) { return Signals(impl::signal_of(p, r)); }
-DINLINE Signals lane_signals(const DevComm& p, int i) { return Signals(p.signals.s[i]); }
+template <typename I>
+DINLINE Signals lane_signals(const DevComm& p, I i) {
+  return Signals(p.signals.s[i]);
+}
 
 }  // namespace hip_comms::p2p
