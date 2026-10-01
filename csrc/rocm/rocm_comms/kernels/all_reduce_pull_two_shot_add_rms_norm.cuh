@@ -44,9 +44,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto peers = p2p::peers<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
-  const auto self  = p2p::self<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
@@ -93,7 +94,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         thread_unpack<T>(res[k], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], thread_pack<T>(s[k]));
+        if (f.in[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.at[k], thread_pack<T>(s[k]));
       }
     }
     float ss[1] = {thread_dot(s, s, f)};
@@ -107,7 +108,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     if constexpr (kAdd) {
       if (threadIdx.x == 0) {
         const vec<float, 4> sc = {{scale, 0.0f, 0.0f, 0.0f}};
-        p2p::write_scratch(self, scale_at + (row - first), __builtin_bit_cast(V, sc));
+        p2p::write_scratch(own_scratch, scale_at + (row - first), __builtin_bit_cast(V, sc));
       }
       return;
     }
@@ -119,7 +120,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
         normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
       }
-      if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], normed);
+      if (f.in[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.at[k], normed);
     }
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other
@@ -148,7 +149,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    read one scale address: one request a wave). Left to the compiler, the scales were loaded
   //    and waited on before the packs were issued, two round trips a row (ISA
   //    2026-10-01T02-33-11Z).
-  const auto gathered = [&](int r, int64_t i) { return p2p::read_scratch(peers[r], i); };
+  const auto gathered = [&](int r, int64_t i) { return p2p::read_scratch(scratches[r], i); };
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
@@ -156,7 +157,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       V sc[ngpus];
       if constexpr (kAdd) {
 #pragma unroll
-        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(peers[r], scale_at + l);
+        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
       }
       V got[ngpus];
 #pragma unroll

@@ -36,8 +36,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   __shared__ V got[kMaxThreads];
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto self = p2p::self<T, ngpus>(p);
-  const auto them = p2p::peer<T, ngpus>(p, peer);
+  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto their_scratch = p2p::scratch<T, ngpus>(p, peer);
+  const auto their_input = p2p::input<T, ngpus>(p, peer);
   block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
   block_stamp(1);
@@ -48,7 +49,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int base    = p.rank * slice_packs;
   const int mine    = min(slice_packs, num_packs - base);
   for (int i = first; i < mine; i += stride) {
-    got[threadIdx.x] = p2p::read_input(them, base + i);
+    got[threadIdx.x] = p2p::read_input(their_input, base + i);
     __syncthreads();
     if (wave == 0) {
       float acc[N];
@@ -61,7 +62,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       V s;
 #pragma unroll
       for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
-      p2p::write_scratch(self, i, s);
+      p2p::write_scratch(own_scratch, i, s);
     }
     __syncthreads();
   }
@@ -77,7 +78,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   V* dst = reinterpret_cast<V*>(out);
   for (int i = first; i < slice_packs; i += stride)
     if (peer * slice_packs + i < num_packs)
-      thread_store(dst + peer * slice_packs + i, p2p::read_scratch(them, i));
+      thread_store(dst + peer * slice_packs + i, p2p::read_scratch(their_scratch, i));
   block_stamp(5);
 }
 

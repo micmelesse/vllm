@@ -32,11 +32,11 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const auto f           = fragment<kRowPacks>(packs);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(p);
   block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
   block_stamp(1);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (kAdd) add
   //    the residual, then RMSNorm, rounding as the reference does:

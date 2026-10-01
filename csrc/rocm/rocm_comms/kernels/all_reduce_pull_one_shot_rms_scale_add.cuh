@@ -29,14 +29,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_s
   const auto fl          = fragment<kRowPacks>(latent_packs);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto peers = p2p::peers<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(p);
   block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
   block_stamp(1);
-  const auto shared = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
-  const auto proj   = [&](int r, int64_t i) { return p2p::read_input(peers[r], i + hidden_packs); };
+  const auto shared = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto proj   = [&](int r, int64_t i) {
+    return p2p::read_input(inputs[r], i + hidden_packs);
+  };
   const auto latent = [&](int r, int64_t i) {
-    return p2p::read_input(peers[r], i + 2 * hidden_packs);
+    return p2p::read_input(inputs[r], i + 2 * hidden_packs);
   };
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's

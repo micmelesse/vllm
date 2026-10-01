@@ -27,14 +27,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     for (int j = 0; j < 4; ++j) acc ^= w[j];
   };
   if (peer >= 0) {
-    const auto them = p2p::peer<T, ngpus>(p, peer);
-    for (int64_t i = first; i < packs; i += stride) fold(p2p::read_input(them, i));
+    const auto their_input = p2p::input<T, ngpus>(p, peer);
+    for (int64_t i = first; i < packs; i += stride) fold(p2p::read_input(their_input, i));
   } else {
-    const auto peers = p2p::peers<T, ngpus>(p);
+    const auto inputs = p2p::inputs<T, ngpus>(p);
     for (int64_t i = first; i < packs; i += stride) {
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
-        if (r != p.rank) fold(p2p::read_input(peers[r], i));
+        if (r != p.rank) fold(p2p::read_input(inputs[r], i));
     }
   }
   if (acc == 0x9e3779b9u) *sink = acc;

@@ -36,9 +36,10 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto peers = p2p::peers<T, ngpus>(p);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
-  const auto self = p2p::self<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
@@ -63,7 +64,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];
-      if (f.in[k] != 0.0f) p2p::write_scratch(self, at + f.at[k], thread_pack<T>(x));
+      if (f.in[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.at[k], thread_pack<T>(x));
     }
   }
 
@@ -82,7 +83,8 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
       // last row is real, and a load under an `if` waits on the one before.
       V got[ngpus];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) got[r] = p2p::read_scratch(peers[r], int64_t{l} * packs + i);
+      for (int r = 0; r < ngpus; ++r)
+        got[r] = p2p::read_scratch(scratches[r], int64_t{l} * packs + i);
 #pragma unroll
       for (int r = 0; r < ngpus; ++r) {
         const int row = r * slice_rows + l;

@@ -52,8 +52,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto peers = p2p::peers<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor.
@@ -63,7 +64,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     const int64_t i   = row * packs + col0 + (e - q * cols);
     const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) p2p::write_scratch(peers[r], i, sum);
+    for (int r = 0; r < ngpus; ++r) p2p::write_scratch(scratches[r], i, sum);
   }
   block_stamp(2);
 
@@ -74,12 +75,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   // 4. This block's rows: the sum out of this rank's scratch, then AttnRes, as the one-shot does.
   //    The next call's first sync keeps a peer from pushing into this scratch while it is read (a
   //    peer's next kernel starts only once this one has finished).
-  const auto self = p2p::self<T, ngpus>(p);
+  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) sum[k] = p2p::read_scratch(self, base + f.at[k]);
+    for (int k = 0; k < kRowPacks; ++k) sum[k] = p2p::read_scratch(own_scratch, base + f.at[k]);
     block_attn_res_row<T, kPrefix, kRowPacks>(
         sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
         norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);

@@ -33,10 +33,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int64_t pass = min(stage_packs, p.scratch_packs * ngpus);
   __shared__ V got[kMaxThreads];
 
-  const auto self    = p2p::self<T, ngpus>(p);
-  const auto them    = p2p::peer<T, ngpus>(p, peer);
-  const auto mine    = p2p::staging<T, ngpus>(p, p.rank);
-  const auto theirs  = p2p::staging<T, ngpus>(p, peer);
+  const auto own_scratch    = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto their_scratch    = p2p::scratch<T, ngpus>(p, peer);
+  const auto own_staging = p2p::staging<T, ngpus>(p, p.rank);
+  const auto their_staging = p2p::staging<T, ngpus>(p, peer);
   V* dst             = reinterpret_cast<V*>(out);
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     //    every peer has read this rank's scratch).
     for (int i = first; i < slice_packs; i += stride) {
       const int64_t at = int64_t{peer} * slice_packs + i;
-      if (at < n) p2p::write_staging(mine, at, own[c0 + at]);
+      if (at < n) p2p::write_staging(own_staging, at, own[c0 + at]);
     }
     p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
     block_stamp(1);
@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     const int64_t base = int64_t{p.rank} * slice_packs;
     const int count    = static_cast<int>(min(int64_t{slice_packs}, n - base));
     for (int i = first; i < count; i += stride) {
-      got[threadIdx.x] = p2p::read_staging(theirs, base + i);
+      got[threadIdx.x] = p2p::read_staging(their_staging, base + i);
       __syncthreads();
       if (wave == 0) {
         float acc[N];
@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
         V s;
 #pragma unroll
         for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
-        p2p::write_scratch(self, i, s);
+        p2p::write_scratch(own_scratch, i, s);
       }
       __syncthreads();
     }
@@ -87,7 +87,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     //    scratch while it is read.
     for (int i = first; i < slice_packs; i += stride)
       if (int64_t{peer} * slice_packs + i < n)
-        thread_store(dst + c0 + int64_t{peer} * slice_packs + i, p2p::read_scratch(them, i));
+        thread_store(dst + c0 + int64_t{peer} * slice_packs + i,
+                     p2p::read_scratch(their_scratch, i));
     block_stamp(5);
   }
 }

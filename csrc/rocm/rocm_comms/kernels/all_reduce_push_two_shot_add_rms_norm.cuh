@@ -47,8 +47,9 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto peers = p2p::peers<T, ngpus>(p);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(peers[r], i); };
+  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor.
@@ -58,7 +59,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const int64_t i   = row * packs + col0 + (e - q * cols);
     const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) p2p::write_scratch(peers[r], i, sum);
+    for (int r = 0; r < ngpus; ++r) p2p::write_scratch(scratches[r], i, sum);
   }
   block_stamp(2);
 
@@ -70,13 +71,13 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    rounding as the reference does (the one-shot kernel spells it out). The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
-  const auto self = p2p::self<T, ngpus>(p);
+  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k)
-      thread_unpack<T>(p2p::read_scratch(self, base + f.at[k]), s[k]);
+      thread_unpack<T>(p2p::read_scratch(own_scratch, base + f.at[k]), s[k]);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       if constexpr (kAdd) {

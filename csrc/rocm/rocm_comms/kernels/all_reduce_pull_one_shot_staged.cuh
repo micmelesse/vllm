@@ -25,16 +25,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const V* own        = reinterpret_cast<const V*>(own_input);
   const int64_t first = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
   const int64_t step  = int64_t{gridDim.x} * blockDim.x;
-  const auto staged   = p2p::stagings<T, ngpus>(p);
-  const auto mine     = p2p::staging<T, ngpus>(p, p.rank);
-  const auto read     = [&](int r, int64_t i) { return p2p::read_staging(staged[r], i); };
+  const auto stagings = p2p::stagings<T, ngpus>(p);
+  const auto own_staging = p2p::staging<T, ngpus>(p, p.rank);
+  const auto read     = [&](int r, int64_t i) { return p2p::read_staging(stagings[r], i); };
   V* dst              = reinterpret_cast<V*>(out);
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += stage_packs) {
     const int64_t n = min(stage_packs, num_packs - c0);
     block_stamp(0);
     // 1. This rank's pass into its staging, then visible to the peers (each has staged its own).
-    for (int64_t i = first; i < n; i += step) p2p::write_staging(mine, i, own[c0 + i]);
+    for (int64_t i = first; i < n; i += step) p2p::write_staging(own_staging, i, own[c0 + i]);
     p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
     block_stamp(1);
     // 2. Read every rank's staged pass, in rank order, and sum.
