@@ -9,7 +9,7 @@
 
 #include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
-#include "../rows/attn_res.cuh"
+#include "../fusions/attn_res.cuh"
 
 namespace hip_comms {
 
