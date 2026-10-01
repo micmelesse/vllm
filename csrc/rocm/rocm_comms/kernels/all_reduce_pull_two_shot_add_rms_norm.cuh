@@ -65,8 +65,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   vec<W, NL> w[kRowPacks];
 #pragma unroll
   for (int k = 0; k < kRowPacks; ++k) w[k] = wv[f.at[k]];
-  // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its wait
-  // covers only its own, older, loads), so the next round trip runs under the reduction and norm.
+  // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
+  // wait covers only its own, older, loads), so the next round trip runs under the reduction and
+  // norm.
   using Packs = PeerPacks<T, ngpus, kRowPacks>;
   const auto one_row = [&](int row, const Packs& cur, Packs& next) {
     const int64_t base = int64_t{row} * packs;
