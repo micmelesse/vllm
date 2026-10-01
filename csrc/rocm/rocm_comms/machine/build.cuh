@@ -56,9 +56,10 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
 
   // A ROW KERNEL'S PACKS A THREAD: each pack keeps a load from every peer in flight at once
-  // (peers_reduce), and AttnRes fp32 copies of it besides: the prefix, the weights, the output,
-  // and one a source of a reduction's. Policy: a row's registers take at most half of the thread's, the rest its
-  // addresses, reductions and the norm. At all of them the norms spilled (8 packs of 8 peers is
+  // (peers_reduce). AttnRes then holds fp32 copies of it (the prefix, the weights, the output, and
+  // one a source of a reduction's), after the loads are summed, so the larger phase counts. Policy:
+  // a row's registers take at most half of the thread's, the rest its addresses, reductions and
+  // the norm. At all of them the norms spilled (8 packs of 8 peers is
   // 256 registers: ISA 2026-09-30T20-23-38Z), and AttnRes at 4.
   const int pack_vgprs  = b.pack_bytes / 4;
   const int row_budget  = hw.arch_vgprs / 2;
@@ -66,7 +67,7 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   // A pack of the narrowest T built (bf16) as fp32, for each copy.
   const int attn_state  = (3 + cal.attn_res_sources_per_reduce) * (b.pack_bytes / 2);
   b.norm_row_packs      = floor_pow2(row_budget / in_flight);
-  b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight + attn_state));
+  b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight > attn_state ? in_flight : attn_state));
   // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
   // registers (the pull norm two-shot spilled at 4 packs: 2026-10-01T00-06-30Z).
   b.pipelined_row_packs = floor_pow2(row_budget / (2 * in_flight));
