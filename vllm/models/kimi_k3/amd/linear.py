@@ -171,6 +171,7 @@ class KimiMoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner,
+        reduce_results: bool = True,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -293,6 +294,7 @@ class KimiMoE(nn.Module):
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
             runner_cls=latent_runner_cls if self.use_latent_moe else None,
+            reduce_results=reduce_results,
         )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -334,6 +336,7 @@ class KimiMLAAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -404,6 +407,7 @@ class KimiMLAAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -464,6 +468,9 @@ class KimiMLAAttention(nn.Module):
 class KimiDecoderLayer(nn.Module):
     # The latent MoE's runner; a fused decoder layer swaps in its own.
     latent_runner_cls: type[ROCmLatentMoERunner] = ROCmLatentMoERunner
+    # Whether attention and the MLP all-reduce their own outputs. A subclass that
+    # reduces them itself, fused with what consumes them, sets it False.
+    reduce_results = True
 
     def __init__(
         self,
@@ -491,6 +498,7 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=self.reduce_results,
                 )
             else:
                 self.self_attn = KimiLinearGatedDeltaNetAttention(
@@ -524,6 +532,7 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=kv_lora_rank,
                 use_nope=mla_use_nope,
+                reduce_results=self.reduce_results,
             )
 
         if (
@@ -538,6 +547,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.block_sparse_moe",
                 layer_idx=layer_idx,
                 latent_runner_cls=self.latent_runner_cls,
+                reduce_results=self.reduce_results,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -549,6 +559,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                reduce_results=self.reduce_results,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

@@ -151,7 +151,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_COMMS_BACKEND: Literal["hip", "iris", "torch"] | None = None
-    VLLM_KIMI_K3_FUSED_DECODER: Literal["none", "norm"] = "none"
+    VLLM_KIMI_K3_FUSED_DECODER: Literal["none", "norm", "attn_res"] = "none"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1359,10 +1359,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The set of names is `rocm_comms.Backend`.
     "VLLM_ROCM_COMMS_BACKEND": lambda: os.getenv("VLLM_ROCM_COMMS_BACKEND") or None,
     # Which fused decoder layer Kimi-K3 runs (all-reduces fused into the ops that
-    # consume them; rocm_comms backend only): none, or norm (the latent MoE tail's
-    # all-reduce and RMSNorm). By default none.
+    # consume them; rocm_comms backend only): none, norm (the latent MoE tail's
+    # all-reduce and RMSNorm) or attn_res (each AttnRes with the all-reduce feeding
+    # it). By default none.
     "VLLM_KIMI_K3_FUSED_DECODER": env_with_choices(
-        "VLLM_KIMI_K3_FUSED_DECODER", "none", ["none", "norm"]
+        "VLLM_KIMI_K3_FUSED_DECODER", "none", ["none", "norm", "attn_res"]
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

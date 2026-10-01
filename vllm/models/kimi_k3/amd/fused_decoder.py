@@ -35,4 +35,10 @@ def layer_class() -> type[KimiDecoderLayer]:
         from vllm.models.kimi_k3.amd.fused_decoder_norm import KimiDecoderLayerNorm
 
         return KimiDecoderLayerNorm
+    if path == "attn_res":
+        from vllm.models.kimi_k3.amd.fused_decoder_attn_res import (
+            KimiDecoderLayerAttnRes,
+        )
+
+        return KimiDecoderLayerAttnRes
     raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={path} names no fused decoder")
