@@ -688,14 +688,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        def get_layer(prefix: str):
-            # VLLM_KIMI_K3_FUSED_DECODER: the decoder layer with its all-reduces
-            # fused into the ops that consume them, in its own class.
-            from vllm.models.kimi_k3.amd import fused_decoder
+        # VLLM_KIMI_K3_FUSED_DECODER: a decoder layer with its all-reduces fused into
+        # the ops that consume them, one class per fusion path.
+        from vllm.models.kimi_k3.amd import fused_decoder
 
-            if fused_decoder.enabled():
-                return fused_decoder.KimiDecoderLayerFused(config, vllm_config, prefix)
-            return KimiDecoderLayer(config, vllm_config, prefix)
+        layer_cls = fused_decoder.layer_class()
+
+        def get_layer(prefix: str):
+            return layer_cls(config, vllm_config, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
