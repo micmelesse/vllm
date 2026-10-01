@@ -158,8 +158,9 @@ constexpr Calibration kGfx950Calibration = {
     .all_reduce_one_shot_max_bytes = 64 * kKiB,
     // Picked at Kimi-K3's shape on the GEMM tail; 1, 2 and 8 were worse at 1 row (2026-09-28).
     .gemm_lanes_per_col = 4,
-    // Triton's AttnRes takes 4 sources a tile; not swept yet.
-    .attn_res_sources_per_reduce = 4,
+    // 1: at 4 (Triton's tile) the row got slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096
+    // tokens, with 100 -> 166 VGPRs (stamps 2026-10-01T06-26-55Z against 04-15-48Z).
+    .attn_res_sources_per_reduce = 1,
     .rms_norm = {
         // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
         .one_shot_max_bytes = 128 * kKiB,
