@@ -683,6 +683,10 @@ class KimiDecoderLayer(nn.Module):
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin):
+    # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant whose
+    # all-reduces are fused into the ops that consume them.
+    layer_cls: type[KimiDecoderLayer] = KimiDecoderLayer
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -700,16 +704,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant
-        # whose all-reduces are fused into the ops that consume them.
-        layer_cls: type[KimiDecoderLayer] = KimiDecoderLayer
         if envs.VLLM_KIMI_K3_FUSED_DECODER != "none":
             from vllm.models.kimi_k3.amd import fused_decoder
 
-            layer_cls = fused_decoder.layer_class(envs.VLLM_KIMI_K3_FUSED_DECODER)
+            self.layer_cls = fused_decoder.layer_class(envs.VLLM_KIMI_K3_FUSED_DECODER)
 
         def get_layer(prefix: str):
-            return layer_cls(config, vllm_config, prefix)
+            return self.layer_cls(config, vllm_config, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
