@@ -14,8 +14,8 @@
 namespace hip_comms {
 
 // What each kernel is, in Kernel's order: its op, its shot, and for a row kernel the most packs of
-// its row a thread holds (machine/build.cuh derives each; 0 for a kernel without rows). A build past
-// that would only ever run slower, so it is not built.
+// its row a thread holds (machine/build.cuh derives each; 0 for a kernel without rows). A build
+// past that would only ever run slower, so it is not built.
 struct KernelInfo {
   Kernel kernel;
   Op op;
