@@ -67,7 +67,8 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   // A pack of the narrowest T built (bf16) as fp32, for each copy.
   const int attn_state  = (3 + cal.attn_res_sources_per_reduce) * (b.pack_bytes / 2);
   b.norm_row_packs      = floor_pow2(row_budget / in_flight);
-  b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight > attn_state ? in_flight : attn_state));
+  const int attn_peak   = in_flight > attn_state ? in_flight : attn_state;
+  b.attn_res_row_packs  = floor_pow2(row_budget / attn_peak);
   // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
   // registers (the pull norm two-shot spilled at 4 packs: 2026-10-01T00-06-30Z).
   b.pipelined_row_packs = floor_pow2(row_budget / (2 * in_flight));
