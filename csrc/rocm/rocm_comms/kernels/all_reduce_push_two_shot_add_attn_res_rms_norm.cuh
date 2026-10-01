@@ -9,7 +9,7 @@
 
 #include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
-#include "all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
+#include "attn_res_row.cuh"
 
 namespace hip_comms {
 
