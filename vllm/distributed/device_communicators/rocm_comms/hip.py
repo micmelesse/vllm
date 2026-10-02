@@ -28,7 +28,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .base import Communicator, Error, Op, Plan
-from .launch import Launch, Template, launch_wire
+from .launch import Launch, launch_wire
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ class HipCommunicator(Communicator):
         what our kernels run is there, none here."""
         template, grid, threads, err = torch.ops._rocm_C.rocm_comms_plan(
             self._handle,
-            get_args(Op).index(op),
+            op,
             list(inp.shape),
             inp.dtype,
             inp.is_contiguous(),
@@ -183,7 +183,7 @@ class HipCommunicator(Communicator):
         )
         if err is not None:
             return Error(err)
-        return Plan(Launch(get_args(Template)[template], grid, threads))
+        return Plan(Launch(template, grid, threads))
 
     def _all_reduce_rms_norm(
         self,

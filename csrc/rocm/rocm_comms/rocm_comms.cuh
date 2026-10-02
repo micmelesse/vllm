@@ -92,6 +92,12 @@ constexpr const char* to_string(Op op) {
 }
 #undef HIP_COMMS_CASE
 constexpr int kNumOps = static_cast<int>(Op::all_reduce_rms_scale_add) + 1;
+// The op a name names, or none.
+inline std::optional<Op> op_named(const std::string& name) {
+  for (int i = 0; i < kNumOps; ++i)
+    if (name == to_string(static_cast<Op>(i))) return static_cast<Op>(i);
+  return std::nullopt;
+}
 
 // Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
 // one per set of template arguments.
@@ -194,8 +200,9 @@ enum class Error : int {
   device_not_built          = 18,
   device_not_tuned          = 19,
   weight_not_built          = 20,
+  no_such_template          = 21,
 };
-constexpr int kNumErrors = 21;
+constexpr int kNumErrors = 22;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -232,6 +239,8 @@ constexpr const char* to_string(Error e) {
       return "device_not_tuned: the device is not the one select is calibrated for";
     case Error::weight_not_built:
       return "weight_not_built: a norm's weight is in the call's dtype or fp32";
+    case Error::no_such_template:
+      return "no_such_template: the forced template's name names none";
   }
   return "unknown";
 }

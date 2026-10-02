@@ -64,7 +64,7 @@ from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
 )
-from vllm.distributed.device_communicators.rocm_comms.launch import Launch, Template
+from vllm.distributed.device_communicators.rocm_comms.launch import Launch
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.device_communicators.rocm_comms.tunables import Tunables
 from vllm.distributed.parallel_state import (
@@ -210,7 +210,7 @@ Shot = Literal["all_reduce_pull_one_shot", "all_reduce_pull_two_shot"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
 # The fast tier forces each, whatever tune would pick.
 PULL_SHOTS: tuple[Shot, ...] = SHOTS
-ALL_REDUCE_KERNELS: tuple[Template, ...] = SHOTS
+ALL_REDUCE_KERNELS: tuple[str, ...] = SHOTS
 # THE FUSED OPS' SHOTS: the pull shots, and the push two-shot (a column split) that the
 # norms and AttnRes have.
 FusedShot = Literal[
@@ -934,7 +934,7 @@ def exercise(
     mode: str,
     groups: Sequence[str],
     dtypes: Sequence[str],
-    kernel: Template | None = None,
+    kernel: str | None = None,
 ) -> tuple[Measurement | None, str | None]:
     """Exercise the world's communicator for `backend` over its whole API. `(worst
     verdict, None)`, or `(None, why nothing was measured)`.
@@ -1045,7 +1045,7 @@ def run_communicator(
     mode: str,
     groups: Sequence[str],
     dtypes: Sequence[str],
-    kernel: Template | None = None,
+    kernel: str | None = None,
 ) -> tuple[Measurement | None, str | None]:
     """Run `exercise` in every rank, fold to the WORST rank's numbers -- a collective's
     bug is often visible on only a subset, so it passes only if EVERY rank passed."""
@@ -1160,7 +1160,7 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
 
 def _communicator_param(
     backend: str,
-    kernel: Template | None,
+    kernel: str | None,
     mode: str,
     dtypes: tuple[str, ...],
     groups: tuple[str, ...],
@@ -1226,7 +1226,7 @@ COMMUNICATOR_CASES = (
 )
 def test_communicator(
     backend: str,
-    kernel: Template | None,
+    kernel: str | None,
     mode: str,
     dtypes: tuple[str, ...],
     groups: tuple[str, ...],
@@ -1331,7 +1331,7 @@ def run_fused_rank(
     inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
     residual = _one_input(world, 1, shape, dtype)
     weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-    launch = Launch(cast(Template, f"{shot}_{form}"))
+    launch = Launch(f"{shot}_{form}")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if form == "rms_norm":
@@ -1590,7 +1590,7 @@ def run_add_attn_res_rms_norm_rank(
     )
     torch.cuda.synchronize()
 
-    launch = Launch(cast(Template, f"{shot}_add_attn_res_rms_norm"))
+    launch = Launch(f"{shot}_add_attn_res_rms_norm")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if not comm.should_allreduce_add_attn_res_rms_norm(mine, launch):
@@ -1700,7 +1700,7 @@ def run_rms_norm_gemm_rank(
     torch.cuda.synchronize()
 
     op = "rms_norm_gemm_add" if add else "rms_norm_gemm"
-    launch = Launch(cast(Template, f"{shot}_{op}"))
+    launch = Launch(f"{shot}_{op}")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     admits = (
@@ -1836,16 +1836,16 @@ def test_all_reduce_rms_scale_add_matches_the_ops_it_replaces(
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
 
 
-def test_python_mirrors_cpps_enums_name_for_name() -> None:
-    """Python's `Error`, `Op` and `Template` are C++'s enums: the same names in the same
-    order, so a number crossing the boundary names the same thing on both sides."""
+def test_python_names_cpps_errors_and_ops() -> None:
+    """Python's `Error` is C++'s, name for name in order, so an Error's number names the
+    same reason on both sides; and its `Op` names exactly C++'s ops, which cross by
+    name."""
     # example-based: fixed tables against fixed tables, nothing to vary
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     built = build_info()
     assert tuple(e.name for e in Error) == built.error_names
-    assert get_args(Op) == built.op_names
-    assert get_args(Template) == built.template_names
+    assert set(get_args(Op)) == set(built.op_names)
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])

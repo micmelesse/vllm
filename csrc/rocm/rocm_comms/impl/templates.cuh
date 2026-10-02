@@ -10,6 +10,8 @@
 #endif
 
 #include <cstdint>
+#include <optional>
+#include <string>
 
 namespace hip_comms {
 
@@ -76,6 +78,12 @@ static_assert(templates_in_order(), "kTemplates must list every Template in its 
 constexpr const TemplateInfo& info(Template k) { return kTemplates[static_cast<int>(k)]; }
 constexpr Op op_of(Template k) { return info(k).op; }
 constexpr const char* to_string(Template k) { return info(k).name; }
+// The template a name names, or none: how a caller forces one (the bench's sweeps, the tests).
+inline std::optional<Template> template_named(const std::string& name) {
+  for (const TemplateInfo& t : kTemplates)
+    if (name == t.name) return t.fn;
+  return std::nullopt;
+}
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 // A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
 constexpr bool gemms(Op op) {

@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 # envelope is: torch is the control, and a control that serves a superset is answering a
 # different question than the backends it is a control for. ----
 
-# EVERY OP, in C++'s order (`enum class Op`; a test holds them equal), named as its
-# method is: the all-reduce, then each all-reduce and the ops it fuses, in order.
+# EVERY OP, as C++ names them (`enum class Op`; a test holds them equal) and as its
+# method is named: the all-reduce, then each all-reduce and the ops it fuses, in order.
 Op = Literal[
     "all_reduce",
     "all_reduce_rms_norm",
@@ -81,6 +81,7 @@ class Error(IntEnum):
     device_not_built = 18
     device_not_tuned = 19
     weight_not_built = 20
+    no_such_template = 21
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -94,23 +95,22 @@ _DTYPES: Mapping[str, torch.dtype] = {
 @dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device (C++'s `kDTypesBuilt`,
-    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`, and its enums' names)."""
+    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`, its ops' and errors' names)."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
     pack_bytes: int
     staging_bytes: int
-    # C++'s `Op`, `Template` and `Error` members by name, each in its enum's order (the
-    # number that crosses the boundary).
+    # C++'s `Op` and `Error` members by name, each in its enum's order: an op crosses
+    # by name, an Error by its number.
     op_names: tuple[str, ...]
-    template_names: tuple[str, ...]
     error_names: tuple[str, ...]
 
 
 @functools.cache
 def build_info() -> BuildInfo:
     """The build's facts, read once: they are fixed when it is compiled."""
-    dtypes, worlds, pack, staging, ops, templates, errors = (
+    dtypes, worlds, pack, staging, ops, errors = (
         torch.ops._rocm_C.rocm_comms_build_info()
     )
     return BuildInfo(
@@ -119,7 +119,6 @@ def build_info() -> BuildInfo:
         pack,
         staging,
         tuple(ops),
-        tuple(templates),
         tuple(errors),
     )
 
