@@ -292,7 +292,8 @@ class Communicator(ABC):
         class because the LINE is shared. What a backend does on either side of it is
         the backend's, so the classification is offered and not applied.
         """
-        if not self._admit("all_reduce", inp, launch, quant_bits):
+        self._require("all_reduce", inp, launch, quant_bits)
+        if self._warming_up("all_reduce"):
             return torch.empty_like(inp)
         # NO BRANCH HERE. It used to fork on `_is_small` and call the same thing on
         # both sides, marking where the paths would part. They part now -- in the
@@ -313,7 +314,8 @@ class Communicator(ABC):
 
         A variant of the collective, so it goes through the same two doors: the capture
         check and the admission check."""
-        if not self._admit("all_reduce_rms_norm", inp, launch, quant_bits):
+        self._require("all_reduce_rms_norm", inp, launch, quant_bits)
+        if self._warming_up("all_reduce_rms_norm"):
             return torch.empty_like(inp)
         return self._all_reduce_rms_norm(inp, weight, eps, launch, quant_bits)
 
@@ -328,7 +330,8 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, then the sum plus residual."""
-        if not self._admit("all_reduce_add_rms_norm", inp, launch, quant_bits):
+        self._require("all_reduce_add_rms_norm", inp, launch, quant_bits)
+        if self._warming_up("all_reduce_add_rms_norm"):
             return torch.empty_like(inp), torch.empty_like(inp)
         return self._all_reduce_add_rms_norm(
             inp, residual, weight, eps, launch, quant_bits
@@ -362,7 +365,8 @@ class Communicator(ABC):
         `prefix` the sum starting one. Returns the prefix (updated in place when given)
         and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
         block."""
-        if not self._admit("all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits):
+        self._require("all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits)
+        if self._warming_up("all_reduce_add_attn_res_rms_norm"):
             started = torch.empty_like(inp) if prefix is None else prefix
             return started, torch.empty_like(inp)
         return self._all_reduce_add_attn_res_rms_norm(
@@ -414,9 +418,10 @@ class Communicator(ABC):
     ) -> None:
         """`out[:, out_col0:out_col0 + N] = rms_norm(all_reduce(inp), norm_weight, eps)
         @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
-        if not self._admit(
+        self._require(
             "all_reduce_rms_norm_gemm", inp, launch, quant_bits, _cols(gemm_weight, 0)
-        ):
+        )
+        if self._warming_up("all_reduce_rms_norm_gemm"):
             return
         self._all_reduce_rms_norm_gemm(
             inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
@@ -455,13 +460,14 @@ class Communicator(ABC):
     ) -> None:
         """`out[:, out_col0:out_col0 + N] += rms_norm(all_reduce(inp), norm_weight, eps)
         @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
-        if not self._admit(
+        self._require(
             "all_reduce_rms_norm_gemm_add",
             inp,
             launch,
             quant_bits,
             _cols(gemm_weight, 0),
-        ):
+        )
+        if self._warming_up("all_reduce_rms_norm_gemm_add"):
             return
         self._all_reduce_rms_norm_gemm_add(
             inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
@@ -493,9 +499,10 @@ class Communicator(ABC):
     ) -> None:
         """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
         + projected * rsqrt(mean(latent^2) + eps)` in one kernel."""
-        if not self._admit(
+        self._require(
             "all_reduce_rms_scale_add", inp, launch, quant_bits, _cols(out, 1)
-        ):
+        )
+        if self._warming_up("all_reduce_rms_scale_add"):
             return
         self._all_reduce_rms_scale_add(inp, out, eps, launch, quant_bits)
 
@@ -559,19 +566,23 @@ class Communicator(ABC):
 
     # ---- The two rules a caller can get wrong, enforced once. ----
 
-    def _admit(
+    def _require(
         self,
         op: AdmitOp,
         inp: torch.Tensor,
         launch: Launch | None,
         quant_bits: int,
         cols: int | None = None,
-    ) -> bool:
-        """Whether `op` launches: False in a capture's WARMUP (inside `capture()`, the
-        stream not recording), whose outputs are discarded, so the op returns
-        unwritten outputs of the right shape and nothing waits on peers, as vLLM's and
-        aiter's custom all-reduce do. Raises on a refusal, and on a recording outside
-        `capture()`."""
+    ) -> None:
+        """Raise unless this backend runs `op` over `inp`: `check`'s Error."""
+        if (err := self.check(op, inp, launch, quant_bits, cols)) is not None:
+            raise RuntimeError(self._rejected(op, inp, err))
+
+    def _warming_up(self, op: str) -> bool:
+        """Whether this is a capture's WARMUP: inside `capture()`, the stream not
+        recording. vLLM discards its outputs, so an op returns unwritten ones of the
+        right shape and launches nothing, as vLLM's and aiter's custom all-reduce do.
+        Raises on a recording outside `capture()`."""
         recording = torch.cuda.is_current_stream_capturing()
         if recording and not self._capturing:
             raise RuntimeError(
@@ -581,9 +592,7 @@ class Communicator(ABC):
                 f"exits, and a graph captured without it "
                 f"replays against addresses that were never registered."
             )
-        if (err := self.check(op, inp, launch, quant_bits, cols)) is not None:
-            raise RuntimeError(self._rejected(op, inp, err))
-        return recording or not self._capturing
+        return self._capturing and not recording
 
     def _rejected(self, op: str, inp: torch.Tensor, err: Error) -> str:
         """A refused call's message: the op, the input, and `check`'s Error."""
