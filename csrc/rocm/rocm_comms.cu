@@ -261,9 +261,11 @@ PlanWire rocm_comms_plan_all_reduce_rms_norm_gemm(fptr_t handle_ptr, const torch
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   if (gemm_weight.dim() != 2) return error_wire(hip_comms::Error::output_not_two_d);
   return planned(handle_ptr,
-                 hip_comms::GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr, 0.f, nullptr,
-                                         gemm_weight.size(0), nullptr,
-                                         std::get<hip_comms::DType>(d), inp.size(0), inp.size(1)},
+                 hip_comms::GemmTailArgs{.add    = add,
+                                         .n_cols = gemm_weight.size(0),
+                                         .dtype  = std::get<hip_comms::DType>(d),
+                                         .rows   = inp.size(0),
+                                         .hidden = inp.size(1)},
                  quant_bits, template_, launch_blocks, launch_threads);
 }
 

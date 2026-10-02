@@ -312,8 +312,8 @@ constexpr bool selections_fit() {
       if (!fits(select(NormArgs{add, nullptr, nullptr, nullptr, bf, bf, rows, hidden, 0.f,
                                 nullptr, nullptr}, w, o)))
         return false;
-      if (!fits(select(GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr, 0.f, nullptr, 0,
-                                    nullptr, bf, rows, hidden}, w, o)))
+      if (!fits(select(GemmTailArgs{.add = add, .dtype = bf, .rows = rows,
+                                    .hidden = hidden}, w, o)))
         return false;
     }
     if (!fits(select(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,

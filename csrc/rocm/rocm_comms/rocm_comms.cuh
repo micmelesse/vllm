@@ -299,8 +299,8 @@ struct AttnResArgs {
   bool has_prefix;
 };
 
-// add: out += the product (out [rows, N], possibly a column slice of a wider buffer) (rms_norm_gemm_add, Kimi-K3's latent tail); otherwise
-// it is written (rms_norm_gemm).
+// add: out += the product (rms_norm_gemm_add, Kimi-K3's latent tail); otherwise it is written
+// (rms_norm_gemm). out is [rows, n_cols] at out_stride, so a column slice of a wider buffer.
 struct GemmTailArgs {
   bool add;
   void* out;
