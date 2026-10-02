@@ -57,7 +57,8 @@ void paged_attention(
 using fptr_t = int64_t;
 
 // Opened over the process group named `group`, a collective: the IPC handles go round in C++.
-fptr_t rocm_comms_open(const std::string& group);
+std::tuple<std::optional<int64_t>, std::optional<int64_t>> rocm_comms_open(
+    const std::string& group);
 // The buffers a capture recorded, registered over `group`, a collective.
 void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group);
 // The probe, every rank together: the round trip to each peer (ns), then GB/s pulled from one

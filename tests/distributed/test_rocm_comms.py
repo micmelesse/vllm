@@ -1838,6 +1838,15 @@ def test_python_names_cpps_errors_and_ops() -> None:
     assert set(get_args(Op)) == set(built.op_names)
 
 
+def test_open_refuses_a_group_no_one_registered() -> None:
+    """Opening over a name no group is registered as is an Error, not a raise."""
+    # example-based: the lookup has one outcome for every unregistered name
+    import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
+
+    handle, err = torch.ops._rocm_C.rocm_comms_open("no-such-group")
+    assert handle is None and Error(err) is Error.no_such_group
+
+
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])
 def test_supported_is_the_builds_answer(size: int) -> None:
     """`supported` is the build's answer: this device (one the build covers, the tuning

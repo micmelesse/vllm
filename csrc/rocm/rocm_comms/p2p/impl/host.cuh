@@ -75,8 +75,8 @@ inline uintptr_t alloc_memory(int64_t scratch_bytes, int64_t staging_bytes) {
 class Group {
  public:
   // `self_memory` is this rank's `alloc_memory`, which the Group now owns; `signal_handles` and
-  // `signal_offsets` are the whole world's handles for theirs, gathered in PYTHON -- the collective
-  // that exchanges them belongs to the process group. `max_buffers` sizes the peer-pointer slab.
+  // `signal_offsets` are the whole world's handles for theirs, one per rank, and `world_size` is
+  // one the build holds (the opener checks both). `max_buffers` sizes the peer-pointer slab.
   Group(int rank, int world_size, uintptr_t self_memory,
         const std::vector<std::string>& signal_handles,
         const std::vector<int64_t>& signal_offsets, int64_t max_buffers, int64_t scratch_bytes,
@@ -86,12 +86,6 @@ class Group {
         self_signal_(reinterpret_cast<Signal*>(self_memory)),
         scratch_bytes_(scratch_bytes),
         staging_bytes_(staging_bytes) {
-    if (world_size_ < 2 || world_size_ > kMaxRanks)
-      throw std::runtime_error("hip_comms: world_size " + std::to_string(world_size_) +
-                               " outside [2, " + std::to_string(kMaxRanks) + "]");
-    if (signal_handles.size() != static_cast<size_t>(world_size_) ||
-        signal_offsets.size() != static_cast<size_t>(world_size_))
-      throw std::runtime_error("hip_comms: expected one signal handle+offset per rank");
     // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
     HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(max_buffers) * sizeof(PeerPtrs)));
     slab_end_ = slab_ + max_buffers;

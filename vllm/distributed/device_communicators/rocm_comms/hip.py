@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from typing import ClassVar, get_args
 
 import torch
-import torch.distributed as dist
 
 from .base import (
     AllReduceArgs,
@@ -67,11 +66,14 @@ class HipCommunicator(Communicator):
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        self.rank = dist.get_rank(self.cpu_group)
         # THE PEER MEMORY, made, sized and owned by C++, which also gathers every rank's
         # IPC handle over the CPU group (by its name, a collective) and opens them.
-        self._handle = torch.ops._rocm_C.rocm_comms_open(self.cpu_group.group_name)
-        logger.info("HipCommunicator ready: rank %d/%d", self.rank, self.world_size)
+        handle, err = torch.ops._rocm_C.rocm_comms_open(self.cpu_group.group_name)
+        if err is not None:
+            logger.info("HipCommunicator disabled: %s", Error(err).name)
+            return False
+        self._handle = handle
+        logger.info("HipCommunicator ready over %d ranks", self.world_size)
         return True
 
     @contextmanager

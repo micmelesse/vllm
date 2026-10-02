@@ -195,8 +195,10 @@ enum class Error : int {
   device_not_tuned          = 19,
   weight_not_built          = 20,
   no_such_template          = 21,
+  no_such_group             = 22,
+  ranks_disagree            = 23,
 };
-constexpr int kNumErrors = 22;
+constexpr int kNumErrors = 24;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -235,6 +237,9 @@ constexpr const char* to_string(Error e) {
       return "weight_not_built: a norm's weight is in the call's dtype or fp32";
     case Error::no_such_template:
       return "no_such_template: the forced template's name names none";
+    case Error::no_such_group: return "no_such_group: no process group is registered by that name";
+    case Error::ranks_disagree:
+      return "ranks_disagree: the ranks captured different numbers of buffers";
   }
   return "unknown";
 }

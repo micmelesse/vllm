@@ -96,6 +96,8 @@ class Error(IntEnum):
     device_not_tuned = 19
     weight_not_built = 20
     no_such_template = 21
+    no_such_group = 22
+    ranks_disagree = 23
 
 
 # C++'s `DType` names, as torch's dtypes.

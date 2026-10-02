@@ -39,10 +39,20 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 // passes none of them.
 
 namespace {
-// EVERY RANK'S `mine`, in rank order, over the process group named `group` (a byte string the
-// same length on every rank): the IPC handles go round here, not in Python.
-std::vector<std::string> all_gathered(const std::string& group, const std::string& mine) {
-  const auto pg = c10d::resolve_process_group(group);
+using Group = c10::intrusive_ptr<c10d::ProcessGroup>;
+
+// THE PROCESS GROUP registered as `name`, or none.
+std::optional<Group> resolved(const std::string& name) {
+  try {
+    return c10d::resolve_process_group(name);
+  } catch (const c10::Error&) {
+    return std::nullopt;
+  }
+}
+
+// EVERY RANK'S `mine`, in rank order, over `pg` (a byte string the same length on every rank): the
+// IPC handles go round here, not in Python.
+std::vector<std::string> all_gathered(const Group& pg, const std::string& mine) {
   const auto as_bytes = torch::TensorOptions().dtype(torch::kUInt8);
   std::vector<at::Tensor> in{torch::empty({static_cast<int64_t>(mine.size())}, as_bytes)};
   std::memcpy(in[0].data_ptr(), mine.data(), mine.size());
@@ -115,14 +125,19 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
       hip_comms::Forced{*t, static_cast<int>(blocks), static_cast<int>(threads)}, stream};
 }
 
+// AN ERROR RAISED, at the torch boundary: a torch op can only return or raise.
+[[noreturn]] void raise(hip_comms::Error e) {
+  TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(e));
+  __builtin_unreachable();
+}
+
 // An op's options, its Error raised: a torch op can only return or raise.
 hip_comms::Options options_or_raise(std::optional<int64_t> quant_bits,
                                     const std::optional<std::string>& template_,
                                     std::optional<int64_t> launch_blocks,
                                     std::optional<int64_t> launch_threads) {
   auto o = options_of(quant_bits, template_, launch_blocks, launch_threads);
-  if (const auto* e = std::get_if<hip_comms::Error>(&o))
-    TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
+  if (const auto* e = std::get_if<hip_comms::Error>(&o)) raise(*e);
   return std::get<hip_comms::Options>(o);
 }
 
@@ -134,39 +149,17 @@ void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
 }
 }  // namespace
 
-// AN OP'S ERROR RAISED, at the torch boundary: a torch op can only return or raise.
+// AN OP'S ERROR RAISED.
 static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result) {
-  if (const hip_comms::Error* e = std::get_if<hip_comms::Error>(&result))
-    TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
+  if (const hip_comms::Error* e = std::get_if<hip_comms::Error>(&result)) raise(*e);
 }
-
-// THE COMMUNICATOR OPENED over the process group named `group`, a collective: this rank's
-// symmetric memory, made and owned here, its handle gathered with every rank's, and the peers'
-// opened.
-fptr_t rocm_comms_open(const std::string& group) {
-  const auto pg   = c10d::resolve_process_group(group);
-  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes,
-                                                       hip_comms::kStagingBytes);
-  std::vector<std::string> handles;
-  std::vector<int64_t> offsets;
-  for (const std::string& bytes : all_gathered(group, handle_bytes(self))) {
-    auto [handle, offset] = from_handle_bytes(bytes);
-    handles.push_back(std::move(handle));
-    offsets.push_back(offset);
-  }
-  auto* handle = new hip_comms::Handle(pg->getRank(), pg->getSize(), self, handles, offsets,
-                                       hip_comms::kMaxBuffers, hip_comms::kScratchBytes,
-                                       hip_comms::kStagingBytes, hip_comms::kSyncTimeoutSeconds);
-  return reinterpret_cast<fptr_t>(handle);
-}
-
-
 
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names         = std::vector<std::string>;
 using PlanWire      = std::tuple<std::optional<std::string>, std::optional<int64_t>,
                                 std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
+using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using ProbeWire     = std::tuple<std::vector<double>, double, double, double, double>;
 using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names>;
 
@@ -291,6 +284,31 @@ PlanWire rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr, const torch
                  hip_comms::ScaleAddArgs{nullptr, nullptr, std::get<hip_comms::DType>(d),
                                          inp.size(0), hidden, latent, 0.f},
                  quant_bits, template_, launch_blocks, launch_threads);
+}
+
+// THE COMMUNICATOR OPENED over the process group named `group`, a collective: this rank's
+// symmetric memory, made and owned here, its handle gathered with every rank's, and the peers'
+// opened. A torch op cannot return a variant, so it is two optionals and exactly one is set, the
+// handle or the Error's number.
+OpenWire rocm_comms_open(const std::string& group) {
+  const auto pg = resolved(group);
+  if (!pg) return {std::nullopt, static_cast<int64_t>(hip_comms::Error::no_such_group)};
+  const int world = (*pg)->getSize();
+  if (!hip_comms::built_in(hip_comms::kWorldsBuilt, world))
+    return {std::nullopt, static_cast<int64_t>(hip_comms::Error::world_not_built)};
+  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes,
+                                                       hip_comms::kStagingBytes);
+  std::vector<std::string> handles;
+  std::vector<int64_t> offsets;
+  for (const std::string& bytes : all_gathered(*pg, handle_bytes(self))) {
+    auto [handle, offset] = from_handle_bytes(bytes);
+    handles.push_back(std::move(handle));
+    offsets.push_back(offset);
+  }
+  auto* handle = new hip_comms::Handle((*pg)->getRank(), world, self, handles, offsets,
+                                       hip_comms::kMaxBuffers, hip_comms::kScratchBytes,
+                                       hip_comms::kStagingBytes, hip_comms::kSyncTimeoutSeconds);
+  return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
 // SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
@@ -430,25 +448,23 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
 // rank must have captured the same graphs, so the same number of buffers.
 void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group) {
   auto& h            = handle_of(handle_ptr);
+  const auto pg      = resolved(group);
+  if (!pg) raise(hip_comms::Error::no_such_group);
   const auto pending = h.pending_graph_buffers();
   const int64_t mine = static_cast<int64_t>(pending.size());
-  std::vector<int64_t> counts;
   for (const std::string& c :
-       all_gathered(group, std::string(reinterpret_cast<const char*>(&mine), sizeof(mine)))) {
+       all_gathered(*pg, std::string(reinterpret_cast<const char*>(&mine), sizeof(mine)))) {
     int64_t n = 0;
     std::memcpy(&n, c.data(), sizeof(n));
-    counts.push_back(n);
+    if (n != mine) raise(hip_comms::Error::ranks_disagree);
   }
-  for (const int64_t n : counts)
-    TORCH_CHECK(n == mine, "rocm_comms: ranks captured different numbers of buffers (", mine,
-                " here, ", n, " on another); every rank must run the same graph");
   if (pending.empty()) return;
   std::string all;
   for (const uintptr_t ptr : pending) all += handle_bytes(ptr);
   const size_t each = all.size() / pending.size();
   std::vector<std::vector<std::string>> handles(pending.size());
   std::vector<std::vector<int64_t>> offsets(pending.size());
-  for (const std::string& theirs : all_gathered(group, all))
+  for (const std::string& theirs : all_gathered(*pg, all))
     for (size_t i = 0; i < pending.size(); ++i) {
       auto [handle, offset] = from_handle_bytes(theirs.substr(i * each, each));
       handles[i].push_back(std::move(handle));
