@@ -34,7 +34,7 @@
 //                              quantized kernel that will use it
 //
 // p2p::host::                the host code (the ops, rocm_comms.cuh)
-//   Group                          the one lifetime object: maps the peers' memory,
+//   Handle                         the one lifetime object: maps the peers' memory,
 //                                  registers buffers, `dev_comm(input, bytes, stream)` per launch
 //                                  (`dev_comm_staged(bytes)` for a staged kernel)
 //   IpcHandle, handle_and_offset(ptr)  a buffer's IPC handle

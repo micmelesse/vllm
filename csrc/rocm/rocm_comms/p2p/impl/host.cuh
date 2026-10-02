@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p::host, behind p2p.cuh: `Group` maps every peer's signal block, scratch and
+// p2p::host, behind p2p.cuh: `Handle` maps every peer's signal block, scratch and
 // registered buffers once over HIP IPC handles, and hands a launch the `DevComm` it passes
 // to its kernel. The one object with a lifetime, on purpose: the mappings must outlive
 // every launch.
@@ -63,7 +63,7 @@ inline std::pair<std::string, int64_t> handle_and_offset(uintptr_t ptr) {
 // THIS RANK'S PEER MEMORY, one allocation, zeroed: the signal block, the scratch, then the
 // staging an eager input is copied into. UNCACHED, as aiter and vLLM's custom all-reduce allocate
 // theirs: peers read what this rank wrote, and cached, those writes sit dirty in L2 for the
-// barrier's writeback to flush. The Group it is passed to owns it.
+// barrier's writeback to flush. The Handle it is passed to owns it.
 inline uintptr_t alloc_memory(const BuildInfo::Memory& m) {
   void* p = nullptr;
   const size_t bytes = sizeof(Signal) + static_cast<size_t>(m.scratch_bytes + m.staging_bytes);
@@ -73,12 +73,12 @@ inline uintptr_t alloc_memory(const BuildInfo::Memory& m) {
   return reinterpret_cast<uintptr_t>(p);
 }
 
-class Group {
+class Handle {
  public:
-  // `self_memory` is this rank's `alloc_memory`, which the Group now owns; `signal_handles` and
+  // `self_memory` is this rank's `alloc_memory`, which the Handle now owns; `signal_handles` and
   // `signal_offsets` are the whole world's handles for theirs, one per rank, and `world_size` is
   // one the build holds (the opener checks both). `build` sizes the memory and the waits.
-  Group(int rank, int world_size, uintptr_t self_memory,
+  Handle(int rank, int world_size, uintptr_t self_memory,
         const std::vector<std::string>& signal_handles, const std::vector<int64_t>& signal_offsets,
         const BuildInfo& build)
       : rank_(rank),
@@ -108,7 +108,7 @@ class Group {
     timeout_ticks_ = static_cast<uint64_t>(build.kernels.sync_timeout_seconds * khz * 1000.0);
   }
 
-  ~Group() {
+  ~Handle() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
     hipFree(self_signal_);
@@ -196,6 +196,15 @@ class Group {
     HIP_CHECK(hipStreamIsCapturing(stream, &status));
     return status == hipStreamCaptureStatusActive ||
            registered_.count(const_cast<void*>(input)) != 0;
+  }
+
+  // What a compiled kernel uses, read once from the code object loaded on this device: only the
+  // compiler knows it.
+  Resources resources_of(const void* kernel) const {
+    if (const auto it = resources_.find(kernel); it != resources_.end()) return it->second;
+    hipFuncAttributes attrs{};
+    HIP_CHECK(hipFuncGetAttributes(&attrs, kernel));
+    return resources_[kernel] = {attrs.numRegs, static_cast<int64_t>(attrs.sharedSizeBytes)};
   }
 
   // A launch with no input: only the signals, for a kernel that moves no data.
@@ -289,6 +298,7 @@ class Group {
   PeerPtrs* slab_end_ = nullptr;
   PeerPtrs* cursor_   = nullptr;
   std::unordered_map<void*, PeerPtrs*> registered_;
+  mutable std::unordered_map<const void*, Resources> resources_;
   std::vector<void*> pending_;
   std::vector<PeerPtrs*> pending_slots_;
   std::unordered_map<std::string, void*> opened_;

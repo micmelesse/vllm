@@ -42,7 +42,7 @@ constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
 }
 
 // WHAT ONE COMPILED KERNEL USES, as the code object records it: a thread's vector registers and
-// a block's LDS. Only the compiler knows them, so they are read at run time (resources_of).
+// a block's LDS. Only the compiler knows them, so they are read at run time (Handle::resources_of).
 struct Resources {
   int vgprs;
   int64_t lds_bytes;

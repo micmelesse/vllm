@@ -11,7 +11,7 @@
 // An op returns the kernel it launched, or the Error and launches nothing. check and launch find
 // the compiled function a Kernel names the same way (impl/dispatch.cuh).
 //
-// Handle                  the state across calls: the peers' memory, mapped once (p2p's Group)
+// Handle                  the state across calls: the peers' memory, mapped once (p2p::host::Handle)
 // AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs, ScaleAddArgs   one op's call
 // Options                 how the caller wants it run: precision, a forced template, the stream
 // Kernel                  what runs: a template, its arguments, its grid and block
@@ -38,7 +38,7 @@
 
 namespace hip_comms {
 
-using Handle = p2p::host::Group;
+using p2p::host::Handle;
 
 template <typename T, size_t N>
 constexpr bool built_in(const std::array<T, N>& built, T x) {

@@ -18,7 +18,6 @@
 #include <c10/util/Half.h>
 #include <hip/hip_runtime.h>
 
-#include <map>
 #include <optional>
 #include <variant>
 #include <stdexcept>
@@ -132,17 +131,6 @@ inline int row_build(std::optional<int> row_packs) {
 }
 
 }  // namespace impl
-
-// What a compiled kernel uses, from its code object; read once a kernel.
-template <typename... P>
-Resources resources_of(void (*kernel)(P...)) {
-  thread_local std::map<const void*, Resources> known;
-  const void* at = reinterpret_cast<const void*>(kernel);
-  if (const auto it = known.find(at); it != known.end()) return it->second;
-  hipFuncAttributes attrs{};
-  HIP_CHECK(hipFuncGetAttributes(&attrs, at));
-  return known[at] = {attrs.numRegs, static_cast<int64_t>(attrs.sharedSizeBytes)};
-}
 
 template <typename F>
 void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {

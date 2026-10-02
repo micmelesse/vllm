@@ -25,7 +25,7 @@
 #include "rocm_comms/rocm_comms.cuh"
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. `p2p::host::Group` is a stateful C++ object and a torch op is a
+// THE TORCH OP BOUNDARY. `p2p::host::Handle` is a stateful C++ object and a torch op is a
 // free function over schema types, so the object crosses as an opaque handle -- the same
 // `fptr_t = int64_t` vLLM's custom all-reduce and quick-reduce use. IPC handles cross as
 // `int[]` for the same reason they do there: a schema has no bytes type.
@@ -39,10 +39,10 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 // passes none of them.
 
 namespace {
-using Group = c10::intrusive_ptr<c10d::ProcessGroup>;
+using ProcessGroupPtr = c10::intrusive_ptr<c10d::ProcessGroup>;
 
 // THE PROCESS GROUP registered as `name`, or none.
-std::optional<Group> resolved(const std::string& name) {
+std::optional<ProcessGroupPtr> resolved(const std::string& name) {
   try {
     return c10d::resolve_process_group(name);
   } catch (const c10::Error&) {
@@ -52,7 +52,7 @@ std::optional<Group> resolved(const std::string& name) {
 
 // EVERY RANK'S `mine`, in rank order, over `pg` (a byte string the same length on every rank): the
 // IPC handles go round here, not in Python.
-std::vector<std::string> all_gathered(const Group& pg, const std::string& mine) {
+std::vector<std::string> all_gathered(const ProcessGroupPtr& pg, const std::string& mine) {
   const auto as_bytes = torch::TensorOptions().dtype(torch::kUInt8);
   std::vector<at::Tensor> in{torch::empty({static_cast<int64_t>(mine.size())}, as_bytes)};
   std::memcpy(in[0].data_ptr(), mine.data(), mine.size());

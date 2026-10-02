@@ -34,10 +34,11 @@ inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) 
 
 // Whether kernel `k` holds its whole grid resident: only the compiled kernel knows what it uses.
 template <typename Args>
-bool resident(const Kernel& k, const Args& a) {
+bool resident(const Handle& h, const Kernel& k, const Args& a) {
   bool fits = true;
   dispatch(k, a, [&](auto kernel, const auto&) {
-    fits = k.grid <= resident_blocks(kTarget, resources_of(kernel), k.threads);
+    const Resources used = h.resources_of(reinterpret_cast<const void*>(kernel));
+    fits                 = k.grid <= resident_blocks(kTarget, used, k.threads);
   });
   return fits;
 }
@@ -69,7 +70,7 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.
   if (!is_staged(k) && !h.reads_in_place(a.inp, o.stream) && bytes_of(a) > h.staging_bytes())
     return Error::staging_too_small;
-  if (!resident(k, a)) return Error::grid_not_resident;
+  if (!resident(h, k, a)) return Error::grid_not_resident;
   return std::nullopt;
 }
 
