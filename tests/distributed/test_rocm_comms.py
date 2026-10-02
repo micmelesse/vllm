@@ -1122,7 +1122,7 @@ def test_admission_matches_the_baseline() -> None:
     only, so closing it needs a kernel.
     """
     ours = object.__new__(TorchCommunicator)
-    ours.disabled = False
+    ours.state = "open"
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real

@@ -17,7 +17,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, final
 
 import torch
 from torch.distributed import ProcessGroup
@@ -54,6 +54,10 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 
 # A LOSSY PRECISION on the wire, in bits; none is exact.
 QuantBits = Literal[8, 4]
+
+# A communicator's life: `__init__` -> open | disabled; open <-> capturing; open |
+# disabled -> closed. Only `Communicator` moves it.
+State = Literal["disabled", "open", "capturing", "closed"]
 
 
 @dataclass(frozen=True)
@@ -245,51 +249,18 @@ class Communicator(ABC):
     out-of-place.
     """
 
-    disabled: bool
+    state: State = "disabled"
 
     # THE OPS THIS BACKEND RUNS; every other is `no_such_op`.
     OPS: ClassVar[frozenset[Op]] = frozenset({"all_reduce"})
 
-    _capturing: bool = False
-    _closed: bool = False
+    @final
+    @property
+    def disabled(self) -> bool:
+        """The flag every vLLM communicator has: no call may run."""
+        return self.state in ("disabled", "closed")
 
-    # WHAT THE BASE OWNS, and therefore what a backend may not override -- checked
-    # when the class is DEFINED. A backend's own rules are its `_plan`.
-    _OWNED = (
-        "__init__",
-        "should_allreduce",
-        "should_allreduce_rms_norm",
-        "should_allreduce_add_rms_norm",
-        "should_allreduce_add_attn_res_rms_norm",
-        "should_allreduce_rms_norm_gemm",
-        "should_allreduce_rms_norm_gemm_add",
-        "should_allreduce_rms_scale_add",
-        "all_reduce",
-        "all_reduce_rms_norm",
-        "all_reduce_add_rms_norm",
-        "all_reduce_add_attn_res_rms_norm",
-        "all_reduce_rms_norm_gemm",
-        "all_reduce_rms_norm_gemm_add",
-        "all_reduce_rms_scale_add",
-        "capture",
-        "plan",
-        "close",
-        "__enter__",
-        "__exit__",
-    )
-
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        super().__init_subclass__(**kwargs)
-        taken = [n for n in Communicator._OWNED if n in cls.__dict__]
-        if taken:
-            raise TypeError(
-                f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an "
-                f"override skips the capture invariant and the shared envelope. "
-                f"Supply `_all_reduce`, `_on_capture` or "
-                f"`_on_close` instead -- what the kernel supports and how long it "
-                f"lives are not a backend's to redefine."
-            )
-
+    @final
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -301,7 +272,7 @@ class Communicator(ABC):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
-        self.disabled = not self._open()
+        self.state = "open" if self._open() else "disabled"
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
@@ -310,6 +281,7 @@ class Communicator(ABC):
     # hip, the one backend with kernels to choose) and the model leaves to the backend;
     # and a lossy `quant_bits`, which a backend without lossy kernels refuses.
 
+    @final
     def plan(self, args: Args, options: Options | None = None) -> Plan | Error:
         """WHAT RUNS the call `args` on this backend, or the Error it meets: the one
         place a refusal is decided, the options' included. Every `should_*` is this, a
@@ -320,12 +292,14 @@ class Communicator(ABC):
             return Error.no_such_op
         return self._plan(args, Options() if options is None else options)
 
+    @final
     def should_allreduce(
         self, inp: torch.Tensor, options: Options | None = None
     ) -> bool:
         """Whether this backend takes `inp`: `plan` is a Plan."""
         return isinstance(self.plan(AllReduceArgs(inp), options), Plan)
 
+    @final
     def should_allreduce_rms_norm(
         self,
         inp: torch.Tensor,
@@ -336,6 +310,7 @@ class Communicator(ABC):
         kernel: `plan` is a Plan."""
         return isinstance(self.plan(NormArgs(inp, weight, add=False), options), Plan)
 
+    @final
     def should_allreduce_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -345,6 +320,7 @@ class Communicator(ABC):
         """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
         return isinstance(self.plan(NormArgs(inp, weight, add=True), options), Plan)
 
+    @final
     def all_reduce(
         self, inp: torch.Tensor, options: Options | None = None
     ) -> torch.Tensor:
@@ -356,6 +332,7 @@ class Communicator(ABC):
             self._all_reduce(out, inp, options)
         return out
 
+    @final
     def all_reduce_rms_norm(
         self,
         inp: torch.Tensor,
@@ -373,6 +350,7 @@ class Communicator(ABC):
             self._all_reduce_rms_norm(out, inp, weight, eps, options)
         return out
 
+    @final
     def all_reduce_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -391,12 +369,14 @@ class Communicator(ABC):
             )
         return out, residual_out
 
+    @final
     def should_allreduce_add_attn_res_rms_norm(
         self, inp: torch.Tensor, options: Options | None = None
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
         return isinstance(self.plan(AttnResArgs(inp), options), Plan)
 
+    @final
     def all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
@@ -438,6 +418,7 @@ class Communicator(ABC):
         )
         return prefix_out, out
 
+    @final
     def should_allreduce_rms_norm_gemm(
         self,
         inp: torch.Tensor,
@@ -450,6 +431,7 @@ class Communicator(ABC):
         args = GemmTailArgs(inp, gemm_weight, add=False)
         return isinstance(self.plan(args, options), Plan)
 
+    @final
     def all_reduce_rms_norm_gemm(
         self,
         inp: torch.Tensor,
@@ -469,6 +451,7 @@ class Communicator(ABC):
             inp, norm_weight, eps, gemm_weight, out, out_col0, options
         )
 
+    @final
     def should_allreduce_rms_norm_gemm_add(
         self,
         inp: torch.Tensor,
@@ -480,6 +463,7 @@ class Communicator(ABC):
         args = GemmTailArgs(inp, gemm_weight, add=True)
         return isinstance(self.plan(args, options), Plan)
 
+    @final
     def all_reduce_rms_norm_gemm_add(
         self,
         inp: torch.Tensor,
@@ -499,6 +483,7 @@ class Communicator(ABC):
             inp, norm_weight, eps, gemm_weight, out, out_col0, options
         )
 
+    @final
     def should_allreduce_rms_scale_add(
         self,
         inp: torch.Tensor,
@@ -509,6 +494,7 @@ class Communicator(ABC):
         row [shared | projected | latent], the widths out's, out's and the rest."""
         return isinstance(self.plan(ScaleAddArgs(inp, out), options), Plan)
 
+    @final
     def all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
@@ -523,6 +509,7 @@ class Communicator(ABC):
             return
         self._all_reduce_rms_scale_add(inp, out, eps, options)
 
+    @final
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
         disabled one.
@@ -538,20 +525,22 @@ class Communicator(ABC):
         caller's -- close before the process group is destroyed, and after any captured
         graph is gone.
         """
-        if self._closed:
+        if self.state == "closed":
             return
-        if self._capturing:
+        if self.state == "capturing":
             raise RuntimeError(
                 f"{type(self).__name__}.close() inside `capture()`: the graph being "
                 f"recorded would "
                 f"replay against released buffers. Leave the capture first."
             )
-        self._closed = True
+        self.state = "closed"
         self._on_close()
 
+    @final
     def __enter__(self) -> "Communicator":
         return self
 
+    @final
     def __exit__(self, *exc: object) -> None:
         self.close()
 
@@ -560,7 +549,7 @@ class Communicator(ABC):
         # moment -- interpreter shutdown included, where the runtime may already be gone
         # -- so this only reports that a release was left to chance. Same bargain as an
         # unclosed file's ResourceWarning.
-        if not self._closed and not getattr(self, "disabled", True):
+        if self.state == "open":
             warnings.warn(
                 f"{type(self).__name__} was never closed; its peer handles and buffers "
                 f"were left to garbage collection. Use `with make_communicator(...) as "
@@ -570,16 +559,17 @@ class Communicator(ABC):
                 stacklevel=2,
             )
 
+    @final
     @contextmanager
     def capture(self) -> Iterator[None]:
         """Enter around a cudagraph capture. Required: a captured launch records an
         address that is not valid yet, so a backend has to be told."""
-        self._capturing = True
+        self.state = "capturing"
         try:
             with self._on_capture():
                 yield
         finally:
-            self._capturing = False
+            self.state = "open"
 
     # ---- The two rules a caller can get wrong, enforced once. ----
 
@@ -597,7 +587,8 @@ class Communicator(ABC):
         right shape and launches nothing, as vLLM's and aiter's custom all-reduce do.
         Raises on a recording outside `capture()`."""
         recording = torch.cuda.is_current_stream_capturing()
-        if recording and not self._capturing:
+        capturing = self.state == "capturing"
+        if recording and not capturing:
             raise RuntimeError(
                 f"{type(self).__name__}.{op} is being captured into a cudagraph "
                 f"without `capture()`. Use `with comm.capture(), torch.cuda.graph(g): "
@@ -605,7 +596,7 @@ class Communicator(ABC):
                 f"exits, and a graph captured without it "
                 f"replays against addresses that were never registered."
             )
-        return self._capturing and not recording
+        return capturing and not recording
 
     def _rejected(self, args: Args, err: Error) -> str:
         """A refused call's message: the op, its input, and `plan`'s Error."""

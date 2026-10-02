@@ -172,6 +172,5 @@ class IrisCommunicator(Communicator):
         self._buf_shape = self._buf_dtype = None
         self._ag_input_slab = self._ag_output_slab = None
         self._shmem = None
-        self.disabled = True
 
     # No `_on_capture`: iris needs nothing around a capture.

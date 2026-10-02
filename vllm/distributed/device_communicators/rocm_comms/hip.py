@@ -265,7 +265,6 @@ class HipCommunicator(Communicator):
     def _on_close(self) -> None:
         """Release the peer memory now. Idempotent. Dropping the object does not close
         the IPC handles the C++ side opened; this does."""
-        self.disabled = True
         if self._handle is None:
             return
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
