@@ -49,8 +49,9 @@ constexpr bool built_in(const std::array<T, N>& built, T x) {
 constexpr bool dtype_built(DType d) { return built_in(kBuild.supports.dtypes, d); }
 constexpr bool world_built(int world) { return built_in(kBuild.supports.worlds, world); }
 
-// What the caller asked for: an all-reduce, alone or with what it fuses, as Python names them.
-enum class Op : int {
+// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses (its name and kernels
+// are its `Op`, impl/op_kernels.cuh).
+enum class OpType : int {
   all_reduce                       = 0,
   all_reduce_rms_norm              = 1,
   all_reduce_add_rms_norm          = 2,
@@ -60,23 +61,6 @@ enum class Op : int {
   all_reduce_rms_scale_add         = 6,
 };
 
-// AN OP'S NAME FROM ITS ENUM TOKEN, as Python names it.
-#define HIP_COMMS_CASE(o) \
-  case Op::o: return #o;
-constexpr const char* to_string(Op op) {
-  switch (op) {
-    HIP_COMMS_CASE(all_reduce)
-    HIP_COMMS_CASE(all_reduce_rms_norm)
-    HIP_COMMS_CASE(all_reduce_add_rms_norm)
-    HIP_COMMS_CASE(all_reduce_add_attn_res_rms_norm)
-    HIP_COMMS_CASE(all_reduce_rms_norm_gemm_add)
-    HIP_COMMS_CASE(all_reduce_rms_norm_gemm)
-    HIP_COMMS_CASE(all_reduce_rms_scale_add)
-  }
-  return "unknown";
-}
-#undef HIP_COMMS_CASE
-constexpr int kNumOps = static_cast<int>(Op::all_reduce_rms_scale_add) + 1;
 
 // Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
 // one per set of template arguments.
@@ -123,11 +107,9 @@ struct GemmTemplateArgs {
   int world;
   DType dtype;
 };
-// `splits`: the slices of a row's hidden, a block each.
 struct ScaleAddTemplateArgs {
   int world;
   DType dtype;
-  int splits;
 };
 using TemplateArgs = std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs,
                                   GemmTemplateArgs, ScaleAddTemplateArgs>;
@@ -333,8 +315,9 @@ struct ScaleAddArgs {
 
 #define HIP_COMMS_INTERFACE
 #include "impl/templates.cuh"
-#include "impl/tuned.cuh"
+#include "impl/op_kernels.cuh"
 #include "impl/select.cuh"
+#include "impl/select_before.cuh"
 #include "impl/dispatch.cuh"
 #include "impl/check.cuh"
 #include "impl/supported.cuh"

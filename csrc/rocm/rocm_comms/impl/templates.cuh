@@ -26,7 +26,7 @@ namespace hip_comms {
 // was worse for the GEMM tail, 2026-09-28; not swept for the others, which copy it).
 
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
-// Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
+// Not swept: select cuts it to the rows, so it matters only past 16 rows.
 constexpr KernelConfig kRmsNormOneShotConfigs[] = {
     {1, 4096, 0, 0, 512, 16}, {1, 8192, 0, 0, 512, 16}, {1, 16384, 0, 0, 512, 16}};
 // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at 128;
@@ -63,6 +63,12 @@ constexpr KernelConfig kAttnResPushConfigs[] = {{1, 4096, 1, 0, 512, 256},
 constexpr KernelConfig kAttnResPullConfigs[] = {
     {1, 4096, 1, 0, 512, 192}, {1, 8192, 1, 0, 512, 192}, {2, 4096, 1, 0, 512, 192},
     {2, 8192, 1, 0, 512, 192}, {4, 4096, 1, 0, 512, 192}, {4, 8192, 1, 0, 512, 192}};
+// THE ONE PHASE NOT ON THE WHOLE GRID, until a multi-phase kernel takes a config a phase: the
+// pull's reduce-scatter runs on its first 32 blocks. Its reads queue behind the links past a few
+// dozen blocks while AttnRes is compute a row and wants every block: at 4096 tokens the
+// reduce-scatter took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
+// (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
+constexpr int kAttnResPullReduceBlocks = 32;
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
 // lane); TILE_K what gfx950's LDS stages at 16 rows beside the widest block's partials; SLICE_K 4,
@@ -94,7 +100,7 @@ constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {{1, 4096, 0, 0, 512, 32},
 struct TemplateInfo {
   Template fn;
   const char* name;
-  Op op;
+  OpType op;
   bool two_shot;
   std::span<const KernelConfig> configs;
 };
@@ -103,37 +109,37 @@ struct TemplateInfo {
 #define HIP_COMMS_NAMED(t) Template::t, #t
 
 constexpr TemplateInfo kTemplates[] = {
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), Op::all_reduce, false, {}},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), Op::all_reduce, true, {}},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), Op::all_reduce_rms_norm, false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), OpType::all_reduce, false, {}},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), OpType::all_reduce, true, {}},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), OpType::all_reduce_rms_norm, false,
      kRmsNormOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), OpType::all_reduce_rms_norm, true,
      kRmsNormPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), Op::all_reduce_add_rms_norm, false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), OpType::all_reduce_add_rms_norm, false,
      kAddRmsNormOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), OpType::all_reduce_add_rms_norm, true,
      kAddRmsNormPullConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, false, kAttnResOneShotConfigs},
+     OpType::all_reduce_add_attn_res_rms_norm, false, kAttnResOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
+     OpType::all_reduce_add_attn_res_rms_norm, true, kAttnResPullConfigs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add), OpType::all_reduce_rms_norm_gemm_add,
      false, kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add), OpType::all_reduce_rms_norm_gemm_add,
      true, kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), OpType::all_reduce_rms_norm, true,
      kRmsNormPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), OpType::all_reduce_add_rms_norm, true,
      kAddRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, false,
+     OpType::all_reduce_add_attn_res_rms_norm, true, kAttnResPushConfigs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), OpType::all_reduce_rms_norm_gemm, false,
      kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), OpType::all_reduce_rms_norm_gemm, true,
      kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), Op::all_reduce_rms_scale_add, false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), OpType::all_reduce_rms_scale_add, false,
      kRmsScaleAddOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), Op::all_reduce_rms_scale_add, true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), OpType::all_reduce_rms_scale_add, true,
      kRmsScaleAddTwoShotConfigs},
 };
 #undef HIP_COMMS_NAMED
@@ -147,7 +153,7 @@ constexpr bool templates_in_order() {
 static_assert(templates_in_order(), "kTemplates must list every Template in its order");
 
 constexpr const TemplateInfo& info(Template k) { return kTemplates[static_cast<int>(k)]; }
-constexpr Op op_of(Template k) { return info(k).op; }
+constexpr OpType op_of(Template k) { return info(k).op; }
 constexpr const char* to_string(Template k) { return info(k).name; }
 // The template a name names, or none: how a caller forces one (the bench's sweeps, the tests).
 inline std::optional<Template> template_named(const std::string& name) {
@@ -157,8 +163,8 @@ inline std::optional<Template> template_named(const std::string& name) {
 }
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 // A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
-constexpr bool gemms(Op op) {
-  return op == Op::all_reduce_rms_norm_gemm || op == Op::all_reduce_rms_norm_gemm_add;
+constexpr bool gemms(OpType op) {
+  return op == OpType::all_reduce_rms_norm_gemm || op == OpType::all_reduce_rms_norm_gemm_add;
 }
 
 constexpr std::span<const KernelConfig> configs_of(Template k) { return info(k).configs; }
@@ -186,27 +192,6 @@ constexpr bool same_builds(Template a, Template b) {
   for (size_t i = 0; i < configs_of(a).size(); ++i)
     if (!same_build(configs_of(a)[i], configs_of(b)[i])) return false;
   return true;
-}
-
-// SELECT'S DEFAULT for `k` on a row of `cols`: its first config whose tile covers it, or none.
-constexpr std::optional<KernelConfig> config_for(Template k, int64_t cols) {
-  for (const KernelConfig& c : configs_of(k))
-    if (c.tile_n >= cols) return c;
-  return std::nullopt;
-}
-
-// A FORCED LAUNCH'S TILE: `k`'s default tile (its first config's tile_m, tile_k, slice_k) at
-// `threads_per_block`, with the smallest built TILE_N covering `cols`; tile_n 0 when none does.
-constexpr KernelConfig tile_for(Template k, int64_t cols, int threads_per_block) {
-  KernelConfig t = configs_of(k)[0];
-  t.threads_per_block = threads_per_block;
-  t.tile_n = 0;
-  for (const KernelConfig& c : configs_of(k))
-    if (c.tile_m == t.tile_m && c.tile_k == t.tile_k && c.slice_k == t.slice_k &&
-        c.threads_per_block == threads_per_block && c.tile_n >= cols &&
-        (t.tile_n == 0 || c.tile_n < t.tile_n))
-      t.tile_n = c.tile_n;
-  return t;
 }
 
 }  // namespace hip_comms

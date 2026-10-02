@@ -25,10 +25,11 @@ namespace hip_comms {
 // it leaves two results (out and the residual). A one-shot reads the inputs and keeps nothing.
 inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
   if (!is_two_shot(t)) return 0;
-  const Op op = op_of(t);
-  if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kBuild.memory.pack_bytes;
+  const OpType op = op_of(t);
+  if (op == OpType::all_reduce)
+    return (rows * packs + world - 1) / world * kBuild.memory.pack_bytes;
   if (slices_columns(t)) return rows * packs * kBuild.memory.pack_bytes;
-  const bool two = op == Op::all_reduce_add_rms_norm;
+  const bool two = op == OpType::all_reduce_add_rms_norm;
   return (rows + world - 1) / world * packs * (two ? 2 : 1) * kBuild.memory.pack_bytes;
 }
 

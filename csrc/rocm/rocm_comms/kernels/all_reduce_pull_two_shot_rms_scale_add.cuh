@@ -21,12 +21,14 @@ namespace hip_comms {
 template <typename T, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
-                                           int hidden_packs, int latent_packs, int splits) {
+                                           int hidden_packs, int latent_packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   V* o                   = reinterpret_cast<V*>(out);
   const int packs        = 2 * hidden_packs + latent_packs;
+  // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
+  const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
   const auto latent_cols =

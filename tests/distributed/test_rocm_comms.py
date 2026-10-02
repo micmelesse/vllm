@@ -1841,6 +1841,26 @@ def test_python_names_cpps_errors_and_ops() -> None:
     assert set(get_args(Op)) == set(built.op_names)
 
 
+def test_build_info_lists_every_template_with_its_configs() -> None:
+    """Every template the build holds names one of its ops, and every tiled one lists at
+    least one config whose launch is legal; the plain all-reduce's lists none."""
+    # example-based: one fixed catalog
+    import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
+
+    built = build_info()
+    assert built.templates
+    for name, t in built.templates.items():
+        assert t.op in built.op_names, name
+        if t.op == "all_reduce":
+            assert t.configs == (), name
+            continue
+        assert t.configs, name
+        for c in t.configs:
+            assert c.threads_per_block > 0 and c.blocks_per_grid > 0, (name, c)
+            assert c.tile_m is not None and c.tile_m > 0, (name, c)
+            assert c.tile_n is not None and c.tile_n > 0, (name, c)
+
+
 def test_open_refuses_a_group_no_one_registered() -> None:
     """Opening over a name no group is registered as is an Error, not a raise."""
     # example-based: the lookup has one outcome for every unregistered name

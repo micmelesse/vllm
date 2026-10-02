@@ -59,11 +59,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
-  //    scratch at their place in the tensor, BY THE FIRST kBuild.kernels.attn_res_reduce_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (machine/hardware.cuh). THE (ROW,
+  //    scratch at their place in the tensor, BY THE FIRST kAttnResPullReduceBlocks BLOCKS
+  //    only: reads queue behind the links past a few dozen blocks (impl/templates.cuh). THE (ROW,
   //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
   //    bytes.
-  const int reducers = min(static_cast<int>(gridDim.x), kBuild.kernels.attn_res_reduce_blocks);
+  const int reducers = min(static_cast<int>(gridDim.x), kAttnResPullReduceBlocks);
   if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
     int q = threadIdx.x / own_packs;  // this thread's row among the block's, and its column

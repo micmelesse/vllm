@@ -117,7 +117,6 @@ struct NormCalibration {
 struct AttnResCalibration {
   int64_t one_shot_max_bytes;
   int64_t push_max_bytes;
-  int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
@@ -168,12 +167,6 @@ constexpr Calibration kGfx950Calibration = {
             // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
             // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
             .push_max_bytes = 3584 * kKiB,
-            // ITS REDUCE-SCATTER ON FEWER: reads queue behind the links past a few dozen blocks,
-            // while AttnRes is compute a row and wants the whole grid. At 4096 tokens the
-            // reduce-scatter
-            // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
-            // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
-            .pull_reduce_blocks = 32,
         },
     .rms_norm_gemm =
         {

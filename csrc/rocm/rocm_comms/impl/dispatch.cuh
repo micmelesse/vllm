@@ -367,7 +367,7 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
       impl::at_tile<K, T>(k.config, [&](auto bn, auto nt) {
         constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
         const auto bind = [&](const p2p::DevComm& p) {
-          return std::make_tuple(p, static_cast<T*>(a.out), a.eps, rows, hp, lp, args.splits);
+          return std::make_tuple(p, static_cast<T*>(a.out), a.eps, rows, hp, lp);
         };
         switch (k.fn) {
           case K:

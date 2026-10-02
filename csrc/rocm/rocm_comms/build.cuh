@@ -80,7 +80,6 @@ struct BuildInfo {
   struct Kernels {
     int max_threads;              // the widest block, and every kernel's __launch_bounds__
     int max_waves;                // its waves
-    int attn_res_reduce_blocks;   // its pull two-shot's blocks that run the reduce-scatter
     double sync_timeout_seconds;  // how long a kernel waits on a peer before it traps
   };
   Supports supports;
@@ -119,7 +118,6 @@ constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
   b.max_waves = b.max_threads / hw.wave_size;
 
-  b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
   // HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
   b.sync_timeout_seconds = 10.0;
   return info;

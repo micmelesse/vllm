@@ -129,9 +129,18 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 
 @dataclass(frozen=True)
+class TemplateBuild:
+    """One C++ template as built: its op, and the KernelConfigs dispatch instantiates
+    (its catalog list; none for the plain all-reduce), each at its listed grid."""
+
+    op: str
+    configs: tuple[KernelConfig, ...]
+
+
+@dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack and staging bytes, and its ops' and errors' names."""
+    pack and staging bytes, its ops' and errors' names, and its templates."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
@@ -141,14 +150,27 @@ class BuildInfo:
     # by name, an Error by its number.
     op_names: tuple[str, ...]
     error_names: tuple[str, ...]
+    # Each template by name, in C++'s `Template` order: what a tuner searches.
+    templates: dict[str, TemplateBuild]
 
 
 @functools.cache
 def build_info() -> BuildInfo:
     """The build's facts, read once: they are fixed when it is compiled."""
-    dtypes, worlds, pack, staging, ops, errors = (
+    dtypes, worlds, pack, staging, ops, errors, names, template_ops, flat, counts = (
         torch.ops._rocm_C.rocm_comms_build_info()
     )
+    templates: dict[str, TemplateBuild] = {}
+    at = 0
+    for name, op, count in zip(names, template_ops, counts):
+        configs = []
+        for _ in range(count):
+            tile_m, tile_n, tile_k, slice_k, threads, blocks = flat[at : at + 6]
+            configs.append(
+                KernelConfig(threads, blocks, tile_m, tile_n, tile_k, slice_k)
+            )
+            at += 6
+        templates[name] = TemplateBuild(op, tuple(configs))
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
@@ -156,6 +178,7 @@ def build_info() -> BuildInfo:
         staging,
         tuple(ops),
         tuple(errors),
+        templates,
     )
 
 

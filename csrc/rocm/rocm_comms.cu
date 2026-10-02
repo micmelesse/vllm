@@ -171,7 +171,8 @@ using PlanWire =
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using ProbeWire     = std::tuple<std::vector<double>, Names, std::vector<double>>;
-using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names>;
+using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names,
+                                 Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
 
 // A torch dtype as ours, or none for one ours has no name for.
 std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
@@ -345,20 +346,31 @@ SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
 }
 
 // WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its worlds, a pack's
-// bytes and a staging's, and its ops
-// and errors by name in their enums' order (each error's name without its reason), which Python's
-// `Op` and `Error` are held to.
+// bytes and a staging's, its ops and errors by name in their enums' order (each error's name
+// without its reason), which Python's `Op` and `Error` are held to, and its templates.
 BuildInfoWire rocm_comms_build_info() {
   using namespace hip_comms;
   Names dtypes, ops, errors;
   for (const DType d : kBuild.supports.dtypes) dtypes.push_back(to_string(d));
   const std::vector<int64_t> worlds(kBuild.supports.worlds.begin(), kBuild.supports.worlds.end());
-  for (int i = 0; i < kNumOps; ++i) ops.push_back(to_string(static_cast<Op>(i)));
+  for (int i = 0; i < kNumOps; ++i) ops.push_back(to_string(static_cast<OpType>(i)));
   for (int i = 0; i < kNumErrors; ++i) {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
-  return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors};
+  // Each template's configs, what dispatch instantiates: the tuner's search space.
+  Names templates, template_ops;
+  std::vector<int64_t> configs, counts;
+  for (const TemplateInfo& t : kTemplates) {
+    templates.push_back(t.name);
+    template_ops.push_back(to_string(t.op));
+    counts.push_back(static_cast<int64_t>(t.configs.size()));
+    for (const KernelConfig& c : t.configs)
+      configs.insert(configs.end(), {c.tile_m, c.tile_n, c.tile_k, c.slice_k,
+                                     c.threads_per_block, c.blocks_per_grid});
+  }
+  return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
+          templates, template_ops, configs, counts};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }

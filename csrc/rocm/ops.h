@@ -127,10 +127,12 @@ rocm_comms_plan_all_reduce_rms_scale_add(
 // A variant at the torch boundary: the arch or the Error's number, exactly one set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_supported(
     int64_t device, int64_t world);
-// The build's dtypes by name, its worlds, a pack's bytes and a staging's, and its ops' and errors'
-// names in their enums' order.
+// The build's dtypes by name, its worlds, a pack's bytes and a staging's, its ops' and errors'
+// names in their enums' order, and each template's name, op and built KernelConfigs (six fields a
+// config, flat, with each template's count).
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
-           std::vector<std::string>, std::vector<std::string>>
+           std::vector<std::string>, std::vector<std::string>, std::vector<std::string>,
+           std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>>
 rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
