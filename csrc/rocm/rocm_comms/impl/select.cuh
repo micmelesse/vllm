@@ -63,16 +63,6 @@ constexpr int grid_of(Template k, int blocks, int64_t rows, int world) {
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
-// A ROW TEMPLATE'S TILE_N: the smallest built tile that covers a row of `packs` at `threads`, in
-// elements, or 0 when none does.
-constexpr int tile_n_for(Template t, int64_t packs, DType d, int threads) {
-  const int r = row_packs_for(t, packs, threads);
-  return r * (kBuild.memory.pack_bytes / elem_bytes(d)) * threads;
-}
-template <typename Args>
-constexpr int tile_n_of(Template t, const Args& a, int threads) {
-  return tile_n_for(t, packs_of(a), a.dtype, threads);
-}
 // THE COLUMNS A ROW TEMPLATE'S TILE COVERS: the row, or the one-all-reduce tail's latent (its
 // hidden is cut into slices of the tile's width).
 template <typename Args>
@@ -80,22 +70,17 @@ constexpr int64_t tile_cols(const Args& a) {
   return hidden_of(a);
 }
 constexpr int64_t tile_cols(const ScaleAddArgs& a) { return a.latent; }
-// WHETHER A TILE IS BUILT for template `t`: TILE_N a power-of-two count of packs a thread up to
-// the template's build, TILE_M 1, or 2 or 4 for AttnRes's pull two-shot (impl/dispatch.cuh).
-constexpr bool tile_built(Template t, const KernelConfig& c, DType d) {
-  const int unit = kBuild.memory.pack_bytes / elem_bytes(d) * c.threads_per_block;
-  const int r = c.tile_n / unit;
-  const bool n =
-      c.tile_n % unit == 0 && (r == 1 || r == 2 || r == 4 || r == 8) && r <= max_row_packs(t);
-  const bool m = c.tile_m == 1 || (t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm &&
-                                   (c.tile_m == 2 || c.tile_m == 4));
-  return n && m;
-}
 // A ROW TEMPLATE'S TILE_M: the rows a tile, from calibration where the template has a choice.
 constexpr int tile_m_of(Template t) {
   return t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm
              ? kTargetCalibration.attn_res.pull_tile_m
              : 1;
+}
+// A ROW TEMPLATE'S TILE_N: the smallest of its builds that covers the call's columns at its rows
+// and `threads`, or 0 when none does (check refuses it).
+template <typename Args>
+constexpr int tile_n_of(Template t, const Args& a, int threads) {
+  return tile_n_for(t, tile_cols(a), tile_m_of(t), threads);
 }
 // THE KERNEL: template `t` at `blocks` x `threads` with its arguments and tile from the call, its
 // grid cut to the rows where it gives each block a row.
@@ -127,7 +112,7 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailA
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddArgs& a,
                             int world) {
   const int e = elem_bytes(a.dtype);
-  const int tile_n = tile_n_for(t, a.latent * e / kBuild.memory.pack_bytes, a.dtype, threads);
+  const int tile_n = tile_n_of(t, a, threads);
   const int64_t span = tile_n > 0 ? tile_n * e / kBuild.memory.pack_bytes : threads;
   const int64_t hp = a.hidden * e / kBuild.memory.pack_bytes;
   const int splits = static_cast<int>((hp + span - 1) / span);
@@ -324,7 +309,7 @@ constexpr bool is_staged(const Kernel& k) {
 // error, not one that overruns its signal slots or register arrays.
 constexpr bool fits(const Kernel& k) {
   if (k.config.blocks_per_grid < 1 || k.config.blocks_per_grid > p2p::kMaxBlocks) return false;
-  if (has_row_packs(k.fn) && k.config.tile_n == 0) return false;
+  if (has_tiles(k.fn) && k.config.tile_n == 0) return false;
   const int t = k.config.threads_per_block;
   return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
 }

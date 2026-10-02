@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE CATALOG: what each Template is (its op, its shot) and the row builds each op has.
+// THE CATALOG: what each Template is (its op, its shot) and the builds (Instances) each one has.
 
 #pragma once
 
@@ -11,57 +11,77 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace hip_comms {
 
-// What each template is, in Template's order: its op, its shot, and for a row template the most
-// packs of its row a thread holds (build.cuh derives each; 0 for one without rows). A build
-// past that would only ever run slower, so it is not built.
+// A ROW TEMPLATE'S BUILD, compiled in: its tile and its threads a block (composable_kernel's
+// instance; Triton's autotune config without the grid, which is the launch's). tile_n counts the
+// elements of a 16-bit dtype, the only ones built. What a template lists is exactly what dispatch
+// instantiates, what check accepts and what a tuner searches.
+struct Instance {
+  int tile_m;
+  int tile_n;
+  int threads_per_block;
+};
+
+// EACH FAMILY'S BUILDS. A build that spills shows in its code object (Handle::resources_of) and
+// loses on the clock; none is ruled out by policy.
+constexpr Instance kNormInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {1, 16384, 512}};
+constexpr Instance kPipelinedNormInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
+constexpr Instance kAttnResInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
+constexpr Instance kAttnResPullInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {2, 4096, 512},
+                                              {2, 8192, 512}, {4, 4096, 512}, {4, 8192, 512}};
+constexpr Instance kGemmTailInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {1, 16384, 512}};
+constexpr Instance kScaleAddInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
+
+// What each template is, in Template's order: its op, its shot, and its builds (none for the plain
+// all-reduce, which has no tile).
 struct TemplateInfo {
   Template fn;
   const char* name;
   Op op;
   bool two_shot;
-  int max_row_packs;
+  std::span<const Instance> instances;
 };
 
 // A TEMPLATE AND ITS NAME FROM ONE TOKEN, so the name cannot differ from the enum's.
 #define HIP_COMMS_NAMED(t) Template::t, #t
 
 constexpr TemplateInfo kTemplates[] = {
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), Op::all_reduce, false, 0},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), Op::all_reduce, true, 0},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), Op::all_reduce, false, {}},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), Op::all_reduce, true, {}},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), Op::all_reduce_rms_norm, false,
-     kBuild.kernels.norm_row_packs},
+     kNormInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
-     kBuild.kernels.pipelined_row_packs},
+     kPipelinedNormInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), Op::all_reduce_add_rms_norm, false,
-     kBuild.kernels.norm_row_packs},
+     kNormInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
-     kBuild.kernels.pipelined_row_packs},
+     kPipelinedNormInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, false, kBuild.kernels.attn_res_row_packs},
+     Op::all_reduce_add_attn_res_rms_norm, false, kAttnResInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kBuild.kernels.attn_res_row_packs},
+     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPullInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
-     false, kBuild.kernels.norm_row_packs},
+     false, kGemmTailInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
-     true, kBuild.kernels.norm_row_packs},
+     true, kGemmTailInstances},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
-     kBuild.kernels.norm_row_packs},
+     kNormInstances},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
-     kBuild.kernels.norm_row_packs},
+     kNormInstances},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kBuild.kernels.attn_res_row_packs},
+     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, false,
-     kBuild.kernels.norm_row_packs},
+     kGemmTailInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, true,
-     kBuild.kernels.norm_row_packs},
+     kGemmTailInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), Op::all_reduce_rms_scale_add, false,
-     kBuild.kernels.scale_add_row_packs},
+     kScaleAddInstances},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), Op::all_reduce_rms_scale_add, true,
-     kBuild.kernels.scale_add_row_packs},
+     kScaleAddInstances},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -88,15 +108,31 @@ constexpr bool gemms(Op op) {
   return op == Op::all_reduce_rms_norm_gemm || op == Op::all_reduce_rms_norm_gemm_add;
 }
 
-constexpr int max_row_packs(Template k) { return info(k).max_row_packs; }
+constexpr std::span<const Instance> instances_of(Template k) { return info(k).instances; }
+constexpr bool has_tiles(Template k) { return !instances_of(k).empty(); }
 
-constexpr bool has_row_packs(Template k) { return max_row_packs(k) > 0; }
+// Whether template `k` builds `c`'s tile at `c`'s threads.
+constexpr bool built(Template k, const KernelConfig& c) {
+  for (const Instance& i : instances_of(k))
+    if (i.tile_m == c.tile_m && i.tile_n == c.tile_n && i.threads_per_block == c.threads_per_block)
+      return true;
+  return false;
+}
+constexpr bool built_at(Template k, int threads_per_block) {
+  for (const Instance& i : instances_of(k))
+    if (i.threads_per_block == threads_per_block) return true;
+  return false;
+}
 
-// The smallest build of `k` that holds a row of `packs` over `threads`; 0 when none does.
-constexpr int row_packs_for(Template k, int64_t packs, int threads) {
-  for (int b = 1; b <= max_row_packs(k); b *= 2)
-    if (int64_t{b} * threads >= packs) return b;
-  return 0;
+// THE SMALLEST BUILT TILE_N of `k` that covers `cols` at `tile_m` rows and `threads_per_block`;
+// 0 when none does.
+constexpr int tile_n_for(Template k, int64_t cols, int tile_m, int threads_per_block) {
+  int best = 0;
+  for (const Instance& i : instances_of(k))
+    if (i.tile_m == tile_m && i.threads_per_block == threads_per_block && i.tile_n >= cols &&
+        (best == 0 || i.tile_n < best))
+      best = i.tile_n;
+  return best;
 }
 
 }  // namespace hip_comms

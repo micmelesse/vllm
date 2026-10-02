@@ -58,11 +58,11 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
         a.latent * e % kBuild.memory.pack_bytes != 0 || a.latent < 1)
       return Error::widths_not_packs;
   if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
-  if (has_row_packs(k.fn) && k.config.threads_per_block != kBuild.kernels.max_threads)
+  if (has_tiles(k.fn) && !built_at(k.fn, k.config.threads_per_block))
     return Error::threads_not_built;
-  if (has_row_packs(k.fn) && k.config.tile_n == 0) return Error::row_too_wide;
-  if (has_row_packs(k.fn) && !tile_built(k.fn, k.config, a.dtype)) return Error::tile_not_built;
-  if (has_row_packs(k.fn) && k.config.tile_n < tile_cols(a)) return Error::row_too_wide;
+  if (has_tiles(k.fn) && k.config.tile_n == 0) return Error::row_too_wide;
+  if (has_tiles(k.fn) && !built(k.fn, k.config)) return Error::tile_not_built;
+  if (has_tiles(k.fn) && k.config.tile_n < tile_cols(a)) return Error::row_too_wide;
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (k.fn == Template::all_reduce_pull_two_shot &&
       k.config.threads_per_block % (world * kWaveSize) != 0)

@@ -100,45 +100,33 @@ void by_weight(DType weight, DType dtype, F&& f) {
   not_built("weight dtype");
 }
 
-// A ROW KERNEL'S TILE, compiled in: TILE_N one of the template's builds (packs a thread a power of
-// two up to kMax) at the one built THREADS_PER_BLOCK; f(constant<TILE_N>,
-// constant<THREADS_PER_BLOCK>).
-template <typename T, int kMax, typename F>
-void by_tile(const KernelConfig& c, F&& f) {
-  constexpr int NT = kBuild.kernels.max_threads;
-  if (c.threads_per_block != NT)
-    not_built("a row kernel at " + std::to_string(c.threads_per_block) + " threads");
-  constexpr int unit = traits<T>::N * NT;  // TILE_N at one pack a thread
-  if (c.tile_n == unit) return f(constant<unit>{}, constant<NT>{});
-  if (c.tile_n == 2 * unit) return f(constant<2 * unit>{}, constant<NT>{});
-  if constexpr (kMax >= 4)
-    if (c.tile_n == 4 * unit) return f(constant<4 * unit>{}, constant<NT>{});
-  if constexpr (kMax >= 8)
-    if (c.tile_n == 8 * unit) return f(constant<8 * unit>{}, constant<NT>{});
-  not_built("a row kernel of TILE_N " + std::to_string(c.tile_n));
+// A ROW KERNEL'S BUILD, compiled in: the instance of template K's list (impl/templates.cuh) the
+// config names, and only those; f(constant<TILE_M>, constant<TILE_N>, constant<THREADS_PER_BLOCK>).
+template <Template K, typename F, size_t... I>
+void by_instance_in(const KernelConfig& c, F& f, std::index_sequence<I...>) {
+  constexpr std::span<const Instance> list = instances_of(K);
+  if (!((c.tile_m == list[I].tile_m && c.tile_n == list[I].tile_n &&
+         c.threads_per_block == list[I].threads_per_block &&
+         (f(constant<list[I].tile_m>{}, constant<list[I].tile_n>{},
+            constant<list[I].threads_per_block>{}),
+          true)) ||
+        ...))
+    not_built(std::string("template ") + to_string(K) + " at that tile and threads");
 }
 
-// A TILE'S ROWS, compiled in: f(constant<TILE_M>).
-template <typename F>
-void by_tile_m(int tile_m, F&& f) {
-  switch (tile_m) {
-    case 1: return f(constant<1>{});
-    case 2: return f(constant<2>{});
-    case 4:
-      return f(constant<4>{});
-    default: break;
-  }
-  not_built("a tile of " + std::to_string(tile_m) + " rows");
+template <Template K, typename F>
+void by_instance(const KernelConfig& c, F&& f) {
+  by_instance_in<K>(c, f, std::make_index_sequence<instances_of(K).size()>{});
 }
 
-// A row kernel's tile, up to its own build (the catalog's max_row_packs).
+// A ONE-ROW TEMPLATE'S BUILD: f(constant<TILE_N>, constant<THREADS_PER_BLOCK>); its list has only
+// TILE_M = 1.
 template <Template K, typename T, typename F>
 void at_tile(const KernelConfig& c, F&& f) {
-  by_tile<T, max_row_packs(K)>(c, std::forward<F>(f));
-}
-
-inline void one_row(const KernelConfig& c) {
-  if (c.tile_m != 1) not_built("this template at TILE_M " + std::to_string(c.tile_m));
+  by_instance<K>(c, [&](auto tm, auto tn, auto tpb) {
+    static_assert(decltype(tm)::value == 1, "this template's kernels take one row a tile");
+    f(tn, tpb);
+  });
 }
 
 [[noreturn]] inline void not_this_ops(Template k) {
@@ -203,7 +191,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
         using K = Template;
         switch (k.fn) {
           case K::all_reduce_pull_one_shot_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_pull_one_shot_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_pull_one_shot_rms_norm<T, W, NG, decltype(bn)::value,
@@ -211,7 +198,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                     norm);
                 });
           case K::all_reduce_pull_two_shot_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_pull_two_shot_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_pull_two_shot_rms_norm<T, W, NG, decltype(bn)::value,
@@ -219,7 +205,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                     norm);
                 });
           case K::all_reduce_push_two_shot_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_push_two_shot_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_push_two_shot_rms_norm<T, W, NG, decltype(bn)::value,
@@ -227,7 +212,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                     norm);
                 });
           case K::all_reduce_pull_one_shot_add_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_pull_one_shot_add_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_pull_one_shot_add_rms_norm<T, W, NG, decltype(bn)::value,
@@ -235,7 +219,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                     add_norm);
                 });
           case K::all_reduce_pull_two_shot_add_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_pull_two_shot_add_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_pull_two_shot_add_rms_norm<T, W, NG, decltype(bn)::value,
@@ -243,7 +226,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
                     add_norm);
                 });
           case K::all_reduce_push_two_shot_add_rms_norm:
-            impl::one_row(k.config);
             return impl::at_tile<K::all_reduce_push_two_shot_add_rms_norm, T>(
                 k.config, [&](auto bn, auto nt) {
                   f(all_reduce_push_two_shot_add_rms_norm<T, W, NG, decltype(bn)::value,
@@ -257,19 +239,6 @@ void dispatch(const Kernel& k, const NormArgs& a, F&& f) {
   });
 }
 
-// AttnRes's and the GEMM tail's kernels share their row builds, so one cap serves each op's.
-static_assert(max_row_packs(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
-                  max_row_packs(Template::all_reduce_pull_two_shot_add_attn_res_rms_norm) &&
-              max_row_packs(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm) ==
-                  max_row_packs(Template::all_reduce_push_two_shot_add_attn_res_rms_norm) &&
-              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Template::all_reduce_pull_two_shot_rms_norm_gemm_add) &&
-              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm) &&
-              max_row_packs(Template::all_reduce_pull_one_shot_rms_norm_gemm_add) ==
-                  max_row_packs(Template::all_reduce_pull_two_shot_rms_norm_gemm),
-              "a kernel with its own row builds needs its own case");
-
 template <typename F>
 void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
   const auto& args = std::get<AttnResTemplateArgs>(k.args);
@@ -279,46 +248,48 @@ void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::at_tile<Template::all_reduce_pull_one_shot_add_attn_res_rms_norm, T>(
-          k.config, [&](auto bn, auto nt) {
-            constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
-            const auto bind = [&](const p2p::DevComm& p) {
-              return std::make_tuple(
-                  p, static_cast<T*>(a.prefix), static_cast<T*>(a.blocks), a.block_stride_m,
-                  a.block_stride_r, static_cast<const T*>(a.norm_weight),
-                  static_cast<const T*>(a.qk_weight), static_cast<const T*>(a.out_norm_weight),
-                  static_cast<T*>(a.out), a.num_blocks, a.write_idx, a.eps, a.out_eps, rows,
-                  packs);
-            };
-            const bool prefix = args.prefix;
-            switch (k.fn) {
-              case Template::all_reduce_pull_one_shot_add_attn_res_rms_norm:
-                impl::one_row(k.config);
-                return prefix
-                           ? f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, BN, NT>,
-                               bind)
-                           : f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, BN, NT>,
-                               bind);
-              case Template::all_reduce_pull_two_shot_add_attn_res_rms_norm:
-                return impl::by_tile_m(k.config.tile_m, [&](auto bm) {
-                  constexpr int BM = decltype(bm)::value;
-                  prefix
-                      ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, BM, BN, NT>,
-                          bind)
-                      : f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, BM, BN, NT>,
-                          bind);
-                });
-              case Template::all_reduce_push_two_shot_add_attn_res_rms_norm:
-                impl::one_row(k.config);
-                return prefix
-                           ? f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, BN, NT>,
-                               bind)
-                           : f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, BN, NT>,
-                               bind);
-              default:
-                impl::not_this_ops(k.fn);
-            }
-          });
+      const auto bind = [&](const p2p::DevComm& p) {
+        return std::make_tuple(
+            p, static_cast<T*>(a.prefix), static_cast<T*>(a.blocks), a.block_stride_m,
+            a.block_stride_r, static_cast<const T*>(a.norm_weight),
+            static_cast<const T*>(a.qk_weight), static_cast<const T*>(a.out_norm_weight),
+            static_cast<T*>(a.out), a.num_blocks, a.write_idx, a.eps, a.out_eps, rows, packs);
+      };
+      const bool prefix = args.prefix;
+      using K = Template;
+      switch (k.fn) {
+        case K::all_reduce_pull_one_shot_add_attn_res_rms_norm:
+          return impl::at_tile<K::all_reduce_pull_one_shot_add_attn_res_rms_norm, T>(
+              k.config, [&](auto tn, auto tpb) {
+                constexpr int TN = decltype(tn)::value, TPB = decltype(tpb)::value;
+                prefix
+                    ? f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN, TPB>, bind)
+                    : f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, TN, TPB>,
+                        bind);
+              });
+        case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
+          return impl::by_instance<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(
+              k.config, [&](auto tm, auto tn, auto tpb) {
+                constexpr int TM = decltype(tm)::value, TN = decltype(tn)::value,
+                              TPB = decltype(tpb)::value;
+                prefix
+                    ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN, TPB>,
+                        bind)
+                    : f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, TM, TN, TPB>,
+                        bind);
+              });
+        case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
+          return impl::at_tile<K::all_reduce_push_two_shot_add_attn_res_rms_norm, T>(
+              k.config, [&](auto tn, auto tpb) {
+                constexpr int TN = decltype(tn)::value, TPB = decltype(tpb)::value;
+                prefix
+                    ? f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN, TPB>, bind)
+                    : f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, TN, TPB>,
+                        bind);
+              });
+        default:
+          impl::not_this_ops(k.fn);
+      }
     });
   });
 }
@@ -334,7 +305,13 @@ void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      impl::one_row(k.config);
+      // The four GEMM-tail templates share one list, so one lookup serves each.
+      static_assert(instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        instances_of(Template::all_reduce_pull_two_shot_rms_norm_gemm_add).data() &&
+                    instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm).data() &&
+                    instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        instances_of(Template::all_reduce_pull_two_shot_rms_norm_gemm).data());
       impl::at_tile<Template::all_reduce_pull_one_shot_rms_norm_gemm_add, T>(
           k.config, [&](auto bn, auto nt) {
             constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
@@ -373,11 +350,10 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      // The one-shot's and the two-shot's row builds are one.
+      // The one-shot's and the two-shot's builds are one list.
       constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
-      static_assert(max_row_packs(K) ==
-                    max_row_packs(Template::all_reduce_pull_two_shot_rms_scale_add));
-      impl::one_row(k.config);
+      static_assert(instances_of(K).data() ==
+                    instances_of(Template::all_reduce_pull_two_shot_rms_scale_add).data());
       impl::at_tile<K, T>(k.config, [&](auto bn, auto nt) {
         constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
         const auto bind = [&](const p2p::DevComm& p) {

@@ -64,12 +64,6 @@ constexpr int resident_blocks(const Hardware& hw, Resources r, int threads) {
   return static_cast<int>(per_cu * hw.compute_units);
 }
 
-constexpr int floor_pow2(int x) {
-  int p = 1;
-  while (p * 2 <= x) p *= 2;
-  return p;
-}
-
 // EVERYTHING THE BUILD FIXES, in one value: what is compiled, the memory and its unit, and the
 // kernels' launch geometry. Python reads a projection of it (`build_info`).
 struct BuildInfo {
@@ -86,10 +80,6 @@ struct BuildInfo {
   struct Kernels {
     int max_threads;              // the widest block, and every kernel's __launch_bounds__
     int max_waves;                // its waves
-    int norm_row_packs;           // a norm's (and the GEMM tail's) row packs a thread, at most
-    int attn_res_row_packs;       // AttnRes's, at most
-    int pipelined_row_packs;      // a pipelined row kernel's (two rows' loads in flight), at most
-    int scale_add_row_packs;      // the one-all-reduce tail's (three spans' loads in flight)
     int gemm_rows;                // the GEMM tail's rows a pass
     int gemm_chunk;               // the GEMM tail's K-chunk staged in LDS, in packs
     int gemm_lanes;               // the GEMM tail's lanes a column, the one build of it
@@ -133,24 +123,6 @@ constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
   b.max_waves = b.max_threads / hw.wave_size;
 
-  // A ROW KERNEL'S PACKS A THREAD: each pack keeps a load from every peer in flight at once
-  // (peers_reduce), and AttnRes fp32 copies of it besides (the prefix, the weights, the output, and
-  // one a source of a reduction's). Policy: a row's registers take at most half of the thread's,
-  // the rest its addresses, reductions and the norm. At all of them the norms spilled (8 packs of
-  // 8 peers is 256 registers: ISA 2026-09-30T20-23-38Z), and AttnRes at 4.
-  const int pack_vgprs = m.pack_bytes / 4;
-  const int row_budget  = hw.arch_vgprs / 2;
-  const int in_flight   = (hw.xgmi_links + 1) * pack_vgprs;
-  // A pack of the narrowest T built (bf16) as fp32, for each copy.
-  const int attn_state = (3 + cal.attn_res_sources_per_reduce) * (m.pack_bytes / 2);
-  b.norm_row_packs      = floor_pow2(row_budget / in_flight);
-  b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight + attn_state));
-  // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
-  // registers (the pull norm two-shot spilled at 4 packs: 2026-10-01T00-06-30Z).
-  b.pipelined_row_packs = floor_pow2(row_budget / (2 * in_flight));
-  // THE ONE-ALL-REDUCE TAIL holds three spans' loads at once (shared, projected, latent).
-  b.scale_add_row_packs = floor_pow2(row_budget / (3 * in_flight));
-
   // Policy: THE GEMM TAIL SUMS 16 ROWS A PASS, one fp32 accumulator a row in each lane; more rows
   // loop over passes.
   b.gemm_rows = 16;
@@ -182,10 +154,6 @@ static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
 static_assert(kBuild.kernels.gemm_lanes == 1 || kBuild.kernels.gemm_lanes == 2 ||
                   kBuild.kernels.gemm_lanes == 4 || kBuild.kernels.gemm_lanes == 8,
               "the GEMM tail splits a wave's lanes over its columns: 1, 2, 4 or 8");
-static_assert(kBuild.kernels.norm_row_packs <= 8 && kBuild.kernels.attn_res_row_packs <= 8 &&
-                  kBuild.kernels.pipelined_row_packs <= 8,
-              "impl/launch.cuh builds up to 8 packs a thread");
-
 // Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
 // device's LDS holds, and no more than the block limit.
 constexpr int lds_max_waves(const Hardware& hw, int64_t fixed, int64_t per_wave) {
