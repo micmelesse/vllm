@@ -153,7 +153,7 @@ class HipCommunicator(Communicator):
         """Sum `inp` across the TP ranks, out of place."""
         out = torch.empty_like(inp)
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, inp, quant_bits, *launch_wire(launch)
+            self._handle, out, inp, quant_bits, launch_wire(launch)
         )
         return out
 
@@ -177,7 +177,7 @@ class HipCommunicator(Communicator):
             cols,
             weight_dtype,
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
         if err is not None:
             return Error(err)
@@ -200,7 +200,7 @@ class HipCommunicator(Communicator):
             weight,
             eps,
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
         return out
 
@@ -226,7 +226,7 @@ class HipCommunicator(Communicator):
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
 
     def _all_reduce_rms_norm_gemm_add(
@@ -251,7 +251,7 @@ class HipCommunicator(Communicator):
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
 
     def _all_reduce_rms_scale_add(
@@ -268,7 +268,7 @@ class HipCommunicator(Communicator):
             inp,
             eps,
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -304,7 +304,7 @@ class HipCommunicator(Communicator):
             out_eps,
             not started,
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
         return prefix_out, out
 
@@ -329,7 +329,7 @@ class HipCommunicator(Communicator):
             weight,
             eps,
             quant_bits,
-            *launch_wire(launch),
+            launch_wire(launch),
         )
         return out, residual_out
 
