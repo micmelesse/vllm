@@ -22,7 +22,8 @@ namespace impl {
 // is spelled out.
 template <typename... P, typename... A>
 void start(void (*kernel)(P...), const Kernel& k, hipStream_t stream, A&&... args) {
-  kernel<<<dim3(k.config.grid), dim3(k.config.num_threads), 0, stream>>>(std::forward<A>(args)...);
+  kernel<<<dim3(k.config.blocks_per_grid), dim3(k.config.threads_per_block), 0, stream>>>(
+      std::forward<A>(args)...);
 }
 
 template <typename Args>

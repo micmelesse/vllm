@@ -110,26 +110,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int traffic_iters, int trials) -> (float[], str[], float[])",
       &rocm_comms_probe);
   // The planners: what runs a call, or the Error it meets.
-  rocm_ops.def("rocm_comms_plan_all_reduce(int handle_ptr, Tensor inp, "
-               "int? quant_bits, str? template_, int? launch_blocks, "
-               "int? launch_threads) -> (str?, int?, int?, int?)",
-               &rocm_comms_plan_all_reduce);
-  rocm_ops.def("rocm_comms_plan_all_reduce_rms_norm(int handle_ptr, Tensor inp, Tensor weight, "
-               "bool add, int? quant_bits, str? template_, int? launch_blocks, "
-               "int? launch_threads) -> (str?, int?, int?, int?)",
-               &rocm_comms_plan_all_reduce_rms_norm);
-  rocm_ops.def("rocm_comms_plan_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor inp, "
-               "int? quant_bits, str? template_, int? launch_blocks, "
-               "int? launch_threads) -> (str?, int?, int?, int?)",
-               &rocm_comms_plan_all_reduce_add_attn_res_rms_norm);
-  rocm_ops.def("rocm_comms_plan_all_reduce_rms_norm_gemm(int handle_ptr, Tensor inp, "
-               "Tensor gemm_weight, bool add, int? quant_bits, str? template_, int? launch_blocks, "
-               "int? launch_threads) -> (str?, int?, int?, int?)",
-               &rocm_comms_plan_all_reduce_rms_norm_gemm);
-  rocm_ops.def("rocm_comms_plan_all_reduce_rms_scale_add(int handle_ptr, Tensor inp, Tensor out, "
-               "int? quant_bits, str? template_, int? launch_blocks, "
-               "int? launch_threads) -> (str?, int?, int?, int?)",
-               &rocm_comms_plan_all_reduce_rms_scale_add);
+  rocm_ops.def(
+      "rocm_comms_plan_all_reduce(int handle_ptr, Tensor inp, "
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> (str?, int?, int?, int?, int?, int?)",
+      &rocm_comms_plan_all_reduce);
+  rocm_ops.def(
+      "rocm_comms_plan_all_reduce_rms_norm(int handle_ptr, Tensor inp, Tensor weight, "
+      "bool add, int? quant_bits, str? template_, int? tile_m, int? tile_n, int? "
+      "threads_per_block, int? blocks_per_grid) -> (str?, int?, int?, int?, int?, int?)",
+      &rocm_comms_plan_all_reduce_rms_norm);
+  rocm_ops.def(
+      "rocm_comms_plan_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor inp, "
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> (str?, int?, int?, int?, int?, int?)",
+      &rocm_comms_plan_all_reduce_add_attn_res_rms_norm);
+  rocm_ops.def(
+      "rocm_comms_plan_all_reduce_rms_norm_gemm(int handle_ptr, Tensor inp, "
+      "Tensor gemm_weight, bool add, int? quant_bits, str? template_, int? tile_m, int? tile_n, "
+      "int? threads_per_block, int? blocks_per_grid) -> (str?, int?, int?, int?, int?, int?)",
+      &rocm_comms_plan_all_reduce_rms_norm_gemm);
+  rocm_ops.def(
+      "rocm_comms_plan_all_reduce_rms_scale_add(int handle_ptr, Tensor inp, Tensor out, "
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> (str?, int?, int?, int?, int?, int?)",
+      &rocm_comms_plan_all_reduce_rms_scale_add);
   rocm_ops.def("rocm_comms_supported(int device, int world) -> (str?, int?)",
                &rocm_comms_supported);
   rocm_ops.def("rocm_comms_build_info() -> (str[], int[], int, int, str[], str[])",
@@ -138,7 +143,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   rocm_ops.def(
       "rocm_comms_all_reduce(int handle_ptr, Tensor! out, Tensor inp, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce", torch::kCUDA, &rocm_comms_all_reduce);
 
   // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
@@ -147,13 +153,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm(int handle_ptr, Tensor! out, Tensor inp, "
       "Tensor weight, float eps, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm);
   rocm_ops.def(
       "rocm_comms_all_reduce_add_rms_norm(int handle_ptr, Tensor! out, "
       "Tensor! residual_out, Tensor inp, Tensor residual, Tensor weight, float eps, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_add_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_rms_norm);
 
@@ -162,27 +170,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor inp, "
       "Tensor! blocks, Tensor norm_weight, Tensor qk_weight, Tensor? out_norm_weight, "
       "int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_attn_res_rms_norm);
 
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm_gemm(int handle_ptr, Tensor! out, "
       "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm_gemm);
 
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_scale_add(int handle_ptr, Tensor! out, Tensor inp, float eps, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_scale_add", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_scale_add);
 
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm_gemm_add(int handle_ptr, Tensor! out, "
       "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, "
-      "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
+      "int? quant_bits, str? template_, int? tile_m, int? tile_n, int? threads_per_block, int? "
+      "blocks_per_grid) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm_add", torch::kCUDA,
                 &rocm_comms_all_reduce_rms_norm_gemm_add);
 

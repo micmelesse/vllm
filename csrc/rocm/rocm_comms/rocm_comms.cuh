@@ -101,7 +101,7 @@ enum class Template : int {
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has; the tile and
-// the launch are the Kernel's Config.
+// the launch are the Kernel's KernelConfig.
 // `staged`: the build that copies an eager input into its staging a pass at a time (any size),
 // not the one that reads a registered or captured input in place; plan decides it.
 struct AllReduceTemplateArgs {
@@ -133,31 +133,23 @@ struct ScaleAddTemplateArgs {
 using TemplateArgs = std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs,
                                   GemmTemplateArgs, ScaleAddTemplateArgs>;
 
-// HOW A KERNEL IS TILED AND LAUNCHED, Triton's autotune config: the tile (BLOCK_M rows x BLOCK_N
-// columns, in elements; block_n 0 when no build holds the call's row, which check refuses), the
-// block's threads (NUM_THREADS, Triton's num_warps x 64) and the grid. A row kernel compiles its
-// tile and threads in; the plain all-reduce has no tile (block_m and block_n 0).
-struct Config {
-  int block_m;
-  int block_n;
-  int num_threads;
-  int grid;
+// HOW A KERNEL IS TILED AND LAUNCHED, Triton's autotune config: the tile (TILE_M rows x TILE_N
+// columns, in elements; tile_n 0 when no build holds the call's row, which check refuses), the
+// block's threads (THREADS_PER_BLOCK, Triton's num_warps x 64) and the grid. A row kernel compiles
+// its tile and threads in; the plain all-reduce has no tile (tile_m and tile_n 0).
+struct KernelConfig {
+  int tile_m;
+  int tile_n;
+  int threads_per_block;
+  int blocks_per_grid;
 };
 
 // WHAT SELECT RETURNS: one kernel, the template with its arguments decided (the compiled
-// instruction sequence), and its Config.
+// instruction sequence), and its KernelConfig.
 struct Kernel {
   Template fn;
   TemplateArgs args;
-  Config config;
-};
-
-// A template the caller forces, at its grid and block (the bench's sweeps); select decides its
-// arguments from the call as for its own choice.
-struct Forced {
-  Template fn;
-  int grid;
-  int threads;
+  KernelConfig config;
 };
 
 // WHY A CALL CANNOT RUN, every reason there is. The numbers cross to Python (rocm_comms.Error), so
@@ -189,8 +181,9 @@ enum class Error : int {
   ranks_disagree = 23,
   groups_disagree = 24,
   threads_not_built = 25,
+  tile_not_built = 26,
 };
-constexpr int kNumErrors = 26;
+constexpr int kNumErrors = 27;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -236,6 +229,8 @@ constexpr const char* to_string(Error e) {
       return "groups_disagree: the CPU and device groups differ in size or in this rank";
     case Error::threads_not_built:
       return "threads_not_built: no build of the template runs at that block size";
+    case Error::tile_not_built:
+      return "tile_not_built: no build of the template has that TILE_M or TILE_N";
   }
   return "unknown";
 }
@@ -243,9 +238,14 @@ constexpr const char* to_string(Error e) {
 // A LOSSY PRECISION on the wire, in bits; none is exact.
 enum class QuantBits : int { eight = 8, four = 4 };
 
+// HOW THE CALLER WANTS A CALL RUN: a lossy precision, and Kernel's own choices forced (a sweep's, a
+// tuner's): its template (at select's launch), and with it its KernelConfig, where a zero tile_m or
+// tile_n is the template's own tile for the call. The call's facts (TemplateArgs) are always
+// select's, from the call.
 struct Options {
   std::optional<QuantBits> quant_bits;  // none: exact
-  std::optional<Forced> forced;         // none: select's
+  std::optional<Template> fn;           // none: select's
+  std::optional<KernelConfig> kernel_config;  // none: select's; only with fn
   hipStream_t stream;
 };
 

@@ -31,6 +31,7 @@ from .base import (
     Communicator,
     Error,
     GemmTailArgs,
+    KernelConfig,
     NormArgs,
     Op,
     Options,
@@ -41,9 +42,23 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _wire(options: Options) -> tuple[int | None, str | None, int | None, int | None]:
-    """The options as our torch ops take them, their last four values."""
-    return options.quant_bits, options.template, options.blocks, options.threads
+_Wire = tuple[int | None, str | None, int | None, int | None, int | None, int | None]
+
+
+def _wire(options: Options) -> _Wire:
+    """The options as our torch ops take them, their last six values: a schema has no
+    struct, so the KernelConfig goes flat."""
+    c = options.kernel_config
+    if c is None:
+        return options.quant_bits, options.template, None, None, None, None
+    return (
+        options.quant_bits,
+        options.template,
+        c.tile_m,
+        c.tile_n,
+        c.threads_per_block,
+        c.blocks_per_grid,
+    )
 
 
 class HipCommunicator(Communicator):
@@ -124,10 +139,12 @@ class HipCommunicator(Communicator):
             )
         else:
             raise AssertionError(f"{type(args).__name__} is an Args with no planner")
-        template, grid, threads, err = got
+        template, tile_m, tile_n, threads_per_block, blocks_per_grid, err = got
         if err is not None:
             return Error(err)
-        return Plan(template, grid, threads)
+        return Plan(
+            template, KernelConfig(threads_per_block, blocks_per_grid, tile_m, tile_n)
+        )
 
     def _all_reduce_rms_norm(
         self,

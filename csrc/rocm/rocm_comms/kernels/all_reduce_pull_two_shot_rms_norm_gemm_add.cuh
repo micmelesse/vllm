@@ -16,21 +16,21 @@ namespace hip_comms {
 // every rank copies every normed row into `workspace` ([rows, packs] of its own); a grid sync;
 // the GEMM over every row, kBuild.kernels.gemm_rows per pass. THE SAME BLOCK AND THREAD INDEX A
 // PACK IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS, bool kAdd>
+template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK, bool kAdd>
 DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
                                                          const T* __restrict__ norm_w, float eps,
                                                          const T* __restrict__ gemm_w, int n_cols,
                                                          T* __restrict__ out, int64_t out_stride,
                                                          T* __restrict__ workspace, int rows,
                                                          int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
+  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.
@@ -114,24 +114,26 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
 // added into `out` (rms_norm_gemm_add).
-template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS>
+template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     all_reduce_pull_two_shot_rms_norm_gemm(p2p::DevComm p, const T* __restrict__ norm_w, float eps,
                                            const T* __restrict__ gemm_w, int n_cols,
                                            T* __restrict__ out, int64_t out_stride,
                                            T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, BLOCK_N, NUM_THREADS, false>(
-      p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, TILE_N, THREADS_PER_BLOCK,
+                                              false>(p, norm_w, eps, gemm_w, n_cols, out,
+                                                     out_stride, workspace, rows, packs);
 }
 
-template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS>
+template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     all_reduce_pull_two_shot_rms_norm_gemm_add(p2p::DevComm p, const T* __restrict__ norm_w,
                                                float eps, const T* __restrict__ gemm_w, int n_cols,
                                                T* __restrict__ out, int64_t out_stride,
                                                T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, BLOCK_N, NUM_THREADS, true>(
-      p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, TILE_N, THREADS_PER_BLOCK,
+                                              true>(p, norm_w, eps, gemm_w, n_cols, out, out_stride,
+                                                    workspace, rows, packs);
 }
 
 }  // namespace hip_comms

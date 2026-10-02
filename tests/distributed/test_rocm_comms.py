@@ -56,6 +56,7 @@ from vllm.distributed.device_communicators.rocm_comms import (
 )
 from vllm.distributed.device_communicators.rocm_comms.base import (
     AllReduceArgs,
+    KernelConfig,
     NormArgs,
     Op,
     Options,
@@ -711,9 +712,12 @@ def _chunks(
 
 
 def _forced(template: str) -> Options:
-    """`template` forced at a width every template admits (16 x 512), for a case that
-    forces one only to check it."""
-    return Options(template=template, blocks=16, threads=512)
+    """`template` forced at a launch every template admits (16 blocks of 512 threads),
+    its own tile, for a case that forces one only to check it."""
+    return Options(
+        template=template,
+        kernel_config=KernelConfig(threads_per_block=512, blocks_per_grid=16),
+    )
 
 
 def declined(

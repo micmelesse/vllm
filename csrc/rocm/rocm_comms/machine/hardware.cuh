@@ -130,7 +130,7 @@ struct AttnResCalibration {
   Launch push;
   Launch pull;
   int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
-  int pull_block_m;        // its AttnRes tile: BLOCK_M rows a block at once
+  int pull_tile_m;         // its AttnRes tile: TILE_M rows a block at once
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
@@ -224,10 +224,10 @@ constexpr Calibration kGfx950Calibration = {
             // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
             // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
             .pull_reduce_blocks = 32,
-            // 1: BLOCK_M = 2 lost at every grid, best 480.0 us at 128 blocks against 412.8 at 1 on
+            // 1: TILE_M = 2 lost at every grid, best 480.0 us at 128 blocks against 412.8 at 1 on
             // 192
             // (4096 x 7168, 2026-10-02T21-19-22Z).
-            .pull_block_m = 1,
+            .pull_tile_m = 1,
         },
     .rms_norm_gemm =
         {

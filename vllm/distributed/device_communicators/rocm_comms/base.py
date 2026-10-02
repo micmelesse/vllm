@@ -61,16 +61,27 @@ State = Literal["disabled", "open", "capturing", "closed"]
 
 
 @dataclass(frozen=True)
+class KernelConfig:
+    """HOW A KERNEL IS TILED AND LAUNCHED, C++'s `hip_comms::KernelConfig` (Triton's autotune
+    config): TILE_M rows x TILE_N columns a tile, the threads a block, the blocks a grid. Forced,
+    a tile_m or tile_n left None is the template's own tile for the call."""
+
+    threads_per_block: int
+    blocks_per_grid: int
+    tile_m: int | None = None
+    tile_n: int | None = None
+
+
+@dataclass(frozen=True)
 class Options:
     """HOW A CALL RUNS, beside what it computes: C++'s `hip_comms::Options`. The model
     passes none. `template` (a C++ template's name, `kTemplates` in
-    `csrc/rocm/rocm_comms/impl/templates.cuh`), `blocks` and `threads` force a launch,
-    all three or none (C++ refuses the rest); none is select's choice."""
+    `csrc/rocm/rocm_comms/impl/templates.cuh`) forces the kernel at select's launch, and
+    `kernel_config` with it forces its KernelConfig; none is select's choice."""
 
     quant_bits: QuantBits | None = None
     template: str | None = None
-    blocks: int | None = None
-    threads: int | None = None
+    kernel_config: KernelConfig | None = None
 
 
 class Error(IntEnum):
@@ -103,6 +114,7 @@ class Error(IntEnum):
     ranks_disagree = 23
     groups_disagree = 24
     threads_not_built = 25
+    tile_not_built = 26
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -146,12 +158,11 @@ def build_info() -> BuildInfo:
 
 @dataclass(frozen=True)
 class Plan:
-    """WHAT RUNS on a call this backend takes: hip's template, grid and block; none of
-    them for a backend with no kernels to choose (torch, iris)."""
+    """WHAT RUNS on a call this backend takes: hip's template and its KernelConfig; none for a
+    backend with no kernels to choose (torch, iris)."""
 
     template: str | None = None
-    blocks: int | None = None
-    threads: int | None = None
+    config: KernelConfig | None = None
 
 
 # A CALL'S INPUTS AND OUTPUTS, one type per op family, as C++'s `AllReduceArgs`,
@@ -717,7 +728,7 @@ class Communicator(ABC):
         its C++'s answer."""
         if options.quant_bits is not None:
             return Error.quantized_not_built
-        if (options.template, options.blocks, options.threads) != (None, None, None):
+        if options.template is not None or options.kernel_config is not None:
             return Error.no_such_template
         inp = args.inp
         if not _is_weak_contiguous(inp):

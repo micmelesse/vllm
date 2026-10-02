@@ -100,44 +100,45 @@ void by_weight(DType weight, DType dtype, F&& f) {
   not_built("weight dtype");
 }
 
-// A ROW KERNEL'S TILE, compiled in: BLOCK_N one of the template's builds (packs a thread a power of
-// two up to kMax) at the one built NUM_THREADS; f(constant<BLOCK_N>, constant<NUM_THREADS>).
+// A ROW KERNEL'S TILE, compiled in: TILE_N one of the template's builds (packs a thread a power of
+// two up to kMax) at the one built THREADS_PER_BLOCK; f(constant<TILE_N>,
+// constant<THREADS_PER_BLOCK>).
 template <typename T, int kMax, typename F>
-void by_tile(const Config& c, F&& f) {
+void by_tile(const KernelConfig& c, F&& f) {
   constexpr int NT = kBuild.kernels.max_threads;
-  if (c.num_threads != NT)
-    not_built("a row kernel at " + std::to_string(c.num_threads) + " threads");
-  constexpr int unit = traits<T>::N * NT;  // BLOCK_N at one pack a thread
-  if (c.block_n == unit) return f(constant<unit>{}, constant<NT>{});
-  if (c.block_n == 2 * unit) return f(constant<2 * unit>{}, constant<NT>{});
+  if (c.threads_per_block != NT)
+    not_built("a row kernel at " + std::to_string(c.threads_per_block) + " threads");
+  constexpr int unit = traits<T>::N * NT;  // TILE_N at one pack a thread
+  if (c.tile_n == unit) return f(constant<unit>{}, constant<NT>{});
+  if (c.tile_n == 2 * unit) return f(constant<2 * unit>{}, constant<NT>{});
   if constexpr (kMax >= 4)
-    if (c.block_n == 4 * unit) return f(constant<4 * unit>{}, constant<NT>{});
+    if (c.tile_n == 4 * unit) return f(constant<4 * unit>{}, constant<NT>{});
   if constexpr (kMax >= 8)
-    if (c.block_n == 8 * unit) return f(constant<8 * unit>{}, constant<NT>{});
-  not_built("a row kernel of BLOCK_N " + std::to_string(c.block_n));
+    if (c.tile_n == 8 * unit) return f(constant<8 * unit>{}, constant<NT>{});
+  not_built("a row kernel of TILE_N " + std::to_string(c.tile_n));
 }
 
-// A TILE'S ROWS, compiled in: f(constant<BLOCK_M>).
+// A TILE'S ROWS, compiled in: f(constant<TILE_M>).
 template <typename F>
-void by_block_m(int block_m, F&& f) {
-  switch (block_m) {
+void by_tile_m(int tile_m, F&& f) {
+  switch (tile_m) {
     case 1: return f(constant<1>{});
     case 2: return f(constant<2>{});
     case 4:
       return f(constant<4>{});
     default: break;
   }
-  not_built("a tile of " + std::to_string(block_m) + " rows");
+  not_built("a tile of " + std::to_string(tile_m) + " rows");
 }
 
 // A row kernel's tile, up to its own build (the catalog's max_row_packs).
 template <Template K, typename T, typename F>
-void at_tile(const Config& c, F&& f) {
+void at_tile(const KernelConfig& c, F&& f) {
   by_tile<T, max_row_packs(K)>(c, std::forward<F>(f));
 }
 
-inline void one_row(const Config& c) {
-  if (c.block_m != 1) not_built("this template at BLOCK_M " + std::to_string(c.block_m));
+inline void one_row(const KernelConfig& c) {
+  if (c.tile_m != 1) not_built("this template at TILE_M " + std::to_string(c.tile_m));
 }
 
 [[noreturn]] inline void not_this_ops(Template k) {
@@ -299,7 +300,7 @@ void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
                            : f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, BN, NT>,
                                bind);
               case Template::all_reduce_pull_two_shot_add_attn_res_rms_norm:
-                return impl::by_block_m(k.config.block_m, [&](auto bm) {
+                return impl::by_tile_m(k.config.tile_m, [&](auto bm) {
                   constexpr int BM = decltype(bm)::value;
                   prefix
                       ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, BM, BN, NT>,

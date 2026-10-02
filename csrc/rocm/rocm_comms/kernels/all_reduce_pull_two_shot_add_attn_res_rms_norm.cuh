@@ -21,13 +21,14 @@ namespace hip_comms {
 // ITS OWN GRID: the reduce-scatter on a few blocks (reads), AttnRes on all of them (compute a
 // row), so a world barrier between them. `blocks` is [rows, num_sources, hidden] with row and
 // source strides in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix, int BLOCK_M, int BLOCK_N, int NUM_THREADS>
-__global__ void __launch_bounds__(NUM_THREADS, 1) all_reduce_pull_two_shot_add_attn_res_rms_norm(
-    p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
-    int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-    const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx, float eps,
-    float out_eps, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
+template <typename T, int ngpus, bool kPrefix, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+    all_reduce_pull_two_shot_add_attn_res_rms_norm(
+        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
+        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
+        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
+        float eps, float out_eps, int rows, int packs) {
+  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
@@ -38,7 +39,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) all_reduce_pull_two_shot_add_a
   const int col0         = min(p.rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));  // a late rank's may be short or none
   const int cols = packs * NL;                             // the row, in elements
-  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -85,15 +86,15 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) all_reduce_pull_two_shot_add_a
   p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
   block_stamp(3);
 
-  // 4. This block's tiles of BLOCK_M rows: each pack from the rank that owns its columns, then
+  // 4. This block's tiles of TILE_M rows: each pack from the rank that owns its columns, then
   //    AttnRes for every row of the tile at once. The next call's first sync keeps a rank from
   //    overwriting its scratch while it is read (a peer's next kernel starts only once this one has
   //    finished).
-  for (int offs_m = blockIdx.x * BLOCK_M; offs_m < rows; offs_m += gridDim.x * BLOCK_M) {
-    const Tile<BLOCK_M, BLOCK_N> tile{rows, cols, offs_m, 0};
-    V sum[BLOCK_M][kRowPacks];
+  for (int offs_m = blockIdx.x * TILE_M; offs_m < rows; offs_m += gridDim.x * TILE_M) {
+    const Tile<TILE_M, TILE_N> tile{rows, cols, offs_m, 0};
+    V sum[TILE_M][kRowPacks];
 #pragma unroll
-    for (int m = 0; m < BLOCK_M; ++m) {
+    for (int m = 0; m < TILE_M; ++m) {
       const int64_t base = int64_t{min(offs_m + m, rows - 1)} * packs;
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k) {

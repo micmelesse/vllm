@@ -19,13 +19,13 @@ namespace hip_comms {
 // (kAdd) norming them by their scales as it goes. Every rank does the same arithmetic on the same
 // bytes, so every rank holds the same result. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH
 // PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename T, typename W, int ngpus, bool kAdd, int BLOCK_N, int NUM_THREADS>
+template <typename T, typename W, int ngpus, bool kAdd, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
                                                         const T* __restrict__ residual,
                                                         const W* __restrict__ weight, float eps,
                                                         int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
+  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const V* res_in        = reinterpret_cast<const V*>(residual);
@@ -37,7 +37,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -194,23 +194,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename T, typename W, int ngpus, int BLOCK_N, int NUM_THREADS>
-__global__ void __launch_bounds__(NUM_THREADS, 1)
+template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_norm(p2p::DevComm p, T* __restrict__ out,
                                       const W* __restrict__ weight, float eps, int rows,
                                       int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, false, BLOCK_N, NUM_THREADS>(
+  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, false, TILE_N, THREADS_PER_BLOCK>(
       p, out, nullptr, nullptr, weight, eps, rows, packs);
 }
 
-template <typename T, typename W, int ngpus, int BLOCK_N, int NUM_THREADS>
-__global__ void __launch_bounds__(NUM_THREADS, 1)
+template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_add_rms_norm(p2p::DevComm p, T* __restrict__ out,
                                           T* __restrict__ residual_out,
                                           const T* __restrict__ residual,
                                           const W* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, true, BLOCK_N, NUM_THREADS>(
+  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, true, TILE_N, THREADS_PER_BLOCK>(
       p, out, residual_out, residual, weight, eps, rows, packs);
 }
 
