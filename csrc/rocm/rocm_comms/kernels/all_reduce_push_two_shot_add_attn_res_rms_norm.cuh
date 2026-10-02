@@ -72,19 +72,20 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
   block_stamp(3);
 
-  // 4. This block's rows: the sum out of this rank's scratch, then AttnRes, as the one-shot does.
-  //    The next call's first sync keeps a peer from pushing into this scratch while it is read (a
-  //    peer's next kernel starts only once this one has finished).
+  // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
+  //    one-shot does. The next call's first sync keeps a peer from pushing into this scratch while
+  //    it is read (a peer's next kernel starts only once this one has finished).
   const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const Tile<1, kRowPacks> tile{rows, packs, row, 0};
     const int64_t base = int64_t{row} * packs;
-    V sum[kRowPacks];
+    V sum[1][kRowPacks];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k)
-      sum[k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
-    block_attn_res_row<T, kPrefix, kRowPacks>(
-        sum, base, thread_cols, pre, written(row), blocks + int64_t{row} * block_stride_m,
-        block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+      sum[0][k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
+    block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,
+                                    block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps,
+                                    out_eps, inv_hidden);
   }
   block_stamp(4);
 }

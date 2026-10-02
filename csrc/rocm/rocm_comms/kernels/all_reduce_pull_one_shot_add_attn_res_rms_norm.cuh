@@ -40,14 +40,15 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
-  // 2. Each of this block's rows: read it from every rank in rank order, sum, AttnRes.
+  // 2. Each of this block's tiles (one row: BLOCK_M = 1): read it from every rank in rank order,
+  //    sum, AttnRes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const int64_t base = int64_t{row} * packs;
-    V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum);
-    block_attn_res_row<T, kPrefix, kRowPacks>(
-        sum, base, thread_cols, pre, written(row), blocks + int64_t{row} * block_stride_m,
-        block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+    const Tile<1, kRowPacks> tile{rows, packs, row, 0};
+    V sum[1][kRowPacks];
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum[0]);
+    block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,
+                                    block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps,
+                                    out_eps, inv_hidden);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
