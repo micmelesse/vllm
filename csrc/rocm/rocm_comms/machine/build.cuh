@@ -131,6 +131,11 @@ constexpr int64_t kStagingBytes = 256 * kMiB;
 // every rank's slice at half width, padded to whole grid strides (Kimi-K3's 4096 x 7168 bf16
 // prefill needs 74 MB at 36 blocks). check refuses a call past it (scratch_too_small).
 constexpr int64_t kScratchBytes = 128 * kMiB;
+// THE PEER-POINTER SLOTS, one per captured launch (capture sizes x collectives a forward): the
+// size vLLM gives the same array, 8 MB of slots. Registration past it fails at capture.
+constexpr int64_t kMaxBuffers = 131072;
+// HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
+constexpr double kSyncTimeoutSeconds = 10.0;
 constexpr int kMaxThreads = kBuild.max_threads;
 constexpr int kMaxWaves = kMaxThreads / kWaveSize;
 constexpr int kGemmRows = kBuild.gemm_rows;

@@ -127,12 +127,12 @@ int64_t rocm_comms_alloc() {
 
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
-                       const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
-                       double sync_timeout_s) {
+                       const std::vector<int64_t>& signal_offsets) {
   auto* handle = new hip_comms::Handle(
       static_cast<int>(rank), static_cast<int>(world_size),
-      static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets, max_buffers,
-      hip_comms::kScratchBytes, hip_comms::kStagingBytes, sync_timeout_s);
+      static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets,
+      hip_comms::kMaxBuffers, hip_comms::kScratchBytes, hip_comms::kStagingBytes,
+      hip_comms::kSyncTimeoutSeconds);
   return reinterpret_cast<fptr_t>(handle);
 }
 

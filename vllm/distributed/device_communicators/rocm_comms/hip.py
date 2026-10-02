@@ -20,7 +20,6 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 import logging
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any, ClassVar, get_args
 
 import torch
@@ -44,17 +43,6 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class HipTunables:
-    """Every arbitrary number this backend has. One default each until measured."""
-
-    # Peer-pointer slots, one per captured launch: capture_sizes x layers. 8 MB, the
-    # size vLLM gives the same array.
-    max_buffers: int = 131072
-    # How long a kernel waits on a peer before it prints where it was and traps.
-    sync_timeout_s: float = 10.0
-
-
 def _wire(options: Options) -> tuple[int | None, str | None, int | None, int | None]:
     """The options as our torch ops take them, their last four values."""
     return options.quant_bits, options.template, options.blocks, options.threads
@@ -76,7 +64,6 @@ class HipCommunicator(Communicator):
     """
 
     OPS: ClassVar[frozenset[Op]] = frozenset(get_args(Op))
-    hip_tunables: HipTunables = HipTunables()
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
@@ -87,10 +74,10 @@ class HipCommunicator(Communicator):
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        tunables = self.hip_tunables
         self.rank = dist.get_rank(self.cpu_group)
-        # THIS RANK'S PEER MEMORY, made and owned by C++ (signal block, scratch,
-        # staging); Python only exchanges its handle, a process-group collective.
+        # THIS RANK'S PEER MEMORY, made, sized and owned by C++ (signal block, scratch,
+        # staging, the slots and the watchdog are its numbers); Python only exchanges
+        # its handle, a process-group collective.
         memory = torch.ops._rocm_C.rocm_comms_alloc()
         handles, offsets = self._exchange(memory)
         self._handle = torch.ops._rocm_C.rocm_comms_init(
@@ -99,15 +86,8 @@ class HipCommunicator(Communicator):
             memory,
             handles,
             offsets,
-            tunables.max_buffers,
-            tunables.sync_timeout_s,
         )
-        logger.info(
-            "HipCommunicator ready: rank %d/%d, %s",
-            self.rank,
-            self.world_size,
-            tunables,
-        )
+        logger.info("HipCommunicator ready: rank %d/%d", self.rank, self.world_size)
         return True
 
     def _exchange(self, ptr: int) -> tuple[list[list[int]], list[int]]:
