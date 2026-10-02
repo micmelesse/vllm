@@ -8,9 +8,10 @@
 //
 // utils.cuh         the helpers
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
+//   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
+// tile.cuh          how a kernel cuts its work
 //   Tile<R, K>, tile<R, K>(len, first)   a block's R rows, cut to len columns from first, and
 //                                this thread's K packs of each, clamped into the slice
-//   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions
 //   thread_load(row, f, out), thread_store(row, f, v)   a Tile row: every load issued, stores
@@ -39,6 +40,7 @@
 
 #define HIP_COMMS_COMMON_INTERFACE
 #include "utils.cuh"
+#include "tile.cuh"
 #include "memory.cuh"
 #include "elementwise.cuh"
 #include "reduce.cuh"
