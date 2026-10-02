@@ -57,12 +57,14 @@ void paged_attention(
 using fptr_t = int64_t;
 
 int64_t rocm_comms_alloc();
+// The probe, every rank together: the round trip to each peer (ns), then GB/s pulled from one
+// peer, pulled from every peer, pushed into every peer, and both at once (each way).
+std::tuple<std::vector<double>, double, double, double, double> rocm_comms_probe(
+    fptr_t handle_ptr, int64_t bytes, int64_t ping_iters, int64_t traffic_iters, int64_t trials);
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets);
-double rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters);
 torch::Tensor rocm_comms_stamps();
-double rocm_comms_peer_read(fptr_t handle_ptr, int64_t peer, int64_t bytes, int64_t iters);
 
 
 void rocm_comms_dispose(fptr_t handle_ptr);
@@ -121,13 +123,15 @@ rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
+                           std::optional<int64_t> launch_blocks,
+                           std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                                     torch::Tensor& weight, double eps,
                                     std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
+                                    std::optional<int64_t> launch_blocks,
+                                    std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         torch::Tensor& residual_out, torch::Tensor& inp,

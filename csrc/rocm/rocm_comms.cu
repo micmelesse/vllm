@@ -19,8 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "rocm_comms/probes/peer_read.cuh"
-#include "rocm_comms/probes/ping_pong.cuh"
+#include "rocm_comms/probe.cuh"
 #include "rocm_comms/rocm_comms.cuh"
 
 // =================================================================================
@@ -99,7 +98,8 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
 // An op's options, its Error raised: a torch op can only return or raise.
 hip_comms::Options options_or_raise(std::optional<int64_t> quant_bits,
                                     const std::optional<std::string>& template_,
-                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
+                                    std::optional<int64_t> launch_blocks,
+                                    std::optional<int64_t> launch_threads) {
   auto o = options_of(quant_bits, template_, launch_blocks, launch_threads);
   if (const auto* e = std::get_if<hip_comms::Error>(&o))
     TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
@@ -143,6 +143,7 @@ using Names         = std::vector<std::string>;
 using PlanWire      = std::tuple<std::optional<std::string>, std::optional<int64_t>,
                                 std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
+using ProbeWire     = std::tuple<std::vector<double>, double, double, double, double>;
 using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names>;
 
 // A torch dtype as ours, or none for one ours has no name for.
@@ -295,45 +296,7 @@ BuildInfoWire rocm_comms_build_info() {
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
 
-// GB/S INTO THIS RANK reading `bytes` of every peer's staging (`peer` -1) or one peer's, `iters`
-// times: every rank calls it together, as an all-reduce reads.
-double rocm_comms_peer_read(fptr_t handle_ptr, int64_t peer, int64_t bytes, int64_t iters) {
-  auto& group = handle_of(handle_ptr);
-  TORCH_CHECK(peer == -1 || (peer >= 0 && peer < group.world_size() && peer != group.rank()),
-              "peer must be another rank, or -1 for every other rank");
-  TORCH_CHECK(iters > 0 && bytes >= 16, "iters must be positive and bytes at least a pack");
-  bytes = std::min<int64_t>(bytes, group.staging_bytes()) / 16 * 16;
-  auto stream = at::cuda::getCurrentCUDAStream();
-  const hip_comms::p2p::DevComm p = group.dev_comm(group.staging(), bytes, stream);
-  auto sink = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt32).device(
-                                   torch::kCUDA, c10::cuda::current_device()));
-  // THE WHOLE DEVICE READING, as a large all-reduce's grid would.
-  void (*kernel)(hip_comms::p2p::DevComm, int, int64_t, uint32_t*) = nullptr;
-  switch (group.world_size()) {
-    case 2: kernel = hip_comms::peer_read<c10::BFloat16, 2>; break;
-    case 4: kernel = hip_comms::peer_read<c10::BFloat16, 4>; break;
-    case 8: kernel = hip_comms::peer_read<c10::BFloat16, 8>; break;
-    default: TORCH_CHECK(false, "world size must be 2, 4 or 8");
-  }
-  const dim3 grid(hip_comms::kTarget.compute_units), block(hip_comms::kMaxThreads);
-  uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
-  const int who = static_cast<int>(peer);
-  auto launch   = [&]() { kernel<<<grid, block, 0, stream>>>(p, who, bytes / 16, s); };
-  launch();  // untimed: the first touch
-  hipEvent_t start, stop;
-  HIP_CHECK(hipEventCreate(&start));
-  HIP_CHECK(hipEventCreate(&stop));
-  HIP_CHECK(hipEventRecord(start, stream));
-  for (int64_t i = 0; i < iters; ++i) launch();
-  HIP_CHECK(hipEventRecord(stop, stream));
-  HIP_CHECK(hipEventSynchronize(stop));
-  float ms = 0.0f;
-  HIP_CHECK(hipEventElapsedTime(&ms, start, stop));
-  HIP_CHECK(hipEventDestroy(start));
-  HIP_CHECK(hipEventDestroy(stop));
-  const int64_t read = peer >= 0 ? 1 : group.world_size() - 1;
-  return static_cast<double>(bytes) * read * iters / (ms * 1e-3) / 1e9;
-}
+
 
 // THE PER-PHASE STAMPS SINCE THE LAST READ, [block][phase] device clock ticks (100 MHz), zero where
 // no block stamped, then zeroed. Only a HIP_COMMS_STAMPS build writes them (block_stamp).
@@ -350,25 +313,91 @@ torch::Tensor rocm_comms_stamps() {
   return out;
 }
 
-// NANOSECONDS PER ROUND TRIP to `peer`, over `iters`: both ranks of the pair call it together.
-double rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters) {
+// THE PROBE, every rank together: the round trip to each peer (ns, by peer, this rank's 0), then
+// GB/s pulled from one peer (rank ^ 1), pulled from every peer, pushed into every peer, and both at
+// once (each way: half the blocks pull and half push the same bytes in one window); each the median
+// of `trials`, a probe barrier before each. `bytes` a peer's share
+// of the staging, `traffic_iters` launches a trial; `ping_iters` round trips a trial.
+ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
+                           int64_t traffic_iters, int64_t trials) {
   auto& group = handle_of(handle_ptr);
-  TORCH_CHECK(peer >= 0 && peer < group.world_size() && peer != group.rank(),
-              "peer must be another rank");
-  TORCH_CHECK(iters > 0, "iters must be positive");
-  auto ticks  = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(
-                                     torch::kCUDA, c10::cuda::current_device()));
-  auto stream = at::cuda::getCurrentCUDAStream();
-  const uint32_t base =
-      group.take_flags(static_cast<int>(peer), hip_comms::ping_pong_flags(static_cast<int>(iters)));
-  hip_comms::ping_pong<<<dim3(1), dim3(64), 0, stream>>>(
-      group.dev_comm(), static_cast<int>(peer), base, static_cast<int>(iters),
-      reinterpret_cast<uint64_t*>(ticks.data_ptr<int64_t>()));
-  const double t = static_cast<double>(ticks.item<int64_t>());
+  TORCH_CHECK(ping_iters > 0 && traffic_iters > 0 && trials > 0 && bytes >= 16,
+              "iters and trials must be positive and bytes at least a pack");
+  bytes             = std::min<int64_t>(bytes, group.staging_bytes()) / 16 * 16;
+  const int world   = group.world_size(), rank = group.rank();
+  auto stream       = at::cuda::getCurrentCUDAStream();
+  const auto on_dev = torch::TensorOptions().device(torch::kCUDA, c10::cuda::current_device());
   int device = 0, khz = 0;
   HIP_CHECK(hipGetDevice(&device));
   HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
-  return t * 1e6 / khz / static_cast<double>(iters);
+  void (*barrier)(hip_comms::p2p::DevComm)                                     = nullptr;
+  void (*traffic)(hip_comms::p2p::DevComm, int, int, int64_t, uint32_t*)       = nullptr;
+  hip_comms::impl::by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    barrier          = hip_comms::probe_barrier<NG>;
+    traffic          = hip_comms::link_traffic<c10::BFloat16, NG>;
+  });
+  const auto together = [&]() {
+    barrier<<<dim3(1), dim3(64), 0, stream>>>(group.dev_comm());
+  };
+  const auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+
+  // THE ROUND TRIP to each peer: round d pairs this rank with rank ^ d, both calling together.
+  std::vector<double> ping(world, 0.0);
+  auto ticks = torch::empty({1}, on_dev.dtype(torch::kInt64));
+  for (int d = 1; d < world; ++d) {
+    const int peer = rank ^ d;
+    std::vector<double> got;
+    for (int64_t t = 0; t < trials; ++t) {
+      together();
+      const uint32_t base =
+          group.take_flags(peer, hip_comms::ping_pong_flags(static_cast<int>(ping_iters)));
+      hip_comms::ping_pong<<<dim3(1), dim3(64), 0, stream>>>(
+          group.dev_comm(), peer, base, static_cast<int>(ping_iters),
+          reinterpret_cast<uint64_t*>(ticks.data_ptr<int64_t>()));
+      got.push_back(static_cast<double>(ticks.item<int64_t>()) * 1e6 / khz /
+                    static_cast<double>(ping_iters));
+    }
+    ping[peer] = median(got);
+  }
+
+  // THE LINKS: GB/s in and out of this rank, the whole device streaming.
+  const hip_comms::p2p::DevComm p = group.dev_comm(group.staging(), bytes, stream);
+  auto sink = torch::empty({1}, on_dev.dtype(torch::kInt32));
+  uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
+  const dim3 grid(hip_comms::kTarget.compute_units), block(hip_comms::kMaxThreads);
+  const auto gbytes = [&](hip_comms::Traffic mode, int peer) {
+    const int how = static_cast<int>(mode);
+    auto launch   = [&]() { traffic<<<grid, block, 0, stream>>>(p, how, peer, bytes / 16, s); };
+    std::vector<double> got;
+    for (int64_t t = 0; t < trials; ++t) {
+      together();
+      launch();  // untimed: the first touch
+      hipEvent_t start, stop;
+      HIP_CHECK(hipEventCreate(&start));
+      HIP_CHECK(hipEventCreate(&stop));
+      HIP_CHECK(hipEventRecord(start, stream));
+      for (int64_t i = 0; i < traffic_iters; ++i) launch();
+      HIP_CHECK(hipEventRecord(stop, stream));
+      HIP_CHECK(hipEventSynchronize(stop));
+      float ms = 0.0f;
+      HIP_CHECK(hipEventElapsedTime(&ms, start, stop));
+      HIP_CHECK(hipEventDestroy(start));
+      HIP_CHECK(hipEventDestroy(stop));
+      const int peers = peer >= 0 ? 1 : world - 1;
+      got.push_back(static_cast<double>(bytes) * peers * traffic_iters / (ms * 1e-3) / 1e9);
+    }
+    return median(got);
+  };
+  using hip_comms::Traffic;
+  const double pull_one = gbytes(Traffic::pull, rank ^ 1);
+  const double pull     = gbytes(Traffic::pull, -1);
+  const double push     = gbytes(Traffic::push, -1);
+  const double both     = gbytes(Traffic::both, -1);
+  return {ping, pull_one, pull, push, both};
 }
 
 
@@ -403,7 +432,8 @@ void rocm_comms_register_graph_buffers(
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
+                           std::optional<int64_t> launch_blocks,
+                           std::optional<int64_t> launch_threads) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
@@ -456,7 +486,8 @@ void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch
                                     torch::Tensor& weight, double eps,
                                     std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
+                                    std::optional<int64_t> launch_blocks,
+                                    std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm(handle_ptr, out, nullptr, inp, nullptr, weight, eps,
                       options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
@@ -557,7 +588,8 @@ void rocm_comms_all_reduce_rms_norm_gemm(
     std::optional<std::string> template_,
     std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm_gemm(handle_ptr, false, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
+                           workspace,
+                           options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
@@ -567,7 +599,8 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     std::optional<std::string> template_,
     std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
+                           workspace,
+                           options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
