@@ -30,7 +30,7 @@ namespace hip_comms {
 // slice a rank). WAVE W STAGES THE SLICE ITS PEER READS, at the packs the peer's same block reads,
 // so a peers barrier makes it visible.
 template <typename T, int ngpus, bool kStaged>
-__global__ void __launch_bounds__(kMaxThreads, 1)
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_two_shot(p2p::DevComm p, T* __restrict__ out, PackCount<kStaged> num_packs,
                              Staged<T, kStaged> staged) {
   if constexpr (kStaged) {
@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     const int stride   = gridDim.x * lanes;
     const V* own       = reinterpret_cast<const V*>(staged.own_input);
     const int64_t pass = min(staged.stage_packs, p.scratch_packs * ngpus);
-    __shared__ V got[kMaxThreads];
+    __shared__ V got[kBuild.kernels.max_threads];
 
     const auto own_scratch    = p2p::scratch<T, ngpus>(p, p.rank);
     const auto their_scratch    = p2p::scratch<T, ngpus>(p, peer);
@@ -114,7 +114,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     const int slice_packs = (num_packs + ngpus - 1) / ngpus;
     const int first       = blockIdx.x * lanes + lane;
     const int stride      = gridDim.x * lanes;
-    __shared__ V got[kMaxThreads];
+    __shared__ V got[kBuild.kernels.max_threads];
 
     // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
     const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);

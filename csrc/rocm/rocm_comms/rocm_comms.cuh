@@ -19,7 +19,8 @@
 // all_reduce_rms_norm_gemm(_add), all_reduce_rms_scale_add      the ops
 // Error, to_string(Error)  why a call cannot run here: every reason, one list
 // supported(device, world)  Supported or the Error: whether the library runs on a device and world
-// kDTypesBuilt, kWorldsBuilt, kPackBytes, kStagingBytes  the build's facts, on every device
+// kBuild (machine/build.cuh)  the build's facts: what is compiled, the memory, the kernels'
+// geometry
 
 #pragma once
 
@@ -39,30 +40,14 @@ namespace hip_comms {
 
 using Handle = p2p::host::Group;
 
-enum class DType { f16, bf16, f32 };
-
-constexpr const char* to_string(DType d) {
-  switch (d) {
-    case DType::f16: return "f16";
-    case DType::bf16: return "bf16";
-    case DType::f32: return "f32";
-  }
-  return "unknown";
-}
-
-// WHAT IS BUILT, one list each: dispatch instantiates exactly these, check refuses the rest, and
-// Python reads them (`build_info`). f32 is a norm weight's dtype, not a call's.
-constexpr DType kDTypesBuilt[] = {DType::f16, DType::bf16};
-constexpr int kWorldsBuilt[]   = {2, 4, 8};
-
 template <typename T, size_t N>
-constexpr bool built_in(const T (&built)[N], T x) {
+constexpr bool built_in(const std::array<T, N>& built, T x) {
   for (const T& b : built)
     if (b == x) return true;
   return false;
 }
-constexpr bool dtype_built(DType d) { return built_in(kDTypesBuilt, d); }
-constexpr bool world_built(int world) { return built_in(kWorldsBuilt, world); }
+constexpr bool dtype_built(DType d) { return built_in(kBuild.supports.dtypes, d); }
+constexpr bool world_built(int world) { return built_in(kBuild.supports.worlds, world); }
 
 // What the caller asked for: an all-reduce, alone or with what it fuses, as Python names them.
 enum class Op : int {

@@ -96,7 +96,7 @@ DINLINE void wave_reduce(float (&v)[N]) {
 // and the N totals are broadcast through LDS once.
 template <typename Op, int N>
 DINLINE void block_reduce(float (&v)[N]) {
-  __shared__ float partial[kMaxWaves][N];
+  __shared__ float partial[kBuild.kernels.max_waves][N];
   __shared__ float total[N];
   const int lane  = threadIdx.x % kWaveSize;
   const int wave  = threadIdx.x / kWaveSize;
@@ -122,7 +122,7 @@ DINLINE void block_reduce(float (&v)[N]) {
 
 // The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.
 constexpr int64_t block_reduce_lds_bytes(int n) {
-  return (int64_t{kMaxWaves} + 1) * n * sizeof(float);
+  return (int64_t{kBuild.kernels.max_waves} + 1) * n * sizeof(float);
 }
 
 }  // namespace hip_comms

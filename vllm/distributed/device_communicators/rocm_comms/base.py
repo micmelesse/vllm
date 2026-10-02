@@ -114,8 +114,8 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 @dataclass(frozen=True)
 class BuildInfo:
-    """What the build holds, the same on every device (C++'s `kDTypesBuilt`,
-    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`, its ops' and errors' names)."""
+    """What the build holds, the same on every device: C++'s `kBuild.supports`, its
+    pack and staging bytes, and its ops' and errors' names."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]

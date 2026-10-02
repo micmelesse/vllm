@@ -25,7 +25,7 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
                           float inv_hidden) {
   using V             = typename traits<T>::V;
   constexpr int NL    = traits<T>::N;
-  constexpr int kTile = kBuild.attn_res_sources;
+  constexpr int kTile = kBuild.kernels.attn_res_sources;
   // The AttnRes, rounding as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
   //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
   //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u

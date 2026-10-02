@@ -25,12 +25,12 @@ struct __align__(sizeof(T) * N) vec {
   T d[N];
 };
 
-// A PACK: kPackBytes (machine/build.cuh: the widest load, 8 bf16), the unit every kernel loads,
-// sums and stores in. `num_packs` counts them.
+// A PACK: kBuild.memory.pack_bytes (machine/build.cuh: the widest load, 8 bf16), the unit every
+// kernel loads, sums and stores in. `num_packs` counts them.
 
 template <typename T>
 struct traits {
-  static constexpr int N = kPackBytes / sizeof(T);
+  static constexpr int N = kBuild.memory.pack_bytes / sizeof(T);
   using V = vec<T, N>;
 };
 

@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../../machine/build.cuh"
 #include "peers.cuh"
 
 #define HIP_CHECK(expr)                                                             \
@@ -63,9 +64,9 @@ inline std::pair<std::string, int64_t> handle_and_offset(uintptr_t ptr) {
 // staging an eager input is copied into. UNCACHED, as aiter and vLLM's custom all-reduce allocate
 // theirs: peers read what this rank wrote, and cached, those writes sit dirty in L2 for the
 // barrier's writeback to flush. The Group it is passed to owns it.
-inline uintptr_t alloc_memory(int64_t scratch_bytes, int64_t staging_bytes) {
+inline uintptr_t alloc_memory(const BuildInfo::Memory& m) {
   void* p = nullptr;
-  const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes + staging_bytes);
+  const size_t bytes = sizeof(Signal) + static_cast<size_t>(m.scratch_bytes + m.staging_bytes);
   HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
   HIP_CHECK(hipMemset(p, 0, bytes));
   HIP_CHECK(hipDeviceSynchronize());
@@ -76,19 +77,19 @@ class Group {
  public:
   // `self_memory` is this rank's `alloc_memory`, which the Group now owns; `signal_handles` and
   // `signal_offsets` are the whole world's handles for theirs, one per rank, and `world_size` is
-  // one the build holds (the opener checks both). `max_buffers` sizes the peer-pointer slab.
+  // one the build holds (the opener checks both). `build` sizes the memory and the waits.
   Group(int rank, int world_size, uintptr_t self_memory,
-        const std::vector<std::string>& signal_handles,
-        const std::vector<int64_t>& signal_offsets, int64_t max_buffers, int64_t scratch_bytes,
-        int64_t staging_bytes, double sync_timeout_s)
+        const std::vector<std::string>& signal_handles, const std::vector<int64_t>& signal_offsets,
+        const BuildInfo& build)
       : rank_(rank),
         world_size_(world_size),
         self_signal_(reinterpret_cast<Signal*>(self_memory)),
-        scratch_bytes_(scratch_bytes),
-        staging_bytes_(staging_bytes) {
+        scratch_bytes_(build.memory.scratch_bytes),
+        staging_bytes_(build.memory.staging_bytes) {
     // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
-    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(max_buffers) * sizeof(PeerPtrs)));
-    slab_end_ = slab_ + max_buffers;
+    const int64_t slots = build.memory.peer_ptr_slots;
+    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * sizeof(PeerPtrs)));
+    slab_end_ = slab_ + slots;
     cursor_   = slab_;
     auto opened = open_peers(signal_handles, signal_offsets, self_memory);
     for (int i = 0; i < world_size_; ++i)
@@ -104,7 +105,7 @@ class Group {
     int device = 0, khz = 0;
     HIP_CHECK(hipGetDevice(&device));
     HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
-    timeout_ticks_ = static_cast<uint64_t>(sync_timeout_s * khz * 1000.0);
+    timeout_ticks_ = static_cast<uint64_t>(build.kernels.sync_timeout_seconds * khz * 1000.0);
   }
 
   ~Group() {

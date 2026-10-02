@@ -68,27 +68,29 @@ struct of_dtype<DType::bf16> {
   using t = c10::BFloat16;
 };
 
-// OVER THE BUILT LISTS (kWorldsBuilt, kDTypesBuilt), so what is compiled is what they say.
+// OVER THE BUILT LISTS (kBuild.supports), so what is compiled is what they say.
 template <typename F, size_t... I>
 void by_world_in(int world, F& f, std::index_sequence<I...>) {
-  if (!((world == kWorldsBuilt[I] && (f(constant<kWorldsBuilt[I]>{}), true)) || ...))
+  constexpr auto& built = kBuild.supports.worlds;
+  if (!((world == built[I] && (f(constant<built[I]>{}), true)) || ...))
     not_built("world size " + std::to_string(world));
 }
 
 template <typename F>
 void by_world(int world, F&& f) {
-  by_world_in(world, f, std::make_index_sequence<sizeof(kWorldsBuilt) / sizeof(int)>{});
+  by_world_in(world, f, std::make_index_sequence<kBuild.supports.worlds.size()>{});
 }
 
 template <typename F, size_t... I>
 void by_dtype_in(DType d, F& f, std::index_sequence<I...>) {
-  if (!((d == kDTypesBuilt[I] && (f(type<typename of_dtype<kDTypesBuilt[I]>::t>{}), true)) || ...))
+  constexpr auto& built = kBuild.supports.dtypes;
+  if (!((d == built[I] && (f(type<typename of_dtype<built[I]>::t>{}), true)) || ...))
     not_built("dtype");
 }
 
 template <typename F>
 void by_dtype(DType d, F&& f) {
-  by_dtype_in(d, f, std::make_index_sequence<sizeof(kDTypesBuilt) / sizeof(DType)>{});
+  by_dtype_in(d, f, std::make_index_sequence<kBuild.supports.dtypes.size()>{});
 }
 
 // A norm's weight: T itself, or fp32.
@@ -145,7 +147,7 @@ Resources resources_of(void (*kernel)(P...)) {
 template <typename F>
 void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {
   const auto& args = std::get<AllReduceTemplateArgs>(k.args);
-  const int n      = static_cast<int>(a.bytes / kPackBytes);
+  const int n = static_cast<int>(a.bytes / kBuild.memory.pack_bytes);
   impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {
@@ -156,9 +158,10 @@ void dispatch(const Kernel& k, const AllReduceArgs& a, F&& f) {
         return std::make_tuple(p, static_cast<T*>(a.out), n, Staged<T, false>{});
       };
       const auto staged = [&](const p2p::DevComm& p) {
-        return std::make_tuple(p, static_cast<T*>(a.out), int64_t{a.bytes / kPackBytes},
-                               Staged<T, true>{static_cast<const T*>(a.inp),
-                                               kStagingBytes / kPackBytes});
+        return std::make_tuple(
+            p, static_cast<T*>(a.out), int64_t{a.bytes / kBuild.memory.pack_bytes},
+            Staged<T, true>{static_cast<const T*>(a.inp),
+                            kBuild.memory.staging_bytes / kBuild.memory.pack_bytes});
       };
       switch (k.fn) {
         case Template::all_reduce_pull_one_shot:
@@ -301,7 +304,7 @@ void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
   const auto& args = std::get<GemmTemplateArgs>(k.args);
   const int rows   = static_cast<int>(a.rows);
   const int packs  = static_cast<int>(packs_of(a));
-  constexpr int L  = kBuild.gemm_lanes;  // one build of it
+  constexpr int L = kBuild.kernels.gemm_lanes;  // one build of it
   if (args.lanes != L) impl::not_built("the GEMM tail at " + std::to_string(args.lanes) + " lanes");
   impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
@@ -338,8 +341,8 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
   const auto& args = std::get<ScaleAddTemplateArgs>(k.args);
   const int e      = elem_bytes(a.dtype);
   const int rows   = static_cast<int>(a.rows);
-  const int hp     = static_cast<int>(a.hidden * e / kPackBytes);
-  const int lp     = static_cast<int>(a.latent * e / kPackBytes);
+  const int hp = static_cast<int>(a.hidden * e / kBuild.memory.pack_bytes);
+  const int lp = static_cast<int>(a.latent * e / kBuild.memory.pack_bytes);
   impl::by_world(args.world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     impl::by_dtype(args.dtype, [&](auto t) {

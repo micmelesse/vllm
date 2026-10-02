@@ -116,10 +116,10 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
   const int64_t blocks = *blocks_, threads = *threads_;
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
               hip_comms::p2p::kMaxBlocks, "]");
-  TORCH_CHECK(threads > 0 && threads <= hip_comms::kMaxThreads &&
+  TORCH_CHECK(threads > 0 && threads <= hip_comms::kBuild.kernels.max_threads &&
                   threads % hip_comms::kWaveSize == 0,
               "threads must be a multiple of ", hip_comms::kWaveSize, " up to ",
-              hip_comms::kMaxThreads);
+              hip_comms::kBuild.kernels.max_threads);
   return hip_comms::Options{
       bits,
       hip_comms::Forced{*t, static_cast<int>(blocks), static_cast<int>(threads)}, stream};
@@ -304,8 +304,7 @@ OpenWire rocm_comms_open(const std::string& cpu_group, const std::string& device
   const int world = (*pg)->getSize();
   const auto ok   = hip_comms::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_comms::Error>(&ok)) return refused(*e);
-  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes,
-                                                       hip_comms::kStagingBytes);
+  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kBuild.memory);
   std::vector<std::string> handles;
   std::vector<int64_t> offsets;
   for (const std::string& bytes : all_gathered(*pg, handle_bytes(self))) {
@@ -313,9 +312,8 @@ OpenWire rocm_comms_open(const std::string& cpu_group, const std::string& device
     handles.push_back(std::move(handle));
     offsets.push_back(offset);
   }
-  auto* handle = new hip_comms::Handle((*pg)->getRank(), world, self, handles, offsets,
-                                       hip_comms::kMaxBuffers, hip_comms::kScratchBytes,
-                                       hip_comms::kStagingBytes, hip_comms::kSyncTimeoutSeconds);
+  auto* handle =
+      new hip_comms::Handle((*pg)->getRank(), world, self, handles, offsets, hip_comms::kBuild);
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -328,20 +326,21 @@ SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
   return {std::get<hip_comms::Supported>(got).arch, std::nullopt};
 }
 
-// WHAT THE BUILD HOLDS: its dtypes by name, its worlds, a pack's bytes and a staging's, and its ops
+// WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its worlds, a pack's
+// bytes and a staging's, and its ops
 // and errors by name in their enums' order (each error's name without its reason), which Python's
 // `Op` and `Error` are held to.
 BuildInfoWire rocm_comms_build_info() {
   using namespace hip_comms;
   Names dtypes, ops, errors;
-  for (const DType d : kDTypesBuilt) dtypes.push_back(to_string(d));
-  const std::vector<int64_t> worlds(std::begin(kWorldsBuilt), std::end(kWorldsBuilt));
+  for (const DType d : kBuild.supports.dtypes) dtypes.push_back(to_string(d));
+  const std::vector<int64_t> worlds(kBuild.supports.worlds.begin(), kBuild.supports.worlds.end());
   for (int i = 0; i < kNumOps; ++i) ops.push_back(to_string(static_cast<Op>(i)));
   for (int i = 0; i < kNumErrors; ++i) {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
-  return {dtypes, worlds, kPackBytes, kStagingBytes, ops, errors};
+  return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
@@ -432,7 +431,7 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   h.register_buffer(cached, handles, offsets);
   auto sink = torch::empty({1}, on_dev.dtype(torch::kInt32));
   uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
-  const dim3 block(hip_comms::kMaxThreads);
+  const dim3 block(hip_comms::kBuild.kernels.max_threads);
   const auto gbytes = [&](const void* over, hip_comms::Traffic mode, int peer,
                           int blocks = hip_comms::kTarget.compute_units, int pullers = -1) {
     const hip_comms::p2p::DevComm p = h.dev_comm(over, bytes, stream);
@@ -561,7 +560,7 @@ void all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor* r
               "weight must be 1-D of hidden=", inp.size(1));
   // The weight is read a pack at a time, a pack's worth of inp's elements per load.
   const int64_t weight_pack =
-      hip_comms::kPackBytes / inp.element_size() * weight.element_size();
+      hip_comms::kBuild.memory.pack_bytes / inp.element_size() * weight.element_size();
   TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack == 0,
               "weight must be aligned to ", weight_pack, " bytes");
   if (residual != nullptr) {
@@ -636,10 +635,11 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   if (out_norm_weight)
     TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == hidden,
                 "out_norm_weight must be 1-D of hidden=", hidden);
-  const int64_t lanes = hip_comms::kPackBytes / inp.element_size();
-  TORCH_CHECK(blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
-                  reinterpret_cast<uintptr_t>(blocks.data_ptr()) % hip_comms::kPackBytes == 0,
-              "blocks must be 16-byte aligned in every row and source");
+  const int64_t lanes = hip_comms::kBuild.memory.pack_bytes / inp.element_size();
+  TORCH_CHECK(
+      blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
+          reinterpret_cast<uintptr_t>(blocks.data_ptr()) % hip_comms::kBuild.memory.pack_bytes == 0,
+      "blocks must be 16-byte aligned in every row and source");
   ran(hip_comms::all_reduce_add_attn_res_rms_norm(
       handle_of(handle_ptr),
       {prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(), blocks.stride(0),

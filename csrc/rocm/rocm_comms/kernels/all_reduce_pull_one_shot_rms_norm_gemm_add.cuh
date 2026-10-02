@@ -13,7 +13,7 @@
 namespace hip_comms {
 
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
-// grid barrier; the GEMM over every row, kGemmRows a pass.
+// grid barrier; the GEMM over every row, kBuild.kernels.gemm_rows a pass.
 // kLanesPerCol is the GEMM's lanes per column (the build's gemm_lanes).
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks, bool kAdd>
 DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
@@ -65,10 +65,10 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   block_stamp(3);
 
   // 4. The GEMM over every row.
-  for (int r0 = 0; r0 < rows; r0 += kGemmRows)
+  for (int r0 = 0; r0 < rows; r0 += kBuild.kernels.gemm_rows)
     grid_gemm<kLanesPerCol, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
-                               min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
-                               out + r0 * out_stride, out_stride);
+                                     min(kBuild.kernels.gemm_rows, rows - r0), gemm_w, n_cols,
+                                     packs, out + r0 * out_stride, out_stride);
 
   block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.

@@ -43,7 +43,7 @@ enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 // `each` block doing both, pack by pack. The pulled packs are folded into `sink` only if they equal an impossible
 // value, which keeps the loads without a store per load.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(kMaxThreads, 1)
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     link_traffic(p2p::DevComm p, int mode, int peer, int pullers, int64_t packs, uint32_t* sink) {
   using V              = typename traits<T>::V;
   const auto traffic   = static_cast<Traffic>(mode);

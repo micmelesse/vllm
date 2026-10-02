@@ -14,8 +14,8 @@ namespace hip_comms {
 
 // Each rank reduces and norms the rows it owns into its scratch, row-major; after the sync
 // every rank copies every normed row into `workspace` ([rows, packs] of its own); a grid sync;
-// the GEMM over every row, kGemmRows per pass. THE SAME BLOCK AND THREAD INDEX A PACK IN
-// BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
+// the GEMM over every row, kBuild.kernels.gemm_rows per pass. THE SAME BLOCK AND THREAD INDEX A
+// PACK IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks, bool kAdd>
 DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
@@ -98,11 +98,11 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
   block_stamp(5);
 
-  // 6. The GEMM over every row, kGemmRows per pass.
-  for (int r0 = 0; r0 < rows; r0 += kGemmRows) {
+  // 6. The GEMM over every row, kBuild.kernels.gemm_rows per pass.
+  for (int r0 = 0; r0 < rows; r0 += kBuild.kernels.gemm_rows) {
     grid_gemm<kLanesPerCol, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
-                               min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
-                               out + r0 * out_stride, out_stride);
+                                     min(kBuild.kernels.gemm_rows, rows - r0), gemm_w, n_cols,
+                                     packs, out + r0 * out_stride, out_stride);
   }
   block_stamp(6);
 }

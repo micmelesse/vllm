@@ -7,11 +7,27 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "hardware.cuh"
 
 namespace hip_comms {
+
+// A TENSOR'S ELEMENT TYPE, as the build names it. f32 is a norm weight's, not a call's.
+enum class DType { f16, bf16, f32 };
+
+constexpr const char* to_string(DType d) {
+  switch (d) {
+    case DType::f16:
+      return "f16";
+    case DType::bf16:
+      return "bf16";
+    case DType::f32:
+      return "f32";
+  }
+  return "unknown";
+}
 
 // Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's
 // __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block puts there, and
@@ -54,25 +70,61 @@ constexpr int floor_pow2(int x) {
   return p;
 }
 
-struct Build {
-  int pack_bytes;           // a pack: the unit every kernel loads, sums and stores in
-  int max_threads;          // the widest block, and every kernel's __launch_bounds__
-  int norm_row_packs;       // a norm's (and the GEMM tail's) row packs a thread, at most
-  int attn_res_row_packs;   // AttnRes's, at most
-  int pipelined_row_packs;  // a pipelined row kernel's (two rows' loads in flight), at most
-  int scale_add_row_packs;  // the one-all-reduce tail's (three spans' loads in flight), at most
-  int gemm_rows;            // the GEMM tail's rows a pass
-  int gemm_chunk;           // the GEMM tail's K-chunk staged in LDS, in packs
-  int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
-  int attn_res_sources;     // AttnRes's sources a block_reduce, the one build of it
-  int attn_res_reduce_blocks;  // its pull two-shot's blocks that run the reduce-scatter
-  int attn_res_gather_blocks;  // and that pull the reduced rows into `out`
+// EVERYTHING THE BUILD FIXES, in one value: what is compiled, the memory and its unit, and the
+// kernels' launch geometry. Python reads a projection of it (`build_info`).
+struct BuildInfo {
+  struct Supports {
+    std::array<DType, 2> dtypes;  // a call's; dispatch instantiates exactly these
+    std::array<int, 3> worlds;
+  };
+  struct Memory {
+    int pack_bytes;          // a pack: the unit every kernel loads, sums and stores in
+    int64_t staging_bytes;   // where an eager input is copied for its peers
+    int64_t scratch_bytes;   // a two-shot's partial sums, per rank
+    int64_t peer_ptr_slots;  // one per registered or captured buffer: its peers' addresses
+  };
+  struct Kernels {
+    int max_threads;              // the widest block, and every kernel's __launch_bounds__
+    int max_waves;                // its waves
+    int norm_row_packs;           // a norm's (and the GEMM tail's) row packs a thread, at most
+    int attn_res_row_packs;       // AttnRes's, at most
+    int pipelined_row_packs;      // a pipelined row kernel's (two rows' loads in flight), at most
+    int scale_add_row_packs;      // the one-all-reduce tail's (three spans' loads in flight)
+    int gemm_rows;                // the GEMM tail's rows a pass
+    int gemm_chunk;               // the GEMM tail's K-chunk staged in LDS, in packs
+    int gemm_lanes;               // the GEMM tail's lanes a column, the one build of it
+    int attn_res_sources;         // AttnRes's sources a block_reduce, the one build of it
+    int attn_res_reduce_blocks;   // its pull two-shot's blocks that run the reduce-scatter
+    int attn_res_gather_blocks;   // and that pull the reduced rows into `out`
+    double sync_timeout_seconds;  // how long a kernel waits on a peer before it traps
+  };
+  Supports supports;
+  Memory memory;
+  Kernels kernels;
 };
 
-constexpr Build derive(const Hardware& hw, const Calibration& cal) {
-  Build b{};
+constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
+  BuildInfo info{};
+  // WHAT IS COMPILED, one list each: dispatch instantiates exactly these, check refuses the rest.
+  info.supports = {{DType::f16, DType::bf16}, {2, 4, 8}};
+
+  BuildInfo::Memory& m = info.memory;
   // A PACK IS THE WIDEST LOAD, as in vLLM's and aiter's custom all-reduce and NCCL.
-  b.pack_bytes = hw.max_load_bytes;
+  m.pack_bytes = hw.max_load_bytes;
+  // THE STAGING an eager input is copied into for its peers: policy. A staged build takes any
+  // size through it a pass at a time; an in-place build on an eager input (the fused ops) needs it
+  // whole, up to Kimi-K3's widest row (the one-all-reduce tail's 4096 x 17920 bf16, 147 MB).
+  m.staging_bytes = 256 * kMiB;
+  // THE TWO-SHOT SCRATCH, per rank, after the signal block: policy. It holds one rank's slice, so
+  // it caps a two-shot buffer at scratch_bytes x ngpus (1 GiB at 8 ranks); a quantized two-shot
+  // holds every rank's slice at half width, padded to whole grid strides (Kimi-K3's 4096 x 7168
+  // bf16 prefill needs 74 MB at 36 blocks). check refuses a call past it (scratch_too_small).
+  m.scratch_bytes = 128 * kMiB;
+  // THE PEER-POINTER SLOTS, one per captured launch (capture sizes x collectives a forward): the
+  // size vLLM gives the same array, 8 MB of slots. Registration past it fails at capture.
+  m.peer_ptr_slots = 131072;
+
+  BuildInfo::Kernels& b = info.kernels;
 
   // THE WIDEST BLOCK WHOSE THREADS KEEP EVERY ARCHITECTURAL REGISTER. A bound is a register trade:
   // at 1024 threads a gfx950 thread gets 128 and the row kernels spill (AttnRes at 2 packs, the
@@ -80,17 +132,18 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   b.max_threads = hw.wave_size;
   for (int t = hw.wave_size; t <= hw.max_workgroup; t += hw.wave_size)
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
+  b.max_waves = b.max_threads / hw.wave_size;
 
   // A ROW KERNEL'S PACKS A THREAD: each pack keeps a load from every peer in flight at once
   // (peers_reduce), and AttnRes fp32 copies of it besides (the prefix, the weights, the output, and
   // one a source of a reduction's). Policy: a row's registers take at most half of the thread's,
   // the rest its addresses, reductions and the norm. At all of them the norms spilled (8 packs of
   // 8 peers is 256 registers: ISA 2026-09-30T20-23-38Z), and AttnRes at 4.
-  const int pack_vgprs  = b.pack_bytes / 4;
+  const int pack_vgprs = m.pack_bytes / 4;
   const int row_budget  = hw.arch_vgprs / 2;
   const int in_flight   = (hw.xgmi_links + 1) * pack_vgprs;
   // A pack of the narrowest T built (bf16) as fp32, for each copy.
-  const int attn_state  = (3 + cal.attn_res_sources_per_reduce) * (b.pack_bytes / 2);
+  const int attn_state = (3 + cal.attn_res_sources_per_reduce) * (m.pack_bytes / 2);
   b.norm_row_packs      = floor_pow2(row_budget / in_flight);
   b.attn_res_row_packs  = floor_pow2(row_budget / (in_flight + attn_state));
   // A PIPELINED ROW KERNEL holds the next row's loads beside this row's: twice the in-flight
@@ -110,46 +163,29 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   const int64_t partials    = int64_t{waves} * b.gemm_rows * hw.wave_size * 4;
   const int64_t reduce      = (int64_t{waves} + 1) * 4;
   b.gemm_chunk =
-      static_cast<int>((hw.lds_bytes - partials - reduce) / (int64_t{b.gemm_rows} * b.pack_bytes));
+      static_cast<int>((hw.lds_bytes - partials - reduce) / (int64_t{b.gemm_rows} * m.pack_bytes));
 
   // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
   b.gemm_lanes = cal.gemm_lanes_per_col;
   b.attn_res_sources = cal.attn_res_sources_per_reduce;
   b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
   b.attn_res_gather_blocks = cal.attn_res.pull_gather_blocks;
-  return b;
+  // HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
+  b.sync_timeout_seconds = 10.0;
+  return info;
 }
 
 // THIS COMPILE PASS'S BUILD: the device code for its own target, the host for the tuning target.
-constexpr Build kBuild = derive(kDevice, kTargetCalibration);
+constexpr BuildInfo kBuild = derive(kDevice, kTargetCalibration);
 
-constexpr int kPackBytes = kBuild.pack_bytes;
-// THE STAGING an eager input is copied into for its peers: policy. A staged build takes any size
-// through it a pass at a time; an in-place build on an eager input (the fused ops) needs it whole,
-// up to Kimi-K3's widest row (the one-all-reduce tail's 4096 x 17920 bf16, 147 MB).
-constexpr int64_t kStagingBytes = 256 * kMiB;
-// THE TWO-SHOT SCRATCH, per rank, after the signal block: policy. It holds one rank's slice, so it
-// caps a two-shot buffer at kScratchBytes x ngpus (1 GiB at 8 ranks); a quantized two-shot holds
-// every rank's slice at half width, padded to whole grid strides (Kimi-K3's 4096 x 7168 bf16
-// prefill needs 74 MB at 36 blocks). check refuses a call past it (scratch_too_small).
-constexpr int64_t kScratchBytes = 128 * kMiB;
-// THE PEER-POINTER SLOTS, one per captured launch (capture sizes x collectives a forward): the
-// size vLLM gives the same array, 8 MB of slots. Registration past it fails at capture.
-constexpr int64_t kMaxBuffers = 131072;
-// HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
-constexpr double kSyncTimeoutSeconds = 10.0;
-constexpr int kMaxThreads = kBuild.max_threads;
-constexpr int kMaxWaves = kMaxThreads / kWaveSize;
-constexpr int kGemmRows = kBuild.gemm_rows;
-constexpr int kGemmChunk = kBuild.gemm_chunk;
-
-static_assert(kMaxThreads <= kDevice.max_workgroup && kMaxThreads % kWaveSize == 0,
+static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
+                  kBuild.kernels.max_threads % kWaveSize == 0,
               "the block limit must be whole waves the device can launch");
-static_assert(kBuild.gemm_lanes == 1 || kBuild.gemm_lanes == 2 || kBuild.gemm_lanes == 4 ||
-                  kBuild.gemm_lanes == 8,
+static_assert(kBuild.kernels.gemm_lanes == 1 || kBuild.kernels.gemm_lanes == 2 ||
+                  kBuild.kernels.gemm_lanes == 4 || kBuild.kernels.gemm_lanes == 8,
               "the GEMM tail splits a wave's lanes over its columns: 1, 2, 4 or 8");
-static_assert(kBuild.norm_row_packs <= 8 && kBuild.attn_res_row_packs <= 8 &&
-                  kBuild.pipelined_row_packs <= 8,
+static_assert(kBuild.kernels.norm_row_packs <= 8 && kBuild.kernels.attn_res_row_packs <= 8 &&
+                  kBuild.kernels.pipelined_row_packs <= 8,
               "impl/launch.cuh builds up to 8 packs a thread");
 
 // Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the

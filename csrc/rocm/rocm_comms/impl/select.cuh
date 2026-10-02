@@ -41,7 +41,7 @@ constexpr int64_t bytes_of(const Args& a) {
 }
 template <typename Args>
 constexpr int64_t packs_of(const Args& a) {
-  return hidden_of(a) * elem_bytes(a.dtype) / kPackBytes;
+  return hidden_of(a) * elem_bytes(a.dtype) / kBuild.memory.pack_bytes;
 }
 
 // A ROW OP GIVES EACH BLOCK WHOLE ROWS, so it needs no more blocks than it has rows: a one-shot
@@ -88,7 +88,8 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResAr
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
                             int world) {
-  return {t, GemmTemplateArgs{world, a.dtype, kBuild.gemm_lanes, row_packs_of(t, a, threads)},
+  const int lanes = kBuild.kernels.gemm_lanes;
+  return {t, GemmTemplateArgs{world, a.dtype, lanes, row_packs_of(t, a, threads)},
           grid_of(t, blocks, rows_of(a), world), threads};
 }
 
@@ -97,9 +98,9 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailA
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddArgs& a,
                             int world) {
   const int e         = elem_bytes(a.dtype);
-  const int r         = row_packs_for(t, a.latent * e / kPackBytes, threads);
+  const int r = row_packs_for(t, a.latent * e / kBuild.memory.pack_bytes, threads);
   const int64_t span  = int64_t{r > 0 ? r : 1} * threads;
-  const int64_t hp    = a.hidden * e / kPackBytes;
+  const int64_t hp = a.hidden * e / kBuild.memory.pack_bytes;
   const int splits    = static_cast<int>((hp + span - 1) / span);
   // A block a (row, slice): every row's in the one-shot, this rank's in the two-shot.
   const int64_t mine  = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
@@ -135,7 +136,7 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddA
 // 128; 1.8 MB: 15.42 us at 64, 14.72 at 80, 16.70 at 256).
 constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, int threads) {
   const double in_flight = hw.xgmi_links * hw.xgmi_gbytes_per_s_a_way * cal.ping_pong_ns;
-  const double per_pass  = static_cast<double>(threads) * kPackBytes;
+  const double per_pass = static_cast<double>(threads) * kBuild.memory.pack_bytes;
   const int blocks       = static_cast<int>(in_flight / per_pass + 0.999);
   return blocks < hw.compute_units ? blocks : hw.compute_units;
 }
@@ -144,7 +145,7 @@ constexpr Kernel tune_all_reduce(const AllReduceArgs& a, int world, const Hardwa
                                  const Calibration& cal) {
   const bool one_shot = bytes_of(a) <= cal.all_reduce_one_shot_max_bytes;
   const Template k = one_shot ? Template::all_reduce_pull_one_shot : Template::all_reduce_pull_two_shot;
-  const int64_t packs = (bytes_of(a) + kPackBytes - 1) / kPackBytes;
+  const int64_t packs = (bytes_of(a) + kBuild.memory.pack_bytes - 1) / kBuild.memory.pack_bytes;
   const int64_t work  = one_shot ? packs : (packs + world - 1) / world;
   const int64_t need  = (work + hw.wave_size - 1) / hw.wave_size;
   const int threads = one_shot ? hw.wave_size : hw.wave_size * world;
@@ -298,7 +299,8 @@ constexpr std::optional<int> row_packs_of(const TemplateArgs& args) {
 constexpr bool fits(const Kernel& k) {
   if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
   if (has_row_packs(k.fn) && !row_packs_of(k.args)) return false;
-  return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
+  return k.threads >= kWaveSize && k.threads <= kBuild.kernels.max_threads &&
+         k.threads % kWaveSize == 0;
 }
 constexpr bool selections_fit() {
   const Options o{std::nullopt, std::nullopt, nullptr};

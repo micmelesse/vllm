@@ -108,18 +108,21 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_push_two_shot_rms_norm(
-    p2p::DevComm p, T* __restrict__ out, const W* __restrict__ weight, float eps, int rows,
-    int packs) {
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+    all_reduce_push_two_shot_rms_norm(p2p::DevComm p, T* __restrict__ out,
+                                      const W* __restrict__ weight, float eps, int rows,
+                                      int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<T, W, ngpus, false, kRowPacks>(
       p, out, nullptr, nullptr, weight, eps, rows, packs);
 }
 
 template <typename T, typename W, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_push_two_shot_add_rms_norm(
-    p2p::DevComm p, T* __restrict__ out, T* __restrict__ residual_out,
-    const T* __restrict__ residual, const W* __restrict__ weight, float eps, int rows,
-    int packs) {
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+    all_reduce_push_two_shot_add_rms_norm(p2p::DevComm p, T* __restrict__ out,
+                                          T* __restrict__ residual_out,
+                                          const T* __restrict__ residual,
+                                          const W* __restrict__ weight, float eps, int rows,
+                                          int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<T, W, ngpus, true, kRowPacks>(
       p, out, residual_out, residual, weight, eps, rows, packs);
 }

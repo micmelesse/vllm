@@ -23,12 +23,12 @@ namespace hip_comms {
 // grid barrier between them. `blocks` is [rows, num_sources, hidden] with row and
 // source strides in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1)
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
-        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks,
-        int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
-        const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
-        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
+        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
+        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
+        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
+        float eps, float out_eps, int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
@@ -57,11 +57,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
-  //    scratch at their place in the tensor, BY THE FIRST kBuild.attn_res_reduce_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (machine/hardware.cuh). THE (ROW,
-  //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
-  //    bytes.
-  const int reducers = min(static_cast<int>(gridDim.x), kBuild.attn_res_reduce_blocks);
+  //    scratch at their place in the tensor, BY THE FIRST kBuild.kernels.attn_res_reduce_blocks
+  //    BLOCKS only: reads queue behind the links past a few dozen blocks (machine/hardware.cuh).
+  //    THE (ROW, COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on
+  //    every 16 bytes.
+  const int reducers = min(static_cast<int>(gridDim.x), kBuild.kernels.attn_res_reduce_blocks);
   if (cols > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
     int q = threadIdx.x / cols;  // this thread's row among the block's, and its column
@@ -86,11 +86,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   block_stamp(3);
 
   // 4. Every row's reduced columns pulled from their owners into `out`, BY THE FIRST
-  //    kBuild.attn_res_gather_blocks BLOCKS only, a wave a (row, 64-pack chunk) so its owner is the
-  //    same across the wave, kInFlight chunks a wave at once. `out` is this rank's own, read back by
-  //    other blocks after the grid barrier and overwritten row by row with AttnRes's output.
+  //    kBuild.kernels.attn_res_gather_blocks BLOCKS only, a wave a (row, 64-pack chunk) so its
+  //    owner is the same across the wave, kInFlight chunks a wave at once. `out` is this rank's
+  //    own, read back by other blocks after the grid barrier and overwritten row by row with
+  //    AttnRes's output.
   constexpr int kInFlight = 8;
-  const int gatherers     = min(static_cast<int>(gridDim.x), kBuild.attn_res_gather_blocks);
+  const int gatherers = min(static_cast<int>(gridDim.x), kBuild.kernels.attn_res_gather_blocks);
   if (static_cast<int>(blockIdx.x) < gatherers) {
     const int waves  = blockDim.x / kWaveSize;
     const int lane   = threadIdx.x % kWaveSize;

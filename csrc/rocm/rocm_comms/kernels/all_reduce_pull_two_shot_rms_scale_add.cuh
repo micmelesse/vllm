@@ -19,9 +19,9 @@ namespace hip_comms {
 // THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: a block gathers exactly the (row, slice)s
 // the same block on each owner finished, which is what a peers barrier makes visible.
 template <typename T, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_two_shot_rms_scale_add(
-    p2p::DevComm p, T* __restrict__ out, float eps, int rows, int hidden_packs, int latent_packs,
-    int splits) {
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+    all_reduce_pull_two_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
+                                           int hidden_packs, int latent_packs, int splits) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   V* o                   = reinterpret_cast<V*>(out);

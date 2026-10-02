@@ -26,10 +26,10 @@ namespace hip_comms {
 inline int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
   if (!is_two_shot(t)) return 0;
   const Op op = op_of(t);
-  if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kPackBytes;
-  if (slices_columns(t)) return rows * packs * kPackBytes;
+  if (op == Op::all_reduce) return (rows * packs + world - 1) / world * kBuild.memory.pack_bytes;
+  if (slices_columns(t)) return rows * packs * kBuild.memory.pack_bytes;
   const bool two = op == Op::all_reduce_add_rms_norm;
-  return (rows + world - 1) / world * packs * (two ? 2 : 1) * kPackBytes;
+  return (rows + world - 1) / world * packs * (two ? 2 : 1) * kBuild.memory.pack_bytes;
 }
 
 // Whether kernel `k` holds its whole grid resident: only the compiled kernel knows what it uses.
@@ -51,9 +51,10 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   if (!dtype_built(a.dtype)) return Error::dtype_not_built;
   if constexpr (std::is_same_v<Args, NormArgs>)
     if (a.weight_dtype != a.dtype && a.weight_dtype != DType::f32) return Error::weight_not_built;
-  if (hidden_of(a) * e % kPackBytes != 0) return Error::row_not_packs;
+  if (hidden_of(a) * e % kBuild.memory.pack_bytes != 0) return Error::row_not_packs;
   if constexpr (std::is_same_v<Args, ScaleAddArgs>)
-    if (a.hidden * e % kPackBytes != 0 || a.latent * e % kPackBytes != 0 || a.latent < 1)
+    if (a.hidden * e % kBuild.memory.pack_bytes != 0 ||
+        a.latent * e % kBuild.memory.pack_bytes != 0 || a.latent < 1)
       return Error::widths_not_packs;
   if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
   if (has_row_packs(k.fn) && !row_packs_of(k.args)) return Error::row_too_wide;
@@ -61,7 +62,7 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   if (k.fn == Template::all_reduce_pull_two_shot && k.threads % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
   if (o.quant_bits) return Error::quantized_not_built;
-  if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.gemm_lanes))
+  if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.kernels.gemm_lanes))
     return Error::block_exceeds_lds;
   if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
     return Error::scratch_too_small;

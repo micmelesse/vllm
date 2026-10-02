@@ -20,7 +20,7 @@ namespace hip_comms {
 // staging holds, EACH THREAD STAGING THE PACKS IT READS: what the same block on a peer copied is
 // what a peers barrier makes visible.
 template <typename T, int ngpus, bool kStaged>
-__global__ void __launch_bounds__(kMaxThreads, 1)
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_one_shot(p2p::DevComm p, T* __restrict__ out, PackCount<kStaged> num_packs,
                              Staged<T, kStaged> staged) {
   if constexpr (kStaged) {

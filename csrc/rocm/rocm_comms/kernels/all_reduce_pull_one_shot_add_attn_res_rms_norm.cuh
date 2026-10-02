@@ -16,12 +16,12 @@ namespace hip_comms {
 // nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
 // in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1)
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
-        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks,
-        int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
-        const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
-        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
+        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
+        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
+        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
+        float eps, float out_eps, int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);

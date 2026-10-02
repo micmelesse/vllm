@@ -17,9 +17,9 @@ namespace hip_comms {
 // (its 1/rms is the same in every slice). Rounds as the reference does: each span's sum lands as
 // T, the all-reduce output, then out = T(float(shared) + float(projected) * scale).
 template <typename T, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kMaxThreads, 1) all_reduce_pull_one_shot_rms_scale_add(
-    p2p::DevComm p, T* __restrict__ out, float eps, int rows, int hidden_packs, int latent_packs,
-    int splits) {
+__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+    all_reduce_pull_one_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
+                                           int hidden_packs, int latent_packs, int splits) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   V* o                   = reinterpret_cast<V*>(out);
