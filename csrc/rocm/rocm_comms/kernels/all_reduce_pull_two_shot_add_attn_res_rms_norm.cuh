@@ -59,7 +59,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
 
   // 0. FOLDING EARLY, by the blocks that do not reduce: needs nothing of the peers, so before the
   //    first barrier.
-  block_stamp(0);
   if (workspace != nullptr && static_cast<int>(blockIdx.x) >= reducers) {
     for (int row = blockIdx.x - reducers; row < rows; row += gridDim.x - reducers) {
       float m[kRowPacks][NL];
@@ -82,9 +81,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   }
 
   // 1. Wait until every peer has launched, so its input is ready.
-  block_stamp(1);
+  block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
-  block_stamp(2);
+  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -112,12 +111,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       }
     }
   }
-  block_stamp(3);
+  block_stamp(2);
 
   // 3. Every rank's columns are in its scratch, and every peer has read this rank's input: A WORLD
   //    BARRIER, since the blocks that wrote a row's columns are not the ones that read them.
   p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
-  block_stamp(4);
+  block_stamp(3);
 
   // 4. This block's rows: each pack from the rank that owns its columns, then AttnRes, as the
   //    one-shot does. The next call's first sync keeps a rank from overwriting its scratch while
@@ -154,7 +153,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
           norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
     }
   }
-  block_stamp(5);
+  block_stamp(4);
 }
 
 }  // namespace hip_comms
