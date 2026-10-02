@@ -1541,8 +1541,10 @@ def run_add_attn_res_rms_norm_rank(
     ctx: RankContext,
     case: tuple[tuple[int, int], bool, int, int, bool],
     shot: FusedShot,
+    grid: int = 16,
 ) -> tuple[bool, str | None]:
-    """ONE rank: the fused op against the two it replaces, on every output it writes."""
+    """ONE rank: the fused op against the two it replaces, on every output it writes,
+    its kernel forced at `grid` blocks of 512."""
     from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 
     rank, world, device = ctx.rank, ctx.world, ctx.device
@@ -1580,7 +1582,9 @@ def run_add_attn_res_rms_norm_rank(
     )
     torch.cuda.synchronize()
 
-    options = _forced(f"{shot}_add_attn_res_rms_norm")
+    options = Options(
+        template=f"{shot}_add_attn_res_rms_norm", blocks=grid, threads=512
+    )
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if not comm.should_allreduce_add_attn_res_rms_norm(mine, options):
@@ -1632,6 +1636,27 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{case}: " + "; ".join(bad)
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
+
+
+@pytest.mark.parametrize("has_prefix", [False, True])
+def test_attn_res_pull_folding_early_matches_the_ops_it_replaces(
+    has_prefix: bool, world: int, ranks: World
+) -> None:
+    """The pull two-shot at select's prefill grid (192 blocks): the blocks that do not
+    reduce fold each row's stored sources into the workspace before the barrier, and the
+    answer is still all_reduce then `attn_res`."""
+    # example-based: one prefill shape with stored sources is what folds early
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    case = ((1024, 7168), has_prefix, 4, 4, True)
+    got = ranks.run(
+        run_add_attn_res_rms_norm_rank,
+        case=case,
+        shot="all_reduce_pull_two_shot",
+        grid=192,
+    )
+    bad = [err for _, err in got if err is not None]
+    assert not bad, "; ".join(bad)
 
 
 # ---------------------------------------------------------------------------------

@@ -272,6 +272,10 @@ void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
                   static_cast<T*>(a.out), a.num_blocks, a.write_idx, a.eps, a.out_eps, rows,
                   packs);
             };
+            // THE PULL TWO-SHOT ALSO TAKES the workspace it folds early into (null: it does not).
+            const auto bind_pull = [&](const p2p::DevComm& p) {
+              return std::tuple_cat(bind(p), std::make_tuple(a.workspace));
+            };
             const bool prefix = args.prefix;
             switch (k.fn) {
               case Template::all_reduce_pull_one_shot_add_attn_res_rms_norm:
@@ -280,10 +284,10 @@ void dispatch(const Kernel& k, const AttnResArgs& a, F&& f) {
                            : f(all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, R>,
                                bind);
               case Template::all_reduce_pull_two_shot_add_attn_res_rms_norm:
-                return prefix
-                           ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, R>, bind)
-                           : f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, R>,
-                               bind);
+                return prefix ? f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, R>,
+                                  bind_pull)
+                              : f(all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, R>,
+                                  bind_pull);
               case Template::all_reduce_push_two_shot_add_attn_res_rms_norm:
                 return prefix
                            ? f(all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, R>, bind)
