@@ -37,9 +37,9 @@ constexpr uint32_t ping_pong_flags(int iters) { return 16 + static_cast<uint32_t
 
 enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
-// EVERY THREAD STREAMING 16-byte packs over the buffer `p.inputs` names on every rank (the staging,
-// or a registered buffer): pulled from `peer` (a pull only) or every other rank, pushed into every
-// other rank, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
+// EVERY THREAD STREAMING 16-byte packs: pulled from the buffer `p.inputs` names on `peer` (a pull
+// only) or every other rank (the staging, or a registered buffer), pushed into every other rank's
+// staging, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
 // `each` block doing both, pack by pack. The pulled packs are folded into `sink` only if they equal an impossible
 // value, which keeps the loads without a store per load.
 template <typename T, int ngpus>
@@ -58,6 +58,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   const int64_t first  = int64_t{index} * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t{blocks} * blockDim.x;
   const auto buffers   = p2p::inputs<T, ngpus>(p);
+  const auto stagings  = p2p::stagings<T, ngpus>(p);  // a push's target: never the pulled buffer
   V v;
   uint32_t* w = reinterpret_cast<uint32_t*>(&v);
 #pragma unroll
@@ -77,7 +78,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
     if (pushes) {
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
-        if (r != p.rank) thread_store(buffers[r].at() + i, v);
+        if (r != p.rank) p2p::write_staging(stagings[r], i, v);
     }
   }
   if (acc == 0x9e3779b9u) *sink = acc;
