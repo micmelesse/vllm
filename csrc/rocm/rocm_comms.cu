@@ -166,7 +166,8 @@ static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result)
 using Names         = std::vector<std::string>;
 using PlanWire =
     std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-               std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>>;
+               std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
+               std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using ProbeWire     = std::tuple<std::vector<double>, Names, std::vector<double>>;
@@ -182,12 +183,13 @@ std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
 
 // WHAT RUNS A CALL, or the first Error it meets: `hip_comms::plan`, one planner per op family,
 // each handed the call's own tensors and reading their facts here. A torch op cannot return a
-// variant, so each returns the kernel's template (by name), grid and threads, or the Error's
-// number: the three or the one. The arguments a call's kernel reads are not, so they are null.
+// variant, so each returns the kernel's template (by name) and its KernelConfig's six fields, or
+// the Error's number: the seven or the one. The arguments a call's kernel reads are not, so they
+// are null.
 namespace {
 PlanWire error_wire(hip_comms::Error e) {
-  return PlanWire{std::nullopt, std::nullopt, std::nullopt,
-                  std::nullopt, std::nullopt, static_cast<int64_t>(e)};
+  return PlanWire{std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                  std::nullopt, std::nullopt, std::nullopt, static_cast<int64_t>(e)};
 }
 
 // AN INPUT AS OURS: its dtype, or the Error it meets first (not contiguous, not 2-D where the op
@@ -216,6 +218,8 @@ PlanWire planned(fptr_t handle_ptr, const Args& a, std::optional<int64_t> quant_
   return PlanWire{std::string(hip_comms::to_string(k.fn)),
                   k.config.tile_m,
                   k.config.tile_n,
+                  k.config.tile_k,
+                  k.config.slice_k,
                   k.config.threads_per_block,
                   k.config.blocks_per_grid,
                   std::nullopt};

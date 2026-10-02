@@ -79,7 +79,7 @@ void rocm_comms_dispose(fptr_t handle_ptr);
 // exact), then a forced template by name with its blocks and threads (none: select's).
 
 // The planners, one per op family, each given the call's own tensors. A variant at the torch
-// boundary: the kernel's template name, grid and threads, or the Error's number.
+// boundary: the kernel's template name and its KernelConfig's six fields, or the Error's number.
 std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>, std::optional<int64_t>>
