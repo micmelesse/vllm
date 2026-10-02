@@ -1853,3 +1853,44 @@ def test_an_eager_all_reduce_wider_than_the_staging_runs_in_passes(
     got = ranks.run(run_eager_beyond_staging_rank, shot=shot)
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot}: " + "; ".join(bad)
+
+
+def run_warmup_rank(ctx: RankContext) -> tuple[bool, str | None]:
+    """ONE rank: inside `capture()` on a stream that is not recording, a capture's
+    warmup, rank 0 alone calls every op. Launching would wait on peers that never
+    come, so finishing proves nothing launched; the outputs are the right shape."""
+    comm = ctx.comm("hip")
+    x = torch.randn(16, 7168, device=ctx.device).to(torch.bfloat16)
+    weight = torch.ones(7168, device=ctx.device, dtype=torch.bfloat16)
+    done = torch.cuda.Event()
+    with comm.capture(), torch.cuda.stream(torch.cuda.Stream()):
+        if ctx.rank == 0:
+            outs = [
+                comm.all_reduce(x),
+                comm.all_reduce_rms_norm(x, weight, 1e-6),
+                *comm.all_reduce_add_rms_norm(x, x, weight, 1e-6),
+            ]
+            done.record()
+    if ctx.rank == 0:
+        deadline = time.monotonic() + 10.0
+        while not done.query():
+            if time.monotonic() > deadline:
+                return False, "a warmup call launched: it waited on its peers"
+            time.sleep(0.01)
+        if any(o.shape != x.shape or o.dtype != x.dtype for o in outs):
+            shapes = [tuple(o.shape) for o in outs]
+            return False, f"outputs {shapes}, not {tuple(x.shape)}"
+    dist.barrier(group=ctx.cpu_group)
+    return True, None
+
+
+def test_a_capture_warmup_launches_nothing(world: int, ranks: World) -> None:
+    """A capture's warmup: vLLM runs the forward on the capture stream before recording
+    and discards the outputs. An op there returns outputs of the right shape and
+    launches nothing, as vLLM's and aiter's custom all-reduce do."""
+    # example-based: the point is one state (a capture's warmup), not a domain
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_warmup_rank)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, "; ".join(bad)
