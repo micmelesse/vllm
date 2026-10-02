@@ -384,7 +384,7 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   HIP_CHECK(hipGetDevice(&device));
   HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
   void (*barrier)(hip_comms::p2p::DevComm)                                     = nullptr;
-  void (*traffic)(hip_comms::p2p::DevComm, int, int, int64_t, uint32_t*)       = nullptr;
+  void (*traffic)(hip_comms::p2p::DevComm, int, int, int, int64_t, uint32_t*)  = nullptr;
   hip_comms::impl::by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     barrier          = hip_comms::probe_barrier<NG>;
@@ -434,11 +434,14 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
   const dim3 block(hip_comms::kMaxThreads);
   const auto gbytes = [&](const void* over, hip_comms::Traffic mode, int peer,
-                          int blocks = hip_comms::kTarget.compute_units) {
+                          int blocks = hip_comms::kTarget.compute_units, int pullers = -1) {
     const hip_comms::p2p::DevComm p = h.dev_comm(over, bytes, stream);
     const dim3 grid(blocks);
     const int how = static_cast<int>(mode);
-    auto launch   = [&]() { traffic<<<grid, block, 0, stream>>>(p, how, peer, bytes / 16, s); };
+    if (pullers < 0) pullers = blocks / 2;
+    auto launch = [&]() {
+      traffic<<<grid, block, 0, stream>>>(p, how, peer, pullers, bytes / 16, s);
+    };
     std::vector<double> got;
     for (int64_t t = 0; t < trials; ++t) {
       together();
@@ -480,6 +483,12 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
     gbps.push_back(gbytes(cached, Traffic::pull, -1, blocks));
     names.push_back("cached_push_b" + std::to_string(blocks));
     gbps.push_back(gbytes(cached, Traffic::push, -1, blocks));
+  }
+  // BOTH AT ONCE AT SANE GRIDS: `pullers` blocks pull, the rest push; GB/s each way.
+  for (const auto& [pullers, pushers] : {std::pair<int, int>{32, 32}, {32, 64}, {32, 128},
+                                         {48, 48}, {48, 144}, {64, 64}}) {
+    names.push_back("cached_split_p" + std::to_string(pullers) + "_q" + std::to_string(pushers));
+    gbps.push_back(gbytes(cached, Traffic::split, -1, pullers + pushers, pullers));
   }
   // Every rank done reading every other's before any frees its copy.
   together();

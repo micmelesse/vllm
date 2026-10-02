@@ -39,21 +39,22 @@ enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
 // EVERY THREAD STREAMING 16-byte packs over the buffer `p.inputs` names on every rank (the staging,
 // or a registered buffer): pulled from `peer` (a pull only) or every other rank, pushed into every
-// other rank, both at once with the blocks `split` (even pull, odd push) or with `each` block doing
-// both, pack by pack. The pulled packs are folded into `sink` only if they equal an impossible
+// other rank, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
+// `each` block doing both, pack by pack. The pulled packs are folded into `sink` only if they equal an impossible
 // value, which keeps the loads without a store per load.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreads, 1)
-    link_traffic(p2p::DevComm p, int mode, int peer, int64_t packs, uint32_t* sink) {
+    link_traffic(p2p::DevComm p, int mode, int peer, int pullers, int64_t packs, uint32_t* sink) {
   using V              = typename traits<T>::V;
   const auto traffic   = static_cast<Traffic>(mode);
   const bool split     = traffic == Traffic::split;
-  const int parity     = static_cast<int>(blockIdx.x % 2);
-  const bool pulls     = traffic == Traffic::pull || traffic == Traffic::each || (split && parity == 0);
-  const bool pushes    = traffic == Traffic::push || traffic == Traffic::each || (split && parity == 1);
+  const bool puller    = static_cast<int>(blockIdx.x) < pullers;
+  const bool pulls     = traffic == Traffic::pull || traffic == Traffic::each || (split && puller);
+  const bool pushes    = traffic == Traffic::push || traffic == Traffic::each || (split && !puller);
   // This block's place among the blocks in its role, and how many there are.
-  const int index      = split ? blockIdx.x / 2 : blockIdx.x;
-  const int blocks     = split ? (gridDim.x + 1 - parity) / 2 : gridDim.x;
+  const int grid       = static_cast<int>(gridDim.x);
+  const int index      = split && !puller ? blockIdx.x - pullers : blockIdx.x;
+  const int blocks     = !split ? grid : puller ? pullers : grid - pullers;
   const int64_t first  = int64_t{index} * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t{blocks} * blockDim.x;
   const auto buffers   = p2p::inputs<T, ngpus>(p);
