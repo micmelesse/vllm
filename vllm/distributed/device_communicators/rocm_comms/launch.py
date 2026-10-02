@@ -44,9 +44,11 @@ class Launch:
     threads: int = 512
 
 
-def launch_wire(launch: Launch | None) -> list[int] | None:
-    """The launch as C++ takes it, last on every op: [template, blocks, threads], or
-    None for select's."""
+def launch_wire(
+    launch: Launch | None,
+) -> tuple[int, int, int] | tuple[None, None, None]:
+    """The launch as C++ takes it, the last three values of every op: its template's
+    number, its blocks and its threads, or none of them for select's."""
     if launch is None:
-        return None
-    return [get_args(Template).index(launch.template), launch.blocks, launch.threads]
+        return None, None, None
+    return get_args(Template).index(launch.template), launch.blocks, launch.threads

@@ -68,17 +68,18 @@ hip_comms::DType dtype_of(const torch::Tensor& t) {
   return hip_comms::DType::f32;
 }
 
-// A forced launch crosses as [template, blocks, threads], or none for select's choice.
-using LaunchWire = std::optional<std::vector<int64_t>>;
-
-hip_comms::Options options_of(int64_t quant_bits, const LaunchWire& launch) {
+// A FORCED LAUNCH is a template, its blocks and its threads, all three or none (select's).
+hip_comms::Options options_of(int64_t quant_bits, std::optional<int64_t> template_,
+                              std::optional<int64_t> blocks_, std::optional<int64_t> threads_) {
   using hip_comms::Template;
   TORCH_CHECK(quant_bits == 16 || quant_bits == 8 || quant_bits == 4,
               "quant_bits must be 16 (exact), 8 or 4");
+  TORCH_CHECK(template_.has_value() == blocks_.has_value() &&
+                  template_.has_value() == threads_.has_value(),
+              "hip_comms: a forced launch names its template, blocks and threads, or none");
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (!launch) return {static_cast<int>(quant_bits), std::nullopt, stream};
-  TORCH_CHECK(launch->size() == 3, "hip_comms: a launch is [template, blocks, threads]");
-  const int64_t kernel = (*launch)[0], blocks = (*launch)[1], threads = (*launch)[2];
+  if (!template_) return {static_cast<int>(quant_bits), std::nullopt, stream};
+  const int64_t kernel = *template_, blocks = *blocks_, threads = *threads_;
   TORCH_CHECK(kernel >= 0 && kernel < hip_comms::kNumTemplates, "hip_comms: no template ",
               kernel);
   TORCH_CHECK(blocks > 0 && blocks <= hip_comms::p2p::kMaxBlocks, "blocks must be in [1, ",
@@ -127,7 +128,8 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
 
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names         = std::vector<std::string>;
-using PlanWire      = std::tuple<std::optional<std::vector<int64_t>>, std::optional<int64_t>>;
+using PlanWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>,
+                                std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names>;
@@ -141,13 +143,14 @@ std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
 }
 
 // WHAT RUNS ON THIS CALL, or the first Error it meets: `hip_comms::plan`, given the call's facts,
-// and Python only passes them. The kernel crosses as [template, grid, threads]; a torch op cannot
-// return a variant, so exactly one of the two is set. `cols` is an output's columns and `weight`
-// a norm's weight dtype, for the ops that have them.
+// and Python only passes them. A torch op cannot return a variant, so it returns the kernel's
+// template, grid and threads, or the Error's number: the three or the one. `cols` is an output's
+// columns and `weight` a norm's weight dtype, for the ops that have them.
 PlanWire rocm_comms_plan(fptr_t handle_ptr, int64_t op, const std::vector<int64_t>& shape,
                          at::ScalarType dtype, bool contiguous, std::optional<int64_t> cols,
                          std::optional<at::ScalarType> weight, int64_t quant_bits,
-                         const LaunchWire& launch) {
+                         std::optional<int64_t> template_,
+                         std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   using hip_comms::Error;
   using hip_comms::Op;
   TORCH_CHECK(op >= 0 && op < hip_comms::kNumOps, "hip_comms: no op ", op);
@@ -156,7 +159,9 @@ PlanWire rocm_comms_plan(fptr_t handle_ptr, int64_t op, const std::vector<int64_
   const bool norms    = which == Op::all_reduce_rms_norm || which == Op::all_reduce_add_rms_norm;
   TORCH_CHECK(has_cols || !cols, "hip_comms: only an op with an output's columns takes cols");
   TORCH_CHECK(norms == weight.has_value(), "hip_comms: a norm op, and only one, takes a weight");
-  const auto error = [](Error e) { return PlanWire{std::nullopt, static_cast<int64_t>(e)}; };
+  const auto error = [](Error e) {
+    return PlanWire{std::nullopt, std::nullopt, std::nullopt, static_cast<int64_t>(e)};
+  };
   if (!contiguous) return error(Error::not_contiguous);
   const std::optional<hip_comms::DType> d = dtype_from(dtype);
   if (!d) return error(Error::dtype_not_built);
@@ -171,14 +176,13 @@ PlanWire rocm_comms_plan(fptr_t handle_ptr, int64_t op, const std::vector<int64_
   const int64_t rows  = which == Op::all_reduce ? 1 : shape[0];
   const int64_t width = which == Op::all_reduce ? numel : shape[1];
   auto& h             = handle_of(handle_ptr);
-  const auto o        = options_of(quant_bits, launch);
+  const auto o        = options_of(quant_bits, template_, blocks, threads);
   const float eps     = 0.f;
   const auto of       = [&](const auto& args) {
     const std::variant<hip_comms::Kernel, Error> p = hip_comms::plan(h, args, o);
     if (const Error* e = std::get_if<Error>(&p)) return error(*e);
     const auto& k = std::get<hip_comms::Kernel>(p);
-    return PlanWire{std::vector<int64_t>{static_cast<int64_t>(k.fn), k.grid, k.threads},
-                    std::nullopt};
+    return PlanWire{static_cast<int64_t>(k.fn), k.grid, k.threads, std::nullopt};
   };
   switch (which) {
     case Op::all_reduce:
@@ -339,14 +343,15 @@ void rocm_comms_register_graph_buffers(
 
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-                           int64_t quant_bits, const LaunchWire& launch) {
+                           int64_t quant_bits, std::optional<int64_t> template_,
+                           std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
   ran(hip_comms::all_reduce(
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), inp.numel() * inp.element_size(), dtype_of(inp)},
-      options_of(quant_bits, launch)));
+      options_of(quant_bits, template_, blocks, threads)));
 }
 
 namespace {
@@ -390,17 +395,21 @@ void all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor* r
 
 void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                                     torch::Tensor& weight, double eps, int64_t quant_bits,
-                                    const LaunchWire& launch) {
+                                    std::optional<int64_t> template_,
+                                    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   all_reduce_rms_norm(handle_ptr, out, nullptr, inp, nullptr, weight, eps,
-                      options_of(quant_bits, launch));
+                      options_of(quant_bits, template_, blocks, threads));
 }
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         torch::Tensor& residual_out, torch::Tensor& inp,
                                         torch::Tensor& residual, torch::Tensor& weight,
-                                        double eps, int64_t quant_bits, const LaunchWire& launch) {
+                                        double eps, int64_t quant_bits,
+                                        std::optional<int64_t> template_,
+                                        std::optional<int64_t> blocks,
+                                        std::optional<int64_t> threads) {
   all_reduce_rms_norm(handle_ptr, out, &residual_out, inp, &residual, weight, eps,
-                      options_of(quant_bits, launch));
+                      options_of(quant_bits, template_, blocks, threads));
 }
 
 // With `has_prefix` the sum is added to `prefix` in place; without, the sum IS the new prefix.
@@ -409,7 +418,8 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
     torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
     int64_t write_idx, double eps, double out_eps, bool has_prefix, int64_t quant_bits,
-    const LaunchWire& launch) {
+    std::optional<int64_t> template_,
+    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   check_device_contiguous({&prefix, &out, &inp, &norm_weight, &qk_weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
   const int64_t hidden = inp.size(1);
@@ -444,7 +454,7 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
        out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0),
        hidden, static_cast<int>(num_blocks), static_cast<int>(write_idx),
        static_cast<float>(eps), static_cast<float>(out_eps), has_prefix},
-      options_of(quant_bits, launch)));
+      options_of(quant_bits, template_, blocks, threads)));
 }
 
 namespace {
@@ -482,24 +492,28 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, i
 void rocm_comms_all_reduce_rms_norm_gemm(
     fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
-    torch::Tensor& workspace, int64_t quant_bits, const LaunchWire& launch) {
+    torch::Tensor& workspace, int64_t quant_bits, std::optional<int64_t> template_,
+    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   all_reduce_rms_norm_gemm(handle_ptr, false, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_of(quant_bits, launch));
+                           workspace, options_of(quant_bits, template_, blocks, threads));
 }
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
     fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
-    torch::Tensor& workspace, int64_t quant_bits, const LaunchWire& launch) {
+    torch::Tensor& workspace, int64_t quant_bits, std::optional<int64_t> template_,
+    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
   all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_of(quant_bits, launch));
+                           workspace, options_of(quant_bits, template_, blocks, threads));
 }
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
 // projected | latent] summed over the ranks first: the widths are out's, out's again, and the rest.
 void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
                                          torch::Tensor& inp, double eps, int64_t quant_bits,
-                                         const LaunchWire& launch) {
+                                         std::optional<int64_t> template_,
+                                         std::optional<int64_t> blocks,
+                                         std::optional<int64_t> threads) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
               "inp and out must be 2-D with the same rows");
@@ -511,7 +525,7 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden, latent,
        static_cast<float>(eps)},
-      options_of(quant_bits, launch)));
+      options_of(quant_bits, template_, blocks, threads)));
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

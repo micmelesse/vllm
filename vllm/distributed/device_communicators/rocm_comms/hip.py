@@ -156,7 +156,7 @@ class HipCommunicator(Communicator):
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, inp, quant_bits, launch_wire(launch)
+            self._handle, out, inp, quant_bits, *launch_wire(launch)
         )
 
     def _plan(
@@ -170,7 +170,7 @@ class HipCommunicator(Communicator):
     ) -> Plan | Error:
         """C++'s answer (`hip_comms::plan`), given the call's facts: every rule about
         what our kernels run is there, none here."""
-        kernel, err = torch.ops._rocm_C.rocm_comms_plan(
+        template, grid, threads, err = torch.ops._rocm_C.rocm_comms_plan(
             self._handle,
             get_args(Op).index(op),
             list(inp.shape),
@@ -179,11 +179,10 @@ class HipCommunicator(Communicator):
             cols,
             weight_dtype,
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
         if err is not None:
             return Error(err)
-        template, grid, threads = kernel
         return Plan(Launch(get_args(Template)[template], grid, threads))
 
     def _all_reduce_rms_norm(
@@ -202,7 +201,7 @@ class HipCommunicator(Communicator):
             weight,
             eps,
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _all_reduce_rms_norm_gemm(
@@ -227,7 +226,7 @@ class HipCommunicator(Communicator):
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _all_reduce_rms_norm_gemm_add(
@@ -252,7 +251,7 @@ class HipCommunicator(Communicator):
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _all_reduce_rms_scale_add(
@@ -269,7 +268,7 @@ class HipCommunicator(Communicator):
             inp,
             eps,
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -304,7 +303,7 @@ class HipCommunicator(Communicator):
             out_eps,
             has_prefix,
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _all_reduce_add_rms_norm(
@@ -328,7 +327,7 @@ class HipCommunicator(Communicator):
             weight,
             eps,
             quant_bits,
-            launch_wire(launch),
+            *launch_wire(launch),
         )
 
     def _on_close(self) -> None:
