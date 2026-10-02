@@ -5,7 +5,7 @@
 memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch geometry
-(`csrc/rocm/rocm_comms/rocm_comms.cuh`); a `Launch` passed with a call is the one way to
+(`csrc/rocm/rocm_comms/rocm_comms.cuh`); `Options` passed with a call are the one way to
 force one, for the sweep and the tests.
 
 TWO MEMORY PATHS, split by lifetime, both C++'s (`p2p::host::Group::dev_comm`). A
@@ -27,8 +27,19 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, Error, Op, Plan
-from .launch import Launch, launch_wire
+from .base import (
+    AllReduceArgs,
+    Args,
+    AttnResArgs,
+    Communicator,
+    Error,
+    GemmTailArgs,
+    NormArgs,
+    Op,
+    Options,
+    Plan,
+    ScaleAddArgs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +58,11 @@ class HipTunables:
     max_buffers: int = 131072
     # How long a kernel waits on a peer before it prints where it was and traps.
     sync_timeout_s: float = 10.0
+
+
+def _wire(options: Options) -> tuple[int | None, str | None, int | None, int | None]:
+    """The options as our torch ops take them, their last four values."""
+    return options.quant_bits, options.template, options.blocks, options.threads
 
 
 def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
@@ -151,39 +167,39 @@ class HipCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
-        torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, inp, quant_bits, *launch_wire(launch)
-        )
+        torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, inp, *_wire(options))
 
-    def _plan(
-        self,
-        op: Op,
-        inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
-        cols: int | None = None,
-        weight_dtype: torch.dtype | None = None,
-    ) -> Plan | Error:
-        """C++'s answer (`hip_comms::plan`), given the call's facts: every rule about
-        what our kernels run is there, none here."""
-        template, grid, threads, err = torch.ops._rocm_C.rocm_comms_plan(
-            self._handle,
-            op,
-            list(inp.shape),
-            inp.dtype,
-            inp.is_contiguous(),
-            cols,
-            weight_dtype,
-            quant_bits,
-            *launch_wire(launch),
-        )
+    def _plan(self, args: Args, options: Options) -> Plan | Error:
+        """C++'s answer (`hip_comms::plan`): the op family's planner, handed the call's
+        own tensors. Every rule about what our kernels run is there, none here."""
+        ops, wire = torch.ops._rocm_C, _wire(options)
+        if isinstance(args, AllReduceArgs):
+            got = ops.rocm_comms_plan_all_reduce(self._handle, args.inp, *wire)
+        elif isinstance(args, NormArgs):
+            got = ops.rocm_comms_plan_all_reduce_rms_norm(
+                self._handle, args.inp, args.weight, args.add, *wire
+            )
+        elif isinstance(args, AttnResArgs):
+            got = ops.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
+                self._handle, args.inp, *wire
+            )
+        elif isinstance(args, GemmTailArgs):
+            got = ops.rocm_comms_plan_all_reduce_rms_norm_gemm(
+                self._handle, args.inp, args.gemm_weight, args.add, *wire
+            )
+        elif isinstance(args, ScaleAddArgs):
+            got = ops.rocm_comms_plan_all_reduce_rms_scale_add(
+                self._handle, args.inp, args.out, *wire
+            )
+        else:
+            raise AssertionError(f"{type(args).__name__} is an Args with no planner")
+        template, grid, threads, err = got
         if err is not None:
             return Error(err)
-        return Plan(Launch(template, grid, threads))
+        return Plan(template, grid, threads)
 
     def _all_reduce_rms_norm(
         self,
@@ -191,8 +207,7 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
             self._handle,
@@ -200,8 +215,7 @@ class HipCommunicator(Communicator):
             inp,
             weight,
             eps,
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _all_reduce_rms_norm_gemm(
@@ -212,8 +226,7 @@ class HipCommunicator(Communicator):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm(
             self._handle,
@@ -225,8 +238,7 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _all_reduce_rms_norm_gemm_add(
@@ -237,8 +249,7 @@ class HipCommunicator(Communicator):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
@@ -250,8 +261,7 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _all_reduce_rms_scale_add(
@@ -259,16 +269,14 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
             self._handle,
             out,
             inp,
             eps,
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -285,8 +293,7 @@ class HipCommunicator(Communicator):
         write_idx: int,
         eps: float,
         out_eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
@@ -302,8 +309,7 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             has_prefix,
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _all_reduce_add_rms_norm(
@@ -314,8 +320,7 @@ class HipCommunicator(Communicator):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         """The normed result into `out`, the sum plus residual into `residual_out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
@@ -326,8 +331,7 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
-            quant_bits,
-            *launch_wire(launch),
+            *_wire(options),
         )
 
     def _on_close(self) -> None:

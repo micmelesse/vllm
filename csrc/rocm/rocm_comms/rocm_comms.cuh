@@ -92,12 +92,6 @@ constexpr const char* to_string(Op op) {
 }
 #undef HIP_COMMS_CASE
 constexpr int kNumOps = static_cast<int>(Op::all_reduce_rms_scale_add) + 1;
-// The op a name names, or none.
-inline std::optional<Op> op_named(const std::string& name) {
-  for (int i = 0; i < kNumOps; ++i)
-    if (name == to_string(static_cast<Op>(i))) return static_cast<Op>(i);
-  return std::nullopt;
-}
 
 // Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
 // one per set of template arguments.
@@ -245,9 +239,12 @@ constexpr const char* to_string(Error e) {
   return "unknown";
 }
 
+// A LOSSY PRECISION on the wire, in bits; none is exact.
+enum class QuantBits : int { eight = 8, four = 4 };
+
 struct Options {
-  int quant_bits;                // the precision accepted on the wire: 16 (exact), 8 or 4
-  std::optional<Forced> forced;  // none: select's
+  std::optional<QuantBits> quant_bits;  // none: exact
+  std::optional<Forced> forced;         // none: select's
   hipStream_t stream;
 };
 

@@ -60,7 +60,7 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (k.fn == Template::all_reduce_pull_two_shot && k.threads % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
-  if (o.quant_bits != 16) return Error::quantized_not_built;
+  if (o.quant_bits) return Error::quantized_not_built;
   if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.gemm_lanes))
     return Error::block_exceeds_lds;
   if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())

@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .launch import Launch
 from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
@@ -54,6 +53,23 @@ def _as_device(device: int | str | torch.device) -> torch.device:
         return torch.device(device)
     assert isinstance(device, torch.device)
     return device
+
+
+# A LOSSY PRECISION on the wire, in bits; none is exact.
+QuantBits = Literal[8, 4]
+
+
+@dataclass(frozen=True)
+class Options:
+    """HOW A CALL RUNS, beside what it computes: C++'s `hip_comms::Options`. The model
+    passes none. `template` (a C++ template's name, `kTemplates` in
+    `csrc/rocm/rocm_comms/impl/templates.cuh`), `blocks` and `threads` force a launch,
+    all three or none (C++ refuses the rest); none is select's choice."""
+
+    quant_bits: QuantBits | None = None
+    template: str | None = None
+    blocks: int | None = None
+    threads: int | None = None
 
 
 class Error(IntEnum):
@@ -125,10 +141,79 @@ def build_info() -> BuildInfo:
 
 @dataclass(frozen=True)
 class Plan:
-    """WHAT RUNS on a call this backend takes: hip's template, grid and block, or None
-    for a backend with no kernels to choose (torch, iris)."""
+    """WHAT RUNS on a call this backend takes: hip's template, grid and block; none of
+    them for a backend with no kernels to choose (torch, iris)."""
 
-    launch: Launch | None
+    template: str | None = None
+    blocks: int | None = None
+    threads: int | None = None
+
+
+# A CALL'S INPUTS AND OUTPUTS, one type per op family, as C++'s `AllReduceArgs`,
+# `NormArgs`, `AttnResArgs`, `GemmTailArgs` and `ScaleAddArgs`: what `plan` is asked
+# about. Each holds the tensors the decision reads, and the backend reads their facts.
+
+
+@dataclass(frozen=True)
+class AllReduceArgs:
+    inp: torch.Tensor
+
+    @property
+    def op(self) -> Op:
+        return "all_reduce"
+
+
+@dataclass(frozen=True)
+class NormArgs:
+    """All-reduce then `rms_norm`, or `fused_add_rms_norm` with `add`."""
+
+    inp: torch.Tensor
+    weight: torch.Tensor
+    add: bool
+
+    @property
+    def op(self) -> Op:
+        return "all_reduce_add_rms_norm" if self.add else "all_reduce_rms_norm"
+
+
+@dataclass(frozen=True)
+class AttnResArgs:
+    inp: torch.Tensor
+
+    @property
+    def op(self) -> Op:
+        return "all_reduce_add_attn_res_rms_norm"
+
+
+@dataclass(frozen=True)
+class GemmTailArgs:
+    """All-reduce, `rms_norm`, then a GEMM by `gemm_weight` [N, hidden], written or
+    added (`add`)."""
+
+    inp: torch.Tensor
+    gemm_weight: torch.Tensor
+    add: bool
+
+    @property
+    def op(self) -> Op:
+        return (
+            "all_reduce_rms_norm_gemm_add" if self.add else "all_reduce_rms_norm_gemm"
+        )
+
+
+@dataclass(frozen=True)
+class ScaleAddArgs:
+    """`inp`'s row [shared | projected | latent] into `out` [rows, hidden]."""
+
+    inp: torch.Tensor
+    out: torch.Tensor
+
+    @property
+    def op(self) -> Op:
+        return "all_reduce_rms_scale_add"
+
+
+Args = AllReduceArgs | NormArgs | AttnResArgs | GemmTailArgs | ScaleAddArgs
 
 
 @dataclass(frozen=True)
@@ -143,11 +228,6 @@ def supported(device: torch.device, world: int) -> Supported | Error:
     answers it (`hip_comms::supported`): the Supported, or the Error."""
     arch, err = torch.ops._rocm_C.rocm_comms_supported(device.index, world)
     return Error(err) if err is not None else Supported(arch)
-
-
-def _cols(t: torch.Tensor, dim: int) -> int | None:
-    """An output's columns, its `dim`, when it is 2-D; else None (refused)."""
-    return t.shape[dim] if t.dim() == 2 else None
 
 
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
@@ -247,67 +327,45 @@ class Communicator(ABC):
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
-    # Every op and every `should_*` takes `launch`, a forced kernel and geometry, per
-    # call. The sweep and the tests pass one (to hip, the one backend with kernels to
-    # choose); the model passes None, the backend's own choice. And `quant_bits`, the
-    # precision the caller accepts on the wire: 16 (exact) unless it says otherwise; a
-    # backend without lossy kernels refuses anything else.
+    # Every op and every `should_*` takes `options`, per call, none meaning the
+    # defaults: a forced template and geometry, which the sweep and the tests pass (to
+    # hip, the one backend with kernels to choose) and the model leaves to the backend;
+    # and a lossy `quant_bits`, which a backend without lossy kernels refuses.
 
-    def plan(
-        self,
-        op: Op,
-        inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
-        cols: int | None = None,
-        weight_dtype: torch.dtype | None = None,
-    ) -> Plan | Error:
-        """WHAT RUNS `op` over `inp` on this backend, or the Error it meets: the one
-        place a refusal is decided. `cols` is the output's columns of an op that has
-        them (the GEMM tails', the scale-add's), `weight_dtype` a norm's weight dtype
-        (the norm ops'); None for the others. Every `should_*` is this, a Plan."""
+    def plan(self, args: Args, options: Options | None = None) -> Plan | Error:
+        """WHAT RUNS the call `args` on this backend, or the Error it meets: the one
+        place a refusal is decided, the options' included. Every `should_*` is this, a
+        Plan."""
         if self.disabled:
             return Error.disabled
-        if op not in self.OPS:
+        if args.op not in self.OPS:
             return Error.no_such_op
-        return self._plan(op, inp, launch, quant_bits, cols, weight_dtype)
+        return self._plan(args, Options() if options is None else options)
 
     def should_allreduce(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
+        self, inp: torch.Tensor, options: Options | None = None
     ) -> bool:
         """Whether this backend takes `inp`: `plan` is a Plan."""
-        return isinstance(self.plan("all_reduce", inp, launch, quant_bits), Plan)
+        return isinstance(self.plan(AllReduceArgs(inp), options), Plan)
 
     def should_allreduce_rms_norm(
         self,
         inp: torch.Tensor,
-        weight_dtype: torch.dtype,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        weight: torch.Tensor,
+        options: Options | None = None,
     ) -> bool:
-        """Whether this backend can all-reduce then `rms_norm` `inp`, its weight in
-        `weight_dtype`, in one kernel: `plan` is a Plan."""
-        got = self.plan(
-            "all_reduce_rms_norm", inp, launch, quant_bits, weight_dtype=weight_dtype
-        )
-        return isinstance(got, Plan)
+        """Whether this backend can all-reduce then `rms_norm` `inp` by `weight` in one
+        kernel: `plan` is a Plan."""
+        return isinstance(self.plan(NormArgs(inp, weight, add=False), options), Plan)
 
     def should_allreduce_add_rms_norm(
         self,
         inp: torch.Tensor,
-        weight_dtype: torch.dtype,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        weight: torch.Tensor,
+        options: Options | None = None,
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
-        got = self.plan(
-            "all_reduce_add_rms_norm",
-            inp,
-            launch,
-            quant_bits,
-            weight_dtype=weight_dtype,
-        )
-        return isinstance(got, Plan)
+        return isinstance(self.plan(NormArgs(inp, weight, add=True), options), Plan)
 
     def _is_small(self, inp: torch.Tensor) -> bool:
         """Whether `inp` is under `small_limit` -- the line that used to pick between
@@ -318,7 +376,7 @@ class Communicator(ABC):
         return inp.numel() * inp.element_size() < self.tunables.small_limit
 
     def all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
+        self, inp: torch.Tensor, options: Options | None = None
     ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE.
 
@@ -331,10 +389,10 @@ class Communicator(ABC):
         class because the LINE is shared. What a backend does on either side of it is
         the backend's, so the classification is offered and not applied.
         """
-        self._require("all_reduce", inp, launch, quant_bits)
+        options = self._require(AllReduceArgs(inp), options)
         out = torch.empty_like(inp)
         if not self._warming_up("all_reduce"):
-            self._all_reduce(out, inp, launch, quant_bits)
+            self._all_reduce(out, inp, options)
         return out
 
     def all_reduce_rms_norm(
@@ -342,19 +400,16 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel.
 
         A variant of the collective, so it goes through the same two doors: the capture
         check and the admission check."""
-        self._require(
-            "all_reduce_rms_norm", inp, launch, quant_bits, weight_dtype=weight.dtype
-        )
+        options = self._require(NormArgs(inp, weight, add=False), options)
         out = torch.empty_like(inp)
         if not self._warming_up("all_reduce_rms_norm"):
-            self._all_reduce_rms_norm(out, inp, weight, eps, launch, quant_bits)
+            self._all_reduce_rms_norm(out, inp, weight, eps, options)
         return out
 
     def all_reduce_add_rms_norm(
@@ -363,31 +418,23 @@ class Communicator(ABC):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, then the sum plus residual."""
-        self._require(
-            "all_reduce_add_rms_norm",
-            inp,
-            launch,
-            quant_bits,
-            weight_dtype=weight.dtype,
-        )
+        options = self._require(NormArgs(inp, weight, add=True), options)
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
         if not self._warming_up("all_reduce_add_rms_norm"):
             self._all_reduce_add_rms_norm(
-                out, residual_out, inp, residual, weight, eps, launch, quant_bits
+                out, residual_out, inp, residual, weight, eps, options
             )
         return out, residual_out
 
     def should_allreduce_add_attn_res_rms_norm(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
+        self, inp: torch.Tensor, options: Options | None = None
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
-        got = self.plan("all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits)
-        return isinstance(got, Plan)
+        return isinstance(self.plan(AttnResArgs(inp), options), Plan)
 
     def all_reduce_add_attn_res_rms_norm(
         self,
@@ -401,14 +448,13 @@ class Communicator(ABC):
         write_idx: int,
         eps: float,
         out_eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
         `prefix` the sum starting one. Returns the prefix (updated in place when given)
         and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
         block."""
-        self._require("all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits)
+        options = self._require(AttnResArgs(inp), options)
         # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
         prefix_out = torch.empty_like(inp) if prefix is None else prefix
         out = torch.empty_like(inp)
@@ -427,8 +473,7 @@ class Communicator(ABC):
             write_idx,
             eps,
             out_eps,
-            launch,
-            quant_bits,
+            options,
         )
         return prefix_out, out
 
@@ -436,20 +481,13 @@ class Communicator(ABC):
         self,
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM
         written into an output; `gemm_weight` is [N, hidden], and its N shapes the
         launch."""
-        got = self.plan(
-            "all_reduce_rms_norm_gemm",
-            inp,
-            launch,
-            quant_bits,
-            _cols(gemm_weight, 0),
-        )
-        return isinstance(got, Plan)
+        args = GemmTailArgs(inp, gemm_weight, add=False)
+        return isinstance(self.plan(args, options), Plan)
 
     def all_reduce_rms_norm_gemm(
         self,
@@ -459,37 +497,27 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> None:
         """`out[:, out_col0:out_col0 + N] = rms_norm(all_reduce(inp), norm_weight, eps)
         @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
-        self._require(
-            "all_reduce_rms_norm_gemm", inp, launch, quant_bits, _cols(gemm_weight, 0)
-        )
+        options = self._require(GemmTailArgs(inp, gemm_weight, add=False), options)
         if self._warming_up("all_reduce_rms_norm_gemm"):
             return
         self._all_reduce_rms_norm_gemm(
-            inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
+            inp, norm_weight, eps, gemm_weight, out, out_col0, options
         )
 
     def should_allreduce_rms_norm_gemm_add(
         self,
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> bool:
         """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM added
         into an output; `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        got = self.plan(
-            "all_reduce_rms_norm_gemm_add",
-            inp,
-            launch,
-            quant_bits,
-            _cols(gemm_weight, 0),
-        )
-        return isinstance(got, Plan)
+        args = GemmTailArgs(inp, gemm_weight, add=True)
+        return isinstance(self.plan(args, options), Plan)
 
     def all_reduce_rms_norm_gemm_add(
         self,
@@ -499,54 +527,40 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> None:
         """`out[:, out_col0:out_col0 + N] += rms_norm(all_reduce(inp), norm_weight, eps)
         @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
-        self._require(
-            "all_reduce_rms_norm_gemm_add",
-            inp,
-            launch,
-            quant_bits,
-            _cols(gemm_weight, 0),
-        )
+        options = self._require(GemmTailArgs(inp, gemm_weight, add=True), options)
         if self._warming_up("all_reduce_rms_norm_gemm_add"):
             return
         self._all_reduce_rms_norm_gemm_add(
-            inp, norm_weight, eps, gemm_weight, out, out_col0, launch, quant_bits
+            inp, norm_weight, eps, gemm_weight, out, out_col0, options
         )
 
     def should_allreduce_rms_scale_add(
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> bool:
         """As `should_allreduce_rms_norm`, for writing `out` [rows, hidden] from `inp`'s
         row [shared | projected | latent], the widths out's, out's and the rest."""
-        got = self.plan(
-            "all_reduce_rms_scale_add", inp, launch, quant_bits, _cols(out, 1)
-        )
-        return isinstance(got, Plan)
+        return isinstance(self.plan(ScaleAddArgs(inp, out), options), Plan)
 
     def all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options | None = None,
     ) -> None:
         """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
         + projected * rsqrt(mean(latent^2) + eps)` in one kernel."""
-        self._require(
-            "all_reduce_rms_scale_add", inp, launch, quant_bits, _cols(out, 1)
-        )
+        options = self._require(ScaleAddArgs(inp, out), options)
         if self._warming_up("all_reduce_rms_scale_add"):
             return
-        self._all_reduce_rms_scale_add(inp, out, eps, launch, quant_bits)
+        self._all_reduce_rms_scale_add(inp, out, eps, options)
 
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
@@ -608,19 +622,13 @@ class Communicator(ABC):
 
     # ---- The two rules a caller can get wrong, enforced once. ----
 
-    def _require(
-        self,
-        op: Op,
-        inp: torch.Tensor,
-        launch: Launch | None,
-        quant_bits: int,
-        cols: int | None = None,
-        weight_dtype: torch.dtype | None = None,
-    ) -> None:
-        """Raise unless this backend runs `op` over `inp`: `plan`'s Error."""
-        got = self.plan(op, inp, launch, quant_bits, cols, weight_dtype)
+    def _require(self, args: Args, options: Options | None) -> Options:
+        """The call's options, resolved, unless this backend refuses `args`: then
+        `plan`'s Error, raised."""
+        got = self.plan(args, options)
         if isinstance(got, Error):
-            raise RuntimeError(self._rejected(op, inp, got))
+            raise RuntimeError(self._rejected(args, got))
+        return Options() if options is None else options
 
     def _warming_up(self, op: str) -> bool:
         """Whether this is a capture's WARMUP: inside `capture()`, the stream not
@@ -638,11 +646,11 @@ class Communicator(ABC):
             )
         return self._capturing and not recording
 
-    def _rejected(self, op: str, inp: torch.Tensor, err: Error) -> str:
-        """A refused call's message: the op, the input, and `check`'s Error."""
+    def _rejected(self, args: Args, err: Error) -> str:
+        """A refused call's message: the op, its input, and `plan`'s Error."""
         return (
-            f"{type(self).__name__} cannot run {op} over shape={tuple(inp.shape)} "
-            f"dtype={inp.dtype}: {err.name}"
+            f"{type(self).__name__} cannot run {args.op} over "
+            f"shape={tuple(args.inp.shape)} dtype={args.inp.dtype}: {err.name}"
         )
 
     # ---- What a BACKEND supplies. ----
@@ -652,8 +660,7 @@ class Communicator(ABC):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         """SUM across ranks into `out`, which the base allocated: input untouched.
         Assume `inp` is admitted -- the base checked. Every op's outputs are the base's,
@@ -668,8 +675,7 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm; "
@@ -684,8 +690,7 @@ class Communicator(ABC):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm; "
@@ -706,8 +711,7 @@ class Communicator(ABC):
         write_idx: int,
         eps: float,
         out_eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
@@ -722,8 +726,7 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm; "
@@ -738,8 +741,7 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         out_col0: int,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm + add; "
@@ -751,29 +753,24 @@ class Communicator(ABC):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms scale + add; "
             f"ask should_allreduce_rms_scale_add first."
         )
 
-    def _plan(
-        self,
-        op: Op,
-        inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
-        cols: int | None = None,
-        weight_dtype: torch.dtype | None = None,
-    ) -> Plan | Error:
-        """A backend's own rules: what runs `op` over `inp`, or the Error it meets. By
-        default (torch, iris) the build's envelope, so a control admits what our kernels
-        do: weak-contiguous, whole packs, a dtype built; no launch to choose and no
-        lossy kernel. Ours overrides it with its C++'s answer."""
-        self._refuse_launch(launch)
-        self._refuse_lossy(quant_bits)
+    def _plan(self, args: Args, options: Options) -> Plan | Error:
+        """A backend's own rules, the options among them: what runs the call `args`, or
+        the Error it meets. By default (torch, iris) the build's envelope, so a control
+        admits what our kernels do: weak-contiguous, whole packs, a dtype built; and no
+        options, having no lossy kernel and no template to force. Ours overrides it with
+        its C++'s answer."""
+        if options.quant_bits is not None:
+            return Error.quantized_not_built
+        if (options.template, options.blocks, options.threads) != (None, None, None):
+            return Error.no_such_template
+        inp = args.inp
         if not _is_weak_contiguous(inp):
             return Error.not_contiguous
         built = build_info()
@@ -781,21 +778,7 @@ class Communicator(ABC):
             return Error.row_not_packs
         if inp.dtype not in built.dtypes:
             return Error.dtype_not_built
-        return Plan(None)
-
-    def _refuse_lossy(self, quant_bits: int) -> None:
-        """A LOSSY PRECISION has no kernel yet; a backend that cannot run one says so
-        rather than returning an exact sum the caller did not ask to time."""
-        if quant_bits != 16:
-            raise ValueError(
-                f"{type(self).__name__} runs exact only; got quant_bits={quant_bits}"
-            )
-
-    def _refuse_launch(self, launch: Launch | None) -> None:
-        """A LAUNCH names hip's kernels; a backend without them says so rather than
-        ignoring it, which would time something other than what was asked."""
-        if launch is not None:
-            raise ValueError(f"{type(self).__name__} takes no launch; got {launch!r}")
+        return Plan()
 
     def _open(self) -> bool:
         """Bring this backend up. True when it is usable; False leaves it disabled,

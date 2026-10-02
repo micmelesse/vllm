@@ -301,7 +301,7 @@ constexpr bool fits(const Kernel& k) {
   return k.threads >= kWaveSize && k.threads <= kMaxThreads && k.threads % kWaveSize == 0;
 }
 constexpr bool selections_fit() {
-  const Options o{16, std::nullopt, nullptr};
+  const Options o{std::nullopt, std::nullopt, nullptr};
   constexpr DType bf = DType::bf16;
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
                                             std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {

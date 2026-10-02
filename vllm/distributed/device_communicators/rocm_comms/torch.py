@@ -12,8 +12,7 @@ import logging
 import torch
 import torch.distributed as dist
 
-from .base import Communicator
-from .launch import Launch
+from .base import Communicator, Options
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +36,7 @@ class TorchCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
-        self._refuse_launch(launch)
-        self._refuse_lossy(quant_bits)
         out.copy_(inp)
         dist.all_reduce(out, group=self.device_group)  # SUM

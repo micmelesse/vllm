@@ -63,10 +63,7 @@ def _all_reduce_rms_norm_impl(
     input_: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> torch.Tensor:
     comm = _rocm_comm()
-    if (
-        comm is not None
-        and comm.should_allreduce_rms_norm(input_, weight.dtype)
-    ):
+    if comm is not None and comm.should_allreduce_rms_norm(input_, weight):
         return comm.all_reduce_rms_norm(input_, weight, epsilon)
     _warn_unfused("rocm_comms_all_reduce_rms_norm")
     return vllm.ir.ops.rms_norm(_summed(input_), weight, epsilon)
@@ -85,10 +82,7 @@ def _all_reduce_add_rms_norm_impl(
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     comm = _rocm_comm()
-    if (
-        comm is not None
-        and comm.should_allreduce_add_rms_norm(input_, weight.dtype)
-    ):
+    if comm is not None and comm.should_allreduce_add_rms_norm(input_, weight):
         return comm.all_reduce_add_rms_norm(input_, residual, weight, epsilon)
     _warn_unfused("rocm_comms_all_reduce_add_rms_norm")
     return vllm.ir.ops.fused_add_rms_norm(_summed(input_), residual, weight, epsilon)

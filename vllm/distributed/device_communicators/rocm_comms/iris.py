@@ -8,8 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .base import Communicator
-from .launch import Launch
+from .base import Communicator, Options
 
 logger = logging.getLogger(__name__)
 
@@ -128,11 +127,8 @@ class IrisCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        launch: Launch | None = None,
-        quant_bits: int = 16,
+        options: Options,
     ) -> None:
-        self._refuse_launch(launch)
-        self._refuse_lossy(quant_bits)
         assert self._shmem is not None
         try:
             input_buf = self._get_buffers(inp.shape, inp.dtype)
