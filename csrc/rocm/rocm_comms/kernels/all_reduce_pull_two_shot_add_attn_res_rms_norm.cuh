@@ -20,18 +20,14 @@ namespace hip_comms {
 // wave's packs have one owner and p2p::scratch's rank is the same across the wave. EACH PHASE AT
 // ITS OWN GRID: the reduce-scatter on a few blocks (reads), AttnRes on all of them (compute a
 // row), so a world barrier between them. `blocks` is [rows, num_sources, hidden] with row and
-// source strides in elements; `write_idx` < 0 writes no block. FOLDING EARLY (a `workspace`, else
-// null): the blocks that do not reduce fold each row's stored sources into it before the first
-// barrier, while the others reduce-scatter and the late ranks arrive, and after the world barrier a
-// row folds only its own sum: fp32 [rows][hidden], then each row's running max and denominator.
+// source strides in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix, int kRowPacks>
 __global__ void __launch_bounds__(kMaxThreads, 1)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks,
         int64_t block_stride_m, int64_t block_stride_r, const T* __restrict__ norm_w,
         const T* __restrict__ qk_w, const T* __restrict__ out_norm_w, T* __restrict__ out,
-        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs,
-        float* __restrict__ workspace) {
+        int num_blocks, int write_idx, float eps, float out_eps, int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
@@ -49,37 +45,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
                                                 write_idx * block_stride_r);
   };
 
-  const int reducers = min(static_cast<int>(gridDim.x), kBuild.attn_res_reduce_blocks);
-  // Each row's partial: its weighted sum, a pack's 8 floats at the pack's place, then its stats.
-  static_assert(NL == 8, "the partial is stored and read as two float4 a pack");
-  const int64_t row_floats = int64_t{packs} * NL;
-  float* const stats       = workspace + int64_t{rows} * row_floats;
-  float w[kRowPacks][NL];
-  if (workspace != nullptr) thread_attn_res_weights<T, kRowPacks>(norm_w, qk_w, f, w);
-
-  // 0. FOLDING EARLY, by the blocks that do not reduce: needs nothing of the peers, so before the
-  //    first barrier.
-  if (workspace != nullptr && static_cast<int>(blockIdx.x) >= reducers) {
-    for (int row = blockIdx.x - reducers; row < rows; row += gridDim.x - reducers) {
-      float m[kRowPacks][NL];
-      OnlineSoftmax softmax;
-      block_attn_res_fold<T, kRowPacks>(blocks + int64_t{row} * block_stride_m, block_stride_r, f,
-                                        w, num_blocks, eps, inv_hidden, m, softmax);
-      float* const at = workspace + int64_t{row} * row_floats;
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-        if (f.in[k] != 0.0f) {
-          float4* const to = reinterpret_cast<float4*>(at + int64_t{f.at[k]} * NL);
-          to[0] = make_float4(m[k][0], m[k][1], m[k][2], m[k][3]);
-          to[1] = make_float4(m[k][4], m[k][5], m[k][6], m[k][7]);
-        }
-      if (threadIdx.x == 0) {
-        stats[2 * int64_t{row}]     = softmax.max;
-        stats[2 * int64_t{row} + 1] = softmax.denominator;
-      }
-    }
-  }
-
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
@@ -95,6 +60,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
   //    only: reads queue behind the links past a few dozen blocks (machine/hardware.cuh). THE (ROW,
   //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
   //    bytes.
+  const int reducers = min(static_cast<int>(gridDim.x), kBuild.attn_res_reduce_blocks);
   if (cols > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
     int q = threadIdx.x / cols;  // this thread's row among the block's, and its column
@@ -129,29 +95,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1)
       const int owner = min(f.at[k] / slice, ngpus - 1);
       sum[k]          = p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + f.at[k]);
     }
-    if (workspace != nullptr) {
-      // The row's stored sources, folded early, then its own sum.
-      const float* const at = workspace + int64_t{row} * row_floats;
-      float m[kRowPacks][NL];
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        float4 lo = make_float4(0.f, 0.f, 0.f, 0.f), hi = lo;
-        if (f.in[k] != 0.0f) {
-          const float4* const from = reinterpret_cast<const float4*>(at + int64_t{f.at[k]} * NL);
-          lo = from[0];
-          hi = from[1];
-        }
-        m[k][0] = lo.x, m[k][1] = lo.y, m[k][2] = lo.z, m[k][3] = lo.w;
-        m[k][4] = hi.x, m[k][5] = hi.y, m[k][6] = hi.z, m[k][7] = hi.w;
-      }
-      const OnlineSoftmax softmax{stats[2 * int64_t{row}], stats[2 * int64_t{row} + 1]};
-      block_attn_res_finish<T, kPrefix, kRowPacks>(sum, base, f, pre, written(row), w, m, softmax,
-                                                   out_norm_w, o, eps, out_eps, inv_hidden);
-    } else {
-      block_attn_res_row<T, kPrefix, kRowPacks>(
-          sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
-          norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
-    }
+    block_attn_res_row<T, kPrefix, kRowPacks>(
+        sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
+        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
   block_stamp(4);
 }

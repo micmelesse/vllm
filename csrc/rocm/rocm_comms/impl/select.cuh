@@ -81,22 +81,10 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs&
   return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype, row_packs_of(t, a, threads)},
           grid_of(t, blocks, rows_of(a), world), threads};
 }
-// WHAT FOLDING EARLY NEEDS of the workspace: each row's fp32 sum, then its max and denominator.
-constexpr int64_t fold_early_bytes(const AttnResArgs& a) {
-  return a.rows * (a.hidden * int64_t{sizeof(float)} + 2 * int64_t{sizeof(float)});
-}
-// THE PULL TWO-SHOT FOLDS EARLY when it has stored sources, blocks besides its reducers, and room.
-constexpr bool fold_early(Template t, int grid, const AttnResArgs& a) {
-  return t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm && a.num_blocks > 0 &&
-         grid > kBuild.attn_res_reduce_blocks && fold_early_bytes(a) <= kWorkspaceBytes;
-}
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResArgs& a,
                             int world) {
-  const int grid = grid_of(t, blocks, rows_of(a), world);
-  return {t,
-          AttnResTemplateArgs{world, a.dtype, row_packs_of(t, a, threads), a.has_prefix,
-                              fold_early(t, grid, a)},
-          grid, threads};
+  return {t, AttnResTemplateArgs{world, a.dtype, row_packs_of(t, a, threads), a.has_prefix},
+          grid_of(t, blocks, rows_of(a), world), threads};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
                             int world) {

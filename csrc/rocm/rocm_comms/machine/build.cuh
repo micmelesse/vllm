@@ -134,10 +134,6 @@ constexpr int64_t kScratchBytes = 128 * kMiB;
 // THE PEER-POINTER SLOTS, one per captured launch (capture sizes x collectives a forward): the
 // size vLLM gives the same array, 8 MB of slots. Registration past it fails at capture.
 constexpr int64_t kMaxBuffers = 131072;
-// THE WORKSPACE, this rank's alone (no peer reads it): a kernel's fp32 partials, today AttnRes's
-// pull two-shot folding its stored sources before its barrier (fp32 [rows, hidden] plus each row's
-// running max and denominator; Kimi-K3's 4096 x 7168 prefill needs 117.5 MB).
-constexpr int64_t kWorkspaceBytes = 128 * kMiB;
 // HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
 constexpr double kSyncTimeoutSeconds = 10.0;
 constexpr int kMaxThreads = kBuild.max_threads;

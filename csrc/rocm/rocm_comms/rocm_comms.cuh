@@ -131,14 +131,11 @@ struct NormTemplateArgs {
   DType weight;  // dtype, or f32
   std::optional<int> row_packs;
 };
-// `fold_early`: the pull two-shot's spare blocks fold each row's stored sources into the workspace
-// while the others reduce-scatter, and a row folds only its own sum after the barrier.
 struct AttnResTemplateArgs {
   int world;
   DType dtype;
   std::optional<int> row_packs;
   bool prefix;
-  bool fold_early;
 };
 struct GemmTemplateArgs {
   int world;
@@ -292,7 +289,6 @@ struct AttnResArgs {
   float eps;
   float out_eps;
   bool has_prefix;
-  float* workspace = nullptr;  // launch's: the handle's, when select folds early (fold_early)
 };
 
 // add: out[:, col0:col0+N] += the product (rms_norm_gemm_add, Kimi-K3's latent tail); otherwise

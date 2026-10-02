@@ -45,12 +45,8 @@ inline void launch(Handle& h, const Kernel& k, const NormArgs& a, hipStream_t s)
   impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
-// The handle's workspace when select folds early.
 inline void launch(Handle& h, const Kernel& k, const AttnResArgs& a, hipStream_t s) {
-  AttnResArgs with = a;
-  if (std::get<AttnResTemplateArgs>(k.args).fold_early)
-    with.workspace = static_cast<float*>(h.workspace());
-  impl::run(h, k, with, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
+  impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const GemmTailArgs& a, hipStream_t s) {

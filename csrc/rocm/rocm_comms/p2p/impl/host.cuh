@@ -80,13 +80,12 @@ class Group {
   Group(int rank, int world_size, uintptr_t self_memory,
         const std::vector<std::string>& signal_handles,
         const std::vector<int64_t>& signal_offsets, int64_t max_buffers, int64_t scratch_bytes,
-        int64_t staging_bytes, int64_t workspace_bytes, double sync_timeout_s)
+        int64_t staging_bytes, double sync_timeout_s)
       : rank_(rank),
         world_size_(world_size),
         self_signal_(reinterpret_cast<Signal*>(self_memory)),
         scratch_bytes_(scratch_bytes),
-        staging_bytes_(staging_bytes),
-        workspace_bytes_(workspace_bytes) {
+        staging_bytes_(staging_bytes) {
     if (world_size_ < 2 || world_size_ > kMaxRanks)
       throw std::runtime_error("hip_comms: world_size " + std::to_string(world_size_) +
                                " outside [2, " + std::to_string(kMaxRanks) + "]");
@@ -97,8 +96,6 @@ class Group {
     HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(max_buffers) * sizeof(PeerPtrs)));
     slab_end_ = slab_ + max_buffers;
     cursor_   = slab_;
-    // THE WORKSPACE: this rank's kernels' partials, read by no peer, so ordinary cached memory.
-    HIP_CHECK(hipMalloc(&workspace_, static_cast<size_t>(workspace_bytes_)));
     auto opened = open_peers(signal_handles, signal_offsets, self_memory);
     for (int i = 0; i < world_size_; ++i)
       signals_.s[i] = reinterpret_cast<Signal*>(opened[i]);
@@ -119,7 +116,6 @@ class Group {
   ~Group() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
-    hipFree(workspace_);
     hipFree(self_signal_);
   }
 
@@ -130,9 +126,6 @@ class Group {
     return reinterpret_cast<char*>(self_signal_) + sizeof(Signal) + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
-  // This rank's workspace, for a kernel's partials: no peer reads it.
-  void* workspace() const { return workspace_; }
-  int64_t workspace_bytes() const { return workspace_bytes_; }
 
   // The CAPTURE path, in two halves. During capture the input address is not registered
   // yet, so `dev_comm` reserves a slab slot and remembers the pointer; afterwards Python
@@ -275,8 +268,6 @@ class Group {
   Signal* self_signal_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
-  int64_t workspace_bytes_;
-  void* workspace_ = nullptr;
   uint64_t timeout_ticks_ = 0;
   PeerSignals signals_{};
   PeerPtrs* slab_     = nullptr;

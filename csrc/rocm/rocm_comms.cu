@@ -132,7 +132,7 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets,
       hip_comms::kMaxBuffers, hip_comms::kScratchBytes, hip_comms::kStagingBytes,
-      hip_comms::kWorkspaceBytes, hip_comms::kSyncTimeoutSeconds);
+      hip_comms::kSyncTimeoutSeconds);
   return reinterpret_cast<fptr_t>(handle);
 }
 
