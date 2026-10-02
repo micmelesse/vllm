@@ -151,6 +151,26 @@ class Group {
     pending_slots_.clear();
   }
 
+  // A BUFFER EVERY RANK ALLOCATED, registered: launches over `self` read the peers' copies where
+  // they are. `forget_buffer` undoes it before the buffer is freed, or a later allocation at the
+  // same address would read the dead buffer's peers.
+  void register_buffer(void* self, const std::vector<std::string>& handles,
+                       const std::vector<int64_t>& offsets) {
+    PeerPtrs* slot = next_slot();
+    write_slot(slot, open_peers(handles, offsets, reinterpret_cast<uintptr_t>(self)));
+    registered_[self] = slot;
+  }
+  void forget_buffer(void* self, const std::vector<std::string>& handles) {
+    registered_.erase(self);
+    for (int i = 0; i < world_size_; ++i) {
+      if (i == rank_) continue;
+      if (auto it = opened_.find(handles[i]); it != opened_.end()) {
+        HIP_CHECK(hipIpcCloseMemHandle(it->second));
+        opened_.erase(it);
+      }
+    }
+  }
+
   // What a launch over `input` (`bytes` long) on `stream` passes to its kernel.
   DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream) {
     DevComm p     = dev_comm();

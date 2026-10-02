@@ -106,8 +106,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_stamps", &rocm_comms_stamps);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
   rocm_ops.def(
-      "rocm_comms_probe(int handle_ptr, int bytes, int ping_iters, int traffic_iters, "
-      "int trials) -> (float[], float, float, float, float)",
+      "rocm_comms_probe(int handle_ptr, str group, int bytes, int ping_iters, "
+      "int traffic_iters, int trials) -> (float[], str[], float[])",
       &rocm_comms_probe);
   // The planners: what runs a call, or the Error it meets.
   rocm_ops.def("rocm_comms_plan_all_reduce(int handle_ptr, Tensor inp, "

@@ -160,7 +160,7 @@ using PlanWire      = std::tuple<std::optional<std::string>, std::optional<int64
                                 std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
-using ProbeWire     = std::tuple<std::vector<double>, double, double, double, double>;
+using ProbeWire     = std::tuple<std::vector<double>, Names, std::vector<double>>;
 using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names>;
 
 // A torch dtype as ours, or none for one ours has no name for.
@@ -363,18 +363,21 @@ torch::Tensor rocm_comms_stamps() {
   return out;
 }
 
-// THE PROBE, every rank together: the round trip to each peer (ns, by peer, this rank's 0), then
-// GB/s pulled from one peer (rank ^ 1), pulled from every peer, pushed into every peer, and both at
-// once (each way: half the blocks pull and half push the same bytes in one window); each the median
-// of `trials`, a probe barrier before each. `bytes` a peer's share
-// of the staging, `traffic_iters` launches a trial; `ping_iters` round trips a trial.
-ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
-                           int64_t traffic_iters, int64_t trials) {
-  auto& group = handle_of(handle_ptr);
+// THE PROBE, every rank together over the process group named `group`: the round trip to each peer
+// (ns, by peer, this rank's 0), then GB/s by name, `<buffer>_<mode>`: the buffer the staging
+// (uncached) or a registered allocation (cached); the mode pulled from one peer (rank ^ 1) or every
+// peer, pushed into every peer, or both at once (each way), the blocks split or each doing both.
+// Each the median of `trials`, a probe barrier before each; `bytes` a peer's share, at most the
+// staging, `traffic_iters` launches a trial, `ping_iters` round trips a trial.
+ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t bytes,
+                           int64_t ping_iters, int64_t traffic_iters, int64_t trials) {
+  auto& h = handle_of(handle_ptr);
   TORCH_CHECK(ping_iters > 0 && traffic_iters > 0 && trials > 0 && bytes >= 16,
               "iters and trials must be positive and bytes at least a pack");
-  bytes             = std::min<int64_t>(bytes, group.staging_bytes()) / 16 * 16;
-  const int world   = group.world_size(), rank = group.rank();
+  const auto pg = resolved(group);
+  if (!pg) raise(hip_comms::Error::no_such_group);
+  bytes             = std::min<int64_t>(bytes, h.staging_bytes()) / 16 * 16;
+  const int world   = h.world_size(), rank = h.rank();
   auto stream       = at::cuda::getCurrentCUDAStream();
   const auto on_dev = torch::TensorOptions().device(torch::kCUDA, c10::cuda::current_device());
   int device = 0, khz = 0;
@@ -388,7 +391,7 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
     traffic          = hip_comms::link_traffic<c10::BFloat16, NG>;
   });
   const auto together = [&]() {
-    barrier<<<dim3(1), dim3(64), 0, stream>>>(group.dev_comm());
+    barrier<<<dim3(1), dim3(64), 0, stream>>>(h.dev_comm());
   };
   const auto median = [](std::vector<double> v) {
     std::sort(v.begin(), v.end());
@@ -404,9 +407,9 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
     for (int64_t t = 0; t < trials; ++t) {
       together();
       const uint32_t base =
-          group.take_flags(peer, hip_comms::ping_pong_flags(static_cast<int>(ping_iters)));
+          h.take_flags(peer, hip_comms::ping_pong_flags(static_cast<int>(ping_iters)));
       hip_comms::ping_pong<<<dim3(1), dim3(64), 0, stream>>>(
-          group.dev_comm(), peer, base, static_cast<int>(ping_iters),
+          h.dev_comm(), peer, base, static_cast<int>(ping_iters),
           reinterpret_cast<uint64_t*>(ticks.data_ptr<int64_t>()));
       got.push_back(static_cast<double>(ticks.item<int64_t>()) * 1e6 / khz /
                     static_cast<double>(ping_iters));
@@ -414,12 +417,24 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
     ping[peer] = median(got);
   }
 
-  // THE LINKS: GB/s in and out of this rank, the whole device streaming.
-  const hip_comms::p2p::DevComm p = group.dev_comm(group.staging(), bytes, stream);
+  // THE LINKS: GB/s in and out of this rank, the whole device streaming, over the staging (the
+  // symmetric memory, uncached) and over an ordinary allocation every rank registers (cached).
+  void* cached = nullptr;
+  HIP_CHECK(hipMalloc(&cached, static_cast<size_t>(bytes)));
+  HIP_CHECK(hipMemset(cached, 0, static_cast<size_t>(bytes)));
+  std::vector<std::string> handles;
+  std::vector<int64_t> offsets;
+  for (const std::string& b : all_gathered(*pg, handle_bytes(reinterpret_cast<uintptr_t>(cached)))) {
+    auto [handle, offset] = from_handle_bytes(b);
+    handles.push_back(std::move(handle));
+    offsets.push_back(offset);
+  }
+  h.register_buffer(cached, handles, offsets);
   auto sink = torch::empty({1}, on_dev.dtype(torch::kInt32));
   uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
   const dim3 grid(hip_comms::kTarget.compute_units), block(hip_comms::kMaxThreads);
-  const auto gbytes = [&](hip_comms::Traffic mode, int peer) {
+  const auto gbytes = [&](const void* over, hip_comms::Traffic mode, int peer) {
+    const hip_comms::p2p::DevComm p = h.dev_comm(over, bytes, stream);
     const int how = static_cast<int>(mode);
     auto launch   = [&]() { traffic<<<grid, block, 0, stream>>>(p, how, peer, bytes / 16, s); };
     std::vector<double> got;
@@ -443,11 +458,27 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
     return median(got);
   };
   using hip_comms::Traffic;
-  const double pull_one = gbytes(Traffic::pull, rank ^ 1);
-  const double pull     = gbytes(Traffic::pull, -1);
-  const double push     = gbytes(Traffic::push, -1);
-  const double both     = gbytes(Traffic::both, -1);
-  return {ping, pull_one, pull, push, both};
+  std::vector<std::string> names;
+  std::vector<double> gbps;
+  for (const auto& [over, where] : {std::pair<const void*, const char*>{h.staging(), "staging"},
+                                    std::pair<const void*, const char*>{cached, "cached"}}) {
+    for (const auto& [mode, peer, what] :
+         {std::tuple<Traffic, int, const char*>{Traffic::pull, rank ^ 1, "pull_one"},
+          {Traffic::pull, -1, "pull"},
+          {Traffic::push, -1, "push"},
+          {Traffic::split, -1, "split"},
+          {Traffic::each, -1, "each"}}) {
+      names.push_back(std::string(where) + "_" + what);
+      gbps.push_back(gbytes(over, mode, peer));
+    }
+  }
+  // Every rank done reading every other's before any frees its copy.
+  together();
+  HIP_CHECK(hipStreamSynchronize(stream));
+  (void)all_gathered(*pg, std::string(1, '\0'));
+  h.forget_buffer(cached, handles);
+  HIP_CHECK(hipFree(cached));
+  return {ping, names, gbps};
 }
 
 
