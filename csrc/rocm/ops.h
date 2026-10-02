@@ -56,25 +56,20 @@ void paged_attention(
 // stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
 using fptr_t = int64_t;
 
-int64_t rocm_comms_alloc();
+// Opened over the process group named `group`, a collective: the IPC handles go round in C++.
+fptr_t rocm_comms_open(const std::string& group);
+// The buffers a capture recorded, registered over `group`, a collective.
+void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group);
 // The probe, every rank together: the round trip to each peer (ns), then GB/s pulled from one
 // peer, pulled from every peer, pushed into every peer, and both at once (each way).
 std::tuple<std::vector<double>, double, double, double, double> rocm_comms_probe(
     fptr_t handle_ptr, int64_t bytes, int64_t ping_iters, int64_t traffic_iters, int64_t trials);
-fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
-                       const std::vector<std::vector<int64_t>>& signal_handles,
-                       const std::vector<int64_t>& signal_offsets);
 torch::Tensor rocm_comms_stamps();
 
 
 void rocm_comms_dispose(fptr_t handle_ptr);
 
 
-std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t handle_ptr);
-
-void rocm_comms_register_graph_buffers(
-    fptr_t handle_ptr, const std::vector<std::vector<int64_t>>& handles,
-    const std::vector<std::vector<int64_t>>& offsets);
 
 
 // Every op takes the same four values last, its options: quant_bits, a lossy precision (none:
@@ -171,5 +166,4 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
     std::optional<std::string> template_,
     std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
-std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
 

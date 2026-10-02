@@ -11,9 +11,11 @@
 #include <c10/util/Half.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <variant>
 #include <string>
@@ -37,18 +39,36 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 // passes none of them.
 
 namespace {
-std::string bytes_of(const std::vector<int64_t>& xs) {
-  std::string out;
-  out.reserve(xs.size());
-  for (int64_t x : xs) out.push_back(static_cast<char>(x));
-  return out;
+// EVERY RANK'S `mine`, in rank order, over the process group named `group` (a byte string the
+// same length on every rank): the IPC handles go round here, not in Python.
+std::vector<std::string> all_gathered(const std::string& group, const std::string& mine) {
+  const auto pg = c10d::resolve_process_group(group);
+  const auto as_bytes = torch::TensorOptions().dtype(torch::kUInt8);
+  std::vector<at::Tensor> in{torch::empty({static_cast<int64_t>(mine.size())}, as_bytes)};
+  std::memcpy(in[0].data_ptr(), mine.data(), mine.size());
+  std::vector<std::vector<at::Tensor>> out(1);
+  for (int r = 0; r < pg->getSize(); ++r) out[0].push_back(torch::empty_like(in[0]));
+  pg->allgather(out, in)->wait();
+  std::vector<std::string> got;
+  for (const auto& t : out[0])
+    got.emplace_back(static_cast<const char*>(t.data_ptr()), static_cast<size_t>(t.numel()));
+  return got;
 }
 
-std::vector<std::string> bytes_of(const std::vector<std::vector<int64_t>>& xss) {
-  std::vector<std::string> out;
-  out.reserve(xss.size());
-  for (const auto& xs : xss) out.push_back(bytes_of(xs));
-  return out;
+// A buffer's IPC handle and its offset in its allocation, as the bytes the gather carries.
+std::string handle_bytes(uintptr_t ptr) {
+  auto [handle, offset] = hip_comms::p2p::host::handle_and_offset(ptr);
+  return handle + std::string(reinterpret_cast<const char*>(&offset), sizeof(offset));
+}
+
+// Rank r's handle and offset out of `handle_bytes`'s string.
+std::pair<std::string, int64_t> from_handle_bytes(const std::string& bytes) {
+  constexpr size_t kHandle = sizeof(hip_comms::p2p::host::IpcHandle);
+  TORCH_CHECK(bytes.size() == kHandle + sizeof(int64_t), "rocm_comms: a handle is ", kHandle,
+              " bytes and an offset");
+  int64_t offset = 0;
+  std::memcpy(&offset, bytes.data() + kHandle, sizeof(offset));
+  return {bytes.substr(0, kHandle), offset};
 }
 }  // namespace
 
@@ -120,19 +140,23 @@ static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result)
     TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
 }
 
-int64_t rocm_comms_alloc() {
-  return static_cast<int64_t>(
-      hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes, hip_comms::kStagingBytes));
-}
-
-fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
-                       const std::vector<std::vector<int64_t>>& signal_handles,
-                       const std::vector<int64_t>& signal_offsets) {
-  auto* handle = new hip_comms::Handle(
-      static_cast<int>(rank), static_cast<int>(world_size),
-      static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets,
-      hip_comms::kMaxBuffers, hip_comms::kScratchBytes, hip_comms::kStagingBytes,
-      hip_comms::kSyncTimeoutSeconds);
+// THE COMMUNICATOR OPENED over the process group named `group`, a collective: this rank's
+// symmetric memory, made and owned here, its handle gathered with every rank's, and the peers'
+// opened.
+fptr_t rocm_comms_open(const std::string& group) {
+  const auto pg   = c10d::resolve_process_group(group);
+  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes,
+                                                       hip_comms::kStagingBytes);
+  std::vector<std::string> handles;
+  std::vector<int64_t> offsets;
+  for (const std::string& bytes : all_gathered(group, handle_bytes(self))) {
+    auto [handle, offset] = from_handle_bytes(bytes);
+    handles.push_back(std::move(handle));
+    offsets.push_back(offset);
+  }
+  auto* handle = new hip_comms::Handle(pg->getRank(), pg->getSize(), self, handles, offsets,
+                                       hip_comms::kMaxBuffers, hip_comms::kScratchBytes,
+                                       hip_comms::kStagingBytes, hip_comms::kSyncTimeoutSeconds);
   return reinterpret_cast<fptr_t>(handle);
 }
 
@@ -401,32 +425,36 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, int64_t bytes, int64_t ping_iters,
 }
 
 
-std::vector<int64_t> rocm_comms_pending_graph_buffers(fptr_t handle_ptr) {
-  auto pending = handle_of(handle_ptr).pending_graph_buffers();
-  return std::vector<int64_t>(pending.begin(), pending.end());
-}
-
-// ONE ENTRY PER PENDING BUFFER, each the WORLD'S handles for it laid end to end: a
-// schema nests two deep and this needs three (buffer, rank, byte), so the innermost
-// level is split back out here by the handle size, which is fixed.
-void rocm_comms_register_graph_buffers(
-    fptr_t handle_ptr, const std::vector<std::vector<int64_t>>& handles,
-    const std::vector<std::vector<int64_t>>& offsets) {
-  const size_t stride = sizeof(hip_comms::p2p::host::IpcHandle);
-  std::vector<std::vector<std::string>> bytes;
-  bytes.reserve(handles.size());
-  for (const auto& joined : handles) {
-    TORCH_CHECK(joined.size() % stride == 0,
-                "rocm_comms: ", joined.size(),
-                " handle bytes is not a whole number of ", stride, "-byte handles");
-    std::string all = bytes_of(joined);
-    std::vector<std::string> per_rank;
-    per_rank.reserve(all.size() / stride);
-    for (size_t at = 0; at < all.size(); at += stride)
-      per_rank.push_back(all.substr(at, stride));
-    bytes.push_back(std::move(per_rank));
+// THE BUFFERS A CAPTURE RECORDED, registered: every rank's handle for each, gathered over the
+// process group named `group`, a collective even with none (or the other ranks wait in it). Every
+// rank must have captured the same graphs, so the same number of buffers.
+void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group) {
+  auto& h            = handle_of(handle_ptr);
+  const auto pending = h.pending_graph_buffers();
+  const int64_t mine = static_cast<int64_t>(pending.size());
+  std::vector<int64_t> counts;
+  for (const std::string& c :
+       all_gathered(group, std::string(reinterpret_cast<const char*>(&mine), sizeof(mine)))) {
+    int64_t n = 0;
+    std::memcpy(&n, c.data(), sizeof(n));
+    counts.push_back(n);
   }
-  handle_of(handle_ptr).register_graph_buffers(bytes, offsets);
+  for (const int64_t n : counts)
+    TORCH_CHECK(n == mine, "rocm_comms: ranks captured different numbers of buffers (", mine,
+                " here, ", n, " on another); every rank must run the same graph");
+  if (pending.empty()) return;
+  std::string all;
+  for (const uintptr_t ptr : pending) all += handle_bytes(ptr);
+  const size_t each = all.size() / pending.size();
+  std::vector<std::vector<std::string>> handles(pending.size());
+  std::vector<std::vector<int64_t>> offsets(pending.size());
+  for (const std::string& theirs : all_gathered(group, all))
+    for (size_t i = 0; i < pending.size(); ++i) {
+      auto [handle, offset] = from_handle_bytes(theirs.substr(i * each, each));
+      handles[i].push_back(std::move(handle));
+      offsets[i].push_back(offset);
+    }
+  h.register_graph_buffers(handles, offsets);
 }
 
 
@@ -625,10 +653,4 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
       options_or_raise(quant_bits, template_, launch_blocks, launch_threads)));
 }
 
-std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {
-  auto [handle, offset] =
-      hip_comms::p2p::host::handle_and_offset(static_cast<uintptr_t>(ptr));
-  std::vector<int64_t> bytes(handle.begin(), handle.end());
-  return std::make_tuple(bytes, offset);
-}
 

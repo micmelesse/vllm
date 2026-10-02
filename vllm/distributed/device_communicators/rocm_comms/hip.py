@@ -18,13 +18,12 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 """
 
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, ClassVar, get_args
+from typing import ClassVar, get_args
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from .base import (
     AllReduceArgs,
@@ -48,12 +47,6 @@ def _wire(options: Options) -> tuple[int | None, str | None, int | None, int | N
     return options.quant_bits, options.template, options.blocks, options.threads
 
 
-def _all_gather_object(group: ProcessGroup, obj: Any) -> list[Any]:
-    out: list[Any] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(out, obj, group=group)
-    return out
-
-
 class HipCommunicator(Communicator):
     """Communicator over our HIP kernels. One per process group, because peer pointers
     are group-scoped.
@@ -75,67 +68,24 @@ class HipCommunicator(Communicator):
         recoverable.
         """
         self.rank = dist.get_rank(self.cpu_group)
-        # THIS RANK'S PEER MEMORY, made, sized and owned by C++ (signal block, scratch,
-        # staging, the slots and the watchdog are its numbers); Python only exchanges
-        # its handle, a process-group collective.
-        memory = torch.ops._rocm_C.rocm_comms_alloc()
-        handles, offsets = self._exchange(memory)
-        self._handle = torch.ops._rocm_C.rocm_comms_init(
-            self.rank,
-            self.world_size,
-            memory,
-            handles,
-            offsets,
-        )
+        # THE PEER MEMORY, made, sized and owned by C++, which also gathers every rank's
+        # IPC handle over the CPU group (by its name, a collective) and opens them.
+        self._handle = torch.ops._rocm_C.rocm_comms_open(self.cpu_group.group_name)
         logger.info("HipCommunicator ready: rank %d/%d", self.rank, self.world_size)
         return True
 
-    def _exchange(self, ptr: int) -> tuple[list[list[int]], list[int]]:
-        """Every rank's IPC handle and offset for its own `ptr`, in rank order. A handle
-        is a list of byte values, since an op schema has no bytes type."""
-        mine = torch.ops._rocm_C.rocm_comms_handle_and_offset(ptr)
-        gathered = _all_gather_object(self.cpu_group, mine)
-        return [h for h, _ in gathered], [o for _, o in gathered]
-
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture; buffers used inside are registered on exit.
-
-        During capture the C++ side reserves a slot per launch and records the pointer.
-        A captured address is fixed for the graph's life, so filling the slots after
-        capture is sound.
-        """
+        """Wrap a cudagraph capture; the buffers its launches recorded are registered
+        on exit, by C++, a collective over the CPU group. A captured address is fixed
+        for the graph's life, so filling the slots after capture is sound."""
         try:
             yield
         finally:
             # Even on error: unfilled slots fault later on a null peer pointer.
-            self._flush_pending()
-
-    def _flush_pending(self) -> None:
-        """Register whatever the capture deferred. Always one collective, even with
-        nothing pending, or the other ranks wait in the gather."""
-        pending: Sequence[int] = torch.ops._rocm_C.rocm_comms_pending_graph_buffers(
-            self._handle
-        )
-        mine = [torch.ops._rocm_C.rocm_comms_handle_and_offset(p) for p in pending]
-        gathered: list[list[tuple[list[int], int]]] = _all_gather_object(
-            self.cpu_group, mine
-        )
-        # The transpose below reads slot `i` from every rank, so the counts must agree.
-        counts = [len(g) for g in gathered]
-        if len(set(counts)) != 1:
-            raise RuntimeError(
-                f"hip_comms: ranks captured different numbers of buffers ({counts}); "
-                "every rank must run the same graph."
+            torch.ops._rocm_C.rocm_comms_register_captured(
+                self._handle, self.cpu_group.group_name
             )
-        if not pending:
-            return
-        # One entry per buffer, the world's handles laid end to end; the op splits them.
-        torch.ops._rocm_C.rocm_comms_register_graph_buffers(
-            self._handle,
-            [[b for g in gathered for b in g[i][0]] for i in range(len(pending))],
-            [[g[i][1] for g in gathered] for i in range(len(pending))],
-        )
 
     def _all_reduce(
         self,
