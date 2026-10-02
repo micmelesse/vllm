@@ -49,6 +49,8 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
   const int e     = elem_bytes(a.dtype);
   if (!world_built(world)) return Error::world_not_built;
   if (!dtype_built(a.dtype)) return Error::dtype_not_built;
+  if constexpr (std::is_same_v<Args, NormArgs>)
+    if (a.weight_dtype != a.dtype && a.weight_dtype != DType::f32) return Error::weight_not_built;
   if (hidden_of(a) * e % kPackBytes != 0) return Error::row_not_packs;
   if constexpr (std::is_same_v<Args, ScaleAddArgs>)
     if (a.hidden * e % kPackBytes != 0 || a.latent * e % kPackBytes != 0 || a.latent < 1)

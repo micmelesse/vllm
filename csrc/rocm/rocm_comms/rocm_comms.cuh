@@ -193,8 +193,9 @@ enum class Error : int {
   staging_too_small         = 17,
   device_not_built          = 18,
   device_not_tuned          = 19,
+  weight_not_built          = 20,
 };
-constexpr int kNumErrors = 20;
+constexpr int kNumErrors = 21;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -229,6 +230,8 @@ constexpr const char* to_string(Error e) {
       return "device_not_built: this build holds no code for the device";
     case Error::device_not_tuned:
       return "device_not_tuned: the device is not the one select is calibrated for";
+    case Error::weight_not_built:
+      return "weight_not_built: a norm's weight is in the call's dtype or fp32";
   }
   return "unknown";
 }

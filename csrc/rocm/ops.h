@@ -78,11 +78,11 @@ void rocm_comms_register_graph_buffers(
 
 // Every op takes the same four integers last: quant_bits, the precision it accepts (16:
 // exact), then its launch: kernel, launch_blocks, launch_threads (-1 and zeros: tune.cuh's).
-std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
-                                        const std::vector<int64_t>& shape, at::ScalarType dtype,
-                                        bool contiguous, std::optional<int64_t> cols,
-                                        int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
-                                        int64_t launch_threads);
+// A variant at the torch boundary: [template, grid, threads] or the Error's number, one set.
+std::tuple<std::optional<std::vector<int64_t>>, std::optional<int64_t>> rocm_comms_plan(
+    fptr_t handle_ptr, int64_t op, const std::vector<int64_t>& shape, at::ScalarType dtype,
+    bool contiguous, std::optional<int64_t> cols, std::optional<at::ScalarType> weight,
+    int64_t quant_bits, int64_t kernel, int64_t launch_blocks, int64_t launch_threads);
 // A variant at the torch boundary: the arch or the Error's number, exactly one set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_supported(
     int64_t device, int64_t world);

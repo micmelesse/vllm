@@ -120,71 +120,84 @@ fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
 
 
 
-// THE FIRST ERROR OUR KERNELS MEET ON THIS CALL, as its number, or none: every rule is here or in
-// `hip_comms::check`, and Python only passes the call's facts. `cols` is an output's columns, for
-// the ops that have one.
-std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
-                                        const std::vector<int64_t>& shape, at::ScalarType dtype,
-                                        bool contiguous, std::optional<int64_t> cols,
-                                        int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
-                                        int64_t launch_threads) {
-  using hip_comms::Error;
-  TORCH_CHECK(op >= 0 && op < hip_comms::kNumOps, "hip_comms: no op ", op);
-  const auto which    = static_cast<hip_comms::Op>(op);
-  const bool has_cols = hip_comms::gemms(which) || which == hip_comms::Op::all_reduce_rms_scale_add;
-  TORCH_CHECK(has_cols || !cols, "hip_comms: only an op with an output's columns takes cols");
-  const auto error = [](Error e) { return std::optional<int64_t>(static_cast<int64_t>(e)); };
-  if (!contiguous) return error(Error::not_contiguous);
-  hip_comms::DType d;
-  if (dtype == at::ScalarType::Half) d = hip_comms::DType::f16;
-  else if (dtype == at::ScalarType::BFloat16) d = hip_comms::DType::bf16;
-  else if (dtype == at::ScalarType::Float) d = hip_comms::DType::f32;
-  else return error(Error::dtype_not_built);
-  int64_t numel = 1;
-  for (const int64_t n : shape) numel *= n;
-  if (which != hip_comms::Op::all_reduce && shape.size() != 2) return error(Error::not_two_d);
-  if (has_cols && !cols) return error(Error::output_not_two_d);
-  // THE CALL, WITHOUT ITS TENSORS: what select reads of it, its pointers null. A norm's weight is
-  // taken in the call's dtype and AttnRes without a prefix: neither changes whether a call runs.
-  const int64_t rows  = which == hip_comms::Op::all_reduce ? 1 : shape[0];
-  const int64_t width = which == hip_comms::Op::all_reduce ? numel : shape[1];
-  auto& h             = handle_of(handle_ptr);
-  const auto o        = options_of(quant_bits, kernel, launch_blocks, launch_threads);
-  const float eps     = 0.f;
-  const auto of = [&](const auto& args) {
-    const std::variant<hip_comms::Kernel, Error> p = hip_comms::plan(h, args, o);
-    const Error* e = std::get_if<Error>(&p);
-    return e ? error(*e) : std::nullopt;
-  };
-  switch (which) {
-    case hip_comms::Op::all_reduce:
-      return of(hip_comms::AllReduceArgs{nullptr, nullptr, numel * hip_comms::elem_bytes(d), d});
-    case hip_comms::Op::all_reduce_rms_norm:
-    case hip_comms::Op::all_reduce_add_rms_norm:
-      return of(hip_comms::NormArgs{which == hip_comms::Op::all_reduce_add_rms_norm, nullptr,
-                                    nullptr, nullptr, d, d, rows, width, eps, nullptr, nullptr});
-    case hip_comms::Op::all_reduce_add_attn_res_rms_norm:
-      return of(hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
-                                       nullptr, d, rows, width, 0, -1, eps, eps, false});
-    case hip_comms::Op::all_reduce_rms_norm_gemm:
-    case hip_comms::Op::all_reduce_rms_norm_gemm_add:
-      return of(hip_comms::GemmTailArgs{which == hip_comms::Op::all_reduce_rms_norm_gemm_add,
-                                        nullptr, 0, 0, nullptr, nullptr, eps, nullptr, *cols,
-                                        nullptr, d, rows, width});
-    // The input's row is [shared | projected | latent], and `cols` the output's width: the
-    // latent is what is left.
-    case hip_comms::Op::all_reduce_rms_scale_add:
-      if (width - 2 * *cols < 1) return error(Error::row_not_wider_than_output);
-      return of(hip_comms::ScaleAddArgs{nullptr, nullptr, d, rows, *cols, width - 2 * *cols, eps});
-  }
-  return error(Error::no_such_op);
-}
-
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names         = std::vector<std::string>;
+using PlanWire      = std::tuple<std::optional<std::vector<int64_t>>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names>;
+
+// A torch dtype as ours, or none for one ours has no name for.
+std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
+  if (s == at::ScalarType::Half) return hip_comms::DType::f16;
+  if (s == at::ScalarType::BFloat16) return hip_comms::DType::bf16;
+  if (s == at::ScalarType::Float) return hip_comms::DType::f32;
+  return std::nullopt;
+}
+
+// WHAT RUNS ON THIS CALL, or the first Error it meets: `hip_comms::plan`, given the call's facts,
+// and Python only passes them. The kernel crosses as [template, grid, threads]; a torch op cannot
+// return a variant, so exactly one of the two is set. `cols` is an output's columns and `weight`
+// a norm's weight dtype, for the ops that have them.
+PlanWire rocm_comms_plan(fptr_t handle_ptr, int64_t op, const std::vector<int64_t>& shape,
+                         at::ScalarType dtype, bool contiguous, std::optional<int64_t> cols,
+                         std::optional<at::ScalarType> weight, int64_t quant_bits, int64_t kernel,
+                         int64_t launch_blocks, int64_t launch_threads) {
+  using hip_comms::Error;
+  using hip_comms::Op;
+  TORCH_CHECK(op >= 0 && op < hip_comms::kNumOps, "hip_comms: no op ", op);
+  const auto which    = static_cast<Op>(op);
+  const bool has_cols = hip_comms::gemms(which) || which == Op::all_reduce_rms_scale_add;
+  const bool norms    = which == Op::all_reduce_rms_norm || which == Op::all_reduce_add_rms_norm;
+  TORCH_CHECK(has_cols || !cols, "hip_comms: only an op with an output's columns takes cols");
+  TORCH_CHECK(norms == weight.has_value(), "hip_comms: a norm op, and only one, takes a weight");
+  const auto error = [](Error e) { return PlanWire{std::nullopt, static_cast<int64_t>(e)}; };
+  if (!contiguous) return error(Error::not_contiguous);
+  const std::optional<hip_comms::DType> d = dtype_from(dtype);
+  if (!d) return error(Error::dtype_not_built);
+  const std::optional<hip_comms::DType> w = weight ? dtype_from(*weight) : d;
+  if (!w) return error(Error::weight_not_built);
+  int64_t numel = 1;
+  for (const int64_t n : shape) numel *= n;
+  if (which != Op::all_reduce && shape.size() != 2) return error(Error::not_two_d);
+  if (has_cols && !cols) return error(Error::output_not_two_d);
+  // THE CALL, WITHOUT ITS TENSORS: what select reads of it, its pointers null. AttnRes without a
+  // prefix: that does not change whether a call runs.
+  const int64_t rows  = which == Op::all_reduce ? 1 : shape[0];
+  const int64_t width = which == Op::all_reduce ? numel : shape[1];
+  auto& h             = handle_of(handle_ptr);
+  const auto o        = options_of(quant_bits, kernel, launch_blocks, launch_threads);
+  const float eps     = 0.f;
+  const auto of       = [&](const auto& args) {
+    const std::variant<hip_comms::Kernel, Error> p = hip_comms::plan(h, args, o);
+    if (const Error* e = std::get_if<Error>(&p)) return error(*e);
+    const auto& k = std::get<hip_comms::Kernel>(p);
+    return PlanWire{std::vector<int64_t>{static_cast<int64_t>(k.fn), k.grid, k.threads},
+                    std::nullopt};
+  };
+  switch (which) {
+    case Op::all_reduce:
+      return of(hip_comms::AllReduceArgs{nullptr, nullptr, numel * hip_comms::elem_bytes(*d), *d});
+    case Op::all_reduce_rms_norm:
+    case Op::all_reduce_add_rms_norm:
+      return of(hip_comms::NormArgs{which == Op::all_reduce_add_rms_norm, nullptr, nullptr, nullptr,
+                                    *d, *w, rows, width, eps, nullptr, nullptr});
+    case Op::all_reduce_add_attn_res_rms_norm:
+      return of(hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
+                                       nullptr, *d, rows, width, 0, -1, eps, eps, false});
+    case Op::all_reduce_rms_norm_gemm:
+    case Op::all_reduce_rms_norm_gemm_add:
+      return of(hip_comms::GemmTailArgs{which == Op::all_reduce_rms_norm_gemm_add, nullptr, 0, 0,
+                                        nullptr, nullptr, eps, nullptr, *cols, nullptr, *d, rows,
+                                        width});
+    // The input's row is [shared | projected | latent], and `cols` the output's width: the
+    // latent is what is left.
+    case Op::all_reduce_rms_scale_add:
+      if (width - 2 * *cols < 1) return error(Error::row_not_wider_than_output);
+      return of(hip_comms::ScaleAddArgs{nullptr, nullptr, *d, rows, *cols, width - 2 * *cols, eps});
+  }
+  return error(Error::no_such_op);
+}
 
 // SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
 // exactly one is set, the arch or the Error's number.

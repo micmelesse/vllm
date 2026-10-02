@@ -27,8 +27,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import Communicator, Error, Op
-from .launch import Launch, launch_wire
+from .base import Communicator, Error, Op, Plan
+from .launch import Launch, Template, launch_wire
 
 logger = logging.getLogger(__name__)
 
@@ -157,27 +157,32 @@ class HipCommunicator(Communicator):
         )
         return out
 
-    def _check(
+    def _plan(
         self,
         op: Op,
         inp: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,
         cols: int | None = None,
-    ) -> Error | None:
+        weight_dtype: torch.dtype | None = None,
+    ) -> Plan | Error:
         """C++'s answer (`hip_comms::plan`), given the call's facts: every rule about
         what our kernels run is there, none here."""
-        err = torch.ops._rocm_C.rocm_comms_check(
+        kernel, err = torch.ops._rocm_C.rocm_comms_plan(
             self._handle,
             get_args(Op).index(op),
             list(inp.shape),
             inp.dtype,
             inp.is_contiguous(),
             cols,
+            weight_dtype,
             quant_bits,
             *launch_wire(launch),
         )
-        return None if err is None else Error(err)
+        if err is not None:
+            return Error(err)
+        template, grid, threads = kernel
+        return Plan(Launch(get_args(Template)[template], grid, threads))
 
     def _all_reduce_rms_norm(
         self,

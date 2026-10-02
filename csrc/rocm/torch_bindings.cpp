@@ -107,9 +107,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("rocm_comms_peer_read", &rocm_comms_peer_read);
   rocm_ops.def("rocm_comms_dispose", &rocm_comms_dispose);
   rocm_ops.def(
-      "rocm_comms_check(int handle_ptr, int op, int[] shape, ScalarType dtype, bool contiguous, "
-      "int? cols, int quant_bits, int kernel, int launch_blocks, int launch_threads) -> int?",
-      &rocm_comms_check);
+      "rocm_comms_plan(int handle_ptr, int op, int[] shape, ScalarType dtype, bool contiguous, "
+      "int? cols, ScalarType? weight, int quant_bits, int kernel, int launch_blocks, "
+      "int launch_threads) -> (int[]?, int?)",
+      &rocm_comms_plan);
   rocm_ops.def("rocm_comms_supported(int device, int world) -> (str?, int?)",
                &rocm_comms_supported);
   rocm_ops.def("rocm_comms_build_info() -> (str[], int[], int, int, str[], str[], str[])",

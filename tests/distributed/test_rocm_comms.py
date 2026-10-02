@@ -1335,14 +1335,14 @@ def run_fused_rank(
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if form == "rms_norm":
-        if not comm.should_allreduce_rms_norm(mine, launch):
+        if not comm.should_allreduce_rms_norm(mine, weight.dtype, launch):
             return False, NO_FUSED_KERNEL
         got = comm.all_reduce_rms_norm(
             mine, weight.to(device), FUSED_EPS, launch=launch
         )
         got_residual = None
     else:
-        if not comm.should_allreduce_add_rms_norm(mine, launch):
+        if not comm.should_allreduce_add_rms_norm(mine, weight.dtype, launch):
             return False, NO_FUSED_KERNEL
         got, got_residual = comm.all_reduce_add_rms_norm(
             mine,
@@ -1454,6 +1454,33 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
     ranks: World,
 ) -> None:
     _fused_case(form, shape, dtype_name, shot, torch.float32, world, ranks)
+
+
+def run_weight_plan_rank(ctx: RankContext) -> tuple[bool, str | None]:
+    """ONE rank: a norm's weight in neither the call's dtype nor fp32 is C++'s refusal,
+    `weight_not_built`; in either, a Plan."""
+    comm = ctx.comm("hip")
+    x = torch.randn(16, 7168, device=ctx.device).to(torch.bfloat16)
+    for op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
+        for weight, want in (
+            (torch.float16, Error.weight_not_built),
+            (torch.bfloat16, None),
+            (torch.float32, None),
+        ):
+            got = comm.plan(op, x, weight_dtype=weight)
+            if (got if isinstance(got, Error) else None) is not want:
+                return False, f"{op} with a {weight} weight: {got}, not {want}"
+    return True, None
+
+
+def test_a_norm_weight_c_does_not_build_is_refused(world: int, ranks: World) -> None:
+    """The weight's dtype is part of the call C++ plans: the rule that a norm's weight
+    is the call's dtype or fp32 is C++'s alone."""
+    # example-based: the three weight dtypes against one input dtype are the whole rule
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    bad = [err for _, err in ranks.run(run_weight_plan_rank) if err is not None]
+    assert not bad, "; ".join(bad)
 
 
 def _fused_case(
@@ -1850,7 +1877,7 @@ def run_eager_beyond_staging_rank(
     comm = ctx.comm("hip")
     launch = Launch(shot)
     if not comm.should_allreduce(x, launch):
-        return False, f"refused: {comm.check('all_reduce', x, launch)}"
+        return False, f"refused: {comm.plan('all_reduce', x, launch)}"
     got = comm.all_reduce(x, launch).float()
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
