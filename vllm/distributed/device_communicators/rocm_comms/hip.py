@@ -18,30 +18,19 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 """
 
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar, get_args
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .base import AdmitOp, Communicator, Error
+from .base import Communicator, Error, Op
 from .launch import Launch, launch_wire
 
 logger = logging.getLogger(__name__)
-
-# The ops as C++ numbers them (`enum class Op`).
-_OP_WIRE: Mapping[AdmitOp, int] = {
-    "all_reduce": 0,
-    "all_reduce_rms_norm": 1,
-    "all_reduce_add_rms_norm": 2,
-    "all_reduce_add_attn_res_rms_norm": 3,
-    "all_reduce_rms_norm_gemm_add": 4,
-    "all_reduce_rms_norm_gemm": 5,
-    "all_reduce_rms_scale_add": 6,
-}
 
 
 @dataclass(frozen=True)
@@ -75,6 +64,7 @@ class HipCommunicator(Communicator):
     would let vLLM run its own all-reduce and report the arm ready.
     """
 
+    OPS: ClassVar[frozenset[Op]] = frozenset(get_args(Op))
     hip_tunables: HipTunables = HipTunables()
 
     # Declared here so a disabled communicator is still safe to hold and close.
@@ -169,7 +159,7 @@ class HipCommunicator(Communicator):
 
     def _check(
         self,
-        op: AdmitOp,
+        op: Op,
         inp: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,
@@ -179,7 +169,7 @@ class HipCommunicator(Communicator):
         what our kernels run is there, none here."""
         err = torch.ops._rocm_C.rocm_comms_check(
             self._handle,
-            _OP_WIRE[op],
+            get_args(Op).index(op),
             list(inp.shape),
             inp.dtype,
             inp.is_contiguous(),

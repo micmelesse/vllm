@@ -17,7 +17,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal
+from typing import ClassVar, Literal
 
 import torch
 import torch.distributed as dist
@@ -34,18 +34,17 @@ logger = logging.getLogger(__name__)
 # envelope is: torch is the control, and a control that serves a superset is answering a
 # different question than the backends it is a control for. ----
 
-# THE FUSED OPS a backend may admit, named as their methods are: all-reduce then the ops
-# named, in order.
-FusedOp = Literal[
+# EVERY OP, in C++'s order (`enum class Op`; a test holds them equal), named as its
+# method is: the all-reduce, then each all-reduce and the ops it fuses, in order.
+Op = Literal[
+    "all_reduce",
     "all_reduce_rms_norm",
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
-    "all_reduce_rms_norm_gemm",
     "all_reduce_rms_norm_gemm_add",
+    "all_reduce_rms_norm_gemm",
     "all_reduce_rms_scale_add",
 ]
-# What `check` is asked about: the plain all-reduce, or a fused op.
-AdmitOp = Literal["all_reduce", FusedOp]
 
 
 def _as_device(device: int | str | torch.device) -> torch.device:
@@ -94,25 +93,33 @@ _DTYPES: Mapping[str, torch.dtype] = {
 @dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device (C++'s `kDTypesBuilt`,
-    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`)."""
+    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`, and its enums' names)."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
     pack_bytes: int
     staging_bytes: int
+    # C++'s `Op`, `Template` and `Error` members by name, each in its enum's order (the
+    # number that crosses the boundary).
+    op_names: tuple[str, ...]
+    template_names: tuple[str, ...]
+    error_names: tuple[str, ...]
 
 
 @functools.cache
 def build_info() -> BuildInfo:
     """The build's facts, read once: they are fixed when it is compiled."""
-    dtypes, worlds, pack_bytes, staging_bytes = (
+    dtypes, worlds, pack, staging, ops, templates, errors = (
         torch.ops._rocm_C.rocm_comms_build_info()
     )
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
-        pack_bytes,
-        staging_bytes,
+        pack,
+        staging,
+        tuple(ops),
+        tuple(templates),
+        tuple(errors),
     )
 
 
@@ -128,18 +135,6 @@ def supported(device: torch.device, world: int) -> Supported | Error:
     answers it (`hip_comms::supported`): the Supported, or the Error."""
     arch, err = torch.ops._rocm_C.rocm_comms_supported(device.index, world)
     return Error(err) if err is not None else Supported(arch)
-
-
-# EACH OP'S IMPLEMENTATION, the method a backend overrides to have it.
-_IMPLS: Mapping[AdmitOp, str] = {
-    "all_reduce": "_all_reduce",
-    "all_reduce_rms_norm": "_all_reduce_rms_norm",
-    "all_reduce_add_rms_norm": "_all_reduce_add_rms_norm",
-    "all_reduce_add_attn_res_rms_norm": "_all_reduce_add_attn_res_rms_norm",
-    "all_reduce_rms_norm_gemm": "_all_reduce_rms_norm_gemm",
-    "all_reduce_rms_norm_gemm_add": "_all_reduce_rms_norm_gemm_add",
-    "all_reduce_rms_scale_add": "_all_reduce_rms_scale_add",
-}
 
 
 def _cols(t: torch.Tensor, dim: int) -> int | None:
@@ -165,6 +160,9 @@ class Communicator(ABC):
     disabled: bool
     tunables: Tunables
     world_size: int
+
+    # THE OPS THIS BACKEND RUNS; every other is `no_such_op`.
+    OPS: ClassVar[frozenset[Op]] = frozenset({"all_reduce"})
 
     _capturing: bool = False
     _closed: bool = False
@@ -249,7 +247,7 @@ class Communicator(ABC):
 
     def check(
         self,
-        op: AdmitOp,
+        op: Op,
         inp: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,
@@ -261,8 +259,7 @@ class Communicator(ABC):
         `should_*` is this, None."""
         if self.disabled:
             return Error.disabled
-        impl = _IMPLS[op]
-        if getattr(type(self), impl) is getattr(Communicator, impl):
+        if op not in self.OPS:
             return Error.no_such_op
         return self._check(op, inp, launch, quant_bits, cols)
 
@@ -583,7 +580,7 @@ class Communicator(ABC):
 
     def _require(
         self,
-        op: AdmitOp,
+        op: Op,
         inp: torch.Tensor,
         launch: Launch | None,
         quant_bits: int,
@@ -722,7 +719,7 @@ class Communicator(ABC):
 
     def _check(
         self,
-        op: AdmitOp,
+        op: Op,
         inp: torch.Tensor,
         launch: Launch | None = None,
         quant_bits: int = 16,

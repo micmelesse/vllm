@@ -129,8 +129,7 @@ std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
                                         int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
                                         int64_t launch_threads) {
   using hip_comms::Error;
-  constexpr auto kLastOp = static_cast<int64_t>(hip_comms::Op::all_reduce_rms_scale_add);
-  TORCH_CHECK(op >= 0 && op <= kLastOp, "hip_comms: no op ", op);
+  TORCH_CHECK(op >= 0 && op < hip_comms::kNumOps, "hip_comms: no op ", op);
   const auto which    = static_cast<hip_comms::Op>(op);
   const bool has_cols = hip_comms::gemms(which) || which == hip_comms::Op::all_reduce_rms_scale_add;
   TORCH_CHECK(has_cols || !cols, "hip_comms: only an op with an output's columns takes cols");
@@ -181,21 +180,14 @@ std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
   return error(Error::no_such_op);
 }
 
-// THE ERROR NAMES, by number: Python's mirror (rocm_comms.Error) is tested against them.
-std::vector<std::string> rocm_comms_error_names() {
-  std::vector<std::string> names;
-  for (int i = 0; i < hip_comms::kNumErrors; ++i) {
-    const std::string s = hip_comms::to_string(static_cast<hip_comms::Error>(i));
-    names.push_back(s.substr(0, s.find(':')));
-  }
-  return names;
-}
+// WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
+using Names         = std::vector<std::string>;
+using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
+using BuildInfoWire =
+    std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names>;
 
 // SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
 // exactly one is set, the arch or the Error's number.
-using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
-using BuildInfoWire = std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t>;
-
 SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
   const auto got = hip_comms::supported(static_cast<int>(device), static_cast<int>(world));
   if (const auto* e = std::get_if<hip_comms::Error>(&got))
@@ -203,14 +195,21 @@ SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
   return {std::get<hip_comms::Supported>(got).arch, std::nullopt};
 }
 
-// WHAT THE BUILD HOLDS: its dtypes by name, its worlds, a pack's bytes and a staging's.
+// WHAT THE BUILD HOLDS: its dtypes by name, its worlds, a pack's bytes and a staging's, and its
+// ops, templates and errors by name in their enums' order (each error's name without its reason),
+// which Python's Literals are held to.
 BuildInfoWire rocm_comms_build_info() {
-  std::vector<std::string> dtypes;
-  for (const hip_comms::DType d : hip_comms::kDTypesBuilt)
-    dtypes.push_back(hip_comms::to_string(d));
-  const auto& w = hip_comms::kWorldsBuilt;
-  std::vector<int64_t> worlds(std::begin(w), std::end(w));
-  return {dtypes, worlds, hip_comms::kPackBytes, hip_comms::kStagingBytes};
+  using namespace hip_comms;
+  Names dtypes, ops, templates, errors;
+  for (const DType d : kDTypesBuilt) dtypes.push_back(to_string(d));
+  const std::vector<int64_t> worlds(std::begin(kWorldsBuilt), std::end(kWorldsBuilt));
+  for (int i = 0; i < kNumOps; ++i) ops.push_back(to_string(static_cast<Op>(i)));
+  for (int i = 0; i < kNumTemplates; ++i) templates.push_back(to_string(static_cast<Template>(i)));
+  for (int i = 0; i < kNumErrors; ++i) {
+    const std::string s = to_string(static_cast<Error>(i));
+    errors.push_back(s.substr(0, s.find(':')));
+  }
+  return {dtypes, worlds, kPackBytes, kStagingBytes, ops, templates, errors};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }

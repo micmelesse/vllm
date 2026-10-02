@@ -18,45 +18,52 @@ namespace hip_comms {
 // past that would only ever run slower, so it is not built.
 struct TemplateInfo {
   Template fn;
+  const char* name;
   Op op;
   bool two_shot;
   int max_row_packs;
 };
 
+// A TEMPLATE AND ITS NAME FROM ONE TOKEN, so the name cannot differ from the enum's.
+#define HIP_COMMS_NAMED(t) Template::t, #t
+
 constexpr TemplateInfo kTemplates[] = {
-    {Template::all_reduce_pull_one_shot, Op::all_reduce, false, 0},
-    {Template::all_reduce_pull_two_shot, Op::all_reduce, true, 0},
-    {Template::all_reduce_pull_one_shot_rms_norm, Op::all_reduce_rms_norm, false,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_pull_two_shot_rms_norm, Op::all_reduce_rms_norm, true,
-     kBuild.pipelined_row_packs},
-    {Template::all_reduce_pull_one_shot_add_rms_norm, Op::all_reduce_add_rms_norm, false,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_pull_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true,
-     kBuild.pipelined_row_packs},
-    {Template::all_reduce_pull_one_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
-     false, kBuild.attn_res_row_packs},
-    {Template::all_reduce_pull_two_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
-     true, kBuild.attn_res_row_packs},
-    {Template::all_reduce_pull_one_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, false,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_pull_two_shot_rms_norm_gemm_add, Op::all_reduce_rms_norm_gemm_add, true,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_push_two_shot_rms_norm, Op::all_reduce_rms_norm, true,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_push_two_shot_add_rms_norm, Op::all_reduce_add_rms_norm, true,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_push_two_shot_add_attn_res_rms_norm, Op::all_reduce_add_attn_res_rms_norm,
-     true, kBuild.attn_res_row_packs},
-    {Template::all_reduce_pull_one_shot_rms_norm_gemm, Op::all_reduce_rms_norm_gemm, false,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_pull_two_shot_rms_norm_gemm, Op::all_reduce_rms_norm_gemm, true,
-     kBuild.norm_row_packs},
-    {Template::all_reduce_pull_one_shot_rms_scale_add, Op::all_reduce_rms_scale_add, false,
-     kBuild.scale_add_row_packs},
-    {Template::all_reduce_pull_two_shot_rms_scale_add, Op::all_reduce_rms_scale_add, true,
-     kBuild.scale_add_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot),
+     Op::all_reduce, false, 0},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot),
+     Op::all_reduce, true, 0},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm),
+     Op::all_reduce_rms_norm, false, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm),
+     Op::all_reduce_rms_norm, true, kBuild.pipelined_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm),
+     Op::all_reduce_add_rms_norm, false, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm),
+     Op::all_reduce_add_rms_norm, true, kBuild.pipelined_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm),
+     Op::all_reduce_add_attn_res_rms_norm, false, kBuild.attn_res_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm),
+     Op::all_reduce_add_attn_res_rms_norm, true, kBuild.attn_res_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add),
+     Op::all_reduce_rms_norm_gemm_add, false, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add),
+     Op::all_reduce_rms_norm_gemm_add, true, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm),
+     Op::all_reduce_rms_norm, true, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm),
+     Op::all_reduce_add_rms_norm, true, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
+     Op::all_reduce_add_attn_res_rms_norm, true, kBuild.attn_res_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm),
+     Op::all_reduce_rms_norm_gemm, false, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm),
+     Op::all_reduce_rms_norm_gemm, true, kBuild.norm_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add),
+     Op::all_reduce_rms_scale_add, false, kBuild.scale_add_row_packs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add),
+     Op::all_reduce_rms_scale_add, true, kBuild.scale_add_row_packs},
 };
+#undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
 
 constexpr bool templates_in_order() {
@@ -68,6 +75,7 @@ static_assert(templates_in_order(), "kTemplates must list every Template in its 
 
 constexpr const TemplateInfo& info(Template k) { return kTemplates[static_cast<int>(k)]; }
 constexpr Op op_of(Template k) { return info(k).op; }
+constexpr const char* to_string(Template k) { return info(k).name; }
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 // A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
 constexpr bool gemms(Op op) {

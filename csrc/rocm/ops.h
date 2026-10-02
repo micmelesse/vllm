@@ -83,12 +83,13 @@ std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
                                         bool contiguous, std::optional<int64_t> cols,
                                         int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
                                         int64_t launch_threads);
-std::vector<std::string> rocm_comms_error_names();
 // A variant at the torch boundary: the arch or the Error's number, exactly one set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_supported(
     int64_t device, int64_t world);
-// The build's dtypes by name, its worlds, a pack's bytes and a staging's.
-std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t>
+// The build's dtypes by name, its worlds, a pack's bytes and a staging's, and its ops', templates'
+// and errors' names in their enums' order.
+std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
+           std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>
 rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,

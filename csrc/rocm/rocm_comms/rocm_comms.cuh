@@ -75,6 +75,24 @@ enum class Op : int {
   all_reduce_rms_scale_add         = 6,
 };
 
+// AN OP'S NAME FROM ITS ENUM TOKEN, as Python names it.
+#define HIP_COMMS_CASE(o) \
+  case Op::o: return #o;
+constexpr const char* to_string(Op op) {
+  switch (op) {
+    HIP_COMMS_CASE(all_reduce)
+    HIP_COMMS_CASE(all_reduce_rms_norm)
+    HIP_COMMS_CASE(all_reduce_add_rms_norm)
+    HIP_COMMS_CASE(all_reduce_add_attn_res_rms_norm)
+    HIP_COMMS_CASE(all_reduce_rms_norm_gemm_add)
+    HIP_COMMS_CASE(all_reduce_rms_norm_gemm)
+    HIP_COMMS_CASE(all_reduce_rms_scale_add)
+  }
+  return "unknown";
+}
+#undef HIP_COMMS_CASE
+constexpr int kNumOps = static_cast<int>(Op::all_reduce_rms_scale_add) + 1;
+
 // Every `__global__` template there is, named by its shot and what it fuses: a family of kernels,
 // one per set of template arguments.
 enum class Template : int {
