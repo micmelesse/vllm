@@ -333,6 +333,7 @@ struct ScaleAddArgs {
 
 #define HIP_COMMS_INTERFACE
 #include "impl/templates.cuh"
+#include "impl/tuned.cuh"
 #include "impl/select.cuh"
 #include "impl/dispatch.cuh"
 #include "impl/check.cuh"

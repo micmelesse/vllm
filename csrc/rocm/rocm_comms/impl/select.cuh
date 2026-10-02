@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <variant>
 
 namespace hip_comms {
@@ -35,6 +36,17 @@ constexpr int64_t hidden_of(const AttnResArgs& a) { return a.hidden; }
 constexpr int64_t hidden_of(const GemmTailArgs& a) { return a.hidden; }
 // The row reduced, [shared | projected | latent].
 constexpr int64_t hidden_of(const ScaleAddArgs& a) { return 2 * a.hidden + a.latent; }
+// EACH OP'S CALL AS ITS OP.
+constexpr Op op_of(const AllReduceArgs&) { return Op::all_reduce; }
+constexpr Op op_of(const NormArgs& a) {
+  return a.add ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
+}
+constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
+constexpr Op op_of(const ScaleAddArgs&) { return Op::all_reduce_rms_scale_add; }
+constexpr Op op_of(const GemmTailArgs& a) {
+  return a.add ? Op::all_reduce_rms_norm_gemm_add : Op::all_reduce_rms_norm_gemm;
+}
+
 template <typename Args>
 constexpr int64_t bytes_of(const Args& a) {
   return rows_of(a) * hidden_of(a) * elem_bytes(a.dtype);
@@ -127,6 +139,76 @@ constexpr Kernel kernel_for(Template t, const Args& a, int world) {
   k.config.slice_k = d.slice_k;
   return k;
 }
+
+// THE KERNEL OF TEMPLATE `t` AT `cfg` on call `a`: `cfg`'s threads and grid (cut to the rows where a
+// block takes a row), and its tile fields where set; a zero is the template's own for the call.
+template <typename Args>
+constexpr Kernel kernel_at(Template t, const KernelConfig& cfg, const Args& a, int world) {
+  Kernel k = kernel_for(t, cfg.blocks_per_grid, cfg.threads_per_block, a, world);
+  if (cfg.tile_m > 0) k.config.tile_m = cfg.tile_m;
+  if (cfg.tile_n > 0) k.config.tile_n = cfg.tile_n;
+  if (cfg.tile_k > 0) k.config.tile_k = cfg.tile_k;
+  if (cfg.slice_k > 0) k.config.slice_k = cfg.slice_k;
+  return k;
+}
+
+// =================================================================================================
+// THE ROW OPS: the tuned table's row for the call (impl/tuned.cuh).
+// =================================================================================================
+
+constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b; }
+
+// THE TUNED ROW FOR CALL `a`: among its op's rows, those at the call's world, else at the nearest
+// tuned world; among those, the call's width, else the nearest tuned width, reading the call's rows
+// as that width's rows of the same bytes (a crossover is about bytes); then the last row whose
+// tokens the call reaches, the first when it reaches none. None when the op has no rows.
+template <typename Args>
+constexpr const Tuned* tuned_for(const Args& a, int world, std::span<const Tuned> table) {
+  const Op op = op_of(a);
+  int w = 0;
+  for (const Tuned& r : table)
+    if (r.op == op && (w == 0 || distance(r.world, world) < distance(w, world))) w = r.world;
+  int64_t h = 0;
+  for (const Tuned& r : table)
+    if (r.op == op && r.world == w &&
+        (h == 0 || distance(r.hidden, hidden_of(a)) < distance(h, hidden_of(a))))
+      h = r.hidden;
+  if (h == 0) return nullptr;
+  const int64_t rows = rows_of(a) * hidden_of(a) / h;
+  const Tuned* first = nullptr;
+  const Tuned* reached = nullptr;
+  for (const Tuned& r : table) {
+    if (r.op != op || r.world != w || r.hidden != h) continue;
+    if (!first || r.tokens < first->tokens) first = &r;
+    if (r.tokens <= rows && (!reached || r.tokens > reached->tokens)) reached = &r;
+  }
+  return reached ? reached : first;
+}
+
+// THE ROW OP'S KERNEL: its tuned row's template at the row's config; at an untuned width whose row
+// the config's tile does not cover, the smallest built tile that does.
+template <typename Args>
+constexpr Kernel tuned(const Args& a, int world) {
+  const Tuned* r = tuned_for(a, world, kTargetTuned);
+  KernelConfig c = r->config;
+  if (c.tile_n < tile_cols(a)) c.tile_n = 0;
+  return kernel_at(r->fn, c, a, world);
+}
+
+// EVERY ROW OP HAS ROWS, and every row's config is one its template builds.
+constexpr bool tuned_covers_ops() {
+  for (const Op op : {Op::all_reduce_rms_norm, Op::all_reduce_add_rms_norm,
+                      Op::all_reduce_add_attn_res_rms_norm, Op::all_reduce_rms_norm_gemm,
+                      Op::all_reduce_rms_norm_gemm_add, Op::all_reduce_rms_scale_add}) {
+    bool has = false;
+    for (const Tuned& r : kTargetTuned) has = has || r.op == op;
+    if (!has) return false;
+  }
+  for (const Tuned& r : kTargetTuned)
+    if (op_of(r.fn) != r.op || !built(r.fn, r.config)) return false;
+  return true;
+}
+static_assert(tuned_covers_ops(), "a row op has no tuned rows, or a row's config is not built");
 
 // =================================================================================================
 // ALL-REDUCE: the critical path, from the launch-config sweep on n11 (bench, 2026-09-29T19-24-48Z:
@@ -260,24 +342,60 @@ constexpr Kernel rule(const AllReduceArgs& a, int world, const Hardware& hw,
                       const Calibration& cal) {
   return tune_all_reduce(a, world, hw, cal);
 }
-constexpr Kernel rule(const NormArgs& a, int world, const Hardware& hw, const Calibration& cal) {
+template <typename Args>
+constexpr Kernel rule(const Args& a, int world, const Hardware&, const Calibration&) {
+  return tuned(a, world);
+}
+
+// TRANSCRIBED, NOT RETUNED: the table gives each row op the kernel the size thresholds gave, at
+// every tuned width, on both sides of every crossover.
+constexpr Kernel legacy_rule(const NormArgs& a, int world, const Hardware& hw,
+                             const Calibration& cal) {
   return a.add ? tune_all_reduce_add_rms_norm(a, world, hw, cal)
                : tune_all_reduce_rms_norm(a, world, hw, cal);
 }
-constexpr Kernel rule(const AttnResArgs& a, int world, const Hardware& hw,
-                      const Calibration& cal) {
+constexpr Kernel legacy_rule(const AttnResArgs& a, int world, const Hardware& hw,
+                             const Calibration& cal) {
   return tune_all_reduce_add_attn_res_rms_norm(a, world, hw, cal);
 }
-constexpr Kernel rule(const GemmTailArgs& a, int world, const Hardware& hw,
-                      const Calibration& cal) {
+constexpr Kernel legacy_rule(const GemmTailArgs& a, int world, const Hardware& hw,
+                             const Calibration& cal) {
   return a.add ? tune_all_reduce_rms_norm_gemm_add(a, world, hw, cal)
                : tune_all_reduce_rms_norm_gemm(a, world, hw, cal);
 }
-
-constexpr Kernel rule(const ScaleAddArgs& a, int world, const Hardware& hw,
-                      const Calibration& cal) {
+constexpr Kernel legacy_rule(const ScaleAddArgs& a, int world, const Hardware& hw,
+                             const Calibration& cal) {
   return tune_all_reduce_rms_scale_add(a, world, hw, cal);
 }
+constexpr bool same_kernel(const Kernel& a, const Kernel& b) {
+  return a.fn == b.fn && same_build(a.config, b.config) &&
+         a.config.blocks_per_grid == b.config.blocks_per_grid;
+}
+template <typename Args>
+constexpr bool transcribed(const Args& a) {
+  return same_kernel(tuned(a, 8), legacy_rule(a, 8, kTarget, kTargetCalibration));
+}
+constexpr bool tuned_is_transcribed() {
+  constexpr DType bf = DType::bf16;
+  for (const int64_t t : {1, 2, 7, 8, 9, 10, 16, 17, 18, 19, 96, 97, 128, 129, 192, 193, 256,
+                          257, 512, 513, 4096, 8192}) {
+    for (const int64_t h : {3584, 7168}) {
+      for (const bool add : {false, true}) {
+        if (!transcribed(NormArgs{add, nullptr, nullptr, nullptr, bf, bf, t, h, 0.f, nullptr,
+                                  nullptr}))
+          return false;
+        if (!transcribed(GemmTailArgs{.add = add, .dtype = bf, .rows = t, .hidden = h}))
+          return false;
+      }
+      if (!transcribed(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
+                                   nullptr, bf, t, h, 0, -1, 0.f, 0.f, true}))
+        return false;
+    }
+    if (!transcribed(ScaleAddArgs{nullptr, nullptr, bf, t, 7168, 3584, 0.f})) return false;
+  }
+  return true;
+}
+static_assert(tuned_is_transcribed(), "the tuned table is not the thresholds it transcribes");
 
 template <typename Args>
 constexpr Kernel select(const Args& a, int world, const Options& o) {
@@ -290,15 +408,7 @@ constexpr Kernel select(const Args& a, int world, const Options& o) {
     return has_tiles(*o.fn)
                ? kernel_for(*o.fn, a, world)
                : kernel_for(*o.fn, k.config.blocks_per_grid, k.config.threads_per_block, a, world);
-  const KernelConfig& launch = *o.kernel_config;
-  k = kernel_for(*o.fn, launch.blocks_per_grid, launch.threads_per_block, a, world);
-  // A forced field of 0 is the template's own.
-  const KernelConfig& f = launch;
-  if (f.tile_m > 0) k.config.tile_m = f.tile_m;
-  if (f.tile_n > 0) k.config.tile_n = f.tile_n;
-  if (f.tile_k > 0) k.config.tile_k = f.tile_k;
-  if (f.slice_k > 0) k.config.slice_k = f.slice_k;
-  return k;
+  return kernel_at(*o.fn, *o.kernel_config, a, world);
 }
 
 // WHETHER A KERNEL IS ITS STAGED BUILD: the plain all-reduce's, when plan found an eager input.
@@ -341,16 +451,5 @@ constexpr bool selections_fit() {
   return true;
 }
 static_assert(selections_fit(), "a rule declines, or exceeds a kernel capability");
-
-// EACH OP'S CALL AS ITS OP.
-constexpr Op op_of(const AllReduceArgs&) { return Op::all_reduce; }
-constexpr Op op_of(const NormArgs& a) {
-  return a.add ? Op::all_reduce_add_rms_norm : Op::all_reduce_rms_norm;
-}
-constexpr Op op_of(const AttnResArgs&) { return Op::all_reduce_add_attn_res_rms_norm; }
-constexpr Op op_of(const ScaleAddArgs&) { return Op::all_reduce_rms_scale_add; }
-constexpr Op op_of(const GemmTailArgs& a) {
-  return a.add ? Op::all_reduce_rms_norm_gemm_add : Op::all_reduce_rms_norm_gemm;
-}
 
 }  // namespace hip_comms
