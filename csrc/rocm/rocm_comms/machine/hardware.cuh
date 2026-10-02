@@ -130,6 +130,7 @@ struct AttnResCalibration {
   Launch push;
   Launch pull;
   int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
+  int pull_gather_blocks;  // and the blocks that pull the reduced rows into local memory
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
@@ -217,6 +218,10 @@ constexpr Calibration kGfx950Calibration = {
         // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
         // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
         .pull_reduce_blocks = 32,
+        // THE GATHER ON FEW BLOCKS TOO: a pull peaks at 32-48 blocks (396 and 394 GB/s) and falls to
+        // 218 at 256 (probe 2026-10-02T19-32-40Z), so the reduced rows land in `out` first and the
+        // whole grid computes AttnRes from local memory.
+        .pull_gather_blocks = 32,
     },
     .rms_norm_gemm = {
         // Not swept: rms_norm_gemm_add's.

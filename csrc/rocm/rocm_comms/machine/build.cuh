@@ -66,6 +66,7 @@ struct Build {
   int gemm_lanes;           // the GEMM tail's lanes a column, the one build of it
   int attn_res_sources;     // AttnRes's sources a block_reduce, the one build of it
   int attn_res_reduce_blocks;  // its pull two-shot's blocks that run the reduce-scatter
+  int attn_res_gather_blocks;  // and that pull the reduced rows into `out`
 };
 
 constexpr Build derive(const Hardware& hw, const Calibration& cal) {
@@ -115,6 +116,7 @@ constexpr Build derive(const Hardware& hw, const Calibration& cal) {
   b.gemm_lanes = cal.gemm_lanes_per_col;
   b.attn_res_sources = cal.attn_res_sources_per_reduce;
   b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
+  b.attn_res_gather_blocks = cal.attn_res.pull_gather_blocks;
   return b;
 }
 
