@@ -148,14 +148,16 @@ class HipCommunicator(Communicator):
         )
 
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
-    ) -> torch.Tensor:
-        """Sum `inp` across the TP ranks, out of place."""
-        out = torch.empty_like(inp)
+        self,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
+        """Sum `inp` across the TP ranks into `out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce(
             self._handle, out, inp, quant_bits, launch_wire(launch)
         )
-        return out
 
     def _plan(
         self,
@@ -186,13 +188,13 @@ class HipCommunicator(Communicator):
 
     def _all_reduce_rms_norm(
         self,
+        out: torch.Tensor,
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> torch.Tensor:
-        out = torch.empty_like(inp)
+    ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
             self._handle,
             out,
@@ -202,7 +204,6 @@ class HipCommunicator(Communicator):
             quant_bits,
             launch_wire(launch),
         )
-        return out
 
     def _all_reduce_rms_norm_gemm(
         self,
@@ -273,8 +274,10 @@ class HipCommunicator(Communicator):
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
+        prefix_out: torch.Tensor,
+        out: torch.Tensor,
         inp: torch.Tensor,
-        prefix: torch.Tensor | None,
+        has_prefix: bool,
         blocks: torch.Tensor,
         norm_weight: torch.Tensor,
         qk_weight: torch.Tensor,
@@ -285,10 +288,7 @@ class HipCommunicator(Communicator):
         out_eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        started = prefix is None
-        prefix_out = torch.empty_like(inp) if started else prefix
-        out = torch.empty_like(inp)
+    ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
             prefix_out,
@@ -302,24 +302,23 @@ class HipCommunicator(Communicator):
             write_idx,
             eps,
             out_eps,
-            not started,
+            has_prefix,
             quant_bits,
             launch_wire(launch),
         )
-        return prefix_out, out
 
     def _all_reduce_add_rms_norm(
         self,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
         inp: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the normed result, then the sum plus residual."""
-        out = torch.empty_like(inp)
-        residual_out = torch.empty_like(inp)
+    ) -> None:
+        """The normed result into `out`, the sum plus residual into `residual_out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
             self._handle,
             out,
@@ -331,7 +330,6 @@ class HipCommunicator(Communicator):
             quant_bits,
             launch_wire(launch),
         )
-        return out, residual_out
 
     def _on_close(self) -> None:
         """Release the peer memory now. Idempotent. Dropping the object does not close

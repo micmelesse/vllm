@@ -333,14 +333,10 @@ class Communicator(ABC):
         the backend's, so the classification is offered and not applied.
         """
         self._require("all_reduce", inp, launch, quant_bits)
-        if self._warming_up("all_reduce"):
-            return torch.empty_like(inp)
-        # NO BRANCH HERE. It used to fork on `_is_small` and call the same thing on
-        # both sides, marking where the paths would part. They part now -- in the
-        # BACKEND: one with a kernel per size asks `_is_small` itself (see `hip`), and
-        # one with a single kernel never hears about it. Splitting here would mean
-        # every backend carrying a parameter for one backend's benefit.
-        return self._all_reduce(inp, launch, quant_bits)
+        out = torch.empty_like(inp)
+        if not self._warming_up("all_reduce"):
+            self._all_reduce(out, inp, launch, quant_bits)
+        return out
 
     def all_reduce_rms_norm(
         self,
@@ -357,9 +353,10 @@ class Communicator(ABC):
         self._require(
             "all_reduce_rms_norm", inp, launch, quant_bits, weight_dtype=weight.dtype
         )
-        if self._warming_up("all_reduce_rms_norm"):
-            return torch.empty_like(inp)
-        return self._all_reduce_rms_norm(inp, weight, eps, launch, quant_bits)
+        out = torch.empty_like(inp)
+        if not self._warming_up("all_reduce_rms_norm"):
+            self._all_reduce_rms_norm(out, inp, weight, eps, launch, quant_bits)
+        return out
 
     def all_reduce_add_rms_norm(
         self,
@@ -379,11 +376,12 @@ class Communicator(ABC):
             quant_bits,
             weight_dtype=weight.dtype,
         )
-        if self._warming_up("all_reduce_add_rms_norm"):
-            return torch.empty_like(inp), torch.empty_like(inp)
-        return self._all_reduce_add_rms_norm(
-            inp, residual, weight, eps, launch, quant_bits
-        )
+        out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
+        if not self._warming_up("all_reduce_add_rms_norm"):
+            self._all_reduce_add_rms_norm(
+                out, residual_out, inp, residual, weight, eps, launch, quant_bits
+            )
+        return out, residual_out
 
     def should_allreduce_add_attn_res_rms_norm(
         self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
@@ -412,12 +410,16 @@ class Communicator(ABC):
         and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
         block."""
         self._require("all_reduce_add_attn_res_rms_norm", inp, launch, quant_bits)
+        # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
+        prefix_out = torch.empty_like(inp) if prefix is None else prefix
+        out = torch.empty_like(inp)
         if self._warming_up("all_reduce_add_attn_res_rms_norm"):
-            started = torch.empty_like(inp) if prefix is None else prefix
-            return started, torch.empty_like(inp)
-        return self._all_reduce_add_attn_res_rms_norm(
+            return prefix_out, out
+        self._all_reduce_add_attn_res_rms_norm(
+            prefix_out,
+            out,
             inp,
-            prefix,
+            prefix is not None,
             blocks,
             norm_weight,
             qk_weight,
@@ -429,6 +431,7 @@ class Communicator(ABC):
             launch,
             quant_bits,
         )
+        return prefix_out, out
 
     def should_allreduce_rms_norm_gemm(
         self,
@@ -647,22 +650,28 @@ class Communicator(ABC):
 
     @abstractmethod
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
-    ) -> torch.Tensor:
-        """SUM across ranks, out of place: input untouched, new tensor returned. Assume
-        `inp` is admitted -- the base checked."""
+        self,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
+        """SUM across ranks into `out`, which the base allocated: input untouched.
+        Assume `inp` is admitted -- the base checked. Every op's outputs are the base's,
+        so a capture's warmup returns them without calling here."""
 
     # The fused variants. Not abstract: a backend without them is one the fusion pass
     # leaves alone, and overriding one is how a backend says it has it.
 
     def _all_reduce_rms_norm(
         self,
+        out: torch.Tensor,
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> torch.Tensor:
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm; "
             f"ask should_allreduce_rms_norm first."
@@ -670,13 +679,15 @@ class Communicator(ABC):
 
     def _all_reduce_add_rms_norm(
         self,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
         inp: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm; "
             f"ask should_allreduce_add_rms_norm first."
@@ -684,8 +695,10 @@ class Communicator(ABC):
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
+        prefix_out: torch.Tensor,
+        out: torch.Tensor,
         inp: torch.Tensor,
-        prefix: torch.Tensor | None,
+        has_prefix: bool,
         blocks: torch.Tensor,
         norm_weight: torch.Tensor,
         qk_weight: torch.Tensor,
@@ -696,7 +709,7 @@ class Communicator(ABC):
         out_eps: float,
         launch: Launch | None = None,
         quant_bits: int = 16,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes; "
             f"ask should_allreduce_add_attn_res_rms_norm first."

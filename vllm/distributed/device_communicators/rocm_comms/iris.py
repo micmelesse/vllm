@@ -125,13 +125,16 @@ class IrisCommunicator(Communicator):
         return self._input_buf
 
     def _all_reduce(
-        self, inp: torch.Tensor, launch: Launch | None = None, quant_bits: int = 16
-    ) -> torch.Tensor:
+        self,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        launch: Launch | None = None,
+        quant_bits: int = 16,
+    ) -> None:
         self._refuse_launch(launch)
         self._refuse_lossy(quant_bits)
         assert self._shmem is not None
         try:
-            out = torch.empty_like(inp)
             input_buf = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
@@ -146,8 +149,6 @@ class IrisCommunicator(Communicator):
                 config=self._gluon_config,
                 async_op=True,
             )
-
-            return out
         except Exception as e:
             logger.error(
                 "IrisCommunicator.all_reduce failed: shape=%s dtype=%s "
