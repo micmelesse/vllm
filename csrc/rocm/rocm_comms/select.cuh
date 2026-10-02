@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // SELECT, THE ONLY CHOICE: `select(args, world, options)` is the kernel a call runs, in three
-// steps: the pick (the op's tuned kernel for the call, impl/op_kernels.cuh, or the caller's
+// steps: the pick (the op's tuned kernel for the call, op.cuh, or the caller's
 // forced template and config), the template's arguments (read off the call), and the pick's
 // config fitted to the call (a forced zero field the template's own, the tile widened to cover the
 // row, the grid cut to the tiles there are).
@@ -25,19 +25,11 @@ namespace hip_comms {
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
 
 // =================================================================================================
-// A CALL, as select reads it: its op, rows (a plain all-reduce is one row), a row's elements, the
-// bytes the hardware moves; and the columns its tile must hold and its grid tiles.
+// A CALL, as select reads it (its op is op.cuh's op_of): rows (a plain all-reduce is one row), a
+// row's elements, the bytes the hardware moves; and the columns its tile must hold and its grid
+// tiles.
 // =================================================================================================
 
-constexpr OpType op_of(const AllReduceArgs&) { return OpType::all_reduce; }
-constexpr OpType op_of(const NormArgs& a) {
-  return a.add ? OpType::all_reduce_add_rms_norm : OpType::all_reduce_rms_norm;
-}
-constexpr OpType op_of(const AttnResArgs&) { return OpType::all_reduce_add_attn_res_rms_norm; }
-constexpr OpType op_of(const GemmTailArgs& a) {
-  return a.add ? OpType::all_reduce_rms_norm_gemm_add : OpType::all_reduce_rms_norm_gemm;
-}
-constexpr OpType op_of(const ScaleAddArgs&) { return OpType::all_reduce_rms_scale_add; }
 
 constexpr int64_t rows_of(const AllReduceArgs&) { return 1; }
 constexpr int64_t rows_of(const NormArgs& a) { return a.rows; }
@@ -139,7 +131,7 @@ constexpr KernelConfig all_reduce_config(Template t, const AllReduceArgs& a, int
   const int64_t even    = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
   const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
-  return KernelConfig{0, 0, 0, 0, threads, blocks};
+  return AllReduceConfig{{threads, blocks}};
 }
 constexpr TunedKernel pick(const AllReduceArgs& a, int world) {
   const Template t = bytes_of(a) <= kTargetCalibration.all_reduce_one_shot_max_bytes
@@ -174,7 +166,7 @@ constexpr TunedKernel pick(const Args& a, int world) {
     if (k.rows <= rows && (!found || k.rows > found->rows)) found = &k;
   }
   TunedKernel got = found ? *found : *first;
-  if (got.config.tile_n < tile_cols(a)) got.config.tile_n = 0;
+  if (tile_n_of(got.config) < tile_cols(a)) set_tile_n(got.config, 0);
   return got;
 }
 
@@ -190,7 +182,7 @@ constexpr KernelConfig default_config(Template t, const Args& a, int world) {
     return all_reduce_config(t, a, world);
   } else {
     for (const KernelConfig& c : configs_of(t))
-      if (c.tile_n >= tile_cols(a)) return c;
+      if (tile_n_of(c) >= tile_cols(a)) return c;
     return configs_of(t)[0];
   }
 }
@@ -199,10 +191,12 @@ constexpr KernelConfig default_config(Template t, const Args& a, int world) {
 // refuses it).
 constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t cols) {
   int n = 0;
-  for (const KernelConfig& b : configs_of(t))
-    if (b.tile_m == c.tile_m && b.tile_k == c.tile_k && b.slice_k == c.slice_k &&
-        b.threads_per_block == c.threads_per_block && b.tile_n >= cols && (n == 0 || b.tile_n < n))
-      n = b.tile_n;
+  for (const KernelConfig& b : configs_of(t)) {
+    KernelConfig same = c;
+    set_tile_n(same, tile_n_of(b));
+    if (same_build(same, b) && tile_n_of(b) >= cols && (n == 0 || tile_n_of(b) < n))
+      n = tile_n_of(b);
+  }
   return n;
 }
 
@@ -213,26 +207,42 @@ constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t cols) {
 template <typename Args>
 constexpr int64_t tiles_of(Template t, const KernelConfig& c, const Args& a, int world) {
   const OpType op = op_of(t);
-  if (op == OpType::all_reduce || gemms(op)) return c.blocks_per_grid;
+  if (op == OpType::all_reduce || gemms(op)) return launch_of(c).blocks_per_grid;
   const bool row_split = is_two_shot(t) && !slices_columns(t);
   const int64_t rows   = row_split ? (rows_of(a) + world - 1) / world : rows_of(a);
   const int64_t cols   = grid_cols(a);
-  return (rows + c.tile_m - 1) / c.tile_m * ((cols + c.tile_n - 1) / c.tile_n);
+  const int64_t tm = tile_m_of(c), tn = tile_n_of(c);
+  return (rows + tm - 1) / tm * ((cols + tn - 1) / tn);
 }
 
+// THE PICK'S CONFIG FITTED TO THE CALL: a zero field the template's own (another family's config
+// is left for check to refuse), tile_n the smallest built covering the row where none is given,
+// and the grid cut to the tiles there are.
 template <typename Args>
 constexpr KernelConfig fitted(Template t, KernelConfig c, const Args& a, int world) {
   const KernelConfig own = default_config(t, a, world);
-  if (c.threads_per_block == 0) c.threads_per_block = own.threads_per_block;
-  if (c.blocks_per_grid == 0) c.blocks_per_grid = own.blocks_per_grid;
+  if (c.index() != own.index()) return c;
+  std::visit(
+      [&](auto& f) {
+        const auto& o     = std::get<std::decay_t<decltype(f)>>(own);
+        const auto filled = [](int& field, int its) {
+          if (field == 0) field = its;
+        };
+        filled(f.launch.threads_per_block, o.launch.threads_per_block);
+        filled(f.launch.blocks_per_grid, o.launch.blocks_per_grid);
+        if constexpr (requires { f.tile_m; }) filled(f.tile_m, o.tile_m);
+        if constexpr (requires { f.tile_k; }) filled(f.tile_k, o.tile_k);
+        if constexpr (requires { f.slice_k; }) filled(f.slice_k, o.slice_k);
+        if constexpr (requires { f.reduce_scatter_blocks; })
+          filled(f.reduce_scatter_blocks, o.reduce_scatter_blocks);
+      },
+      c);
   if (!has_tiles(t)) return c;
-  if (c.tile_m == 0) c.tile_m = own.tile_m;
-  if (c.tile_k == 0) c.tile_k = own.tile_k;
-  if (c.slice_k == 0) c.slice_k = own.slice_k;
-  if (c.tile_n == 0) c.tile_n = smallest_tile_n(t, c, tile_cols(a));
-  if (c.tile_n == 0) return c;
+  if (tile_n_of(c) == 0) set_tile_n(c, smallest_tile_n(t, c, tile_cols(a)));
+  if (tile_n_of(c) == 0) return c;
   const int64_t tiles = tiles_of(t, c, a, world);
-  if (tiles < c.blocks_per_grid) c.blocks_per_grid = static_cast<int>(tiles > 0 ? tiles : 1);
+  int& blocks         = launch_of(c).blocks_per_grid;
+  if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
   return c;
 }
 
@@ -243,7 +253,7 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, const Args& a, int wor
 template <typename Args>
 constexpr Kernel select(const Args& a, int world, const Options& o) {
   const TunedKernel p = o.fn ? TunedKernel{world, rows_of(a), hidden_of(a), *o.fn,
-                                           o.kernel_config.value_or(KernelConfig{})}
+                                           o.kernel_config.value_or(zero_config(family_of(*o.fn)))}
                              : pick(a, world);
   return Kernel{p.fn, template_args(a, world), fitted(p.fn, p.config, a, world)};
 }
@@ -258,13 +268,14 @@ constexpr bool is_staged(const Kernel& k) {
 // declines (a fusion that is on runs its fused op), and a kernel past a capability is a compile
 // error, not one that overruns its signal slots or register arrays.
 constexpr bool fits(const Kernel& k) {
-  if (k.config.blocks_per_grid < 1 || k.config.blocks_per_grid > p2p::kMaxBlocks) return false;
-  if (has_tiles(k.fn) && k.config.tile_n == 0) return false;
-  const int t = k.config.threads_per_block;
+  const LaunchConfig& l = launch_of(k.config);
+  if (l.blocks_per_grid < 1 || l.blocks_per_grid > p2p::kMaxBlocks) return false;
+  if (has_tiles(k.fn) && tile_n_of(k.config) == 0) return false;
+  const int t = l.threads_per_block;
   return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
 }
 constexpr bool selections_fit() {
-  const Options o{std::nullopt, std::nullopt, std::nullopt, nullptr};
+  const Options o{std::nullopt, std::nullopt, nullptr};
   constexpr DType bf = DType::bf16;
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
                                             std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {

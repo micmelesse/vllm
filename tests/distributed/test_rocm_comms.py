@@ -56,12 +56,13 @@ from vllm.distributed.device_communicators.rocm_comms import (
 )
 from vllm.distributed.device_communicators.rocm_comms.base import (
     AllReduceArgs,
-    KernelConfig,
+    LaunchConfig,
     NormArgs,
     Op,
     Options,
     Supported,
     build_info,
+    knob,
     supported,
 )
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
@@ -714,10 +715,8 @@ def _chunks(
 def _forced(template: str) -> Options:
     """`template` forced at a launch every template admits (16 blocks of 512 threads),
     its own tile, for a case that forces one only to check it."""
-    return Options(
-        template=template,
-        kernel_config=KernelConfig(threads_per_block=512, blocks_per_grid=16),
-    )
+    family = build_info().templates[template].family
+    return Options(template=template, kernel_config=family(LaunchConfig(512, 16)))
 
 
 def declined(
@@ -1856,9 +1855,10 @@ def test_build_info_lists_every_template_with_its_configs() -> None:
             continue
         assert t.configs, name
         for c in t.configs:
-            assert c.threads_per_block > 0 and c.blocks_per_grid > 0, (name, c)
-            assert c.tile_m is not None and c.tile_m > 0, (name, c)
-            assert c.tile_n is not None and c.tile_n > 0, (name, c)
+            assert isinstance(c, t.family), (name, c)
+            assert c.launch.threads_per_block > 0 and c.launch.blocks_per_grid > 0, (name, c)
+            tile_n = knob(c, "tile_n")
+            assert tile_n is not None and tile_n > 0, (name, c)
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:

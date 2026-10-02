@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE BUILD: every number fixed at compile time, derived from the device's `Hardware` and its
-// `Calibration` (hardware.cuh) and nothing else; what depends on the input is select's
-// (impl/select.cuh), at run time. A number neither gives is a policy: one named line in `derive`.
+// THE BUILD: every number fixed at compile time, derived from the device's `Hardware`
+// (hardware.cuh) and nothing else; what depends on the input is select's
+// (select.cuh), at run time. A number neither gives is a policy: one named line in `derive`.
 
 #pragma once
 
@@ -87,7 +87,7 @@ struct BuildInfo {
   Kernels kernels;
 };
 
-constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
+constexpr BuildInfo derive(const Hardware& hw) {
   BuildInfo info{};
   // WHAT IS COMPILED, one list each: dispatch instantiates exactly these, check refuses the rest.
   info.supports = {{DType::f16, DType::bf16}, {2, 4, 8}};
@@ -124,7 +124,17 @@ constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
 }
 
 // THIS COMPILE PASS'S BUILD: the device code for its own target, the host for the tuning target.
-constexpr BuildInfo kBuild = derive(kDevice, kTargetCalibration);
+constexpr BuildInfo kBuild = derive(kDevice);
+
+// WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly these.
+template <typename T, size_t N>
+constexpr bool built_in(const std::array<T, N>& built, T x) {
+  for (const T& b : built)
+    if (b == x) return true;
+  return false;
+}
+constexpr bool dtype_built(DType d) { return built_in(kBuild.supports.dtypes, d); }
+constexpr bool world_built(int world) { return built_in(kBuild.supports.worlds, world); }
 
 static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
                   kBuild.kernels.max_threads % kWaveSize == 0,

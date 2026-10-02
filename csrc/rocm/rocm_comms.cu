@@ -34,9 +34,9 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-// EVERY OP TAKES THE SAME FOUR VALUES LAST, its Options: quant_bits, a lossy precision (none:
-// exact), then a forced template by name with its blocks and threads (none: select's). The model
-// passes none of them.
+// EACH OP TAKES ITS OWN FORCING LAST: a template by name, and only the config fields that op's
+// kernels have (its families' KernelConfig, kernel.cuh), each none for select's or the template's
+// own. The model passes none of them; the bench and the tests force with them.
 
 namespace {
 using ProcessGroupPtr = c10::intrusive_ptr<c10d::ProcessGroup>;
@@ -86,31 +86,12 @@ hip_comms::DType dtype_of(const torch::Tensor& t) {
   return hip_comms::DType::f32;
 }
 
-// A FORCED KERNEL, as Options carries it: a template by name, and with it a KernelConfig
-// (threads_per_block and grid together, tile_m and tile_n each where given, else the template's
-// own), a schema having no struct. A name that names no template is the caller's Error; the rest
-// are its mistakes, raised.
-std::variant<hip_comms::Options, hip_comms::Error> options_of(
-    std::optional<int64_t> quant_bits, const std::optional<std::string>& template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
-  TORCH_CHECK(!quant_bits || *quant_bits == 8 || *quant_bits == 4,
-              "quant_bits is 8 or 4, or none (exact)");
-  const std::optional<hip_comms::QuantBits> bits =
-      quant_bits ? std::optional(static_cast<hip_comms::QuantBits>(*quant_bits)) : std::nullopt;
-  const bool config = blocks_per_grid.has_value();
-  TORCH_CHECK(
-      config == threads_per_block.has_value(),
-      "hip_comms: a forced KernelConfig gives its threads_per_block and blocks_per_grid together");
-  TORCH_CHECK(config || (!tile_m && !tile_n && !tile_k && !slice_k),
-              "hip_comms: a forced tile needs its launch");
-  TORCH_CHECK(!config || template_, "hip_comms: a forced KernelConfig needs its template");
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (!template_) return hip_comms::Options{bits, std::nullopt, std::nullopt, stream};
-  const std::optional<hip_comms::Template> t = hip_comms::template_named(*template_);
-  if (!t) return hip_comms::Error::no_such_template;
-  if (!config) return hip_comms::Options{bits, t, std::nullopt, stream};
+// A FORCED LAUNCH: threads_per_block and blocks_per_grid together, or neither (select's).
+std::optional<hip_comms::LaunchConfig> launch_of(std::optional<int64_t> threads_per_block,
+                                                 std::optional<int64_t> blocks_per_grid) {
+  TORCH_CHECK(threads_per_block.has_value() == blocks_per_grid.has_value(),
+              "hip_comms: a forced launch gives threads_per_block and blocks_per_grid together");
+  if (!blocks_per_grid) return std::nullopt;
   TORCH_CHECK(*blocks_per_grid > 0 && *blocks_per_grid <= hip_comms::p2p::kMaxBlocks,
               "blocks_per_grid must be in [1, ", hip_comms::p2p::kMaxBlocks, "]");
   TORCH_CHECK(*threads_per_block > 0 &&
@@ -118,16 +99,78 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
                   *threads_per_block % hip_comms::kWaveSize == 0,
               "threads_per_block must be a multiple of ", hip_comms::kWaveSize, " up to ",
               hip_comms::kBuild.kernels.max_threads);
-  TORCH_CHECK(tile_m.value_or(1) > 0 && tile_n.value_or(1) > 0 && tile_k.value_or(1) > 0 &&
-                  slice_k.value_or(1) > 0,
-              "tile_m, tile_n, tile_k and slice_k are positive");
-  return hip_comms::Options{
-      bits, t,
-      hip_comms::KernelConfig{
-          static_cast<int>(tile_m.value_or(0)), static_cast<int>(tile_n.value_or(0)),
-          static_cast<int>(tile_k.value_or(0)), static_cast<int>(slice_k.value_or(0)),
-          static_cast<int>(*threads_per_block), static_cast<int>(*blocks_per_grid)},
-      stream};
+  return hip_comms::LaunchConfig{static_cast<int>(*threads_per_block),
+                                 static_cast<int>(*blocks_per_grid)};
+}
+
+// A FORCED FIELD: its value, or 0 for the template's own; positive, and only with a launch.
+int field(std::optional<int64_t> v, const char* name, bool launched) {
+  TORCH_CHECK(!v || launched, "hip_comms: a forced ", name, " needs its launch");
+  TORCH_CHECK(!v || *v > 0, "hip_comms: ", name, " is positive");
+  return static_cast<int>(v.value_or(0));
+}
+
+// EACH OP FAMILY'S FORCED CONFIG, from its own arguments; none where no launch is forced.
+std::optional<hip_comms::KernelConfig> all_reduce_config(std::optional<int64_t> threads_per_block,
+                                                         std::optional<int64_t> blocks_per_grid) {
+  const auto launch = launch_of(threads_per_block, blocks_per_grid);
+  if (!launch) return std::nullopt;
+  return hip_comms::AllReduceConfig{*launch};
+}
+std::optional<hip_comms::KernelConfig> row_config(std::optional<int64_t> tile_n,
+                                                  std::optional<int64_t> threads_per_block,
+                                                  std::optional<int64_t> blocks_per_grid) {
+  const auto launch = launch_of(threads_per_block, blocks_per_grid);
+  const int n       = field(tile_n, "tile_n", launch.has_value());
+  if (!launch) return std::nullopt;
+  return hip_comms::RowConfig{*launch, n};
+}
+std::optional<hip_comms::KernelConfig> gemm_config(std::optional<int64_t> tile_m,
+                                                   std::optional<int64_t> tile_n,
+                                                   std::optional<int64_t> tile_k,
+                                                   std::optional<int64_t> slice_k,
+                                                   std::optional<int64_t> threads_per_block,
+                                                   std::optional<int64_t> blocks_per_grid) {
+  const auto launch = launch_of(threads_per_block, blocks_per_grid);
+  const bool l      = launch.has_value();
+  const int m = field(tile_m, "tile_m", l), n = field(tile_n, "tile_n", l);
+  const int k = field(tile_k, "tile_k", l), sk = field(slice_k, "slice_k", l);
+  if (!launch) return std::nullopt;
+  return hip_comms::GemmConfig{*launch, m, n, k, sk};
+}
+// AttnRes's: the pull's family when the forced template is the pull (its TILE_M and its
+// reduce-scatter blocks), the one-shot's and push's otherwise (neither of those).
+std::optional<hip_comms::KernelConfig> attn_res_config(const std::optional<std::string>& template_,
+    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid) {
+  const auto launch = launch_of(threads_per_block, blocks_per_grid);
+  const bool l      = launch.has_value();
+  const int m = field(tile_m, "tile_m", l), n = field(tile_n, "tile_n", l);
+  const int k = field(tile_k, "tile_k", l);
+  const int rs = field(reduce_scatter_blocks, "reduce_scatter_blocks", l);
+  if (!launch) return std::nullopt;
+  using hip_comms::Template;
+  const bool pull = template_ && hip_comms::template_named(*template_) ==
+                                     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
+  if (pull) return hip_comms::AttnResPullConfig{*launch, m, n, k, rs};
+  TORCH_CHECK(m == 0 && rs == 0,
+              "hip_comms: only the AttnRes pull two-shot has tile_m and reduce_scatter_blocks");
+  return hip_comms::AttnResConfig{*launch, n, k};
+}
+
+// A FORCED KERNEL, as Options carries it: the template a name names (none: select's), with the
+// config forced for it. A name that names no template is the caller's Error; a config forced
+// without its template is its mistake, raised.
+std::variant<hip_comms::Options,
+    hip_comms::Error> options_of(const std::optional<std::string>& template_,
+                                 std::optional<hip_comms::KernelConfig> config) {
+  TORCH_CHECK(!config || template_, "hip_comms: a forced config needs its template");
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (!template_) return hip_comms::Options{std::nullopt, std::nullopt, stream};
+  const std::optional<hip_comms::Template> t = hip_comms::template_named(*template_);
+  if (!t) return hip_comms::Error::no_such_template;
+  return hip_comms::Options{t, config, stream};
 }
 
 // AN ERROR RAISED, at the torch boundary: a torch op can only return or raise.
@@ -137,14 +180,9 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
 }
 
 // An op's options, its Error raised: a torch op can only return or raise.
-hip_comms::Options options_or_raise(std::optional<int64_t> quant_bits,
-                                    const std::optional<std::string>& template_,
-                                    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                                    std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-                                    std::optional<int64_t> threads_per_block,
-                                    std::optional<int64_t> blocks_per_grid) {
-  auto o = options_of(quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                      blocks_per_grid);
+hip_comms::Options options_or_raise(const std::optional<std::string>& template_,
+                                    std::optional<hip_comms::KernelConfig> config) {
+  auto o = options_of(template_, config);
   if (const auto* e = std::get_if<hip_comms::Error>(&o)) raise(*e);
   return std::get<hip_comms::Options>(o);
 }
@@ -164,14 +202,10 @@ static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result)
 
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names         = std::vector<std::string>;
-using PlanWire =
-    std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-               std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-               std::optional<int64_t>, std::optional<int64_t>>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using ProbeWire     = std::tuple<std::vector<double>, Names, std::vector<double>>;
-using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names,
+using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names,
                                  Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
 
 // A torch dtype as ours, or none for one ours has no name for.
@@ -183,16 +217,11 @@ std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
 }
 
 // WHAT RUNS A CALL, or the first Error it meets: `hip_comms::plan`, one planner per op family,
-// each handed the call's own tensors and reading their facts here. A torch op cannot return a
-// variant, so each returns the kernel's template (by name) and its KernelConfig's six fields, or
-// the Error's number: the seven or the one. The arguments a call's kernel reads are not, so they
-// are null.
+// each handed the call's own tensors and reading their facts here, with the op's own forcing. A
+// torch op cannot return a variant, so each returns the kernel's template (by name) and its config
+// as that op's own fields, or the Error's number: those or the one. The arguments a call's kernel
+// reads are not, so they are null.
 namespace {
-PlanWire error_wire(hip_comms::Error e) {
-  return PlanWire{std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                  std::nullopt, std::nullopt, std::nullopt, static_cast<int64_t>(e)};
-}
-
 // AN INPUT AS OURS: its dtype, or the Error it meets first (not contiguous, not 2-D where the op
 // reads rows, a dtype ours has no name for).
 std::variant<hip_comms::DType, hip_comms::Error> admitted(const torch::Tensor& inp, bool rows) {
@@ -203,117 +232,132 @@ std::variant<hip_comms::DType, hip_comms::Error> admitted(const torch::Tensor& i
   return *d;
 }
 
+// `a` planned under the forcing: the Kernel, or the Error.
 template <typename Args>
-PlanWire planned(fptr_t handle_ptr, const Args& a, std::optional<int64_t> quant_bits,
-                 std::optional<std::string> template_, std::optional<int64_t> tile_m,
-                 std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-                 std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-                 std::optional<int64_t> blocks_per_grid) {
-  const auto forced = options_of(quant_bits, template_, tile_m, tile_n, tile_k, slice_k,
-                                 threads_per_block, blocks_per_grid);
-  if (const auto* e = std::get_if<hip_comms::Error>(&forced)) return error_wire(*e);
-  const std::variant<hip_comms::Kernel, hip_comms::Error> p =
-      hip_comms::plan(handle_of(handle_ptr), a, std::get<hip_comms::Options>(forced));
-  if (const auto* e = std::get_if<hip_comms::Error>(&p)) return error_wire(*e);
+std::variant<hip_comms::Kernel, hip_comms::Error> planned(fptr_t handle_ptr, const Args& a,
+    const std::optional<std::string>& template_, std::optional<hip_comms::KernelConfig> config) {
+  const auto o = options_of(template_, config);
+  if (const auto* e = std::get_if<hip_comms::Error>(&o)) return *e;
+  return hip_comms::plan(handle_of(handle_ptr), a, std::get<hip_comms::Options>(o));
+}
+
+std::optional<std::string> name_of(const hip_comms::Kernel& k) {
+  return std::string(hip_comms::to_string(k.fn));
+}
+std::optional<int64_t> number_of(hip_comms::Error e) { return static_cast<int64_t>(e); }
+
+// EACH OP FAMILY'S ANSWER, as its schema returns it.
+RocmCommsAllReducePlan all_reduce_plan(const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+  if (const auto* e = std::get_if<hip_comms::Error>(&p))
+    return {std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
   const auto& k = std::get<hip_comms::Kernel>(p);
-  return PlanWire{std::string(hip_comms::to_string(k.fn)),
-                  k.config.tile_m,
-                  k.config.tile_n,
-                  k.config.tile_k,
-                  k.config.slice_k,
-                  k.config.threads_per_block,
-                  k.config.blocks_per_grid,
-                  std::nullopt};
+  const auto& c = std::get<hip_comms::AllReduceConfig>(k.config);
+  return {name_of(k), c.launch.threads_per_block, c.launch.blocks_per_grid, std::nullopt};
+}
+RocmCommsRowPlan row_plan(const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+  if (const auto* e = std::get_if<hip_comms::Error>(&p))
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const auto& k = std::get<hip_comms::Kernel>(p);
+  const auto& c = std::get<hip_comms::RowConfig>(k.config);
+  return {name_of(k), c.tile_n, c.launch.threads_per_block, c.launch.blocks_per_grid,
+          std::nullopt};
+}
+RocmCommsAttnResPlan attn_res_plan(const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+  if (const auto* e = std::get_if<hip_comms::Error>(&p))
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const auto& k = std::get<hip_comms::Kernel>(p);
+  if (const auto* c = std::get_if<hip_comms::AttnResPullConfig>(&k.config))
+    return {name_of(k),  c->tile_m, c->tile_n, c->tile_k, c->reduce_scatter_blocks,
+            c->launch.threads_per_block, c->launch.blocks_per_grid, std::nullopt};
+  const auto& c = std::get<hip_comms::AttnResConfig>(k.config);
+  return {name_of(k), std::nullopt, c.tile_n, c.tile_k, std::nullopt,
+          c.launch.threads_per_block, c.launch.blocks_per_grid, std::nullopt};
+}
+RocmCommsGemmPlan gemm_plan(const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+  if (const auto* e = std::get_if<hip_comms::Error>(&p))
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const auto& k = std::get<hip_comms::Kernel>(p);
+  const auto& c = std::get<hip_comms::GemmConfig>(k.config);
+  return {name_of(k), c.tile_m, c.tile_n, c.tile_k, c.slice_k, c.launch.threads_per_block,
+          c.launch.blocks_per_grid, std::nullopt};
 }
 }  // namespace
 
-PlanWire rocm_comms_plan_all_reduce(fptr_t handle_ptr, const torch::Tensor& inp,
-                                    std::optional<int64_t> quant_bits,
-                                    std::optional<std::string> template_,
-                                    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                                    std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-                                    std::optional<int64_t> threads_per_block,
-                                    std::optional<int64_t> blocks_per_grid) {
+RocmCommsAllReducePlan rocm_comms_plan_all_reduce(fptr_t handle_ptr, const torch::Tensor& inp,
+    std::optional<std::string> template_, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid) {
   const auto d = admitted(inp, false);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
-  const hip_comms::DType dtype = std::get<hip_comms::DType>(d);
-  return planned(
-      handle_ptr,
-      hip_comms::AllReduceArgs{nullptr, nullptr, inp.numel() * inp.element_size(), dtype},
-      quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block, blocks_per_grid);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return all_reduce_plan(*e);
+  const hip_comms::AllReduceArgs a{nullptr, nullptr, inp.numel() * inp.element_size(),
+                                   std::get<hip_comms::DType>(d)};
+  return all_reduce_plan(planned(handle_ptr, a, template_, all_reduce_config(threads_per_block,
+      blocks_per_grid)));
 }
 
 // `add`: fused_add_rms_norm; otherwise rms_norm.
-PlanWire rocm_comms_plan_all_reduce_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight, bool add,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
+RocmCommsRowPlan rocm_comms_plan_all_reduce_rms_norm(fptr_t handle_ptr, const torch::Tensor& inp,
+    const torch::Tensor& weight, bool add, std::optional<std::string> template_,
+    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid) {
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return row_plan(*e);
   const std::optional<hip_comms::DType> w = dtype_from(weight.scalar_type());
-  if (!w) return error_wire(hip_comms::Error::weight_not_built);
-  return planned(handle_ptr,
-                 hip_comms::NormArgs{add, nullptr, nullptr, nullptr, std::get<hip_comms::DType>(d),
-                                     *w, inp.size(0), inp.size(1), 0.f, nullptr, nullptr},
-                 quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                 blocks_per_grid);
+  if (!w) return row_plan(hip_comms::Error::weight_not_built);
+  const hip_comms::NormArgs a{add, nullptr, nullptr, nullptr, std::get<hip_comms::DType>(d), *w,
+                              inp.size(0), inp.size(1), 0.f, nullptr, nullptr};
+  return row_plan(planned(handle_ptr, a, template_, row_config(tile_n, threads_per_block,
+      blocks_per_grid)));
 }
 
-PlanWire rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, std::optional<int64_t> quant_bits,
+RocmCommsAttnResPlan rocm_comms_plan_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr,
+    const torch::Tensor& inp, std::optional<std::string> template_, std::optional<int64_t> tile_m,
+    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid) {
+  const auto d = admitted(inp, true);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return attn_res_plan(*e);
+  const hip_comms::AttnResArgs a{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
+                                 nullptr, std::get<hip_comms::DType>(d), inp.size(0),
+                                 inp.size(1), 0, -1, 0.f, 0.f, false};
+  return attn_res_plan(planned(handle_ptr, a, template_, attn_res_config(template_, tile_m, tile_n,
+      tile_k, reduce_scatter_blocks, threads_per_block, blocks_per_grid)));
+}
+
+// `add`: the GEMM added into the output; otherwise written. `gemm_weight` is [N, hidden].
+RocmCommsGemmPlan rocm_comms_plan_all_reduce_rms_norm_gemm(fptr_t handle_ptr,
+    const torch::Tensor& inp, const torch::Tensor& gemm_weight, bool add,
     std::optional<std::string> template_, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
     std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid) {
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
-  return planned(handle_ptr,
-                 hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr,
-                                        nullptr, std::get<hip_comms::DType>(d), inp.size(0),
-                                        inp.size(1), 0, -1, 0.f, 0.f, false},
-                 quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                 blocks_per_grid);
-}
-
-// `add`: the GEMM added into the output; otherwise written. `gemm_weight` is [N, hidden].
-PlanWire rocm_comms_plan_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& gemm_weight, bool add,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
-  const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
-  if (gemm_weight.dim() != 2) return error_wire(hip_comms::Error::output_not_two_d);
-  return planned(handle_ptr,
-                 hip_comms::GemmTailArgs{.add = add,
-                                         .n_cols = gemm_weight.size(0),
-                                         .dtype = std::get<hip_comms::DType>(d),
-                                         .rows = inp.size(0),
-                                         .hidden = inp.size(1)},
-                 quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                 blocks_per_grid);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return gemm_plan(*e);
+  if (gemm_weight.dim() != 2) return gemm_plan(hip_comms::Error::output_not_two_d);
+  const hip_comms::GemmTailArgs a{.add = add,
+                                  .n_cols = gemm_weight.size(0),
+                                  .dtype = std::get<hip_comms::DType>(d),
+                                  .rows = inp.size(0),
+                                  .hidden = inp.size(1)};
+  return gemm_plan(planned(handle_ptr, a, template_, gemm_config(tile_m, tile_n, tile_k, slice_k,
+      threads_per_block, blocks_per_grid)));
 }
 
 // `inp`'s row is [shared | projected | latent] and `out` [rows, hidden]: the latent is what is
 // left.
-PlanWire rocm_comms_plan_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& out,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
+RocmCommsRowPlan rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr,
+    const torch::Tensor& inp, const torch::Tensor& out, std::optional<std::string> template_,
+    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid) {
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
-  if (out.dim() != 2) return error_wire(hip_comms::Error::output_not_two_d);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return row_plan(*e);
+  if (out.dim() != 2) return row_plan(hip_comms::Error::output_not_two_d);
   const int64_t hidden = out.size(1), latent = inp.size(1) - 2 * hidden;
-  if (latent < 1) return error_wire(hip_comms::Error::row_not_wider_than_output);
-  return planned(handle_ptr,
-                 hip_comms::ScaleAddArgs{nullptr, nullptr, std::get<hip_comms::DType>(d),
-                                         inp.size(0), hidden, latent, 0.f},
-                 quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                 blocks_per_grid);
+  if (latent < 1) return row_plan(hip_comms::Error::row_not_wider_than_output);
+  const hip_comms::ScaleAddArgs a{nullptr,     nullptr, std::get<hip_comms::DType>(d),
+                                  inp.size(0), hidden,  latent, 0.f};
+  return row_plan(planned(handle_ptr, a, template_, row_config(tile_n, threads_per_block,
+      blocks_per_grid)));
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
@@ -358,19 +402,32 @@ BuildInfoWire rocm_comms_build_info() {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
-  // Each template's configs, what dispatch instantiates: the tuner's search space.
-  Names templates, template_ops;
+  // Each template's op and config family, and its configs (what dispatch instantiates: the
+  // tuner's search space), flat: a config's fields in kConfigFields' order, 0 where its family
+  // has none.
+  Names templates, template_ops, families;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
     templates.push_back(t.name);
-    template_ops.push_back(to_string(t.op));
+    template_ops.push_back(to_string(op_of(t.fn)));
+    families.push_back(kConfigFamilies[family_of(t.fn)]);
     counts.push_back(static_cast<int64_t>(t.configs.size()));
     for (const KernelConfig& c : t.configs)
-      configs.insert(configs.end(), {c.tile_m, c.tile_n, c.tile_k, c.slice_k,
-                                     c.threads_per_block, c.blocks_per_grid});
+      std::visit(
+          [&](const auto& f) {
+            int64_t m = 0, n = 0, k = 0, sk = 0, rs = 0;
+            if constexpr (requires { f.tile_m; }) m = f.tile_m;
+            if constexpr (requires { f.tile_n; }) n = f.tile_n;
+            if constexpr (requires { f.tile_k; }) k = f.tile_k;
+            if constexpr (requires { f.slice_k; }) sk = f.slice_k;
+            if constexpr (requires { f.reduce_scatter_blocks; }) rs = f.reduce_scatter_blocks;
+            configs.insert(configs.end(), {m, n, k, sk, rs, f.launch.threads_per_block,
+                                           f.launch.blocks_per_grid});
+          },
+          c);
   }
   return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
-          templates, template_ops, configs, counts};
+          templates, template_ops, families, configs, counts};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
@@ -532,19 +589,15 @@ void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group) {
 }
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-                           std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                           std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
+                           std::optional<std::string> template_,
                            std::optional<int64_t> threads_per_block,
                            std::optional<int64_t> blocks_per_grid) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
-  ran(hip_comms::all_reduce(
-      handle_of(handle_ptr),
-      {out.data_ptr(), inp.data_ptr(), inp.numel() * inp.element_size(), dtype_of(inp)},
-      options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                       blocks_per_grid)));
+  ran(hip_comms::all_reduce(handle_of(handle_ptr), {out.data_ptr(), inp.data_ptr(),
+      inp.numel() * inp.element_size(), dtype_of(inp)}, options_or_raise(template_,
+      all_reduce_config(threads_per_block, blocks_per_grid))));
 }
 
 namespace {
@@ -588,37 +641,36 @@ void all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor* r
 
 void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                                     torch::Tensor& weight, double eps,
-                                    std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                                    std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
+                                    std::optional<int64_t> tile_n,
                                     std::optional<int64_t> threads_per_block,
                                     std::optional<int64_t> blocks_per_grid) {
   all_reduce_rms_norm(handle_ptr, out, nullptr, inp, nullptr, weight, eps,
-                      options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k,
-                                       threads_per_block, blocks_per_grid));
+                      options_or_raise(template_, row_config(tile_n, threads_per_block,
+      blocks_per_grid)));
 }
 
-void rocm_comms_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out, torch::Tensor& inp,
-    torch::Tensor& residual, torch::Tensor& weight, double eps, std::optional<int64_t> quant_bits,
-    std::optional<std::string> template_, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid) {
+void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
+                                        torch::Tensor& residual_out, torch::Tensor& inp,
+                                        torch::Tensor& residual, torch::Tensor& weight, double eps,
+                                        std::optional<std::string> template_,
+                                        std::optional<int64_t> tile_n,
+                                        std::optional<int64_t> threads_per_block,
+                                        std::optional<int64_t> blocks_per_grid) {
   all_reduce_rms_norm(handle_ptr, out, &residual_out, inp, &residual, weight, eps,
-                      options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k,
-                                       threads_per_block, blocks_per_grid));
+                      options_or_raise(template_, row_config(tile_n, threads_per_block,
+      blocks_per_grid)));
 }
 
 // With `has_prefix` the sum is added to `prefix` in place; without, the sum IS the new prefix.
-void rocm_comms_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
-    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
-    double eps, double out_eps, bool has_prefix, std::optional<int64_t> quant_bits,
+void rocm_comms_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr, torch::Tensor& prefix,
+    torch::Tensor& out, torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight, const std::optional<torch::Tensor>& out_norm_weight,
+    int64_t num_blocks, int64_t write_idx, double eps, double out_eps, bool has_prefix,
     std::optional<std::string> template_, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid) {
+    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid) {
   check_device_contiguous({&prefix, &out, &inp, &norm_weight, &qk_weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
   const int64_t hidden = inp.size(1);
@@ -647,15 +699,14 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
       blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
           reinterpret_cast<uintptr_t>(blocks.data_ptr()) % hip_comms::kBuild.memory.pack_bytes == 0,
       "blocks must be 16-byte aligned in every row and source");
-  ran(hip_comms::all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr),
-      {prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(), blocks.stride(0),
-       blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-       out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0), hidden,
-       static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps),
-       static_cast<float>(out_eps), has_prefix},
-      options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                       blocks_per_grid)));
+  ran(hip_comms::all_reduce_add_attn_res_rms_norm(handle_of(handle_ptr), {prefix.data_ptr(),
+      out.data_ptr(), inp.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
+      norm_weight.data_ptr(), qk_weight.data_ptr(),
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0), hidden,
+      static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps),
+      static_cast<float>(out_eps), has_prefix}, options_or_raise(template_,
+      attn_res_config(template_, tile_m, tile_n, tile_k, reduce_scatter_blocks, threads_per_block,
+                      blocks_per_grid))));
 }
 
 namespace {
@@ -682,7 +733,8 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out,
               "norm_weight must be 1-D of hidden=", hidden);
   for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight})
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
-  const hip_comms::GemmTailArgs a{add, out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(), static_cast<float>(eps),
+  const hip_comms::GemmTailArgs a{add, out.data_ptr(), out.stride(0), inp.data_ptr(),
+                                  norm_weight.data_ptr(), static_cast<float>(eps),
                                   gemm_weight.data_ptr(), n_cols, workspace.data_ptr(),
                                   dtype_of(inp), rows, hidden};
   ran(add ? hip_comms::all_reduce_rms_norm_gemm_add(handle_of(handle_ptr), a, o)
@@ -690,49 +742,54 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out,
 }
 }  // namespace
 
-void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
+void rocm_comms_all_reduce_rms_norm_gemm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+                                         torch::Tensor& norm_weight, double eps,
+                                         torch::Tensor& gemm_weight, torch::Tensor& workspace,
+                                         std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_m,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> tile_k,
+                                         std::optional<int64_t> slice_k,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid) {
   all_reduce_rms_norm_gemm(handle_ptr, false, out, inp, norm_weight, eps, gemm_weight, workspace,
-                           options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k,
-                                            threads_per_block, blocks_per_grid));
+                           options_or_raise(template_, gemm_config(tile_m, tile_n, tile_k, slice_k,
+      threads_per_block, blocks_per_grid)));
 }
 
-void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
+void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t handle_ptr, torch::Tensor& out,
+                                             torch::Tensor& inp, torch::Tensor& norm_weight,
+                                             double eps, torch::Tensor& gemm_weight,
+                                             torch::Tensor& workspace,
+                                             std::optional<std::string> template_,
+                                             std::optional<int64_t> tile_m,
+                                             std::optional<int64_t> tile_n,
+                                             std::optional<int64_t> tile_k,
+                                             std::optional<int64_t> slice_k,
+                                             std::optional<int64_t> threads_per_block,
+                                             std::optional<int64_t> blocks_per_grid) {
   all_reduce_rms_norm_gemm(handle_ptr, true, out, inp, norm_weight, eps, gemm_weight, workspace,
-                           options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k,
-                                            threads_per_block, blocks_per_grid));
+                           options_or_raise(template_, gemm_config(tile_m, tile_n, tile_k, slice_k,
+      threads_per_block, blocks_per_grid)));
 }
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
 // projected | latent] summed over the ranks first: the widths are out's, out's again, and the rest.
-void rocm_comms_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, double eps,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
+void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+                                         double eps, std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
               "inp and out must be 2-D with the same rows");
   const int64_t hidden = out.size(1);
   const int64_t latent = inp.size(1) - 2 * hidden;
-  TORCH_CHECK(latent > 0, "inp's row must be wider than twice out's: [shared | projected | latent]");
+  TORCH_CHECK(latent > 0,
+              "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  ran(hip_comms::all_reduce_rms_scale_add(
-      handle_of(handle_ptr),
-      {out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden, latent,
-       static_cast<float>(eps)},
-      options_or_raise(quant_bits, template_, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-                       blocks_per_grid)));
+  ran(hip_comms::all_reduce_rms_scale_add(handle_of(handle_ptr), {out.data_ptr(), inp.data_ptr(),
+      dtype_of(inp), inp.size(0), hidden, latent, static_cast<float>(eps)},
+                                          options_or_raise(template_, row_config(tile_n,
+      threads_per_block, blocks_per_grid))));
 }

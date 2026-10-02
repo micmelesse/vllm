@@ -39,7 +39,8 @@ bool resident(const Handle& h, const Kernel& k, const Args& a) {
   bool fits = true;
   dispatch(k, a, [&](auto kernel, const auto&) {
     const Resources used = h.resources_of(reinterpret_cast<const void*>(kernel));
-    fits = k.config.blocks_per_grid <= resident_blocks(kTarget, used, k.config.threads_per_block);
+    const LaunchConfig& l = launch_of(k.config);
+    fits = l.blocks_per_grid <= resident_blocks(kTarget, used, l.threads_per_block);
   });
   return fits;
 }
@@ -59,18 +60,19 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
         a.latent * e % kBuild.memory.pack_bytes != 0 || a.latent < 1)
       return Error::widths_not_packs;
   if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
-  if (has_tiles(k.fn) && !built_at(k.fn, k.config.threads_per_block))
+  const int threads = launch_of(k.config).threads_per_block;
+  if (k.config.index() != family_of(k.fn)) return Error::tile_not_built;
+  if (has_tiles(k.fn) && !built_at(k.fn, threads))
     return Error::threads_not_built;
-  if (has_tiles(k.fn) && k.config.tile_n == 0) return Error::row_too_wide;
+  if (has_tiles(k.fn) && tile_n_of(k.config) == 0) return Error::row_too_wide;
   if (has_tiles(k.fn) && !built(k.fn, k.config)) return Error::tile_not_built;
-  if (has_tiles(k.fn) && k.config.tile_n < tile_cols(a)) return Error::row_too_wide;
+  if (has_tiles(k.fn) && tile_n_of(k.config) < tile_cols(a)) return Error::row_too_wide;
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
   if (k.fn == Template::all_reduce_pull_two_shot &&
-      k.config.threads_per_block % (world * kWaveSize) != 0)
+      threads % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
-  if (o.quant_bits) return Error::quantized_not_built;
-  if (gemms(op_of(a)) && !gemm_fits(kTarget, k.config.tile_m, k.config.tile_k, k.config.slice_k,
-                                    k.config.threads_per_block))
+  if (const GemmConfig* g = std::get_if<GemmConfig>(&k.config);
+      g && !gemm_fits(kTarget, g->tile_m, g->tile_k, g->slice_k, threads))
     return Error::block_exceeds_lds;
   if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
     return Error::scratch_too_small;

@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
         p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
         int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
         const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
-        float eps, float out_eps, int rows, int packs) {
+        float eps, float out_eps, int rows, int packs, int reduce_scatter_blocks) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -59,11 +59,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
-  //    scratch at their place in the tensor, BY THE FIRST kAttnResPullReduceBlocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (impl/templates.cuh). THE (ROW,
+  //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
+  //    only: reads queue behind the links past a few dozen blocks (its config, op.cuh). THE (ROW,
   //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
   //    bytes.
-  const int reducers = min(static_cast<int>(gridDim.x), kAttnResPullReduceBlocks);
+  const int reducers = min(static_cast<int>(gridDim.x), reduce_scatter_blocks);
   if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
     int q = threadIdx.x / own_packs;  // this thread's row among the block's, and its column

@@ -3,7 +3,7 @@
 //
 // THE HARDWARE: each target's facts, as the device and AMD's docs report them, and what was
 // measured on it (`Calibration`). No decision lives here: build.cuh derives what a build is from
-// them, impl/select.cuh a launch from them and the input. A new target is one more `Hardware`;
+// them, select.cuh a launch from them and the input. A new target is one more `Hardware`;
 // `kTarget` is the one the host tunes for.
 
 #pragma once
@@ -105,33 +105,12 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 // MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
 // sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
 // kernels change. Each value cites the run that measured it; one not swept says so and whose it
-// copies. A kernel's launch is not here: it is its template's configs (impl/templates.cuh).
-// The norms (rms_norm, add_rms_norm): one-shot, then the push two-shot (a column split), then the
-// pull two-shot (a row split), at two crossovers.
-struct NormCalibration {
-  int64_t one_shot_max_bytes;
-  int64_t push_max_bytes;
-};
-
-// AttnRes: one-shot, then the push two-shot, then the pull two-shot (both split columns).
-struct AttnResCalibration {
-  int64_t one_shot_max_bytes;
-  int64_t push_max_bytes;
-};
-
-// A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
-struct GemmCalibration {
-  int64_t one_shot_max_rows;  // one GEMM pass of rows
-};
-
+// copies. A kernel's launch is not here: it is its template's configs (op.cuh).
+// What remains is the plain all-reduce's, until the tuner measures its kernels too (PLAN
+// 5.3.12.4.5.2); every other op's choices are its tuned kernels (op.cuh).
 struct Calibration {
   double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
   int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
-  NormCalibration rms_norm;
-  NormCalibration add_rms_norm;
-  AttnResCalibration attn_res;
-  GemmCalibration rms_norm_gemm;
-  GemmCalibration rms_norm_gemm_add;
 };
 
 // gfx950 on n11. MI300X has none yet.
@@ -142,42 +121,6 @@ constexpr Calibration kGfx950Calibration = {
     // One-shot won at 56 KiB (7.12 against 7.83 us), two-shot at 112 KiB (7.87 against 8.19),
     // uncached scratch (2026-09-30T18-00-30Z).
     .all_reduce_one_shot_max_bytes = 64 * kKiB,
-    .rms_norm =
-        {
-            // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
-            .one_shot_max_bytes = 128 * kKiB,
-            // Push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
-            // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
-            .push_max_bytes = 1792 * kKiB,
-        },
-    .add_rms_norm =
-        {
-            // Not swept: rms_norm's.
-            .one_shot_max_bytes = 128 * kKiB,
-            // Push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at 1.75 MiB
-            // (18.36 against push's 18.46; 2026-10-01T03-26-44Z).
-            .push_max_bytes = 1344 * kKiB,
-        },
-    .attn_res =
-        {
-            // None: the push two-shot beat the one-shot from 1 token (12.89 against 13.68 us; 14.03
-            // against 15.18 at 8; 2026-10-01T03-57-23Z), so AttnRes starts at the push.
-            .one_shot_max_bytes = 0,
-            // Push won through 1.75 MiB (128 tokens of 7168 bf16: 22.82 against unfused 23.22) and
-            // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
-            // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
-            .push_max_bytes = 3584 * kKiB,
-        },
-    .rms_norm_gemm =
-        {
-            // Not swept: rms_norm_gemm_add's.
-            .one_shot_max_rows = 16,
-        },
-    .rms_norm_gemm_add =
-        {
-            // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
-            .one_shot_max_rows = 16,
-        },
 };
 
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.

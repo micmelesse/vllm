@@ -52,37 +52,92 @@ def _as_device(device: int | str | torch.device) -> torch.device:
     return device
 
 
-# A LOSSY PRECISION on the wire, in bits; none is exact.
-QuantBits = Literal[8, 4]
-
 # A communicator's life: `__init__` -> open | disabled; open <-> capturing; open |
 # disabled -> closed. Only `Communicator` moves it.
 State = Literal["disabled", "open", "capturing", "closed"]
 
 
 @dataclass(frozen=True)
-class KernelConfig:
-    """HOW A KERNEL IS TILED AND LAUNCHED, C++'s `hip_comms::KernelConfig` (Triton's autotune
-    config): TILE_M rows x TILE_N columns a tile, TILE_K of the reduced dimension (the GEMM's K
-    a pass, AttnRes's sources a step), SLICE_K lanes splitting one output's K, the threads a
-    block, the blocks a grid. Forced, a tile field left None is the template's own."""
+class LaunchConfig:
+    """HOW A KERNEL IS LAUNCHED, C++'s `hip_comms::LaunchConfig`: the threads a block and
+    the blocks a grid. Every kernel has one."""
 
     threads_per_block: int
     blocks_per_grid: int
+
+
+# EACH KERNEL FAMILY'S CONFIG, C++'s (kernel.cuh): its launch and its own fields, nothing
+# it lacks (Triton's autotune config). TILE_M rows x TILE_N columns a tile, TILE_K of the
+# reduced dimension (the GEMM's K a pass, AttnRes's sources a step), SLICE_K lanes
+# splitting one output's K, and the AttnRes pull's reduce-scatter on its grid's first
+# `reduce_scatter_blocks` blocks. Forced, a field left None is the template's own.
+
+
+@dataclass(frozen=True)
+class AllReduceConfig:
+    """The plain all-reduce: no tile."""
+
+    launch: LaunchConfig
+
+
+@dataclass(frozen=True)
+class RowConfig:
+    """The norms and the one-all-reduce tail: one row a tile."""
+
+    launch: LaunchConfig
+    tile_n: int | None = None
+
+
+@dataclass(frozen=True)
+class AttnResConfig:
+    """AttnRes's one-shot and push."""
+
+    launch: LaunchConfig
+    tile_n: int | None = None
+    tile_k: int | None = None
+
+
+@dataclass(frozen=True)
+class AttnResPullConfig:
+    """AttnRes's pull two-shot."""
+
+    launch: LaunchConfig
+    tile_m: int | None = None
+    tile_n: int | None = None
+    tile_k: int | None = None
+    reduce_scatter_blocks: int | None = None
+
+
+@dataclass(frozen=True)
+class GemmConfig:
+    """The GEMM tails."""
+
+    launch: LaunchConfig
     tile_m: int | None = None
     tile_n: int | None = None
     tile_k: int | None = None
     slice_k: int | None = None
 
 
+KernelConfig = (
+    AllReduceConfig | RowConfig | AttnResConfig | AttnResPullConfig | GemmConfig
+)
+# Each family by C++'s name for it (`kConfigFamilies`).
+CONFIG_FAMILIES: Mapping[str, type[KernelConfig]] = {
+    "all_reduce": AllReduceConfig,
+    "row": RowConfig,
+    "attn_res": AttnResConfig,
+    "attn_res_pull": AttnResPullConfig,
+    "gemm": GemmConfig,
+}
 @dataclass(frozen=True)
 class Options:
-    """HOW A CALL RUNS, beside what it computes: C++'s `hip_comms::Options`. The model
+    """WHAT A CALL FORCES, beside what it computes: C++'s `hip_comms::Options`. The model
     passes none. `template` (a C++ template's name, `kTemplates` in
-    `csrc/rocm/rocm_comms/impl/templates.cuh`) forces the kernel at select's launch, and
-    `kernel_config` with it forces its KernelConfig; none is select's choice."""
+    `csrc/rocm/rocm_comms/op.cuh`) forces the kernel at select's launch, and
+    `kernel_config` (that template's family's) with it forces its fields; none is select's
+    choice."""
 
-    quant_bits: QuantBits | None = None
     template: str | None = None
     kernel_config: KernelConfig | None = None
 
@@ -104,20 +159,19 @@ class Error(IntEnum):
     template_not_this_ops = 10
     row_too_wide = 11
     block_not_a_wave_per_peer = 12
-    quantized_not_built = 13
-    block_exceeds_lds = 14
-    scratch_too_small = 15
-    grid_not_resident = 16
-    staging_too_small = 17
-    device_not_built = 18
-    device_not_tuned = 19
-    weight_not_built = 20
-    no_such_template = 21
-    no_such_group = 22
-    ranks_disagree = 23
-    groups_disagree = 24
-    threads_not_built = 25
-    tile_not_built = 26
+    block_exceeds_lds = 13
+    scratch_too_small = 14
+    grid_not_resident = 15
+    staging_too_small = 16
+    device_not_built = 17
+    device_not_tuned = 18
+    weight_not_built = 19
+    no_such_template = 20
+    no_such_group = 21
+    ranks_disagree = 22
+    groups_disagree = 23
+    threads_not_built = 24
+    tile_not_built = 25
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -130,10 +184,12 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 @dataclass(frozen=True)
 class TemplateBuild:
-    """One C++ template as built: its op, and the KernelConfigs dispatch instantiates
-    (its catalog list; none for the plain all-reduce), each at its listed grid."""
+    """One C++ template as built: its op, its config family, and the KernelConfigs
+    dispatch instantiates (its catalog list; none for the plain all-reduce), each at its
+    listed grid."""
 
     op: str
+    family: type[KernelConfig]
     configs: tuple[KernelConfig, ...]
 
 
@@ -154,23 +210,38 @@ class BuildInfo:
     templates: dict[str, TemplateBuild]
 
 
+def _built_config(family: type[KernelConfig], fields: list[int]) -> KernelConfig:
+    """One config of build_info's flat list (C++'s order: tile_m, tile_n, tile_k,
+    slice_k, reduce_scatter_blocks, threads_per_block, blocks_per_grid; 0 where its family
+    has none) as its family's."""
+    tile_m, tile_n, tile_k, slice_k, reduce_scatter_blocks, threads, blocks = fields
+    launch = LaunchConfig(threads, blocks)
+    if family is AllReduceConfig:
+        return AllReduceConfig(launch)
+    if family is RowConfig:
+        return RowConfig(launch, tile_n)
+    if family is AttnResConfig:
+        return AttnResConfig(launch, tile_n, tile_k)
+    if family is AttnResPullConfig:
+        return AttnResPullConfig(launch, tile_m, tile_n, tile_k, reduce_scatter_blocks)
+    assert family is GemmConfig
+    return GemmConfig(launch, tile_m, tile_n, tile_k, slice_k)
+
+
 @functools.cache
 def build_info() -> BuildInfo:
     """The build's facts, read once: they are fixed when it is compiled."""
-    dtypes, worlds, pack, staging, ops, errors, names, template_ops, flat, counts = (
-        torch.ops._rocm_C.rocm_comms_build_info()
-    )
+    (dtypes, worlds, pack, staging, ops, errors, names, template_ops, families, flat,
+     counts) = torch.ops._rocm_C.rocm_comms_build_info()
     templates: dict[str, TemplateBuild] = {}
     at = 0
-    for name, op, count in zip(names, template_ops, counts):
+    for name, op, family_name, count in zip(names, template_ops, families, counts):
+        family = CONFIG_FAMILIES[family_name]
         configs = []
         for _ in range(count):
-            tile_m, tile_n, tile_k, slice_k, threads, blocks = flat[at : at + 6]
-            configs.append(
-                KernelConfig(threads, blocks, tile_m, tile_n, tile_k, slice_k)
-            )
-            at += 6
-        templates[name] = TemplateBuild(op, tuple(configs))
+            configs.append(_built_config(family, flat[at : at + 7]))
+            at += 7
+        templates[name] = TemplateBuild(op, family, tuple(configs))
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
@@ -315,9 +386,8 @@ class Communicator(ABC):
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
     # Every op and every `should_*` takes `options`, per call, none meaning the
-    # defaults: a forced template and geometry, which the sweep and the tests pass (to
-    # hip, the one backend with kernels to choose) and the model leaves to the backend;
-    # and a lossy `quant_bits`, which a backend without lossy kernels refuses.
+    # defaults: a forced template and its config, which the sweep and the tests pass (to
+    # hip, the one backend with kernels to choose) and the model leaves to the backend.
 
     @final
     def plan(self, args: Args, options: Options | None = None) -> Plan | Error:
@@ -750,10 +820,7 @@ class Communicator(ABC):
         """A backend's own rules, the options among them: what runs the call `args`, or
         the Error it meets. By default (torch, iris) the build's envelope, so a control
         admits what our kernels do: weak-contiguous, whole packs, a dtype built; and no
-        options, having no lossy kernel and no template to force. Ours overrides it with
-        its C++'s answer."""
-        if options.quant_bits is not None:
-            return Error.quantized_not_built
+        options, having no template to force. Ours overrides it with its C++'s answer."""
         if options.template is not None or options.kernel_config is not None:
             return Error.no_such_template
         inp = args.inp

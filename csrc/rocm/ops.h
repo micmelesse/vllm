@@ -75,115 +75,124 @@ void rocm_comms_dispose(fptr_t handle_ptr);
 
 
 
-// Every op takes the same four values last, its options: quant_bits, a lossy precision (none:
-// exact), then a forced template by name with its blocks and threads (none: select's).
+// Each op takes its own forcing last: a template by name, and only the config fields its kernels
+// have (none: select's, or the template's own).
 
-// The planners, one per op family, each given the call's own tensors. A variant at the torch
-// boundary: the kernel's template name and its KernelConfig's six fields, or the Error's number.
-std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>>
+// A PLANNER'S ANSWER: the template's name and the op's config fields as its kernel has them, or
+// the Error's number.
+using RocmCommsField = std::optional<int64_t>;
+template <typename... Fields>
+using RocmCommsPlan = std::tuple<std::optional<std::string>, Fields..., std::optional<int64_t>>;
+using RocmCommsAllReducePlan = RocmCommsPlan<RocmCommsField, RocmCommsField>;
+using RocmCommsRowPlan       = RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField>;
+using RocmCommsAttnResPlan   = RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
+                                             RocmCommsField, RocmCommsField, RocmCommsField>;
+using RocmCommsGemmPlan      = RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
+                                             RocmCommsField, RocmCommsField, RocmCommsField>;
+
+// The planners, one per op family, each given the call's own tensors.
+RocmCommsAllReducePlan
 rocm_comms_plan_all_reduce(fptr_t handle_ptr, const torch::Tensor& inp,
-                           std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                           std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
+                           std::optional<std::string> template_,
                            std::optional<int64_t> threads_per_block,
                            std::optional<int64_t> blocks_per_grid);
-std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>>
-rocm_comms_plan_all_reduce_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight, bool add,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>>
-rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, std::optional<int64_t> quant_bits,
+RocmCommsRowPlan
+rocm_comms_plan_all_reduce_rms_norm(fptr_t handle_ptr, const torch::Tensor& inp,
+                                    const torch::Tensor& weight, bool add,
+                                    std::optional<std::string> template_,
+                                    std::optional<int64_t> tile_n,
+                                    std::optional<int64_t> threads_per_block,
+                                    std::optional<int64_t> blocks_per_grid);
+RocmCommsAttnResPlan
+rocm_comms_plan_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr, const torch::Tensor& inp,
     std::optional<std::string> template_, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>>
-rocm_comms_plan_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& gemm_weight, bool add,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>, std::optional<int64_t>,
-           std::optional<int64_t>, std::optional<int64_t>>
-rocm_comms_plan_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& out,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
+    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid);
+RocmCommsGemmPlan
+rocm_comms_plan_all_reduce_rms_norm_gemm(fptr_t handle_ptr, const torch::Tensor& inp,
+                                         const torch::Tensor& gemm_weight, bool add,
+                                         std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_m,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> tile_k,
+                                         std::optional<int64_t> slice_k,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid);
+RocmCommsRowPlan
+rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr, const torch::Tensor& inp,
+                                         const torch::Tensor& out,
+                                         std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid);
 // A variant at the torch boundary: the arch or the Error's number, exactly one set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_supported(
     int64_t device, int64_t world);
 // The build's dtypes by name, its worlds, a pack's bytes and a staging's, its ops' and errors'
-// names in their enums' order, and each template's name, op and built KernelConfigs (six fields a
-// config, flat, with each template's count).
+// names in their enums' order, and each template's name, op, config family and built
+// KernelConfigs (seven fields a config, flat, 0 where its family has none, with each template's
+// count).
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
            std::vector<std::string>, std::vector<std::string>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>>
+           std::vector<std::string>, std::vector<std::string>, std::vector<int64_t>,
+           std::vector<int64_t>>
 rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-                           std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                           std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
+                           std::optional<std::string> template_,
                            std::optional<int64_t> threads_per_block,
                            std::optional<int64_t> blocks_per_grid);
 
-void rocm_comms_all_reduce_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& weight, double eps,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
+void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+                                    torch::Tensor& weight, double eps,
+                                    std::optional<std::string> template_,
+                                    std::optional<int64_t> tile_n,
+                                    std::optional<int64_t> threads_per_block,
+                                    std::optional<int64_t> blocks_per_grid);
 
-void rocm_comms_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out, torch::Tensor& inp,
-    torch::Tensor& residual, torch::Tensor& weight, double eps, std::optional<int64_t> quant_bits,
+void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
+                                        torch::Tensor& residual_out, torch::Tensor& inp,
+                                        torch::Tensor& residual, torch::Tensor& weight, double eps,
+                                        std::optional<std::string> template_,
+                                        std::optional<int64_t> tile_n,
+                                        std::optional<int64_t> threads_per_block,
+                                        std::optional<int64_t> blocks_per_grid);
+
+void rocm_comms_all_reduce_rms_norm_gemm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+                                         torch::Tensor& norm_weight, double eps,
+                                         torch::Tensor& gemm_weight, torch::Tensor& workspace,
+                                         std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_m,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> tile_k,
+                                         std::optional<int64_t> slice_k,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid);
+
+void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+                                         double eps, std::optional<std::string> template_,
+                                         std::optional<int64_t> tile_n,
+                                         std::optional<int64_t> threads_per_block,
+                                         std::optional<int64_t> blocks_per_grid);
+
+void rocm_comms_all_reduce_rms_norm_gemm_add(fptr_t handle_ptr, torch::Tensor& out,
+                                             torch::Tensor& inp, torch::Tensor& norm_weight,
+                                             double eps, torch::Tensor& gemm_weight,
+                                             torch::Tensor& workspace,
+                                             std::optional<std::string> template_,
+                                             std::optional<int64_t> tile_m,
+                                             std::optional<int64_t> tile_n,
+                                             std::optional<int64_t> tile_k,
+                                             std::optional<int64_t> slice_k,
+                                             std::optional<int64_t> threads_per_block,
+                                             std::optional<int64_t> blocks_per_grid);
+
+void rocm_comms_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr, torch::Tensor& prefix,
+    torch::Tensor& out, torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight, const std::optional<torch::Tensor>& out_norm_weight,
+    int64_t num_blocks, int64_t write_idx, double eps, double out_eps, bool has_prefix,
     std::optional<std::string> template_, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-
-void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-
-void rocm_comms_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, double eps,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid);
-
-void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);
-
-void rocm_comms_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
-    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
-    double eps, double out_eps, bool has_prefix, std::optional<int64_t> quant_bits,
-    std::optional<std::string> template_, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid);

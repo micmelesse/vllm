@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // LAUNCH, NO DECISIONS: the peers' view of the input, then the kernel select named (its compiled
-// function from impl/dispatch.cuh) at its grid and block.
+// function from dispatch.cuh) at its grid and block.
 
 #pragma once
 
@@ -22,7 +22,8 @@ namespace impl {
 // is spelled out.
 template <typename... P, typename... A>
 void start(void (*kernel)(P...), const Kernel& k, hipStream_t stream, A&&... args) {
-  kernel<<<dim3(k.config.blocks_per_grid), dim3(k.config.threads_per_block), 0, stream>>>(
+  const LaunchConfig& l = launch_of(k.config);
+  kernel<<<dim3(l.blocks_per_grid), dim3(l.threads_per_block), 0, stream>>>(
       std::forward<A>(args)...);
 }
 

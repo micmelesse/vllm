@@ -31,45 +31,116 @@ from .base import (
     Communicator,
     Error,
     GemmTailArgs,
-    KernelConfig,
     NormArgs,
     Op,
     Options,
     Plan,
     ScaleAddArgs,
+    AllReduceConfig,
+    AttnResConfig,
+    AttnResPullConfig,
+    GemmConfig,
+    LaunchConfig,
+    RowConfig,
 )
 
 logger = logging.getLogger(__name__)
 
 
-_Wire = tuple[
-    int | None,
-    str | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-]
-
-
-def _wire(options: Options) -> _Wire:
-    """The options as our torch ops take them, their last eight values: a schema has no
-    struct, so the KernelConfig goes flat."""
-    c = options.kernel_config
+# EACH OP FAMILY'S FORCING, as its schemas take it last: the template by name, then that
+# family's own config fields (a schema has no struct), each None for select's or the
+# template's own.
+def _all_reduce_forcing(o: Options) -> tuple[str | None, int | None, int | None]:
+    c = o.kernel_config
     if c is None:
-        return options.quant_bits, options.template, None, None, None, None, None, None
-    return (
-        options.quant_bits,
-        options.template,
-        c.tile_m,
-        c.tile_n,
-        c.tile_k,
-        c.slice_k,
-        c.threads_per_block,
-        c.blocks_per_grid,
-    )
+        return o.template, None, None
+    assert isinstance(c, AllReduceConfig), c
+    return o.template, c.launch.threads_per_block, c.launch.blocks_per_grid
+
+
+def _row_forcing(o: Options) -> tuple[str | None, int | None, int | None, int | None]:
+    c = o.kernel_config
+    if c is None:
+        return o.template, None, None, None
+    assert isinstance(c, RowConfig), c
+    return o.template, c.tile_n, c.launch.threads_per_block, c.launch.blocks_per_grid
+
+
+def _attn_res_forcing(
+    o: Options,
+) -> tuple[str | None, int | None, int | None, int | None, int | None, int | None, int | None]:
+    c = o.kernel_config
+    if c is None:
+        return o.template, None, None, None, None, None, None
+    launch = c.launch
+    if isinstance(c, AttnResPullConfig):
+        return (o.template, c.tile_m, c.tile_n, c.tile_k, c.reduce_scatter_blocks,
+                launch.threads_per_block, launch.blocks_per_grid)
+    assert isinstance(c, AttnResConfig), c
+    return (o.template, None, c.tile_n, c.tile_k, None, launch.threads_per_block,
+            launch.blocks_per_grid)
+
+
+def _gemm_forcing(
+    o: Options,
+) -> tuple[str | None, int | None, int | None, int | None, int | None, int | None, int | None]:
+    c = o.kernel_config
+    if c is None:
+        return o.template, None, None, None, None, None, None
+    assert isinstance(c, GemmConfig), c
+    return (o.template, c.tile_m, c.tile_n, c.tile_k, c.slice_k,
+            c.launch.threads_per_block, c.launch.blocks_per_grid)
+
+
+# EACH OP FAMILY'S PLANNER ANSWER: the template and its config, or the Error's number.
+def _all_reduce_plan(got: tuple[str | None, int | None, int | None, int | None]) -> Plan | Error:
+    template, threads, blocks, err = got
+    if err is not None:
+        return Error(err)
+    assert template is not None and threads is not None and blocks is not None
+    return Plan(template, AllReduceConfig(LaunchConfig(threads, blocks)))
+
+
+def _row_plan(
+    got: tuple[str | None, int | None, int | None, int | None, int | None],
+) -> Plan | Error:
+    template, tile_n, threads, blocks, err = got
+    if err is not None:
+        return Error(err)
+    assert template is not None and threads is not None and blocks is not None
+    return Plan(template, RowConfig(LaunchConfig(threads, blocks), tile_n))
+
+
+def _attn_res_plan(
+    got: tuple[
+        str | None, int | None, int | None, int | None, int | None, int | None, int | None,
+        int | None,
+    ],
+) -> Plan | Error:
+    template, tile_m, tile_n, tile_k, reduce_scatter_blocks, threads, blocks, err = got
+    if err is not None:
+        return Error(err)
+    assert template is not None and threads is not None and blocks is not None
+    launch = LaunchConfig(threads, blocks)
+    if reduce_scatter_blocks is not None:
+        return Plan(
+            template,
+            AttnResPullConfig(launch, tile_m, tile_n, tile_k, reduce_scatter_blocks),
+        )
+    return Plan(template, AttnResConfig(launch, tile_n, tile_k))
+
+
+def _gemm_plan(
+    got: tuple[
+        str | None, int | None, int | None, int | None, int | None, int | None, int | None,
+        int | None,
+    ],
+) -> Plan | Error:
+    template, tile_m, tile_n, tile_k, slice_k, threads, blocks, err = got
+    if err is not None:
+        return Error(err)
+    assert template is not None and threads is not None and blocks is not None
+    return Plan(template, GemmConfig(LaunchConfig(threads, blocks), tile_m, tile_n, tile_k, slice_k))
 
 
 class HipCommunicator(Communicator):
@@ -124,38 +195,45 @@ class HipCommunicator(Communicator):
         options: Options,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
-        torch.ops._rocm_C.rocm_comms_all_reduce(self._handle, out, inp, *_wire(options))
+        torch.ops._rocm_C.rocm_comms_all_reduce(
+            self._handle, out, inp, *_all_reduce_forcing(options)
+        )
 
     def _plan(self, args: Args, options: Options) -> Plan | Error:
         """C++'s answer (`hip_comms::plan`): the op family's planner, handed the call's
         own tensors. Every rule about what our kernels run is there, none here."""
-        ops, wire = torch.ops._rocm_C, _wire(options)
+        ops = torch.ops._rocm_C
         if isinstance(args, AllReduceArgs):
-            got = ops.rocm_comms_plan_all_reduce(self._handle, args.inp, *wire)
-        elif isinstance(args, NormArgs):
-            got = ops.rocm_comms_plan_all_reduce_rms_norm(
-                self._handle, args.inp, args.weight, args.add, *wire
+            return _all_reduce_plan(
+                ops.rocm_comms_plan_all_reduce(
+                    self._handle, args.inp, *_all_reduce_forcing(options)
+                )
             )
-        elif isinstance(args, AttnResArgs):
-            got = ops.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
-                self._handle, args.inp, *wire
+        if isinstance(args, NormArgs):
+            return _row_plan(
+                ops.rocm_comms_plan_all_reduce_rms_norm(
+                    self._handle, args.inp, args.weight, args.add, *_row_forcing(options)
+                )
             )
-        elif isinstance(args, GemmTailArgs):
-            got = ops.rocm_comms_plan_all_reduce_rms_norm_gemm(
-                self._handle, args.inp, args.gemm_weight, args.add, *wire
+        if isinstance(args, AttnResArgs):
+            return _attn_res_plan(
+                ops.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
+                    self._handle, args.inp, *_attn_res_forcing(options)
+                )
             )
-        elif isinstance(args, ScaleAddArgs):
-            got = ops.rocm_comms_plan_all_reduce_rms_scale_add(
-                self._handle, args.inp, args.out, *wire
+        if isinstance(args, GemmTailArgs):
+            return _gemm_plan(
+                ops.rocm_comms_plan_all_reduce_rms_norm_gemm(
+                    self._handle, args.inp, args.gemm_weight, args.add, *_gemm_forcing(options)
+                )
             )
-        else:
-            raise AssertionError(f"{type(args).__name__} is an Args with no planner")
-        template, tile_m, tile_n, tile_k, slice_k, threads, blocks, err = got
-        if err is not None:
-            return Error(err)
-        return Plan(
-            template, KernelConfig(threads, blocks, tile_m, tile_n, tile_k, slice_k)
-        )
+        if isinstance(args, ScaleAddArgs):
+            return _row_plan(
+                ops.rocm_comms_plan_all_reduce_rms_scale_add(
+                    self._handle, args.inp, args.out, *_row_forcing(options)
+                )
+            )
+        raise AssertionError(f"{type(args).__name__} is an Args with no planner")
 
     def _all_reduce_rms_norm(
         self,
@@ -171,7 +249,7 @@ class HipCommunicator(Communicator):
             inp,
             weight,
             eps,
-            *_wire(options),
+            *_row_forcing(options),
         )
 
     def _all_reduce_rms_norm_gemm(
@@ -192,7 +270,7 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
-            *_wire(options),
+            *_gemm_forcing(options),
         )
 
     def _all_reduce_rms_norm_gemm_add(
@@ -213,7 +291,7 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
-            *_wire(options),
+            *_gemm_forcing(options),
         )
 
     def _all_reduce_rms_scale_add(
@@ -228,7 +306,7 @@ class HipCommunicator(Communicator):
             out,
             inp,
             eps,
-            *_wire(options),
+            *_row_forcing(options),
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -261,7 +339,7 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             has_prefix,
-            *_wire(options),
+            *_attn_res_forcing(options),
         )
 
     def _all_reduce_add_rms_norm(
@@ -283,7 +361,7 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
-            *_wire(options),
+            *_row_forcing(options),
         )
 
     def _on_close(self) -> None:

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <c10/util/BFloat16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -18,9 +19,12 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "build.cuh"
+#include "error.cuh"
+#include "kernels/all_reduce_pull_one_shot.cuh"
 #include "p2p/p2p.cuh"
 
 #define HIP_CHECK(expr)                                                     \
@@ -208,8 +212,8 @@ class Handle {
   }
 
   // A BUFFER AS THE GATHER CARRIES IT: its allocation's IPC handle, then its offset in that
-  // allocation. hipIpcGetMemHandle must be given an allocation's BASE, and a torch tensor sits at an
-  // offset inside one.
+  // allocation. hipIpcGetMemHandle must be given an allocation's BASE, and a torch tensor sits at
+  // an offset inside one.
   static std::string ipc_bytes(const void* ptr) {
     void* base = nullptr;
     HIP_CHECK(hipPointerGetAttribute(&base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
@@ -310,5 +314,37 @@ class Handle {
   std::unordered_map<std::string, void*> opened_;
   uint32_t flags_used_[p2p::kMaxRanks] = {};
 };
+
+// =================================================================================================
+// WHETHER A HANDLE CAN EXIST HERE (`supported`): whether the library runs on a device and world,
+// asked once before anything is opened. The build answers, not a list: a device with no code
+// object for our kernels is not built, and one that is but is not select's target would run on
+// another device's tuning.
+// =================================================================================================
+
+// WHAT THE LIBRARY RUNS ON, once `supported` finds it can: the device's arch, as HIP names it.
+struct Supported {
+  std::string arch;
+};
+
+inline std::variant<Supported, Error> supported(int device, int world) {
+  if (!world_built(world)) return Error::world_not_built;
+  hipDeviceProp_t prop;
+  if (hipGetDeviceProperties(&prop, device) != hipSuccess) return Error::device_not_built;
+  const std::string name = prop.gcnArchName;
+  const std::string arch = name.substr(0, name.find(':'));  // gfx950:sramecc+:xnack-
+  // A CODE OBJECT FOR THIS DEVICE: any of our kernels has one exactly when the build covered it.
+  int was = 0;
+  HIP_CHECK(hipGetDevice(&was));
+  HIP_CHECK(hipSetDevice(device));
+  hipFuncAttributes attrs;
+  const hipError_t found = hipFuncGetAttributes(
+      &attrs, reinterpret_cast<const void*>(all_reduce_pull_one_shot<c10::BFloat16, 2, false>));
+  (void)hipGetLastError();
+  HIP_CHECK(hipSetDevice(was));
+  if (found != hipSuccess) return Error::device_not_built;
+  if (arch != kTargetArch) return Error::device_not_tuned;
+  return Supported{arch};
+}
 
 }  // namespace hip_comms

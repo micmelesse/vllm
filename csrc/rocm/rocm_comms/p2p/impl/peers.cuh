@@ -21,7 +21,7 @@ namespace hip_comms::p2p {
 
 constexpr int kMaxRanks  = kMaxPeers;
 // ONE SIGNAL SLOT PER BLOCK THE HARDWARE CAN HOLD RESIDENT, on any target built: the signal block
-// never rules out a grid. Which grid is fast is select's (impl/select.cuh).
+// never rules out a grid. Which grid is fast is select's (select.cuh).
 constexpr int kMaxBlocks = kMaxResidentBlocks;
 
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
