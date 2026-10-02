@@ -19,8 +19,8 @@ namespace hip_comms {
 
 // This thread's share of dot(a, b) over the row, packs past its end counting zero: the partial a
 // block_reduce turns into the row's dot (a sum of squares is thread_dot(x, x)).
-template <int K, int N>
-DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const Fragment<K>& f) {
+template <int R, int K, int N>
+DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const Tile<R, K>& f) {
   float d = 0.0f;
 #pragma unroll
   for (int k = 0; k < K; ++k) {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE REDUCTIONS, by scope, each built on the one below: over the PEERS (a pack or a fragment
+// THE REDUCTIONS, by scope, each built on the one below: over the PEERS (a pack or a tile row
 // summed over every rank, fp32, rounded once, in rank order), over a WAVE (shuffles), over a BLOCK
 // (a wave's result, then one LDS pass). N values at once at every scope: each block pass is two
 // barriers and an LDS round trip, so a kernel with several reductions takes them together.

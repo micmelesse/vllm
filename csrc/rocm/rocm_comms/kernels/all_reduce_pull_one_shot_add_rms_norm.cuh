@@ -29,7 +29,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const auto f           = fragment<kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(packs);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);

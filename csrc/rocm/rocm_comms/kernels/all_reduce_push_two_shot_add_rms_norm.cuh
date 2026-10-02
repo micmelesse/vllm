@@ -39,7 +39,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto f           = fragment<kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(packs);
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);

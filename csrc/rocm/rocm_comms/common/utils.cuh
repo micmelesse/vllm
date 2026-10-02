@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE HELPERS every op and kernel uses: the pack (16 bytes, the unit everything loads, sums and
-// stores in) and the Fragment (a thread's packs of a row a block owns).
+// stores in) and the Tile (the rows a block works on at once, and a thread's packs of each).
 
 #pragma once
 
@@ -34,34 +34,37 @@ struct traits {
   using V = vec<T, N>;
 };
 
-// WHO HOLDS WHAT: a Fragment (CUTLASS's, CuTe's and rocWMMA's name for a thread's registers of a
-// distributed tile) is this thread's packs of a row a block owns. Its indices are clamped into the
-// row and a pack past its end is weighted zero (`in`), so nothing reading it branches: a load under
-// a runtime `if` cannot be hoisted past the branch, and loads meant to be in flight together then
-// wait one at a time.
+// WHO HOLDS WHAT: a Tile is the kRows rows a block works on at once, cut to `len` columns from
+// `first`, and this thread's kPacks packs of each, at the same columns in every row (CuTe's and
+// Triton's tile; the thread's share is CUTLASS's fragment). How a kernel cuts its work, by rows and
+// by columns, is its tile's shape. Its indices are clamped into the slice and a pack past its end is
+// weighted zero (`in`), so nothing reading it branches: a load under a runtime `if` cannot be
+// hoisted past the branch, and loads meant to be in flight together then wait one at a time.
 //
-// Packs threadIdx.x + k * blockDim.x, k < K, of a row `len` packs long: `at` clamped into the row,
-// `in` 1 for a pack inside it and 0 past its end.
-template <int K>
-struct Fragment {
-  int at[K];
-  float in[K];
+// Packs first + threadIdx.x + k * blockDim.x, k < kPacks: `at` clamped into the slice, `in` 1 for a
+// pack inside it and 0 past its end.
+template <int kRows, int kPacks>
+struct Tile {
+  static constexpr int rows  = kRows;
+  static constexpr int packs = kPacks;
+  int at[kPacks];
+  float in[kPacks];
 };
 
-template <int K>
-DINLINE Fragment<K> fragment(int len) {
-  Fragment<K> f;
+template <int kRows, int kPacks>
+DINLINE Tile<kRows, kPacks> tile(int len, int first = 0) {
+  Tile<kRows, kPacks> t;
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
+  for (int k = 0; k < kPacks; ++k) {
     const int i = threadIdx.x + k * blockDim.x;
-    f.at[k]     = i < len ? i : len - 1;
-    f.in[k]     = i < len ? 1.0f : 0.0f;
+    t.at[k]     = first + (i < len ? i : len - 1);
+    t.in[k]     = i < len ? 1.0f : 0.0f;
   }
-  return f;
+  return t;
 }
 
 // EVERY SOURCE'S PACKS IN REGISTERS: a pack from each of `ngpus` sources (the ranks), K of them a
-// source for a Fragment of a row. What peers_load issues and peers_reduce consumes, so a kernel
+// source for a row of a Tile. What peers_load issues and peers_reduce consumes, so a kernel
 // can start one row's loads and work on another's while they are in flight.
 template <typename T, int ngpus, int K = 1>
 struct PeerPacks {

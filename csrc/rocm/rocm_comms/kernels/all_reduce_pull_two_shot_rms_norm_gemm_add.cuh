@@ -26,7 +26,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
-  const auto f           = fragment<kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(packs);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.

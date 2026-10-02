@@ -28,17 +28,14 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto fl          = fragment<kRowPacks>(latent_packs);
+  const auto fl          = tile<1, kRowPacks>(latent_packs);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
-  // This (row, slice)'s packs of the hidden, in this thread's fragment.
+  // This (row, slice)'s tile of the hidden: one row cut to the slice's columns.
   const auto slice_of    = [&](int w) {
-    const int first        = (w % splits) * slice;
-    Fragment<kRowPacks> fh = fragment<kRowPacks>(min(slice, hidden_packs - first));
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) fh.at[k] += first;
-    return fh;
+    const int first = (w % splits) * slice;
+    return tile<1, kRowPacks>(min(slice, hidden_packs - first), first);
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
@@ -61,7 +58,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int first_row = p.rank * slice_rows;
   for (int w = blockIdx.x; w < rows_of(p.rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
-    const Fragment<kRowPacks> fh = slice_of(w);
+    const Tile<1, kRowPacks> fh = slice_of(w);
     const auto sh                = peers_load<T, ngpus>(shared, row, packs, fh);
     const auto pj                = peers_load<T, ngpus>(proj, row, packs, fh);
     const auto lt                = peers_load<T, ngpus>(latent, row, packs, fl);
@@ -100,7 +97,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    (row, slice)s of each. EVERY OWNER'S PACKS LOADED BEFORE ANY IS STORED. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read.
   for (int w = blockIdx.x; w < slice_rows * splits; w += gridDim.x) {
-    const Fragment<kRowPacks> fh = slice_of(w);
+    const Tile<1, kRowPacks> fh = slice_of(w);
     const int l                  = w / splits;
     V got[ngpus][kRowPacks];
 #pragma unroll

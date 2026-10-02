@@ -12,12 +12,12 @@
 namespace hip_comms {
 
 // ONE ROW OF ATTNRES, once the row's sum over the ranks is in `sum` (packs of this thread's
-// Fragment): the new prefix (written back, and to the block row when `written` is not null), the
+// Tile): the new prefix (written back, and to the block row when `written` is not null), the
 // softmax over the stored blocks and the prefix, and the output, normed when `out_norm_w` is given.
 // A block owns the row; every AttnRes kernel computes its rows with it, so the rounding is one.
 template <typename T, bool kPrefix, int kRowPacks>
 DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], int64_t base,
-                          const Fragment<kRowPacks>& f, typename traits<T>::V* pre,
+                          const Tile<1, kRowPacks>& f, typename traits<T>::V* pre,
                           typename traits<T>::V* written, const T* row_blocks,
                           int64_t block_stride_r, const T* __restrict__ norm_w,
                           const T* __restrict__ qk_w, const T* __restrict__ out_norm_w,

@@ -8,16 +8,17 @@
 //
 // utils.cuh         the helpers
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
-//   Fragment<K>, fragment<K>(len)   this thread's K packs of a row a block owns, clamped into it
+//   Tile<R, K>, tile<R, K>(len, first)   a block's R rows, cut to len columns from first, and
+//                                this thread's K packs of each, clamped into the slice
 //   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions
-//   thread_load(row, f, out), thread_store(row, f, v)   a Fragment: every load issued, stores
+//   thread_load(row, f, out), thread_store(row, f, v)   a Tile row: every load issued, stores
 //                                               only inside the row
 //   thread_load_uncached(p), thread_store_uncached(p, v)   one pack past every cache (system
 //                                               scope); no kernel uses them now
 //   peers_load<T, ngpus>(read, i), peers_load<T, ngpus>(read, row, packs, f)   every source's
-//                                               pack (or Fragment) in flight; waits at its use
+//                                               pack (or Tile row) in flight; waits at its use
 // elementwise.cuh
 //   thread_unpack(v, x), thread_pack(x)         a pack to fp32 and back, rounding once
 // reduce.cuh

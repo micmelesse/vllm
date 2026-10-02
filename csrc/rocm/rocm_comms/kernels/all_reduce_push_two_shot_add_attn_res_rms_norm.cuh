@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto f           = fragment<kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(packs);
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
