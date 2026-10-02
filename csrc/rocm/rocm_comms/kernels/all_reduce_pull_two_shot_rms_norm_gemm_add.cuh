@@ -14,9 +14,10 @@ namespace hip_comms {
 
 // Each rank reduces and norms the rows it owns into its scratch, row-major; after the sync
 // every rank copies every normed row into `workspace` ([rows, packs] of its own); a grid sync;
-// the GEMM over every row, kBuild.kernels.gemm_rows per pass. THE SAME BLOCK AND THREAD INDEX A
+// the GEMM over every row, TILE_M per pass. THE SAME BLOCK AND THREAD INDEX A
 // PACK IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK, bool kAdd>
+template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
+          int THREADS_PER_BLOCK, bool kAdd>
 DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
                                                          const T* __restrict__ norm_w, float eps,
                                                          const T* __restrict__ gemm_w, int n_cols,
@@ -103,37 +104,45 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
   p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
   block_stamp(5);
 
-  // 6. The GEMM over every row, kBuild.kernels.gemm_rows per pass.
-  for (int r0 = 0; r0 < rows; r0 += kBuild.kernels.gemm_rows) {
-    grid_gemm<kLanesPerCol, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
-                                     min(kBuild.kernels.gemm_rows, rows - r0), gemm_w, n_cols,
-                                     packs, out + r0 * out_stride, out_stride);
+  // 6. The GEMM over every row, TILE_M per pass.
+  for (int r0 = 0; r0 < rows; r0 += TILE_M) {
+    grid_gemm<TILE_M, TILE_K, SLICE_K, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
+                                                min(TILE_M, rows - r0), gemm_w, n_cols, packs,
+                                                out + r0 * out_stride, out_stride);
   }
   block_stamp(6);
 }
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
 // added into `out` (rms_norm_gemm_add).
-template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
+template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
+          int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_norm_gemm(p2p::DevComm p, const T* __restrict__ norm_w, float eps,
                                            const T* __restrict__ gemm_w, int n_cols,
                                            T* __restrict__ out, int64_t out_stride,
                                            T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, TILE_N, THREADS_PER_BLOCK,
-                                              false>(p, norm_w, eps, gemm_w, n_cols, out,
-                                                     out_stride, workspace, rows, packs);
+  if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
+    all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
+                                                THREADS_PER_BLOCK, false>(
+        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+  else
+    __builtin_trap();
 }
 
-template <typename T, int ngpus, int kLanesPerCol, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
+template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
+          int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_norm_gemm_add(p2p::DevComm p, const T* __restrict__ norm_w,
                                                float eps, const T* __restrict__ gemm_w, int n_cols,
                                                T* __restrict__ out, int64_t out_stride,
                                                T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, TILE_N, THREADS_PER_BLOCK,
-                                              true>(p, norm_w, eps, gemm_w, n_cols, out, out_stride,
-                                                    workspace, rows, packs);
+  if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
+    all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
+                                                THREADS_PER_BLOCK, true>(
+        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+  else
+    __builtin_trap();
 }
 
 }  // namespace hip_comms

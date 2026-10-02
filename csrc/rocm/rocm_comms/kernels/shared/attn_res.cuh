@@ -11,9 +11,9 @@
 
 namespace hip_comms {
 
-// A TILE OF ATTNRES, every AttnRes kernel's: the tile's TILE_M rows at once, so each source pays
-// ONE block reduction for every row of the tile, not one a row. Rounds as
-// `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
+// A TILE OF ATTNRES, every AttnRes kernel's: the tile's TILE_M rows at once, TILE_K sources a step
+// (the reduced dimension, Triton's BLOCK_L), so each step pays ONE block reduction for every row
+// and source of the tile. Rounds as `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
 //   d = float(T(sum over ranks)); u = kPrefix ? float(T(float(prefix) + d)) : d (the prefix)
 //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u
 //   m = softmax(logits) . sources, online, a tile of sources at a time; out = T(m), or
@@ -21,7 +21,8 @@ namespace hip_comms {
 // `sum[m]` is row offs_m + m's sum over the ranks; a row past M (the last tile's) reads row M - 1
 // and writes nothing, so every thread still reaches every reduction. `written(row)` is the block
 // row a row writes, or null.
-template <typename T, bool kPrefix, int TILE_M, int TILE_N, int kRowPacks, typename Written>
+template <typename T, bool kPrefix, int TILE_K, int TILE_M, int TILE_N, int kRowPacks,
+          typename Written>
 DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRowPacks],
                                  const Tile<TILE_M, TILE_N>& tile,
                                  const ThreadOffs<kRowPacks>& thread_cols,
@@ -32,7 +33,6 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
                                  int num_blocks, float eps, float out_eps, float inv_hidden) {
   using V = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  constexpr int kTile = kBuild.kernels.attn_res_sources;
   int64_t base[TILE_M];
   const T* row_blocks[TILE_M];
   bool live[TILE_M];
@@ -93,13 +93,13 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
 #pragma unroll
         for (int j = 0; j < NL; ++j) acc[m][k][j] = 0.0f;
     OnlineSoftmax softmax[TILE_M];
-    for (int src0 = 0; src0 <= num_blocks; src0 += kTile) {
-      float v[TILE_M][kTile][kRowPacks][NL];
-      float sums[TILE_M * 2 * kTile];
+    for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
+      float v[TILE_M][TILE_K][kRowPacks][NL];
+      float sums[TILE_M * 2 * TILE_K];
 #pragma unroll
       for (int m = 0; m < TILE_M; ++m)
 #pragma unroll
-        for (int s = 0; s < kTile; ++s) {
+        for (int s = 0; s < TILE_K; ++s) {
           const int src = src0 + s;
           if (src < num_blocks) {
             const V* at_src = reinterpret_cast<const V*>(row_blocks[m] + src * block_stride_r);
@@ -112,20 +112,20 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
 #pragma unroll
               for (int j = 0; j < NL; ++j) v[m][s][k][j] = src == num_blocks ? u[m][k][j] : 0.0f;
           }
-          sums[(m * kTile + s) * 2] = thread_dot(v[m][s], v[m][s], thread_cols);
-          sums[(m * kTile + s) * 2 + 1] = thread_dot(v[m][s], w, thread_cols);
+          sums[(m * TILE_K + s) * 2] = thread_dot(v[m][s], v[m][s], thread_cols);
+          sums[(m * TILE_K + s) * 2 + 1] = thread_dot(v[m][s], w, thread_cols);
         }
       block_reduce<Sum>(sums);
 #pragma unroll
       for (int m = 0; m < TILE_M; ++m) {
-        float logit[kTile];
+        float logit[TILE_K];
 #pragma unroll
-        for (int s = 0; s < kTile; ++s)
+        for (int s = 0; s < TILE_K; ++s)
           logit[s] = src0 + s <= num_blocks
-                         ? sums[(m * kTile + s) * 2 + 1] *
-                               rsqrtf(sums[(m * kTile + s) * 2] * inv_hidden + eps)
+                         ? sums[(m * TILE_K + s) * 2 + 1] *
+                               rsqrtf(sums[(m * TILE_K + s) * 2] * inv_hidden + eps)
                          : -INFINITY;
-        float scale[kTile];
+        float scale[TILE_K];
         const float old_scale = thread_softmax_fold(softmax[m], logit, scale);
 #pragma unroll
         for (int k = 0; k < kRowPacks; ++k)
@@ -133,7 +133,7 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
           for (int j = 0; j < NL; ++j) {
             float a = acc[m][k][j] * old_scale;
 #pragma unroll
-            for (int s = 0; s < kTile; ++s) a += scale[s] * v[m][s][k][j];
+            for (int s = 0; s < TILE_K; ++s) a += scale[s] * v[m][s][k][j];
             acc[m][k][j] = a;
           }
       }

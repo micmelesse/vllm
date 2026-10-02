@@ -33,64 +33,76 @@ DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N],
   return d;
 }
 
-// kBuild.kernels.gemm_rows and kBuild.kernels.gemm_chunk, the rows a pass and the K-chunk staged in
-// LDS, are build.cuh's. Its LDS: the staged chunk and a norm's block_reduce, plus one
-// [kBuild.kernels.gemm_rows][tile] float partial per wave, tile = kWaveSize / lanes columns. The
-// device decides how many waves that allows.
-constexpr int64_t kGemmLdsFixed =
-    int64_t{kBuild.kernels.gemm_rows} * kBuild.kernels.gemm_chunk * kBuild.memory.pack_bytes +
-    block_reduce_lds_bytes(1);
-constexpr int64_t gemm_lds_per_wave(int lanes_per_col) {
-  return int64_t{kBuild.kernels.gemm_rows} * (kWaveSize / lanes_per_col) * sizeof(float);
+// THE GEMM TAIL'S LDS, for its tile: a TILE_M x TILE_K chunk of x staged, a norm's block_reduce,
+// and a [TILE_M][wave / SLICE_K] fp32 partial per wave. The device decides how many waves fit.
+constexpr int64_t gemm_lds_fixed(int tile_m, int tile_k) {
+  return int64_t{tile_m} * tile_k * kBuild.memory.pack_bytes + block_reduce_lds_bytes(1);
 }
-constexpr int gemm_max_waves(int lanes_per_col) {
-  const int fit = lds_max_waves(kDevice, kGemmLdsFixed, gemm_lds_per_wave(lanes_per_col));
+constexpr int64_t gemm_lds_per_wave(const Hardware& hw, int tile_m, int slice_k) {
+  return int64_t{tile_m} * (hw.wave_size / slice_k) * sizeof(float);
+}
+constexpr int gemm_max_waves(const Hardware& hw, int tile_m, int tile_k, int slice_k) {
+  const int fit =
+      lds_max_waves(hw, gemm_lds_fixed(tile_m, tile_k), gemm_lds_per_wave(hw, tile_m, slice_k));
   return fit < kBuild.kernels.max_waves ? fit : kBuild.kernels.max_waves;
 }
-constexpr int gemm_max_threads(int lanes_per_col) {
-  return gemm_max_waves(lanes_per_col) * kWaveSize;
+constexpr int gemm_max_threads(const Hardware& hw, int tile_m, int tile_k, int slice_k) {
+  return gemm_max_waves(hw, tile_m, tile_k, slice_k) * hw.wave_size;
 }
-static_assert(gemm_max_waves(1) >= kBuild.kernels.max_waves,
-              "the GEMM tail holds the widest block at every lane split");
+// Whether a GEMM-tail config fits `hw`: its block's waves and their partials in LDS beside the
+// staged chunk. A config built for the tuning target that `hw` cannot hold compiles to a trap there
+// (check refuses it first: a device that is not the target is never tuned, `supported`).
+constexpr bool gemm_fits(const Hardware& hw, int tile_m, int tile_k, int slice_k, int threads) {
+  return gemm_lds_fixed(tile_m, tile_k) < hw.lds_bytes &&
+         threads <= gemm_max_threads(hw, tile_m, tile_k, slice_k);
+}
+// THE LARGEST TILE_K THE LDS STAGES at `tile_m` rows: what `hw` holds beside the widest block's
+// partials at one lane a column (the most a split gives) and a block_reduce's.
+constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
+  const int64_t partials = int64_t{kBuild.kernels.max_waves} * tile_m * hw.wave_size * 4;
+  const int64_t reduce = (int64_t{kBuild.kernels.max_waves} + 1) * 4;
+  return static_cast<int>((hw.lds_bytes - partials - reduce) /
+                          (int64_t{tile_m} * kBuild.memory.pack_bytes));
+}
 
 // out[r, n] = T(sum_k x[r][k] * w[n][k]), or with kAccumulate
-// T(float(out[r, n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= kBuild.kernels.gemm_rows,
+// T(float(out[r, n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= TILE_M,
 // the sum in fp32 and rounded once. `row(r)` points at row r of x, wherever it lives.
 //
-// x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
+// x is staged in LDS TILE_K packs at a time (coalesced, once per block per chunk), so the hot
 // loop's row reads are LDS reads, not a global round trip per K-step.
 //
 // A SKINNY GEMM: a lane keeps one column's row sums in registers; K is split over the
-// kLanesPerCol lanes of a column (the build's gemm_lanes) and over the waves of the
+// SLICE_K lanes of a column (CUTLASS's sliced-K) and over the waves of the
 // block; shuffles and an LDS pass add the splits; blocks stride over tiles of
-// kWaveSize / kLanesPerCol columns. A column's lanes read adjacent packs of its weight row.
+// kWaveSize / SLICE_K columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <int kLanesPerCol, bool kAccumulate, typename T, typename Row>
+template <int TILE_M, int TILE_K, int SLICE_K, bool kAccumulate, typename T, typename Row>
 DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
-                  T* __restrict__ out, int64_t out_stride) {
+                       T* __restrict__ out, int64_t out_stride) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
-  constexpr int kTile = kWaveSize / kLanesPerCol;
-  static_assert(kTile * kLanesPerCol == kWaveSize, "a column's lanes must divide a wave");
-  __shared__ float partial[gemm_max_waves(kLanesPerCol)][kBuild.kernels.gemm_rows][kTile];
-  __shared__ V xs[kBuild.kernels.gemm_rows][kBuild.kernels.gemm_chunk];
+  constexpr int kTile = kWaveSize / SLICE_K;
+  static_assert(kTile * SLICE_K == kWaveSize, "a column's lanes must divide a wave");
+  __shared__ float partial[gemm_max_waves(kDevice, TILE_M, TILE_K, SLICE_K)][TILE_M][kTile];
+  __shared__ V xs[TILE_M][TILE_K];
   const int lane   = threadIdx.x % kWaveSize;
   const int wave   = threadIdx.x / kWaveSize;
   const int waves  = blockDim.x / kWaveSize;
   const int column = lane % kTile;
-  const int splits = waves * kLanesPerCol;
-  const int split  = wave * kLanesPerCol + lane / kTile;
+  const int splits = waves * SLICE_K;
+  const int split = wave * SLICE_K + lane / kTile;
   const V* wv      = reinterpret_cast<const V*>(gemm_w);
   const int tiles  = (n_cols + kTile - 1) / kTile;
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
     const int n   = tile * kTile + column;
     const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
-    float acc[kBuild.kernels.gemm_rows];
+    float acc[TILE_M];
 #pragma unroll
-    for (int r = 0; r < kBuild.kernels.gemm_rows; ++r) acc[r] = 0.0f;
-    for (int k0 = 0; k0 < packs; k0 += kBuild.kernels.gemm_chunk) {
-      const int chunk = min(kBuild.kernels.gemm_chunk, packs - k0);
+    for (int r = 0; r < TILE_M; ++r) acc[r] = 0.0f;
+    for (int k0 = 0; k0 < packs; k0 += TILE_K) {
+      const int chunk = min(TILE_K, packs - k0);
       // Rows past `rows` are never staged; their sums read stale LDS and are never stored.
       for (int i = threadIdx.x; i < rows * chunk; i += blockDim.x)
         xs[i / chunk][i % chunk] = row(i / chunk)[k0 + i % chunk];
@@ -101,7 +113,7 @@ DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_co
 #pragma unroll
         for (int j = 0; j < NL; ++j) w[j] = static_cast<float>(wx.d[j]);
 #pragma unroll
-        for (int r = 0; r < kBuild.kernels.gemm_rows; ++r) {
+        for (int r = 0; r < TILE_M; ++r) {
           const V xr = xs[r][k];
 #pragma unroll
           for (int j = 0; j < NL; ++j) acc[r] += static_cast<float>(xr.d[j]) * w[j];
@@ -112,16 +124,16 @@ DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_co
     }
     // A column's lanes are kTile apart in the wave.
 #pragma unroll
-    for (int r = 0; r < kBuild.kernels.gemm_rows; ++r)
+    for (int r = 0; r < TILE_M; ++r)
 #pragma unroll
       for (int s = kTile; s < kWaveSize; s <<= 1)
         acc[r] += __shfl_xor(acc[r], s, kWaveSize);
     if (lane < kTile) {
 #pragma unroll
-      for (int r = 0; r < kBuild.kernels.gemm_rows; ++r) partial[wave][r][column] = acc[r];
+      for (int r = 0; r < TILE_M; ++r) partial[wave][r][column] = acc[r];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < kBuild.kernels.gemm_rows * kTile; i += blockDim.x) {
+    for (int i = threadIdx.x; i < TILE_M * kTile; i += blockDim.x) {
       const int r   = i / kTile;
       const int col = tile * kTile + i % kTile;
       if (r < rows && col < n_cols) {

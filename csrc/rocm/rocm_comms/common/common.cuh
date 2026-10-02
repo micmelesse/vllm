@@ -35,7 +35,7 @@
 //   thread_dot(a, b, thread_cols)                         this thread's share of a row's dot
 //   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
-//                                               with its geometry (kBuild.kernels.gemm_rows,
+//                                               with its tile (TILE_M rows, TILE_K, SLICE_K;
 //                                               gemm_max_threads)
 // softmax.cuh
 //   OnlineSoftmax, thread_softmax_fold(s, logit, scale)   a softmax a tile of logits at a time,

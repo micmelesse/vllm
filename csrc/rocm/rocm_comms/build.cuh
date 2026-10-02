@@ -80,10 +80,6 @@ struct BuildInfo {
   struct Kernels {
     int max_threads;              // the widest block, and every kernel's __launch_bounds__
     int max_waves;                // its waves
-    int gemm_rows;                // the GEMM tail's rows a pass
-    int gemm_chunk;               // the GEMM tail's K-chunk staged in LDS, in packs
-    int gemm_lanes;               // the GEMM tail's lanes a column, the one build of it
-    int attn_res_sources;         // AttnRes's sources a block_reduce, the one build of it
     int attn_res_reduce_blocks;   // its pull two-shot's blocks that run the reduce-scatter
     double sync_timeout_seconds;  // how long a kernel waits on a peer before it traps
   };
@@ -123,22 +119,6 @@ constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
   b.max_waves = b.max_threads / hw.wave_size;
 
-  // Policy: THE GEMM TAIL SUMS 16 ROWS A PASS, one fp32 accumulator a row in each lane; more rows
-  // loop over passes.
-  b.gemm_rows = 16;
-
-  // THE GEMM TAIL'S K-CHUNK IS WHAT LDS HOLDS beside the rest of the block's: the widest block's
-  // [gemm_rows][wave_size] fp32 partials (one lane a column, the most partials a split gives) and a
-  // block_reduce's (one value per wave, plus the total).
-  const int waves           = b.max_threads / hw.wave_size;
-  const int64_t partials    = int64_t{waves} * b.gemm_rows * hw.wave_size * 4;
-  const int64_t reduce      = (int64_t{waves} + 1) * 4;
-  b.gemm_chunk =
-      static_cast<int>((hw.lds_bytes - partials - reduce) / (int64_t{b.gemm_rows} * m.pack_bytes));
-
-  // THE GEMM TAIL'S LANES A COLUMN, as measured: a template parameter, so one build, not four.
-  b.gemm_lanes = cal.gemm_lanes_per_col;
-  b.attn_res_sources = cal.attn_res_sources_per_reduce;
   b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
   // HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
   b.sync_timeout_seconds = 10.0;
@@ -151,9 +131,6 @@ constexpr BuildInfo kBuild = derive(kDevice, kTargetCalibration);
 static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
                   kBuild.kernels.max_threads % kWaveSize == 0,
               "the block limit must be whole waves the device can launch");
-static_assert(kBuild.kernels.gemm_lanes == 1 || kBuild.kernels.gemm_lanes == 2 ||
-                  kBuild.kernels.gemm_lanes == 4 || kBuild.kernels.gemm_lanes == 8,
-              "the GEMM tail splits a wave's lanes over its columns: 1, 2, 4 or 8");
 // Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
 // device's LDS holds, and no more than the block limit.
 constexpr int lds_max_waves(const Hardware& hw, int64_t fixed, int64_t per_wave) {

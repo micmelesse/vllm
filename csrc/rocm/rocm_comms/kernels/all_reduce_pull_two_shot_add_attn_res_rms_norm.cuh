@@ -21,7 +21,8 @@ namespace hip_comms {
 // ITS OWN GRID: the reduce-scatter on a few blocks (reads), AttnRes on all of them (compute a
 // row), so a world barrier between them. `blocks` is [rows, num_sources, hidden] with row and
 // source strides in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
+template <typename T, int ngpus, bool kPrefix, int TILE_M, int TILE_N, int TILE_K,
+          int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
@@ -103,9 +104,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
             p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + thread_cols.offs_n[k]);
       }
     }
-    block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,
-                                    block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps,
-                                    out_eps, inv_hidden);
+    block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
+                                            block_stride_m, block_stride_r, norm_w, qk_w,
+                                            out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
   block_stamp(4);
 }

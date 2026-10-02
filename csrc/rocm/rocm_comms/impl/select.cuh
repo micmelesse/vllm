@@ -70,52 +70,47 @@ constexpr int64_t tile_cols(const Args& a) {
   return hidden_of(a);
 }
 constexpr int64_t tile_cols(const ScaleAddArgs& a) { return a.latent; }
-// A FORCED LAUNCH'S TILE: one row, the smallest built TILE_N covering the call's columns at
-// `threads`, or 0 when none does (check refuses it).
+// A LAUNCH AT `threads`: the template's default tile (impl/templates.cuh's tile_for) covering the
+// call's columns, at `blocks` cut to the rows where it gives each block a row.
 template <typename Args>
-constexpr int tile_n_of(Template t, const Args& a, int threads) {
-  return tile_n_for(t, tile_cols(a), 1, threads);
+constexpr KernelConfig config_at(Template t, const Args& a, int blocks, int threads, int world) {
+  KernelConfig c = tile_for(t, tile_cols(a), threads);
+  c.blocks_per_grid = grid_of(t, blocks, rows_of(a), world);
+  return c;
 }
-// THE KERNEL: template `t` at `blocks` x `threads` with its arguments and tile from the call, its
-// grid cut to the rows where it gives each block a row.
+// THE KERNEL: template `t` at `blocks` x `threads` with its arguments and tile from the call.
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AllReduceArgs& a,
                             int world) {
   return {t, AllReduceTemplateArgs{world, a.dtype, false},
-          KernelConfig{0, 0, threads, grid_of(t, blocks, rows_of(a), world)}};
+          KernelConfig{0, 0, 0, 0, threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs& a, int world) {
-  return {
-      t, NormTemplateArgs{world, a.dtype, a.weight_dtype},
-      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
+  return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype},
+          config_at(t, a, blocks, threads, world)};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResArgs& a,
                             int world) {
-  return {
-      t, AttnResTemplateArgs{world, a.dtype, a.has_prefix},
-      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
+  return {t, AttnResTemplateArgs{world, a.dtype, a.has_prefix},
+          config_at(t, a, blocks, threads, world)};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
                             int world) {
-  const int lanes = kBuild.kernels.gemm_lanes;
-  return {
-      t, GemmTemplateArgs{world, a.dtype, lanes},
-      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
+  return {t, GemmTemplateArgs{world, a.dtype}, config_at(t, a, blocks, threads, world)};
 }
 // THE ONE-ALL-REDUCE TAIL: a block holds the whole latent (its build) and a slice of the hidden
 // as wide, so a row takes `splits` blocks.
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddArgs& a,
                             int world) {
   const int e = elem_bytes(a.dtype);
-  const int tile_n = tile_n_of(t, a, threads);
-  const int64_t span = tile_n > 0 ? tile_n * e / kBuild.memory.pack_bytes : threads;
+  KernelConfig c = tile_for(t, tile_cols(a), threads);
+  const int64_t span = c.tile_n > 0 ? c.tile_n * e / kBuild.memory.pack_bytes : threads;
   const int64_t hp = a.hidden * e / kBuild.memory.pack_bytes;
   const int splits = static_cast<int>((hp + span - 1) / span);
   // A block a (row, slice): every row's in the one-shot, this rank's in the two-shot.
   const int64_t mine = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
   const int64_t work = mine * splits;
-  return {t, ScaleAddTemplateArgs{world, a.dtype, splits},
-          KernelConfig{1, tile_n, threads,
-                       static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks)}};
+  c.blocks_per_grid = static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks);
+  return {t, ScaleAddTemplateArgs{world, a.dtype, splits}, c};
 }
 
 // THE KERNEL AT ITS TEMPLATE'S DEFAULT: the first of its configs whose tile covers the call, at
@@ -128,6 +123,8 @@ constexpr Kernel kernel_for(Template t, const Args& a, int world) {
   Kernel k = kernel_for(t, d.blocks_per_grid, d.threads_per_block, a, world);
   k.config.tile_m = d.tile_m;
   k.config.tile_n = c ? d.tile_n : 0;
+  k.config.tile_k = d.tile_k;
+  k.config.slice_k = d.slice_k;
   return k;
 }
 
@@ -295,8 +292,12 @@ constexpr Kernel select(const Args& a, int world, const Options& o) {
                : kernel_for(*o.fn, k.config.blocks_per_grid, k.config.threads_per_block, a, world);
   const KernelConfig& launch = *o.kernel_config;
   k = kernel_for(*o.fn, launch.blocks_per_grid, launch.threads_per_block, a, world);
-  if (o.kernel_config && o.kernel_config->tile_m > 0) k.config.tile_m = o.kernel_config->tile_m;
-  if (o.kernel_config && o.kernel_config->tile_n > 0) k.config.tile_n = o.kernel_config->tile_n;
+  // A forced field of 0 is the template's own.
+  const KernelConfig& f = launch;
+  if (f.tile_m > 0) k.config.tile_m = f.tile_m;
+  if (f.tile_n > 0) k.config.tile_n = f.tile_n;
+  if (f.tile_k > 0) k.config.tile_k = f.tile_k;
+  if (f.slice_k > 0) k.config.slice_k = f.slice_k;
   return k;
 }
 

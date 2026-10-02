@@ -15,7 +15,7 @@ namespace hip_comms {
 // A block owns a row, as the fused norm does: every rank reduces every row, so there is
 // nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
 // in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix, int TILE_N, int THREADS_PER_BLOCK>
+template <typename T, int ngpus, bool kPrefix, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
@@ -48,9 +48,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const Tile<1, TILE_N> tile{rows, cols, row, 0};
     V sum[1][kRowPacks];
     peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum[0]);
-    block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,
-                                    block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps,
-                                    out_eps, inv_hidden);
+    block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
+                                            block_stride_m, block_stride_r, norm_w, qk_w,
+                                            out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.

@@ -63,13 +63,16 @@ State = Literal["disabled", "open", "capturing", "closed"]
 @dataclass(frozen=True)
 class KernelConfig:
     """HOW A KERNEL IS TILED AND LAUNCHED, C++'s `hip_comms::KernelConfig` (Triton's autotune
-    config): TILE_M rows x TILE_N columns a tile, the threads a block, the blocks a grid. Forced,
-    a tile_m or tile_n left None is the template's own tile for the call."""
+    config): TILE_M rows x TILE_N columns a tile, TILE_K of the reduced dimension (the GEMM's K
+    a pass, AttnRes's sources a step), SLICE_K lanes splitting one output's K, the threads a
+    block, the blocks a grid. Forced, a tile field left None is the template's own."""
 
     threads_per_block: int
     blocks_per_grid: int
     tile_m: int | None = None
     tile_n: int | None = None
+    tile_k: int | None = None
+    slice_k: int | None = None
 
 
 @dataclass(frozen=True)

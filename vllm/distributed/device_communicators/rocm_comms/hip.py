@@ -42,20 +42,31 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-_Wire = tuple[int | None, str | None, int | None, int | None, int | None, int | None]
+_Wire = tuple[
+    int | None,
+    str | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+]
 
 
 def _wire(options: Options) -> _Wire:
-    """The options as our torch ops take them, their last six values: a schema has no
+    """The options as our torch ops take them, their last eight values: a schema has no
     struct, so the KernelConfig goes flat."""
     c = options.kernel_config
     if c is None:
-        return options.quant_bits, options.template, None, None, None, None
+        return options.quant_bits, options.template, None, None, None, None, None, None
     return (
         options.quant_bits,
         options.template,
         c.tile_m,
         c.tile_n,
+        c.tile_k,
+        c.slice_k,
         c.threads_per_block,
         c.blocks_per_grid,
     )
@@ -139,11 +150,11 @@ class HipCommunicator(Communicator):
             )
         else:
             raise AssertionError(f"{type(args).__name__} is an Args with no planner")
-        template, tile_m, tile_n, threads_per_block, blocks_per_grid, err = got
+        template, tile_m, tile_n, tile_k, slice_k, threads, blocks, err = got
         if err is not None:
             return Error(err)
         return Plan(
-            template, KernelConfig(threads_per_block, blocks_per_grid, tile_m, tile_n)
+            template, KernelConfig(threads, blocks, tile_m, tile_n, tile_k, slice_k)
         )
 
     def _all_reduce_rms_norm(

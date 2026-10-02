@@ -122,7 +122,6 @@ struct AttnResTemplateArgs {
 struct GemmTemplateArgs {
   int world;
   DType dtype;
-  int lanes;  // grid_gemm's lanes a column
 };
 // `splits`: the slices of a row's hidden, a block each.
 struct ScaleAddTemplateArgs {
@@ -134,12 +133,16 @@ using TemplateArgs = std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnR
                                   GemmTemplateArgs, ScaleAddTemplateArgs>;
 
 // HOW A KERNEL IS TILED AND LAUNCHED, Triton's autotune config: the tile (TILE_M rows x TILE_N
-// columns, in elements; tile_n 0 when no build holds the call's row, which check refuses), the
-// block's threads (THREADS_PER_BLOCK, Triton's num_warps x 64) and the grid. A row kernel compiles
-// its tile and threads in; the plain all-reduce has no tile (tile_m and tile_n 0).
+// columns in elements, tile_n 0 when no build holds the call's row, which check refuses; TILE_K of
+// the reduced dimension, the GEMM's K a pass or AttnRes's sources a step; SLICE_K lanes splitting
+// one output's K, CUTLASS's sliced-K), the block's threads (Triton's num_warps x 64) and the grid.
+// A row kernel compiles all but the grid in; a field its kernel does not have is 0, and the plain
+// all-reduce has no tile.
 struct KernelConfig {
   int tile_m;
   int tile_n;
+  int tile_k;
+  int slice_k;
   int threads_per_block;
   int blocks_per_grid;
 };

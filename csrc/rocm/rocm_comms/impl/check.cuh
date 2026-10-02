@@ -68,7 +68,8 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
       k.config.threads_per_block % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
   if (o.quant_bits) return Error::quantized_not_built;
-  if (gemms(op_of(a)) && k.config.threads_per_block > gemm_max_threads(kBuild.kernels.gemm_lanes))
+  if (gemms(op_of(a)) && !gemm_fits(kTarget, k.config.tile_m, k.config.tile_k, k.config.slice_k,
+                                    k.config.threads_per_block))
     return Error::block_exceeds_lds;
   if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
     return Error::scratch_too_small;
