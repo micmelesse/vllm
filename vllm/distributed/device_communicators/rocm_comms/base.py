@@ -98,6 +98,7 @@ class Error(IntEnum):
     no_such_template = 21
     no_such_group = 22
     ranks_disagree = 23
+    groups_disagree = 24
 
 
 # C++'s `DType` names, as torch's dtypes.

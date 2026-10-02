@@ -197,8 +197,9 @@ enum class Error : int {
   no_such_template          = 21,
   no_such_group             = 22,
   ranks_disagree            = 23,
+  groups_disagree           = 24,
 };
-constexpr int kNumErrors = 24;
+constexpr int kNumErrors = 25;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -240,6 +241,8 @@ constexpr const char* to_string(Error e) {
     case Error::no_such_group: return "no_such_group: no process group is registered by that name";
     case Error::ranks_disagree:
       return "ranks_disagree: the ranks captured different numbers of buffers";
+    case Error::groups_disagree:
+      return "groups_disagree: the CPU and device groups differ in size or in this rank";
   }
   return "unknown";
 }

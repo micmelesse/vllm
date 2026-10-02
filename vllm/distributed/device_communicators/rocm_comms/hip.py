@@ -66,14 +66,16 @@ class HipCommunicator(Communicator):
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        # THE PEER MEMORY, made, sized and owned by C++, which also gathers every rank's
-        # IPC handle over the CPU group (by its name, a collective) and opens them.
-        handle, err = torch.ops._rocm_C.rocm_comms_open(self.cpu_group.group_name)
+        # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
+        # device and gathers every rank's IPC handle over the CPU group (a collective).
+        handle, err = torch.ops._rocm_C.rocm_comms_open(
+            self.cpu_group.group_name, self.device_group.group_name, self.device.index
+        )
         if err is not None:
             logger.info("HipCommunicator disabled: %s", Error(err).name)
             return False
         self._handle = handle
-        logger.info("HipCommunicator ready over %d ranks", self.world_size)
+        logger.info("HipCommunicator ready")
         return True
 
     @contextmanager

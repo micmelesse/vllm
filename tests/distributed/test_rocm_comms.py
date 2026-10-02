@@ -1843,7 +1843,7 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     # example-based: the lookup has one outcome for every unregistered name
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
-    handle, err = torch.ops._rocm_C.rocm_comms_open("no-such-group")
+    handle, err = torch.ops._rocm_C.rocm_comms_open("no-such", "no-such", 0)
     assert handle is None and Error(err) is Error.no_such_group
 
 

@@ -286,16 +286,22 @@ PlanWire rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr, const torch
                  quant_bits, template_, launch_blocks, launch_threads);
 }
 
-// THE COMMUNICATOR OPENED over the process group named `group`, a collective: this rank's
-// symmetric memory, made and owned here, its handle gathered with every rank's, and the peers'
-// opened. A torch op cannot return a variant, so it is two optionals and exactly one is set, the
-// handle or the Error's number.
-OpenWire rocm_comms_open(const std::string& group) {
-  const auto pg = resolved(group);
-  if (!pg) return {std::nullopt, static_cast<int64_t>(hip_comms::Error::no_such_group)};
+// THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
+// handles) and `device_group`, a collective: this rank's symmetric memory, made and owned here, its
+// handle gathered with every rank's, and the peers' opened. A torch op cannot return a variant, so
+// it is two optionals and exactly one is set, the handle or the Error's number.
+OpenWire rocm_comms_open(const std::string& cpu_group, const std::string& device_group,
+                         int64_t device) {
+  const auto refused = [](hip_comms::Error e) {
+    return OpenWire{std::nullopt, static_cast<int64_t>(e)};
+  };
+  const auto pg = resolved(cpu_group), dg = resolved(device_group);
+  if (!pg || !dg) return refused(hip_comms::Error::no_such_group);
+  if ((*pg)->getSize() != (*dg)->getSize() || (*pg)->getRank() != (*dg)->getRank())
+    return refused(hip_comms::Error::groups_disagree);
   const int world = (*pg)->getSize();
-  if (!hip_comms::built_in(hip_comms::kWorldsBuilt, world))
-    return {std::nullopt, static_cast<int64_t>(hip_comms::Error::world_not_built)};
+  const auto ok   = hip_comms::supported(static_cast<int>(device), world);
+  if (const auto* e = std::get_if<hip_comms::Error>(&ok)) return refused(*e);
   const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes,
                                                        hip_comms::kStagingBytes);
   std::vector<std::string> handles;

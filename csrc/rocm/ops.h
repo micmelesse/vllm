@@ -56,9 +56,10 @@ void paged_attention(
 // stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
 using fptr_t = int64_t;
 
-// Opened over the process group named `group`, a collective: the IPC handles go round in C++.
+// Opened on `device` over the process groups named `cpu_group` and `device_group`, a collective:
+// the handle or the Error's number. The IPC handles go round in C++.
 std::tuple<std::optional<int64_t>, std::optional<int64_t>> rocm_comms_open(
-    const std::string& group);
+    const std::string& cpu_group, const std::string& device_group, int64_t device);
 // The buffers a capture recorded, registered over `group`, a collective.
 void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group);
 // The probe, every rank together: the round trip to each peer (ns), then GB/s pulled from one
