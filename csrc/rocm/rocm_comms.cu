@@ -191,14 +191,26 @@ std::vector<std::string> rocm_comms_error_names() {
   return names;
 }
 
-// SUPPORT AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
+// SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
 // exactly one is set, the arch or the Error's number.
-std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_support(int64_t device,
-                                                                                  int64_t world) {
-  const auto got = hip_comms::support(static_cast<int>(device), static_cast<int>(world));
+using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
+using BuildInfoWire = std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t>;
+
+SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
+  const auto got = hip_comms::supported(static_cast<int>(device), static_cast<int>(world));
   if (const auto* e = std::get_if<hip_comms::Error>(&got))
     return {std::nullopt, static_cast<int64_t>(*e)};
-  return {std::get<hip_comms::Support>(got).arch, std::nullopt};
+  return {std::get<hip_comms::Supported>(got).arch, std::nullopt};
+}
+
+// WHAT THE BUILD HOLDS: its dtypes by name, its worlds, a pack's bytes and a staging's.
+BuildInfoWire rocm_comms_build_info() {
+  std::vector<std::string> dtypes;
+  for (const hip_comms::DType d : hip_comms::kDTypesBuilt)
+    dtypes.push_back(hip_comms::to_string(d));
+  const auto& w = hip_comms::kWorldsBuilt;
+  std::vector<int64_t> worlds(std::begin(w), std::end(w));
+  return {dtypes, worlds, hip_comms::kPackBytes, hip_comms::kStagingBytes};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }

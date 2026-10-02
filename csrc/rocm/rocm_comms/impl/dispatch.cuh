@@ -56,23 +56,39 @@ using constant = std::integral_constant<int, N>;
   throw std::runtime_error("hip_comms: " + what + " not built");
 }
 
+// THE C++ TYPE OF A BUILT DTYPE.
+template <DType D>
+struct of_dtype;
+template <>
+struct of_dtype<DType::f16> {
+  using t = c10::Half;
+};
+template <>
+struct of_dtype<DType::bf16> {
+  using t = c10::BFloat16;
+};
+
+// OVER THE BUILT LISTS (kWorldsBuilt, kDTypesBuilt), so what is compiled is what they say.
+template <typename F, size_t... I>
+void by_world_in(int world, F& f, std::index_sequence<I...>) {
+  if (!((world == kWorldsBuilt[I] && (f(constant<kWorldsBuilt[I]>{}), true)) || ...))
+    not_built("world size " + std::to_string(world));
+}
+
 template <typename F>
 void by_world(int world, F&& f) {
-  switch (world) {
-    case 2: return f(constant<2>{});
-    case 4: return f(constant<4>{});
-    case 8: return f(constant<8>{});
-    default: not_built("world size " + std::to_string(world));
-  }
+  by_world_in(world, f, std::make_index_sequence<sizeof(kWorldsBuilt) / sizeof(int)>{});
+}
+
+template <typename F, size_t... I>
+void by_dtype_in(DType d, F& f, std::index_sequence<I...>) {
+  if (!((d == kDTypesBuilt[I] && (f(type<typename of_dtype<kDTypesBuilt[I]>::t>{}), true)) || ...))
+    not_built("dtype");
 }
 
 template <typename F>
 void by_dtype(DType d, F&& f) {
-  switch (d) {
-    case DType::f16: return f(type<c10::Half>{});
-    case DType::bf16: return f(type<c10::BFloat16>{});
-    default: not_built("dtype");
-  }
+  by_dtype_in(d, f, std::make_index_sequence<sizeof(kDTypesBuilt) / sizeof(DType)>{});
 }
 
 // A norm's weight: T itself, or fp32.

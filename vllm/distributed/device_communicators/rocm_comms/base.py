@@ -9,6 +9,7 @@ share -- the abstract surface `CudaCommunicator` calls, and the admission checks
 decide whether a tensor is one of ours at all.
 """
 
+import functools
 import logging
 import warnings
 from abc import ABC, abstractmethod
@@ -82,18 +83,51 @@ class Error(IntEnum):
     device_not_tuned = 19
 
 
+# C++'s `DType` names, as torch's dtypes.
+_DTYPES: Mapping[str, torch.dtype] = {
+    "f16": torch.float16,
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+}
+
+
 @dataclass(frozen=True)
-class Support:
-    """What the library runs on, once `support` finds it can: the device's arch."""
+class BuildInfo:
+    """What the build holds, the same on every device (C++'s `kDTypesBuilt`,
+    `kWorldsBuilt`, `kPackBytes`, `kStagingBytes`)."""
+
+    dtypes: frozenset[torch.dtype]
+    worlds: frozenset[int]
+    pack_bytes: int
+    staging_bytes: int
+
+
+@functools.cache
+def build_info() -> BuildInfo:
+    """The build's facts, read once: they are fixed when it is compiled."""
+    dtypes, worlds, pack_bytes, staging_bytes = (
+        torch.ops._rocm_C.rocm_comms_build_info()
+    )
+    return BuildInfo(
+        frozenset(_DTYPES[d] for d in dtypes),
+        frozenset(worlds),
+        pack_bytes,
+        staging_bytes,
+    )
+
+
+@dataclass(frozen=True)
+class Supported:
+    """What the library runs on, once `supported` finds it can: the device's arch."""
 
     arch: str
 
 
-def support(device: torch.device, world: int) -> Support | Error:
+def supported(device: torch.device, world: int) -> Supported | Error:
     """Whether our kernels run on `device` in a world of `world`, as the C++ build
-    answers it (`hip_comms::support`): the Support, or the Error."""
-    arch, err = torch.ops._rocm_C.rocm_comms_support(device.index, world)
-    return Error(err) if err is not None else Support(arch)
+    answers it (`hip_comms::supported`): the Supported, or the Error."""
+    arch, err = torch.ops._rocm_C.rocm_comms_supported(device.index, world)
+    return Error(err) if err is not None else Supported(arch)
 
 
 # EACH OP'S IMPLEMENTATION, the method a backend overrides to have it.
@@ -131,12 +165,6 @@ class Communicator(ABC):
     disabled: bool
     tunables: Tunables
     world_size: int
-
-    # The admission envelope, shared by EVERY backend including torch. Uniform on
-    # purpose: torch is the control, so a control that admits a superset is comparing
-    # against a different question -- a shape outside the envelope would run on torch
-    # and fall back on the others.
-    _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
     _capturing: bool = False
     _closed: bool = False
@@ -205,7 +233,7 @@ class Communicator(ABC):
         # THE BOX, NOT THE BACKEND, asked of the build once for every backend. torch is
         # gated too: it is the CONTROL, and a control available where no backend is has
         # nothing to be a control for.
-        got = support(self.device, self.world_size)
+        got = supported(self.device, self.world_size)
         if isinstance(got, Error):
             logger.info("%s disabled: %s", type(self).__name__, got.name)
             return
@@ -701,16 +729,17 @@ class Communicator(ABC):
         cols: int | None = None,
     ) -> Error | None:
         """A backend's own rules: the Error it meets running `op` over `inp`, or None.
-        By default (torch, iris) the envelope of vLLM's custom all-reduce, which these
-        replace (weak-contiguous, 16-byte multiple, fp16 or bf16), no launch to choose
-        and no lossy kernel. Ours overrides it with its C++'s answer."""
+        By default (torch, iris) the build's envelope, so a control admits what our
+        kernels do: weak-contiguous, whole packs, a dtype built; no launch to choose and
+        no lossy kernel. Ours overrides it with its C++'s answer."""
         self._refuse_launch(launch)
         self._refuse_lossy(quant_bits)
         if not _is_weak_contiguous(inp):
             return Error.not_contiguous
-        if inp.numel() * inp.element_size() % 16 != 0:
+        built = build_info()
+        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
             return Error.row_not_packs
-        if inp.dtype not in self._SUPPORTED_DTYPES:
+        if inp.dtype not in built.dtypes:
             return Error.dtype_not_built
         return None
 

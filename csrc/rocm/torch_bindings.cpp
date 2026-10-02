@@ -111,7 +111,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int? cols, int quant_bits, int kernel, int launch_blocks, int launch_threads) -> int?",
       &rocm_comms_check);
   rocm_ops.def("rocm_comms_error_names() -> str[]", &rocm_comms_error_names);
-  rocm_ops.def("rocm_comms_support(int device, int world) -> (str?, int?)", &rocm_comms_support);
+  rocm_ops.def("rocm_comms_supported(int device, int world) -> (str?, int?)",
+               &rocm_comms_supported);
+  rocm_ops.def("rocm_comms_build_info() -> (str[], int[], int, int)", &rocm_comms_build_info);
   rocm_ops.def("rocm_comms_pending_graph_buffers", &rocm_comms_pending_graph_buffers);
   rocm_ops.def("rocm_comms_register_graph_buffers", &rocm_comms_register_graph_buffers);
   rocm_ops.def("rocm_comms_handle_and_offset", &rocm_comms_handle_and_offset);

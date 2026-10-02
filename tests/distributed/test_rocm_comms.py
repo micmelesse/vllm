@@ -54,7 +54,11 @@ from vllm.distributed.device_communicators.rocm_comms import (
     Error,
     make_communicator,
 )
-from vllm.distributed.device_communicators.rocm_comms.base import Support, support
+from vllm.distributed.device_communicators.rocm_comms.base import (
+    Supported,
+    build_info,
+    supported,
+)
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
@@ -1814,21 +1818,18 @@ def test_python_error_is_cpps_number_for_number() -> None:
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])
-def test_support_is_the_builds_answer(size: int) -> None:
-    """`support` is the build's answer: this device (one the build covers, the tuning
-    target) runs exactly the worlds dispatch compiles, and refuses the rest by name."""
+def test_supported_is_the_builds_answer(size: int) -> None:
+    """`supported` is the build's answer: this device (one the build covers, the tuning
+    target) runs exactly the worlds `build_info` says are built, and refuses the rest by
+    name."""
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
-    got = support(torch.device("cuda:0"), size)
-    if size in (2, 4, 8):
-        assert isinstance(got, Support), got
+    got = supported(torch.device("cuda:0"), size)
+    if size in build_info().worlds:
+        assert isinstance(got, Supported), got
         assert got.arch in torch.cuda.get_device_properties(0).gcnArchName
     else:
         assert got is Error.world_not_built
-
-
-# C++'s kStagingBytes (machine/build.cuh): what one eager pass holds.
-_STAGING_BYTES = 256 << 20
 
 
 def run_eager_beyond_staging_rank(
@@ -1837,7 +1838,7 @@ def run_eager_beyond_staging_rank(
     """ONE rank: an eager all-reduce of two and a half stagings, forced at `shot`,
     against RCCL's fp32 sum. Each rank draws its own input on the device: the input is
     too large to rebuild every rank's on the CPU."""
-    n = _STAGING_BYTES * 5 // 2 // 2  # bf16 elements
+    n = build_info().staging_bytes * 5 // 2 // 2  # bf16 elements
     g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
     x = torch.randn(n, generator=g, device=ctx.device).to(torch.bfloat16)
     want = x.float()

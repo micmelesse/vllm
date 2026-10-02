@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// SUPPORT: whether the library runs on a device and world, asked once before anything is opened.
+// SUPPORTED: whether the library runs on a device and world, asked once before anything is opened.
 // The build answers, not a list: a device with no code object for our kernels is not built, and
 // one that is but is not select's target would run on another device's calibration.
 
@@ -18,7 +18,7 @@
 
 namespace hip_comms {
 
-inline std::variant<Support, Error> support(int device, int world) {
+inline std::variant<Supported, Error> supported(int device, int world) {
   if (!world_built(world)) return Error::world_not_built;
   hipDeviceProp_t prop;
   if (hipGetDeviceProperties(&prop, device) != hipSuccess) return Error::device_not_built;
@@ -35,7 +35,7 @@ inline std::variant<Support, Error> support(int device, int world) {
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;
   if (arch != kTargetArch) return Error::device_not_tuned;
-  return Support{arch};
+  return Supported{arch};
 }
 
 }  // namespace hip_comms
