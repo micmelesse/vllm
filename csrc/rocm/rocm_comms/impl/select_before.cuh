@@ -548,27 +548,52 @@ constexpr bool chooses_as_before(const Args& a, int world) {
   }
   return true;
 }
-constexpr bool select_is_as_before() {
+// One op family at one width a static_assert, each within the compiler's step budget.
+enum class Checked { all_reduce, norm, add_norm, gemm, gemm_add, attn_res, scale_add };
+constexpr bool select_is_as_before(Checked op, int64_t h) {
   constexpr DType bf = DType::bf16;
   for (const int64_t t : {1, 2, 7, 8, 9, 10, 16, 17, 19, 96, 97, 129, 193, 256, 257, 512, 513,
                           4096}) {
-    for (const int64_t h : {2048, 3584, 7168, 8192}) {
-      if (!chooses_as_before(AllReduceArgs{nullptr, nullptr, t * h * 2, bf}, 8)) return false;
-      for (const bool add : {false, true}) {
-        if (!chooses_as_before(NormArgs{add, nullptr, nullptr, nullptr, bf, bf, t, h, 0.f,
-                                        nullptr, nullptr}, 8))
-          return false;
-        if (!chooses_as_before(GemmTailArgs{.add = add, .dtype = bf, .rows = t, .hidden = h}, 8))
-          return false;
-      }
-      if (!chooses_as_before(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr,
-                                         nullptr, nullptr, bf, t, h, 0, -1, 0.f, 0.f, true}, 8))
-        return false;
+    bool same = true;
+    switch (op) {
+      case Checked::all_reduce:
+        same = chooses_as_before(AllReduceArgs{nullptr, nullptr, t * h * 2, bf}, 8);
+        break;
+      case Checked::norm:
+      case Checked::add_norm:
+        same = chooses_as_before(NormArgs{op == Checked::add_norm, nullptr, nullptr, nullptr, bf,
+                                          bf, t, h, 0.f, nullptr, nullptr}, 8);
+        break;
+      case Checked::gemm:
+      case Checked::gemm_add:
+        same = chooses_as_before(
+            GemmTailArgs{.add = op == Checked::gemm_add, .dtype = bf, .rows = t, .hidden = h}, 8);
+        break;
+      case Checked::attn_res:
+        same = chooses_as_before(AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr,
+                                             nullptr, nullptr, bf, t, h, 0, -1, 0.f, 0.f, true},
+                                 8);
+        break;
+      case Checked::scale_add:
+        same = chooses_as_before(ScaleAddArgs{nullptr, nullptr, bf, t, h, h / 2, 0.f}, 8);
+        break;
     }
-    if (!chooses_as_before(ScaleAddArgs{nullptr, nullptr, bf, t, 7168, 3584, 0.f}, 8)) return false;
+    if (!same) return false;
   }
   return true;
 }
-static_assert(select_is_as_before(), "the new select chooses differently from the old one");
+#define HIP_COMMS_AS_BEFORE(op)                                                       \
+  static_assert(select_is_as_before(Checked::op, 2048), "select differs: " #op " 2048"); \
+  static_assert(select_is_as_before(Checked::op, 3584), "select differs: " #op " 3584"); \
+  static_assert(select_is_as_before(Checked::op, 7168), "select differs: " #op " 7168"); \
+  static_assert(select_is_as_before(Checked::op, 8192), "select differs: " #op " 8192");
+HIP_COMMS_AS_BEFORE(all_reduce)
+HIP_COMMS_AS_BEFORE(norm)
+HIP_COMMS_AS_BEFORE(add_norm)
+HIP_COMMS_AS_BEFORE(gemm)
+HIP_COMMS_AS_BEFORE(gemm_add)
+HIP_COMMS_AS_BEFORE(attn_res)
+HIP_COMMS_AS_BEFORE(scale_add)
+#undef HIP_COMMS_AS_BEFORE
 
 }  // namespace hip_comms
