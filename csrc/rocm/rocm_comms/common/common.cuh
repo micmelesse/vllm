@@ -15,11 +15,13 @@
 //   ThreadOffs<K>, thread_offs(tile)   this thread's columns (offs_n) and their mask (mask_n)
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions
-//   thread_load(row, f, out), thread_store(row, f, v)   a Tile row: every load issued, stores
+//   thread_load(row, thread_cols, out), thread_store(row, thread_cols, v)   a Tile row: every load
+//   issued, stores
 //                                               only inside the row
 //   thread_load_uncached(p), thread_store_uncached(p, v)   one pack past every cache (system
 //                                               scope); no kernel uses them now
-//   peers_load<T, ngpus>(read, i), peers_load<T, ngpus>(read, row, packs, f)   every source's
+//   peers_load<T, ngpus>(read, i), peers_load<T, ngpus>(read, row, packs, thread_cols)   every
+//   source's
 //                                               pack (or Tile row) in flight; waits at its use
 // elementwise.cuh
 //   thread_unpack(v, x), thread_pack(x)         a pack to fp32 and back, rounding once
@@ -28,7 +30,7 @@
 //                                               source order, rounded once
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
-//   thread_dot(a, b, f)                         this thread's share of a row's dot
+//   thread_dot(a, b, thread_cols)                         this thread's share of a row's dot
 //   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its geometry (kBuild.kernels.gemm_rows,

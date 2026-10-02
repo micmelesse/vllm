@@ -130,6 +130,7 @@ struct AttnResCalibration {
   Launch push;
   Launch pull;
   int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
+  int pull_block_m;        // its AttnRes tile: BLOCK_M rows a block at once
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
@@ -166,74 +167,84 @@ constexpr Calibration kGfx950Calibration = {
     // 1: at 4 (Triton's tile) the row got slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096
     // tokens, with 100 -> 166 VGPRs (stamps 2026-10-01T06-26-55Z against 04-15-48Z).
     .attn_res_sources_per_reduce = 1,
-    .rms_norm = {
-        // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
-        .one_shot_max_bytes = 128 * kKiB,
-        // Push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
-        // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
-        .push_max_bytes = 1792 * kKiB,
-        // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
-        .one_shot = {16, 512},
-        // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at
-        // 128; 2026-10-01T03-26-44Z); a row a block below that.
-        .push = {256, 512},
-        // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and
-        // 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-        .pull = {48, 512},
-    },
-    .add_rms_norm = {
-        // Not swept: rms_norm's.
-        .one_shot_max_bytes = 128 * kKiB,
-        // Push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at 1.75 MiB
-        // (18.36 against push's 18.46; 2026-10-01T03-26-44Z).
-        .push_max_bytes = 1344 * kKiB,
-        // Not swept: rms_norm's.
-        .one_shot = {16, 512},
-        // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128; 2026-10-01T03-26-44Z).
-        .push = {256, 512},
-        // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at
-        // 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-        .pull = {48, 512},
-    },
-    .attn_res = {
-        // None: the push two-shot beat the one-shot from 1 token (12.89 against 13.68 us; 14.03
-        // against 15.18 at 8; 2026-10-01T03-57-23Z), so AttnRes starts at the push.
-        .one_shot_max_bytes = 0,
-        // Push won through 1.75 MiB (128 tokens of 7168 bf16: 22.82 against unfused 23.22) and
-        // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
-        // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
-        .push_max_bytes = 3584 * kKiB,
-        // Not swept: the norms'.
-        .one_shot = {16, 512},
-        // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15,
-        // 159.33 at 128), a row a block below that (2026-10-01T03-57-23Z).
-        .push = {256, 512},
-        // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within
-        // about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7
-        // at the 36 it had, the row-split norm's (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
-        .pull = {192, 512},
-        // ITS REDUCE-SCATTER ON FEWER: reads queue behind the links past a few dozen blocks, while
-        // AttnRes is compute a row and wants the whole grid. At 4096 tokens the reduce-scatter
-        // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
-        // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
-        .pull_reduce_blocks = 32,
-    },
-    .rms_norm_gemm = {
-        // Not swept: rms_norm_gemm_add's.
-        .one_shot_max_rows = 16,
-        // Not swept: rms_norm_gemm_add's.
-        .one_shot = {56, 512},
-        // Not swept: rms_norm_gemm_add's.
-        .two_shot = {56, 512},
-    },
-    .rms_norm_gemm_add = {
-        // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
-        .one_shot_max_rows = 16,
-        // The best at 1 row, 4 lanes a column (2026-09-28, log).
-        .one_shot = {56, 512},
-        // Not swept: the one-shot's.
-        .two_shot = {56, 512},
-    },
+    .rms_norm =
+        {
+            // Moved to 64 KiB it lost at 16 tokens, 11.43 against 10.56 us (2026-09-30T21-06-57Z).
+            .one_shot_max_bytes = 128 * kKiB,
+            // Push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
+            // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
+            .push_max_bytes = 1792 * kKiB,
+            // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
+            .one_shot = {16, 512},
+            // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at
+            // 128; 2026-10-01T03-26-44Z); a row a block below that.
+            .push = {256, 512},
+            // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and
+            // 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
+            .pull = {48, 512},
+        },
+    .add_rms_norm =
+        {
+            // Not swept: rms_norm's.
+            .one_shot_max_bytes = 128 * kKiB,
+            // Push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at 1.75 MiB
+            // (18.36 against push's 18.46; 2026-10-01T03-26-44Z).
+            .push_max_bytes = 1344 * kKiB,
+            // Not swept: rms_norm's.
+            .one_shot = {16, 512},
+            // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128;
+            // 2026-10-01T03-26-44Z).
+            .push = {256, 512},
+            // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at
+            // 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
+            .pull = {48, 512},
+        },
+    .attn_res =
+        {
+            // None: the push two-shot beat the one-shot from 1 token (12.89 against 13.68 us; 14.03
+            // against 15.18 at 8; 2026-10-01T03-57-23Z), so AttnRes starts at the push.
+            .one_shot_max_bytes = 0,
+            // Push won through 1.75 MiB (128 tokens of 7168 bf16: 22.82 against unfused 23.22) and
+            // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
+            // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
+            .push_max_bytes = 3584 * kKiB,
+            // Not swept: the norms'.
+            .one_shot = {16, 512},
+            // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15,
+            // 159.33 at 128), a row a block below that (2026-10-01T03-57-23Z).
+            .push = {256, 512},
+            // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within
+            // about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against
+            // 1160.7
+            // at the 36 it had, the row-split norm's (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
+            .pull = {192, 512},
+            // ITS REDUCE-SCATTER ON FEWER: reads queue behind the links past a few dozen blocks,
+            // while
+            // AttnRes is compute a row and wants the whole grid. At 4096 tokens the reduce-scatter
+            // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
+            // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
+            .pull_reduce_blocks = 32,
+            // Not swept yet: 1 is the row a block it always had.
+            .pull_block_m = 2,
+        },
+    .rms_norm_gemm =
+        {
+            // Not swept: rms_norm_gemm_add's.
+            .one_shot_max_rows = 16,
+            // Not swept: rms_norm_gemm_add's.
+            .one_shot = {56, 512},
+            // Not swept: rms_norm_gemm_add's.
+            .two_shot = {56, 512},
+        },
+    .rms_norm_gemm_add =
+        {
+            // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
+            .one_shot_max_rows = 16,
+            // The best at 1 row, 4 lanes a column (2026-09-28, log).
+            .one_shot = {56, 512},
+            // Not swept: the one-shot's.
+            .two_shot = {56, 512},
+        },
     // About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of
     // the best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4
     // at 256 (2026-10-01T22-07-13Z).

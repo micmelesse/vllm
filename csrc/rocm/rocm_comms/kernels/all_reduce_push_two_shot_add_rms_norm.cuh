@@ -39,7 +39,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -77,30 +77,31 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k)
-      thread_unpack<T>(p2p::read_scratch(own_scratch, base + f.offs_n[k]), s[k]);
+      thread_unpack<T>(p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]), s[k]);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       if constexpr (kAdd) {
         float r[NL];
-        thread_unpack<T>(res_in[base + f.offs_n[k]], r);
+        thread_unpack<T>(res_in[base + thread_cols.offs_n[k]], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.mask_n[k] != 0.0f) thread_store(res_out + base + f.offs_n[k], thread_pack<T>(s[k]));
+        if (thread_cols.mask_n[k] != 0.0f)
+          thread_store(res_out + base + thread_cols.offs_n[k], thread_pack<T>(s[k]));
       }
     }
-    float ss[1] = {thread_dot(s, s, f)};
+    float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      const vec<W, NL> w = wv[f.offs_n[k]];
+      const vec<W, NL> w = wv[thread_cols.offs_n[k]];
       V normed;
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
         normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
       }
-      if (f.mask_n[k] != 0.0f) thread_store(o + base + f.offs_n[k], normed);
+      if (thread_cols.mask_n[k] != 0.0f) thread_store(o + base + thread_cols.offs_n[k], normed);
     }
   }
   block_stamp(4);

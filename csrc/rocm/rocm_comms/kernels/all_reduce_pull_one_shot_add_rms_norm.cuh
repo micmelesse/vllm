@@ -29,7 +29,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -47,7 +47,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum);
     block_stamp(2);
     float s[kRowPacks][NL];
 #pragma unroll
@@ -55,26 +55,27 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       thread_unpack<T>(sum[k], s[k]);
       if constexpr (kAdd) {
         float r[NL];
-        thread_unpack<T>(res_in[base + f.offs_n[k]], r);
+        thread_unpack<T>(res_in[base + thread_cols.offs_n[k]], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.mask_n[k] != 0.0f) res_out[base + f.offs_n[k]] = thread_pack<T>(s[k]);
+        if (thread_cols.mask_n[k] != 0.0f)
+          res_out[base + thread_cols.offs_n[k]] = thread_pack<T>(s[k]);
       }
     }
-    float ss[1] = {thread_dot(s, s, f)};
+    float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      const vec<W, NL> w = wv[f.offs_n[k]];
+      const vec<W, NL> w = wv[thread_cols.offs_n[k]];
       V normed;
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
         normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
       }
-      if (f.mask_n[k] != 0.0f) o[base + f.offs_n[k]] = normed;
+      if (thread_cols.mask_n[k] != 0.0f) o[base + thread_cols.offs_n[k]] = normed;
     }
   }
 

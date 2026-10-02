@@ -20,14 +20,15 @@ namespace hip_comms {
 // This thread's share of dot(a, b) over the row, packs past its end counting zero: the partial a
 // block_reduce turns into the row's dot (a sum of squares is thread_dot(x, x)).
 template <int K, int N>
-DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N], const ThreadOffs<K>& f) {
+DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N],
+                         const ThreadOffs<K>& thread_cols) {
   float d = 0.0f;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     float dk = 0.0f;
 #pragma unroll
     for (int j = 0; j < N; ++j) dk += a[k][j] * b[k][j];
-    d += f.mask_n[k] * dk;
+    d += thread_cols.mask_n[k] * dk;
   }
   return d;
 }

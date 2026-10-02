@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
   const int col0         = min(p.rank * slice, packs);
   const int cols         = max(0, min(slice, packs - col0));  // a late rank's may be short or none
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -84,20 +84,27 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
   block_stamp(3);
 
-  // 4. This block's rows: each pack from the rank that owns its columns, then AttnRes, as the
-  //    one-shot does. The next call's first sync keeps a rank from overwriting its scratch while
-  //    it is read (a peer's next kernel starts only once this one has finished).
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const int64_t base = int64_t{row} * packs;
-    V sum[kRowPacks];
+  // 4. This block's tiles of BLOCK_M rows: each pack from the rank that owns its columns, then
+  //    AttnRes for every row of the tile at once. The next call's first sync keeps a rank from
+  //    overwriting its scratch while it is read (a peer's next kernel starts only once this one has
+  //    finished).
+  constexpr int BLOCK_M = kBuild.kernels.attn_res_block_m;
+  for (int offs_m = blockIdx.x * BLOCK_M; offs_m < rows; offs_m += gridDim.x * BLOCK_M) {
+    const Tile<BLOCK_M, kRowPacks> tile{rows, packs, offs_m, 0};
+    V sum[BLOCK_M][kRowPacks];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      const int owner = min(f.offs_n[k] / slice, ngpus - 1);
-      sum[k]          = p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + f.offs_n[k]);
+    for (int m = 0; m < BLOCK_M; ++m) {
+      const int64_t base = int64_t{min(offs_m + m, rows - 1)} * packs;
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k) {
+        const int owner = min(thread_cols.offs_n[k] / slice, ngpus - 1);
+        sum[m][k] =
+            p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + thread_cols.offs_n[k]);
+      }
     }
-    block_attn_res_row<T, kPrefix, kRowPacks>(
-        sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
-        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+    block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,
+                                    block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps,
+                                    out_eps, inv_hidden);
   }
   block_stamp(4);
 }

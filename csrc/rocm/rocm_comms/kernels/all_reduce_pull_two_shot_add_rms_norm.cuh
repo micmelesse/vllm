@@ -35,7 +35,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -58,12 +58,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const int first = p.rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   // Row `row`'s packs from every rank.
-  const auto load = [&](int row) { return peers_load<T, ngpus>(read, row, packs, f); };
+  const auto load = [&](int row) { return peers_load<T, ngpus>(read, row, packs, thread_cols); };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
   vec<W, NL> w[kRowPacks];
 #pragma unroll
-  for (int k = 0; k < kRowPacks; ++k) w[k] = wv[f.offs_n[k]];
+  for (int k = 0; k < kRowPacks; ++k) w[k] = wv[thread_cols.offs_n[k]];
   // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
   // wait covers only its own, older, loads), so the next round trip runs under the reduction and
   // norm.
@@ -74,7 +74,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     V res[kRowPacks];
     if constexpr (kAdd) {
 #pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + f.offs_n[k]];
+      for (int k = 0; k < kRowPacks; ++k) res[k] = res_in[base + thread_cols.offs_n[k]];
     }
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
@@ -94,10 +94,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         thread_unpack<T>(res[k], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.mask_n[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.offs_n[k], thread_pack<T>(s[k]));
+        if (thread_cols.mask_n[k] != 0.0f)
+          p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], thread_pack<T>(s[k]));
       }
     }
-    float ss[1] = {thread_dot(s, s, f)};
+    float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
@@ -120,7 +121,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
         normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
       }
-      if (f.mask_n[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.offs_n[k], normed);
+      if (thread_cols.mask_n[k] != 0.0f)
+        p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], normed);
     }
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other

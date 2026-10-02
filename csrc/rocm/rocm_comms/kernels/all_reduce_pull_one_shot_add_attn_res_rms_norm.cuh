@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -44,10 +44,10 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum);
     block_attn_res_row<T, kPrefix, kRowPacks>(
-        sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
-        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+        sum, base, thread_cols, pre, written(row), blocks + int64_t{row} * block_stride_m,
+        block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.

@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto fl          = thread_offs(Tile<1, kRowPacks>{rows, latent_packs, 0, 0});
+  const auto latent_cols = thread_offs(Tile<1, kRowPacks>{rows, latent_packs, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
@@ -58,16 +58,16 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int first_row = p.rank * slice_rows;
   for (int w = blockIdx.x; w < rows_of(p.rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
-    const auto fh = slice_of(w);
-    const auto sh                = peers_load<T, ngpus>(shared, row, packs, fh);
-    const auto pj                = peers_load<T, ngpus>(proj, row, packs, fh);
-    const auto lt                = peers_load<T, ngpus>(latent, row, packs, fl);
+    const auto hidden_cols = slice_of(w);
+    const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
+    const auto pj = peers_load<T, ngpus>(proj, row, packs, hidden_cols);
+    const auto lt = peers_load<T, ngpus>(latent, row, packs, latent_cols);
     V l_sum[kRowPacks];
     peers_reduce(lt, l_sum);
     float l[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(l_sum[k], l[k]);
-    float ss[1] = {thread_dot(l, l, fl)};
+    float ss[1] = {thread_dot(l, l, latent_cols)};
     block_stamp(2);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
@@ -83,7 +83,8 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       V r;
 #pragma unroll
       for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
-      if (fh.mask_n[k] != 0.0f) p2p::write_scratch(own_scratch, at + fh.offs_n[k], r);
+      if (hidden_cols.mask_n[k] != 0.0f)
+        p2p::write_scratch(own_scratch, at + hidden_cols.offs_n[k], r);
     }
   }
 
@@ -97,21 +98,23 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    (row, slice)s of each. EVERY OWNER'S PACKS LOADED BEFORE ANY IS STORED. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read.
   for (int w = blockIdx.x; w < slice_rows * splits; w += gridDim.x) {
-    const auto fh = slice_of(w);
+    const auto hidden_cols = slice_of(w);
     const int l                  = w / splits;
     V got[ngpus][kRowPacks];
 #pragma unroll
     for (int r = 0; r < ngpus; ++r)
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k)
-        got[r][k] = p2p::read_scratch(scratches[r], int64_t{l} * hidden_packs + fh.offs_n[k]);
+        got[r][k] =
+            p2p::read_scratch(scratches[r], int64_t{l} * hidden_packs + hidden_cols.offs_n[k]);
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) {
       if (l >= rows_of(r)) continue;
       const int64_t base = (int64_t{r} * slice_rows + l) * hidden_packs;
 #pragma unroll
       for (int k = 0; k < kRowPacks; ++k)
-        if (fh.mask_n[k] != 0.0f) thread_store(o + base + fh.offs_n[k], got[r][k]);
+        if (hidden_cols.mask_n[k] != 0.0f)
+          thread_store(o + base + hidden_cols.offs_n[k], got[r][k]);
     }
   }
   block_stamp(5);

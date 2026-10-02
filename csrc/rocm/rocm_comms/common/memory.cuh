@@ -75,11 +75,13 @@ DINLINE void thread_store_uncached(V* p, const V& v) {
 // nothing). A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's
 // pack is 32 bytes and loads as the compiler chooses.
 template <int K, typename V>
-DINLINE void thread_load(const V* row, const ThreadOffs<K>& f, V (&out)[K]) {
+DINLINE void thread_load(const V* row, const ThreadOffs<K>& thread_cols, V (&out)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    if constexpr (sizeof(V) == 16) out[k] = thread_load(row + f.offs_n[k]);
-    else out[k] = row[f.offs_n[k]];
+    if constexpr (sizeof(V) == 16)
+      out[k] = thread_load(row + thread_cols.offs_n[k]);
+    else
+      out[k] = row[thread_cols.offs_n[k]];
   }
 }
 
@@ -106,13 +108,14 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
 // past the row reads the last one, weighted zero where it is used), where an `if (i < packs)` made
 // each pack's loads wait on the one before.
 template <typename T, int ngpus, int K, typename Read>
-DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const ThreadOffs<K>& f) {
+DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs,
+                                          const ThreadOffs<K>& thread_cols) {
   // A pack position at a time, every source's for it: the address is computed once a position (the
   // other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z).
   PeerPacks<T, ngpus, K> out;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    const int64_t i = int64_t{row} * packs + f.offs_n[k];
+    const int64_t i = int64_t{row} * packs + thread_cols.offs_n[k];
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) out.p[r][k] = read(r, i);
   }
@@ -121,12 +124,14 @@ DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const T
 }
 
 template <int K, typename V>
-DINLINE void thread_store(V* row, const ThreadOffs<K>& f, const V (&v)[K]) {
+DINLINE void thread_store(V* row, const ThreadOffs<K>& thread_cols, const V (&v)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    if (f.mask_n[k] == 0.0f) continue;
-    if constexpr (sizeof(V) == 16) thread_store(row + f.offs_n[k], v[k]);
-    else row[f.offs_n[k]] = v[k];
+    if (thread_cols.mask_n[k] == 0.0f) continue;
+    if constexpr (sizeof(V) == 16)
+      thread_store(row + thread_cols.offs_n[k], v[k]);
+    else
+      row[thread_cols.offs_n[k]] = v[k];
   }
 }
 

@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -80,10 +80,11 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     const int64_t base = int64_t{row} * packs;
     V sum[kRowPacks];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) sum[k] = p2p::read_scratch(own_scratch, base + f.offs_n[k]);
+    for (int k = 0; k < kRowPacks; ++k)
+      sum[k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
     block_attn_res_row<T, kPrefix, kRowPacks>(
-        sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,
-        norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+        sum, base, thread_cols, pre, written(row), blocks + int64_t{row} * block_stride_m,
+        block_stride_r, norm_w, qk_w, out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
   block_stamp(4);
 }

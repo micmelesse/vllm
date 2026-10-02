@@ -26,7 +26,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
-  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.
@@ -48,23 +48,24 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     const int64_t at = int64_t{row - first} * packs;
     V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, f), sum);
+    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum);
     // The norm, rounding as vLLM's reference rms_norm does (weight in T):
     //   out = T(T(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(T(sum over ranks))
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
-    float ss[1] = {thread_dot(s, s, f)};
+    float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       float w[NL], x[NL];
-      thread_unpack<T>(weight[f.offs_n[k]], w);
+      thread_unpack<T>(weight[thread_cols.offs_n[k]], w);
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];
-      if (f.mask_n[k] != 0.0f) p2p::write_scratch(own_scratch, at + f.offs_n[k], thread_pack<T>(x));
+      if (thread_cols.mask_n[k] != 0.0f)
+        p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], thread_pack<T>(x));
     }
   }
 

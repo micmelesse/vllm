@@ -39,14 +39,14 @@ struct ThreadOffs {
 
 template <int BLOCK_M, int K>
 DINLINE ThreadOffs<K> thread_offs(const Tile<BLOCK_M, K>& t) {
-  ThreadOffs<K> f;
+  ThreadOffs<K> cols;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     const int n  = t.offs_n + threadIdx.x + k * blockDim.x;
-    f.offs_n[k]  = n < t.N ? n : t.N - 1;
-    f.mask_n[k]  = n < t.N ? 1.0f : 0.0f;
+    cols.offs_n[k] = n < t.N ? n : t.N - 1;
+    cols.mask_n[k] = n < t.N ? 1.0f : 0.0f;
   }
-  return f;
+  return cols;
 }
 
 }  // namespace hip_comms

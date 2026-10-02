@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto fl          = thread_offs(Tile<1, kRowPacks>{rows, latent_packs, 0, 0});
+  const auto latent_cols = thread_offs(Tile<1, kRowPacks>{rows, latent_packs, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -48,16 +48,16 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     const int row   = w / splits;
     const int first = (w % splits) * slice;
     const int len   = min(slice, hidden_packs - first);
-    const auto fh = thread_offs(Tile<1, kRowPacks>{rows, first + len, row, first});
-    const auto sh = peers_load<T, ngpus>(shared, row, packs, fh);
-    const auto pj = peers_load<T, ngpus>(proj, row, packs, fh);
-    const auto lt = peers_load<T, ngpus>(latent, row, packs, fl);
+    const auto hidden_cols = thread_offs(Tile<1, kRowPacks>{rows, first + len, row, first});
+    const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
+    const auto pj = peers_load<T, ngpus>(proj, row, packs, hidden_cols);
+    const auto lt = peers_load<T, ngpus>(latent, row, packs, latent_cols);
     V l_sum[kRowPacks];
     peers_reduce(lt, l_sum);
     float l[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(l_sum[k], l[k]);
-    float ss[1] = {thread_dot(l, l, fl)};
+    float ss[1] = {thread_dot(l, l, latent_cols)};
     block_stamp(2);
     block_reduce<Sum>(ss);
     block_stamp(3);
@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       V r;
 #pragma unroll
       for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
-      if (fh.mask_n[k] != 0.0f) o[base + fh.offs_n[k]] = r;
+      if (hidden_cols.mask_n[k] != 0.0f) o[base + hidden_cols.offs_n[k]] = r;
     }
   }
 
