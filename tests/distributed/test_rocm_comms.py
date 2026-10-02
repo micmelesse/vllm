@@ -68,7 +68,6 @@ from vllm.distributed.device_communicators.rocm_comms.iris import (
     IrisCommunicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
-from vllm.distributed.device_communicators.rocm_comms.tunables import Tunables
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -1112,12 +1111,6 @@ def ranks(world: int) -> Iterator[World]:
         ranks.stop()
 
 
-def baseline_admits(nbytes: int) -> bool:
-    """`should_custom_ar` for a contiguous input on a fully-connected box, from the
-    numbers above."""
-    return nbytes % BASELINE_ALIGNMENT == 0 and nbytes < BASELINE_MAX_SIZE
-
-
 # FULL: it spawns no ranks, but it checks a rule that moves rarely, against a baseline
 # that moves never.
 @pytest.mark.full
@@ -1131,7 +1124,6 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
     """
     ours = object.__new__(TorchCommunicator)
     ours.disabled, ours.world_size = False, world_size
-    ours.tunables = Tunables(small_limit=BASELINE_MAX_SIZE)
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real
@@ -1145,28 +1137,14 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             t = torch.empty(nbytes // es, dtype=dtype)
             where = f"{dtype} {nbytes}B world={world_size}"
             aligned = nbytes % BASELINE_ALIGNMENT == 0
-            # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. The size moved out to
-            # `_is_small`, and the dtype grid here is fp16/bf16, so what `should_*`
-            # still refuses is a tensor the kernel cannot vectorise: `vec` is 16 bytes
-            # wide. The grid REACHES those on purpose -- an edge +/- one element is 14
-            # and 18 bytes off the 16-byte edge -- and asserting they are admitted is
-            # how this read `assert ours.should_allreduce(t)` and failed on the first
-            # run that ever executed it (2026-09-17).
+            # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. Size refuses nothing,
+            # and the dtype grid here is fp16/bf16, so what `should_*` still refuses is
+            # a tensor the kernel cannot vectorise: `vec` is 16 bytes wide. The grid
+            # REACHES those on purpose: an edge +/- one element is 14 and 18 bytes off
+            # the 16-byte edge.
             assert ours.should_allreduce(t) is aligned, (
                 f"all_reduce admission is not the alignment rule: {where}"
             )
-            # SIZE ALONE, and nothing else: `_is_small` is the algorithm switch, so it
-            # says nothing about whether the tensor is ours.
-            assert ours._is_small(t) is (nbytes < BASELINE_MAX_SIZE), (
-                f"the small/large line moved: {where}"
-            )
-            # AND THE TWO COMPOSE BACK TO THE BASELINE. This is the property the matrix
-            # rests on: CustomAllreduce took a tensor iff it was aligned AND small, and
-            # that is exactly the set we now call ours-and-small. What changed is that
-            # the rest is ours too, not that the line moved.
-            assert (ours.should_allreduce(t) and ours._is_small(t)) is baseline_admits(
-                nbytes
-            ), f"our fast path is not CustomAllreduce's: {where}"
 
 
 def _communicator_param(

@@ -28,6 +28,9 @@ class IrisTunables:
     heap_bytes: int = 12 * 2**30  # 12 GiB
     slab_bytes: int = 2**25  # all-gather, 32 MB per rank
     use_gluon: bool = True
+    # WHERE A COLLECTIVE STOPS BEING SMALL, the line iris switches algorithms at, and so
+    # the least the heap must back. CustomAllreduce's `max_size`; unmeasured for iris.
+    small_limit: int = 8 * 1024 * 1024
 
 
 def _iris_available() -> bool:
@@ -96,7 +99,7 @@ class IrisCommunicator(Communicator):
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size
         # -- so a large enough input can still exhaust the heap at call time.
-        small = self.tunables.small_limit
+        small = self.iris.small_limit
         if small * 2 > self._heap or small > self.iris.slab_bytes:
             logger.warning(
                 "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back a "

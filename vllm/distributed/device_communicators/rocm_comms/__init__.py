@@ -3,7 +3,6 @@
 
 """ROCm TP collective backends: one interface, one file per implementation.
 
-    tunables  the tunable parameters every backend shares
     base      the Communicator interface, and the admission rules every backend shares
     hip       our own kernel, built into `_rocm_C` (csrc/rocm/rocm_comms.cu)
     iris      iris's GPU-initiated collectives
@@ -20,7 +19,6 @@ import torch
 from torch.distributed import ProcessGroup
 
 from .base import Communicator, Error
-from .tunables import Tunables
 
 logger = logging.getLogger(__name__)
 
@@ -54,22 +52,17 @@ def make_communicator(
             f"unknown communicator backend {backend!r}; there is "
             f"{', '.join(get_args(Backend))}"
         )
-    # FILLED IN HERE, not asked for. The tunables are this package's own business, so a
-    # caller picks a backend and nothing else.
-    tunables = Tunables()
-    logger.info(
-        "rocm_comms make_communicator: backend=%s tunables=%s", backend, tunables
-    )
+    logger.info("rocm_comms make_communicator: backend=%s", backend)
     if backend == "iris":
         from .iris import IrisCommunicator
 
-        return IrisCommunicator(cpu_group, device_group, device, tunables)
+        return IrisCommunicator(cpu_group, device_group, device)
     if backend == "torch":
         from .torch import TorchCommunicator
 
-        return TorchCommunicator(cpu_group, device_group, device, tunables)
+        return TorchCommunicator(cpu_group, device_group, device)
     if backend == "hip":
         from .hip import HipCommunicator
 
-        return HipCommunicator(cpu_group, device_group, device, tunables)
+        return HipCommunicator(cpu_group, device_group, device)
     raise AssertionError(f"backend {backend!r} is in Backend and has no branch here")

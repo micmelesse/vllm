@@ -23,8 +23,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .tunables import Tunables
-
 logger = logging.getLogger(__name__)
 
 # ---- THE CAPABILITIES EVERY BACKEND HERE IS BOUND BY. Not tunables: a tunable is a
@@ -246,7 +244,6 @@ class Communicator(ABC):
     """
 
     disabled: bool
-    tunables: Tunables
     world_size: int
 
     # THE OPS THIS BACKEND RUNS; every other is `no_such_op`.
@@ -297,7 +294,6 @@ class Communicator(ABC):
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
-        tunables: Tunables,
     ) -> None:
         """Every backend's construction, done ONCE here.
 
@@ -313,7 +309,6 @@ class Communicator(ABC):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
-        self.tunables = tunables
         self.world_size = dist.get_world_size(device_group)
 
         # THE BOX, NOT THE BACKEND, asked of the build once for every backend. torch is
@@ -367,28 +362,11 @@ class Communicator(ABC):
         """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
         return isinstance(self.plan(NormArgs(inp, weight, add=True), options), Plan)
 
-    def _is_small(self, inp: torch.Tensor) -> bool:
-        """Whether `inp` is under `small_limit` -- the line that used to pick between
-        this backend and QuickReduce, and now picks between this backend's OWN paths.
-        Nothing calls it to refuse work; it is the switch for when a second kernel
-        exists.
-        """
-        return inp.numel() * inp.element_size() < self.tunables.small_limit
-
     def all_reduce(
         self, inp: torch.Tensor, options: Options | None = None
     ) -> torch.Tensor:
-        """EVERY all-reduce this backend's kernel can compile for, at any SIZE.
-
-        The size used to decide whether the caller kept it or handed it to QuickReduce,
-        so an arm named for a backend was that backend under the limit and something
-        else above it. Now the collective is ours and `_is_small` picks which of OUR
-        paths it takes.
-
-        SIZE IS NOT DECIDED HERE, though `_is_small` and `small_limit` live on this
-        class because the LINE is shared. What a backend does on either side of it is
-        the backend's, so the classification is offered and not applied.
-        """
+        """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
+        picks among a backend's own paths (hip's in C++), never whether it is ours."""
         options = self._require(AllReduceArgs(inp), options)
         out = torch.empty_like(inp)
         if not self._warming_up("all_reduce"):
