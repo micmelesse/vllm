@@ -33,12 +33,8 @@
 //                              QuickReduce's integers (8, 4) under one fp32 scale; for the
 //                              quantized kernel that will use it
 //
-// p2p::host::                the host code (the ops, rocm_comms.cuh)
-//   Handle                         the one lifetime object: maps the peers' memory,
-//                                  registers buffers, `dev_comm(input, bytes, stream)` per launch
-//                                  (`dev_comm_staged(bytes)` for a staged kernel)
-//   IpcHandle, handle_and_offset(ptr)  a buffer's IPC handle
-// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks.
+// and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks. The host side, which maps
+// the peers' memory and fills a DevComm per launch, is ../handle.cuh's Handle.
 
 #pragma once
 
@@ -47,5 +43,4 @@
 #include "impl/buffers.cuh"
 #include "impl/core.cuh"
 #include "impl/codec.cuh"
-#include "impl/host.cuh"
 #undef HIP_COMMS_P2P_INTERFACE

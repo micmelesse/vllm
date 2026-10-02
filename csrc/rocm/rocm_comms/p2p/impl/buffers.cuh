@@ -7,7 +7,7 @@
 // of T.
 //
 // A RANK'S MEMORY, two places:
-//   ours, one allocation (host::alloc_memory), mapped by every peer at startup:
+//   ours, one allocation (Handle's symmetric memory), mapped by every peer at startup:
 //     [ Signal | scratch | staging ]
 //   the caller's, one tensor a call:
 //     [ input ]   read in place only when registered or captured; otherwise a staged kernel

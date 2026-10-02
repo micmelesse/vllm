@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE CONTRACT between p2p's two sides, behind p2p.cuh: what the host (host.cuh) maps and
+// THE CONTRACT between p2p's two sides, behind p2p.cuh: what the host (../handle.cuh) maps and
 // fills, and what a kernel (core.cuh) reads. Plain data only.
 
 #pragma once
@@ -51,7 +51,7 @@ struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
 // THE DEVICE COMMUNICATOR, what a launch passes by value (NCCL's ncclDevComm): every rank's input
 // (through a slot of the peer-pointer slab), every rank's signal block and scratch, and this
-// launch's limits. Plain fields; `host::Handle::dev_comm` fills one per launch.
+// launch's limits. Plain fields; `Handle::dev_comm` fills one per launch.
 struct DevComm {
   int rank;
   const PeerPtrs* inputs;      // device memory: every rank's input for this launch

@@ -16,7 +16,7 @@
 namespace hip_comms {
 
 // What each template is, in Template's order: its op, its shot, and for a row template the most
-// packs of its row a thread holds (machine/build.cuh derives each; 0 for one without rows). A build
+// packs of its row a thread holds (build.cuh derives each; 0 for one without rows). A build
 // past that would only ever run slower, so it is not built.
 struct TemplateInfo {
   Template fn;

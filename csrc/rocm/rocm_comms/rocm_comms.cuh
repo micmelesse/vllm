@@ -11,7 +11,7 @@
 // An op returns the kernel it launched, or the Error and launches nothing. check and launch find
 // the compiled function a Kernel names the same way (impl/dispatch.cuh).
 //
-// Handle                  the state across calls: the peers' memory, mapped once (p2p::host::Handle)
+// Handle (handle.cuh)     the runtime state: the peers' memory, mapped once; kBuild's runtime twin
 // AllReduceArgs, NormArgs, AttnResArgs, GemmTailArgs, ScaleAddArgs   one op's call
 // Options                 how the caller wants it run: precision, a forced template, the stream
 // Kernel                  what runs: a template, its arguments, its grid and block
@@ -19,7 +19,7 @@
 // all_reduce_rms_norm_gemm(_add), all_reduce_rms_scale_add      the ops
 // Error, to_string(Error)  why a call cannot run here: every reason, one list
 // supported(device, world)  Supported or the Error: whether the library runs on a device and world
-// kBuild (machine/build.cuh)  the build's facts: what is compiled, the memory, the kernels'
+// kBuild (build.cuh)  the build's facts: what is compiled, the memory, the kernels'
 // geometry
 
 #pragma once
@@ -33,12 +33,12 @@
 #include <variant>
 
 #include "p2p/p2p.cuh"
-#include "machine/build.cuh"
+#include "build.cuh"
+#include "handle.cuh"
 #include "machine/hardware.cuh"
 
 namespace hip_comms {
 
-using p2p::host::Handle;
 
 template <typename T, size_t N>
 constexpr bool built_in(const std::array<T, N>& built, T x) {

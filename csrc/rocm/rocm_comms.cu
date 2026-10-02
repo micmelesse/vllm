@@ -25,10 +25,10 @@
 #include "rocm_comms/rocm_comms.cuh"
 
 // =================================================================================
-// THE TORCH OP BOUNDARY. `p2p::host::Handle` is a stateful C++ object and a torch op is a
-// free function over schema types, so the object crosses as an opaque handle -- the same
-// `fptr_t = int64_t` vLLM's custom all-reduce and quick-reduce use. IPC handles cross as
-// `int[]` for the same reason they do there: a schema has no bytes type.
+// THE TORCH OP BOUNDARY. `Handle` (handle.cuh) is a stateful C++ object and a torch op is a
+// free function over schema types, so the object crosses as an opaque pointer -- the same
+// `fptr_t = int64_t` vLLM's custom all-reduce and quick-reduce use. The IPC handles never cross:
+// the Handle gathers them over the process group this boundary resolves by name.
 // =================================================================================
 
 using fptr_t = int64_t;
@@ -65,20 +65,9 @@ std::vector<std::string> all_gathered(const ProcessGroupPtr& pg, const std::stri
   return got;
 }
 
-// A buffer's IPC handle and its offset in its allocation, as the bytes the gather carries.
-std::string handle_bytes(uintptr_t ptr) {
-  auto [handle, offset] = hip_comms::p2p::host::handle_and_offset(ptr);
-  return handle + std::string(reinterpret_cast<const char*>(&offset), sizeof(offset));
-}
-
-// Rank r's handle and offset out of `handle_bytes`'s string.
-std::pair<std::string, int64_t> from_handle_bytes(const std::string& bytes) {
-  constexpr size_t kHandle = sizeof(hip_comms::p2p::host::IpcHandle);
-  TORCH_CHECK(bytes.size() == kHandle + sizeof(int64_t), "rocm_comms: a handle is ", kHandle,
-              " bytes and an offset");
-  int64_t offset = 0;
-  std::memcpy(&offset, bytes.data() + kHandle, sizeof(offset));
-  return {bytes.substr(0, kHandle), offset};
+// THE HANDLE'S COLLECTIVE, over `pg`: what the IPC handles go round in.
+hip_comms::Gather gather_over(const ProcessGroupPtr& pg) {
+  return [pg](const std::string& mine) { return all_gathered(pg, mine); };
 }
 }  // namespace
 
@@ -304,16 +293,7 @@ OpenWire rocm_comms_open(const std::string& cpu_group, const std::string& device
   const int world = (*pg)->getSize();
   const auto ok   = hip_comms::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_comms::Error>(&ok)) return refused(*e);
-  const auto self = hip_comms::p2p::host::alloc_memory(hip_comms::kBuild.memory);
-  std::vector<std::string> handles;
-  std::vector<int64_t> offsets;
-  for (const std::string& bytes : all_gathered(*pg, handle_bytes(self))) {
-    auto [handle, offset] = from_handle_bytes(bytes);
-    handles.push_back(std::move(handle));
-    offsets.push_back(offset);
-  }
-  auto* handle =
-      new hip_comms::Handle((*pg)->getRank(), world, self, handles, offsets, hip_comms::kBuild);
+  auto* handle = new hip_comms::Handle((*pg)->getRank(), world, gather_over(*pg));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -421,14 +401,7 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   void* cached = nullptr;
   HIP_CHECK(hipMalloc(&cached, static_cast<size_t>(bytes)));
   HIP_CHECK(hipMemset(cached, 0, static_cast<size_t>(bytes)));
-  std::vector<std::string> handles;
-  std::vector<int64_t> offsets;
-  for (const std::string& b : all_gathered(*pg, handle_bytes(reinterpret_cast<uintptr_t>(cached)))) {
-    auto [handle, offset] = from_handle_bytes(b);
-    handles.push_back(std::move(handle));
-    offsets.push_back(offset);
-  }
-  h.register_buffer(cached, handles, offsets);
+  h.register_buffer(cached, gather_over(*pg));
   auto sink = torch::empty({1}, on_dev.dtype(torch::kInt32));
   uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
   const dim3 block(hip_comms::kBuild.kernels.max_threads);
@@ -493,40 +466,19 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   together();
   HIP_CHECK(hipStreamSynchronize(stream));
   (void)all_gathered(*pg, std::string(1, '\0'));
-  h.forget_buffer(cached, handles);
+  h.forget_buffer(cached);
   HIP_CHECK(hipFree(cached));
   return {ping, names, gbps};
 }
 
 
-// THE BUFFERS A CAPTURE RECORDED, registered: every rank's handle for each, gathered over the
-// process group named `group`, a collective even with none (or the other ranks wait in it). Every
-// rank must have captured the same graphs, so the same number of buffers.
+// THE BUFFERS A CAPTURE RECORDED, registered over the process group named `group`, every rank
+// together (Handle::register_captured).
 void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group) {
-  auto& h            = handle_of(handle_ptr);
-  const auto pg      = resolved(group);
+  const auto pg = resolved(group);
   if (!pg) raise(hip_comms::Error::no_such_group);
-  const auto pending = h.pending_graph_buffers();
-  const int64_t mine = static_cast<int64_t>(pending.size());
-  for (const std::string& c :
-       all_gathered(*pg, std::string(reinterpret_cast<const char*>(&mine), sizeof(mine)))) {
-    int64_t n = 0;
-    std::memcpy(&n, c.data(), sizeof(n));
-    if (n != mine) raise(hip_comms::Error::ranks_disagree);
-  }
-  if (pending.empty()) return;
-  std::string all;
-  for (const uintptr_t ptr : pending) all += handle_bytes(ptr);
-  const size_t each = all.size() / pending.size();
-  std::vector<std::vector<std::string>> handles(pending.size());
-  std::vector<std::vector<int64_t>> offsets(pending.size());
-  for (const std::string& theirs : all_gathered(*pg, all))
-    for (size_t i = 0; i < pending.size(); ++i) {
-      auto [handle, offset] = from_handle_bytes(theirs.substr(i * each, each));
-      handles[i].push_back(std::move(handle));
-      offsets[i].push_back(offset);
-    }
-  h.register_graph_buffers(handles, offsets);
+  if (!handle_of(handle_ptr).register_captured(gather_over(*pg)))
+    raise(hip_comms::Error::ranks_disagree);
 }
 
 

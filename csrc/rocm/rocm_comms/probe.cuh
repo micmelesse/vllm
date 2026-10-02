@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "machine/build.cuh"
+#include "build.cuh"
 #include "p2p/p2p.cuh"
 
 namespace hip_comms {

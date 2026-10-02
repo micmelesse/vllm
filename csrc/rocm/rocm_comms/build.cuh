@@ -10,7 +10,7 @@
 #include <array>
 #include <cstdint>
 
-#include "hardware.cuh"
+#include "machine/hardware.cuh"
 
 namespace hip_comms {
 
