@@ -10,7 +10,7 @@
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
 //   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
 // tile.cuh          how a kernel cuts its work
-//   Tile<R, K>, tile<R, K>(len, first)   a block's R rows, cut to len columns from first, and
+//   Tile<R, K>, tile<R, K>(first, len)   a block's R rows, cut to the len columns from first, and
 //                                this thread's K packs of each, clamped into the slice
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions

@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
-  const auto f           = tile<1, kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(0, packs);
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr

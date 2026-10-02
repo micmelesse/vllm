@@ -14,7 +14,7 @@
 
 namespace hip_comms {
 
-// WHO HOLDS WHAT: a Tile is the kRows rows a block works on at once, cut to `len` columns from
+// WHO HOLDS WHAT: a Tile is the kRows rows a block works on at once, cut to the `len` columns from
 // `first`, and this thread's kPacks packs of each, at the same columns in every row (CuTe's and
 // Triton's tile; the thread's share is CUTLASS's fragment). How a kernel cuts its work, by rows and
 // by columns, is its tile's shape. Its indices are clamped into the slice and a pack past its end is
@@ -32,7 +32,7 @@ struct Tile {
 };
 
 template <int kRows, int kPacks>
-DINLINE Tile<kRows, kPacks> tile(int len, int first = 0) {
+DINLINE Tile<kRows, kPacks> tile(int first, int len) {
   Tile<kRows, kPacks> t;
 #pragma unroll
   for (int k = 0; k < kPacks; ++k) {

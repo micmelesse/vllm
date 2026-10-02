@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
   const int col0         = min(p.rank * slice, packs);
   const int cols         = max(0, min(slice, packs - col0));  // a late rank's may be short or none
-  const auto f           = tile<1, kRowPacks>(packs);
+  const auto f           = tile<1, kRowPacks>(0, packs);
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr

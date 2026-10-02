@@ -28,14 +28,14 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto fl          = tile<1, kRowPacks>(latent_packs);
+  const auto fl          = tile<1, kRowPacks>(0, latent_packs);
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
   // This (row, slice)'s tile of the hidden: one row cut to the slice's columns.
   const auto slice_of    = [&](int w) {
     const int first = (w % splits) * slice;
-    return tile<1, kRowPacks>(min(slice, hidden_packs - first), first);
+    return tile<1, kRowPacks>(first, min(slice, hidden_packs - first));
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
