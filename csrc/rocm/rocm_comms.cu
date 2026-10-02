@@ -432,9 +432,11 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   h.register_buffer(cached, handles, offsets);
   auto sink = torch::empty({1}, on_dev.dtype(torch::kInt32));
   uint32_t* s = reinterpret_cast<uint32_t*>(sink.data_ptr<int32_t>());
-  const dim3 grid(hip_comms::kTarget.compute_units), block(hip_comms::kMaxThreads);
-  const auto gbytes = [&](const void* over, hip_comms::Traffic mode, int peer) {
+  const dim3 block(hip_comms::kMaxThreads);
+  const auto gbytes = [&](const void* over, hip_comms::Traffic mode, int peer,
+                          int blocks = hip_comms::kTarget.compute_units) {
     const hip_comms::p2p::DevComm p = h.dev_comm(over, bytes, stream);
+    const dim3 grid(blocks);
     const int how = static_cast<int>(mode);
     auto launch   = [&]() { traffic<<<grid, block, 0, stream>>>(p, how, peer, bytes / 16, s); };
     std::vector<double> got;
@@ -471,6 +473,13 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
       names.push_back(std::string(where) + "_" + what);
       gbps.push_back(gbytes(over, mode, peer));
     }
+  }
+  // THE GRID: how many blocks the links take before reads queue (the kernels' reduce runs on dozens).
+  for (const int blocks : {16, 32, 48, 64, 96, 128}) {
+    names.push_back("cached_pull_b" + std::to_string(blocks));
+    gbps.push_back(gbytes(cached, Traffic::pull, -1, blocks));
+    names.push_back("cached_push_b" + std::to_string(blocks));
+    gbps.push_back(gbytes(cached, Traffic::push, -1, blocks));
   }
   // Every rank done reading every other's before any frees its copy.
   together();
