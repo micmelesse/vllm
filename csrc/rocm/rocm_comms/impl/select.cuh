@@ -70,17 +70,11 @@ constexpr int64_t tile_cols(const Args& a) {
   return hidden_of(a);
 }
 constexpr int64_t tile_cols(const ScaleAddArgs& a) { return a.latent; }
-// A ROW TEMPLATE'S TILE_M: the rows a tile, from calibration where the template has a choice.
-constexpr int tile_m_of(Template t) {
-  return t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm
-             ? kTargetCalibration.attn_res.pull_tile_m
-             : 1;
-}
-// A ROW TEMPLATE'S TILE_N: the smallest of its builds that covers the call's columns at its rows
-// and `threads`, or 0 when none does (check refuses it).
+// A FORCED LAUNCH'S TILE: one row, the smallest built TILE_N covering the call's columns at
+// `threads`, or 0 when none does (check refuses it).
 template <typename Args>
 constexpr int tile_n_of(Template t, const Args& a, int threads) {
-  return tile_n_for(t, tile_cols(a), tile_m_of(t), threads);
+  return tile_n_for(t, tile_cols(a), 1, threads);
 }
 // THE KERNEL: template `t` at `blocks` x `threads` with its arguments and tile from the call, its
 // grid cut to the rows where it gives each block a row.
@@ -90,22 +84,22 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const AllReduce
           KernelConfig{0, 0, threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs& a, int world) {
-  return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype},
-          KernelConfig{tile_m_of(t), tile_n_of(t, a, threads), threads,
-                       grid_of(t, blocks, rows_of(a), world)}};
+  return {
+      t, NormTemplateArgs{world, a.dtype, a.weight_dtype},
+      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResArgs& a,
                             int world) {
-  return {t, AttnResTemplateArgs{world, a.dtype, a.has_prefix},
-          KernelConfig{tile_m_of(t), tile_n_of(t, a, threads), threads,
-                       grid_of(t, blocks, rows_of(a), world)}};
+  return {
+      t, AttnResTemplateArgs{world, a.dtype, a.has_prefix},
+      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
                             int world) {
   const int lanes = kBuild.kernels.gemm_lanes;
-  return {t, GemmTemplateArgs{world, a.dtype, lanes},
-          KernelConfig{tile_m_of(t), tile_n_of(t, a, threads), threads,
-                       grid_of(t, blocks, rows_of(a), world)}};
+  return {
+      t, GemmTemplateArgs{world, a.dtype, lanes},
+      KernelConfig{1, tile_n_of(t, a, threads), threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 // THE ONE-ALL-REDUCE TAIL: a block holds the whole latent (its build) and a slice of the hidden
 // as wide, so a row takes `splits` blocks.
@@ -120,8 +114,21 @@ constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddA
   const int64_t mine = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
   const int64_t work = mine * splits;
   return {t, ScaleAddTemplateArgs{world, a.dtype, splits},
-          KernelConfig{tile_m_of(t), tile_n, threads,
+          KernelConfig{1, tile_n, threads,
                        static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks)}};
+}
+
+// THE KERNEL AT ITS TEMPLATE'S DEFAULT: the first of its configs whose tile covers the call, at
+// that config's threads and grid (cut to the rows); a tile_n of 0 when none covers it (check
+// refuses it).
+template <typename Args>
+constexpr Kernel kernel_for(Template t, const Args& a, int world) {
+  const std::optional<KernelConfig> c = config_for(t, tile_cols(a));
+  const KernelConfig d = c ? *c : configs_of(t)[0];
+  Kernel k = kernel_for(t, d.blocks_per_grid, d.threads_per_block, a, world);
+  k.config.tile_m = d.tile_m;
+  k.config.tile_n = c ? d.tile_n : 0;
+  return k;
 }
 
 // =================================================================================================
@@ -185,11 +192,9 @@ constexpr Kernel tune_all_reduce(const AllReduceArgs& a, int world, const Hardwa
 // up to the op's push_max_bytes, where it wins; the pull two-shot (rows) past it, at prefill.
 constexpr Kernel fused_norm(Template one_shot, Template push, Template pull, const NormArgs& a,
                             int world, const NormCalibration& c) {
-  if (bytes_of(a) <= c.one_shot_max_bytes)
-    return kernel_for(one_shot, c.one_shot.blocks, c.one_shot.threads, a, world);
-  if (bytes_of(a) <= c.push_max_bytes)
-    return kernel_for(push, c.push.blocks, c.push.threads, a, world);
-  return kernel_for(pull, c.pull.blocks, c.pull.threads, a, world);
+  if (bytes_of(a) <= c.one_shot_max_bytes) return kernel_for(one_shot, a, world);
+  if (bytes_of(a) <= c.push_max_bytes) return kernel_for(push, a, world);
+  return kernel_for(pull, a, world);
 }
 
 constexpr Kernel tune_all_reduce_rms_norm(const NormArgs& a, int world, const Hardware&,
@@ -211,13 +216,10 @@ constexpr Kernel tune_all_reduce_add_attn_res_rms_norm(const AttnResArgs& a, int
                                                        const Hardware&, const Calibration& cal) {
   const AttnResCalibration& c = cal.attn_res;
   if (bytes_of(a) <= c.one_shot_max_bytes)
-    return kernel_for(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm, c.one_shot.blocks,
-                      c.one_shot.threads, a, world);
+    return kernel_for(Template::all_reduce_pull_one_shot_add_attn_res_rms_norm, a, world);
   if (bytes_of(a) <= c.push_max_bytes)
-    return kernel_for(Template::all_reduce_push_two_shot_add_attn_res_rms_norm, c.push.blocks,
-                      c.push.threads, a, world);
-  return kernel_for(Template::all_reduce_pull_two_shot_add_attn_res_rms_norm, c.pull.blocks,
-                    c.pull.threads, a, world);
+    return kernel_for(Template::all_reduce_push_two_shot_add_attn_res_rms_norm, a, world);
+  return kernel_for(Template::all_reduce_pull_two_shot_add_attn_res_rms_norm, a, world);
 }
 
 // ALWAYS FUSED, as every op: one-shot up to one GEMM pass of rows, two-shot past it, 56 blocks of
@@ -225,9 +227,8 @@ constexpr Kernel tune_all_reduce_add_attn_res_rms_norm(const AttnResArgs& a, int
 // against 20 us at 1 token, 2026-09-30T20-23-38Z): a loss to fix, shown as one.
 constexpr Kernel gemm(Template one_shot, Template two_shot, const GemmTailArgs& a, int world,
                       const GemmCalibration& c) {
-  return rows_of(a) <= c.one_shot_max_rows
-             ? kernel_for(one_shot, c.one_shot.blocks, c.one_shot.threads, a, world)
-             : kernel_for(two_shot, c.two_shot.blocks, c.two_shot.threads, a, world);
+  return rows_of(a) <= c.one_shot_max_rows ? kernel_for(one_shot, a, world)
+                                           : kernel_for(two_shot, a, world);
 }
 
 constexpr Kernel tune_all_reduce_rms_norm_gemm(const GemmTailArgs& a, int world, const Hardware&,
@@ -250,12 +251,8 @@ constexpr Kernel tune_all_reduce_rms_norm_gemm_add(const GemmTailArgs& a, int wo
 // two-shot: its calibrated grid (machine/hardware.cuh), each block looping over its (row, slice)s.
 constexpr Kernel tune_all_reduce_rms_scale_add(const ScaleAddArgs& a, int world, const Hardware& hw,
                                                const Calibration& cal) {
-  if (a.rows < world)
-    return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, hw.compute_units,
-                      cal.rms_norm.one_shot.threads, a, world);
-  const Launch& two = cal.rms_scale_add_two_shot;
-  return kernel_for(Template::all_reduce_pull_two_shot_rms_scale_add, two.blocks, two.threads, a,
-                    world);
+  if (a.rows < world) return kernel_for(Template::all_reduce_pull_one_shot_rms_scale_add, a, world);
+  return kernel_for(Template::all_reduce_pull_two_shot_rms_scale_add, a, world);
 }
 
 // =================================================================================================
@@ -289,9 +286,14 @@ template <typename Args>
 constexpr Kernel select(const Args& a, int world, const Options& o) {
   Kernel k = rule(a, world, kTarget, kTargetCalibration);
   if (!o.fn) return k;
-  // A FORCED KERNEL: the template at select's launch, or at the forced KernelConfig's, whose zero
+  // A FORCED KERNEL: the template at its own default config (a row template's list; the plain
+  // all-reduce, which has none, at the rule's launch), or at the forced KernelConfig, whose zero
   // tile fields take the template's own tile for the call.
-  const KernelConfig launch = o.kernel_config ? *o.kernel_config : k.config;
+  if (!o.kernel_config)
+    return has_tiles(*o.fn)
+               ? kernel_for(*o.fn, a, world)
+               : kernel_for(*o.fn, k.config.blocks_per_grid, k.config.threads_per_block, a, world);
+  const KernelConfig& launch = *o.kernel_config;
   k = kernel_for(*o.fn, launch.blocks_per_grid, launch.threads_per_block, a, world);
   if (o.kernel_config && o.kernel_config->tile_m > 0) k.config.tile_m = o.kernel_config->tile_m;
   if (o.kernel_config && o.kernel_config->tile_n > 0) k.config.tile_n = o.kernel_config->tile_n;

@@ -100,11 +100,12 @@ void by_weight(DType weight, DType dtype, F&& f) {
   not_built("weight dtype");
 }
 
-// A ROW KERNEL'S BUILD, compiled in: the instance of template K's list (impl/templates.cuh) the
-// config names, and only those; f(constant<TILE_M>, constant<TILE_N>, constant<THREADS_PER_BLOCK>).
+// A ROW KERNEL'S BUILD, compiled in: the build of template K's configs (impl/templates.cuh) the
+// config names (its tile and threads; the grid is the launch's), and only those;
+// f(constant<TILE_M>, constant<TILE_N>, constant<THREADS_PER_BLOCK>).
 template <Template K, typename F, size_t... I>
 void by_instance_in(const KernelConfig& c, F& f, std::index_sequence<I...>) {
-  constexpr std::span<const Instance> list = instances_of(K);
+  constexpr std::span<const KernelConfig> list = configs_of(K);
   if (!((c.tile_m == list[I].tile_m && c.tile_n == list[I].tile_n &&
          c.threads_per_block == list[I].threads_per_block &&
          (f(constant<list[I].tile_m>{}, constant<list[I].tile_n>{},
@@ -116,7 +117,7 @@ void by_instance_in(const KernelConfig& c, F& f, std::index_sequence<I...>) {
 
 template <Template K, typename F>
 void by_instance(const KernelConfig& c, F&& f) {
-  by_instance_in<K>(c, f, std::make_index_sequence<instances_of(K).size()>{});
+  by_instance_in<K>(c, f, std::make_index_sequence<configs_of(K).size()>{});
 }
 
 // A ONE-ROW TEMPLATE'S BUILD: f(constant<TILE_N>, constant<THREADS_PER_BLOCK>); its list has only
@@ -306,12 +307,12 @@ void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
     impl::by_dtype(args.dtype, [&](auto t) {
       using T = typename decltype(t)::t;
       // The four GEMM-tail templates share one list, so one lookup serves each.
-      static_assert(instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        instances_of(Template::all_reduce_pull_two_shot_rms_norm_gemm_add).data() &&
-                    instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm).data() &&
-                    instances_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        instances_of(Template::all_reduce_pull_two_shot_rms_norm_gemm).data());
+      static_assert(configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        configs_of(Template::all_reduce_pull_two_shot_rms_norm_gemm_add).data() &&
+                    configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm).data() &&
+                    configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
+                        configs_of(Template::all_reduce_pull_two_shot_rms_norm_gemm).data());
       impl::at_tile<Template::all_reduce_pull_one_shot_rms_norm_gemm_add, T>(
           k.config, [&](auto bn, auto nt) {
             constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
@@ -352,8 +353,7 @@ void dispatch(const Kernel& k, const ScaleAddArgs& a, F&& f) {
       using T = typename decltype(t)::t;
       // The one-shot's and the two-shot's builds are one list.
       constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
-      static_assert(instances_of(K).data() ==
-                    instances_of(Template::all_reduce_pull_two_shot_rms_scale_add).data());
+      static_assert(same_builds(K, Template::all_reduce_pull_two_shot_rms_scale_add));
       impl::at_tile<K, T>(k.config, [&](auto bn, auto nt) {
         constexpr int BN = decltype(bn)::value, NT = decltype(nt)::value;
         const auto bind = [&](const p2p::DevComm& p) {

@@ -104,40 +104,25 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 
 // MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
 // sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
-// kernels change. EACH OP HAS ITS OWN, AND EACH KERNEL ITS OWN LAUNCH: a value measured on one
-// kernel is never another's by sharing a field; one not swept says so and whose it copies. Every
-// value cites the run that measured it; a tune reads only its input, `Hardware` and `Calibration`.
-struct Launch {
-  int blocks;   // the grid, at most (a row kernel's is cut to its rows)
-  int threads;  // the block
-};
-
+// kernels change. Each value cites the run that measured it; one not swept says so and whose it
+// copies. A kernel's launch is not here: it is its template's configs (impl/templates.cuh).
 // The norms (rms_norm, add_rms_norm): one-shot, then the push two-shot (a column split), then the
 // pull two-shot (a row split), at two crossovers.
 struct NormCalibration {
   int64_t one_shot_max_bytes;
   int64_t push_max_bytes;
-  Launch one_shot;
-  Launch push;
-  Launch pull;
 };
 
 // AttnRes: one-shot, then the push two-shot, then the pull two-shot (both split columns).
 struct AttnResCalibration {
   int64_t one_shot_max_bytes;
   int64_t push_max_bytes;
-  Launch one_shot;
-  Launch push;
-  Launch pull;
   int pull_reduce_blocks;  // of the pull's grid, the blocks that run its reduce-scatter
-  int pull_tile_m;         // its AttnRes tile: TILE_M rows a block at once
 };
 
 // A norm then a GEMM (rms_norm_gemm, and with the add rms_norm_gemm_add).
 struct GemmCalibration {
   int64_t one_shot_max_rows;  // one GEMM pass of rows
-  Launch one_shot;
-  Launch two_shot;
 };
 
 struct Calibration {
@@ -150,11 +135,9 @@ struct Calibration {
   AttnResCalibration attn_res;
   GemmCalibration rms_norm_gemm;
   GemmCalibration rms_norm_gemm_add;
-  Launch rms_scale_add_two_shot;  // the one-all-reduce tail's row two-shot
 };
 
-// gfx950 on n11. MI300X has none yet. The fused kernels' 512-thread block: 256 was worse for the
-// GEMM tail (2026-09-28); not swept for the others, which copy it.
+// gfx950 on n11. MI300X has none yet.
 constexpr Calibration kGfx950Calibration = {
     // calibrate.py, dev run 2026-09-30T19-02-08Z: 28 pairs 1274-1383 ns; a repeat
     // (2026-09-30T19-13-36Z) gave 1282, so about 5% run to run.
@@ -174,14 +157,6 @@ constexpr Calibration kGfx950Calibration = {
             // Push won through 1.75 MiB (256 tokens of 3584 bf16: 18.04 against pull's 18.41 and
             // unfused 18.37), pull from 2.6 MiB (2026-10-01T03-26-44Z).
             .push_max_bytes = 1792 * kKiB,
-            // Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
-            .one_shot = {16, 512},
-            // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at
-            // 128; 2026-10-01T03-26-44Z); a row a block below that.
-            .push = {256, 512},
-            // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and
-            // 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-            .pull = {48, 512},
         },
     .add_rms_norm =
         {
@@ -190,14 +165,6 @@ constexpr Calibration kGfx950Calibration = {
             // Push won through 1.31 MiB (192 tokens: 15.48 against pull's 16.28), pull at 1.75 MiB
             // (18.36 against push's 18.46; 2026-10-01T03-26-44Z).
             .push_max_bytes = 1344 * kKiB,
-            // Not swept: rms_norm's.
-            .one_shot = {16, 512},
-            // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128;
-            // 2026-10-01T03-26-44Z).
-            .push = {256, 512},
-            // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at
-            // 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-            .pull = {48, 512},
         },
     .attn_res =
         {
@@ -208,49 +175,23 @@ constexpr Calibration kGfx950Calibration = {
             // through 3.5 MiB against the pull at its grid (256 tokens: 34.8 against 35.8-38.7 us,
             // 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
             .push_max_bytes = 3584 * kKiB,
-            // Not swept: the norms'.
-            .one_shot = {16, 512},
-            // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15,
-            // 159.33 at 128), a row a block below that (2026-10-01T03-57-23Z).
-            .push = {256, 512},
-            // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within
-            // about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against
-            // 1160.7
-            // at the 36 it had, the row-split norm's (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
-            .pull = {192, 512},
             // ITS REDUCE-SCATTER ON FEWER: reads queue behind the links past a few dozen blocks,
-            // while
-            // AttnRes is compute a row and wants the whole grid. At 4096 tokens the reduce-scatter
+            // while AttnRes is compute a row and wants the whole grid. At 4096 tokens the
+            // reduce-scatter
             // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
             // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
             .pull_reduce_blocks = 32,
-            // 1: TILE_M = 2 lost at every grid, best 480.0 us at 128 blocks against 412.8 at 1 on
-            // 192
-            // (4096 x 7168, 2026-10-02T21-19-22Z).
-            .pull_tile_m = 1,
         },
     .rms_norm_gemm =
         {
             // Not swept: rms_norm_gemm_add's.
             .one_shot_max_rows = 16,
-            // Not swept: rms_norm_gemm_add's.
-            .one_shot = {56, 512},
-            // Not swept: rms_norm_gemm_add's.
-            .two_shot = {56, 512},
         },
     .rms_norm_gemm_add =
         {
             // Not swept: one GEMM pass, where the one-shot kernel once had to stop.
             .one_shot_max_rows = 16,
-            // The best at 1 row, 4 lanes a column (2026-09-28, log).
-            .one_shot = {56, 512},
-            // Not swept: the one-shot's.
-            .two_shot = {56, 512},
         },
-    // About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of
-    // the best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4
-    // at 256 (2026-10-01T22-07-13Z).
-    .rms_scale_add_two_shot = {32, 512},
 };
 
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.

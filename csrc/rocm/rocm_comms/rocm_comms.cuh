@@ -239,9 +239,9 @@ constexpr const char* to_string(Error e) {
 enum class QuantBits : int { eight = 8, four = 4 };
 
 // HOW THE CALLER WANTS A CALL RUN: a lossy precision, and Kernel's own choices forced (a sweep's, a
-// tuner's): its template (at select's launch), and with it its KernelConfig, where a zero tile_m or
-// tile_n is the template's own tile for the call. The call's facts (TemplateArgs) are always
-// select's, from the call.
+// tuner's): its template (at its own default config), and with it its KernelConfig, where a zero
+// tile_m or tile_n is the template's own tile for the call. The call's facts (TemplateArgs) are
+// always select's, from the call.
 struct Options {
   std::optional<QuantBits> quant_bits;  // none: exact
   std::optional<Template> fn;           // none: select's

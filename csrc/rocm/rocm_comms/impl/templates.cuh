@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE CATALOG: what each Template is (its op, its shot) and the builds (Instances) each one has.
+// THE CATALOG: what each Template is (its op, its shot) and the KernelConfigs it is built for.
 
 #pragma once
 
@@ -16,25 +16,60 @@
 
 namespace hip_comms {
 
-// A ROW TEMPLATE'S BUILD, compiled in: its tile and its threads a block (composable_kernel's
-// instance; Triton's autotune config without the grid, which is the launch's). tile_n counts the
-// elements of a 16-bit dtype, the only ones built. What a template lists is exactly what dispatch
-// instantiates, what check accepts and what a tuner searches.
-struct Instance {
-  int tile_m;
-  int tile_n;
-  int threads_per_block;
-};
+// A ROW TEMPLATE'S CONFIGS: the KernelConfigs it is built for, in the order select prefers them
+// (its default for a call is the first whose tile covers the call's row). The compiled part
+// (tile_m, tile_n, threads_per_block) is what dispatch instantiates, what check accepts and what a
+// tuner searches; blocks_per_grid is each config's launch (cut to the rows where a block takes a
+// row), and a caller may force another. tile_n counts the elements of a 16-bit dtype, the only ones
+// built. A config that spills shows in its code object (Handle::resources_of) and loses on the
+// clock; none is ruled out by policy. Each grid cites the sweep that set it, at 512 threads (256
+// was worse for the GEMM tail, 2026-09-28; not swept for the others, which copy it).
 
-// EACH FAMILY'S BUILDS. A build that spills shows in its code object (Handle::resources_of) and
-// loses on the clock; none is ruled out by policy.
-constexpr Instance kNormInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {1, 16384, 512}};
-constexpr Instance kPipelinedNormInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
-constexpr Instance kAttnResInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
-constexpr Instance kAttnResPullInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {2, 4096, 512},
-                                              {2, 8192, 512}, {4, 4096, 512}, {4, 8192, 512}};
-constexpr Instance kGemmTailInstances[] = {{1, 4096, 512}, {1, 8192, 512}, {1, 16384, 512}};
-constexpr Instance kScaleAddInstances[] = {{1, 4096, 512}, {1, 8192, 512}};
+// The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
+// Not swept: grid_of cuts it to the rows, so it matters only past 16 rows.
+constexpr KernelConfig kRmsNormOneShotConfigs[] = {
+    {1, 4096, 512, 16}, {1, 8192, 512, 16}, {1, 16384, 512, 16}};
+// 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at 128;
+// 2026-10-01T03-26-44Z); a row a block below that.
+constexpr KernelConfig kRmsNormPushConfigs[] = {
+    {1, 4096, 512, 256}, {1, 8192, 512, 256}, {1, 16384, 512, 256}};
+// Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and 147.6 at
+// 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
+constexpr KernelConfig kRmsNormPullConfigs[] = {{1, 4096, 512, 48}, {1, 8192, 512, 48}};
+// Not swept: rms_norm's.
+constexpr KernelConfig kAddRmsNormOneShotConfigs[] = {
+    {1, 4096, 512, 16}, {1, 8192, 512, 16}, {1, 16384, 512, 16}};
+// 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128; 2026-10-01T03-26-44Z).
+constexpr KernelConfig kAddRmsNormPushConfigs[] = {
+    {1, 4096, 512, 256}, {1, 8192, 512, 256}, {1, 16384, 512, 256}};
+// 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at 2048 and 4096
+// against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
+constexpr KernelConfig kAddRmsNormPullConfigs[] = {{1, 4096, 512, 48}, {1, 8192, 512, 48}};
+
+// AttnRes. Not swept: the norms'.
+constexpr KernelConfig kAttnResOneShotConfigs[] = {{1, 4096, 512, 16}, {1, 8192, 512, 16}};
+// 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15, 159.33 at
+// 128), a row a block below that (2026-10-01T03-57-23Z).
+constexpr KernelConfig kAttnResPushConfigs[] = {{1, 4096, 512, 256}, {1, 8192, 512, 256}};
+// The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within about 5%
+// of the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7 at the 36 it had
+// (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z). TILE_M 2 and 4 lost at every grid, best 480.0 us
+// at 128 blocks against 412.8 at 1 on 192 (4096 x 7168, 2026-10-02T21-19-22Z), so they come last.
+constexpr KernelConfig kAttnResPullConfigs[] = {{1, 4096, 512, 192}, {1, 8192, 512, 192},
+                                                {2, 4096, 512, 192}, {2, 8192, 512, 192},
+                                                {4, 4096, 512, 192}, {4, 8192, 512, 192}};
+
+// The GEMM tails, both ops and both shots: 56 blocks the best at 1 row, 4 lanes a column
+// (2026-09-28, log); not swept for the rest, which copy it.
+constexpr KernelConfig kGemmTailConfigs[] = {
+    {1, 4096, 512, 56}, {1, 8192, 512, 56}, {1, 16384, 512, 56}};
+
+// The one-all-reduce tail. The one-shot: a block a (row, slice) up to one a compute unit.
+constexpr KernelConfig kRmsScaleAddOneShotConfigs[] = {{1, 4096, 512, 256}, {1, 8192, 512, 256}};
+// About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of the
+// best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4 at 256
+// (2026-10-01T22-07-13Z).
+constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {{1, 4096, 512, 32}, {1, 8192, 512, 32}};
 
 // What each template is, in Template's order: its op, its shot, and its builds (none for the plain
 // all-reduce, which has no tile).
@@ -43,7 +78,7 @@ struct TemplateInfo {
   const char* name;
   Op op;
   bool two_shot;
-  std::span<const Instance> instances;
+  std::span<const KernelConfig> configs;
 };
 
 // A TEMPLATE AND ITS NAME FROM ONE TOKEN, so the name cannot differ from the enum's.
@@ -53,35 +88,35 @@ constexpr TemplateInfo kTemplates[] = {
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot), Op::all_reduce, false, {}},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot), Op::all_reduce, true, {}},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), Op::all_reduce_rms_norm, false,
-     kNormInstances},
+     kRmsNormOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
-     kPipelinedNormInstances},
+     kRmsNormPullConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), Op::all_reduce_add_rms_norm, false,
-     kNormInstances},
+     kAddRmsNormOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
-     kPipelinedNormInstances},
+     kAddRmsNormPullConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, false, kAttnResInstances},
+     Op::all_reduce_add_attn_res_rms_norm, false, kAttnResOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPullInstances},
+     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPullConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
-     false, kGemmTailInstances},
+     false, kGemmTailConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add), Op::all_reduce_rms_norm_gemm_add,
-     true, kGemmTailInstances},
+     true, kGemmTailConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), Op::all_reduce_rms_norm, true,
-     kNormInstances},
+     kRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), Op::all_reduce_add_rms_norm, true,
-     kNormInstances},
+     kAddRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
-     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResInstances},
+     Op::all_reduce_add_attn_res_rms_norm, true, kAttnResPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, false,
-     kGemmTailInstances},
+     kGemmTailConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), Op::all_reduce_rms_norm_gemm, true,
-     kGemmTailInstances},
+     kGemmTailConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), Op::all_reduce_rms_scale_add, false,
-     kScaleAddInstances},
+     kRmsScaleAddOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), Op::all_reduce_rms_scale_add, true,
-     kScaleAddInstances},
+     kRmsScaleAddTwoShotConfigs},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -108,30 +143,47 @@ constexpr bool gemms(Op op) {
   return op == Op::all_reduce_rms_norm_gemm || op == Op::all_reduce_rms_norm_gemm_add;
 }
 
-constexpr std::span<const Instance> instances_of(Template k) { return info(k).instances; }
-constexpr bool has_tiles(Template k) { return !instances_of(k).empty(); }
+constexpr std::span<const KernelConfig> configs_of(Template k) { return info(k).configs; }
+constexpr bool has_tiles(Template k) { return !configs_of(k).empty(); }
 
+// Whether two configs are one build: the same tile at the same threads (the grid is a launch's).
+constexpr bool same_build(const KernelConfig& a, const KernelConfig& b) {
+  return a.tile_m == b.tile_m && a.tile_n == b.tile_n && a.threads_per_block == b.threads_per_block;
+}
 // Whether template `k` builds `c`'s tile at `c`'s threads.
 constexpr bool built(Template k, const KernelConfig& c) {
-  for (const Instance& i : instances_of(k))
-    if (i.tile_m == c.tile_m && i.tile_n == c.tile_n && i.threads_per_block == c.threads_per_block)
-      return true;
+  for (const KernelConfig& b : configs_of(k))
+    if (same_build(b, c)) return true;
   return false;
 }
 constexpr bool built_at(Template k, int threads_per_block) {
-  for (const Instance& i : instances_of(k))
-    if (i.threads_per_block == threads_per_block) return true;
+  for (const KernelConfig& b : configs_of(k))
+    if (b.threads_per_block == threads_per_block) return true;
   return false;
 }
+// Whether two templates are built for the same tiles and threads (one dispatch serves both).
+constexpr bool same_builds(Template a, Template b) {
+  if (configs_of(a).size() != configs_of(b).size()) return false;
+  for (size_t i = 0; i < configs_of(a).size(); ++i)
+    if (!same_build(configs_of(a)[i], configs_of(b)[i])) return false;
+  return true;
+}
 
-// THE SMALLEST BUILT TILE_N of `k` that covers `cols` at `tile_m` rows and `threads_per_block`;
-// 0 when none does.
+// SELECT'S DEFAULT for `k` on a row of `cols`: its first config whose tile covers it, or none.
+constexpr std::optional<KernelConfig> config_for(Template k, int64_t cols) {
+  for (const KernelConfig& c : configs_of(k))
+    if (c.tile_n >= cols) return c;
+  return std::nullopt;
+}
+
+// A FORCED LAUNCH'S TILE: the smallest built TILE_N of `k` covering `cols` at `tile_m` rows and
+// `threads_per_block`; 0 when none does.
 constexpr int tile_n_for(Template k, int64_t cols, int tile_m, int threads_per_block) {
   int best = 0;
-  for (const Instance& i : instances_of(k))
-    if (i.tile_m == tile_m && i.threads_per_block == threads_per_block && i.tile_n >= cols &&
-        (best == 0 || i.tile_n < best))
-      best = i.tile_n;
+  for (const KernelConfig& c : configs_of(k))
+    if (c.tile_m == tile_m && c.threads_per_block == threads_per_block && c.tile_n >= cols &&
+        (best == 0 || c.tile_n < best))
+      best = c.tile_n;
   return best;
 }
 
