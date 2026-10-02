@@ -48,11 +48,6 @@ logger = logging.getLogger(__name__)
 class HipTunables:
     """Every arbitrary number this backend has. One default each until measured."""
 
-    # Two-shot's scratch, after the signal block, per rank. It holds one rank's slice,
-    # so it caps a two-shot buffer at `scratch_bytes` x ngpus (1.07 GB at 8 ranks); the
-    # INT8 two-shot holds every rank's slice at half width, padded to whole grid
-    # strides (Kimi-K3's 4096 x 7168 bf16 prefill needs 74 MB at 36 blocks).
-    scratch_bytes: int = 128 << 20
     # Peer-pointer slots, one per captured launch: capture_sizes x layers. 8 MB, the
     # size vLLM gives the same array.
     max_buffers: int = 131072
@@ -96,7 +91,7 @@ class HipCommunicator(Communicator):
         self.rank = dist.get_rank(self.cpu_group)
         # THIS RANK'S PEER MEMORY, made and owned by C++ (signal block, scratch,
         # staging); Python only exchanges its handle, a process-group collective.
-        memory = torch.ops._rocm_C.rocm_comms_alloc(tunables.scratch_bytes)
+        memory = torch.ops._rocm_C.rocm_comms_alloc()
         handles, offsets = self._exchange(memory)
         self._handle = torch.ops._rocm_C.rocm_comms_init(
             self.rank,
@@ -105,7 +100,6 @@ class HipCommunicator(Communicator):
             handles,
             offsets,
             tunables.max_buffers,
-            tunables.scratch_bytes,
             tunables.sync_timeout_s,
         )
         logger.info(

@@ -126,6 +126,11 @@ constexpr int kPackBytes = kBuild.pack_bytes;
 // through it a pass at a time; an in-place build on an eager input (the fused ops) needs it whole,
 // up to Kimi-K3's widest row (the one-all-reduce tail's 4096 x 17920 bf16, 147 MB).
 constexpr int64_t kStagingBytes = 256 * kMiB;
+// THE TWO-SHOT SCRATCH, per rank, after the signal block: policy. It holds one rank's slice, so it
+// caps a two-shot buffer at kScratchBytes x ngpus (1 GiB at 8 ranks); a quantized two-shot holds
+// every rank's slice at half width, padded to whole grid strides (Kimi-K3's 4096 x 7168 bf16
+// prefill needs 74 MB at 36 blocks). check refuses a call past it (scratch_too_small).
+constexpr int64_t kScratchBytes = 128 * kMiB;
 constexpr int kMaxThreads = kBuild.max_threads;
 constexpr int kMaxWaves = kMaxThreads / kWaveSize;
 constexpr int kGemmRows = kBuild.gemm_rows;

@@ -120,19 +120,19 @@ static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result)
     TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
 }
 
-int64_t rocm_comms_alloc(int64_t scratch_bytes) {
+int64_t rocm_comms_alloc() {
   return static_cast<int64_t>(
-      hip_comms::p2p::host::alloc_memory(scratch_bytes, hip_comms::kStagingBytes));
+      hip_comms::p2p::host::alloc_memory(hip_comms::kScratchBytes, hip_comms::kStagingBytes));
 }
 
 fptr_t rocm_comms_init(int64_t rank, int64_t world_size, int64_t self_memory,
                        const std::vector<std::vector<int64_t>>& signal_handles,
                        const std::vector<int64_t>& signal_offsets, int64_t max_buffers,
-                       int64_t scratch_bytes, double sync_timeout_s) {
+                       double sync_timeout_s) {
   auto* handle = new hip_comms::Handle(
       static_cast<int>(rank), static_cast<int>(world_size),
       static_cast<uintptr_t>(self_memory), bytes_of(signal_handles), signal_offsets, max_buffers,
-      scratch_bytes, hip_comms::kStagingBytes, sync_timeout_s);
+      hip_comms::kScratchBytes, hip_comms::kStagingBytes, sync_timeout_s);
   return reinterpret_cast<fptr_t>(handle);
 }
 
