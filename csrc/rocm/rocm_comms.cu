@@ -99,8 +99,8 @@ std::variant<hip_comms::Options, hip_comms::Error> options_of(
 // An op's options, its Error raised: a torch op can only return or raise.
 hip_comms::Options options_or_raise(std::optional<int64_t> quant_bits,
                                     const std::optional<std::string>& template_,
-                                    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
-  auto o = options_of(quant_bits, template_, blocks, threads);
+                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
+  auto o = options_of(quant_bits, template_, launch_blocks, launch_threads);
   if (const auto* e = std::get_if<hip_comms::Error>(&o))
     TORCH_CHECK(false, "hip_comms: ", hip_comms::to_string(*e));
   return std::get<hip_comms::Options>(o);
@@ -174,9 +174,9 @@ std::variant<hip_comms::DType, hip_comms::Error> admitted(const torch::Tensor& i
 
 template <typename Args>
 PlanWire planned(fptr_t handle_ptr, const Args& a, std::optional<int64_t> quant_bits,
-                 std::optional<std::string> template_, std::optional<int64_t> blocks,
-                 std::optional<int64_t> threads) {
-  const auto forced = options_of(quant_bits, template_, blocks, threads);
+                 std::optional<std::string> template_, std::optional<int64_t> launch_blocks,
+                 std::optional<int64_t> launch_threads) {
+  const auto forced = options_of(quant_bits, template_, launch_blocks, launch_threads);
   if (const auto* e = std::get_if<hip_comms::Error>(&forced)) return error_wire(*e);
   const std::variant<hip_comms::Kernel, hip_comms::Error> p =
       hip_comms::plan(handle_of(handle_ptr), a, std::get<hip_comms::Options>(forced));
@@ -189,15 +189,15 @@ PlanWire planned(fptr_t handle_ptr, const Args& a, std::optional<int64_t> quant_
 PlanWire rocm_comms_plan_all_reduce(fptr_t handle_ptr, const torch::Tensor& inp,
                                     std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> blocks,
-                                    std::optional<int64_t> threads) {
+                                    std::optional<int64_t> launch_blocks,
+                                    std::optional<int64_t> launch_threads) {
   const auto d = admitted(inp, false);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   const hip_comms::DType dtype = std::get<hip_comms::DType>(d);
   return planned(handle_ptr,
                  hip_comms::AllReduceArgs{nullptr, nullptr,
                                           inp.numel() * inp.element_size(), dtype},
-                 quant_bits, template_, blocks, threads);
+                 quant_bits, template_, launch_blocks, launch_threads);
 }
 
 // `add`: fused_add_rms_norm; otherwise rms_norm.
@@ -205,8 +205,8 @@ PlanWire rocm_comms_plan_all_reduce_rms_norm(fptr_t handle_ptr, const torch::Ten
                                              const torch::Tensor& weight, bool add,
                                              std::optional<int64_t> quant_bits,
                                              std::optional<std::string> template_,
-                                             std::optional<int64_t> blocks,
-                                             std::optional<int64_t> threads) {
+                                             std::optional<int64_t> launch_blocks,
+                                             std::optional<int64_t> launch_threads) {
   const auto d = admitted(inp, true);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   const std::optional<hip_comms::DType> w = dtype_from(weight.scalar_type());
@@ -214,22 +214,22 @@ PlanWire rocm_comms_plan_all_reduce_rms_norm(fptr_t handle_ptr, const torch::Ten
   return planned(handle_ptr,
                  hip_comms::NormArgs{add, nullptr, nullptr, nullptr, std::get<hip_comms::DType>(d),
                                      *w, inp.size(0), inp.size(1), 0.f, nullptr, nullptr},
-                 quant_bits, template_, blocks, threads);
+                 quant_bits, template_, launch_blocks, launch_threads);
 }
 
 PlanWire rocm_comms_plan_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr,
                                                           const torch::Tensor& inp,
                                                           std::optional<int64_t> quant_bits,
                                                           std::optional<std::string> template_,
-                                                          std::optional<int64_t> blocks,
-                                                          std::optional<int64_t> threads) {
+                                                          std::optional<int64_t> launch_blocks,
+                                                          std::optional<int64_t> launch_threads) {
   const auto d = admitted(inp, true);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   return planned(handle_ptr,
                  hip_comms::AttnResArgs{nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr,
                                         nullptr, nullptr, std::get<hip_comms::DType>(d),
                                         inp.size(0), inp.size(1), 0, -1, 0.f, 0.f, false},
-                 quant_bits, template_, blocks, threads);
+                 quant_bits, template_, launch_blocks, launch_threads);
 }
 
 // `add`: the GEMM added into the output; otherwise written. `gemm_weight` is [N, hidden].
@@ -237,8 +237,8 @@ PlanWire rocm_comms_plan_all_reduce_rms_norm_gemm(fptr_t handle_ptr, const torch
                                                   const torch::Tensor& gemm_weight, bool add,
                                                   std::optional<int64_t> quant_bits,
                                                   std::optional<std::string> template_,
-                                                  std::optional<int64_t> blocks,
-                                                  std::optional<int64_t> threads) {
+                                                  std::optional<int64_t> launch_blocks,
+                                                  std::optional<int64_t> launch_threads) {
   const auto d = admitted(inp, true);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   if (gemm_weight.dim() != 2) return error_wire(hip_comms::Error::output_not_two_d);
@@ -246,7 +246,7 @@ PlanWire rocm_comms_plan_all_reduce_rms_norm_gemm(fptr_t handle_ptr, const torch
                  hip_comms::GemmTailArgs{add, nullptr, 0, 0, nullptr, nullptr, 0.f, nullptr,
                                          gemm_weight.size(0), nullptr,
                                          std::get<hip_comms::DType>(d), inp.size(0), inp.size(1)},
-                 quant_bits, template_, blocks, threads);
+                 quant_bits, template_, launch_blocks, launch_threads);
 }
 
 // `inp`'s row is [shared | projected | latent] and `out` [rows, hidden]: the latent is what is
@@ -255,8 +255,8 @@ PlanWire rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr, const torch
                                                   const torch::Tensor& out,
                                                   std::optional<int64_t> quant_bits,
                                                   std::optional<std::string> template_,
-                                                  std::optional<int64_t> blocks,
-                                                  std::optional<int64_t> threads) {
+                                                  std::optional<int64_t> launch_blocks,
+                                                  std::optional<int64_t> launch_threads) {
   const auto d = admitted(inp, true);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return error_wire(*e);
   if (out.dim() != 2) return error_wire(hip_comms::Error::output_not_two_d);
@@ -265,7 +265,7 @@ PlanWire rocm_comms_plan_all_reduce_rms_scale_add(fptr_t handle_ptr, const torch
   return planned(handle_ptr,
                  hip_comms::ScaleAddArgs{nullptr, nullptr, std::get<hip_comms::DType>(d),
                                          inp.size(0), hidden, latent, 0.f},
-                 quant_bits, template_, blocks, threads);
+                 quant_bits, template_, launch_blocks, launch_threads);
 }
 
 // SUPPORTED AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
@@ -403,14 +403,14 @@ void rocm_comms_register_graph_buffers(
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> blocks, std::optional<int64_t> threads) {
+                           std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
   ran(hip_comms::all_reduce(
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), inp.numel() * inp.element_size(), dtype_of(inp)},
-      options_or_raise(quant_bits, template_, blocks, threads)));
+      options_or_raise(quant_bits, template_, launch_blocks, launch_threads)));
 }
 
 namespace {
@@ -456,9 +456,9 @@ void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch
                                     torch::Tensor& weight, double eps,
                                     std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
+                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm(handle_ptr, out, nullptr, inp, nullptr, weight, eps,
-                      options_or_raise(quant_bits, template_, blocks, threads));
+                      options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
@@ -466,10 +466,10 @@ void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         torch::Tensor& residual, torch::Tensor& weight,
                                         double eps, std::optional<int64_t> quant_bits,
                                         std::optional<std::string> template_,
-                                        std::optional<int64_t> blocks,
-                                        std::optional<int64_t> threads) {
+                                        std::optional<int64_t> launch_blocks,
+                                        std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm(handle_ptr, out, &residual_out, inp, &residual, weight, eps,
-                      options_or_raise(quant_bits, template_, blocks, threads));
+                      options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 // With `has_prefix` the sum is added to `prefix` in place; without, the sum IS the new prefix.
@@ -480,7 +480,7 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
     int64_t write_idx, double eps, double out_eps, bool has_prefix,
     std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   check_device_contiguous({&prefix, &out, &inp, &norm_weight, &qk_weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
   const int64_t hidden = inp.size(1);
@@ -515,7 +515,7 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
        out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0),
        hidden, static_cast<int>(num_blocks), static_cast<int>(write_idx),
        static_cast<float>(eps), static_cast<float>(out_eps), has_prefix},
-      options_or_raise(quant_bits, template_, blocks, threads)));
+      options_or_raise(quant_bits, template_, launch_blocks, launch_threads)));
 }
 
 namespace {
@@ -555,9 +555,9 @@ void rocm_comms_all_reduce_rms_norm_gemm(
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm_gemm(handle_ptr, false, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_or_raise(quant_bits, template_, blocks, threads));
+                           workspace, options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
@@ -565,9 +565,9 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads) {
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
   all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
-                           workspace, options_or_raise(quant_bits, template_, blocks, threads));
+                           workspace, options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
@@ -576,8 +576,8 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
                                          torch::Tensor& inp, double eps,
                                          std::optional<int64_t> quant_bits,
                                          std::optional<std::string> template_,
-                                         std::optional<int64_t> blocks,
-                                         std::optional<int64_t> threads) {
+                                         std::optional<int64_t> launch_blocks,
+                                         std::optional<int64_t> launch_threads) {
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
               "inp and out must be 2-D with the same rows");
@@ -589,7 +589,7 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
       handle_of(handle_ptr),
       {out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden, latent,
        static_cast<float>(eps)},
-      options_or_raise(quant_bits, template_, blocks, threads)));
+      options_or_raise(quant_bits, template_, launch_blocks, launch_threads)));
 }
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr) {

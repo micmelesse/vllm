@@ -85,31 +85,31 @@ std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int
 rocm_comms_plan_all_reduce(
     fptr_t handle_ptr, const torch::Tensor& inp,
     std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>>
 rocm_comms_plan_all_reduce_rms_norm(
     fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight, bool add,
     std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>>
 rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, const torch::Tensor& inp,
     std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>>
 rocm_comms_plan_all_reduce_rms_norm_gemm(
     fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& gemm_weight, bool add,
     std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<int64_t>,
            std::optional<int64_t>>
 rocm_comms_plan_all_reduce_rms_scale_add(
     fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& out,
     std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 // A variant at the torch boundary: the arch or the Error's number, exactly one set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_supported(
     int64_t device, int64_t world);
@@ -121,42 +121,42 @@ rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            std::optional<int64_t> quant_bits, std::optional<std::string> template_,
-                           std::optional<int64_t> blocks, std::optional<int64_t> threads);
+                           std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                                     torch::Tensor& weight, double eps,
                                     std::optional<int64_t> quant_bits,
                                     std::optional<std::string> template_,
-                                    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+                                    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         torch::Tensor& residual_out, torch::Tensor& inp,
                                         torch::Tensor& residual, torch::Tensor& weight,
                                         double eps, std::optional<int64_t> quant_bits,
                                         std::optional<std::string> template_,
-                                        std::optional<int64_t> blocks,
-                                        std::optional<int64_t> threads);
+                                        std::optional<int64_t> launch_blocks,
+                                        std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm_gemm(
     fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
                                          torch::Tensor& inp, double eps,
                                          std::optional<int64_t> quant_bits,
                                          std::optional<std::string> template_,
-                                         std::optional<int64_t> blocks,
-                                         std::optional<int64_t> threads);
+                                         std::optional<int64_t> launch_blocks,
+                                         std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
     fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
@@ -165,7 +165,7 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
     int64_t write_idx, double eps, double out_eps, bool has_prefix,
     std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
-    std::optional<int64_t> blocks, std::optional<int64_t> threads);
+    std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads);
 
 std::tuple<std::vector<int64_t>, int64_t> rocm_comms_handle_and_offset(int64_t ptr);
 
