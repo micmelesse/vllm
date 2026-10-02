@@ -439,17 +439,15 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options | None = None,
     ) -> None:
-        """`out[:, out_col0:out_col0 + N] = rms_norm(all_reduce(inp), norm_weight, eps)
-        @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
+        """`out = rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
+        kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
+        wider buffer is fine)."""
         options = self._require(GemmTailArgs(inp, gemm_weight, add=False), options)
         if self._warming_up("all_reduce_rms_norm_gemm"):
             return
-        self._all_reduce_rms_norm_gemm(
-            inp, norm_weight, eps, gemm_weight, out, out_col0, options
-        )
+        self._all_reduce_rms_norm_gemm(inp, norm_weight, eps, gemm_weight, out, options)
 
     @final
     def should_allreduce_rms_norm_gemm_add(
@@ -471,16 +469,16 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options | None = None,
     ) -> None:
-        """`out[:, out_col0:out_col0 + N] += rms_norm(all_reduce(inp), norm_weight, eps)
-        @ gemm_weight.T` in one kernel, `gemm_weight` being [N, hidden]."""
+        """`out += rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
+        kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
+        wider buffer is fine)."""
         options = self._require(GemmTailArgs(inp, gemm_weight, add=True), options)
         if self._warming_up("all_reduce_rms_norm_gemm_add"):
             return
         self._all_reduce_rms_norm_gemm_add(
-            inp, norm_weight, eps, gemm_weight, out, out_col0, options
+            inp, norm_weight, eps, gemm_weight, out, options
         )
 
     @final
@@ -677,7 +675,6 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options,
     ) -> None:
         raise NotImplementedError(
@@ -692,7 +689,6 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options,
     ) -> None:
         raise NotImplementedError(

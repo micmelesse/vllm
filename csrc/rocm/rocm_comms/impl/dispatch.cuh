@@ -314,7 +314,7 @@ void dispatch(const Kernel& k, const GemmTailArgs& a, F&& f) {
               return std::make_tuple(
                   p, static_cast<const T*>(a.norm_weight), a.eps,
                   static_cast<const T*>(a.gemm_weight), static_cast<int>(a.n_cols),
-                  static_cast<T*>(a.out), a.out_stride, a.out_col0, static_cast<T*>(a.workspace),
+                  static_cast<T*>(a.out), a.out_stride, static_cast<T*>(a.workspace),
                   rows, packs);
             };
             switch (k.fn) {

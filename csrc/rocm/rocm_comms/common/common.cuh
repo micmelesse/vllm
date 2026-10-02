@@ -26,7 +26,7 @@
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
 //   thread_dot(a, b, f)                         this thread's share of a row's dot
-//   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride, col0)  the
+//   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its geometry (kGemmRows, gemm_max_threads)
 // softmax.cuh

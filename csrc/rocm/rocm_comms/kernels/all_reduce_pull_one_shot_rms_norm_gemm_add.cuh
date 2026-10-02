@@ -18,7 +18,7 @@ namespace hip_comms {
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks, bool kAdd>
 DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    int n_cols, T* __restrict__ out, int64_t out_stride,
     T* __restrict__ workspace, int rows, int packs) {
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -68,7 +68,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   for (int r0 = 0; r0 < rows; r0 += kGemmRows)
     grid_gemm<kLanesPerCol, kAdd, T>([&](int r) { return normed + (r0 + r) * packs; },
                                min(kGemmRows, rows - r0), gemm_w, n_cols, packs,
-                               out + r0 * out_stride, out_stride, out_col0);
+                               out + r0 * out_stride, out_stride);
 
   block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.
@@ -81,20 +81,20 @@ template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     all_reduce_pull_one_shot_rms_norm_gemm(
     p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    int n_cols, T* __restrict__ out, int64_t out_stride,
     T* __restrict__ workspace, int rows, int packs) {
   all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, false>(
-      p, norm_w, eps, gemm_w, n_cols, out, out_stride, out_col0, workspace, rows, packs);
+      p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
 }
 
 template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
     all_reduce_pull_one_shot_rms_norm_gemm_add(
     p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride, int out_col0,
+    int n_cols, T* __restrict__ out, int64_t out_stride,
     T* __restrict__ workspace, int rows, int packs) {
   all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, true>(
-      p, norm_w, eps, gemm_w, n_cols, out, out_stride, out_col0, workspace, rows, packs);
+      p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
 }
 
 

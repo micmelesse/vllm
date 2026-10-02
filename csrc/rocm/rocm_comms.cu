@@ -600,9 +600,10 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
 }
 
 namespace {
-// out[:, col0:col0+N] = rms_norm(all_reduce(inp)) @ gemm_weight^T, or += with `add`; `workspace`
+// out = rms_norm(all_reduce(inp)) @ gemm_weight^T (out [rows, N], a column slice of a wider
+// buffer allowed), or += with `add`; `workspace`
 // holds the normed rows, inp's shape and dtype.
-void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, int64_t out_col0,
+void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out,
                               torch::Tensor& inp, torch::Tensor& norm_weight, double eps,
                               torch::Tensor& gemm_weight, torch::Tensor& workspace,
                               const hip_comms::Options& o) {
@@ -615,15 +616,14 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, i
                   gemm_weight.stride(1) == 1 && gemm_weight.stride(0) == hidden,
               "gemm_weight must be [N, hidden] with contiguous rows");
   const int64_t n_cols = gemm_weight.size(0);
-  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == rows && out.stride(1) == 1 &&
-                  out_col0 >= 0 && out_col0 + n_cols <= out.size(1),
-              "out must be [rows, >= col0 + N] with a unit column stride");
+  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == rows && out.size(1) == n_cols &&
+                  out.stride(1) == 1,
+              "out must be [rows, N] with a unit column stride");
   TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == hidden,
               "norm_weight must be 1-D of hidden=", hidden);
   for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight})
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
-  const hip_comms::GemmTailArgs a{add, out.data_ptr(), out.stride(0), static_cast<int>(out_col0),
-                                  inp.data_ptr(), norm_weight.data_ptr(), static_cast<float>(eps),
+  const hip_comms::GemmTailArgs a{add, out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(), static_cast<float>(eps),
                                   gemm_weight.data_ptr(), n_cols, workspace.data_ptr(),
                                   dtype_of(inp), rows, hidden};
   ran(add ? hip_comms::all_reduce_rms_norm_gemm_add(handle_of(handle_ptr), a, o)
@@ -632,23 +632,23 @@ void all_reduce_rms_norm_gemm(fptr_t handle_ptr, bool add, torch::Tensor& out, i
 }  // namespace
 
 void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
     std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
-  all_reduce_rms_norm_gemm(handle_ptr, false, out, out_col0, inp, norm_weight, eps, gemm_weight,
+  all_reduce_rms_norm_gemm(handle_ptr, false, out, inp, norm_weight, eps, gemm_weight,
                            workspace,
                            options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
     std::optional<int64_t> launch_blocks, std::optional<int64_t> launch_threads) {
-  all_reduce_rms_norm_gemm(handle_ptr, true, out, out_col0, inp, norm_weight, eps, gemm_weight,
+  all_reduce_rms_norm_gemm(handle_ptr, true, out, inp, norm_weight, eps, gemm_weight,
                            workspace,
                            options_or_raise(quant_bits, template_, launch_blocks, launch_threads));
 }

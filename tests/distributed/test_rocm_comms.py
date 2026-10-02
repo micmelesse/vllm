@@ -1701,7 +1701,7 @@ def run_rms_norm_gemm_rank(
         return False, NO_FUSED_KERNEL
     got = shared.clone()
     run = comm.all_reduce_rms_norm_gemm_add if add else comm.all_reduce_rms_norm_gemm
-    run(mine, norm_w, FUSED_EPS, gemm_w, got, col0, options=options)
+    run(mine, norm_w, FUSED_EPS, gemm_w, got.narrow(-1, col0, shard), options=options)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float().cpu()

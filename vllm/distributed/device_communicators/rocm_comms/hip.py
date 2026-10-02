@@ -153,13 +153,11 @@ class HipCommunicator(Communicator):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm(
             self._handle,
             out,
-            out_col0,
             inp,
             norm_weight,
             eps,
@@ -176,13 +174,11 @@ class HipCommunicator(Communicator):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        out_col0: int,
         options: Options,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
             self._handle,
             out,
-            out_col0,
             inp,
             norm_weight,
             eps,

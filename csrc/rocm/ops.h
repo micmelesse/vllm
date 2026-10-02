@@ -139,7 +139,7 @@ void rocm_comms_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                         std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,
@@ -153,7 +153,7 @@ void rocm_comms_all_reduce_rms_scale_add(fptr_t handle_ptr, torch::Tensor& out,
                                          std::optional<int64_t> launch_threads);
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, int64_t out_col0, torch::Tensor& inp,
+    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
     torch::Tensor& workspace, std::optional<int64_t> quant_bits,
     std::optional<std::string> template_,

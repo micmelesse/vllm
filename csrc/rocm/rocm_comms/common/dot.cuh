@@ -50,8 +50,8 @@ constexpr int gemm_max_threads(int lanes_per_col) {
 static_assert(gemm_max_waves(1) >= kMaxWaves,
               "the GEMM tail holds the widest block at every lane split");
 
-// out[r, col0 + n] = T(sum_k x[r][k] * w[n][k]), or with kAccumulate
-// T(float(out[r, col0 + n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= kGemmRows, the sum
+// out[r, n] = T(sum_k x[r][k] * w[n][k]), or with kAccumulate
+// T(float(out[r, n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= kGemmRows, the sum
 // in fp32 and rounded once. `row(r)` points at row r of x, wherever it lives.
 //
 // x is staged in LDS a K-chunk at a time (coalesced, once per block per chunk), so the hot
@@ -65,7 +65,7 @@ static_assert(gemm_max_waves(1) >= kMaxWaves,
 // the last bits, not bitwise.
 template <int kLanesPerCol, bool kAccumulate, typename T, typename Row>
 DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
-                  T* __restrict__ out, int64_t out_stride, int out_col0) {
+                  T* __restrict__ out, int64_t out_stride) {
   using V          = typename traits<T>::V;
   constexpr int NL = traits<T>::N;
   constexpr int kTile = kWaveSize / kLanesPerCol;
@@ -124,7 +124,7 @@ DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_co
       if (r < rows && col < n_cols) {
         float v = 0.0f;
         for (int q = 0; q < waves; ++q) v += partial[q][r][i % kTile];
-        T* at = out + r * out_stride + out_col0 + col;
+        T* at = out + r * out_stride + col;
         if constexpr (kAccumulate) *at = static_cast<T>(static_cast<float>(*at) + v);
         else *at = static_cast<T>(v);
       }

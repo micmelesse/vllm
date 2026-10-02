@@ -167,7 +167,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                 &rocm_comms_all_reduce_add_attn_res_rms_norm);
 
   rocm_ops.def(
-      "rocm_comms_all_reduce_rms_norm_gemm(int handle_ptr, Tensor! out, int out_col0, "
+      "rocm_comms_all_reduce_rms_norm_gemm(int handle_ptr, Tensor! out, "
       "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, "
       "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm", torch::kCUDA,
@@ -180,7 +180,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                 &rocm_comms_all_reduce_rms_scale_add);
 
   rocm_ops.def(
-      "rocm_comms_all_reduce_rms_norm_gemm_add(int handle_ptr, Tensor! out, int out_col0, "
+      "rocm_comms_all_reduce_rms_norm_gemm_add(int handle_ptr, Tensor! out, "
       "Tensor inp, Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, "
       "int? quant_bits, str? template_, int? launch_blocks, int? launch_threads) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_rms_norm_gemm_add", torch::kCUDA,
