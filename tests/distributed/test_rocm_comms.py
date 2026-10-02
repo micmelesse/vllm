@@ -1114,8 +1114,7 @@ def ranks(world: int) -> Iterator[World]:
 # FULL: it spawns no ranks, but it checks a rule that moves rarely, against a baseline
 # that moves never.
 @pytest.mark.full
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_admission_matches_the_baseline(world_size: int) -> None:
+def test_admission_matches_the_baseline() -> None:
     """Every backend admits exactly what vLLM's CustomAllreduce does -- the precondition
     for the matrix
     meaning anything, since arms that route different work compare routing rather than
@@ -1123,7 +1122,7 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
     only, so closing it needs a kernel.
     """
     ours = object.__new__(TorchCommunicator)
-    ours.disabled, ours.world_size = False, world_size
+    ours.disabled = False
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real
@@ -1135,7 +1134,7 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
             if nbytes % es:
                 continue
             t = torch.empty(nbytes // es, dtype=dtype)
-            where = f"{dtype} {nbytes}B world={world_size}"
+            where = f"{dtype} {nbytes}B"
             aligned = nbytes % BASELINE_ALIGNMENT == 0
             # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. Size refuses nothing,
             # and the dtype grid here is fp16/bf16, so what `should_*` still refuses is

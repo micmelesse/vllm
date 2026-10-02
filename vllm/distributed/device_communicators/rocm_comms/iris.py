@@ -7,8 +7,9 @@ import logging
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
-from .base import Communicator, Options
+from .base import Communicator, Error, Options, supported
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,11 @@ class IrisCommunicator(Communicator):
         return self.iris.heap_bytes
 
     def _open(self) -> bool:
+        world = dist.get_world_size(self.device_group)
+        got = supported(self.device, world)
+        if isinstance(got, Error):
+            logger.info("IrisCommunicator disabled: %s", got.name)
+            return False
         if not _iris_available():
             logger.warning("IrisCommunicator disabled: the iris package is not here")
             return False
@@ -85,14 +91,14 @@ class IrisCommunicator(Communicator):
             return False
 
         # ITS RANKS AND OURS MUST AGREE. iris counts its own, and every buffer below is
-        # sized by `self.world_size`, which came from the device group. They match in
+        # sized by `world`, which came from the device group. They match in
         # any arrangement we run; a mismatch would be a silently wrong shape, so it is
         # a disable and not an assumption.
-        if self._shmem.num_ranks != self.world_size:
+        if self._shmem.num_ranks != world:
             logger.warning(
                 "IrisCommunicator disabled: iris has %d ranks, the device group %d",
                 self._shmem.num_ranks,
-                self.world_size,
+                world,
             )
             return False
 
@@ -111,7 +117,7 @@ class IrisCommunicator(Communicator):
             return False
         logger.info(
             "IrisCommunicator ready: world_size=%d heap=%dGB small_limit=%dMB",
-            self.world_size,
+            world,
             self._heap >> 30,
             small >> 20,
         )

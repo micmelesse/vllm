@@ -12,7 +12,7 @@ import logging
 import torch
 import torch.distributed as dist
 
-from .base import Communicator, Options
+from .base import Communicator, Error, Options, supported
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +25,17 @@ class TorchCommunicator(Communicator):
     for interface parity and unused. It admits exactly what the others admit, taking the
     shared envelope unchanged.
 
-    Supplies no `_open` and no `_on_capture`: there is nothing to bring up and nothing
-    to do around a capture.
-
-    It is gated on arch and width like the others even though torch.distributed is
-    neither -- see `base.__init__`. A control is only wanted where the backends run.
+    Supplies no `_on_capture`: there is nothing to do around a capture.
     """
+
+    def _open(self) -> bool:
+        """Nothing to bring up, but gated on the device and world like hip: a control
+        is only wanted where the backends run."""
+        got = supported(self.device, dist.get_world_size(self.device_group))
+        if isinstance(got, Error):
+            logger.info("TorchCommunicator disabled: %s", got.name)
+            return False
+        return True
 
     def _all_reduce(
         self,

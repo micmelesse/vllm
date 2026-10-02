@@ -20,7 +20,6 @@ from enum import IntEnum
 from typing import ClassVar, Literal
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
@@ -247,7 +246,6 @@ class Communicator(ABC):
     """
 
     disabled: bool
-    world_size: int
 
     # THE OPS THIS BACKEND RUNS; every other is `no_such_op`.
     OPS: ClassVar[frozenset[Op]] = frozenset({"all_reduce"})
@@ -298,29 +296,11 @@ class Communicator(ABC):
         device_group: ProcessGroup,
         device: int | str | torch.device,
     ) -> None:
-        """Every backend's construction, done ONCE here.
-
-        It was three copies of the same prelude -- normalise the device, keep the two
-        groups, read the world size, gate on the hardware -- and a backend now supplies
-        only `_open`, the part that is actually its own.
-
-        DISABLED FIRST, so every early return leaves a safe object rather than one whose
-        flag depends on how far this got. Unavailability is not an error: the caller
-        checks `.disabled`.
-        """
-        self.disabled = True
+        """Keep the groups and the device, then `_open`, which checks the backend's
+        availability. Unavailability is not an error: the caller checks `.disabled`."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
-        self.world_size = dist.get_world_size(device_group)
-
-        # THE BOX, NOT THE BACKEND, asked of the build once for every backend. torch is
-        # gated too: it is the CONTROL, and a control available where no backend is has
-        # nothing to be a control for.
-        got = supported(self.device, self.world_size)
-        if isinstance(got, Error):
-            logger.info("%s disabled: %s", type(self).__name__, got.name)
-            return
         self.disabled = not self._open()
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
@@ -761,14 +741,10 @@ class Communicator(ABC):
             return Error.dtype_not_built
         return Plan()
 
+    @abstractmethod
     def _open(self) -> bool:
-        """Bring this backend up. True when it is usable; False leaves it disabled,
-        which is not an error.
-
-        NOTHING, by default -- torch needs no setup. It is where a backend's OWN
-        availability checks go, the ones only it could run.
-        """
-        return True
+        """Bring this backend up, its availability checks included. True when it is
+        usable; False leaves it disabled, which is not an error."""
 
     def _on_capture(self) -> AbstractContextManager[None]:
         """What this backend needs around a capture. Nothing, by default."""
