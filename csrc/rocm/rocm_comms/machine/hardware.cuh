@@ -224,8 +224,10 @@ constexpr Calibration kGfx950Calibration = {
             // took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4
             // (stamps, 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
             .pull_reduce_blocks = 32,
-            // Not swept yet: 1 is the row a block it always had.
-            .pull_block_m = 2,
+            // 1: BLOCK_M = 2 lost at every grid, best 480.0 us at 128 blocks against 412.8 at 1 on
+            // 192
+            // (4096 x 7168, 2026-10-02T21-19-22Z).
+            .pull_block_m = 1,
         },
     .rms_norm_gemm =
         {

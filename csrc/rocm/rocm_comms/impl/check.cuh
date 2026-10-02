@@ -38,7 +38,7 @@ bool resident(const Handle& h, const Kernel& k, const Args& a) {
   bool fits = true;
   dispatch(k, a, [&](auto kernel, const auto&) {
     const Resources used = h.resources_of(reinterpret_cast<const void*>(kernel));
-    fits                 = k.grid <= resident_blocks(kTarget, used, k.threads);
+    fits = k.config.grid <= resident_blocks(kTarget, used, k.config.num_threads);
   });
   return fits;
 }
@@ -58,12 +58,14 @@ std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, cons
         a.latent * e % kBuild.memory.pack_bytes != 0 || a.latent < 1)
       return Error::widths_not_packs;
   if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
-  if (has_row_packs(k.fn) && !row_packs_of(k.args)) return Error::row_too_wide;
+  if (has_row_packs(k.fn) && k.config.num_threads != kBuild.kernels.max_threads)
+    return Error::threads_not_built;
+  if (has_row_packs(k.fn) && k.config.block_n == 0) return Error::row_too_wide;
   // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
-  if (k.fn == Template::all_reduce_pull_two_shot && k.threads % (world * kWaveSize) != 0)
+  if (k.fn == Template::all_reduce_pull_two_shot && k.config.num_threads % (world * kWaveSize) != 0)
     return Error::block_not_a_wave_per_peer;
   if (o.quant_bits) return Error::quantized_not_built;
-  if (gemms(op_of(a)) && k.threads > gemm_max_threads(kBuild.kernels.gemm_lanes))
+  if (gemms(op_of(a)) && k.config.num_threads > gemm_max_threads(kBuild.kernels.gemm_lanes))
     return Error::block_exceeds_lds;
   if (!is_staged(k) && scratch_need(k.fn, rows_of(a), packs_of(a), world) > h.scratch_bytes())
     return Error::scratch_too_small;

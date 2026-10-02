@@ -102,6 +102,7 @@ class Error(IntEnum):
     no_such_group = 22
     ranks_disagree = 23
     groups_disagree = 24
+    threads_not_built = 25
 
 
 # C++'s `DType` names, as torch's dtypes.

@@ -15,18 +15,21 @@ namespace hip_comms {
 // Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
 // grid barrier; the GEMM over every row, kBuild.kernels.gemm_rows a pass.
 // kLanesPerCol is the GEMM's lanes per column (the build's gemm_lanes).
-template <typename T, int ngpus, int kLanesPerCol, int kRowPacks, bool kAdd>
-DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
-    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride,
-    T* __restrict__ workspace, int rows, int packs) {
+template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS, bool kAdd>
+DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
+                                                         const T* __restrict__ norm_w, float eps,
+                                                         const T* __restrict__ gemm_w, int n_cols,
+                                                         T* __restrict__ out, int64_t out_stride,
+                                                         T* __restrict__ workspace, int rows,
+                                                         int packs) {
+  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -79,25 +82,24 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
 // added into `out` (rms_norm_gemm_add).
-template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
+template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
-    all_reduce_pull_one_shot_rms_norm_gemm(
-    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride,
-    T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, false>(
+    all_reduce_pull_one_shot_rms_norm_gemm(p2p::DevComm p, const T* __restrict__ norm_w, float eps,
+                                           const T* __restrict__ gemm_w, int n_cols,
+                                           T* __restrict__ out, int64_t out_stride,
+                                           T* __restrict__ workspace, int rows, int packs) {
+  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, BLOCK_N, NUM_THREADS, false>(
       p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
 }
 
-template <typename T, int ngpus, int kLanesPerCol, int kRowPacks>
+template <typename T, int ngpus, int kLanesPerCol, int BLOCK_N, int NUM_THREADS>
 __global__ void __launch_bounds__(gemm_max_threads(kLanesPerCol), 1)
-    all_reduce_pull_one_shot_rms_norm_gemm_add(
-    p2p::DevComm p, const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w,
-    int n_cols, T* __restrict__ out, int64_t out_stride,
-    T* __restrict__ workspace, int rows, int packs) {
-  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, kRowPacks, true>(
+    all_reduce_pull_one_shot_rms_norm_gemm_add(p2p::DevComm p, const T* __restrict__ norm_w,
+                                               float eps, const T* __restrict__ gemm_w, int n_cols,
+                                               T* __restrict__ out, int64_t out_stride,
+                                               T* __restrict__ workspace, int rows, int packs) {
+  all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, kLanesPerCol, BLOCK_N, NUM_THREADS, true>(
       p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
 }
-
 
 }  // namespace hip_comms

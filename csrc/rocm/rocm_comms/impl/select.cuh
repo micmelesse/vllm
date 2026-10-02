@@ -63,52 +63,62 @@ constexpr int grid_of(Template k, int blocks, int64_t rows, int world) {
   return mine < blocks ? static_cast<int>(mine) : blocks;
 }
 
-// A ROW TEMPLATE'S BUILD: the smallest that holds the call's row at `threads`, or none.
-template <typename Args>
-constexpr std::optional<int> row_packs_of(Template t, const Args& a, int threads) {
-  const int r = row_packs_for(t, packs_of(a), threads);
-  return r > 0 ? std::optional<int>(r) : std::nullopt;
+// A ROW TEMPLATE'S BLOCK_N: the smallest built tile that covers a row of `packs` at `threads`, in
+// elements, or 0 when none does.
+constexpr int block_n_for(Template t, int64_t packs, DType d, int threads) {
+  const int r = row_packs_for(t, packs, threads);
+  return r * (kBuild.memory.pack_bytes / elem_bytes(d)) * threads;
 }
-
-// THE KERNEL: template `t` at `blocks` x `threads` with its arguments from the call, its grid cut
-// to the rows where it gives each block a row.
+template <typename Args>
+constexpr int block_n_of(Template t, const Args& a, int threads) {
+  return block_n_for(t, packs_of(a), a.dtype, threads);
+}
+// A ROW TEMPLATE'S BLOCK_M: the rows a tile, from calibration where the template has a choice.
+constexpr int block_m_of(Template t) {
+  return t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm
+             ? kTargetCalibration.attn_res.pull_block_m
+             : 1;
+}
+// THE KERNEL: template `t` at `blocks` x `threads` with its arguments and tile from the call, its
+// grid cut to the rows where it gives each block a row.
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AllReduceArgs& a,
                             int world) {
-  return {t, AllReduceTemplateArgs{world, a.dtype, false}, grid_of(t, blocks, rows_of(a), world),
-          threads};
+  return {t, AllReduceTemplateArgs{world, a.dtype, false},
+          Config{0, 0, threads, grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const NormArgs& a, int world) {
-  return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype, row_packs_of(t, a, threads)},
-          grid_of(t, blocks, rows_of(a), world), threads};
+  return {t, NormTemplateArgs{world, a.dtype, a.weight_dtype},
+          Config{block_m_of(t), block_n_of(t, a, threads), threads,
+                 grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const AttnResArgs& a,
                             int world) {
-  return {t, AttnResTemplateArgs{world, a.dtype, row_packs_of(t, a, threads), a.has_prefix},
-          grid_of(t, blocks, rows_of(a), world), threads};
+  return {t, AttnResTemplateArgs{world, a.dtype, a.has_prefix},
+          Config{block_m_of(t), block_n_of(t, a, threads), threads,
+                 grid_of(t, blocks, rows_of(a), world)}};
 }
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const GemmTailArgs& a,
                             int world) {
   const int lanes = kBuild.kernels.gemm_lanes;
-  return {t, GemmTemplateArgs{world, a.dtype, lanes, row_packs_of(t, a, threads)},
-          grid_of(t, blocks, rows_of(a), world), threads};
+  return {t, GemmTemplateArgs{world, a.dtype, lanes},
+          Config{block_m_of(t), block_n_of(t, a, threads), threads,
+                 grid_of(t, blocks, rows_of(a), world)}};
 }
-
 // THE ONE-ALL-REDUCE TAIL: a block holds the whole latent (its build) and a slice of the hidden
 // as wide, so a row takes `splits` blocks.
 constexpr Kernel kernel_for(Template t, int blocks, int threads, const ScaleAddArgs& a,
                             int world) {
-  const int e         = elem_bytes(a.dtype);
-  const int r = row_packs_for(t, a.latent * e / kBuild.memory.pack_bytes, threads);
-  const int64_t span  = int64_t{r > 0 ? r : 1} * threads;
+  const int e = elem_bytes(a.dtype);
+  const int block_n = block_n_for(t, a.latent * e / kBuild.memory.pack_bytes, a.dtype, threads);
+  const int64_t span = block_n > 0 ? block_n * e / kBuild.memory.pack_bytes : threads;
   const int64_t hp = a.hidden * e / kBuild.memory.pack_bytes;
-  const int splits    = static_cast<int>((hp + span - 1) / span);
+  const int splits = static_cast<int>((hp + span - 1) / span);
   // A block a (row, slice): every row's in the one-shot, this rank's in the two-shot.
-  const int64_t mine  = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
-  const int64_t work  = mine * splits;
-  return {t,
-          ScaleAddTemplateArgs{world, a.dtype, r > 0 ? std::optional<int>(r) : std::nullopt,
-                               splits},
-          static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks), threads};
+  const int64_t mine = is_two_shot(t) ? (a.rows + world - 1) / world : a.rows;
+  const int64_t work = mine * splits;
+  return {t, ScaleAddTemplateArgs{world, a.dtype, splits},
+          Config{block_m_of(t), block_n, threads,
+                 static_cast<int>(work < blocks ? (work > 0 ? work : 1) : blocks)}};
 }
 
 // =================================================================================================
@@ -284,23 +294,14 @@ constexpr bool is_staged(const Kernel& k) {
   return a && a->staged;
 }
 
-// A KERNEL'S ROW BUILD, for the templates with rows; none for the plain all-reduce.
-constexpr std::optional<int> row_packs_of(const TemplateArgs& args) {
-  if (const auto* n = std::get_if<NormTemplateArgs>(&args)) return n->row_packs;
-  if (const auto* r = std::get_if<AttnResTemplateArgs>(&args)) return r->row_packs;
-  if (const auto* g = std::get_if<GemmTemplateArgs>(&args)) return g->row_packs;
-  if (const auto* c = std::get_if<ScaleAddTemplateArgs>(&args)) return c->row_packs;
-  return std::nullopt;
-}
-
 // EVERY SELECTED KERNEL FITS, for every op at the smallest call and a large one: a rule never
 // declines (a fusion that is on runs its fused op), and a kernel past a capability is a compile
 // error, not one that overruns its signal slots or register arrays.
 constexpr bool fits(const Kernel& k) {
-  if (k.grid < 1 || k.grid > p2p::kMaxBlocks) return false;
-  if (has_row_packs(k.fn) && !row_packs_of(k.args)) return false;
-  return k.threads >= kWaveSize && k.threads <= kBuild.kernels.max_threads &&
-         k.threads % kWaveSize == 0;
+  if (k.config.grid < 1 || k.config.grid > p2p::kMaxBlocks) return false;
+  if (has_row_packs(k.fn) && k.config.block_n == 0) return false;
+  const int t = k.config.num_threads;
+  return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
 }
 constexpr bool selections_fit() {
   const Options o{std::nullopt, std::nullopt, nullptr};

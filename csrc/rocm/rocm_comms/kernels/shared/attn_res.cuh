@@ -21,9 +21,9 @@ namespace hip_comms {
 // `sum[m]` is row offs_m + m's sum over the ranks; a row past M (the last tile's) reads row M - 1
 // and writes nothing, so every thread still reaches every reduction. `written(row)` is the block row
 // a row writes, or null.
-template <typename T, bool kPrefix, int BLOCK_M, int kRowPacks, typename Written>
+template <typename T, bool kPrefix, int BLOCK_M, int BLOCK_N, int kRowPacks, typename Written>
 DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[BLOCK_M][kRowPacks],
-                                 const Tile<BLOCK_M, kRowPacks>& tile,
+                                 const Tile<BLOCK_M, BLOCK_N>& tile,
                                  const ThreadOffs<kRowPacks>& thread_cols,
                                  typename traits<T>::V* pre, Written written, const T* blocks,
                                  int64_t block_stride_m, int64_t block_stride_r,

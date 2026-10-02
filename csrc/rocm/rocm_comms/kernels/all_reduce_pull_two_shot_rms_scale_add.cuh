@@ -18,25 +18,27 @@ namespace hip_comms {
 // A BLOCK OWNS ONE (ROW, SLICE) OF THIS RANK'S ROWS, `splits` slices a row, as in the one-shot.
 // THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: a block gathers exactly the (row, slice)s
 // the same block on each owner finished, which is what a peers barrier makes visible.
-template <typename T, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+template <typename T, int ngpus, int BLOCK_N, int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS, 1)
     all_reduce_pull_two_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
                                            int hidden_packs, int latent_packs, int splits) {
+  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   V* o                   = reinterpret_cast<V*>(out);
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto latent_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, latent_packs * NL, 0, 0});
+  const auto latent_cols =
+      thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, latent_packs * NL, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
   // This (row, slice)'s tile of the hidden: one row cut to the slice's columns.
   const auto slice_of    = [&](int w) {
     const int first = (w % splits) * slice;
-    return thread_offs<T>(
-        Tile<1, kRowPacks>{rows, min(first + slice, hidden_packs) * NL, 0, first * NL});
+    return thread_offs<T, NUM_THREADS>(
+        Tile<1, BLOCK_N>{rows, min(first + slice, hidden_packs) * NL, 0, first * NL});
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.

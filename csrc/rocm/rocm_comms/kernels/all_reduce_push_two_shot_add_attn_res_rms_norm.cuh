@@ -20,13 +20,13 @@ namespace hip_comms {
 // BELONGS TO BLOCK q % gridDim.x IN BOTH PHASES: after the sync a block may read only what the
 // same block on a peer wrote. `blocks` is [rows, num_sources, hidden] with row and source strides
 // in elements; `write_idx` < 0 writes no block.
-template <typename T, int ngpus, bool kPrefix, int kRowPacks>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
-    all_reduce_push_two_shot_add_attn_res_rms_norm(
-        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
-        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
-        float eps, float out_eps, int rows, int packs) {
+template <typename T, int ngpus, bool kPrefix, int BLOCK_N, int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS, 1) all_reduce_push_two_shot_add_attn_res_rms_norm(
+    p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
+    int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
+    const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx, float eps,
+    float out_eps, int rows, int packs) {
+  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
@@ -39,7 +39,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    it is read (a peer's next kernel starts only once this one has finished).
   const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const Tile<1, kRowPacks> tile{rows, cols, row, 0};
+    const Tile<1, BLOCK_N> tile{rows, cols, row, 0};
     const int64_t base = int64_t{row} * packs;
     V sum[1][kRowPacks];
 #pragma unroll

@@ -16,17 +16,19 @@ namespace hip_comms {
 // takes several blocks rather than more registers; each reads the whole latent for the row's RMS
 // (its 1/rms is the same in every slice). Rounds as the reference does: each span's sum lands as
 // T, the all-reduce output, then out = T(float(shared) + float(projected) * scale).
-template <typename T, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+template <typename T, int ngpus, int BLOCK_N, int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS, 1)
     all_reduce_pull_one_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
                                            int hidden_packs, int latent_packs, int splits) {
+  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   V* o                   = reinterpret_cast<V*>(out);
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto latent_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, latent_packs * NL, 0, 0});
+  const auto latent_cols =
+      thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, latent_packs * NL, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -49,7 +51,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     const int first = (w % splits) * slice;
     const int len   = min(slice, hidden_packs - first);
     const auto hidden_cols =
-        thread_offs<T>(Tile<1, kRowPacks>{rows, (first + len) * NL, row, first * NL});
+        thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, (first + len) * NL, row, first * NL});
     const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
     const auto pj = peers_load<T, ngpus>(proj, row, packs, hidden_cols);
     const auto lt = peers_load<T, ngpus>(latent, row, packs, latent_cols);

@@ -100,9 +100,8 @@ enum class Template : int {
   all_reduce_pull_two_shot_rms_scale_add         = 16,
 };
 
-// A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has. `row_packs`
-// is the packs of a row a thread holds, its row build: none when no build holds the call's row
-// (validate refuses it).
+// A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has; the tile and
+// the launch are the Kernel's Config.
 // `staged`: the build that copies an eager input into its staging a pass at a time (any size),
 // not the one that reads a registered or captured input in place; plan decides it.
 struct AllReduceTemplateArgs {
@@ -114,37 +113,43 @@ struct NormTemplateArgs {
   int world;
   DType dtype;
   DType weight;  // dtype, or f32
-  std::optional<int> row_packs;
 };
 struct AttnResTemplateArgs {
   int world;
   DType dtype;
-  std::optional<int> row_packs;
   bool prefix;
 };
 struct GemmTemplateArgs {
   int world;
   DType dtype;
   int lanes;  // grid_gemm's lanes a column
-  std::optional<int> row_packs;
 };
 // `splits`: the slices of a row's hidden, a block each.
 struct ScaleAddTemplateArgs {
   int world;
   DType dtype;
-  std::optional<int> row_packs;
   int splits;
 };
 using TemplateArgs = std::variant<AllReduceTemplateArgs, NormTemplateArgs, AttnResTemplateArgs,
                                   GemmTemplateArgs, ScaleAddTemplateArgs>;
 
+// HOW A KERNEL IS TILED AND LAUNCHED, Triton's autotune config: the tile (BLOCK_M rows x BLOCK_N
+// columns, in elements; block_n 0 when no build holds the call's row, which check refuses), the
+// block's threads (NUM_THREADS, Triton's num_warps x 64) and the grid. A row kernel compiles its
+// tile and threads in; the plain all-reduce has no tile (block_m and block_n 0).
+struct Config {
+  int block_m;
+  int block_n;
+  int num_threads;
+  int grid;
+};
+
 // WHAT SELECT RETURNS: one kernel, the template with its arguments decided (the compiled
-// instruction sequence), and its launch.
+// instruction sequence), and its Config.
 struct Kernel {
   Template fn;
   TemplateArgs args;
-  int grid;
-  int threads;
+  Config config;
 };
 
 // A template the caller forces, at its grid and block (the bench's sweeps); select decides its
@@ -158,33 +163,34 @@ struct Forced {
 // WHY A CALL CANNOT RUN, every reason there is. The numbers cross to Python (rocm_comms.Error), so
 // a reason is only ever added at the end. `disabled` and `no_such_op` are the communicator's own.
 enum class Error : int {
-  disabled                  = 0,
-  no_such_op                = 1,
-  not_contiguous            = 2,
-  not_two_d                 = 3,
-  output_not_two_d          = 4,
-  dtype_not_built           = 5,
-  world_not_built           = 6,
-  row_not_packs             = 7,
-  widths_not_packs          = 8,
+  disabled = 0,
+  no_such_op = 1,
+  not_contiguous = 2,
+  not_two_d = 3,
+  output_not_two_d = 4,
+  dtype_not_built = 5,
+  world_not_built = 6,
+  row_not_packs = 7,
+  widths_not_packs = 8,
   row_not_wider_than_output = 9,
-  template_not_this_ops     = 10,
-  row_too_wide              = 11,
+  template_not_this_ops = 10,
+  row_too_wide = 11,
   block_not_a_wave_per_peer = 12,
-  quantized_not_built       = 13,
-  block_exceeds_lds         = 14,
-  scratch_too_small         = 15,
-  grid_not_resident         = 16,
-  staging_too_small         = 17,
-  device_not_built          = 18,
-  device_not_tuned          = 19,
-  weight_not_built          = 20,
-  no_such_template          = 21,
-  no_such_group             = 22,
-  ranks_disagree            = 23,
-  groups_disagree           = 24,
+  quantized_not_built = 13,
+  block_exceeds_lds = 14,
+  scratch_too_small = 15,
+  grid_not_resident = 16,
+  staging_too_small = 17,
+  device_not_built = 18,
+  device_not_tuned = 19,
+  weight_not_built = 20,
+  no_such_template = 21,
+  no_such_group = 22,
+  ranks_disagree = 23,
+  groups_disagree = 24,
+  threads_not_built = 25,
 };
-constexpr int kNumErrors = 25;
+constexpr int kNumErrors = 26;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -228,6 +234,8 @@ constexpr const char* to_string(Error e) {
       return "ranks_disagree: the ranks captured different numbers of buffers";
     case Error::groups_disagree:
       return "groups_disagree: the CPU and device groups differ in size or in this rank";
+    case Error::threads_not_built:
+      return "threads_not_built: no build of the template runs at that block size";
   }
   return "unknown";
 }

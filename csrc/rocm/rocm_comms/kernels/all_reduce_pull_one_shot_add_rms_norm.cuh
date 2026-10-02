@@ -16,12 +16,13 @@ namespace hip_comms {
 // trip and a launch against an all-reduce then a norm kernel. A block owns a row. `residual` and
 // `residual_out` are unused (null) unless kAdd; `weight` keeps its own dtype W (T or fp32), as
 // vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`).
-template <typename T, typename W, int ngpus, bool kAdd, int kRowPacks>
+template <typename T, typename W, int ngpus, bool kAdd, int BLOCK_N, int NUM_THREADS>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
                                                         T* __restrict__ residual_out,
                                                         const T* __restrict__ residual,
                                                         const W* __restrict__ weight, float eps,
                                                         int rows, int packs) {
+  constexpr int kRowPacks = packs_per_thread<T, BLOCK_N, NUM_THREADS>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   const V* res_in        = reinterpret_cast<const V*>(residual);
@@ -30,7 +31,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
+  const auto thread_cols = thread_offs<T, NUM_THREADS>(Tile<1, BLOCK_N>{rows, cols, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -87,23 +88,23 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename T, typename W, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+template <typename T, typename W, int ngpus, int BLOCK_N, int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS, 1)
     all_reduce_pull_one_shot_rms_norm(p2p::DevComm p, T* __restrict__ out,
                                       const W* __restrict__ weight, float eps, int rows,
                                       int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false, kRowPacks>(
+  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false, BLOCK_N, NUM_THREADS>(
       p, out, nullptr, nullptr, weight, eps, rows, packs);
 }
 
-template <typename T, typename W, int ngpus, int kRowPacks>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+template <typename T, typename W, int ngpus, int BLOCK_N, int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS, 1)
     all_reduce_pull_one_shot_add_rms_norm(p2p::DevComm p, T* __restrict__ out,
                                           T* __restrict__ residual_out,
                                           const T* __restrict__ residual,
                                           const W* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true, kRowPacks>(
+  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true, BLOCK_N, NUM_THREADS>(
       p, out, residual_out, residual, weight, eps, rows, packs);
 }
 

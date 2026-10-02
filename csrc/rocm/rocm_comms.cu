@@ -189,7 +189,8 @@ PlanWire planned(fptr_t handle_ptr, const Args& a, std::optional<int64_t> quant_
       hip_comms::plan(handle_of(handle_ptr), a, std::get<hip_comms::Options>(forced));
   if (const auto* e = std::get_if<hip_comms::Error>(&p)) return error_wire(*e);
   const auto& k = std::get<hip_comms::Kernel>(p);
-  return PlanWire{std::string(hip_comms::to_string(k.fn)), k.grid, k.threads, std::nullopt};
+  return PlanWire{std::string(hip_comms::to_string(k.fn)), k.config.grid, k.config.num_threads,
+                  std::nullopt};
 }
 }  // namespace
 

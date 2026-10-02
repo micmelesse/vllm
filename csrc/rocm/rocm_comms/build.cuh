@@ -95,7 +95,6 @@ struct BuildInfo {
     int gemm_lanes;               // the GEMM tail's lanes a column, the one build of it
     int attn_res_sources;         // AttnRes's sources a block_reduce, the one build of it
     int attn_res_reduce_blocks;   // its pull two-shot's blocks that run the reduce-scatter
-    int attn_res_block_m;         // its pull two-shot's AttnRes tile: BLOCK_M rows at once
     double sync_timeout_seconds;  // how long a kernel waits on a peer before it traps
   };
   Supports supports;
@@ -169,7 +168,6 @@ constexpr BuildInfo derive(const Hardware& hw, const Calibration& cal) {
   b.gemm_lanes = cal.gemm_lanes_per_col;
   b.attn_res_sources = cal.attn_res_sources_per_reduce;
   b.attn_res_reduce_blocks = cal.attn_res.pull_reduce_blocks;
-  b.attn_res_block_m = cal.attn_res.pull_block_m;
   // HOW LONG A KERNEL WAITS ON A PEER before it prints where it was and traps.
   b.sync_timeout_seconds = 10.0;
   return info;
