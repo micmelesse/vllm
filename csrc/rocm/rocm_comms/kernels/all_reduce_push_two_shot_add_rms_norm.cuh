@@ -35,11 +35,12 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice        = (packs + ngpus - 1) / ngpus;
   const int col0         = p.rank * slice;
-  const int cols         = max(0, min(slice, packs - col0));  // the last rank's may be short
+  const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int cols = packs * NL;  // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -53,10 +54,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor.
-  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * cols; e += blockDim.x) {
-    const int64_t q   = e / cols;
+  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * own_packs; e += blockDim.x) {
+    const int64_t q = e / own_packs;
     const int64_t row = blockIdx.x + q * gridDim.x;
-    const int64_t i   = row * packs + col0 + (e - q * cols);
+    const int64_t i = row * packs + col0 + (e - q * own_packs);
     const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) p2p::write_scratch(scratches[r], i, sum);

@@ -36,8 +36,9 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int per_rank     = (packs + ngpus - 1) / ngpus;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
   const int col0         = min(p.rank * slice, packs);
-  const int cols         = max(0, min(slice, packs - col0));  // a late rank's may be short or none
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int own_packs = max(0, min(slice, packs - col0));  // a late rank's may be short or none
+  const int cols = packs * NL;                             // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -61,18 +62,18 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
   //    bytes.
   const int reducers = min(static_cast<int>(gridDim.x), kBuild.kernels.attn_res_reduce_blocks);
-  if (cols > 0 && static_cast<int>(blockIdx.x) < reducers) {
+  if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
-    int q = threadIdx.x / cols;  // this thread's row among the block's, and its column
-    int c = threadIdx.x - q * cols;
-    const int dq = blockDim.x / cols, dc = blockDim.x - dq * cols;
+    int q = threadIdx.x / own_packs;  // this thread's row among the block's, and its column
+    int c = threadIdx.x - q * own_packs;
+    const int dq = blockDim.x / own_packs, dc = blockDim.x - dq * own_packs;
     for (; q < reduce_rows;) {
       const int64_t i = (int64_t{blockIdx.x} + int64_t{q} * reducers) * packs + col0 + c;
       p2p::write_scratch(own_scratch, i, peers_reduce(peers_load<T, ngpus>(read, i)));
       q += dq;
       c += dc;
-      if (c >= cols) {
-        c -= cols;
+      if (c >= own_packs) {
+        c -= own_packs;
         ++q;
       }
     }
@@ -90,7 +91,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    finished).
   constexpr int BLOCK_M = kBuild.kernels.attn_res_block_m;
   for (int offs_m = blockIdx.x * BLOCK_M; offs_m < rows; offs_m += gridDim.x * BLOCK_M) {
-    const Tile<BLOCK_M, kRowPacks> tile{rows, packs, offs_m, 0};
+    const Tile<BLOCK_M, kRowPacks> tile{rows, cols, offs_m, 0};
     V sum[BLOCK_M][kRowPacks];
 #pragma unroll
     for (int m = 0; m < BLOCK_M; ++m) {

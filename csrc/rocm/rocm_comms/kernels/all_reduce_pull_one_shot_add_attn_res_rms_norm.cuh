@@ -27,7 +27,8 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   V* pre                 = reinterpret_cast<V*>(prefix);
   V* o                   = reinterpret_cast<V*>(out);
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int cols = packs * NL;  // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -43,7 +44,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   // 2. Each of this block's tiles (one row: BLOCK_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const Tile<1, kRowPacks> tile{rows, packs, row, 0};
+    const Tile<1, kRowPacks> tile{rows, cols, row, 0};
     V sum[1][kRowPacks];
     peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum[0]);
     block_attn_res_tile<T, kPrefix>(sum, tile, thread_cols, pre, written, blocks, block_stride_m,

@@ -41,7 +41,7 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[BLOCK_M][kRo
     const int row = tile.offs_m + m;
     live[m] = row < tile.M;
     const int at = live[m] ? row : tile.M - 1;
-    base[m] = int64_t{at} * tile.N;
+    base[m] = int64_t{at} * (tile.N / NL);  // the row, in packs
     row_blocks[m] = blocks + int64_t{at} * block_stride_m;
   }
   // The new prefix: the sum over the ranks added to the old one, rounded once to T.

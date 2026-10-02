@@ -25,7 +25,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int cols = packs * NL;  // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);

@@ -35,7 +35,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int cols = packs * NL;  // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);

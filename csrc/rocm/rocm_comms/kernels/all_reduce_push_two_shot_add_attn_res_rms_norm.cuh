@@ -34,11 +34,12 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   V* o                   = reinterpret_cast<V*>(out);
   const int slice        = (packs + ngpus - 1) / ngpus;
   const int col0         = p.rank * slice;
-  const int cols         = max(0, min(slice, packs - col0));  // the last rank's may be short
+  const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const auto thread_cols = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
+  const int cols = packs * NL;  // the row, in elements
+  const auto thread_cols = thread_offs<T>(Tile<1, kRowPacks>{rows, cols, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -58,10 +59,10 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor.
-  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * cols; e += blockDim.x) {
-    const int64_t q   = e / cols;
+  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * own_packs; e += blockDim.x) {
+    const int64_t q = e / own_packs;
     const int64_t row = blockIdx.x + q * gridDim.x;
-    const int64_t i   = row * packs + col0 + (e - q * cols);
+    const int64_t i = row * packs + col0 + (e - q * own_packs);
     const V sum       = peers_reduce(peers_load<T, ngpus>(read, i));
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) p2p::write_scratch(scratches[r], i, sum);
@@ -77,7 +78,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   //    it is read (a peer's next kernel starts only once this one has finished).
   const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const Tile<1, kRowPacks> tile{rows, packs, row, 0};
+    const Tile<1, kRowPacks> tile{rows, cols, row, 0};
     const int64_t base = int64_t{row} * packs;
     V sum[1][kRowPacks];
 #pragma unroll
