@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int packs        = 2 * hidden_packs + latent_packs;
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto fl          = tile<1, kRowPacks>(0, latent_packs);
+  const auto fl          = thread_offs(Tile<1, kRowPacks>{rows, latent_packs, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -48,7 +48,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     const int row   = w / splits;
     const int first = (w % splits) * slice;
     const int len   = min(slice, hidden_packs - first);
-    const Tile<1, kRowPacks> fh = tile<1, kRowPacks>(first, len);
+    const auto fh = thread_offs(Tile<1, kRowPacks>{rows, first + len, row, first});
     const auto sh = peers_load<T, ngpus>(shared, row, packs, fh);
     const auto pj = peers_load<T, ngpus>(proj, row, packs, fh);
     const auto lt = peers_load<T, ngpus>(latent, row, packs, fl);
@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       V r;
 #pragma unroll
       for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
-      if (fh.in[k] != 0.0f) o[base + fh.at[k]] = r;
+      if (fh.mask_n[k] != 0.0f) o[base + fh.offs_n[k]] = r;
     }
   }
 

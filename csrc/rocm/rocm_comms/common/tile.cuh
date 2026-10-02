@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE TILE: how a kernel cuts its work. The rows a block works on at once, cut to a slice of
-// columns, and this thread's packs of each.
+// THE TILE: how a kernel cuts its work, in Triton's terms (BLOCK_M, offs_m, M, a mask for the last
+// tile), and a thread's columns of it.
 
 #pragma once
 
@@ -14,33 +14,39 @@
 
 namespace hip_comms {
 
-// WHO HOLDS WHAT: a Tile is the kRows rows a block works on at once, cut to the `len` columns from
-// `first`, and this thread's kPacks packs of each, at the same columns in every row (CuTe's and
-// Triton's tile; the thread's share is CUTLASS's fragment). How a kernel cuts its work, by rows and
-// by columns, is its tile's shape. Its indices are clamped into the slice and a pack past its end is
-// weighted zero (`in`), so nothing reading it branches: a load under a runtime `if` cannot be
-// hoisted past the branch, and loads meant to be in flight together then wait one at a time.
-//
-// Packs first + threadIdx.x + k * blockDim.x, k < kPacks: `at` clamped into the slice, `in` 1 for a
-// pack inside it and 0 past its end.
-template <int kRows, int kPacks>
+// A TILE, in Triton's terms: BLOCK_M rows of an M x N tensor from row offs_m, and its columns from
+// offs_n to N, a block's work at once; kPacks is the packs a thread holds of each row. Columns count
+// packs (16 bytes), the unit every pointer here indexes. Row m of the tile is real when
+// offs_m + m < M (the last tile may be short); a scale-add slice is a tile whose N is the slice's
+// end. The type carries what sizes registers (BLOCK_M rows, kPacks packs a thread of each); the
+// values say where the tile is.
+template <int BLOCK_M, int kPacks>
 struct Tile {
-  static constexpr int rows  = kRows;
-  static constexpr int packs = kPacks;
-  int at[kPacks];
-  float in[kPacks];
+  int M, N;
+  int offs_m, offs_n;
 };
 
-template <int kRows, int kPacks>
-DINLINE Tile<kRows, kPacks> tile(int first, int len) {
-  Tile<kRows, kPacks> t;
+// THIS THREAD'S COLUMNS OF A TILE, the same in every row: packs offs_n + threadIdx.x + k *
+// blockDim.x, k < K, and their mask, 1 inside the tile and 0 past N (a float, multiplied in, so
+// nothing reading it branches: a load under a runtime `if` cannot be hoisted past the branch, and
+// loads meant to be in flight together then wait one at a time). Past N an offset is clamped to the
+// last column, so every load stays in bounds.
+template <int K>
+struct ThreadOffs {
+  int offs_n[K];
+  float mask_n[K];
+};
+
+template <int BLOCK_M, int K>
+DINLINE ThreadOffs<K> thread_offs(const Tile<BLOCK_M, K>& t) {
+  ThreadOffs<K> f;
 #pragma unroll
-  for (int k = 0; k < kPacks; ++k) {
-    const int i = threadIdx.x + k * blockDim.x;
-    t.at[k]     = first + (i < len ? i : len - 1);
-    t.in[k]     = i < len ? 1.0f : 0.0f;
+  for (int k = 0; k < K; ++k) {
+    const int n  = t.offs_n + threadIdx.x + k * blockDim.x;
+    f.offs_n[k]  = n < t.N ? n : t.N - 1;
+    f.mask_n[k]  = n < t.N ? 1.0f : 0.0f;
   }
-  return t;
+  return f;
 }
 
 }  // namespace hip_comms

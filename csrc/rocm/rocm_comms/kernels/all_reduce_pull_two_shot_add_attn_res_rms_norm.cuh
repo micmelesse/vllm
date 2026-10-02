@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
   const int col0         = min(p.rank * slice, packs);
   const int cols         = max(0, min(slice, packs - col0));  // a late rank's may be short or none
-  const auto f           = tile<1, kRowPacks>(0, packs);
+  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
   // The block row `row` writes, or none.
   auto written = [&](int row) -> V* {
     return write_idx < 0 ? nullptr
@@ -92,8 +92,8 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     V sum[kRowPacks];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      const int owner = min(f.at[k] / slice, ngpus - 1);
-      sum[k]          = p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + f.at[k]);
+      const int owner = min(f.offs_n[k] / slice, ngpus - 1);
+      sum[k]          = p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + f.offs_n[k]);
     }
     block_attn_res_row<T, kPrefix, kRowPacks>(
         sum, base, f, pre, written(row), blocks + int64_t{row} * block_stride_m, block_stride_r,

@@ -17,7 +17,7 @@ namespace hip_comms {
 // A block owns the row; every AttnRes kernel computes its rows with it, so the rounding is one.
 template <typename T, bool kPrefix, int kRowPacks>
 DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], int64_t base,
-                          const Tile<1, kRowPacks>& f, typename traits<T>::V* pre,
+                          const ThreadOffs<kRowPacks>& f, typename traits<T>::V* pre,
                           typename traits<T>::V* written, const T* row_blocks,
                           int64_t block_stride_r, const T* __restrict__ norm_w,
                           const T* __restrict__ qk_w, const T* __restrict__ out_norm_w,
@@ -36,7 +36,7 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
 #pragma unroll
   for (int k = 0; k < kRowPacks; ++k) {
     if constexpr (kPrefix) {
-      const V old = pre[base + f.at[k]];
+      const V old = pre[base + f.offs_n[k]];
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         new_prefix[k].d[j] =
@@ -45,9 +45,9 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
       new_prefix[k] = sum[k];
     }
     thread_unpack<T>(new_prefix[k], u[k]);
-    if (f.in[k] != 0.0f) {
-      pre[base + f.at[k]] = new_prefix[k];
-      if (written) written[f.at[k]] = new_prefix[k];
+    if (f.mask_n[k] != 0.0f) {
+      pre[base + f.offs_n[k]] = new_prefix[k];
+      if (written) written[f.offs_n[k]] = new_prefix[k];
     }
   }
   float m[kRowPacks][NL];
@@ -62,8 +62,8 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       float a[NL], b[NL];
-      thread_unpack<T>(reinterpret_cast<const V*>(norm_w)[f.at[k]], a);
-      thread_unpack<T>(reinterpret_cast<const V*>(qk_w)[f.at[k]], b);
+      thread_unpack<T>(reinterpret_cast<const V*>(norm_w)[f.offs_n[k]], a);
+      thread_unpack<T>(reinterpret_cast<const V*>(qk_w)[f.offs_n[k]], b);
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         w[k][j] = a[j] * b[j];
@@ -82,7 +82,7 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
         if (src < num_blocks) {
           const V* at_src = reinterpret_cast<const V*>(row_blocks + src * block_stride_r);
 #pragma unroll
-          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.at[k]], v[t][k]);
+          for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(at_src[f.offs_n[k]], v[t][k]);
         } else {
 #pragma unroll
           for (int k = 0; k < kRowPacks; ++k)
@@ -129,13 +129,13 @@ DINLINE void block_attn_res_row(const typename traits<T>::V (&sum)[kRowPacks], i
     V result;
     if (out_norm_w != nullptr) {
       float g[NL];
-      thread_unpack<T>(reinterpret_cast<const V*>(out_norm_w)[f.at[k]], g);
+      thread_unpack<T>(reinterpret_cast<const V*>(out_norm_w)[f.offs_n[k]], g);
 #pragma unroll
       for (int j = 0; j < NL; ++j) result.d[j] = static_cast<T>(m[k][j] * scale * g[j]);
     } else {
       result = thread_pack<T>(m[k]);
     }
-    if (f.in[k] != 0.0f) o[base + f.at[k]] = result;
+    if (f.mask_n[k] != 0.0f) o[base + f.offs_n[k]] = result;
   }
 }
 

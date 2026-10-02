@@ -10,8 +10,9 @@
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
 //   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
 // tile.cuh          how a kernel cuts its work
-//   Tile<R, K>, tile<R, K>(first, len)   a block's R rows, cut to the len columns from first, and
-//                                this thread's K packs of each, clamped into the slice
+//   Tile<BLOCK_M, K>{M, N, offs_m, offs_n}   BLOCK_M rows of an M x N tensor from offs_m, its
+//                                columns from offs_n to N, K packs a thread of each row
+//   ThreadOffs<K>, thread_offs(tile)   this thread's columns (offs_n) and their mask (mask_n)
 // memory.cuh        reads and writes
 //   thread_load(p), thread_store(p, v)          one pack, global instructions
 //   thread_load(row, f, out), thread_store(row, f, v)   a Tile row: every load issued, stores

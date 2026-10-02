@@ -29,7 +29,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const auto f           = tile<1, kRowPacks>(0, packs);
+  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -55,10 +55,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
       thread_unpack<T>(sum[k], s[k]);
       if constexpr (kAdd) {
         float r[NL];
-        thread_unpack<T>(res_in[base + f.at[k]], r);
+        thread_unpack<T>(res_in[base + f.offs_n[k]], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (f.in[k] != 0.0f) res_out[base + f.at[k]] = thread_pack<T>(s[k]);
+        if (f.mask_n[k] != 0.0f) res_out[base + f.offs_n[k]] = thread_pack<T>(s[k]);
       }
     }
     float ss[1] = {thread_dot(s, s, f)};
@@ -67,14 +67,14 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(p2p::DevComm p, T* __res
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      const vec<W, NL> w = wv[f.at[k]];
+      const vec<W, NL> w = wv[f.offs_n[k]];
       V normed;
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
         const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
         normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
       }
-      if (f.in[k] != 0.0f) o[base + f.at[k]] = normed;
+      if (f.mask_n[k] != 0.0f) o[base + f.offs_n[k]] = normed;
     }
   }
 

@@ -25,7 +25,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const V* weight        = reinterpret_cast<const V*>(norm_w);
   V* normed              = reinterpret_cast<V*>(workspace);
-  const auto f           = tile<1, kRowPacks>(0, packs);
+  const auto f           = thread_offs(Tile<1, kRowPacks>{rows, packs, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(p);
@@ -51,11 +51,11 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       float w[NL], x[NL];
-      thread_unpack<T>(weight[f.at[k]], w);
+      thread_unpack<T>(weight[f.offs_n[k]], w);
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];
-      if (f.in[k] != 0.0f) thread_store(normed + base + f.at[k], thread_pack<T>(x));
+      if (f.mask_n[k] != 0.0f) thread_store(normed + base + f.offs_n[k], thread_pack<T>(x));
     }
   }
 

@@ -4,7 +4,7 @@
 // THE READS AND WRITES: how a pack is loaded and stored, each pair with who can see a store and
 // when (the global pair for this GPU's memory and a peer's read after a sync, the uncached pair for
 // what a rank writes into a peer and the peer reads back: no kernel does today, a remote write
-// must), and a Tile row's load and store.
+// must), and a row's load and store at a thread's columns.
 
 #pragma once
 
@@ -70,16 +70,16 @@ DINLINE void thread_store_uncached(V* p, const V& v) {
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
-// A TILE ROW'S LOAD AND STORE: every load issued (a pack past the row reads the last one), and a
+// A ROW'S LOAD AND STORE AT A THREAD'S COLUMNS: every load issued (a pack past the row reads the last one), and a
 // store only of the packs inside the row (stores do not hold up loads, so the guard costs
 // nothing). A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's
 // pack is 32 bytes and loads as the compiler chooses.
-template <int R, int K, typename V>
-DINLINE void thread_load(const V* row, const Tile<R, K>& f, V (&out)[K]) {
+template <int K, typename V>
+DINLINE void thread_load(const V* row, const ThreadOffs<K>& f, V (&out)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    if constexpr (sizeof(V) == 16) out[k] = thread_load(row + f.at[k]);
-    else out[k] = row[f.at[k]];
+    if constexpr (sizeof(V) == 16) out[k] = thread_load(row + f.offs_n[k]);
+    else out[k] = row[f.offs_n[k]];
   }
 }
 
@@ -102,17 +102,17 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
   return out;
 }
 
-// THIS THREAD'S PACKS OF ROW `row` of its tile, from every source: every pack's loads go out together (a pack
+// THIS THREAD'S COLUMNS OF ROW `row`, from every source: every pack's loads go out together (a pack
 // past the row reads the last one, weighted zero where it is used), where an `if (i < packs)` made
 // each pack's loads wait on the one before.
-template <typename T, int ngpus, int R, int K, typename Read>
-DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const Tile<R, K>& f) {
+template <typename T, int ngpus, int K, typename Read>
+DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const ThreadOffs<K>& f) {
   // A pack position at a time, every source's for it: the address is computed once a position (the
   // other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z).
   PeerPacks<T, ngpus, K> out;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    const int64_t i = int64_t{row} * packs + f.at[k];
+    const int64_t i = int64_t{row} * packs + f.offs_n[k];
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) out.p[r][k] = read(r, i);
   }
@@ -120,13 +120,13 @@ DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs, const T
   return out;
 }
 
-template <int R, int K, typename V>
-DINLINE void thread_store(V* row, const Tile<R, K>& f, const V (&v)[K]) {
+template <int K, typename V>
+DINLINE void thread_store(V* row, const ThreadOffs<K>& f, const V (&v)[K]) {
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    if (f.in[k] == 0.0f) continue;
-    if constexpr (sizeof(V) == 16) thread_store(row + f.at[k], v[k]);
-    else row[f.at[k]] = v[k];
+    if (f.mask_n[k] == 0.0f) continue;
+    if constexpr (sizeof(V) == 16) thread_store(row + f.offs_n[k], v[k]);
+    else row[f.offs_n[k]] = v[k];
   }
 }
 
