@@ -243,6 +243,7 @@ constexpr Calibration kGfx950Calibration = {
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.
 constexpr const Hardware& kTarget               = kGfx950;
 constexpr const Calibration& kTargetCalibration = kGfx950Calibration;
+constexpr const char* kTargetArch               = "gfx950";
 
 // THE DEVICE THIS COMPILE PASS IS FOR: a build compiles the device code once per offload arch
 // (gfx942 and gfx950), each against its own facts; the host pass sees the tuning target.

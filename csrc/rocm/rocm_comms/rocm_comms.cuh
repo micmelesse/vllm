@@ -18,6 +18,7 @@
 // all_reduce, all_reduce_rms_norm (and _add_), all_reduce_add_attn_res_rms_norm,
 // all_reduce_rms_norm_gemm(_add), all_reduce_rms_scale_add      the ops
 // Error, to_string(Error)  why a call cannot run here: every reason, one list
+// support(device, world)   Support or the Error: whether the library runs on this device and world
 
 #pragma once
 
@@ -147,8 +148,10 @@ enum class Error : int {
   scratch_too_small         = 15,
   grid_not_resident         = 16,
   staging_too_small         = 17,
+  device_not_built          = 18,
+  device_not_tuned          = 19,
 };
-constexpr int kNumErrors = 18;
+constexpr int kNumErrors = 20;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -179,6 +182,10 @@ constexpr const char* to_string(Error e) {
       return "grid_not_resident: the grid exceeds the blocks the GPU holds resident";
     case Error::staging_too_small:
       return "staging_too_small: an eager input this kernel reads in place exceeds the staging";
+    case Error::device_not_built:
+      return "device_not_built: this build holds no code for the device";
+    case Error::device_not_tuned:
+      return "device_not_tuned: the device is not the one select is calibrated for";
   }
   return "unknown";
 }
@@ -250,6 +257,11 @@ struct GemmTailArgs {
   int64_t hidden;
 };
 
+// WHAT THE LIBRARY RUNS ON, once `support` finds it can: the device's arch, as HIP names it.
+struct Support {
+  std::string arch;
+};
+
 // inp is [rows, 2 * hidden + latent], [shared | projected | latent]; out [rows, hidden] = shared +
 // projected * rsqrt(mean(latent^2) + eps), all three summed over the ranks first.
 struct ScaleAddArgs {
@@ -269,6 +281,7 @@ struct ScaleAddArgs {
 #include "impl/select.cuh"
 #include "impl/dispatch.cuh"
 #include "impl/check.cuh"
+#include "impl/support.cuh"
 #include "impl/launch.cuh"
 #include "impl/ops.cuh"
 #undef HIP_COMMS_INTERFACE

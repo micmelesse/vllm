@@ -191,6 +191,16 @@ std::vector<std::string> rocm_comms_error_names() {
   return names;
 }
 
+// SUPPORT AT THE TORCH BOUNDARY: a torch op cannot return a variant, so it is two optionals and
+// exactly one is set, the arch or the Error's number.
+std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_support(int64_t device,
+                                                                                  int64_t world) {
+  const auto got = hip_comms::support(static_cast<int>(device), static_cast<int>(world));
+  if (const auto* e = std::get_if<hip_comms::Error>(&got))
+    return {std::nullopt, static_cast<int64_t>(*e)};
+  return {std::get<hip_comms::Support>(got).arch, std::nullopt};
+}
+
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
 
 // GB/S INTO THIS RANK reading `bytes` of every peer's staging (`peer` -1) or one peer's, `iters`

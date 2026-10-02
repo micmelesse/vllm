@@ -14,8 +14,9 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal, get_args
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -32,12 +33,6 @@ logger = logging.getLogger(__name__)
 # envelope is: torch is the control, and a control that serves a superset is answering a
 # different question than the backends it is a control for. ----
 
-# THE WIDTHS OUR KERNELS EXIST FOR. `csrc/rocm/rocm_comms.cu` dispatches
-# `switch (world_size_)` over case 2, 4 and 8, and `ngpus` is a template argument, so
-# this is the instantiation menu; iris serves the same three. Adding 16 here without
-# adding the instantiation is a dispatch error at launch.
-WorldSize = Literal[2, 4, 8]
-
 # THE FUSED OPS a backend may admit, named as their methods are: all-reduce then the ops
 # named, in order.
 FusedOp = Literal[
@@ -50,20 +45,6 @@ FusedOp = Literal[
 ]
 # What `check` is asked about: the plain all-reduce, or a fused op.
 AdmitOp = Literal["all_reduce", FusedOp]
-
-# What `_rocm_C` is built for.
-SUPPORTED_ARCHS = ("gfx94", "gfx95")
-
-
-def _rocm_arch_available() -> bool:
-    """Whether this box is one our kernels were built for. PRIVATE: `__init__` runs it,
-    so no backend has to know it exists."""
-    try:
-        props = torch.cuda.get_device_properties(0)
-        gcn_arch = getattr(props, "gcnArchName", "")
-        return any(gfx in gcn_arch for gfx in SUPPORTED_ARCHS)
-    except Exception:
-        return False
 
 
 def _as_device(device: int | str | torch.device) -> torch.device:
@@ -97,6 +78,22 @@ class Error(IntEnum):
     scratch_too_small = 15
     grid_not_resident = 16
     staging_too_small = 17
+    device_not_built = 18
+    device_not_tuned = 19
+
+
+@dataclass(frozen=True)
+class Support:
+    """What the library runs on, once `support` finds it can: the device's arch."""
+
+    arch: str
+
+
+def support(device: torch.device, world: int) -> Support | Error:
+    """Whether our kernels run on `device` in a world of `world`, as the C++ build
+    answers it (`hip_comms::support`): the Support, or the Error."""
+    arch, err = torch.ops._rocm_C.rocm_comms_support(device.index, world)
+    return Error(err) if err is not None else Support(arch)
 
 
 # EACH OP'S IMPLEMENTATION, the method a backend overrides to have it.
@@ -205,22 +202,12 @@ class Communicator(ABC):
         self.tunables = tunables
         self.world_size = dist.get_world_size(device_group)
 
-        # THE BOX, NOT THE BACKEND. Whether our kernels exist here is a fact about the
-        # arch and the build, and every backend in this package got the same answer --
-        # so it is asked once, unconditionally, rather than being something each one
-        # calls or switches off. torch is gated too: it is the CONTROL, and a control
-        # available where no backend is has nothing to be a control for.
-        who = type(self).__name__
-        if not _rocm_arch_available():
-            logger.info("%s disabled: unsupported ROCm arch", who)
-            return
-        if self.world_size not in get_args(WorldSize):
-            logger.info(
-                "%s disabled: world_size=%d not in %s",
-                who,
-                self.world_size,
-                get_args(WorldSize),
-            )
+        # THE BOX, NOT THE BACKEND, asked of the build once for every backend. torch is
+        # gated too: it is the CONTROL, and a control available where no backend is has
+        # nothing to be a control for.
+        got = support(self.device, self.world_size)
+        if isinstance(got, Error):
+            logger.info("%s disabled: %s", type(self).__name__, got.name)
             return
         self.disabled = not self._open()
 

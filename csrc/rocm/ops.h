@@ -84,6 +84,8 @@ std::optional<int64_t> rocm_comms_check(fptr_t handle_ptr, int64_t op,
                                         int64_t quant_bits, int64_t kernel, int64_t launch_blocks,
                                         int64_t launch_threads);
 std::vector<std::string> rocm_comms_error_names();
+std::tuple<std::optional<std::string>, std::optional<int64_t>> rocm_comms_support(int64_t device,
+                                                                                  int64_t world);
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            int64_t quant_bits, int64_t kernel, int64_t launch_blocks,

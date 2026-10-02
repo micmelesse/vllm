@@ -19,6 +19,9 @@
 
 namespace hip_comms {
 
+// THE WORLDS BUILT: dispatch's by_world compiles 2, 4 and 8.
+constexpr bool world_built(int world) { return world == 2 || world == 4 || world == 8; }
+
 // A KERNEL'S SCRATCH, row-major (a staged build needs none: it runs in passes of what the
 // scratch holds): the plain two-shot's slice of packs; a column two-shot the whole
 // reduced tensor (each rank's columns at their place); a row two-shot its rank's rows, twice where
@@ -47,7 +50,7 @@ template <typename Args>
 std::optional<Error> check(const Handle& h, const Kernel& k, const Args& a, const Options& o) {
   const int world = h.world_size();
   const int e     = elem_bytes(a.dtype);
-  if (world != 2 && world != 4 && world != 8) return Error::world_not_built;
+  if (!world_built(world)) return Error::world_not_built;
   if (e != 2) return Error::dtype_not_built;
   if (hidden_of(a) * e % kPackBytes != 0) return Error::row_not_packs;
   if constexpr (std::is_same_v<Args, ScaleAddArgs>)
