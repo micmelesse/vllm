@@ -449,8 +449,8 @@ void rocm_comms_link_traffic(fptr_t handle_ptr, const std::optional<torch::Tenso
                     : mode == "split" ? Traffic::split
                                       : Traffic::each;
   const auto got = hip_comms::experimental::link_traffic(
-      handle_of(handle_ptr),
-      buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer), *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream());
+      handle_of(handle_ptr), buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer),
+      *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream());
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
@@ -616,7 +616,12 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   const auto got = hip_comms::all_reduce_add_attn_res_rms_norm(
       handle_of(handle_ptr), prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(),
       blocks.stride(0), blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0), inp.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), static_cast<float>(out_eps), has_prefix, algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0),
+      inp.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
+      static_cast<float>(eps), static_cast<float>(out_eps), has_prefix, algorithm_from(algorithm),
+      direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
+      narrowed(reduce_scatter_blocks), narrowed(threads_per_block), narrowed(blocks_per_grid),
+      current_stream());
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
@@ -715,6 +720,9 @@ void rocm_comms_add_attn_res_rms_norm(
   const auto got = hip_comms::experimental::add_attn_res_rms_norm(
       prefix.data_ptr(), out.data_ptr(), delta.data_ptr(), blocks.data_ptr(), blocks.stride(0),
       blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0), delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_n), narrowed(tile_k), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0),
+      delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
+      static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_n), narrowed(tile_k),
+      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
