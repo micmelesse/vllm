@@ -68,7 +68,7 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
 inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l) {
   const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
@@ -83,7 +83,7 @@ inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& 
 inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
   const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
@@ -101,7 +101,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
                                                     const AllReduceAddAttnResRmsNormLaunch& l) {
   const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
@@ -125,7 +125,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
 inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGemmLaunch& l) {
   const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormGemmOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
@@ -142,7 +142,7 @@ inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGem
 inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNormGemmAddLaunch& l) {
   const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormGemmOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
@@ -162,7 +162,7 @@ inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAd
   const int rows      = static_cast<int>(l.rows);
   const int hp = static_cast<int>(packs_of(l.hidden, l.dtype));
   const int lp = static_cast<int>(packs_of(l.latent, l.dtype));
-  const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
+  const PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsScaleAddOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inputs, h.peer_signals(), h.self_signal(),

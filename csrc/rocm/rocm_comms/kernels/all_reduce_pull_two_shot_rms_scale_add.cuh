@@ -10,7 +10,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 
 namespace hip_comms {
@@ -20,9 +19,9 @@ namespace hip_comms {
 // the same block on each owner finished, which is what a peers barrier makes visible.
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                           p2p::PeerPtrs peer_scratch,
-                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_two_shot_rms_scale_add(const PeerPtrs* __restrict__ peer_inputs,
+                                           PeerPtrs peer_scratch,
+                                           PeerSignals peer_signals, Signal* self_signal,
                                            int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
@@ -46,16 +45,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs      = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
+  const auto inputs      = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto shared = [&](int r) { return inputs[r].data(); };
-  const auto proj   = [&](int r) { return inputs[r].data() + hidden; };
-  const auto latent = [&](int r) { return inputs[r].data() + 2 * hidden; };
+  const auto shared = [&](int r) { return inputs[r]; };
+  const auto proj   = [&](int r) { return inputs[r] + hidden; };
+  const auto latent = [&](int r) { return inputs[r] + 2 * hidden; };
 
   // 2. This rank's rows, finished: each (row, slice) from every rank, the latent's sum of squares
   //    over the block, then the slice into this rank's scratch, at the row's place among its own.
@@ -84,13 +83,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const RowF q = peers_reduce(pj).template to<float>();
     Row r = tile_add(s, tile_mul(q, scale)).template to<DTYPE>();
     r.offs_m = w / splits;  // at the row's place among this rank's
-    tile_store(own_scratch.data(), hidden, r);
+    tile_store(own_scratch, hidden, r);
   }
 
   block_stamp(3);
   // 3. Every rank's finished rows are visible to its peers, and every peer has read this rank's
   //    input.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+  barrier<WORLD, Among::peers, Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(4);
 
@@ -102,7 +101,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     Row got[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) got[r] = slice_of(w, l);
-    peers_load(got, [&](int r) { return scratches[r].data(); }, hidden);
+    peers_load(got, [&](int r) { return scratches[r]; }, hidden);
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) {
       if (l >= rows_of(r)) continue;

@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 #include "shared/attn_res.cuh"
 
@@ -17,9 +16,9 @@ namespace hip_comms {
 // in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_add_attn_res_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                                   p2p::PeerSignals peer_signals,
-                                                   p2p::Signal* self_signal, int rank,
+    all_reduce_pull_one_shot_add_attn_res_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                                   PeerSignals peer_signals,
+                                                   Signal* self_signal, int rank,
                                                    uint64_t timeout_ticks, DTYPE* __restrict__ prefix,
                                                    DTYPE* __restrict__ blocks, int64_t block_stride_m,
                                                    int64_t block_stride_r,
@@ -34,10 +33,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
-  const auto input = [&](int r) { return inputs[r].data(); };
+  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
@@ -52,7 +51,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
 }
 

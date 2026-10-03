@@ -203,4 +203,18 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
   impl::issued();
 }
 
+// A ROW'S SCALAR (a norm's scale), one float a row of `scalars`: thread 0 stores row `row`'s; every
+// rank's for row `row`, `data(r)` its scalars, loaded by every thread, all in flight together (a
+// wave's lanes read one address: one request a wave), issued after any tile loads before them.
+DINLINE void block_store_row_scalar(float* scalars, int row, float v) {
+  if (threadIdx.x == 0) *(__attribute__((address_space(1))) float*)(scalars + row) = v;
+}
+template <int WORLD, typename RANK_DATA>
+DINLINE void peers_load_row_scalars(RANK_DATA data, int row, float (&out)[WORLD]) {
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r)
+    out[r] = *(const __attribute__((address_space(1))) float*)(data(r) + row);
+  impl::issued();
+}
+
 }  // namespace hip_comms

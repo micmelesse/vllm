@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 
 namespace hip_comms {
@@ -22,9 +21,9 @@ namespace hip_comms {
 // SECOND PHASE WHAT THE SAME BLOCK ON EACH RANK WROTE IN THE FIRST: both stride over chunks alike.
 template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                             p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
-                             p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+    all_reduce_pull_two_shot(const PeerPtrs* __restrict__ peer_inputs,
+                             PeerPtrs peer_scratch, PeerSignals peer_signals,
+                             Signal* self_signal, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out, int num_packs) {
   using Chunk     = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
   constexpr int NL = traits<DTYPE>::N;
@@ -34,14 +33,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const int mine  = max(0, min(slice, len - first));             // a late rank's may be short
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
+  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
   const DTYPE* rotated[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w)
-    rotated[w] = p2p::input<DTYPE, WORLD>(*peer_inputs, (rank + w) % WORLD).data() + first;
+    rotated[w] = rank_input<DTYPE, WORLD>(*peer_inputs, (rank + w) % WORLD) + first;
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
@@ -52,12 +51,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 #pragma unroll
     for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
     peers_load(peers, [&](int w) { return rotated[w]; }, mine);
-    tile_store(own_scratch.data(), mine, peers_reduce(peers));
+    tile_store(own_scratch, mine, peers_reduce(peers));
   }
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+  barrier<WORLD, Among::peers, Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
@@ -69,7 +68,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     Chunk got[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
-    peers_load(got, [&](int r) { return scratches[r].data(); }, slice);
+    peers_load(got, [&](int r) { return scratches[r]; }, slice);
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) {
       got[r].N = max(0, min(slice, len - r * slice));  // the rank's slice, a late one short
@@ -86,17 +85,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 // visible.
 template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_staged(p2p::PeerPtrs peer_scratch, p2p::PeerPtrs peer_staging,
-                                    p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_two_shot_staged(PeerPtrs peer_scratch, PeerPtrs peer_staging,
+                                    PeerSignals peer_signals, Signal* self_signal,
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
   using Chunk        = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
   constexpr int NL   = traits<DTYPE>::N;
   const int64_t pass = min(stage_packs, scratch_packs * WORLD);
-  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
-  const auto own_staging = p2p::staging<DTYPE, WORLD>(peer_staging, rank);
+  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto own_staging = rank_staging<DTYPE, WORLD>(peer_staging, rank);
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
     const int len    = static_cast<int>(min(pass, num_packs - c0)) * NL;  // this pass, elements
@@ -107,7 +106,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const DTYPE* rotated[WORLD];
 #pragma unroll
     for (int w = 0; w < WORLD; ++w)
-      rotated[w] = p2p::staging<DTYPE, WORLD>(peer_staging, (rank + w) % WORLD).data() + first;
+      rotated[w] = rank_staging<DTYPE, WORLD>(peer_staging, (rank + w) % WORLD) + first;
     block_stamp(0);
     // 1. Every rank's slice of this pass into this rank's staging, the chunks each rank's same
     //    block reads, then visible (and, past the first pass, every peer has read this rank's
@@ -120,10 +119,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
         if (offs_n >= n) continue;
         Chunk part{1, n, 0, offs_n};
         tile_load(part, own_input + at + r * slice, n);
-        tile_store(own_staging.data() + r * slice, n, part);
+        tile_store(own_staging + r * slice, n, part);
       }
     }
-    p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+    barrier<WORLD, Among::peers, Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(1);
 
@@ -134,13 +133,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 #pragma unroll
       for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
       peers_load(peers, [&](int w) { return rotated[w]; }, mine);
-      tile_store(own_scratch.data(), mine, peers_reduce(peers));
+      tile_store(own_scratch, mine, peers_reduce(peers));
     }
 
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
     //    pass, so the next one may overwrite it.
-    p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+    barrier<WORLD, Among::peers, Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(3);
 
@@ -150,7 +149,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       Chunk got[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
-      peers_load(got, [&](int r) { return scratches[r].data(); }, slice);
+      peers_load(got, [&](int r) { return scratches[r]; }, slice);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
         got[r].N = max(0, min(slice, len - r * slice));

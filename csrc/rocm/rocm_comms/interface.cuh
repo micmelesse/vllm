@@ -184,7 +184,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> add_attn_res_rms_norm(
 }
 
 
-// THE PROBE'S OPS: the machine as the p2p layer sees it, one measurement at a time (calibrate.py
+// THE PROBE'S OPS: the machine as the peers layer (common/peers.cuh, barrier.cuh) sees it, one measurement at a time (calibrate.py
 // times them).
 inline std::variant<ProbeBarrierLaunch, Error> probe_barrier(Handle& h, hipStream_t stream) {
   std::variant<ProbeBarrierLaunch, Error> l = select_probe_barrier(h, stream);

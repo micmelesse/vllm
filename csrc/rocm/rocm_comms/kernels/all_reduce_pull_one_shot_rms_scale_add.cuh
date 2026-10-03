@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 
 namespace hip_comms {
@@ -19,8 +18,8 @@ namespace hip_comms {
 // float(projected) * scale).
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_one_shot_rms_scale_add(const PeerPtrs* __restrict__ peer_inputs,
+                                           PeerSignals peer_signals, Signal* self_signal,
                                            int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
@@ -36,14 +35,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto shared = [&](int r) { return inputs[r].data(); };
-  const auto proj   = [&](int r) { return inputs[r].data() + hidden; };
-  const auto latent = [&](int r) { return inputs[r].data() + 2 * hidden; };
+  const auto shared = [&](int r) { return inputs[r]; };
+  const auto proj   = [&](int r) { return inputs[r] + hidden; };
+  const auto latent = [&](int r) { return inputs[r] + 2 * hidden; };
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's
   //    latent from every rank, all in flight together; the latent's sum of squares over the block,
@@ -79,7 +78,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
   block_stamp(5);
 }

@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 
 namespace hip_comms {
@@ -19,8 +18,8 @@ namespace hip_comms {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, bool ADD_RESIDUAL>
 DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
-    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
-    p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+    const PeerPtrs* __restrict__ peer_inputs, PeerPtrs peer_scratch,
+    PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     const DTYPE* __restrict__ norm_w, float eps, const DTYPE* __restrict__ gemm_w, int n_cols,
     DTYPE* __restrict__ out, int64_t out_stride, DTYPE* __restrict__ workspace, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
@@ -34,16 +33,16 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = p2p::scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r].data(); };
-  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto input = [&](int r) { return inputs[r]; };
+  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
@@ -68,12 +67,12 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
     x.offs_m = row - first;
-    tile_store(own_scratch.data(), cols, x);
+    tile_store(own_scratch, cols, x);
   }
 
   // 3. Every rank's normed rows are visible to its peers.
   block_stamp(2);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+  barrier<WORLD, Among::peers, Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
@@ -85,7 +84,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     Row got[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) got[r] = Row{slice_rows, cols, l, 0};
-    peers_load(got, [&](int r) { return scratches[r].data(); }, cols);
+    peers_load(got, [&](int r) { return scratches[r]; }, cols);
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) {
       got[r].M      = rows;
@@ -96,7 +95,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 5. The GEMM reads rows other blocks of this rank copied.
   block_stamp(4);
-  p2p::barrier<WORLD, p2p::Among::grid, p2p::Ensure::visible>(
+  barrier<WORLD, Among::grid, Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(5);
 
@@ -114,9 +113,9 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_norm_gemm(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                           p2p::PeerPtrs peer_scratch,
-                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_two_shot_rms_norm_gemm(const PeerPtrs* __restrict__ peer_inputs,
+                                           PeerPtrs peer_scratch,
+                                           PeerSignals peer_signals, Signal* self_signal,
                                            int rank, uint64_t timeout_ticks,
                                            const DTYPE* __restrict__ norm_w, float eps,
                                            const DTYPE* __restrict__ gemm_w, int n_cols,
@@ -136,10 +135,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_norm_gemm_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                               p2p::PeerPtrs peer_scratch,
-                                               p2p::PeerSignals peer_signals,
-                                               p2p::Signal* self_signal, int rank,
+    all_reduce_pull_two_shot_rms_norm_gemm_add(const PeerPtrs* __restrict__ peer_inputs,
+                                               PeerPtrs peer_scratch,
+                                               PeerSignals peer_signals,
+                                               Signal* self_signal, int rank,
                                                uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w,
                                                float eps, const DTYPE* __restrict__ gemm_w, int n_cols,
                                                DTYPE* __restrict__ out, int64_t out_stride,

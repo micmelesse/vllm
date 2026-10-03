@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 #include "shared/attn_res.cuh"
 
@@ -22,10 +21,10 @@ namespace hip_comms {
 // in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_push_two_shot_add_attn_res_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                                   p2p::PeerPtrs peer_scratch,
-                                                   p2p::PeerSignals peer_signals,
-                                                   p2p::Signal* self_signal, int rank,
+    all_reduce_push_two_shot_add_attn_res_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                                   PeerPtrs peer_scratch,
+                                                   PeerSignals peer_signals,
+                                                   Signal* self_signal, int rank,
                                                    uint64_t timeout_ticks, DTYPE* __restrict__ prefix,
                                                    DTYPE* __restrict__ blocks, int64_t block_stride_m,
                                                    int64_t block_stride_r,
@@ -52,14 +51,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = p2p::scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r].data(); };
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
@@ -74,23 +73,23 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       peers_load(peers, input, cols);
       const Slice sum = peers_reduce(peers);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r].data(), cols, sum);
+      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r], cols, sum);
     }
   }
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read this rank's input.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
+  barrier<WORLD, Among::peers, Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
   //    one-shot does. The next call's first sync keeps a peer from pushing into this scratch while
   //    it is read (a peer's next kernel starts only once this one has finished).
-  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};
-    tile_load(sum, own_scratch.data(), cols);
+    tile_load(sum, own_scratch, cols);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
                                          out_eps, inv_hidden);

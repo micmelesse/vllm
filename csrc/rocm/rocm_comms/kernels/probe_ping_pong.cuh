@@ -6,13 +6,12 @@
 #pragma once
 
 #include "../machine/build.cuh"
-#include "../p2p/p2p.cuh"
 
 namespace hip_comms {
 
 // One thread on each rank of the pair: the lower rank writes and waits, the higher waits and writes
 // back, `kWarm` untimed then `iters` timed, from flag value `base` on. Device wall-clock ticks.
-__global__ void ping_pong(p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
+__global__ void ping_pong(PeerSignals peer_signals, Signal* self_signal, int rank,
                           uint64_t timeout_ticks, int peer, uint32_t base, int iters,
                           uint64_t* ticks) {
   constexpr int kWarm = 16;
@@ -22,9 +21,9 @@ __global__ void ping_pong(p2p::PeerSignals peer_signals, p2p::Signal* self_signa
   for (int i = 1; i <= kWarm + iters; ++i) {
     if (i == kWarm + 1) t0 = wall_clock64();
     const uint32_t v = base + static_cast<uint32_t>(i);
-    if (!first) p2p::wait_flag(self_signal, rank, timeout_ticks, peer, v);
-    p2p::write_flag(peer_signals, rank, peer, v);
-    if (first) p2p::wait_flag(self_signal, rank, timeout_ticks, peer, v);
+    if (!first) wait_flag(self_signal, rank, timeout_ticks, peer, v);
+    write_flag(peer_signals, rank, peer, v);
+    if (first) wait_flag(self_signal, rank, timeout_ticks, peer, v);
   }
   *ticks = wall_clock64() - t0;
 }

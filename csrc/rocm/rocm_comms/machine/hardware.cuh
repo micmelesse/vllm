@@ -109,7 +109,7 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 // What remains is the plain all-reduce's, until the tuner measures its kernels too (PLAN
 // 5.3.12.4.5.2); every other op's choices are its tuned kernels (select.cuh).
 struct Calibration {
-  double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
+  double ping_pong_ns;                    // a flag to a peer and back, median of every pair
   int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
 };
 
@@ -137,12 +137,12 @@ constexpr const Hardware& kDevice = kTarget;
 #endif
 constexpr int kWaveSize = kDevice.wave_size;
 
-// THE MOST COMPUTE UNITS ON ANY TARGET BUILT: for a layout host and device share (p2p's signal
+// THE MOST COMPUTE UNITS ON ANY TARGET BUILT: for a layout host and device share (the peers' signal
 // block), which one device pass's kDevice cannot size.
 constexpr int kMaxComputeUnits =
     kGfx950.compute_units > kGfx942.compute_units ? kGfx950.compute_units : kGfx942.compute_units;
 
-// THE MOST BLOCKS RESIDENT AT ONCE ON ANY TARGET BUILT: every CU full of one-wave blocks, so p2p's
+// THE MOST BLOCKS RESIDENT AT ONCE ON ANY TARGET BUILT: every CU full of one-wave blocks, so the peers'
 // signal block never rules out a grid. Whether one kernel's grid is resident is its occupancy,
 // which only the compiled kernel knows (resident_blocks below, checked by select).
 constexpr int resident_waves(const Hardware& hw) { return hw.compute_units * hw.max_waves_per_cu; }

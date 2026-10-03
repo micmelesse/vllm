@@ -47,6 +47,20 @@
 // softmax.cuh
 //   OnlineSoftmax, thread_softmax_fold(s, logit, scale)   a softmax a tile of logits at a time,
 //                                               folded into a running weighted sum
+// peers.cuh         the ranks' memory, every rank's buffer as a tensor (r the same across the wave)
+//   PeerPtrs, PeerSignals, Signal, kMaxRanks, kMaxBlocks   what a kernel takes them in
+//   rank_input<DTYPE, WORLD>(p, r), rank_inputs<DTYPE, WORLD>(p)   a rank's input, read in place
+//   rank_staging(p, r), rank_stagings(p)   a rank's staging: a staged kernel copies its input there
+//   rank_scratch(p, r), rank_scratches(p)  a rank's scratch: a two-shot's partial sums
+// barrier.cuh       the ranks' synchronization
+//   barrier<WORLD, Among, Ensure>(...)   Among::peers (this block and the same block on every
+//                         rank), grid (every block of this rank) or world; Ensure::launched (every
+//                         peer's input is ready), visible (what was written before is seen after),
+//                         read (every peer is done reading this rank)
+//   write_flag(p, rank, peer, v), wait_flag(...)   v into `peer`'s slot for this rank; until it
+//                         reaches v
+//   own_signals(p), signals(p, r), lane_signals(p, i)   a rank's Signal block as `Signals`, its
+//                         counters (`Counter`) touched only atomically
 
 #pragma once
 
@@ -58,4 +72,6 @@
 #include "reduce.cuh"
 #include "dot.cuh"
 #include "softmax.cuh"
+#include "peers.cuh"
+#include "barrier.cuh"
 #undef HIP_COMMS_COMMON_INTERFACE

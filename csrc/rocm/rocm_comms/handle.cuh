@@ -25,7 +25,7 @@
 #include "machine/build.cuh"
 #include "types.cuh"
 #include "kernels/all_reduce_pull_one_shot.cuh"
-#include "p2p/p2p.cuh"
+#include "common/common.cuh"
 
 #define HIP_CHECK(expr)                                                     \
   do {                                                                      \
@@ -52,20 +52,20 @@ class Handle {
         world_size_(world_size),
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
-    self_signal_ = static_cast<p2p::Signal*>(alloc_symmetric());
+    self_signal_ = static_cast<Signal*>(alloc_symmetric());
     // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
     const int64_t slots = build.memory.peer_ptr_slots;
-    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * sizeof(p2p::PeerPtrs)));
+    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * sizeof(PeerPtrs)));
     slab_end_         = slab_ + slots;
     cursor_           = slab_;
     const auto opened = open_peers(gather(ipc_bytes(self_signal_)), self_signal_);
     for (int i = 0; i < world_size_; ++i)
-      signals_.s[i] = static_cast<p2p::Signal*>(opened[i]);
+      signals_.s[i] = static_cast<Signal*>(opened[i]);
     // THE STAGING IS REGISTERED HERE: every rank's lies at the same offset in its allocation.
     std::vector<void*> staging(world_size_);
     for (int i = 0; i < world_size_; ++i)
-      staging[i] = static_cast<char*>(opened[i]) + sizeof(p2p::Signal) + scratch_bytes_;
-    p2p::PeerPtrs* slot = next_slot();
+      staging[i] = static_cast<char*>(opened[i]) + sizeof(Signal) + scratch_bytes_;
+    PeerPtrs* slot = next_slot();
     write_slot(slot, staging);
     registered_[staging[rank_]] = slot;
     // The device wall clock is fixed-rate, in kHz; the kernels count the timeout in it.
@@ -89,7 +89,7 @@ class Handle {
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it holds.
   void* staging() const {
-    return reinterpret_cast<char*>(self_signal_) + sizeof(p2p::Signal) + scratch_bytes_;
+    return reinterpret_cast<char*>(self_signal_) + sizeof(Signal) + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
 
@@ -129,7 +129,7 @@ class Handle {
   // allocation at the same address would read the dead buffer's peers.
   void register_buffer(void* self, const Gather& gather) {
     const std::vector<std::string> theirs = gather(ipc_bytes(self));
-    p2p::PeerPtrs* slot                   = next_slot();
+    PeerPtrs* slot                   = next_slot();
     write_slot(slot, open_peers(theirs, self));
     registered_[self]     = slot;
     buffer_handles_[self] = theirs;
@@ -152,27 +152,27 @@ class Handle {
   // WHAT A KERNEL IS HANDED, each its own argument. Every rank's input for a launch over `input`
   // (`bytes` long) on `stream`: a device table, filled after the capture for a captured launch
   // (an eager input is copied into the staging, and the table is the staging's).
-  const p2p::PeerPtrs* peer_inputs(const void* input, int64_t bytes, hipStream_t stream) {
+  const PeerPtrs* peer_inputs(const void* input, int64_t bytes, hipStream_t stream) {
     return slot_for(const_cast<void*>(input), bytes, stream);
   }
   // Every rank's scratch and staging, fixed for the handle's life: each rank's symmetric memory is
   // [ Signal | scratch | staging ].
-  p2p::PeerPtrs peer_scratch() const {
-    p2p::PeerPtrs p{};
+  PeerPtrs peer_scratch() const {
+    PeerPtrs p{};
     for (int r = 0; r < world_size_; ++r)
-      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(p2p::Signal);
+      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(Signal);
     return p;
   }
-  p2p::PeerPtrs peer_staging() const {
-    p2p::PeerPtrs p{};
+  PeerPtrs peer_staging() const {
+    PeerPtrs p{};
     for (int r = 0; r < world_size_; ++r)
-      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(p2p::Signal) + scratch_bytes_;
+      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(Signal) + scratch_bytes_;
     return p;
   }
   // The synchronization state: every rank's signal block, this rank's, and how long a wait may
   // last before it traps.
-  p2p::PeerSignals peer_signals() const { return signals_; }
-  p2p::Signal* self_signal() const { return self_signal_; }
+  PeerSignals peer_signals() const { return signals_; }
+  Signal* self_signal() const { return self_signal_; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
   // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is
@@ -194,7 +194,7 @@ class Handle {
   }
 
   // The first of `n` flag values for `peer`, the rest reserved: flags only grow, so each use starts
-  // past the last (p2p::write_flag).
+  // past the last (write_flag).
   uint32_t take_flags(int peer, uint32_t n) {
     const uint32_t base = flags_used_[peer];
     flags_used_[peer] += n;
@@ -207,7 +207,7 @@ class Handle {
   // rank wrote, and cached, those writes sit dirty in L2 for the barrier's writeback to flush.
   void* alloc_symmetric() const {
     void* p            = nullptr;
-    const size_t bytes = sizeof(p2p::Signal) + static_cast<size_t>(scratch_bytes_ + staging_bytes_);
+    const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes_ + staging_bytes_);
     HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
     HIP_CHECK(hipMemset(p, 0, bytes));
     HIP_CHECK(hipDeviceSynchronize());
@@ -260,7 +260,7 @@ class Handle {
 
   // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's
   // with the input copied in.
-  p2p::PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream) {
+  PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream) {
     hipStreamCaptureStatus status;
     HIP_CHECK(hipStreamIsCapturing(stream, &status));
     if (status == hipStreamCaptureStatusActive) {
@@ -268,7 +268,7 @@ class Handle {
       // buffers are freed with the graph and the allocator hands the same address back.
       // Skipping the record would make the recorded COUNT depend on that luck, and the
       // exchange after capture is COLLECTIVE, so ranks would exchange different counts.
-      p2p::PeerPtrs* slot = next_slot();
+      PeerPtrs* slot = next_slot();
       pending_.push_back(input);
       pending_slots_.push_back(slot);
       return slot;
@@ -287,35 +287,35 @@ class Handle {
     return registered_.at(staging());
   }
 
-  p2p::PeerPtrs* next_slot() {
+  PeerPtrs* next_slot() {
     if (cursor_ >= slab_end_)
       throw std::runtime_error("hip_comms: peer-pointer slab is full; allocate a larger one");
     return cursor_++;
   }
 
-  void write_slot(p2p::PeerPtrs* slot, const std::vector<void*>& ptrs) {
-    p2p::PeerPtrs host{};
+  void write_slot(PeerPtrs* slot, const std::vector<void*>& ptrs) {
+    PeerPtrs host{};
     for (int i = 0; i < world_size_; ++i) host.p[i] = ptrs[i];
-    HIP_CHECK(hipMemcpy(slot, &host, sizeof(p2p::PeerPtrs), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(slot, &host, sizeof(PeerPtrs), hipMemcpyHostToDevice));
   }
 
   int rank_;
   int world_size_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
-  p2p::Signal* self_signal_ = nullptr;
+  Signal* self_signal_ = nullptr;
   uint64_t timeout_ticks_   = 0;
-  p2p::PeerSignals signals_{};
-  p2p::PeerPtrs* slab_     = nullptr;
-  p2p::PeerPtrs* slab_end_ = nullptr;
-  p2p::PeerPtrs* cursor_   = nullptr;
-  std::unordered_map<void*, p2p::PeerPtrs*> registered_;
+  PeerSignals signals_{};
+  PeerPtrs* slab_     = nullptr;
+  PeerPtrs* slab_end_ = nullptr;
+  PeerPtrs* cursor_   = nullptr;
+  std::unordered_map<void*, PeerPtrs*> registered_;
   std::unordered_map<void*, std::vector<std::string>> buffer_handles_;
   mutable std::unordered_map<const void*, Resources> resources_;
   std::vector<void*> pending_;
-  std::vector<p2p::PeerPtrs*> pending_slots_;
+  std::vector<PeerPtrs*> pending_slots_;
   std::unordered_map<std::string, void*> opened_;
-  uint32_t flags_used_[p2p::kMaxRanks] = {};
+  uint32_t flags_used_[kMaxRanks] = {};
 };
 
 // =================================================================================================

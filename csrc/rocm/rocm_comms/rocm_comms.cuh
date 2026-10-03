@@ -31,7 +31,7 @@
 #include <string>
 #include <variant>
 
-#include "p2p/p2p.cuh"
+#include "common/common.cuh"
 #include "machine/build.cuh"
 #include "handle.cuh"
 #include "types.cuh"

@@ -7,15 +7,14 @@
 #pragma once
 
 #include "../machine/build.cuh"
-#include "../p2p/p2p.cuh"
 
 namespace hip_comms {
 
 // One block, its twin on every rank: so the measurement after it starts on every rank together.
 template <int WORLD>
-__global__ void probe_barrier(p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
+__global__ void probe_barrier(PeerSignals peer_signals, Signal* self_signal, int rank,
                               uint64_t timeout_ticks) {
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
 }
 

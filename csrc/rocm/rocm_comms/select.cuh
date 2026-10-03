@@ -658,7 +658,7 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
   if (threads_per_block.has_value() != blocks_per_grid.has_value())
     return Error::launch_incomplete;
   const bool launched = blocks_per_grid.has_value();
-  if (launched && (*blocks_per_grid < 1 || *blocks_per_grid > p2p::kMaxBlocks ||
+  if (launched && (*blocks_per_grid < 1 || *blocks_per_grid > kMaxBlocks ||
                    *threads_per_block < kWaveSize ||
                    *threads_per_block > kBuild.kernels.max_threads ||
                    *threads_per_block % kWaveSize != 0))
@@ -1630,7 +1630,7 @@ inline std::variant<LinkTrafficLaunch, Error> select_link_traffic(
   if (!world_built(world)) return Error::world_not_built;
   if (bytes < kBuild.memory.pack_bytes || bytes % kBuild.memory.pack_bytes != 0 ||
       bytes > h.staging_bytes() || peer >= world || peer == h.rank() || blocks < 1 ||
-      blocks > p2p::kMaxBlocks || pullers < 0 || pullers > blocks)
+      blocks > kMaxBlocks || pullers < 0 || pullers > blocks)
     return Error::probe_out_of_range;
   const void* kernel = nullptr;
   by_world(world, [&](auto ng) {
@@ -1662,7 +1662,7 @@ inline std::variant<LinkTrafficLaunch, Error> select_link_traffic(
 
 constexpr bool fits(Template fn, const KernelConfig& c) {
   const LaunchConfig& l = launch_of(c);
-  if (l.blocks_per_grid < 1 || l.blocks_per_grid > p2p::kMaxBlocks) return false;
+  if (l.blocks_per_grid < 1 || l.blocks_per_grid > kMaxBlocks) return false;
   if (has_tiles(fn) && tile_n_of(c) == 0) return false;
   const int t = l.threads_per_block;
   return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
@@ -1675,7 +1675,7 @@ constexpr bool tuned_fits(OpType o, int world, int64_t rows, int64_t row, int64_
 }
 constexpr bool selections_fit() {
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
-                                            std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {
+                                            std::array<int64_t, 3>{kMaxRanks, 4096, 7168}}) {
     const int w = static_cast<int>(call[0]);
     const int64_t rows = call[1], hidden = call[2], latent = hidden / 2;
     for (const OpType o :

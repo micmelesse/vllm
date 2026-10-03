@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "../p2p/p2p.cuh"
 #include "../common/common.cuh"
 
 namespace hip_comms {
@@ -18,8 +17,8 @@ namespace hip_comms {
 // vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`).
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
-    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerSignals peer_signals,
-    p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
+    const PeerPtrs* __restrict__ peer_inputs, PeerSignals peer_signals,
+    Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
     DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual, const WEIGHT_DTYPE* __restrict__ weight,
     float eps, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
@@ -30,12 +29,12 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
+  barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto input = [&](int r) { return inputs[r].data(); };
+  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (ADD_RESIDUAL) add
   //    the residual, then RMSNorm, rounding as the reference does:
@@ -76,7 +75,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
   block_stamp(5);
 }
@@ -84,8 +83,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 // THE KERNELS, one per op, both the body above.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                      p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_one_shot_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                      PeerSignals peer_signals, Signal* self_signal,
                                       int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                       const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                       int packs) {
@@ -96,8 +95,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
-                                          p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+    all_reduce_pull_one_shot_add_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                          PeerSignals peer_signals, Signal* self_signal,
                                           int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                           DTYPE* __restrict__ residual_out,
                                           const DTYPE* __restrict__ residual,

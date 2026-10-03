@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// p2p's synchronization, behind p2p.cuh: `barrier`, the flags, and in `impl` what they are made
-// of. A rank's buffers and their reads and writes are buffers.cuh's.
+// THE RANKS' SYNCHRONIZATION: a rank's Signal block, whose only view (`Signals`) hands out its
+// counters, each touched only atomically; `barrier`, the flags, and in `impl` what they are made
+// of. A rank's buffers are peers.cuh's.
 //
 // HIP_COMMS_DEBUG=1 BUILDS THE TESTS' MACHINERY IN: a wait that outlives the timeout prints where
 // it was before it traps, and every wait is skewed by a random per-block delay, so a race shows
@@ -12,19 +13,96 @@
 
 #pragma once
 
-#ifndef HIP_COMMS_P2P_INTERFACE
-#error "include p2p/p2p.cuh, p2p's one interface, not its parts"
+#ifndef HIP_COMMS_COMMON_INTERFACE
+#error "include common/common.cuh, common's one interface, not its parts"
 #endif
 
 #include <hip/hip_runtime.h>
-
 #include <array>
 #include <cstdint>
 
-#include "../../common/common.cuh"
 #include "peers.cuh"
+#include "utils.cuh"
 
-namespace hip_comms::p2p {
+namespace hip_comms {
+
+// ONE SIGNAL COUNTER: only atomic operations, each with its order and scope spelled at the call. A
+// plain load or store of a counter cannot be written.
+class Counter {
+  uint32_t* at_;
+
+ public:
+  explicit DINLINE Counter(uint32_t* at) : at_(at) {}
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
+  DINLINE void store(uint32_t v) const {
+    __scoped_atomic_store_n(at_, v, MEMORY_ORDER, MEMORY_SCOPE);
+  }
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
+  DINLINE uint32_t load() const {
+    return __scoped_atomic_load_n(at_, MEMORY_ORDER, MEMORY_SCOPE);
+  }
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
+  DINLINE uint32_t fetch_add(uint32_t v) const {
+    return __scoped_atomic_fetch_add(at_, v, MEMORY_ORDER, MEMORY_SCOPE);
+  }
+};
+
+// A RANK'S SIGNAL BLOCK: its counters, handed out one at a time. `seq` (a block's own, written only
+// by that block) and `epoch` (written only by the grid's last block to arrive) are plain: nothing
+// else ever touches them.
+class Signals {
+  Signal* s_;
+
+ public:
+  explicit DINLINE Signals(Signal* s) : s_(s) {}
+  // Block `block`'s pairing slot for rank `rank`, at a launch's start or at its other barriers.
+  // AN INDEX KEEPS ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as passed): an int
+  // where the caller had an unsigned costs a sign extension in every kernel.
+  template <typename RANK_TYPE>
+  DINLINE Counter start(unsigned block, RANK_TYPE rank) const {
+    return Counter(&s_->start[block][rank]);
+  }
+  template <typename RANK_TYPE>
+  DINLINE Counter end(unsigned block, RANK_TYPE rank) const {
+    return Counter(&s_->end[block][rank]);
+  }
+  // The grid barrier's: rank `rank`'s epoch here, the arrivals, the generation.
+  DINLINE Counter peer(int rank) const { return Counter(&s_->peer[rank]); }
+  DINLINE Counter arrive() const { return Counter(&s_->arrive); }
+  DINLINE Counter gen() const { return Counter(&s_->gen); }
+  // The last flag rank `rank` wrote here (write_flag).
+  DINLINE Counter flag(int rank) const { return Counter(&s_->flag[rank]); }
+  DINLINE uint32_t seq(unsigned block) const { return s_->seq[block]; }
+  DINLINE void set_seq(unsigned block, uint32_t v) const { s_->seq[block] = v; }
+  DINLINE uint32_t epoch() const { return s_->epoch; }
+  DINLINE void set_epoch(uint32_t v) const { s_->epoch = v; }
+};
+
+namespace impl {
+
+// Rank r's signal block, by select.
+DINLINE Signal* signal_of(const PeerSignals& peer_signals, int r) {
+  Signal* at = peer_signals.s[0];
+#pragma unroll
+  for (int k = 1; k < kMaxRanks; ++k)
+    if (r == k) at = peer_signals.s[k];
+  return at;
+}
+
+}  // namespace impl
+
+// This rank's signal block; rank r's, r the same across the wave (by select); and thread i's peer
+// i's, each thread its own (a per-lane load, as the pairing barrier issues it).
+DINLINE Signals own_signals(Signal* self_signal) { return Signals(self_signal); }
+DINLINE Signals signals(const PeerSignals& peer_signals, int r) {
+  return Signals(impl::signal_of(peer_signals, r));
+}
+template <typename INDEX_TYPE>
+DINLINE Signals lane_signals(const PeerSignals& peer_signals, INDEX_TYPE i) {
+  return Signals(peer_signals.s[i]);
+}
+
+
 
 #ifndef HIP_COMMS_DEBUG
 #define HIP_COMMS_DEBUG 0
@@ -165,7 +243,7 @@ DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int r
 }  // namespace impl
 
 // =================================================================================
-// HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in p2p.cuh): the barriers and flags, written
+// HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in common.cuh): the barriers and flags, written
 // against a rank's Signals (buffers.cuh); a rank's data buffers are ordered only by `barrier`.
 // =================================================================================
 
@@ -212,4 +290,4 @@ DINLINE void wait_flag(Signal* self_signal, int rank, uint64_t timeout_ticks, in
                                            v, "flag", peer);
 }
 
-}  // namespace hip_comms::p2p
+}  // namespace hip_comms
