@@ -494,6 +494,12 @@ def pick_layer(fusion: str) -> type[nn.Module]:
         )
 
         return fused.KimiDecoderLayerAllReduceAddAttnResRmsNorm
+    if fusion == "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm":
+        from vllm.models.kimi_k3.amd import (
+            fused_decoder_all_reduce_rms_norm_all_reduce_add_attn_res_rms_norm as both,
+        )
+
+        return both.KimiDecoderLayerAllReduceRmsNormAllReduceAddAttnResRmsNorm
     if fusion == "rms_weight_gemm_all_reduce_rms_scale_add":
         from vllm.models.kimi_k3.amd import (
             fused_decoder_rms_weight_gemm_all_reduce_rms_scale_add as fused_tail,

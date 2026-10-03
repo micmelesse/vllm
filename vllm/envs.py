@@ -155,6 +155,7 @@ if TYPE_CHECKING:
         "none",
         "all_reduce_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
+        "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm",
         "rms_weight_gemm_all_reduce_rms_scale_add",
     ] = "none"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
@@ -1376,6 +1377,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "none",
             "all_reduce_rms_norm",
             "all_reduce_add_attn_res_rms_norm",
+            "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm",
             "rms_weight_gemm_all_reduce_rms_scale_add",
         ],
     ),
