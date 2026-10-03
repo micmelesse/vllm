@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
   //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (its config, op.cuh). THE (ROW,
+  //    only: reads queue behind the links past a few dozen blocks (its config, launch.cuh). THE (ROW,
   //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
   //    bytes.
   const int reducers = min(static_cast<int>(gridDim.x), reduce_scatter_blocks);

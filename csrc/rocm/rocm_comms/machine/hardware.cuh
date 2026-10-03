@@ -105,9 +105,9 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 // MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
 // sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
 // kernels change. Each value cites the run that measured it; one not swept says so and whose it
-// copies. A kernel's launch is not here: it is its template's configs (op.cuh).
+// copies. A kernel's launch is not here: it is its template's configs (launch.cuh).
 // What remains is the plain all-reduce's, until the tuner measures its kernels too (PLAN
-// 5.3.12.4.5.2); every other op's choices are its tuned kernels (op.cuh).
+// 5.3.12.4.5.2); every other op's choices are its tuned kernels (select.cuh).
 struct Calibration {
   double ping_pong_ns;                    // a p2p flag to a peer and back, median of every pair
   int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)

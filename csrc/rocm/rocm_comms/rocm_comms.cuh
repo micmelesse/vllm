@@ -3,28 +3,22 @@
 //
 // ROCM_COMMS, THE ONE INTERFACE: our collectives, torch-free, and an index of their parts. An OP is
 // what a caller asks for (an API call); a KERNEL is what runs, one compiled instruction sequence
-// (vllm CONTEXT's lingo). Every op is plan (select's kernel, or the first Error check meets),
-// then launch (which decides nothing); it returns the kernel it launched, or the Error and
-// launches nothing.
+// (vllm CONTEXT's lingo). Every op is select (everything decided: the op's launch, or the first
+// Error the call meets) then launch (which decides nothing).
 //
-// What a build is, and what runs:
+// What a build is:
 //   error.cuh       Error: every reason a call cannot run here
 //   build.cuh       kBuild: what is compiled, the memory, the kernels' geometry (compile time)
 //   handle.cuh      Handle: the peers' memory, mapped once (run time; kBuild's twin), and
 //                   supported(device, world): whether one can exist there
-//   kernel.cuh      Kernel: a Template, its arguments, its family's KernelConfig (LaunchConfig and
-//                   the family's fields)
-//   args.cuh        each op's call (AllReduceArgs ... AddAttnResArgs), and the Options it runs
-//                   under
-// How a call becomes a kernel:
-//   op.cuh          the ops: the template catalog (each Template's built KernelConfigs), and each
-//                   op's name, templates and tuned kernels
-//   select.cuh      select: the op's tuned kernel for the call (or the forced one), fitted to it
-//   dispatch.cuh    a Kernel to its compiled instance
-//   check.cuh       check and plan: the first Error a kernel meets on a call, or none
-//   launch.cuh      launch: the kernel on the stream
-// The API:
-//   interface.cuh   every op a caller can run (hip_comms::experimental: no stability promise)
+//   types.cuh       the vocabulary: Template, each family's KernelConfig, OpType, Algorithm,
+//                   Direction, and each op's launch (the normal form select returns)
+// How a call runs:
+//   launch.cuh      what is built (each template's configs), a launch's compiled instance, and
+//                   each op's launch_<op>
+//   select.cuh      what was tuned (each op's kernels), and the steps every select takes: forced or
+//                   picked, fitted, checked
+//   interface.cuh   THE API: each op's select_<op>, and the op (select then launch)
 
 #pragma once
 
@@ -40,15 +34,11 @@
 #include "build.cuh"
 #include "error.cuh"
 #include "handle.cuh"
-#include "kernel.cuh"
-#include "args.cuh"
+#include "types.cuh"
 #include "machine/hardware.cuh"
 
 #define HIP_COMMS_INTERFACE
-#include "op.cuh"
-#include "select.cuh"
-#include "dispatch.cuh"
-#include "check.cuh"
 #include "launch.cuh"
+#include "select.cuh"
 #include "interface.cuh"
 #undef HIP_COMMS_INTERFACE

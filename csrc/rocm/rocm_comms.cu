@@ -130,7 +130,8 @@ void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
 }  // namespace
 
 // AN OP'S ERROR RAISED.
-static void ran(const std::variant<hip_comms::Kernel, hip_comms::Error>& result) {
+template <typename Launch>
+void ran(const std::variant<Launch, hip_comms::Error>& result) {
   if (const hip_comms::Error* e = std::get_if<hip_comms::Error>(&result)) raise(*e);
 }
 
@@ -168,86 +169,58 @@ std::variant<hip_comms::DType, hip_comms::Error> admitted(
   return *d;
 }
 
-std::optional<std::string> algorithm_of(const hip_comms::Kernel& k) {
-  return std::string(hip_comms::is_two_shot(k.fn) ? "two_shot" : "one_shot");
+std::optional<std::string> name_of(hip_comms::Algorithm a) {
+  return std::string(a == hip_comms::Algorithm::two_shot ? "two_shot" : "one_shot");
 }
-std::optional<std::string> direction_of(const hip_comms::Kernel& k) {
-  return std::string(hip_comms::info(k.fn).push ? "push" : "pull");
+std::optional<std::string> name_of(hip_comms::Direction d) {
+  return std::string(d == hip_comms::Direction::push ? "push" : "pull");
 }
-std::optional<int64_t> number_of(hip_comms::Error e) {
-  return static_cast<int64_t>(e);
-}
+std::optional<int64_t> number_of(hip_comms::Error e) { return static_cast<int64_t>(e); }
 
-// EACH OP FAMILY'S ANSWER, as its schema returns it.
-RocmCommsAllReducePlan all_reduce_plan(
-    const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+// EACH OP'S ANSWER, as its schema returns it: the launch's fields, or the Error's number.
+RocmCommsAllReducePlan all_reduce_plan_of(
+    const std::variant<hip_comms::AllReduceLaunch, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            number_of(*e)};
-  const auto& k = std::get<hip_comms::Kernel>(p);
-  const auto& c = std::get<hip_comms::AllReduceConfig>(k.config);
-  return {algorithm_of(k), direction_of(k), c.launch.threads_per_block,
-          c.launch.blocks_per_grid, std::nullopt};
-}
-RocmCommsRowPlan row_plan(
-    const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
-  if (const auto* e = std::get_if<hip_comms::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, number_of(*e)};
-  const auto& k = std::get<hip_comms::Kernel>(p);
-  const auto& c = std::get<hip_comms::RowConfig>(k.config);
-  return {algorithm_of(k),
-          direction_of(k),
-          c.tile_n,
-          c.launch.threads_per_block,
-          c.launch.blocks_per_grid,
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const auto& l = std::get<hip_comms::AllReduceLaunch>(p);
+  return {name_of(l.algorithm), name_of(l.direction), l.threads_per_block, l.blocks_per_grid,
           std::nullopt};
 }
-RocmCommsAttnResPlan attn_res_plan(
-    const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+template <typename Launch>
+RocmCommsRowPlan row_plan_of(const std::variant<Launch, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, number_of(*e)};
-  const auto& k = std::get<hip_comms::Kernel>(p);
-  if (const auto* c = std::get_if<hip_comms::AttnResPullConfig>(&k.config))
-    return {algorithm_of(k),
-            direction_of(k),
-            c->tile_m,
-            c->tile_n,
-            c->tile_k,
-            c->reduce_scatter_blocks,
-            c->launch.threads_per_block,
-            c->launch.blocks_per_grid,
-            std::nullopt};
-  const auto& c = std::get<hip_comms::AttnResConfig>(k.config);
-  return {algorithm_of(k),
-          direction_of(k),
-          std::nullopt,
-          c.tile_n,
-          c.tile_k,
-          std::nullopt,
-          c.launch.threads_per_block,
-          c.launch.blocks_per_grid,
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const Launch& l = std::get<Launch>(p);
+  return {name_of(l.algorithm), name_of(l.direction), l.tile_n, l.threads_per_block,
+          l.blocks_per_grid, std::nullopt};
+}
+// The one-shot and push report no TILE_M and no reduce-scatter blocks (their families have none).
+RocmCommsAttnResPlan attn_res_plan_of(
+    const std::variant<hip_comms::AllReduceAddAttnResRmsNormLaunch, hip_comms::Error>& p) {
+  if (const auto* e = std::get_if<hip_comms::Error>(&p))
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const auto& l   = std::get<hip_comms::AllReduceAddAttnResRmsNormLaunch>(p);
+  const bool pull = l.algorithm == hip_comms::Algorithm::two_shot &&
+                    l.direction == hip_comms::Direction::pull;
+  return {name_of(l.algorithm),
+          name_of(l.direction),
+          pull ? std::optional<int64_t>{l.tile_m} : std::nullopt,
+          l.tile_n,
+          l.tile_k,
+          pull ? std::optional<int64_t>{l.reduce_scatter_blocks} : std::nullopt,
+          l.threads_per_block,
+          l.blocks_per_grid,
           std::nullopt};
 }
-RocmCommsGemmPlan gemm_plan(
-    const std::variant<hip_comms::Kernel, hip_comms::Error>& p) {
+template <typename Launch>
+RocmCommsGemmPlan gemm_plan_of(const std::variant<Launch, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, number_of(*e)};
-  const auto& k = std::get<hip_comms::Kernel>(p);
-  const auto& c = std::get<hip_comms::GemmConfig>(k.config);
-  return {algorithm_of(k),
-          direction_of(k),
-          c.tile_m,
-          c.tile_n,
-          c.tile_k,
-          c.slice_k,
-          c.launch.threads_per_block,
-          c.launch.blocks_per_grid,
-          std::nullopt};
+    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
+  const Launch& l = std::get<Launch>(p);
+  return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.tile_k, l.slice_k,
+          l.threads_per_block, l.blocks_per_grid, std::nullopt};
 }
 }  // namespace
 
@@ -258,10 +231,11 @@ RocmCommsAllReducePlan rocm_comms_plan_all_reduce(
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
   const auto d = admitted(inp, false);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return all_reduce_plan(*e);
-  return all_reduce_plan(hip_comms::plan_all_reduce(
-      handle_of(handle_ptr), inp.numel() * inp.element_size(), std::get<hip_comms::DType>(d),
-      alg, dir, narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream()));
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return all_reduce_plan_of(*e);
+  return all_reduce_plan_of(hip_comms::select_all_reduce(
+      handle_of(handle_ptr), nullptr, nullptr, inp.numel() * inp.element_size(),
+      std::get<hip_comms::DType>(d), alg, dir, narrowed(threads_per_block),
+      narrowed(blocks_per_grid), current_stream()));
 }
 
 // `add`: fused_add_rms_norm's; otherwise rms_norm's.
@@ -273,14 +247,22 @@ RocmCommsRowPlan rocm_comms_plan_all_reduce_rms_norm(
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return row_plan(*e);
+  if (const auto* e = std::get_if<hip_comms::Error>(&d))
+    return row_plan_of<hip_comms::AllReduceRmsNormLaunch>(*e);
   const std::optional<hip_comms::DType> w = dtype_from(weight.scalar_type());
-  if (!w) return row_plan(hip_comms::Error::weight_not_built);
-  const auto plan = add ? hip_comms::plan_all_reduce_add_rms_norm
-                        : hip_comms::plan_all_reduce_rms_norm;
-  return row_plan(plan(handle_of(handle_ptr), std::get<hip_comms::DType>(d), *w, inp.size(0),
-                       inp.size(1), alg, dir, narrowed(tile_n), narrowed(threads_per_block),
-                       narrowed(blocks_per_grid), current_stream()));
+  if (!w)
+    return row_plan_of<hip_comms::AllReduceRmsNormLaunch>(hip_comms::Error::weight_not_built);
+  auto& h = handle_of(handle_ptr);
+  const hip_comms::DType dt = std::get<hip_comms::DType>(d);
+  const auto tn = narrowed(tile_n), tpb = narrowed(threads_per_block);
+  const auto bpg = narrowed(blocks_per_grid);
+  if (add)
+    return row_plan_of(hip_comms::select_all_reduce_add_rms_norm(
+        h, nullptr, nullptr, nullptr, nullptr, nullptr, dt, *w, inp.size(0), inp.size(1), 0.f,
+        alg, dir, tn, tpb, bpg, current_stream()));
+  return row_plan_of(hip_comms::select_all_reduce_rms_norm(
+      h, nullptr, nullptr, nullptr, dt, *w, inp.size(0), inp.size(1), 0.f, alg, dir, tn, tpb,
+      bpg, current_stream()));
 }
 
 RocmCommsAttnResPlan rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
@@ -292,9 +274,10 @@ RocmCommsAttnResPlan rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return attn_res_plan(*e);
-  return attn_res_plan(hip_comms::plan_all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr), std::get<hip_comms::DType>(d), inp.size(0), inp.size(1), alg, dir,
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return attn_res_plan_of(*e);
+  return attn_res_plan_of(hip_comms::select_all_reduce_add_attn_res_rms_norm(
+      handle_of(handle_ptr), nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr,
+      std::get<hip_comms::DType>(d), inp.size(0), inp.size(1), 0, -1, 0.f, 0.f, false, alg, dir,
       narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
       narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream()));
 }
@@ -309,15 +292,23 @@ RocmCommsGemmPlan rocm_comms_plan_all_reduce_rms_norm_gemm(
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return gemm_plan(*e);
-  if (gemm_weight.dim() != 2) return gemm_plan(hip_comms::Error::output_not_two_d);
-  const auto plan = add ? hip_comms::plan_all_reduce_rms_norm_gemm_add
-                        : hip_comms::plan_all_reduce_rms_norm_gemm;
-  return gemm_plan(plan(handle_of(handle_ptr), gemm_weight.size(0),
-                        std::get<hip_comms::DType>(d), inp.size(0), inp.size(1), alg, dir,
-                        narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
-                        narrowed(threads_per_block), narrowed(blocks_per_grid),
-                        current_stream()));
+  if (const auto* e = std::get_if<hip_comms::Error>(&d))
+    return gemm_plan_of<hip_comms::AllReduceRmsNormGemmLaunch>(*e);
+  if (gemm_weight.dim() != 2)
+    return gemm_plan_of<hip_comms::AllReduceRmsNormGemmLaunch>(
+        hip_comms::Error::output_not_two_d);
+  auto& h = handle_of(handle_ptr);
+  const hip_comms::DType dt = std::get<hip_comms::DType>(d);
+  const auto tm = narrowed(tile_m), tn = narrowed(tile_n), tk = narrowed(tile_k);
+  const auto sk = narrowed(slice_k), tpb = narrowed(threads_per_block);
+  const auto bpg = narrowed(blocks_per_grid);
+  if (add)
+    return gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm_add(
+        h, nullptr, 0, nullptr, nullptr, 0.f, nullptr, gemm_weight.size(0), nullptr, dt,
+        inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, current_stream()));
+  return gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm(
+      h, nullptr, 0, nullptr, nullptr, 0.f, nullptr, gemm_weight.size(0), nullptr, dt,
+      inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, current_stream()));
 }
 
 // `inp`'s row is [shared | projected | latent] and `out` [rows, hidden]: the latent is what is
@@ -330,14 +321,15 @@ RocmCommsRowPlan rocm_comms_plan_all_reduce_rms_scale_add(
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
   const auto d = admitted(inp, true);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return row_plan(*e);
-  if (out.dim() != 2) return row_plan(hip_comms::Error::output_not_two_d);
+  using L = hip_comms::AllReduceRmsScaleAddLaunch;
+  if (const auto* e = std::get_if<hip_comms::Error>(&d)) return row_plan_of<L>(*e);
+  if (out.dim() != 2) return row_plan_of<L>(hip_comms::Error::output_not_two_d);
   const int64_t hidden = out.size(1), latent = inp.size(1) - 2 * hidden;
-  if (latent < 1) return row_plan(hip_comms::Error::row_not_wider_than_output);
-  return row_plan(hip_comms::plan_all_reduce_rms_scale_add(
-      handle_of(handle_ptr), std::get<hip_comms::DType>(d), inp.size(0), hidden, latent, alg,
-      dir, narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      current_stream()));
+  if (latent < 1) return row_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
+  return row_plan_of(hip_comms::select_all_reduce_rms_scale_add(
+      handle_of(handle_ptr), nullptr, nullptr, std::get<hip_comms::DType>(d), inp.size(0), hidden,
+      latent, 0.f, alg, dir, narrowed(tile_n), narrowed(threads_per_block),
+      narrowed(blocks_per_grid), current_stream()));
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
@@ -647,7 +639,8 @@ void rocm_comms_all_reduce_add_rms_norm(
 
 namespace {
 // AN ATTNRES CALL'S TENSORS, as every AttnRes op takes them: `inp` (the partial sum, or the delta)
-// [tokens, hidden], prefix and out its shape, blocks [tokens, sources, hidden], every one its dtype.
+// [tokens, hidden], prefix and out its shape, blocks [tokens, sources, hidden], every one its
+// dtype.
 void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
                       const torch::Tensor& inp, const torch::Tensor& blocks,
                       const torch::Tensor& norm_weight, const torch::Tensor& qk_weight,
