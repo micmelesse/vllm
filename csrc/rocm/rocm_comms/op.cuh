@@ -88,25 +88,30 @@ constexpr KernelConfig kAttnResOneShotConfigs[] = {
 };
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15, 159.33 at
 // 128), a row a block below that (2026-10-01T03-57-23Z).
+// 256 threads a block: Triton's program for AttnRes, and more blocks resident at once (AttnRes
+// from local memory took 192.8 / 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps
+// 2026-10-02T20-36-56Z); its grid not swept yet.
 constexpr KernelConfig kAttnResPushConfigs[] = {
     AttnResConfig{{512, 256}, 4096, 1},
     AttnResConfig{{512, 256}, 8192, 1},
+    AttnResConfig{{256, 512}, 4096, 1},
+    AttnResConfig{{256, 512}, 8192, 1},
 };
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within about 5% of
 // the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7 at the 36 it had
 // (2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z). TILE_M 2 and 4 lost at every grid, best 480.0 us at
-// 128 blocks against 412.8 at 1 on 192 (4096 x 7168, 2026-10-02T21-19-22Z), so they come last. Its
+// 128 blocks against 412.8 at 1 on 192 (4096 x 7168, 2026-10-02T21-19-22Z). Its
 // reduce-scatter on the grid's first 32 blocks (reduce_scatter_blocks): its reads queue behind the
 // links past a few dozen blocks while AttnRes is compute a row and wants every block. At 4096
 // tokens it took 146.6 us on 32 blocks against 218.9 on 192, AttnRes 1110.5 against 199.4 (stamps,
 // 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
+// 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4 are no longer
+// built: they lost at every grid, and 4 spilled 25-30 VGPRs.
 constexpr KernelConfig kAttnResPullConfigs[] = {
     AttnResPullConfig{{512, 192}, 1, 4096, 1, 32},
     AttnResPullConfig{{512, 192}, 1, 8192, 1, 32},
-    AttnResPullConfig{{512, 192}, 2, 4096, 1, 32},
-    AttnResPullConfig{{512, 192}, 2, 8192, 1, 32},
-    AttnResPullConfig{{512, 192}, 4, 4096, 1, 32},
-    AttnResPullConfig{{512, 192}, 4, 8192, 1, 32},
+    AttnResPullConfig{{256, 384}, 1, 4096, 1, 32},
+    AttnResPullConfig{{256, 384}, 1, 8192, 1, 32},
 };
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
