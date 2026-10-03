@@ -138,7 +138,6 @@ void ran(const std::variant<Launch, hip_comms::Error>& result) {
 using Names         = std::vector<std::string>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
-using ProbeWire     = std::tuple<std::vector<double>, Names, std::vector<double>>;
 using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names,
                                  Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
 
@@ -421,17 +420,62 @@ torch::Tensor rocm_comms_stamps() {
   return out;
 }
 
-// THE PROBE, every rank together over the process group named `group` (experimental::probe).
-ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t bytes,
-                           int64_t ping_iters, int64_t traffic_iters, int64_t trials) {
+// THE PROBE'S OPS (experimental): calibrate.py times them, every rank together.
+void rocm_comms_probe_barrier(fptr_t handle_ptr) {
+  ran(hip_comms::experimental::probe_barrier(handle_of(handle_ptr), current_stream()));
+}
+
+// `ticks` an int64 [1] on device: the device clock ticks of `iters` round trips to `peer`.
+void rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters, torch::Tensor& ticks) {
+  check_device_contiguous({&ticks});
+  TORCH_CHECK(ticks.scalar_type() == at::ScalarType::Long && ticks.numel() == 1,
+              "ticks must be one int64");
+  ran(hip_comms::experimental::ping_pong(handle_of(handle_ptr), *narrowed(peer),
+                                         *narrowed(iters), ticks.data_ptr(), current_stream()));
+}
+
+// `buffer` registered with the peers, or none for the staging; `mode` pull, push, split or each;
+// `peer` -1 for every peer; `sink` an int32 [1] on device.
+void rocm_comms_link_traffic(fptr_t handle_ptr, const std::optional<torch::Tensor>& buffer,
+                             int64_t bytes, const std::string& mode, int64_t peer,
+                             int64_t blocks, int64_t pullers, torch::Tensor& sink) {
+  if (buffer) check_device_contiguous({&*buffer});
+  check_device_contiguous({&sink});
+  TORCH_CHECK(sink.scalar_type() == at::ScalarType::Int && sink.numel() == 1,
+              "sink must be one int32");
+  TORCH_CHECK(!buffer || buffer->numel() * buffer->element_size() >= bytes,
+              "buffer must hold `bytes`");
+  using hip_comms::Traffic;
+  TORCH_CHECK(mode == "pull" || mode == "push" || mode == "split" || mode == "each",
+              "hip_comms: mode is pull, push, split or each");
+  const Traffic m = mode == "pull"   ? Traffic::pull
+                    : mode == "push" ? Traffic::push
+                    : mode == "split" ? Traffic::split
+                                      : Traffic::each;
+  ran(hip_comms::experimental::link_traffic(
+      handle_of(handle_ptr), buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer),
+      *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream()));
+}
+
+// `buffer` registered with every rank's over the process group named `group`, a collective: the
+// peers read it where it is until it is forgotten, which must come before it is freed.
+void rocm_comms_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
+                                const std::string& group) {
+  check_device_contiguous({&buffer});
   const auto pg = resolved(group);
   if (!pg) raise(hip_comms::Error::no_such_group);
-  const auto got = hip_comms::experimental::probe(
-      handle_of(handle_ptr), gather_over(*pg), bytes, *narrowed(ping_iters),
-      *narrowed(traffic_iters), *narrowed(trials), current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-  const auto& r = std::get<hip_comms::ProbeResult>(got);
-  return {r.ping_ns, r.names, r.gbytes_per_s};
+  handle_of(handle_ptr).register_buffer(buffer.data_ptr(), gather_over(*pg));
+}
+void rocm_comms_forget_buffer(fptr_t handle_ptr, torch::Tensor& buffer) {
+  handle_of(handle_ptr).forget_buffer(buffer.data_ptr());
+}
+
+// The device clock's rate, kHz: what its ticks are per ms.
+int64_t rocm_comms_wall_clock_khz(int64_t device) {
+  int khz = 0;
+  HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
+                                  static_cast<int>(device)));
+  return khz;
 }
 
 // THE BUFFERS A CAPTURE RECORDED, registered over the process group named `group`, every rank

@@ -121,6 +121,25 @@ inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l) {
                               static_cast<int>(packs_of(l.hidden, l.dtype)));
 }
 
+// The probe's: a barrier over the signals only; the ping-pong's flags from this pair's next ones
+// (flags only grow); the link traffic over the peers' view of its buffer.
+inline void launch_probe_barrier(Handle& h, const ProbeBarrierLaunch& l) {
+  Call<ProbeBarrierKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
+                                h.dev_comm());
+}
+
+inline void launch_ping_pong(Handle& h, const PingPongLaunch& l) {
+  const uint32_t base = h.take_flags(l.peer, ping_pong_flags(l.iters));
+  Call<PingPongKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
+                            h.dev_comm(), l.peer, base, l.iters, l.ticks);
+}
+
+inline void launch_link_traffic(Handle& h, const LinkTrafficLaunch& l) {
+  Call<LinkTrafficKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
+                               h.dev_comm(l.buffer, l.bytes, l.stream), static_cast<int>(l.mode),
+                               l.peer, l.pullers, l.bytes / kBuild.memory.pack_bytes, l.sink);
+}
+
 }  // namespace experimental
 
 }  // namespace hip_comms

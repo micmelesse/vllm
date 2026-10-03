@@ -13,9 +13,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
-#include <string>
 #include <variant>
-#include <vector>
 
 #include "build.cuh"
 #include "p2p/p2p.cuh"
@@ -125,8 +123,7 @@ constexpr const char* to_string(Error e) {
     case Error::field_not_this_templates:
       return "field_not_this_templates: the forced template has no such config field";
     case Error::probe_out_of_range:
-      return "probe_out_of_range: the probe's iterations and trials are positive and its bytes at "
-             "least a pack";
+      return "probe_out_of_range: a probe's peer, iterations, bytes or grid is out of range";
   }
   return "unknown";
 }
@@ -159,6 +156,10 @@ enum class Template : int {
 // write into it).
 enum class Algorithm : int { one_shot = 0, two_shot = 1 };
 enum class Direction : int { pull = 0, push = 1 };
+
+// WHAT THE PROBE'S LINK TRAFFIC MOVES: pulled from the peers, pushed into them, both at once with
+// the blocks split between the two, or both from every block.
+enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
 // WHICH OP the caller asked for: an all-reduce, alone or with what it fuses, and the experimental
 // ops (no all-reduce).
@@ -302,6 +303,11 @@ using RmsScaleAddKernel = void (*)(p2p::DevComm, void*, float, int, int, int);
 using AddAttnResKernel = void (*)(void*, const void*, void*, int64_t, int64_t, const void*,
                                   const void*, const void*, void*, int, int, float, float, int,
                                   int);
+
+// The probe's: no arguments; peer, flag base, iterations, ticks; mode, peer, pullers, packs, sink.
+using ProbeBarrierKernel = void (*)(p2p::DevComm);
+using PingPongKernel     = void (*)(p2p::DevComm, int, uint32_t, int, void*);
+using LinkTrafficKernel  = void (*)(p2p::DevComm, int, int, int, int64_t, void*);
 
 // =================================================================================================
 // EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel (the
@@ -502,12 +508,41 @@ struct AddAttnResRmsNormLaunch {
   float out_eps;
 };
 
-// WHAT THE PROBE MEASURED (experimental::probe): the round trip to each peer in ns (by rank, this
-// rank's 0), and GB/s by name, `<buffer>_<mode>`.
-struct ProbeResult {
-  std::vector<double> ping_ns;
-  std::vector<std::string> names;
-  std::vector<double> gbytes_per_s;
+// THE PROBE'S, experimental: one block a rank, so the next measurement starts on every rank
+// together; a flag to `peer` and back `iters` times, the device clock ticks written to `ticks`;
+// every thread streaming `bytes` of `buffer` (null: the staging) by `mode`, the first `pullers`
+// blocks pulling where the mode is split, the pulled packs folded into `sink`.
+struct ProbeBarrierLaunch {
+  const void* kernel;
+  int world;
+  int threads_per_block;
+  int blocks_per_grid;
+  hipStream_t stream;
+};
+
+struct PingPongLaunch {
+  const void* kernel;
+  int world;
+  int threads_per_block;
+  int blocks_per_grid;
+  hipStream_t stream;
+  int peer;
+  int iters;
+  void* ticks;
+};
+
+struct LinkTrafficLaunch {
+  const void* kernel;
+  int world;
+  int threads_per_block;
+  int blocks_per_grid;
+  hipStream_t stream;
+  const void* buffer;
+  int64_t bytes;
+  Traffic mode;
+  int peer;
+  int pullers;
+  void* sink;
 };
 
 }  // namespace hip_comms

@@ -9,10 +9,9 @@
 
 #include "../build.cuh"
 #include "../p2p/p2p.cuh"
+#include "../types.cuh"
 
 namespace hip_comms {
-
-enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
 // EVERY THREAD STREAMING 16-byte packs: pulled from the buffer `p.inputs` names on `peer` (a pull
 // only) or every other rank (the staging, or a registered buffer), pushed into every other rank's

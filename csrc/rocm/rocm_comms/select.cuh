@@ -43,6 +43,9 @@
 #include "kernels/all_reduce_pull_two_shot_rms_scale_add.cuh"
 #include "kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
+#include "kernels/probe_barrier.cuh"
+#include "kernels/probe_link_traffic.cuh"
+#include "kernels/probe_ping_pong.cuh"
 
 namespace hip_comms {
 
@@ -1556,6 +1559,70 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
                                  .write_idx         = write_idx,
                                  .eps               = eps,
                                  .out_eps           = out_eps};
+}
+
+// THE PROBE'S: one block of 64 threads, its twin on every rank.
+inline std::variant<ProbeBarrierLaunch, Error> select_probe_barrier(const Handle& h,
+                                                                    hipStream_t stream) {
+  const int world = h.world_size();
+  if (!world_built(world)) return Error::world_not_built;
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    kernel = instance<ProbeBarrierKernel>(probe_barrier<decltype(ng)::value>);
+  });
+  return ProbeBarrierLaunch{.kernel            = kernel,
+                            .world             = world,
+                            .threads_per_block = kWaveSize,
+                            .blocks_per_grid   = 1,
+                            .stream            = stream};
+}
+
+// One thread on each rank of the pair (a wave launched).
+inline std::variant<PingPongLaunch, Error> select_ping_pong(const Handle& h, int peer, int iters,
+                                                            void* ticks, hipStream_t stream) {
+  const int world = h.world_size();
+  if (!world_built(world)) return Error::world_not_built;
+  if (peer < 0 || peer >= world || peer == h.rank() || iters < 1)
+    return Error::probe_out_of_range;
+  return PingPongLaunch{.kernel            = instance<PingPongKernel>(ping_pong),
+                        .world             = world,
+                        .threads_per_block = kWaveSize,
+                        .blocks_per_grid   = 1,
+                        .stream            = stream,
+                        .peer              = peer,
+                        .iters             = iters,
+                        .ticks             = ticks};
+}
+
+// Every thread of `blocks` full blocks streaming; `peer` < 0 every peer. A buffer the peers read
+// (the staging, or one registered) whole packs long, within the staging's size.
+inline std::variant<LinkTrafficLaunch, Error> select_link_traffic(
+    const Handle& h, const void* buffer, int64_t bytes, Traffic mode, int peer, int blocks,
+    int pullers, void* sink, hipStream_t stream) {
+  const int world = h.world_size();
+  if (!world_built(world)) return Error::world_not_built;
+  if (bytes < kBuild.memory.pack_bytes || bytes % kBuild.memory.pack_bytes != 0 ||
+      bytes > h.staging_bytes() || peer >= world || peer == h.rank() || blocks < 1 ||
+      blocks > p2p::kMaxBlocks || pullers < 0 || pullers > blocks)
+    return Error::probe_out_of_range;
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    kernel = instance<LinkTrafficKernel>(link_traffic<c10::BFloat16, decltype(ng)::value>);
+  });
+  const LinkTrafficLaunch l{.kernel            = kernel,
+                            .world             = world,
+                            .threads_per_block = kBuild.kernels.max_threads,
+                            .blocks_per_grid   = blocks,
+                            .stream            = stream,
+                            .buffer            = buffer ? buffer : h.staging(),
+                            .bytes             = bytes,
+                            .mode              = mode,
+                            .peer              = peer,
+                            .pullers           = pullers,
+                            .sink              = sink};
+  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
+    return Error::grid_not_resident;
+  return l;
 }
 
 }  // namespace experimental
