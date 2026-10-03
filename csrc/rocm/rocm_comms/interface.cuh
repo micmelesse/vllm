@@ -34,7 +34,7 @@ inline std::variant<AllReduceLaunch, Error> all_reduce(
   std::variant<AllReduceLaunch, Error> l = select_all_reduce(
       h, out, inp, bytes, dtype, algorithm, direction, threads_per_block, blocks_per_grid, stream);
   if (const AllReduceLaunch* got = std::get_if<AllReduceLaunch>(&l))
-    launch_all_reduce(h, *got, stream);
+    launch_all_reduce(h, *got);
   return l;
 }
 
@@ -54,7 +54,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> all_reduce_rms_norm(
       h, out, inp, weight, dtype, weight_dtype, rows, hidden, eps, algorithm, direction, tile_n,
       threads_per_block, blocks_per_grid, stream);
   if (const AllReduceRmsNormLaunch* got = std::get_if<AllReduceRmsNormLaunch>(&l))
-    launch_all_reduce_rms_norm(h, *got, stream);
+    launch_all_reduce_rms_norm(h, *got);
   return l;
 }
 
@@ -68,7 +68,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> all_reduce_add_rms_norm(
       h, out, residual_out, inp, residual, weight, dtype, weight_dtype, rows, hidden, eps,
       algorithm, direction, tile_n, threads_per_block, blocks_per_grid, stream);
   if (const AllReduceAddRmsNormLaunch* got = std::get_if<AllReduceAddRmsNormLaunch>(&l))
-    launch_all_reduce_add_rms_norm(h, *got, stream);
+    launch_all_reduce_add_rms_norm(h, *got);
   return l;
 }
 
@@ -94,7 +94,7 @@ inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error> all_reduce_add_attn
           algorithm, direction, tile_m, tile_n, tile_k, reduce_scatter_blocks, threads_per_block,
           blocks_per_grid, stream);
   if (const auto* got = std::get_if<AllReduceAddAttnResRmsNormLaunch>(&l))
-    launch_all_reduce_add_attn_res_rms_norm(h, *got, stream);
+    launch_all_reduce_add_attn_res_rms_norm(h, *got);
   return l;
 }
 
@@ -117,7 +117,7 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> all_reduce_rms_norm_gemm(
       hidden, algorithm, direction, tile_m, tile_n, tile_k, slice_k, threads_per_block,
       blocks_per_grid, stream);
   if (const AllReduceRmsNormGemmLaunch* got = std::get_if<AllReduceRmsNormGemmLaunch>(&l))
-    launch_all_reduce_rms_norm_gemm(h, *got, stream);
+    launch_all_reduce_rms_norm_gemm(h, *got);
   return l;
 }
 
@@ -133,7 +133,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> all_reduce_rms_norm_ge
       hidden, algorithm, direction, tile_m, tile_n, tile_k, slice_k, threads_per_block,
       blocks_per_grid, stream);
   if (const AllReduceRmsNormGemmAddLaunch* got = std::get_if<AllReduceRmsNormGemmAddLaunch>(&l))
-    launch_all_reduce_rms_norm_gemm_add(h, *got, stream);
+    launch_all_reduce_rms_norm_gemm_add(h, *got);
   return l;
 }
 
@@ -154,7 +154,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
       h, out, inp, dtype, rows, hidden, latent, eps, algorithm, direction, tile_n,
       threads_per_block, blocks_per_grid, stream);
   if (const AllReduceRmsScaleAddLaunch* got = std::get_if<AllReduceRmsScaleAddLaunch>(&l))
-    launch_all_reduce_rms_scale_add(h, *got, stream);
+    launch_all_reduce_rms_scale_add(h, *got);
   return l;
 }
 
@@ -176,9 +176,9 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> add_attn_res_rms_norm(
   std::variant<AddAttnResRmsNormLaunch, Error> l = select_add_attn_res_rms_norm(
       prefix, out, delta, blocks, block_stride_m, block_stride_r, norm_weight, qk_weight,
       out_norm_weight, dtype, rows, hidden, num_blocks, write_idx, eps, out_eps, tile_n, tile_k,
-      threads_per_block, blocks_per_grid);
+      threads_per_block, blocks_per_grid, stream);
   if (const AddAttnResRmsNormLaunch* got = std::get_if<AddAttnResRmsNormLaunch>(&l))
-    launch_add_attn_res_rms_norm(*got, stream);
+    launch_add_attn_res_rms_norm(*got);
   return l;
 }
 

@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <hip/hip_runtime.h>
+
 #include <cstdint>
 #include <variant>
 
@@ -151,7 +153,8 @@ constexpr KernelConfig zero_config(size_t family) {
 // =================================================================================================
 // EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel
 // (algorithm, direction), what is compiled in (the tile, threads_per_block), the grid
-// (blocks_per_grid, and the pull's reduce_scatter_blocks), then the kernel's arguments.
+// (blocks_per_grid, and the pull's reduce_scatter_blocks), the stream (select decides on it: a
+// stream being captured reads its input in place), then the kernel's arguments.
 // =================================================================================================
 
 // `staged`: the build that copies an eager input through the staging a pass at a time, not the
@@ -162,6 +165,7 @@ struct AllReduceLaunch {
   int threads_per_block;
   int blocks_per_grid;
   bool staged;
+  hipStream_t stream;
   void* out;
   const void* inp;
   int64_t bytes;
@@ -175,6 +179,7 @@ struct AllReduceRmsNormLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* out;
   const void* inp;
   const void* weight;
@@ -191,6 +196,7 @@ struct AllReduceAddRmsNormLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* out;
   void* residual_out;
   const void* inp;
@@ -215,6 +221,7 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int reduce_scatter_blocks;
+  hipStream_t stream;
   void* prefix;
   void* out;
   const void* inp;
@@ -244,6 +251,7 @@ struct AllReduceRmsNormGemmLaunch {
   int slice_k;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* out;
   int64_t out_stride;
   const void* inp;
@@ -266,6 +274,7 @@ struct AllReduceRmsNormGemmAddLaunch {
   int slice_k;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* out;
   int64_t out_stride;
   const void* inp;
@@ -286,6 +295,7 @@ struct AllReduceRmsScaleAddLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* out;
   const void* inp;
   DType dtype;
@@ -303,6 +313,7 @@ struct AddAttnResRmsNormLaunch {
   int tile_k;
   int threads_per_block;
   int blocks_per_grid;
+  hipStream_t stream;
   void* prefix;
   void* out;
   const void* delta;

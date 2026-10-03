@@ -381,9 +381,9 @@ void by_weight(DType weight, DType dtype, F&& f) {
   not_built("weight dtype");
 }
 
-// A TEMPLATE'S BUILD, compiled in: the one of template K's configs (the catalog above) `c` names (all but
-// its launch's grid and reduce_scatter_blocks, which are run time), and only those. f is handed
-// it as config_constant<C>, C its family's config, every field a constant expression.
+// A TEMPLATE'S BUILD, compiled in: the one of template K's configs (the catalog above) `c` names
+// (all but its launch's grid and reduce_scatter_blocks, which are run time), and only those. f is
+// handed it as config_constant<C>, C its family's config, every field a constant expression.
 template <Template K>
 using family_t = std::variant_alternative_t<family_of(K), KernelConfig>;
 template <Template K, size_t I>
@@ -727,10 +727,12 @@ void start(void (*kernel)(P...), int blocks_per_grid, int threads_per_block, hip
 
 // Launch `l` over the peers' view `p`.
 template <typename L>
-void launch_on(const L& l, int world, const p2p::DevComm& p, hipStream_t s) {
+void launch_on(const L& l, int world, const p2p::DevComm& p) {
   dispatch(l, world, [&](auto kernel, const auto& bind) {
     std::apply(
-        [&](auto&&... xs) { start(kernel, l.blocks_per_grid, l.threads_per_block, s, xs...); },
+        [&](auto&&... xs) {
+          start(kernel, l.blocks_per_grid, l.threads_per_block, l.stream, xs...);
+        },
         bind(p));
   });
 }
@@ -747,43 +749,45 @@ bool resident(const Handle& h, const L& l) {
 }
 
 // A STAGED BUILD copies the input in itself, so no peer reads it where it is.
-inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l, hipStream_t s) {
+inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
   launch_on(l, h.world_size(),
-            l.staged ? h.dev_comm_staged(l.bytes) : h.dev_comm(l.inp, l.bytes, s), s);
+            l.staged ? h.dev_comm_staged(l.bytes) : h.dev_comm(l.inp, l.bytes, l.stream));
 }
-inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l,
-                                       hipStream_t s) {
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, l.rows * l.hidden * elem_bytes(l.dtype), s), s);
+inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l) {
+  const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
-inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l,
-                                           hipStream_t s) {
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, l.rows * l.hidden * elem_bytes(l.dtype), s), s);
+inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
+  const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
 inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
                                                     const AllReduceAddAttnResRmsNormLaunch& l,
                                                     hipStream_t s) {
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, l.rows * l.hidden * elem_bytes(l.dtype), s), s);
+  const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
-inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGemmLaunch& l,
-                                            hipStream_t s) {
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, l.rows * l.hidden * elem_bytes(l.dtype), s), s);
+inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGemmLaunch& l) {
+  const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
-inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNormGemmAddLaunch& l,
-                                                hipStream_t s) {
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, l.rows * l.hidden * elem_bytes(l.dtype), s), s);
+inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNormGemmAddLaunch& l) {
+  const int64_t bytes = l.rows * l.hidden * elem_bytes(l.dtype);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
-inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAddLaunch& l,
-                                            hipStream_t s) {
+inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAddLaunch& l) {
   const int64_t bytes = l.rows * (2 * l.hidden + l.latent) * elem_bytes(l.dtype);
-  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, s), s);
+  launch_on(l, h.world_size(), h.dev_comm(l.inp, bytes, l.stream));
 }
 
 namespace experimental {
 
-inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l, hipStream_t s) {
+inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l) {
   dispatch(l, [&](auto kernel, const auto& bind) {
     std::apply(
-        [&](auto&&... xs) { start(kernel, l.blocks_per_grid, l.threads_per_block, s, xs...); },
+        [&](auto&&... xs) {
+          start(kernel, l.blocks_per_grid, l.threads_per_block, l.stream, xs...);
+        },
         bind());
   });
 }

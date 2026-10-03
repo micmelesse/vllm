@@ -586,8 +586,16 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                   stream))
     return *e;
   const LaunchConfig& g = launch_of(c);
-  const AllReduceLaunch l{algorithm_of(fn), direction_of(fn), g.threads_per_block,
-                          g.blocks_per_grid, staged,      out, inp, bytes, dtype};
+  const AllReduceLaunch l{.algorithm = algorithm_of(fn),
+                          .direction = direction_of(fn),
+                          .threads_per_block = g.threads_per_block,
+                          .blocks_per_grid = g.blocks_per_grid,
+                          .staged = staged,
+                          .stream = stream,
+                          .out = out,
+                          .inp = inp,
+                          .bytes = bytes,
+                          .dtype = dtype};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -608,19 +616,20 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                              stream))
     return *e;
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceRmsNormLaunch l{algorithm_of(fn),
-                                 direction_of(fn),
-                                 r.tile_n,
-                                 r.launch.threads_per_block,
-                                 r.launch.blocks_per_grid,
-                                 out,
-                                 inp,
-                                 weight,
-                                 dtype,
-                                 weight_dtype,
-                                 rows,
-                                 hidden,
-                                 eps};
+  const AllReduceRmsNormLaunch l{.algorithm = algorithm_of(fn),
+                                 .direction = direction_of(fn),
+                                 .tile_n = r.tile_n,
+                                 .threads_per_block = r.launch.threads_per_block,
+                                 .blocks_per_grid = r.launch.blocks_per_grid,
+                                 .stream = stream,
+                                 .out = out,
+                                 .inp = inp,
+                                 .weight = weight,
+                                 .dtype = dtype,
+                                 .weight_dtype = weight_dtype,
+                                 .rows = rows,
+                                 .hidden = hidden,
+                                 .eps = eps};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -642,21 +651,22 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
                                              stream))
     return *e;
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceAddRmsNormLaunch l{algorithm_of(fn),
-                                    direction_of(fn),
-                                    r.tile_n,
-                                    r.launch.threads_per_block,
-                                    r.launch.blocks_per_grid,
-                                    out,
-                                    residual_out,
-                                    inp,
-                                    residual,
-                                    weight,
-                                    dtype,
-                                    weight_dtype,
-                                    rows,
-                                    hidden,
-                                    eps};
+  const AllReduceAddRmsNormLaunch l{.algorithm = algorithm_of(fn),
+                                    .direction = direction_of(fn),
+                                    .tile_n = r.tile_n,
+                                    .threads_per_block = r.launch.threads_per_block,
+                                    .blocks_per_grid = r.launch.blocks_per_grid,
+                                    .stream = stream,
+                                    .out = out,
+                                    .residual_out = residual_out,
+                                    .inp = inp,
+                                    .residual = residual,
+                                    .weight = weight,
+                                    .dtype = dtype,
+                                    .weight_dtype = weight_dtype,
+                                    .rows = rows,
+                                    .hidden = hidden,
+                                    .eps = eps};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -684,31 +694,35 @@ select_all_reduce_add_attn_res_rms_norm(
   // THE PULL'S FAMILY has TILE_M and its reduce-scatter blocks; the others are a row a tile.
   const AttnResPullConfig* pull = std::get_if<AttnResPullConfig>(&c);
   const LaunchConfig& g         = launch_of(c);
-  const AllReduceAddAttnResRmsNormLaunch l{algorithm_of(fn),
-                                           direction_of(fn),
-                                           pull ? pull->tile_m : 1,
-                                           tile_n_of(c),
-                                           pull ? pull->tile_k : std::get<AttnResConfig>(c).tile_k,
-                                           g.threads_per_block,
-                                           g.blocks_per_grid,
-                                           pull ? pull->reduce_scatter_blocks : 0,
-                                           prefix,
-                                           out,
-                                           inp,
-                                           blocks,
-                                           block_stride_m,
-                                           block_stride_r,
-                                           norm_weight,
-                                           qk_weight,
-                                           out_norm_weight,
-                                           dtype,
-                                           rows,
-                                           hidden,
-                                           num_blocks,
-                                           write_idx,
-                                           eps,
-                                           out_eps,
-                                           has_prefix};
+  const int tm = pull ? pull->tile_m : 1;
+  const int tk = pull ? pull->tile_k : std::get<AttnResConfig>(c).tile_k;
+  const int rs = pull ? pull->reduce_scatter_blocks : 0;
+  const AllReduceAddAttnResRmsNormLaunch l{.algorithm = algorithm_of(fn),
+                                           .direction = direction_of(fn),
+                                           .tile_m = tm,
+                                           .tile_n = tile_n_of(c),
+                                           .tile_k = tk,
+                                           .threads_per_block = g.threads_per_block,
+                                           .blocks_per_grid = g.blocks_per_grid,
+                                           .reduce_scatter_blocks = rs,
+                                           .stream = stream,
+                                           .prefix = prefix,
+                                           .out = out,
+                                           .inp = inp,
+                                           .blocks = blocks,
+                                           .block_stride_m = block_stride_m,
+                                           .block_stride_r = block_stride_r,
+                                           .norm_weight = norm_weight,
+                                           .qk_weight = qk_weight,
+                                           .out_norm_weight = out_norm_weight,
+                                           .dtype = dtype,
+                                           .rows = rows,
+                                           .hidden = hidden,
+                                           .num_blocks = num_blocks,
+                                           .write_idx = write_idx,
+                                           .eps = eps,
+                                           .out_eps = out_eps,
+                                           .has_prefix = has_prefix};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -730,25 +744,26 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
   const GemmConfig& g = std::get<GemmConfig>(c);
-  const AllReduceRmsNormGemmLaunch l{algorithm_of(fn),
-                                     direction_of(fn),
-                                     g.tile_m,
-                                     g.tile_n,
-                                     g.tile_k,
-                                     g.slice_k,
-                                     g.launch.threads_per_block,
-                                     g.launch.blocks_per_grid,
-                                     out,
-                                     out_stride,
-                                     inp,
-                                     norm_weight,
-                                     eps,
-                                     gemm_weight,
-                                     n_cols,
-                                     workspace,
-                                     dtype,
-                                     rows,
-                                     hidden};
+  const AllReduceRmsNormGemmLaunch l{.algorithm = algorithm_of(fn),
+                                     .direction = direction_of(fn),
+                                     .tile_m = g.tile_m,
+                                     .tile_n = g.tile_n,
+                                     .tile_k = g.tile_k,
+                                     .slice_k = g.slice_k,
+                                     .threads_per_block = g.launch.threads_per_block,
+                                     .blocks_per_grid = g.launch.blocks_per_grid,
+                                     .stream = stream,
+                                     .out = out,
+                                     .out_stride = out_stride,
+                                     .inp = inp,
+                                     .norm_weight = norm_weight,
+                                     .eps = eps,
+                                     .gemm_weight = gemm_weight,
+                                     .n_cols = n_cols,
+                                     .workspace = workspace,
+                                     .dtype = dtype,
+                                     .rows = rows,
+                                     .hidden = hidden};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -770,25 +785,26 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
   const GemmConfig& g = std::get<GemmConfig>(c);
-  const AllReduceRmsNormGemmAddLaunch l{algorithm_of(fn),
-                                        direction_of(fn),
-                                        g.tile_m,
-                                        g.tile_n,
-                                        g.tile_k,
-                                        g.slice_k,
-                                        g.launch.threads_per_block,
-                                        g.launch.blocks_per_grid,
-                                        out,
-                                        out_stride,
-                                        inp,
-                                        norm_weight,
-                                        eps,
-                                        gemm_weight,
-                                        n_cols,
-                                        workspace,
-                                        dtype,
-                                        rows,
-                                        hidden};
+  const AllReduceRmsNormGemmAddLaunch l{.algorithm = algorithm_of(fn),
+                                        .direction = direction_of(fn),
+                                        .tile_m = g.tile_m,
+                                        .tile_n = g.tile_n,
+                                        .tile_k = g.tile_k,
+                                        .slice_k = g.slice_k,
+                                        .threads_per_block = g.launch.threads_per_block,
+                                        .blocks_per_grid = g.launch.blocks_per_grid,
+                                        .stream = stream,
+                                        .out = out,
+                                        .out_stride = out_stride,
+                                        .inp = inp,
+                                        .norm_weight = norm_weight,
+                                        .eps = eps,
+                                        .gemm_weight = gemm_weight,
+                                        .n_cols = n_cols,
+                                        .workspace = workspace,
+                                        .dtype = dtype,
+                                        .rows = rows,
+                                        .hidden = hidden};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -816,18 +832,19 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
           refused(&h, fn, c, dtype, rows, row, latent, widths, inp, false, stream))
     return *err;
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceRmsScaleAddLaunch l{algorithm_of(fn),
-                                     direction_of(fn),
-                                     r.tile_n,
-                                     r.launch.threads_per_block,
-                                     r.launch.blocks_per_grid,
-                                     out,
-                                     inp,
-                                     dtype,
-                                     rows,
-                                     hidden,
-                                     latent,
-                                     eps};
+  const AllReduceRmsScaleAddLaunch l{.algorithm = algorithm_of(fn),
+                                     .direction = direction_of(fn),
+                                     .tile_n = r.tile_n,
+                                     .threads_per_block = r.launch.threads_per_block,
+                                     .blocks_per_grid = r.launch.blocks_per_grid,
+                                     .stream = stream,
+                                     .out = out,
+                                     .inp = inp,
+                                     .dtype = dtype,
+                                     .rows = rows,
+                                     .hidden = hidden,
+                                     .latent = latent,
+                                     .eps = eps};
   if (!resident(h, l)) return Error::grid_not_resident;
   return l;
 }
@@ -840,7 +857,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
     const void* out_norm_weight, DType dtype, int64_t rows, int64_t hidden, int num_blocks,
     int write_idx, float eps, float out_eps, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid) {
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
   const std::variant<Chosen, Error> got =
       chosen(OpType::add_attn_res_rms_norm, 1, rows, hidden, hidden, hidden, std::nullopt,
              std::nullopt, threads_per_block, blocks_per_grid, {tile_n, tile_k},
@@ -848,31 +865,32 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
   if (const Error* e = std::get_if<Error>(&got)) return *e;
   const auto& [fn, c] = std::get<Chosen>(got);
   if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, rows, hidden, hidden,
-                                             std::nullopt, delta, false, nullptr))
+                                             std::nullopt, delta, false, stream))
     return *e;
   const AttnResConfig& a = std::get<AttnResConfig>(c);
-  return AddAttnResRmsNormLaunch{algorithm_of(fn),
-                                 direction_of(fn),
-                                 a.tile_n,
-                                 a.tile_k,
-                                 a.launch.threads_per_block,
-                                 a.launch.blocks_per_grid,
-                                 prefix,
-                                 out,
-                                 delta,
-                                 blocks,
-                                 block_stride_m,
-                                 block_stride_r,
-                                 norm_weight,
-                                 qk_weight,
-                                 out_norm_weight,
-                                 dtype,
-                                 rows,
-                                 hidden,
-                                 num_blocks,
-                                 write_idx,
-                                 eps,
-                                 out_eps};
+  return AddAttnResRmsNormLaunch{.algorithm = algorithm_of(fn),
+                                 .direction = direction_of(fn),
+                                 .tile_n = a.tile_n,
+                                 .tile_k = a.tile_k,
+                                 .threads_per_block = a.launch.threads_per_block,
+                                 .blocks_per_grid = a.launch.blocks_per_grid,
+                                 .stream = stream,
+                                 .prefix = prefix,
+                                 .out = out,
+                                 .delta = delta,
+                                 .blocks = blocks,
+                                 .block_stride_m = block_stride_m,
+                                 .block_stride_r = block_stride_r,
+                                 .norm_weight = norm_weight,
+                                 .qk_weight = qk_weight,
+                                 .out_norm_weight = out_norm_weight,
+                                 .dtype = dtype,
+                                 .rows = rows,
+                                 .hidden = hidden,
+                                 .num_blocks = num_blocks,
+                                 .write_idx = write_idx,
+                                 .eps = eps,
+                                 .out_eps = out_eps};
 }
 
 }  // namespace experimental
