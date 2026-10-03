@@ -557,4 +557,324 @@ constexpr bool selections_fit() {
 }
 static_assert(selections_fit(), "a selection declines, or exceeds a kernel capability");
 
+// =================================================================================================
+// EACH OP'S SELECT: the op's launch, everything decided (the kernel, its config, its grid), from
+// the call's primitives and its forcing, or the first Error the call meets.
+// =================================================================================================
+
+using Chosen = std::pair<Template, KernelConfig>;
+
+constexpr std::optional<Error> weight_refused(DType dtype, DType weight_dtype) {
+  if (weight_dtype != dtype && weight_dtype != DType::f32) return Error::weight_not_built;
+  return std::nullopt;
+}
+
+inline std::variant<AllReduceLaunch, Error> select_all_reduce(
+    const Handle& h, void* out, const void* inp, int64_t bytes, DType dtype,
+    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
+    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    hipStream_t stream) {
+  const std::variant<Chosen, Error> got = chosen_all_reduce(
+      h.world_size(), bytes, algorithm, direction, threads_per_block, blocks_per_grid);
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  // THE BUILD, from what the handle knows: in place when the peers can read the input where it
+  // is, otherwise its staged build.
+  const bool staged = !h.reads_in_place(inp, stream);
+  if (const std::optional<Error> e =
+          refused(&h, fn, c, dtype, 1, bytes / elem_bytes(dtype), 0, std::nullopt, inp, staged,
+                  stream))
+    return *e;
+  const LaunchConfig& g = launch_of(c);
+  const AllReduceLaunch l{algorithm_of(fn), direction_of(fn), g.threads_per_block,
+                          g.blocks_per_grid, staged,      out, inp, bytes, dtype};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
+    const Handle& h, void* out, const void* inp, const void* weight, DType dtype,
+    DType weight_dtype, int64_t rows, int64_t hidden, float eps,
+    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
+    std::optional<int> tile_n, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_rms_norm, h.world_size(), rows, hidden, hidden, hidden, algorithm,
+             direction, threads_per_block, blocks_per_grid, {tile_n}, row_config(tile_n));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
+                                             weight_refused(dtype, weight_dtype), inp, false,
+                                             stream))
+    return *e;
+  const RowConfig& r = std::get<RowConfig>(c);
+  const AllReduceRmsNormLaunch l{algorithm_of(fn),
+                                 direction_of(fn),
+                                 r.tile_n,
+                                 r.launch.threads_per_block,
+                                 r.launch.blocks_per_grid,
+                                 out,
+                                 inp,
+                                 weight,
+                                 dtype,
+                                 weight_dtype,
+                                 rows,
+                                 hidden,
+                                 eps};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_norm(
+    const Handle& h, void* out, void* residual_out, const void* inp, const void* residual,
+    const void* weight, DType dtype, DType weight_dtype, int64_t rows, int64_t hidden, float eps,
+    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
+    std::optional<int> tile_n, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_add_rms_norm, h.world_size(), rows, hidden, hidden, hidden,
+             algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+             row_config(tile_n));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
+                                             weight_refused(dtype, weight_dtype), inp, false,
+                                             stream))
+    return *e;
+  const RowConfig& r = std::get<RowConfig>(c);
+  const AllReduceAddRmsNormLaunch l{algorithm_of(fn),
+                                    direction_of(fn),
+                                    r.tile_n,
+                                    r.launch.threads_per_block,
+                                    r.launch.blocks_per_grid,
+                                    out,
+                                    residual_out,
+                                    inp,
+                                    residual,
+                                    weight,
+                                    dtype,
+                                    weight_dtype,
+                                    rows,
+                                    hidden,
+                                    eps};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error>
+select_all_reduce_add_attn_res_rms_norm(
+    const Handle& h, void* prefix, void* out, const void* inp, void* blocks,
+    int64_t block_stride_m, int64_t block_stride_r, const void* norm_weight,
+    const void* qk_weight, const void* out_norm_weight, DType dtype, int64_t rows, int64_t hidden,
+    int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix,
+    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
+    std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> tile_k,
+    std::optional<int> reduce_scatter_blocks, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_add_attn_res_rms_norm, h.world_size(), rows, hidden, hidden,
+             hidden, algorithm, direction, threads_per_block, blocks_per_grid,
+             {tile_m, tile_n, tile_k, reduce_scatter_blocks},
+             attn_res_config(tile_m, tile_n, tile_k, reduce_scatter_blocks));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e =
+          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+    return *e;
+  // THE PULL'S FAMILY has TILE_M and its reduce-scatter blocks; the others are a row a tile.
+  const AttnResPullConfig* pull = std::get_if<AttnResPullConfig>(&c);
+  const LaunchConfig& g         = launch_of(c);
+  const AllReduceAddAttnResRmsNormLaunch l{algorithm_of(fn),
+                                           direction_of(fn),
+                                           pull ? pull->tile_m : 1,
+                                           tile_n_of(c),
+                                           pull ? pull->tile_k : std::get<AttnResConfig>(c).tile_k,
+                                           g.threads_per_block,
+                                           g.blocks_per_grid,
+                                           pull ? pull->reduce_scatter_blocks : 0,
+                                           prefix,
+                                           out,
+                                           inp,
+                                           blocks,
+                                           block_stride_m,
+                                           block_stride_r,
+                                           norm_weight,
+                                           qk_weight,
+                                           out_norm_weight,
+                                           dtype,
+                                           rows,
+                                           hidden,
+                                           num_blocks,
+                                           write_idx,
+                                           eps,
+                                           out_eps,
+                                           has_prefix};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_norm_gemm(
+    const Handle& h, void* out, int64_t out_stride, const void* inp, const void* norm_weight,
+    float eps, const void* gemm_weight, int64_t n_cols, void* workspace, DType dtype,
+    int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
+    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
+    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_rms_norm_gemm, h.world_size(), rows, hidden, hidden, hidden,
+             algorithm, direction, threads_per_block, blocks_per_grid,
+             {tile_m, tile_n, tile_k, slice_k}, gemm_config(tile_m, tile_n, tile_k, slice_k));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e =
+          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+    return *e;
+  const GemmConfig& g = std::get<GemmConfig>(c);
+  const AllReduceRmsNormGemmLaunch l{algorithm_of(fn),
+                                     direction_of(fn),
+                                     g.tile_m,
+                                     g.tile_n,
+                                     g.tile_k,
+                                     g.slice_k,
+                                     g.launch.threads_per_block,
+                                     g.launch.blocks_per_grid,
+                                     out,
+                                     out_stride,
+                                     inp,
+                                     norm_weight,
+                                     eps,
+                                     gemm_weight,
+                                     n_cols,
+                                     workspace,
+                                     dtype,
+                                     rows,
+                                     hidden};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_norm_gemm_add(
+    const Handle& h, void* out, int64_t out_stride, const void* inp, const void* norm_weight,
+    float eps, const void* gemm_weight, int64_t n_cols, void* workspace, DType dtype,
+    int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
+    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
+    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_rms_norm_gemm_add, h.world_size(), rows, hidden, hidden, hidden,
+             algorithm, direction, threads_per_block, blocks_per_grid,
+             {tile_m, tile_n, tile_k, slice_k}, gemm_config(tile_m, tile_n, tile_k, slice_k));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e =
+          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+    return *e;
+  const GemmConfig& g = std::get<GemmConfig>(c);
+  const AllReduceRmsNormGemmAddLaunch l{algorithm_of(fn),
+                                        direction_of(fn),
+                                        g.tile_m,
+                                        g.tile_n,
+                                        g.tile_k,
+                                        g.slice_k,
+                                        g.launch.threads_per_block,
+                                        g.launch.blocks_per_grid,
+                                        out,
+                                        out_stride,
+                                        inp,
+                                        norm_weight,
+                                        eps,
+                                        gemm_weight,
+                                        n_cols,
+                                        workspace,
+                                        dtype,
+                                        rows,
+                                        hidden};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_scale_add(
+    const Handle& h, void* out, const void* inp, DType dtype, int64_t rows, int64_t hidden,
+    int64_t latent, float eps, std::optional<Algorithm> algorithm,
+    std::optional<Direction> direction, std::optional<int> tile_n,
+    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    hipStream_t stream) {
+  const int64_t row = 2 * hidden + latent;
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::all_reduce_rms_scale_add, h.world_size(), rows, row, latent, hidden,
+             algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+             row_config(tile_n));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  const int e = elem_bytes(dtype);
+  const std::optional<Error> widths =
+      hidden * e % kBuild.memory.pack_bytes != 0 || latent * e % kBuild.memory.pack_bytes != 0 ||
+              latent < 1
+          ? std::optional<Error>{Error::widths_not_packs}
+          : std::nullopt;
+  if (const std::optional<Error> err =
+          refused(&h, fn, c, dtype, rows, row, latent, widths, inp, false, stream))
+    return *err;
+  const RowConfig& r = std::get<RowConfig>(c);
+  const AllReduceRmsScaleAddLaunch l{algorithm_of(fn),
+                                     direction_of(fn),
+                                     r.tile_n,
+                                     r.launch.threads_per_block,
+                                     r.launch.blocks_per_grid,
+                                     out,
+                                     inp,
+                                     dtype,
+                                     rows,
+                                     hidden,
+                                     latent,
+                                     eps};
+  if (!resident(h, l)) return Error::grid_not_resident;
+  return l;
+}
+
+namespace experimental {
+
+inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm(
+    void* prefix, void* out, const void* delta, void* blocks, int64_t block_stride_m,
+    int64_t block_stride_r, const void* norm_weight, const void* qk_weight,
+    const void* out_norm_weight, DType dtype, int64_t rows, int64_t hidden, int num_blocks,
+    int write_idx, float eps, float out_eps, std::optional<int> tile_n,
+    std::optional<int> tile_k, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid) {
+  const std::variant<Chosen, Error> got =
+      chosen(OpType::add_attn_res_rms_norm, 1, rows, hidden, hidden, hidden, std::nullopt,
+             std::nullopt, threads_per_block, blocks_per_grid, {tile_n, tile_k},
+             attn_res_config(std::nullopt, tile_n, tile_k, std::nullopt));
+  if (const Error* e = std::get_if<Error>(&got)) return *e;
+  const auto& [fn, c] = std::get<Chosen>(got);
+  if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, rows, hidden, hidden,
+                                             std::nullopt, delta, false, nullptr))
+    return *e;
+  const AttnResConfig& a = std::get<AttnResConfig>(c);
+  return AddAttnResRmsNormLaunch{algorithm_of(fn),
+                                 direction_of(fn),
+                                 a.tile_n,
+                                 a.tile_k,
+                                 a.launch.threads_per_block,
+                                 a.launch.blocks_per_grid,
+                                 prefix,
+                                 out,
+                                 delta,
+                                 blocks,
+                                 block_stride_m,
+                                 block_stride_r,
+                                 norm_weight,
+                                 qk_weight,
+                                 out_norm_weight,
+                                 dtype,
+                                 rows,
+                                 hidden,
+                                 num_blocks,
+                                 write_idx,
+                                 eps,
+                                 out_eps};
+}
+
+}  // namespace experimental
+
 }  // namespace hip_comms
