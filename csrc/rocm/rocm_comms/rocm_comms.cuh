@@ -7,11 +7,10 @@
 // Error the call meets) then launch (which decides nothing).
 //
 // What a build is:
-//   error.cuh       Error: every reason a call cannot run here
 //   build.cuh       kBuild: what is compiled, the memory, the kernels' geometry (compile time)
 //   handle.cuh      Handle: the peers' memory, mapped once (run time; kBuild's twin), and
 //                   supported(device, world): whether one can exist there
-//   types.cuh       the vocabulary: Template, each family's KernelConfig, OpType, Algorithm,
+//   types.cuh       the vocabulary: Error, Template, each family's KernelConfig, OpType, Algorithm,
 //                   Direction, each op's kernel signatures, and each op's launch (the normal
 //                   form select returns)
 // How a call runs:
@@ -33,7 +32,6 @@
 
 #include "p2p/p2p.cuh"
 #include "build.cuh"
-#include "error.cuh"
 #include "handle.cuh"
 #include "types.cuh"
 #include "machine/hardware.cuh"

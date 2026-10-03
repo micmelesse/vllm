@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "build.cuh"
-#include "error.cuh"
+#include "types.cuh"
 #include "kernels/all_reduce_pull_one_shot.cuh"
 #include "p2p/p2p.cuh"
 
@@ -339,7 +339,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   HIP_CHECK(hipSetDevice(device));
   hipFuncAttributes attrs;
   const hipError_t found = hipFuncGetAttributes(
-      &attrs, reinterpret_cast<const void*>(all_reduce_pull_one_shot<c10::BFloat16, 2, false>));
+      &attrs, reinterpret_cast<const void*>(all_reduce_pull_one_shot<c10::BFloat16, 2>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;

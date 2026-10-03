@@ -441,222 +441,6 @@ const void* instance(void (*kernel)(P...)) {
   return reinterpret_cast<const void*>(kernel);
 }
 
-inline const void* all_reduce_kernel(Template fn, DType dtype, int world, bool staged) {
-  const void* k = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      switch (fn) {
-        case Template::all_reduce_pull_one_shot:
-          k = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_one_shot_staged<T, NG>)
-                     : instance<AllReduceKernel>(all_reduce_pull_one_shot<T, NG>);
-          return;
-        case Template::all_reduce_pull_two_shot:
-          k = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_two_shot_staged<T, NG>)
-                     : instance<AllReduceKernel>(all_reduce_pull_two_shot<T, NG>);
-          return;
-        default: not_this_ops(fn);
-      }
-    });
-  });
-  return k;
-}
-
-// The norms', written or with a residual.
-inline const void* rms_norm_kernel(Template fn, const KernelConfig& c, DType dtype,
-                                   DType weight_dtype, int world) {
-  using K       = Template;
-  const void* k = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      by_weight<T>(weight_dtype, dtype, [&](auto w) {
-        using W = typename decltype(w)::t;
-        switch (fn) {
-          case K::all_reduce_pull_one_shot_rms_norm:
-            return by_config<K::all_reduce_pull_one_shot_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<RmsNormKernel>(all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB>);
-            });
-          case K::all_reduce_pull_two_shot_rms_norm:
-            return by_config<K::all_reduce_pull_two_shot_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<RmsNormKernel>(all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB>);
-            });
-          case K::all_reduce_push_two_shot_rms_norm:
-            return by_config<K::all_reduce_push_two_shot_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<RmsNormKernel>(all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB>);
-            });
-          case K::all_reduce_pull_one_shot_add_rms_norm:
-            return by_config<K::all_reduce_pull_one_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<AddRmsNormKernel>(
-                  all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB>);
-            });
-          case K::all_reduce_pull_two_shot_add_rms_norm:
-            return by_config<K::all_reduce_pull_two_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<AddRmsNormKernel>(
-                  all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
-            });
-          case K::all_reduce_push_two_shot_add_rms_norm:
-            return by_config<K::all_reduce_push_two_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              k = instance<AddRmsNormKernel>(
-                  all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
-            });
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  return k;
-}
-
-inline const void* attn_res_kernel(Template fn, const KernelConfig& c, DType dtype, int world,
-                                   bool prefix) {
-  using K       = Template;
-  const void* k = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      switch (fn) {
-        case K::all_reduce_pull_one_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_pull_one_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AttnResConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
-            k = prefix ? instance<AttnResKernel>(
-                             all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN, TK,
-                                                                            TPB>)
-                       : instance<AttnResKernel>(
-                             all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, TN, TK,
-                                                                            TPB>);
-          });
-        case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AttnResPullConfig C = decltype(cc)::value;
-            constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
-                          TPB = C.launch.threads_per_block;
-            k = prefix ? instance<AttnResPullKernel>(
-                             all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN,
-                                                                            TK, TPB>)
-                       : instance<AttnResPullKernel>(
-                             all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, TM, TN,
-                                                                            TK, TPB>);
-          });
-        case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_push_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AttnResConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
-            k = prefix ? instance<AttnResKernel>(
-                             all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN, TK,
-                                                                            TPB>)
-                       : instance<AttnResKernel>(
-                             all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, TN, TK,
-                                                                            TPB>);
-          });
-        default: not_this_ops(fn);
-      }
-    });
-  });
-  return k;
-}
-
-// THE GEMM TAILS, written or added: one config list for all four templates, so one lookup serves
-// each.
-inline const void* gemm_tail_kernel(Template fn, const KernelConfig& c, DType dtype, int world) {
-  const void* k = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      static_assert(configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        configs_of(Template::all_reduce_pull_two_shot_rms_norm_gemm_add).data() &&
-                    configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm).data() &&
-                    configs_of(Template::all_reduce_pull_one_shot_rms_norm_gemm_add).data() ==
-                        configs_of(Template::all_reduce_pull_two_shot_rms_norm_gemm).data());
-      by_config<Template::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
-        constexpr GemmConfig C = decltype(cc)::value;
-        constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.launch.threads_per_block;
-        switch (fn) {
-          case Template::all_reduce_pull_one_shot_rms_norm_gemm_add:
-            k = instance<GemmTailKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
-            return;
-          case Template::all_reduce_pull_two_shot_rms_norm_gemm_add:
-            k = instance<GemmTailKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
-            return;
-          case Template::all_reduce_pull_one_shot_rms_norm_gemm:
-            k = instance<GemmTailKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
-            return;
-          case Template::all_reduce_pull_two_shot_rms_norm_gemm:
-            k = instance<GemmTailKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
-            return;
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  return k;
-}
-
-inline const void* rms_scale_add_kernel(Template fn, const KernelConfig& c, DType dtype,
-                                        int world) {
-  const void* k = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      // The one-shot's and the two-shot's builds are one list.
-      constexpr Template K = Template::all_reduce_pull_one_shot_rms_scale_add;
-      static_assert(same_builds(K, Template::all_reduce_pull_two_shot_rms_scale_add));
-      by_config<K>(c, [&](auto cc) {
-        constexpr RowConfig C = decltype(cc)::value;
-        constexpr int BN = C.tile_n, NT = C.launch.threads_per_block;
-        switch (fn) {
-          case K:
-            k = instance<RmsScaleAddKernel>(all_reduce_pull_one_shot_rms_scale_add<T, NG, BN, NT>);
-            return;
-          case Template::all_reduce_pull_two_shot_rms_scale_add:
-            k = instance<RmsScaleAddKernel>(all_reduce_pull_two_shot_rms_scale_add<T, NG, BN, NT>);
-            return;
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  return k;
-}
-
-inline const void* add_attn_res_kernel(Template fn, const KernelConfig& c, DType dtype) {
-  const void* k = nullptr;
-  if (fn != Template::add_attn_res_rms_norm) not_this_ops(fn);
-  by_dtype(dtype, [&](auto t) {
-    using T = typename decltype(t)::t;
-    by_config<Template::add_attn_res_rms_norm>(c, [&](auto cc) {
-      constexpr AttnResConfig C = decltype(cc)::value;
-      k = instance<AddAttnResKernel>(
-          add_attn_res_rms_norm<T, C.tile_n, C.tile_k, C.launch.threads_per_block>);
-    });
-  });
-  return k;
-}
-
 // WHETHER `kernel` HOLDS A GRID OF `blocks` BLOCKS OF `threads` RESIDENT: only the compiled kernel
 // knows what it uses.
 inline bool resident(const Handle& h, const void* kernel, int blocks, int threads) {
@@ -877,37 +661,6 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
 // A FORCED FIELD's value, or 0: the template's own.
 constexpr int own(std::optional<int> v) { return v.value_or(0); }
 
-// EACH FAMILY'S FORCED CONFIG from the op's fields.
-constexpr auto all_reduce_config() {
-  return [](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-    return AllReduceConfig{l};
-  };
-}
-constexpr auto row_config(std::optional<int> tile_n) {
-  return [=](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-    return RowConfig{l, own(tile_n)};
-  };
-}
-// AttnRes's: the pull's family (TILE_M and its reduce-scatter blocks) for the pull two-shot, the
-// one-shot's and push's (neither of those) otherwise.
-constexpr auto attn_res_config(std::optional<int> tile_m, std::optional<int> tile_n,
-                               std::optional<int> tile_k,
-                               std::optional<int> reduce_scatter_blocks) {
-  return [=](LaunchConfig l, Template t) -> std::variant<KernelConfig, Error> {
-    if (t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm)
-      return AttnResPullConfig{l, own(tile_m), own(tile_n), own(tile_k),
-                               own(reduce_scatter_blocks)};
-    if (tile_m || reduce_scatter_blocks) return Error::field_not_this_templates;
-    return AttnResConfig{l, own(tile_n), own(tile_k)};
-  };
-}
-constexpr auto gemm_config(std::optional<int> tile_m, std::optional<int> tile_n,
-                           std::optional<int> tile_k, std::optional<int> slice_k) {
-  return [=](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-    return GemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
-  };
-}
-
 // =================================================================================================
 // 2. THE PICK.
 // =================================================================================================
@@ -1044,55 +797,6 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t 
   return c;
 }
 
-// A TILED OP'S KERNEL for the call: the forced template and config (a zero field, or a config not
-// forced, the template's own), else the op's tuned kernel; fitted to the call either way. `rows`
-// rows of `hidden` elements; its tile holds `tile_cols` of them and its grid tiles `grid_cols`.
-template <typename Config>
-constexpr std::variant<std::pair<Template, KernelConfig>, Error> chosen(
-    OpType o, int world, int64_t rows, int64_t hidden, int64_t tile_cols, int64_t grid_cols,
-    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::initializer_list<std::optional<int>> fields, Config config) {
-  const std::variant<Forced, Error> f =
-      forced(o, algorithm, direction, threads_per_block, blocks_per_grid, fields, config);
-  if (const Error* e = std::get_if<Error>(&f)) return *e;
-  const Forced& got = std::get<Forced>(f);
-  Template fn;
-  KernelConfig c;
-  if (got) {
-    fn = got->first;
-    c  = got->second.value_or(zero_config(family_of(fn)));
-  } else {
-    const TunedKernel p = pick(o, world, rows, hidden, tile_cols);
-    fn                  = p.fn;
-    c                   = p.config;
-  }
-  return std::pair{fn, fitted(fn, c, rows, tile_cols, grid_cols, world)};
-}
-
-// THE PLAIN ALL-REDUCE'S KERNEL for `bytes`: forced, else pull one-shot up to the calibrated size
-// and two-shot past it; its launch, where not forced, derived from the bytes.
-constexpr std::variant<std::pair<Template, KernelConfig>, Error> chosen_all_reduce(
-    int world, int64_t bytes, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid) {
-  const std::variant<Forced, Error> f = forced(OpType::all_reduce, algorithm, direction,
-                                               threads_per_block, blocks_per_grid, {},
-                                               all_reduce_config());
-  if (const Error* e = std::get_if<Error>(&f)) return *e;
-  const Forced& got = std::get<Forced>(f);
-  const Template fn = got ? got->first
-                          : bytes <= kTargetCalibration.all_reduce_one_shot_max_bytes
-                                ? Template::all_reduce_pull_one_shot
-                                : Template::all_reduce_pull_two_shot;
-  KernelConfig c = got && got->second ? *got->second : AllReduceConfig{{0, 0}};
-  const KernelConfig derived = all_reduce_config(fn, bytes, world);
-  LaunchConfig& l            = launch_of(c);
-  if (l.threads_per_block == 0) l.threads_per_block = launch_of(derived).threads_per_block;
-  if (l.blocks_per_grid == 0) l.blocks_per_grid = launch_of(derived).blocks_per_grid;
-  return std::pair{fn, c};
-}
-
 // =================================================================================================
 // 4. THE CHECK: the first Error kernel `fn` at `c` meets on the call here, in this order, or none.
 // Every Error is a capability (a kernel that cannot take the input), never "the unfused ops would
@@ -1148,181 +852,268 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   return std::nullopt;
 }
 
-// =================================================================================================
-// EVERY SELECTION FITS, for every op at the smallest call and a large one: an op never declines (a
-// fusion that is on runs its fused op), and a kernel past a capability is a compile error, not one
-// that overruns its signal slots or register arrays.
-// =================================================================================================
 
-constexpr bool fits(const std::variant<std::pair<Template, KernelConfig>, Error>& got) {
-  const auto* k = std::get_if<std::pair<Template, KernelConfig>>(&got);
-  if (!k) return false;
-  const LaunchConfig& l = launch_of(k->second);
-  if (l.blocks_per_grid < 1 || l.blocks_per_grid > p2p::kMaxBlocks) return false;
-  if (has_tiles(k->first) && tile_n_of(k->second) == 0) return false;
-  const int t = l.threads_per_block;
-  return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
-}
-constexpr bool selections_fit() {
-  constexpr std::nullopt_t none = std::nullopt;
-  for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
-                                            std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {
-    const int w = static_cast<int>(call[0]);
-    const int64_t rows = call[1], hidden = call[2];
-    if (!fits(chosen_all_reduce(w, rows * hidden * 2, none, none, none, none))) return false;
-    for (const OpType o : {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm})
-      if (!fits(chosen(o, w, rows, hidden, hidden, hidden, none, none, none, none, {},
-                       row_config(none))))
-        return false;
-    // The one-all-reduce tail: [shared | projected | latent], the latent half the hidden.
-    const int64_t latent = hidden / 2;
-    if (!fits(chosen(OpType::all_reduce_rms_scale_add, w, rows, 2 * hidden + latent, latent,
-                     hidden, none, none, none, none, {}, row_config(none))))
-      return false;
-    for (const OpType o : {OpType::all_reduce_rms_norm_gemm, OpType::all_reduce_rms_norm_gemm_add})
-      if (!fits(chosen(o, w, rows, hidden, hidden, hidden, none, none, none, none, {},
-                       gemm_config(none, none, none, none))))
-        return false;
-    for (const OpType o : {OpType::all_reduce_add_attn_res_rms_norm,
-                           OpType::add_attn_res_rms_norm})
-      if (!fits(chosen(o, o == OpType::add_attn_res_rms_norm ? 1 : w, rows, hidden, hidden,
-                       hidden, none, none, none, none, {},
-                       attn_res_config(none, none, none, none))))
-        return false;
-  }
-  return true;
-}
-static_assert(selections_fit(), "a selection declines, or exceeds a kernel capability");
-
-// =================================================================================================
-// EACH OP'S SELECT: the op's launch, everything decided (the kernel, its config, its grid), from
-// the call's primitives and its forcing, or the first Error the call meets.
-// =================================================================================================
-
-using Chosen = std::pair<Template, KernelConfig>;
-
+// THE WEIGHT a norm takes: its input's dtype, or fp32.
 constexpr std::optional<Error> weight_refused(DType dtype, DType weight_dtype) {
   if (weight_dtype != dtype && weight_dtype != DType::f32) return Error::weight_not_built;
   return std::nullopt;
 }
 
+// =================================================================================================
+// EACH OP'S SELECT: the op's launch, everything decided, from the call's primitives and its
+// forcing, or the first Error the call meets. Each in four steps: 1. the kernel (the forced
+// template and config, a zero field or a config not forced the template's own; else the op's
+// tuned kernel; fitted to the call), 2. the checks, 3. its compiled instance, 4. the launch.
+// =================================================================================================
+
+// all_reduce: the sum of every rank's `inp` (`bytes` of `dtype`) into `out`. Not tiled: its
+// launch, where not forced, is derived from the bytes. In place when the peers can read the input
+// where it is (registered, or captured on this stream), otherwise its staged kernel.
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, void* out, const void* inp, int64_t bytes, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     hipStream_t stream) {
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got = chosen_all_reduce(
-      world, bytes, algorithm, direction, threads_per_block, blocks_per_grid);
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
-  // THE BUILD, from what the handle knows: in place when the peers can read the input where it
-  // is, otherwise its staged build.
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid, {},
+             [](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return AllReduceConfig{l};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f   = std::get<Forced>(forcing);
+  const Template fn = f ? f->first
+                        : bytes <= kTargetCalibration.all_reduce_one_shot_max_bytes
+                              ? Template::all_reduce_pull_one_shot
+                              : Template::all_reduce_pull_two_shot;
+  KernelConfig c = f && f->second ? *f->second : AllReduceConfig{{0, 0}};
+  const LaunchConfig derived = launch_of(all_reduce_config(fn, bytes, world));
+  LaunchConfig& g            = launch_of(c);
+  if (g.threads_per_block == 0) g.threads_per_block = derived.threads_per_block;
+  if (g.blocks_per_grid == 0) g.blocks_per_grid = derived.blocks_per_grid;
   const bool staged = !h.reads_in_place(inp, stream);
-  if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, 1, bytes / elem_bytes(dtype), 0, std::nullopt, inp, staged,
-                  stream))
+  // 2.
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, 1, bytes / elem_bytes(dtype), 0,
+                                             std::nullopt, inp, staged, stream))
     return *e;
-  const void* kernel = all_reduce_kernel(fn, dtype, world, staged);
-  const LaunchConfig& g = launch_of(c);
-  const AllReduceLaunch l{.kernel = kernel,
-                          .algorithm = algorithm_of(fn),
-                          .direction = direction_of(fn),
-                          .world = world,
+  // 3.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      switch (fn) {
+        case Template::all_reduce_pull_one_shot:
+          kernel = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_one_shot_staged<T, NG>)
+                          : instance<AllReduceKernel>(all_reduce_pull_one_shot<T, NG>);
+          return;
+        case Template::all_reduce_pull_two_shot:
+          kernel = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_two_shot_staged<T, NG>)
+                          : instance<AllReduceKernel>(all_reduce_pull_two_shot<T, NG>);
+          return;
+        default: not_this_ops(fn);
+      }
+    });
+  });
+  // 4.
+  const AllReduceLaunch l{.kernel            = kernel,
+                          .algorithm         = algorithm_of(fn),
+                          .direction         = direction_of(fn),
+                          .world             = world,
                           .threads_per_block = g.threads_per_block,
-                          .blocks_per_grid = g.blocks_per_grid,
-                          .staged = staged,
-                          .stream = stream,
-                          .out = out,
-                          .inp = inp,
-                          .bytes = bytes,
-                          .dtype = dtype};
+                          .blocks_per_grid   = g.blocks_per_grid,
+                          .staged            = staged,
+                          .stream            = stream,
+                          .out               = out,
+                          .inp               = inp,
+                          .bytes             = bytes,
+                          .dtype             = dtype};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_rms_norm: out = rms_norm(all_reduce(inp), weight), vLLM's roundings exactly. inp
+// [rows, hidden]; the weight `weight_dtype`, dtype or f32.
 inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
     const Handle& h, void* out, const void* inp, const void* weight, DType dtype,
     DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  using K         = Template;
+  const OpType op = OpType::all_reduce_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_rms_norm, world, rows, hidden, hidden, hidden, algorithm,
-             direction, threads_per_block, blocks_per_grid, {tile_n}, row_config(tile_n));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return RowConfig{l, own(tile_n)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
                                              weight_refused(dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
-  const void* kernel = rms_norm_kernel(fn, c, dtype, weight_dtype, world);
+  // 3.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      by_weight<T>(weight_dtype, dtype, [&](auto w) {
+        using W = typename decltype(w)::t;
+        switch (fn) {
+          case K::all_reduce_pull_one_shot_rms_norm:
+            return by_config<K::all_reduce_pull_one_shot_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<RmsNormKernel>(
+                  all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB>);
+            });
+          case K::all_reduce_pull_two_shot_rms_norm:
+            return by_config<K::all_reduce_pull_two_shot_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<RmsNormKernel>(
+                  all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB>);
+            });
+          case K::all_reduce_push_two_shot_rms_norm:
+            return by_config<K::all_reduce_push_two_shot_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<RmsNormKernel>(
+                  all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB>);
+            });
+          default: not_this_ops(fn);
+        }
+      });
+    });
+  });
+  // 4.
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceRmsNormLaunch l{.kernel = kernel,
-                                 .algorithm = algorithm_of(fn),
-                                 .direction = direction_of(fn),
-                                 .world = world,
-                                 .tile_n = r.tile_n,
+  const AllReduceRmsNormLaunch l{.kernel            = kernel,
+                                 .algorithm         = algorithm_of(fn),
+                                 .direction         = direction_of(fn),
+                                 .world             = world,
+                                 .tile_n            = r.tile_n,
                                  .threads_per_block = r.launch.threads_per_block,
-                                 .blocks_per_grid = r.launch.blocks_per_grid,
-                                 .stream = stream,
-                                 .out = out,
-                                 .inp = inp,
-                                 .weight = weight,
-                                 .dtype = dtype,
-                                 .weight_dtype = weight_dtype,
-                                 .rows = rows,
-                                 .hidden = hidden,
-                                 .eps = eps};
+                                 .blocks_per_grid   = r.launch.blocks_per_grid,
+                                 .stream            = stream,
+                                 .out               = out,
+                                 .inp               = inp,
+                                 .weight            = weight,
+                                 .dtype             = dtype,
+                                 .weight_dtype      = weight_dtype,
+                                 .rows              = rows,
+                                 .hidden            = hidden,
+                                 .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_add_rms_norm: out, residual_out = fused_add_rms_norm(all_reduce(inp), residual,
+// weight), vLLM's roundings exactly.
 inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_norm(
     const Handle& h, void* out, void* residual_out, const void* inp, const void* residual,
     const void* weight, DType dtype, DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  using K         = Template;
+  const OpType op = OpType::all_reduce_add_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_add_rms_norm, world, rows, hidden, hidden, hidden,
-             algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
-             row_config(tile_n));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return RowConfig{l, own(tile_n)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
                                              weight_refused(dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
-  const void* kernel = rms_norm_kernel(fn, c, dtype, weight_dtype, world);
+  // 3.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      by_weight<T>(weight_dtype, dtype, [&](auto w) {
+        using W = typename decltype(w)::t;
+        switch (fn) {
+          case K::all_reduce_pull_one_shot_add_rms_norm:
+            return by_config<K::all_reduce_pull_one_shot_add_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<AddRmsNormKernel>(
+                  all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB>);
+            });
+          case K::all_reduce_pull_two_shot_add_rms_norm:
+            return by_config<K::all_reduce_pull_two_shot_add_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<AddRmsNormKernel>(
+                  all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
+            });
+          case K::all_reduce_push_two_shot_add_rms_norm:
+            return by_config<K::all_reduce_push_two_shot_add_rms_norm>(c, [&](auto cc) {
+              constexpr RowConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              kernel = instance<AddRmsNormKernel>(
+                  all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
+            });
+          default: not_this_ops(fn);
+        }
+      });
+    });
+  });
+  // 4.
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceAddRmsNormLaunch l{.kernel = kernel,
-                                    .algorithm = algorithm_of(fn),
-                                    .direction = direction_of(fn),
-                                    .world = world,
-                                    .tile_n = r.tile_n,
+  const AllReduceAddRmsNormLaunch l{.kernel            = kernel,
+                                    .algorithm         = algorithm_of(fn),
+                                    .direction         = direction_of(fn),
+                                    .world             = world,
+                                    .tile_n            = r.tile_n,
                                     .threads_per_block = r.launch.threads_per_block,
-                                    .blocks_per_grid = r.launch.blocks_per_grid,
-                                    .stream = stream,
-                                    .out = out,
-                                    .residual_out = residual_out,
-                                    .inp = inp,
-                                    .residual = residual,
-                                    .weight = weight,
-                                    .dtype = dtype,
-                                    .weight_dtype = weight_dtype,
-                                    .rows = rows,
-                                    .hidden = hidden,
-                                    .eps = eps};
+                                    .blocks_per_grid   = r.launch.blocks_per_grid,
+                                    .stream            = stream,
+                                    .out               = out,
+                                    .residual_out      = residual_out,
+                                    .inp               = inp,
+                                    .residual          = residual,
+                                    .weight            = weight,
+                                    .dtype             = dtype,
+                                    .weight_dtype      = weight_dtype,
+                                    .rows              = rows,
+                                    .hidden            = hidden,
+                                    .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each row of the
+// all-reduced sum of `inp`. With `has_prefix` the sum is added to `prefix` in place; without, the
+// sum IS the new prefix. The pull two-shot's config family has TILE_M and its reduce-scatter
+// blocks; the one-shot's and push's (a row a tile) have neither.
 inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error>
 select_all_reduce_add_attn_res_rms_norm(
     const Handle& h, void* prefix, void* out, const void* inp, void* blocks,
@@ -1333,57 +1124,121 @@ select_all_reduce_add_attn_res_rms_norm(
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  using K         = Template;
+  const OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_add_attn_res_rms_norm, world, rows, hidden, hidden,
-             hidden, algorithm, direction, threads_per_block, blocks_per_grid,
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
              {tile_m, tile_n, tile_k, reduce_scatter_blocks},
-             attn_res_config(tile_m, tile_n, tile_k, reduce_scatter_blocks));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+             [&](LaunchConfig l, Template t) -> std::variant<KernelConfig, Error> {
+               if (t == K::all_reduce_pull_two_shot_add_attn_res_rms_norm)
+                 return AttnResPullConfig{l, own(tile_m), own(tile_n), own(tile_k),
+                                          own(reduce_scatter_blocks)};
+               if (tile_m || reduce_scatter_blocks) return Error::field_not_this_templates;
+               return AttnResConfig{l, own(tile_n), own(tile_k)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
-  const void* kernel = attn_res_kernel(fn, c, dtype, world, has_prefix);
-  // THE PULL'S FAMILY has TILE_M and its reduce-scatter blocks; the others are a row a tile.
+  // 3.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      switch (fn) {
+        case K::all_reduce_pull_one_shot_add_attn_res_rms_norm:
+          return by_config<K::all_reduce_pull_one_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
+            constexpr AttnResConfig C = decltype(cc)::value;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
+            kernel = has_prefix
+                         ? instance<AttnResKernel>(
+                               all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN,
+                                                                              TK, TPB>)
+                         : instance<AttnResKernel>(
+                               all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, TN,
+                                                                              TK, TPB>);
+          });
+        case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
+          return by_config<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
+            constexpr AttnResPullConfig C = decltype(cc)::value;
+            constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
+                          TPB = C.launch.threads_per_block;
+            kernel = has_prefix
+                         ? instance<AttnResPullKernel>(
+                               all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN,
+                                                                              TK, TPB>)
+                         : instance<AttnResPullKernel>(
+                               all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, TM,
+                                                                              TN, TK, TPB>);
+          });
+        case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
+          return by_config<K::all_reduce_push_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
+            constexpr AttnResConfig C = decltype(cc)::value;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
+            kernel = has_prefix
+                         ? instance<AttnResKernel>(
+                               all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN,
+                                                                              TK, TPB>)
+                         : instance<AttnResKernel>(
+                               all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, TN,
+                                                                              TK, TPB>);
+          });
+        default: not_this_ops(fn);
+      }
+    });
+  });
+  // 4.
   const AttnResPullConfig* pull = std::get_if<AttnResPullConfig>(&c);
   const LaunchConfig& g         = launch_of(c);
   const int tm = pull ? pull->tile_m : 1;
   const int tk = pull ? pull->tile_k : std::get<AttnResConfig>(c).tile_k;
   const int rs = pull ? pull->reduce_scatter_blocks : 0;
-  const AllReduceAddAttnResRmsNormLaunch l{.kernel = kernel,
-                                           .algorithm = algorithm_of(fn),
-                                           .direction = direction_of(fn),
-                                           .world = world,
-                                           .tile_m = tm,
-                                           .tile_n = tile_n_of(c),
-                                           .tile_k = tk,
-                                           .threads_per_block = g.threads_per_block,
-                                           .blocks_per_grid = g.blocks_per_grid,
+  const AllReduceAddAttnResRmsNormLaunch l{.kernel                = kernel,
+                                           .algorithm             = algorithm_of(fn),
+                                           .direction             = direction_of(fn),
+                                           .world                 = world,
+                                           .tile_m                = tm,
+                                           .tile_n                = tile_n_of(c),
+                                           .tile_k                = tk,
+                                           .threads_per_block     = g.threads_per_block,
+                                           .blocks_per_grid       = g.blocks_per_grid,
                                            .reduce_scatter_blocks = rs,
-                                           .stream = stream,
-                                           .prefix = prefix,
-                                           .out = out,
-                                           .inp = inp,
-                                           .blocks = blocks,
-                                           .block_stride_m = block_stride_m,
-                                           .block_stride_r = block_stride_r,
-                                           .norm_weight = norm_weight,
-                                           .qk_weight = qk_weight,
-                                           .out_norm_weight = out_norm_weight,
-                                           .dtype = dtype,
-                                           .rows = rows,
-                                           .hidden = hidden,
-                                           .num_blocks = num_blocks,
-                                           .write_idx = write_idx,
-                                           .eps = eps,
-                                           .out_eps = out_eps,
-                                           .has_prefix = has_prefix};
+                                           .stream                = stream,
+                                           .prefix                = prefix,
+                                           .out                   = out,
+                                           .inp                   = inp,
+                                           .blocks                = blocks,
+                                           .block_stride_m        = block_stride_m,
+                                           .block_stride_r        = block_stride_r,
+                                           .norm_weight           = norm_weight,
+                                           .qk_weight             = qk_weight,
+                                           .out_norm_weight       = out_norm_weight,
+                                           .dtype                 = dtype,
+                                           .rows                  = rows,
+                                           .hidden                = hidden,
+                                           .num_blocks            = num_blocks,
+                                           .write_idx             = write_idx,
+                                           .eps                   = eps,
+                                           .out_eps               = out_eps,
+                                           .has_prefix            = has_prefix};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_rms_norm_gemm: out = rms_norm(all_reduce(inp), norm_weight) @ gemm_weight^T, out
+// [rows, n_cols] at `out_stride` (a column slice of a wider buffer); gemm_weight [n_cols, hidden];
+// `workspace` holds the normed rows, inp's shape.
 inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_norm_gemm(
     const Handle& h, void* out, int64_t out_stride, const void* inp, const void* norm_weight,
     float eps, const void* gemm_weight, int64_t n_cols, void* workspace, DType dtype,
@@ -1391,45 +1246,82 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  using K         = Template;
+  const OpType op = OpType::all_reduce_rms_norm_gemm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_rms_norm_gemm, world, rows, hidden, hidden, hidden,
-             algorithm, direction, threads_per_block, blocks_per_grid,
-             {tile_m, tile_n, tile_k, slice_k}, gemm_config(tile_m, tile_n, tile_k, slice_k));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
+             {tile_m, tile_n, tile_k, slice_k},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return GemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
-  const void* kernel = gemm_tail_kernel(fn, c, dtype, world);
+  // 3. The four GEMM-tail templates share one config list, so one lookup serves each.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
+        constexpr GemmConfig C = decltype(cc)::value;
+        constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
+                      TPB = C.launch.threads_per_block;
+        switch (fn) {
+          case K::all_reduce_pull_one_shot_rms_norm_gemm:
+            kernel = instance<GemmTailKernel>(
+                all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
+            return;
+          case K::all_reduce_pull_two_shot_rms_norm_gemm:
+            kernel = instance<GemmTailKernel>(
+                all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
+            return;
+          default: not_this_ops(fn);
+        }
+      });
+    });
+  });
+  // 4.
   const GemmConfig& g = std::get<GemmConfig>(c);
-  const AllReduceRmsNormGemmLaunch l{.kernel = kernel,
-                                     .algorithm = algorithm_of(fn),
-                                     .direction = direction_of(fn),
-                                     .world = world,
-                                     .tile_m = g.tile_m,
-                                     .tile_n = g.tile_n,
-                                     .tile_k = g.tile_k,
-                                     .slice_k = g.slice_k,
+  const AllReduceRmsNormGemmLaunch l{.kernel            = kernel,
+                                     .algorithm         = algorithm_of(fn),
+                                     .direction         = direction_of(fn),
+                                     .world             = world,
+                                     .tile_m            = g.tile_m,
+                                     .tile_n            = g.tile_n,
+                                     .tile_k            = g.tile_k,
+                                     .slice_k           = g.slice_k,
                                      .threads_per_block = g.launch.threads_per_block,
-                                     .blocks_per_grid = g.launch.blocks_per_grid,
-                                     .stream = stream,
-                                     .out = out,
-                                     .out_stride = out_stride,
-                                     .inp = inp,
-                                     .norm_weight = norm_weight,
-                                     .eps = eps,
-                                     .gemm_weight = gemm_weight,
-                                     .n_cols = n_cols,
-                                     .workspace = workspace,
-                                     .dtype = dtype,
-                                     .rows = rows,
-                                     .hidden = hidden};
+                                     .blocks_per_grid   = g.launch.blocks_per_grid,
+                                     .stream            = stream,
+                                     .out               = out,
+                                     .out_stride        = out_stride,
+                                     .inp               = inp,
+                                     .norm_weight       = norm_weight,
+                                     .eps               = eps,
+                                     .gemm_weight       = gemm_weight,
+                                     .n_cols            = n_cols,
+                                     .workspace         = workspace,
+                                     .dtype             = dtype,
+                                     .rows              = rows,
+                                     .hidden            = hidden};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_rms_norm_gemm_add: the latent MoE tail: as all_reduce_rms_norm_gemm, the
+// product added into out.
 inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_norm_gemm_add(
     const Handle& h, void* out, int64_t out_stride, const void* inp, const void* norm_weight,
     float eps, const void* gemm_weight, int64_t n_cols, void* workspace, DType dtype,
@@ -1437,59 +1329,108 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  using K         = Template;
+  const OpType op = OpType::all_reduce_rms_norm_gemm_add;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_rms_norm_gemm_add, world, rows, hidden, hidden, hidden,
-             algorithm, direction, threads_per_block, blocks_per_grid,
-             {tile_m, tile_n, tile_k, slice_k}, gemm_config(tile_m, tile_n, tile_k, slice_k));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
+             {tile_m, tile_n, tile_k, slice_k},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return GemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
-  const void* kernel = gemm_tail_kernel(fn, c, dtype, world);
+  // 3. The four GEMM-tail templates share one config list, so one lookup serves each.
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
+        constexpr GemmConfig C = decltype(cc)::value;
+        constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
+                      TPB = C.launch.threads_per_block;
+        switch (fn) {
+          case K::all_reduce_pull_one_shot_rms_norm_gemm_add:
+            kernel = instance<GemmTailKernel>(
+                all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
+            return;
+          case K::all_reduce_pull_two_shot_rms_norm_gemm_add:
+            kernel = instance<GemmTailKernel>(
+                all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
+            return;
+          default: not_this_ops(fn);
+        }
+      });
+    });
+  });
+  // 4.
   const GemmConfig& g = std::get<GemmConfig>(c);
-  const AllReduceRmsNormGemmAddLaunch l{.kernel = kernel,
-                                        .algorithm = algorithm_of(fn),
-                                        .direction = direction_of(fn),
-                                        .world = world,
-                                        .tile_m = g.tile_m,
-                                        .tile_n = g.tile_n,
-                                        .tile_k = g.tile_k,
-                                        .slice_k = g.slice_k,
+  const AllReduceRmsNormGemmAddLaunch l{.kernel            = kernel,
+                                        .algorithm         = algorithm_of(fn),
+                                        .direction         = direction_of(fn),
+                                        .world             = world,
+                                        .tile_m            = g.tile_m,
+                                        .tile_n            = g.tile_n,
+                                        .tile_k            = g.tile_k,
+                                        .slice_k           = g.slice_k,
                                         .threads_per_block = g.launch.threads_per_block,
-                                        .blocks_per_grid = g.launch.blocks_per_grid,
-                                        .stream = stream,
-                                        .out = out,
-                                        .out_stride = out_stride,
-                                        .inp = inp,
-                                        .norm_weight = norm_weight,
-                                        .eps = eps,
-                                        .gemm_weight = gemm_weight,
-                                        .n_cols = n_cols,
-                                        .workspace = workspace,
-                                        .dtype = dtype,
-                                        .rows = rows,
-                                        .hidden = hidden};
+                                        .blocks_per_grid   = g.launch.blocks_per_grid,
+                                        .stream            = stream,
+                                        .out               = out,
+                                        .out_stride        = out_stride,
+                                        .inp               = inp,
+                                        .norm_weight       = norm_weight,
+                                        .eps               = eps,
+                                        .gemm_weight       = gemm_weight,
+                                        .n_cols            = n_cols,
+                                        .workspace         = workspace,
+                                        .dtype             = dtype,
+                                        .rows              = rows,
+                                        .hidden            = hidden};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
+// all_reduce_rms_scale_add: Kimi-K3's latent MoE tail with one all-reduce. inp's row is [shared |
+// projected | latent], widths hidden, hidden and latent, summed over the ranks; out [rows, hidden]
+// = shared + projected * rsqrt(mean(latent^2) + eps). Its tile holds the latent whole (each tile
+// needs the row's RMS) beside a TILE_N slice of the hidden, so its grid tiles the hidden.
 inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_scale_add(
     const Handle& h, void* out, const void* inp, DType dtype, int64_t rows, int64_t hidden,
     int64_t latent, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     hipStream_t stream) {
-  const int world = h.world_size();
+  using K           = Template;
+  const OpType op   = OpType::all_reduce_rms_scale_add;
+  const int world   = h.world_size();
   const int64_t row = 2 * hidden + latent;
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::all_reduce_rms_scale_add, world, rows, row, latent, hidden,
-             algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
-             row_config(tile_n));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return RowConfig{l, own(tile_n)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, row, latent);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, latent,
+             hidden, world);
+  // 2.
   const int e = elem_bytes(dtype);
   const std::optional<Error> widths =
       hidden * e % kBuild.memory.pack_bytes != 0 || latent * e % kBuild.memory.pack_bytes != 0 ||
@@ -1499,23 +1440,48 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   if (const std::optional<Error> err =
           refused(&h, fn, c, dtype, rows, row, latent, widths, inp, false, stream))
     return *err;
-  const void* kernel = rms_scale_add_kernel(fn, c, dtype, world);
+  // 3. The one-shot's and the two-shot's builds are one list.
+  static_assert(same_builds(K::all_reduce_pull_one_shot_rms_scale_add,
+                            K::all_reduce_pull_two_shot_rms_scale_add));
+  const void* kernel = nullptr;
+  by_world(world, [&](auto ng) {
+    constexpr int NG = decltype(ng)::value;
+    by_dtype(dtype, [&](auto t) {
+      using T = typename decltype(t)::t;
+      by_config<K::all_reduce_pull_one_shot_rms_scale_add>(c, [&](auto cc) {
+        constexpr RowConfig C = decltype(cc)::value;
+        constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+        switch (fn) {
+          case K::all_reduce_pull_one_shot_rms_scale_add:
+            kernel = instance<RmsScaleAddKernel>(
+                all_reduce_pull_one_shot_rms_scale_add<T, NG, TN, TPB>);
+            return;
+          case K::all_reduce_pull_two_shot_rms_scale_add:
+            kernel = instance<RmsScaleAddKernel>(
+                all_reduce_pull_two_shot_rms_scale_add<T, NG, TN, TPB>);
+            return;
+          default: not_this_ops(fn);
+        }
+      });
+    });
+  });
+  // 4.
   const RowConfig& r = std::get<RowConfig>(c);
-  const AllReduceRmsScaleAddLaunch l{.kernel = kernel,
-                                     .algorithm = algorithm_of(fn),
-                                     .direction = direction_of(fn),
-                                     .world = world,
-                                     .tile_n = r.tile_n,
+  const AllReduceRmsScaleAddLaunch l{.kernel            = kernel,
+                                     .algorithm         = algorithm_of(fn),
+                                     .direction         = direction_of(fn),
+                                     .world             = world,
+                                     .tile_n            = r.tile_n,
                                      .threads_per_block = r.launch.threads_per_block,
-                                     .blocks_per_grid = r.launch.blocks_per_grid,
-                                     .stream = stream,
-                                     .out = out,
-                                     .inp = inp,
-                                     .dtype = dtype,
-                                     .rows = rows,
-                                     .hidden = hidden,
-                                     .latent = latent,
-                                     .eps = eps};
+                                     .blocks_per_grid   = r.launch.blocks_per_grid,
+                                     .stream            = stream,
+                                     .out               = out,
+                                     .inp               = inp,
+                                     .dtype             = dtype,
+                                     .rows              = rows,
+                                     .hidden            = hidden,
+                                     .latent            = latent,
+                                     .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1523,6 +1489,10 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
 
 namespace experimental {
 
+// add_attn_res_rms_norm: AttnRes and its RMSNorm on a local `delta`, no all-reduce: prefix +=
+// delta (rounded once), then Triton's attn_res over the blocks and the new prefix. One rank, no
+// Handle: its one template needs no algorithm to force a config, and the checks that need peers
+// are left out.
 inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm(
     void* prefix, void* out, const void* delta, void* blocks, int64_t block_stride_m,
     int64_t block_stride_r, const void* norm_weight, const void* qk_weight,
@@ -1530,45 +1500,107 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
     int write_idx, float eps, float out_eps, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, hipStream_t stream) {
+  const OpType op = OpType::add_attn_res_rms_norm;
   const int world = 1;
-  const std::variant<Chosen, Error> got =
-      chosen(OpType::add_attn_res_rms_norm, world, rows, hidden, hidden, hidden, std::nullopt,
-             std::nullopt, threads_per_block, blocks_per_grid, {tile_n, tile_k},
-             attn_res_config(std::nullopt, tile_n, tile_k, std::nullopt));
-  if (const Error* e = std::get_if<Error>(&got)) return *e;
-  const auto& [fn, c] = std::get<Chosen>(got);
+  // 1.
+  const std::variant<Forced, Error> forcing =
+      forced(op, std::nullopt, std::nullopt, threads_per_block, blocks_per_grid, {tile_n, tile_k},
+             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
+               return AttnResConfig{l, own(tile_n), own(tile_k)};
+             });
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  const Forced& f         = std::get<Forced>(forcing);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const Template fn       = f ? f->first : tuned.fn;
+  const KernelConfig c =
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
+             hidden, world);
+  // 2.
   if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, rows, hidden, hidden,
                                              std::nullopt, delta, false, stream))
     return *e;
-  const void* kernel = add_attn_res_kernel(fn, c, dtype);
+  // 3.
+  const void* kernel = nullptr;
+  by_dtype(dtype, [&](auto t) {
+    using T = typename decltype(t)::t;
+    by_config<Template::add_attn_res_rms_norm>(c, [&](auto cc) {
+      constexpr AttnResConfig C = decltype(cc)::value;
+      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
+      kernel = instance<AddAttnResKernel>(add_attn_res_rms_norm<T, TN, TK, TPB>);
+    });
+  });
+  // 4.
   const AttnResConfig& a = std::get<AttnResConfig>(c);
-  return AddAttnResRmsNormLaunch{.kernel = kernel,
-                                 .algorithm = algorithm_of(fn),
-                                 .direction = direction_of(fn),
-                                 .world = world,
-                                 .tile_n = a.tile_n,
-                                 .tile_k = a.tile_k,
+  return AddAttnResRmsNormLaunch{.kernel            = kernel,
+                                 .algorithm         = algorithm_of(fn),
+                                 .direction         = direction_of(fn),
+                                 .world             = world,
+                                 .tile_n            = a.tile_n,
+                                 .tile_k            = a.tile_k,
                                  .threads_per_block = a.launch.threads_per_block,
-                                 .blocks_per_grid = a.launch.blocks_per_grid,
-                                 .stream = stream,
-                                 .prefix = prefix,
-                                 .out = out,
-                                 .delta = delta,
-                                 .blocks = blocks,
-                                 .block_stride_m = block_stride_m,
-                                 .block_stride_r = block_stride_r,
-                                 .norm_weight = norm_weight,
-                                 .qk_weight = qk_weight,
-                                 .out_norm_weight = out_norm_weight,
-                                 .dtype = dtype,
-                                 .rows = rows,
-                                 .hidden = hidden,
-                                 .num_blocks = num_blocks,
-                                 .write_idx = write_idx,
-                                 .eps = eps,
-                                 .out_eps = out_eps};
+                                 .blocks_per_grid   = a.launch.blocks_per_grid,
+                                 .stream            = stream,
+                                 .prefix            = prefix,
+                                 .out               = out,
+                                 .delta             = delta,
+                                 .blocks            = blocks,
+                                 .block_stride_m    = block_stride_m,
+                                 .block_stride_r    = block_stride_r,
+                                 .norm_weight       = norm_weight,
+                                 .qk_weight         = qk_weight,
+                                 .out_norm_weight   = out_norm_weight,
+                                 .dtype             = dtype,
+                                 .rows              = rows,
+                                 .hidden            = hidden,
+                                 .num_blocks        = num_blocks,
+                                 .write_idx         = write_idx,
+                                 .eps               = eps,
+                                 .out_eps           = out_eps};
 }
 
 }  // namespace experimental
+
+// =================================================================================================
+// EVERY TUNED SELECTION FITS, for every tiled op at the smallest call and a large one: an op never
+// declines (a fusion that is on runs its fused op), and a kernel past a capability is a compile
+// error, not one that overruns its signal slots or register arrays.
+// =================================================================================================
+
+constexpr bool fits(Template fn, const KernelConfig& c) {
+  const LaunchConfig& l = launch_of(c);
+  if (l.blocks_per_grid < 1 || l.blocks_per_grid > p2p::kMaxBlocks) return false;
+  if (has_tiles(fn) && tile_n_of(c) == 0) return false;
+  const int t = l.threads_per_block;
+  return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
+}
+// The tuned kernel for `rows` rows of `row` elements, fitted.
+constexpr bool tuned_fits(OpType o, int world, int64_t rows, int64_t row, int64_t tile_cols,
+                          int64_t grid_cols) {
+  const TunedKernel t = pick(o, world, rows, row, tile_cols);
+  return fits(t.fn, fitted(t.fn, t.config, rows, tile_cols, grid_cols, world));
+}
+constexpr bool selections_fit() {
+  for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
+                                            std::array<int64_t, 3>{p2p::kMaxRanks, 4096, 7168}}) {
+    const int w = static_cast<int>(call[0]);
+    const int64_t rows = call[1], hidden = call[2], latent = hidden / 2;
+    for (const OpType o :
+         {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
+          OpType::all_reduce_add_attn_res_rms_norm, OpType::all_reduce_rms_norm_gemm,
+          OpType::all_reduce_rms_norm_gemm_add})
+      if (!tuned_fits(o, w, rows, hidden, hidden, hidden)) return false;
+    // The one-all-reduce tail: [shared | projected | latent].
+    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, rows, 2 * hidden + latent, latent,
+                    hidden))
+      return false;
+    if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, rows, hidden, hidden, hidden)) return false;
+    // The plain all-reduce's derived launch.
+    for (const Template t :
+         {Template::all_reduce_pull_one_shot, Template::all_reduce_pull_two_shot})
+      if (!fits(t, all_reduce_config(t, rows * hidden * 2, w))) return false;
+  }
+  return true;
+}
+static_assert(selections_fit(), "a selection declines, or exceeds a kernel capability");
 
 }  // namespace hip_comms
