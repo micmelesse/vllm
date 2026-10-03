@@ -35,6 +35,8 @@ template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
           typename ACC_DTYPE = DTYPE>
 struct Tile {
   static constexpr int kPack     = traits<DTYPE>::N;                  // elements in a group
+  static constexpr int kTileM   = TILE_M;  // the chunk, rows x columns in elements
+  static constexpr int kTileN   = TILE_N;
   static constexpr int kThreads = THREADS_M * THREADS_N;  // the block
   static constexpr int kThreadsM = THREADS_M;
   static_assert(TILE_M % THREADS_M == 0, "a tile's rows are whole for every row of threads");
@@ -63,6 +65,8 @@ struct Tile {
   }
   // This thread's row m, a row past M reading row M - 1 (and storing nothing).
   DINLINE int tile_row(int m) const {
+    // One row of threads: the row is the block's, so its address stays scalar.
+    if constexpr (THREADS_M == 1) return m;
     return static_cast<int>(threadIdx.x) / THREADS_N + m * THREADS_M;
   }
   DINLINE bool live(int m) const { return offs_m + tile_row(m) * row_step < M; }
