@@ -25,7 +25,7 @@
 #include <array>
 #include <cstdint>
 
-#include "../machine/hardware.cuh"
+#include "hardware.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {

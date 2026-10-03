@@ -18,6 +18,9 @@
 // pack offsets are common's. The one-pack forms below remain for the flat all-reduce loops until
 // they are tiles too (PLAN), and nothing new uses them.
 //
+// hardware.cuh      the device: Hardware (documented facts), the machine model over it (residency,
+//                   registers, LDS), kDevice / kTarget, kWaveSize
+// build.cuh         the build: kBuild, what is compiled for the device, fixed at compile time
 // tile.cuh
 //   Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n,
 //                         row_step = 1}   a chunk of an M x N tensor, the block's: TILE_M rows from

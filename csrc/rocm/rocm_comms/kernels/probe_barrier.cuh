@@ -6,7 +6,8 @@
 
 #pragma once
 
-#include "../machine/build.cuh"
+#include "../common/common.cuh"
+
 
 namespace hip_comms {
 

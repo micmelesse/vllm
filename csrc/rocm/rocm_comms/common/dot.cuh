@@ -11,7 +11,7 @@
 #error "include common/common.cuh, common's one interface, not its parts"
 #endif
 
-#include "../machine/build.cuh"
+#include "build.cuh"
 #include "reduce.cuh"
 #include "utils.cuh"
 
