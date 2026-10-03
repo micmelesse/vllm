@@ -57,7 +57,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto inputs = p2p::inputs<T, ngpus>(p);
   const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
   const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
-  const auto scratches    = p2p::scratches<T, ngpus>(p);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
   //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
@@ -72,11 +71,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const int dq = blockDim.x / own_packs, dc = blockDim.x - dq * own_packs;
     for (; q < reduce_rows;) {
       const int64_t i = (int64_t{blockIdx.x} + int64_t{q} * reducers) * packs + col0 + c;
-      // EXPERIMENT: the sum PUSHED to every rank's scratch (its own too), so AttnRes reads only
-      // local memory; the pushes go out while the reads come in, the links' two directions.
-      const V sum = peers_reduce(peers_load<T, ngpus>(read, i));
-#pragma unroll
-      for (int r = 0; r < ngpus; ++r) p2p::write_scratch(scratches[r], i, sum);
+      p2p::write_scratch(own_scratch, i, peers_reduce(peers_load<T, ngpus>(read, i)));
       q += dq;
       c += dc;
       if (c >= own_packs) {
@@ -103,8 +98,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int m = 0; m < TILE_M; ++m) {
       const int64_t base = int64_t{min(offs_m + m, rows - 1)} * packs;
 #pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-        sum[m][k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
+      for (int k = 0; k < kRowPacks; ++k) {
+        const int owner = min(thread_cols.offs_n[k] / slice, ngpus - 1);
+        sum[m][k] =
+            p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + thread_cols.offs_n[k]);
+      }
     }
     block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
                                             block_stride_m, block_stride_r, norm_w, qk_w,
