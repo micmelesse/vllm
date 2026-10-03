@@ -5,7 +5,8 @@
 memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
-keyword arguments an op takes after its own (a template by name, that op's config fields)
+keyword arguments an op takes after its own (the algorithm, the direction, that op's
+config fields)
 are the one way to force one, for the sweep and the tests. Every one is passed through as
 it came: C++ builds the config, checks it, and answers.
 
@@ -31,8 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 def _answer(got: tuple[str | int | None, ...]) -> Ran | Error:
-    """A C++ planner's answer: what would run (the template and the op's config fields),
-    or its last value, the Error's number."""
+    """A C++ planner's answer: what would run (the algorithm, the direction and the op's
+    config fields), or its last value, the Error's number."""
     err = got[-1]
     if err is not None:
         assert isinstance(err, int)
@@ -88,13 +89,19 @@ class HipCommunicator(Communicator):
     def _check_all_reduce(
         self,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce(
-                self._handle, inp, template, threads_per_block, blocks_per_grid
+                self._handle,
+                inp,
+                algorithm,
+                direction,
+                threads_per_block,
+                blocks_per_grid,
             )
         )
 
@@ -102,13 +109,20 @@ class HipCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, inp, template, threads_per_block, blocks_per_grid
+            self._handle,
+            out,
+            inp,
+            algorithm,
+            direction,
+            threads_per_block,
+            blocks_per_grid,
         )
 
     def _check_all_reduce_rms_norm(
@@ -116,7 +130,8 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         weight: torch.Tensor,
         add: bool,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -127,7 +142,8 @@ class HipCommunicator(Communicator):
                 inp,
                 weight,
                 add,
-                template,
+                algorithm,
+                direction,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -140,7 +156,8 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -151,7 +168,8 @@ class HipCommunicator(Communicator):
             inp,
             weight,
             eps,
-            template,
+            algorithm,
+            direction,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -165,7 +183,8 @@ class HipCommunicator(Communicator):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -179,7 +198,8 @@ class HipCommunicator(Communicator):
             residual,
             weight,
             eps,
-            template,
+            algorithm,
+            direction,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -188,7 +208,8 @@ class HipCommunicator(Communicator):
     def _check_all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -200,7 +221,8 @@ class HipCommunicator(Communicator):
             torch.ops._rocm_C.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
                 self._handle,
                 inp,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -224,7 +246,8 @@ class HipCommunicator(Communicator):
         write_idx: int,
         eps: float,
         out_eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -246,7 +269,8 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             has_prefix,
-            template,
+            algorithm,
+            direction,
             tile_m,
             tile_n,
             tile_k,
@@ -260,7 +284,8 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
         add: bool,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -274,7 +299,8 @@ class HipCommunicator(Communicator):
                 inp,
                 gemm_weight,
                 add,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -292,7 +318,8 @@ class HipCommunicator(Communicator):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -314,7 +341,8 @@ class HipCommunicator(Communicator):
             gemm_weight,
             # The normed rows, which the GEMM reads over and over.
             torch.empty_like(inp),
-            template,
+            algorithm,
+            direction,
             tile_m,
             tile_n,
             tile_k,
@@ -327,7 +355,8 @@ class HipCommunicator(Communicator):
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -337,7 +366,8 @@ class HipCommunicator(Communicator):
                 self._handle,
                 inp,
                 out,
-                template,
+                algorithm,
+                direction,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -349,7 +379,8 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -359,7 +390,8 @@ class HipCommunicator(Communicator):
             out,
             inp,
             eps,
-            template,
+            algorithm,
+            direction,
             tile_n,
             threads_per_block,
             blocks_per_grid,

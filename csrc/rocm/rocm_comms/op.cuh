@@ -149,6 +149,7 @@ struct TemplateInfo {
   Template fn;
   const char* name;
   bool two_shot;
+  bool push;  // peers push into this rank (else it pulls from them)
   std::span<const KernelConfig> configs;
 };
 
@@ -156,35 +157,35 @@ struct TemplateInfo {
 #define HIP_COMMS_NAMED(t) Template::t, #t
 
 constexpr TemplateInfo kTemplates[] = {
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), false, {}},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), true, {}},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot), false, false, {}},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot), true, false, {}},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), false, false,
      kRmsNormOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), true, false,
      kRmsNormPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_rms_norm), false, false,
      kAddRmsNormOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_rms_norm), true, false,
      kAddRmsNormPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm), false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_add_attn_res_rms_norm), false, false,
      kAttnResOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm), true, kAttnResPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add),
-     false, kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add),
-     true, kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm), true, false,
+     kAttnResPullConfigs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add), false, false, kGemmTailConfigs},
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add), true, false, kGemmTailConfigs},
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), true, true,
      kRmsNormPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), true,
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), true, true,
      kAddRmsNormPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm), true, kAttnResPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), false,
+    {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm), true, true,
+     kAttnResPushConfigs},
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), false, false,
      kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), true, false,
      kGemmTailConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), false,
+    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), false, false,
      kRmsScaleAddOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), true,
+    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), true, false,
      kRmsScaleAddTwoShotConfigs},
 };
 #undef HIP_COMMS_NAMED
@@ -199,12 +200,6 @@ static_assert(templates_in_order(), "kTemplates must list every Template in its 
 
 constexpr const TemplateInfo& info(Template k) { return kTemplates[static_cast<int>(k)]; }
 constexpr const char* to_string(Template k) { return info(k).name; }
-// The template a name names, or none: how a caller forces one (the bench's sweeps, the tests).
-inline std::optional<Template> template_named(const std::string& name) {
-  for (const TemplateInfo& t : kTemplates)
-    if (name == t.name) return t.fn;
-  return std::nullopt;
-}
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 
 constexpr std::span<const KernelConfig> configs_of(Template k) { return info(k).configs; }
@@ -423,6 +418,14 @@ constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
 
 constexpr const Op& op(OpType t) { return kOps[static_cast<int>(t)]; }
 constexpr const char* to_string(OpType t) { return op(t).name; }
+
+// THE OP'S TEMPLATE at a shot and direction, how a caller forces one; none where the op has no
+// such template.
+constexpr std::optional<Template> template_for(OpType o, bool two_shot, bool push) {
+  for (const Template t : op(o).templates)
+    if (info(t).two_shot == two_shot && info(t).push == push) return t;
+  return std::nullopt;
+}
 
 // THE OP A TEMPLATE RUNS: the one whose templates name it.
 constexpr OpType op_of(Template k) {

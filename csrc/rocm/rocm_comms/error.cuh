@@ -75,7 +75,7 @@ constexpr const char* to_string(Error e) {
     case Error::weight_not_built:
       return "weight_not_built: a norm's weight is in the call's dtype or fp32";
     case Error::no_such_template:
-      return "no_such_template: the forced template's name names none";
+      return "no_such_template: the op has no template of the forced algorithm and direction";
     case Error::no_such_group: return "no_such_group: no process group is registered by that name";
     case Error::ranks_disagree:
       return "ranks_disagree: the ranks captured different numbers of buffers";

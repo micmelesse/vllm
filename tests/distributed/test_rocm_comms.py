@@ -712,10 +712,16 @@ def _chunks(
 Forced = dict[str, str | int]
 
 
-def _forced(template: str) -> Forced:
-    """`template` forced at a launch every template admits (16 blocks of 512 threads),
-    its own tile, for a case that forces one only to check it."""
-    return {"template": template, "threads_per_block": 512, "blocks_per_grid": 16}
+def _forced(kernel: str) -> Forced:
+    """The kernel a case names (`all_reduce_push_two_shot...`) forced, by its algorithm
+    and direction, at a launch every template admits (16 blocks of 512 threads), its
+    own tile, for a case that forces one only to check it."""
+    return {
+        "algorithm": "two_shot" if "two_shot" in kernel else "one_shot",
+        "direction": "push" if "_push_" in kernel else "pull",
+        "threads_per_block": 512,
+        "blocks_per_grid": 16,
+    }
 
 
 def declined(

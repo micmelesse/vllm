@@ -41,7 +41,8 @@ class TorchCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> None:

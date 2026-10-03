@@ -160,8 +160,9 @@ def build_info() -> BuildInfo:
     )
 
 
-# WHAT RAN: the template's name and the op's config fields as its kernel had them, in the
-# op's argument order; all None from a backend with no kernels to choose (torch, iris).
+# WHAT RAN: the algorithm and direction, then the op's config fields as its kernel had
+# them, in the op's argument order; all None from a backend with no kernels to choose
+# (torch, iris).
 Ran = tuple[str | int | None, ...]
 
 
@@ -231,8 +232,9 @@ class Communicator(ABC):
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
     # Each op and its `should_` take the same arguments: the op's own tensors and values,
-    # then, keyword-only, what the sweep and the tests force (a template by name and that
-    # op's own config fields, each None for the backend's choice); the model forces none.
+    # then, keyword-only, what the sweep and the tests force (the algorithm, `one_shot` or
+    # `two_shot`, the direction, `pull` or `push`, and that op's own config fields, each None
+    # for the backend's choice); the model forces none.
     # `should_` answers whether the op runs; the op runs and returns what ran, or raises
     # Refused for a call its `should_` would have refused.
 
@@ -241,7 +243,8 @@ class Communicator(ABC):
         self,
         inp: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
     ) -> bool:
@@ -249,7 +252,7 @@ class Communicator(ABC):
         ran = self._checked(
             "all_reduce",
             lambda: self._check_all_reduce(
-                inp, template, threads_per_block, blocks_per_grid
+                inp, algorithm, direction, threads_per_block, blocks_per_grid
             ),
         )
         return not isinstance(ran, Error)
@@ -259,7 +262,8 @@ class Communicator(ABC):
         self,
         inp: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
     ) -> tuple[torch.Tensor, Ran]:
@@ -270,12 +274,14 @@ class Communicator(ABC):
             "all_reduce",
             inp,
             lambda: self._check_all_reduce(
-                inp, template, threads_per_block, blocks_per_grid
+                inp, algorithm, direction, threads_per_block, blocks_per_grid
             ),
         )
         out = torch.empty_like(inp)
         if not self._warming_up("all_reduce"):
-            self._all_reduce(out, inp, template, threads_per_block, blocks_per_grid)
+            self._all_reduce(
+                out, inp, algorithm, direction, threads_per_block, blocks_per_grid
+            )
         return out, ran
 
     @final
@@ -284,7 +290,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -293,7 +300,14 @@ class Communicator(ABC):
         ran = self._checked(
             "all_reduce_rms_norm",
             lambda: self._check_all_reduce_rms_norm(
-                inp, weight, False, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                weight,
+                False,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         return not isinstance(ran, Error)
@@ -305,7 +319,8 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -316,7 +331,14 @@ class Communicator(ABC):
             "all_reduce_rms_norm",
             inp,
             lambda: self._check_all_reduce_rms_norm(
-                inp, weight, False, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                weight,
+                False,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         out = torch.empty_like(inp)
@@ -326,7 +348,8 @@ class Communicator(ABC):
                 inp,
                 weight,
                 eps,
-                template,
+                algorithm,
+                direction,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -339,7 +362,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -348,7 +372,14 @@ class Communicator(ABC):
         ran = self._checked(
             "all_reduce_add_rms_norm",
             lambda: self._check_all_reduce_rms_norm(
-                inp, weight, True, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                weight,
+                True,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         return not isinstance(ran, Error)
@@ -361,7 +392,8 @@ class Communicator(ABC):
         weight: torch.Tensor,
         eps: float,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -372,7 +404,14 @@ class Communicator(ABC):
             "all_reduce_add_rms_norm",
             inp,
             lambda: self._check_all_reduce_rms_norm(
-                inp, weight, True, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                weight,
+                True,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
@@ -384,7 +423,8 @@ class Communicator(ABC):
                 residual,
                 weight,
                 eps,
-                template,
+                algorithm,
+                direction,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -396,7 +436,8 @@ class Communicator(ABC):
         self,
         inp: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -409,7 +450,8 @@ class Communicator(ABC):
             "all_reduce_add_attn_res_rms_norm",
             lambda: self._check_all_reduce_add_attn_res_rms_norm(
                 inp,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -434,7 +476,8 @@ class Communicator(ABC):
         eps: float,
         out_eps: float,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -451,7 +494,8 @@ class Communicator(ABC):
             inp,
             lambda: self._check_all_reduce_add_attn_res_rms_norm(
                 inp,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -478,7 +522,8 @@ class Communicator(ABC):
             write_idx,
             eps,
             out_eps,
-            template,
+            algorithm,
+            direction,
             tile_m,
             tile_n,
             tile_k,
@@ -494,7 +539,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -510,7 +556,8 @@ class Communicator(ABC):
                 inp,
                 gemm_weight,
                 False,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -530,7 +577,8 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -548,7 +596,8 @@ class Communicator(ABC):
                 inp,
                 gemm_weight,
                 False,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -565,7 +614,8 @@ class Communicator(ABC):
                 eps,
                 gemm_weight,
                 out,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -581,7 +631,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -597,7 +648,8 @@ class Communicator(ABC):
                 inp,
                 gemm_weight,
                 True,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -617,7 +669,8 @@ class Communicator(ABC):
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
         tile_k: int | None = None,
@@ -635,7 +688,8 @@ class Communicator(ABC):
                 inp,
                 gemm_weight,
                 True,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -652,7 +706,8 @@ class Communicator(ABC):
                 eps,
                 gemm_weight,
                 out,
-                template,
+                algorithm,
+                direction,
                 tile_m,
                 tile_n,
                 tile_k,
@@ -668,7 +723,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         out: torch.Tensor,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -678,7 +734,13 @@ class Communicator(ABC):
         ran = self._checked(
             "all_reduce_rms_scale_add",
             lambda: self._check_all_reduce_rms_scale_add(
-                inp, out, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                out,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         return not isinstance(ran, Error)
@@ -690,7 +752,8 @@ class Communicator(ABC):
         out: torch.Tensor,
         eps: float,
         *,
-        template: str | None = None,
+        algorithm: str | None = None,
+        direction: str | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -701,12 +764,25 @@ class Communicator(ABC):
             "all_reduce_rms_scale_add",
             inp,
             lambda: self._check_all_reduce_rms_scale_add(
-                inp, out, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                out,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             ),
         )
         if not self._warming_up("all_reduce_rms_scale_add"):
             self._all_reduce_rms_scale_add(
-                inp, out, eps, template, tile_n, threads_per_block, blocks_per_grid
+                inp,
+                out,
+                eps,
+                algorithm,
+                direction,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             )
         return ran
 
@@ -821,7 +897,8 @@ class Communicator(ABC):
     def _check_all_reduce(
         self,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
@@ -829,7 +906,8 @@ class Communicator(ABC):
         kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
         having no template to force. Ours overrides it with its C++'s answer."""
         if (
-            template is not None
+            algorithm is not None
+            or direction is not None
             or threads_per_block is not None
             or blocks_per_grid is not None
         ):
@@ -841,14 +919,15 @@ class Communicator(ABC):
             return Error.row_not_packs
         if inp.dtype not in built.dtypes:
             return Error.dtype_not_built
-        return (None, None, None)
+        return (None, None, None, None)
 
     @abstractmethod
     def _all_reduce(
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> None:
@@ -860,7 +939,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         add: bool,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -875,7 +955,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -892,7 +973,8 @@ class Communicator(ABC):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -904,7 +986,8 @@ class Communicator(ABC):
     def _check_all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -930,7 +1013,8 @@ class Communicator(ABC):
         write_idx: int,
         eps: float,
         out_eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -947,7 +1031,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
         add: bool,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -967,7 +1052,8 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
         tile_k: int | None,
@@ -981,7 +1067,8 @@ class Communicator(ABC):
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -995,7 +1082,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        template: str | None,
+        algorithm: str | None,
+        direction: str | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
