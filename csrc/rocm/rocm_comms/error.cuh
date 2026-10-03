@@ -37,8 +37,15 @@ enum class Error : int {
   groups_disagree = 23,
   threads_not_built = 24,
   tile_not_built = 25,
+  direction_without_algorithm = 26,
+  config_without_algorithm = 27,
+  launch_incomplete = 28,
+  launch_out_of_range = 29,
+  field_without_launch = 30,
+  field_not_positive = 31,
+  field_not_this_templates = 32,
 };
-constexpr int kNumErrors = 26;
+constexpr int kNumErrors = 33;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -85,6 +92,23 @@ constexpr const char* to_string(Error e) {
       return "threads_not_built: no build of the template runs at that block size";
     case Error::tile_not_built:
       return "tile_not_built: no build of the template has that TILE_M or TILE_N";
+    case Error::direction_without_algorithm:
+      return "direction_without_algorithm: a forced direction needs its algorithm";
+    case Error::config_without_algorithm:
+      return "config_without_algorithm: a forced config needs its algorithm where the op has "
+             "more than one template";
+    case Error::launch_incomplete:
+      return "launch_incomplete: a forced launch gives threads_per_block and blocks_per_grid "
+             "together";
+    case Error::launch_out_of_range:
+      return "launch_out_of_range: threads_per_block is whole waves up to the build's maximum, "
+             "blocks_per_grid at least 1 and at most the resident maximum";
+    case Error::field_without_launch:
+      return "field_without_launch: a forced config field needs its launch";
+    case Error::field_not_positive:
+      return "field_not_positive: a forced config field is positive";
+    case Error::field_not_this_templates:
+      return "field_not_this_templates: the forced template has no such config field";
   }
   return "unknown";
 }

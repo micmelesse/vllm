@@ -36,6 +36,12 @@ enum class Template : int {
   add_attn_res_rms_norm                          = 17,  // experimental: no all-reduce
 };
 
+// HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's whole input; two-shot
+// reduce-scatters then gathers) and the direction (pull: this rank reads its peers; push: they
+// write into it).
+enum class Algorithm : int { one_shot = 0, two_shot = 1 };
+enum class Direction : int { pull = 0, push = 1 };
+
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has; the tile and
 // the launch are the Kernel's KernelConfig.
 // `staged`: the build that copies an eager input into its staging a pass at a time (any size),

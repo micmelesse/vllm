@@ -4,8 +4,10 @@
 
 import pytest
 import torch
-from hypothesis import given, settings
-from hypothesis import strategies as st
+
+pytest.importorskip("hypothesis")
+from hypothesis import given, settings  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
 
 from vllm.distributed.device_communicators.rocm_comms.base import build_info
 

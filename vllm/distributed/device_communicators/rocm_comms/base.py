@@ -87,6 +87,13 @@ class Error(IntEnum):
     groups_disagree = 23
     threads_not_built = 24
     tile_not_built = 25
+    direction_without_algorithm = 26
+    config_without_algorithm = 27
+    launch_incomplete = 28
+    launch_out_of_range = 29
+    field_without_launch = 30
+    field_not_positive = 31
+    field_not_this_templates = 32
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -228,11 +235,12 @@ class Communicator(ABC):
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
-    # Each op and its `should_` take the same arguments: the op's own tensors and values,
-    # then, keyword-only, what the sweep and the tests force (the algorithm, `one_shot` or
-    # `two_shot`, the direction, `pull` or `push`, and that op's own config fields, each None
-    # for the backend's choice); the model forces none. `should_` is the op's check; the op
-    # runs its check, raises Refused on an Error, and returns what ran.
+    # Each op and its `should_` take the same arguments: the op's own tensors and
+    # values, then, keyword-only, what the sweep and the tests force (the algorithm,
+    # `one_shot` or `two_shot`, the direction, `pull` or `push`, and that op's own
+    # config fields, each None for the backend's choice); the model forces none.
+    # `should_` is the op's check; the op runs its check, raises Refused on an Error,
+    # and returns what ran.
 
     @final
     def should_allreduce(
@@ -819,10 +827,11 @@ class Communicator(ABC):
             self.state == "capturing" and not torch.cuda.is_current_stream_capturing()
         )
 
-    # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or the
-    # Error; disabled when it is) and its launch, both taking the op's own arguments. Every
-    # op's outputs are the base's, so a capture's warmup returns them without calling here.
-    # The fused ops are not abstract: a backend without one keeps its check, no_such_op. ----
+    # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or
+    # the Error; disabled when it is) and its launch, both taking the op's own
+    # arguments. Every op's outputs are the base's, so a capture's warmup returns them
+    # without calling here. The fused ops are not abstract: a backend without one keeps
+    # its check, no_such_op. ----
 
     def _check_all_reduce(
         self,
