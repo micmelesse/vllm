@@ -6,7 +6,7 @@
 // (`OpType`, and the forcing: `Algorithm`, `Direction`), each op's kernel signatures, and per op
 // its LAUNCH, the normal form select returns and launch runs: which kernel (the compiled instance,
 // its algorithm, direction and world), what is compiled in, its grid, its stream and its
-// arguments, each a plain field, 0 where the template has none. `DType` is build.cuh's.
+// arguments, each a plain field, 0 where the template has none. `DType` is machine/build.cuh's.
 
 #pragma once
 
@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <variant>
 
-#include "build.cuh"
+#include "machine/build.cuh"
 #include "p2p/p2p.cuh"
 
 namespace hip_comms {

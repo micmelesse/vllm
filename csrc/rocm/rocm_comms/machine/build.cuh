@@ -2,15 +2,15 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE BUILD: every number fixed at compile time, derived from the device's `Hardware`
-// (hardware.cuh) and nothing else; what depends on the input is select's
-// (select.cuh), at run time. A number neither gives is a policy: one named line in `derive`.
+// (hardware.cuh) and nothing else; what depends on the input is select's (select.cuh), at run
+// time. A number neither gives is a policy: one named line in `derive`.
 
 #pragma once
 
 #include <array>
 #include <cstdint>
 
-#include "machine/hardware.cuh"
+#include "hardware.cuh"
 
 namespace hip_comms {
 
@@ -27,41 +27,6 @@ constexpr const char* to_string(DType d) {
       return "f32";
   }
   return "unknown";
-}
-
-// Vector registers a thread may use when a block of `threads` must fit on one CU (a kernel's
-// __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block puts there, and
-// at most the architectural and accumulation registers together.
-constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
-  const int waves         = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane  = hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int64_t v         = per_lane / waves_on_simd;
-  const int64_t cap       = hw.arch_vgprs + hw.acc_vgprs;
-  return static_cast<int>(v < cap ? v : cap);
-}
-
-// WHAT ONE COMPILED KERNEL USES, as the code object records it: a thread's vector registers and
-// a block's LDS. Only the compiler knows them, so they are read at run time (Handle::resources_of).
-struct Resources {
-  int vgprs;
-  int64_t lds_bytes;
-};
-
-// THE MOST BLOCKS OF A KERNEL RESIDENT AT ONCE ON THE DEVICE: on each CU, as many as its wave
-// slots, its SIMDs' register files and its LDS hold. A peer barrier spins until the same block on
-// every peer arrives, so a grid past it can hang.
-constexpr int resident_blocks(const Hardware& hw, Resources r, int threads) {
-  const int waves         = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane  = hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int used          = r.vgprs < 1 ? 1 : r.vgprs;
-  const int vgprs         = (used + hw.vgpr_granule - 1) / hw.vgpr_granule * hw.vgpr_granule;
-  int64_t per_cu = hw.max_waves_per_cu / waves;
-  const int64_t by_registers = per_lane / vgprs / waves_on_simd;
-  if (by_registers < per_cu) per_cu = by_registers;
-  if (r.lds_bytes > 0 && hw.lds_bytes / r.lds_bytes < per_cu) per_cu = hw.lds_bytes / r.lds_bytes;
-  return static_cast<int>(per_cu * hw.compute_units);
 }
 
 // EVERYTHING THE BUILD FIXES, in one value: what is compiled, the memory and its unit, and the
@@ -139,12 +104,5 @@ constexpr bool world_built(int world) { return built_in(kBuild.supports.worlds, 
 static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
                   kBuild.kernels.max_threads % kWaveSize == 0,
               "the block limit must be whole waves the device can launch");
-// Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
-// device's LDS holds, and no more than the block limit.
-constexpr int lds_max_waves(const Hardware& hw, int64_t fixed, int64_t per_wave) {
-  const int64_t fit = (hw.lds_bytes - fixed) / per_wave;
-  const int64_t cap = hw.max_workgroup / hw.wave_size;
-  return static_cast<int>(fit < cap ? fit : cap);
-}
 
 }  // namespace hip_comms

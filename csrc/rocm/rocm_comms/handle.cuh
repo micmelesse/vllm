@@ -2,10 +2,10 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE RUNTIME STATE, one `Handle` per communicator: everything the running program learns, as
-// build.cuh's `BuildInfo` is everything fixed at compile time. It maps every peer's signal block,
-// scratch and registered buffers once over HIP IPC handles, and hands a launch the `DevComm` its
-// kernel reads. The collective that exchanges the handles is the caller's (`Gather`), so this
-// names no process group.
+// machine/build.cuh's `BuildInfo` is everything fixed at compile time. It maps every peer's signal
+// block, scratch and registered buffers once over HIP IPC handles, and hands a launch the
+// `DevComm` its kernel reads. The collective that exchanges the handles is the caller's
+// (`Gather`), so this names no process group.
 
 #pragma once
 
@@ -22,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-#include "build.cuh"
+#include "machine/build.cuh"
 #include "types.cuh"
 #include "kernels/all_reduce_pull_one_shot.cuh"
 #include "p2p/p2p.cuh"
