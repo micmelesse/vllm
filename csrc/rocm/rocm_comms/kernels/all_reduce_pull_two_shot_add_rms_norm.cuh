@@ -28,8 +28,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
   using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
-  using Weight           = Tile<W, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, W>;
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);

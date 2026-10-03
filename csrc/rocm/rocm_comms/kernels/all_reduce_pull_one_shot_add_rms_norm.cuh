@@ -24,8 +24,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     float eps, int rows, int packs) {
   constexpr int NL       = traits<T>::N;
   using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
-  using Weight           = Tile<W, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, W>;
   const int cols         = packs * NL;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 

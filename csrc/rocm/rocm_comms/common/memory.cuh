@@ -107,29 +107,28 @@ DINLINE P pack_load(const P* p) {
 }
 }  // namespace impl
 
-template <typename E, int TILE_M, int TILE_N, int THREADS, int NL>
-DINLINE void thread_load(Tile<E, TILE_M, TILE_N, THREADS, NL>& t, const E* data,
+template <typename Tl>
+DINLINE void thread_load(Tl& t, const typename Tl::Acc* data,
                          int64_t row_stride) {
-  using P = vec<E, NL>;
+  using P = typename Tl::Pack;
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
-  for (int m = 0; m < TILE_M; ++m) {
-    const P* row = at + int64_t{t.row(m)} * (row_stride / NL);
+  for (int m = 0; m < Tl::kRows; ++m) {
+    const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) t.v[m][k] = impl::pack_load(row + t.col(k));
   }
   impl::issued();
 }
 
-template <typename E, int TILE_M, int TILE_N, int THREADS, int NL>
-DINLINE void thread_store(E* data, int64_t row_stride,
-                          const Tile<E, TILE_M, TILE_N, THREADS, NL>& t) {
-  using P = vec<E, NL>;
+template <typename Tl>
+DINLINE void thread_store(typename Tl::Acc* data, int64_t row_stride, const Tl& t) {
+  using P = typename Tl::Pack;
   P* at   = reinterpret_cast<P*>(data);
 #pragma unroll
-  for (int m = 0; m < TILE_M; ++m) {
+  for (int m = 0; m < Tl::kRows; ++m) {
     if (!t.live(m)) continue;
-    P* row = at + int64_t{t.row(m)} * (row_stride / NL);
+    P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
       if (t.mask(k) == 0.0f) continue;
@@ -146,15 +145,15 @@ DINLINE void thread_store(E* data, int64_t row_stride,
 // computed once a position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until a tile is used (peers_reduce), so loads issued here
 // can run under other work.
-template <int ngpus, typename E, int TILE_M, int TILE_N, int THREADS, int NL, typename Data>
-DINLINE void peers_load(Tile<E, TILE_M, TILE_N, THREADS, NL> (&t)[ngpus], Data data,
+template <typename Tl, int ngpus, typename Data>
+DINLINE void peers_load(Tl (&t)[ngpus], Data data,
                         int64_t row_stride) {
-  using P = vec<E, NL>;
+  using P = typename Tl::Pack;
 #pragma unroll
-  for (int m = 0; m < TILE_M; ++m)
+  for (int m = 0; m < Tl::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < t[0].K; ++k) {
-      const int64_t i = int64_t{t[0].row(m)} * (row_stride / NL) + t[0].col(k);
+      const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
         t[r].v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(r)) + i);
@@ -165,17 +164,17 @@ DINLINE void peers_load(Tile<E, TILE_M, TILE_N, THREADS, NL> (&t)[ngpus], Data d
 // A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
 // end): each pack from its owner's tensor, `data(r)`. A SLICE IS WHOLE WAVES, so a wave's packs
 // have one owner.
-template <int ngpus, typename E, int TILE_M, int TILE_N, int THREADS, int NL, typename Data>
-DINLINE void sliced_load(Tile<E, TILE_M, TILE_N, THREADS, NL>& t, Data data, int64_t row_stride,
+template <int ngpus, typename Tl, typename Data>
+DINLINE void sliced_load(Tl& t, Data data, int64_t row_stride,
                          int slice) {
-  using P = vec<E, NL>;
+  using P = typename Tl::Pack;
 #pragma unroll
-  for (int m = 0; m < TILE_M; ++m)
+  for (int m = 0; m < Tl::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
-      const int owner = min(t.col(k) / (slice / NL), ngpus - 1);
+      const int owner = min(t.col(k) / (slice / t.kPack), ngpus - 1);
       t.v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
-                                  int64_t{t.row(m)} * (row_stride / NL) + t.col(k));
+                                  int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k));
     }
   impl::issued();
 }

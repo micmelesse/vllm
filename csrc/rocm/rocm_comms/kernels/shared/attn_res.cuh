@@ -22,17 +22,18 @@ namespace hip_comms {
 // `blocks` [rows, sources, hidden] at row and source strides in elements, and `write_idx` < 0
 // writes no block. A row past M (the last tile's) reads row M - 1 and writes nothing, so every
 // thread still reaches every reduction.
-template <bool kPrefix, int TILE_K, typename T, int TILE_M, int TILE_N, int THREADS, int NL>
-DINLINE void block_attn_res_tile(const Tile<T, TILE_M, TILE_N, THREADS, NL>& sum, T* prefix,
+template <bool kPrefix, int TILE_K, typename T, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
+DINLINE void block_attn_res_tile(const Tile<T, TILE_M, TILE_N, THREADS_PER_BLOCK>& sum, T* prefix,
                                  T* blocks, int64_t block_stride_m, int64_t block_stride_r,
                                  int write_idx, const T* __restrict__ norm_w,
                                  const T* __restrict__ qk_w, const T* __restrict__ out_norm_w,
                                  T* out, int num_blocks, float eps, float out_eps,
                                  float inv_hidden) {
-  using Rows    = Tile<T, TILE_M, TILE_N, THREADS, NL>;
-  using RowsF   = Tile<float, TILE_M, TILE_N, THREADS, NL>;
-  using Weight  = Tile<T, 1, TILE_N, THREADS, NL>;
-  using WeightF = Tile<float, 1, TILE_N, THREADS, NL>;
+  using Rows    = Tile<T, TILE_M, TILE_N, THREADS_PER_BLOCK>;
+  using RowsF   = Tile<T, TILE_M, TILE_N, THREADS_PER_BLOCK, float>;
+  using Weight  = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using WeightF = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  constexpr int NL = Rows::kPack;
   const int64_t stride = sum.N;
   const Weight at_cols{1, sum.N, 0, sum.offs_n};
 

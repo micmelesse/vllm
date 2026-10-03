@@ -25,7 +25,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     T* __restrict__ out, int64_t out_stride, T* __restrict__ workspace, int rows, int packs) {
   constexpr int NL       = traits<T>::N;
   using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   using V                = typename traits<T>::V;
   V* normed              = reinterpret_cast<V*>(workspace);

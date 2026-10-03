@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                            int hidden_packs, int latent_packs) {
   constexpr int NL       = traits<T>::N;
   using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
   const int packs        = 2 * hidden_packs + latent_packs;
   const int hidden       = hidden_packs * NL;  // in elements
   const int64_t stride   = int64_t{packs} * NL;

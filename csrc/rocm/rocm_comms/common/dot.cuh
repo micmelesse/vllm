@@ -20,10 +20,11 @@ namespace hip_comms {
 // This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
 // partials a block_reduce turns into the rows' dots (a sum of squares is thread_dot(x, x)). A
 // one-row b (a weight) is every row's.
-template <int TILE_M, int B_M, int TILE_N, int THREADS, int NL>
-DINLINE void thread_dot(const Tile<float, TILE_M, TILE_N, THREADS, NL>& a,
-                        const Tile<float, B_M, TILE_N, THREADS, NL>& b, float (&d)[TILE_M]) {
+template <typename DTYPE, int TILE_M, int B_M, int TILE_N, int THREADS_PER_BLOCK>
+DINLINE void thread_dot(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>& a,
+                        const Tile<DTYPE, B_M, TILE_N, THREADS_PER_BLOCK, float>& b, float (&d)[TILE_M]) {
   static_assert(B_M == TILE_M || B_M == 1, "b is a's shape or one row");
+  constexpr int NL = Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>::kPack;
 #pragma unroll
   for (int m = 0; m < TILE_M; ++m) {
     const int mb = B_M == 1 ? 0 : m;

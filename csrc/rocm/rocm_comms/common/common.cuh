@@ -18,9 +18,10 @@
 // they are tiles too (PLAN), and nothing new uses them.
 //
 // tile.cuh
-//   Tile<E, TILE_M, TILE_N, THREADS>{M, N, offs_m, offs_n}   TILE_M rows x TILE_N columns
-//                         (elements) of an M x N tensor from (offs_m, offs_n), and this thread's
-//                         elements of it; to<U>() converts them, like<U>() is the same place empty
+//   Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n}   TILE_M
+//                         rows x TILE_N columns (elements) of an M x N tensor from (offs_m,
+//                         offs_n), and this thread's elements of it held as ACC_DTYPE;
+//                         to<U>() holds them as U, like<U>() is the same place empty
 // memory.cuh
 //   thread_load(tile, data, row_stride), thread_store(data, row_stride, tile)   one round trip a
 //                         tile; a row past M reads the last, stores only rows below M
