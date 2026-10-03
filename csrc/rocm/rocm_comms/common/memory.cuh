@@ -12,6 +12,7 @@
 #error "include common/common.cuh, common's one interface, not its parts"
 #endif
 
+#include "tile.cuh"
 #include "utils.cuh"
 
 namespace hip_comms {
@@ -78,24 +79,6 @@ namespace impl {
 DINLINE void issued() { __builtin_amdgcn_sched_barrier(0); }
 }  // namespace impl
 
-// A ROW'S LOAD AND STORE AT A THREAD'S COLUMNS: every load issued together, one round trip a row
-// (a pack past the row reads the last one), and a store only of the packs inside the row (stores
-// do not hold up loads, so the guard costs nothing). Load a row whole before storing anything:
-// packs loaded between stores wait one round trip each, since a store may alias the next load.
-// A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's pack is
-// 32 bytes and loads as the compiler chooses.
-template <int K, typename V>
-DINLINE void thread_load(const V* row, const ThreadOffs<K>& thread_cols, V (&out)[K]) {
-#pragma unroll
-  for (int k = 0; k < K; ++k) {
-    if constexpr (sizeof(V) == 16)
-      out[k] = thread_load(row + thread_cols.offs_n[k]);
-    else
-      out[k] = row[thread_cols.offs_n[k]];
-  }
-  impl::issued();
-}
-
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
 // waits until a pack is used (peers_reduce), so loads issued here can run under other work.
 template <typename T, int ngpus, typename Read>
@@ -107,35 +90,94 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
   return out;
 }
 
-// THIS THREAD'S COLUMNS OF ROW `row`, from every source: every pack's loads go out together (a pack
-// past the row reads the last one, weighted zero where it is used), where an `if (i < packs)` made
-// each pack's loads wait on the one before.
-template <typename T, int ngpus, int K, typename Read>
-DINLINE PeerPacks<T, ngpus, K> peers_load(Read read, int row, int packs,
-                                          const ThreadOffs<K>& thread_cols) {
-  // A pack position at a time, every source's for it: the address is computed once a position (the
-  // other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z).
-  PeerPacks<T, ngpus, K> out;
+// A TILE'S LOAD AND STORE, `data` the tensor's first element and `row_stride` elements between its
+// rows: every load issued together, ONE ROUND TRIP A TILE (a row past M reads row M - 1, a pack
+// past N the last one), and a store of only the rows below M and the packs below N (stores do not
+// hold up loads, so the guard costs nothing). LOAD A TILE WHOLE BEFORE STORING ANYTHING: a pack
+// loaded between stores waits a round trip, since a store may alias it. A 16-byte pack goes through
+// the one-pack global instructions above; an fp32 tile's pack is 32 bytes and loads as the compiler
+// chooses.
+namespace impl {
+template <typename P>
+DINLINE P pack_load(const P* p) {
+  if constexpr (sizeof(P) == 16)
+    return thread_load(p);
+  else
+    return *p;
+}
+}  // namespace impl
+
+template <typename E, int TILE_M, int TILE_N, int THREADS, int NL>
+DINLINE void thread_load(Tile<E, TILE_M, TILE_N, THREADS, NL>& t, const E* data,
+                         int64_t row_stride) {
+  using P = vec<E, NL>;
+  const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    const int64_t i = int64_t{row} * packs + thread_cols.offs_n[k];
+  for (int m = 0; m < TILE_M; ++m) {
+    const P* row = at + int64_t{t.row(m)} * (row_stride / NL);
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) out.p[r][k] = read(r, i);
+    for (int k = 0; k < t.K; ++k) t.v[m][k] = impl::pack_load(row + t.col(k));
   }
   impl::issued();
-  return out;
 }
 
-template <int K, typename V>
-DINLINE void thread_store(V* row, const ThreadOffs<K>& thread_cols, const V (&v)[K]) {
+template <typename E, int TILE_M, int TILE_N, int THREADS, int NL>
+DINLINE void thread_store(E* data, int64_t row_stride,
+                          const Tile<E, TILE_M, TILE_N, THREADS, NL>& t) {
+  using P = vec<E, NL>;
+  P* at   = reinterpret_cast<P*>(data);
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    if (thread_cols.mask_n[k] == 0.0f) continue;
-    if constexpr (sizeof(V) == 16)
-      thread_store(row + thread_cols.offs_n[k], v[k]);
-    else
-      row[thread_cols.offs_n[k]] = v[k];
+  for (int m = 0; m < TILE_M; ++m) {
+    if (!t.live(m)) continue;
+    P* row = at + int64_t{t.row(m)} * (row_stride / NL);
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      if (t.mask(k) == 0.0f) continue;
+      if constexpr (sizeof(P) == 16)
+        thread_store(row + t.col(k), t.v[m][k]);
+      else
+        row[t.col(k)] = t.v[m][k];
+    }
   }
+}
+
+// EVERY PEER'S TILE, all in flight together: `data(r)` is rank r's tensor, `row_stride` its
+// elements between rows. A pack position at a time, every rank's for it, so the address is
+// computed once a position (the other way round cost 16 scalar instructions at two packs: ISA
+// 2026-10-01T00-31-14Z). Nothing waits until a tile is used (peers_reduce), so loads issued here
+// can run under other work.
+template <int ngpus, typename E, int TILE_M, int TILE_N, int THREADS, int NL, typename Data>
+DINLINE void peers_load(Tile<E, TILE_M, TILE_N, THREADS, NL> (&t)[ngpus], Data data,
+                        int64_t row_stride) {
+  using P = vec<E, NL>;
+#pragma unroll
+  for (int m = 0; m < TILE_M; ++m)
+#pragma unroll
+    for (int k = 0; k < t[0].K; ++k) {
+      const int64_t i = int64_t{t[0].row(m)} * (row_stride / NL) + t[0].col(k);
+#pragma unroll
+      for (int r = 0; r < ngpus; ++r)
+        t[r].v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(r)) + i);
+    }
+  impl::issued();
+}
+
+// A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
+// end): each pack from its owner's tensor, `data(r)`. A SLICE IS WHOLE WAVES, so a wave's packs
+// have one owner.
+template <int ngpus, typename E, int TILE_M, int TILE_N, int THREADS, int NL, typename Data>
+DINLINE void sliced_load(Tile<E, TILE_M, TILE_N, THREADS, NL>& t, Data data, int64_t row_stride,
+                         int slice) {
+  using P = vec<E, NL>;
+#pragma unroll
+  for (int m = 0; m < TILE_M; ++m)
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      const int owner = min(t.col(k) / (slice / NL), ngpus - 1);
+      t.v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
+                                  int64_t{t.row(m)} * (row_stride / NL) + t.col(k));
+    }
+  impl::issued();
 }
 
 }  // namespace hip_comms

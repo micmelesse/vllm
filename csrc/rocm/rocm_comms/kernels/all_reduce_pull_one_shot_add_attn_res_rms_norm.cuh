@@ -29,36 +29,26 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                                    T* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
-  constexpr int NL       = traits<T>::N;
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  V* pre                 = reinterpret_cast<V*>(prefix);
-  V* o                   = reinterpret_cast<V*>(out);
-  const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
-  // The block row `row` writes, or none.
-  auto written = [&](int row) -> V* {
-    return write_idx < 0 ? nullptr
-                         : reinterpret_cast<V*>(blocks + row * block_stride_m +
-                                                write_idx * block_stride_r);
-  };
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  const int cols         = packs * traits<T>::N;  // the row, in elements
+  const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const Tile<1, TILE_N> tile{rows, cols, row, 0};
-    V sum[1][kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum[0]);
-    block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
-                                            block_stride_m, block_stride_r, norm_w, qk_w,
-                                            out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+    Row peers[ngpus];
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) peers[r] = Row{rows, cols, row, 0};
+    peers_load(peers, input, cols);
+    block_attn_res_tile<kPrefix, TILE_K>(peers_reduce(peers), prefix, blocks, block_stride_m,
+                                         block_stride_r, write_idx, norm_w, qk_w, out_norm_w, out,
+                                         num_blocks, eps, out_eps, inv_hidden);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.

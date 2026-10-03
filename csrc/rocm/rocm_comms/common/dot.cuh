@@ -17,20 +17,25 @@
 
 namespace hip_comms {
 
-// This thread's share of dot(a, b) over the row, packs past its end counting zero: the partial a
-// block_reduce turns into the row's dot (a sum of squares is thread_dot(x, x)).
-template <int K, int N>
-DINLINE float thread_dot(const float (&a)[K][N], const float (&b)[K][N],
-                         const ThreadOffs<K>& thread_cols) {
-  float d = 0.0f;
+// This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
+// partials a block_reduce turns into the rows' dots (a sum of squares is thread_dot(x, x)). A
+// one-row b (a weight) is every row's.
+template <int TILE_M, int B_M, int TILE_N, int THREADS, int NL>
+DINLINE void thread_dot(const Tile<float, TILE_M, TILE_N, THREADS, NL>& a,
+                        const Tile<float, B_M, TILE_N, THREADS, NL>& b, float (&d)[TILE_M]) {
+  static_assert(B_M == TILE_M || B_M == 1, "b is a's shape or one row");
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float dk = 0.0f;
+  for (int m = 0; m < TILE_M; ++m) {
+    const int mb = B_M == 1 ? 0 : m;
+    d[m] = 0.0f;
 #pragma unroll
-    for (int j = 0; j < N; ++j) dk += a[k][j] * b[k][j];
-    d += thread_cols.mask_n[k] * dk;
+    for (int k = 0; k < a.K; ++k) {
+      float dk = 0.0f;
+#pragma unroll
+      for (int j = 0; j < NL; ++j) dk += a.v[m][k].d[j] * b.v[mb][k].d[j];
+      d[m] += a.mask(k) * dk;
+    }
   }
-  return d;
 }
 
 // THE GEMM TAIL'S LDS, for its tile: a TILE_M x TILE_K chunk of x staged, a norm's block_reduce,

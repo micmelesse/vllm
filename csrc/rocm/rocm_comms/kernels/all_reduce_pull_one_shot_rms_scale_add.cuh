@@ -24,17 +24,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                            int rank, uint64_t timeout_ticks, T* __restrict__ out,
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  V* o                   = reinterpret_cast<V*>(out);
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
   const int packs        = 2 * hidden_packs + latent_packs;
+  const int hidden       = hidden_packs * NL;  // in elements
+  const int64_t stride   = int64_t{packs} * NL;
   // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto latent_cols =
-      thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, latent_packs * NL, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
@@ -42,13 +41,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto shared = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
-  const auto proj   = [&](int r, int64_t i) {
-    return p2p::read_input(inputs[r], i + hidden_packs);
-  };
-  const auto latent = [&](int r, int64_t i) {
-    return p2p::read_input(inputs[r], i + 2 * hidden_packs);
-  };
+  const auto shared = [&](int r) { return inputs[r].data(); };
+  const auto proj   = [&](int r) { return inputs[r].data() + hidden; };
+  const auto latent = [&](int r) { return inputs[r].data() + 2 * hidden; };
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's
   //    latent from every rank, all in flight together; the latent's sum of squares over the block,
@@ -57,35 +52,34 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const int row   = w / splits;
     const int first = (w % splits) * slice;
     const int len   = min(slice, hidden_packs - first);
-    const auto hidden_cols = thread_offs<T, THREADS_PER_BLOCK>(
-        Tile<1, TILE_N>{rows, (first + len) * NL, row, first * NL});
-    const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
-    const auto pj = peers_load<T, ngpus>(proj, row, packs, hidden_cols);
-    const auto lt = peers_load<T, ngpus>(latent, row, packs, latent_cols);
-    V l_sum[kRowPacks];
-    peers_reduce(lt, l_sum);
-    float l[kRowPacks][NL];
+    const Row hid{rows, (first + len) * NL, row, first * NL};
+    const Row lat{rows, latent_packs * NL, row, 0};
+    Row sh[ngpus], pj[ngpus], lt[ngpus];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(l_sum[k], l[k]);
-    float ss[1] = {thread_dot(l, l, latent_cols)};
+    for (int r = 0; r < ngpus; ++r) {
+      sh[r] = hid;
+      pj[r] = hid;
+      lt[r] = lat;
+    }
+    peers_load(sh, shared, stride);
+    peers_load(pj, proj, stride);
+    peers_load(lt, latent, stride);
+    const RowF l = peers_reduce(lt).template to<float>();
+    float ss[1];
+    thread_dot(l, l, ss);
     block_stamp(2);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
-    V s_sum[kRowPacks], p_sum[kRowPacks];
-    peers_reduce(sh, s_sum);
-    peers_reduce(pj, p_sum);
-    const int64_t base = int64_t{row} * hidden_packs;
+    const RowF s = peers_reduce(sh).template to<float>();
+    const RowF q = peers_reduce(pj).template to<float>();
+    Row r = hid;
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      float s[NL], q[NL];
-      thread_unpack<T>(s_sum[k], s);
-      thread_unpack<T>(p_sum[k], q);
-      V r;
+    for (int k = 0; k < Row::K; ++k)
 #pragma unroll
-      for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
-      if (hidden_cols.mask_n[k] != 0.0f) o[base + hidden_cols.offs_n[k]] = r;
-    }
+      for (int j = 0; j < NL; ++j)
+        r.v[0][k].d[j] = static_cast<T>(s.v[0][k].d[j] + q.v[0][k].d[j] * scale);
+    thread_store(out, hidden, r);
   }
 
   block_stamp(4);

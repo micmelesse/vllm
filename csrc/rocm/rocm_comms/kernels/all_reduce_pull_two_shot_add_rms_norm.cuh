@@ -25,10 +25,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
     T* __restrict__ out, T* __restrict__ residual_out, const T* __restrict__ residual,
     const W* __restrict__ weight, float eps, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  const V* res_in        = reinterpret_cast<const V*>(residual);
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using Weight           = Tile<W, 1, TILE_N, THREADS_PER_BLOCK, NL>;
   const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
@@ -37,7 +38,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -49,7 +49,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // scratch (the ISA gate, 2026-09-30).
   const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
   const auto own_scratch  = p2p::scratch<T, ngpus>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
@@ -60,44 +60,42 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    4096 tokens, each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
-  // Row `row`'s packs from every rank.
-  const auto load = [&](int row) { return peers_load<T, ngpus>(read, row, packs, thread_cols); };
+  // Row `row` from every rank.
+  using Peers = Row[ngpus];
+  const auto load = [&](int row, Peers& got) {
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) got[r] = Row{rows, cols, row, 0};
+    peers_load(got, input, cols);
+  };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
-  vec<W, NL> w[kRowPacks];
-  thread_load(wv, thread_cols, w);
+  Weight w{1, cols, 0, 0};
+  thread_load(w, weight, 0);
   // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
   // wait covers only its own, older, loads), so the next round trip runs under the reduction and
-  // norm.
-  using Packs = PeerPacks<T, ngpus, kRowPacks>;
-  const auto one_row = [&](int row, const Packs& cur, Packs& next) {
-    const int64_t base = int64_t{row} * packs;
-    const int64_t at   = int64_t{row - first} * packs;
-    V res[kRowPacks];
-    if constexpr (kAdd) thread_load(res_in + base, thread_cols, res);
+  // norm. Its rows land in this rank's scratch at row - first.
+  const auto one_row = [&](int row, const Peers& cur, Peers& next) {
+    Row res{rows, cols, row, 0};
+    if constexpr (kAdd) thread_load(res, residual, cols);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
     // again; at 256 tokens every block has one row: 2026-10-01T01-07-56Z).
-    if (row + static_cast<int>(gridDim.x) < last) next = load(row + gridDim.x);
-    V sum[kRowPacks];
-    peers_reduce(cur, sum);
-    float s[kRowPacks][NL];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
+    if (row + static_cast<int>(gridDim.x) < last) load(row + gridDim.x, next);
+    RowF s = peers_reduce(cur).template to<float>();
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
+    if constexpr (kAdd) {
+      const RowF r = res.template to<float>();
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      if constexpr (kAdd) {
-        float r[NL];
-        thread_unpack<T>(res[k], r);
+      for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (thread_cols.mask_n[k] != 0.0f)
-          p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], thread_pack<T>(s[k]));
-      }
+        for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
+      Row added = s.template to<T>();
+      added.offs_m = row - first;
+      thread_store(own_scratch.data(), cols, added);
     }
-    float ss[1] = {thread_dot(s, s, thread_cols)};
+    float ss[1];
+    thread_dot(s, s, ss);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
@@ -112,23 +110,21 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       }
       return;
     }
+    Row normed{rows, cols, row - first, 0};
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      V normed;
+    for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
+        const float x       = static_cast<float>(static_cast<W>(s.v[0][k].d[j] * scale));
+        normed.v[0][k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w.v[0][k].d[j])));
       }
-      if (thread_cols.mask_n[k] != 0.0f)
-        p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], normed);
-    }
+    thread_store(own_scratch.data(), cols, normed);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other
   // (a copy cost 32 moves a row at one pack a thread: ISA 2026-10-01T00-58-37Z).
-  Packs a, b;
+  Peers a, b;
   int row = first + blockIdx.x;
-  if (row < last) a = load(row);
+  if (row < last) load(row, a);
   for (; row < last; row += 2 * gridDim.x) {
     one_row(row, a, b);
     if (row + static_cast<int>(gridDim.x) >= last) break;

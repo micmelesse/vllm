@@ -37,24 +37,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                                    T* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs, int reduce_scatter_blocks) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
-  constexpr int NL       = traits<T>::N;
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  V* pre                 = reinterpret_cast<V*>(prefix);
-  V* o                   = reinterpret_cast<V*>(out);
+  using Rows             = Tile<T, TILE_M, TILE_N, THREADS_PER_BLOCK>;
+  const int cols         = packs * traits<T>::N;  // the row, in elements
+  const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + ngpus - 1) / ngpus;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
   const int col0         = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));  // a late rank's may be short or none
-  const int cols = packs * NL;                             // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
-  // The block row `row` writes, or none.
-  auto written = [&](int row) -> V* {
-    return write_idx < 0 ? nullptr
-                         : reinterpret_cast<V*>(blocks + row * block_stride_m +
-                                                write_idx * block_stride_r);
-  };
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -102,22 +91,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   //    overwriting its scratch while it is read (a peer's next kernel starts only once this one has
   //    finished).
   for (int offs_m = blockIdx.x * TILE_M; offs_m < rows; offs_m += gridDim.x * TILE_M) {
-    const Tile<TILE_M, TILE_N> tile{rows, cols, offs_m, 0};
-    V sum[TILE_M][kRowPacks];
-#pragma unroll
-    for (int m = 0; m < TILE_M; ++m) {
-      const int64_t base = int64_t{min(offs_m + m, rows - 1)} * packs;
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        const int owner = min(thread_cols.offs_n[k] / slice, ngpus - 1);
-        sum[m][k] =
-            p2p::read_scratch(p2p::scratch<T, ngpus>(peer_scratch, owner),
-                              base + thread_cols.offs_n[k]);
-      }
-    }
-    block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
-                                            block_stride_m, block_stride_r, norm_w, qk_w,
-                                            out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
+    Rows sum{rows, cols, offs_m, 0};
+    sliced_load<ngpus>(sum, [&](int r) { return p2p::scratch<T, ngpus>(peer_scratch, r).data(); },
+                       cols, slice * traits<T>::N);
+    block_attn_res_tile<kPrefix, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
+                                         write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
+                                         out_eps, inv_hidden);
   }
   block_stamp(4);
 }

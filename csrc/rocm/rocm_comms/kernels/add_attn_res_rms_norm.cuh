@@ -13,8 +13,7 @@ namespace hip_comms {
 
 // A ROW A TILE, the grid striding over rows: each row's delta read from local memory, then the
 // tile every AttnRes kernel computes (shared/attn_res.cuh), so its instructions are the fused
-// kernels' AttnRes. `blocks` is [rows, num_sources, hidden] with row and source strides in
-// elements; `write_idx` < 0 writes no block.
+// kernels' AttnRes.
 template <typename T, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     add_attn_res_rms_norm(T* __restrict__ prefix, const T* __restrict__ delta,
@@ -22,27 +21,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                           const T* __restrict__ norm_w, const T* __restrict__ qk_w,
                           const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks,
                           int write_idx, float eps, float out_eps, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                 = typename traits<T>::V;
-  constexpr int NL        = traits<T>::N;
-  const float inv_hidden  = 1.0f / static_cast<float>(packs * NL);
-  const int cols          = packs * NL;
-  const auto thread_cols  = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
-  const V* d              = reinterpret_cast<const V*>(delta);
-  auto written            = [&](int row) -> V* {
-    return write_idx < 0 ? nullptr
-                                    : reinterpret_cast<V*>(blocks + row * block_stride_m +
-                                                           write_idx * block_stride_r);
-  };
-  for (int offs_m = blockIdx.x; offs_m < rows; offs_m += gridDim.x) {
-    const Tile<1, TILE_N> tile{rows, cols, offs_m, 0};
-    const int64_t base = int64_t{offs_m} * packs;
-    V sum[1][kRowPacks];
-    thread_load(d + base, thread_cols, sum[0]);
-    block_attn_res_tile<T, true, TILE_K>(sum, tile, thread_cols, reinterpret_cast<V*>(prefix),
-                                         written, blocks, block_stride_m, block_stride_r, norm_w,
-                                         qk_w, out_norm_w, reinterpret_cast<V*>(out), num_blocks,
-                                         eps, out_eps, inv_hidden);
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  const int cols         = packs * traits<T>::N;  // the row, in elements
+  const float inv_hidden = 1.0f / static_cast<float>(cols);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    Row sum{rows, cols, row, 0};
+    thread_load(sum, delta, cols);
+    block_attn_res_tile<true, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
+                                      write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
+                                      out_eps, inv_hidden);
   }
 }
 

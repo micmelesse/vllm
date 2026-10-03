@@ -23,14 +23,13 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
     const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w, int n_cols,
     T* __restrict__ out, int64_t out_stride, T* __restrict__ workspace, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const V* weight        = reinterpret_cast<const V*>(norm_w);
+  using V                = typename traits<T>::V;
   V* normed              = reinterpret_cast<V*>(workspace);
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
 
   // 1. Wait until every peer has launched, so its input is ready.
@@ -43,7 +42,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   // scratch (the ISA gate, 2026-09-30).
   const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
   const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
@@ -51,29 +50,27 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
-    const int64_t at = int64_t{row - first} * packs;
-    V sum[kRowPacks];
-    peers_reduce(peers_load<T, ngpus>(read, row, packs, thread_cols), sum);
+    Row peers[ngpus];
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) peers[r] = Row{rows, cols, row, 0};
+    peers_load(peers, input, cols);
+    const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in T):
     //   out = T(T(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(T(sum over ranks))
-    float s[kRowPacks][NL];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
-    V wk[kRowPacks];
-    thread_load(weight, thread_cols, wk);  // under the reduction
-    float ss[1] = {thread_dot(s, s, thread_cols)};
+    Row wk{1, cols, 0, 0};
+    thread_load(wk, norm_w, 0);  // under the reduction
+    float ss[1];
+    thread_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    const RowF w = wk.template to<float>();
+    RowF x{rows, cols, row - first, 0};
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      float w[NL], x[NL];
-      thread_unpack<T>(wk[k], w);
+    for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j)
-        x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];
-      if (thread_cols.mask_n[k] != 0.0f)
-        p2p::write_scratch(own_scratch, at + thread_cols.offs_n[k], thread_pack<T>(x));
-    }
+        x.v[0][k].d[j] = static_cast<float>(static_cast<T>(s.v[0][k].d[j] * scale)) * w.v[0][k].d[j];
+    thread_store(own_scratch.data(), cols, x.template to<T>());
   }
 
   // 3. Every rank's normed rows are visible to its peers.

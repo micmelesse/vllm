@@ -22,16 +22,12 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, T* __restrict__ out,
     T* __restrict__ residual_out, const T* __restrict__ residual, const W* __restrict__ weight,
     float eps, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  const V* res_in        = reinterpret_cast<const V*>(residual);
-  const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
-  V* res_out             = reinterpret_cast<V*>(residual_out);
-  V* o                   = reinterpret_cast<V*>(out);
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using Weight           = Tile<W, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  const int cols         = packs * NL;  // the row, in elements
+  const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
@@ -39,7 +35,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (kAdd) add
   //    the residual, then RMSNorm, rounding as the reference does:
@@ -48,45 +44,41 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   //      out = T(W(W(s * rsqrt(mean(s^2) + eps)) * float(w)))
   //    The variance is of `s` before any further rounding, kept in registers between the passes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const int64_t base = int64_t{row} * packs;
+    const Row at{rows, cols, row, 0};
     // Every load of the row before any store: the peers' and the residual together, the weight
     // under the reduction.
-    const auto peers = peers_load<T, ngpus>(read, row, packs, thread_cols);
-    V res[kRowPacks];
-    if constexpr (kAdd) thread_load(res_in + base, thread_cols, res);
-    V sum[kRowPacks];
-    peers_reduce(peers, sum);
+    Row peers[ngpus];
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) peers[r] = at;
+    peers_load(peers, input, cols);
+    Row res = at;
+    if constexpr (kAdd) thread_load(res, residual, cols);
+    RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
-    float s[kRowPacks][NL];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
     if constexpr (kAdd) {
-      V added[kRowPacks];
+      const RowF r = res.template to<float>();
 #pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        float r[NL];
-        thread_unpack<T>(res[k], r);
+      for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        added[k] = thread_pack<T>(s[k]);
-      }
-      thread_store(res_out + base, thread_cols, added);
+        for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
+      thread_store(residual_out, cols, s.template to<T>());
     }
-    vec<W, NL> w[kRowPacks];
-    thread_load(wv, thread_cols, w);
-    float ss[1] = {thread_dot(s, s, thread_cols)};
+    Weight w{1, cols, 0, 0};
+    thread_load(w, weight, 0);
+    float ss[1];
+    thread_dot(s, s, ss);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
-    V normed[kRowPacks];
+    Row normed = at;
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k)
+    for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x  = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed[k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
+        const float x       = static_cast<float>(static_cast<W>(s.v[0][k].d[j] * scale));
+        normed.v[0][k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w.v[0][k].d[j])));
       }
-    thread_store(o + base, thread_cols, normed);
+    thread_store(out, cols, normed);
   }
 
   block_stamp(4);

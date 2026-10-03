@@ -72,6 +72,8 @@ class Buffer {
     at_ = impl::rank_of<T, ngpus>(ptrs, __builtin_amdgcn_readfirstlane(r));
   }
   DINLINE V* at() const { return at_; }
+  // The rank's tensor, for a tile's load or store (common/memory.cuh).
+  DINLINE T* data() const { return reinterpret_cast<T*>(at_); }
 };
 
 template <typename T, int ngpus>

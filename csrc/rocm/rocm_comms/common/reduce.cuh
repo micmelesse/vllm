@@ -40,6 +40,28 @@ DINLINE void peers_reduce(const PeerPacks<T, ngpus, K>& packs, typename traits<T
 }
 
 // One pack, the same.
+// EVERY PEER'S TILE SUMMED, in rank order in fp32 and rounded once to E, as a pack's is.
+template <int ngpus, typename E, int TILE_M, int TILE_N, int THREADS, int NL>
+DINLINE Tile<E, TILE_M, TILE_N, THREADS, NL> peers_reduce(
+    const Tile<E, TILE_M, TILE_N, THREADS, NL> (&t)[ngpus]) {
+  auto sum = t[0].template like<E>();
+#pragma unroll
+  for (int m = 0; m < TILE_M; ++m)
+#pragma unroll
+    for (int k = 0; k < sum.K; ++k) {
+      float acc[NL];
+#pragma unroll
+      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k].d[j]);
+#pragma unroll
+      for (int r = 1; r < ngpus; ++r)
+#pragma unroll
+        for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(t[r].v[m][k].d[j]);
+#pragma unroll
+      for (int j = 0; j < NL; ++j) sum.v[m][k].d[j] = static_cast<E>(acc[j]);
+    }
+  return sum;
+}
+
 template <typename T, int ngpus>
 DINLINE typename traits<T>::V peers_reduce(const PeerPacks<T, ngpus>& packs) {
   typename traits<T>::V sum[1];

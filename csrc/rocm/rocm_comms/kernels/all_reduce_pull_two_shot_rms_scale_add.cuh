@@ -26,25 +26,23 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                            int rank, uint64_t timeout_ticks, T* __restrict__ out,
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
-  using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  V* o                   = reinterpret_cast<V*>(out);
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
   const int packs        = 2 * hidden_packs + latent_packs;
+  const int hidden       = hidden_packs * NL;  // in elements
+  const int64_t stride   = int64_t{packs} * NL;
   // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const auto latent_cols =
-      thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, latent_packs * NL, 0, 0});
   const int slice_rows   = (rows + ngpus - 1) / ngpus;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
-  // This (row, slice)'s tile of the hidden: one row cut to the slice's columns.
-  const auto slice_of    = [&](int w) {
+  // (Row, slice) w's tile of the hidden at row `row`: one row cut to the slice's columns.
+  const auto slice_of    = [&](int w, int row) {
     const int first = (w % splits) * slice;
-    return thread_offs<T, THREADS_PER_BLOCK>(
-        Tile<1, TILE_N>{rows, min(first + slice, hidden_packs) * NL, 0, first * NL});
+    return Row{rows, min(first + slice, hidden_packs) * NL, row, first * NL};
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
@@ -55,47 +53,42 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
-  const auto shared = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
-  const auto proj   = [&](int r, int64_t i) {
-    return p2p::read_input(inputs[r], i + hidden_packs);
-  };
-  const auto latent = [&](int r, int64_t i) {
-    return p2p::read_input(inputs[r], i + 2 * hidden_packs);
-  };
+  const auto shared = [&](int r) { return inputs[r].data(); };
+  const auto proj   = [&](int r) { return inputs[r].data() + hidden; };
+  const auto latent = [&](int r) { return inputs[r].data() + 2 * hidden; };
 
   // 2. This rank's rows, finished: each (row, slice) from every rank, the latent's sum of squares
   //    over the block, then the slice into this rank's scratch, at the row's place among its own.
   const int first_row = rank * slice_rows;
   for (int w = blockIdx.x; w < rows_of(rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
-    const auto hidden_cols = slice_of(w);
-    const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
-    const auto pj = peers_load<T, ngpus>(proj, row, packs, hidden_cols);
-    const auto lt = peers_load<T, ngpus>(latent, row, packs, latent_cols);
-    V l_sum[kRowPacks];
-    peers_reduce(lt, l_sum);
-    float l[kRowPacks][NL];
+    const Row hid = slice_of(w, row);
+    const Row lat{rows, latent_packs * NL, row, 0};
+    Row sh[ngpus], pj[ngpus], lt[ngpus];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(l_sum[k], l[k]);
-    float ss[1] = {thread_dot(l, l, latent_cols)};
+    for (int r = 0; r < ngpus; ++r) {
+      sh[r] = hid;
+      pj[r] = hid;
+      lt[r] = lat;
+    }
+    peers_load(sh, shared, stride);
+    peers_load(pj, proj, stride);
+    peers_load(lt, latent, stride);
+    const RowF l = peers_reduce(lt).template to<float>();
+    float ss[1];
+    thread_dot(l, l, ss);
     block_stamp(2);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
-    V s_sum[kRowPacks], p_sum[kRowPacks];
-    peers_reduce(sh, s_sum);
-    peers_reduce(pj, p_sum);
-    const int64_t at = int64_t{w / splits} * hidden_packs;
+    const RowF s = peers_reduce(sh).template to<float>();
+    const RowF q = peers_reduce(pj).template to<float>();
+    Row r = slice_of(w, w / splits);  // at the row's place among this rank's
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      float s[NL], q[NL];
-      thread_unpack<T>(s_sum[k], s);
-      thread_unpack<T>(p_sum[k], q);
-      V r;
+    for (int k = 0; k < Row::K; ++k)
 #pragma unroll
-      for (int j = 0; j < NL; ++j) r.d[j] = static_cast<T>(s[j] + q[j] * scale);
-      if (hidden_cols.mask_n[k] != 0.0f)
-        p2p::write_scratch(own_scratch, at + hidden_cols.offs_n[k], r);
-    }
+      for (int j = 0; j < NL; ++j)
+        r.v[0][k].d[j] = static_cast<T>(s.v[0][k].d[j] + q.v[0][k].d[j] * scale);
+    thread_store(own_scratch.data(), hidden, r);
   }
 
   block_stamp(3);
@@ -109,23 +102,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   //    (row, slice)s of each. EVERY OWNER'S PACKS LOADED BEFORE ANY IS STORED. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read.
   for (int w = blockIdx.x; w < slice_rows * splits; w += gridDim.x) {
-    const auto hidden_cols = slice_of(w);
-    const int l                  = w / splits;
-    V got[ngpus][kRowPacks];
+    const int l = w / splits;
+    Row got[ngpus];
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r)
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-        got[r][k] =
-            p2p::read_scratch(scratches[r], int64_t{l} * hidden_packs + hidden_cols.offs_n[k]);
+    for (int r = 0; r < ngpus; ++r) got[r] = slice_of(w, l);
+    peers_load(got, [&](int r) { return scratches[r].data(); }, hidden);
 #pragma unroll
     for (int r = 0; r < ngpus; ++r) {
       if (l >= rows_of(r)) continue;
-      const int64_t base = (int64_t{r} * slice_rows + l) * hidden_packs;
-#pragma unroll
-      for (int k = 0; k < kRowPacks; ++k)
-        if (hidden_cols.mask_n[k] != 0.0f)
-          thread_store(o + base + hidden_cols.offs_n[k], got[r][k]);
+      got[r].offs_m = r * slice_rows + l;
+      thread_store(out, hidden, got[r]);
     }
   }
   block_stamp(5);

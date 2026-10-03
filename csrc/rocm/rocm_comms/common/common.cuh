@@ -13,33 +13,26 @@
 //   3. A load that does not depend on a reduction is issued before it (weights, the next row or
 //      source), so its round trip runs under the reduction.
 //
-// utils.cuh         the helpers
-//   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
-//   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)
-// tile.cuh          how a kernel cuts its work
-//   Tile<TILE_M, TILE_N>{M, N, offs_m, offs_n}   TILE_M rows x TILE_N columns (elements) of an
-//                                M x N tensor, from (offs_m, offs_n)
-//   ThreadOffs<K>, thread_offs<T, THREADS_PER_BLOCK>(tile)   this thread's columns in packs
-//   (offs_n) and
-//                                their mask (mask_n), K = TILE_N / (pack x THREADS_PER_BLOCK)
-// memory.cuh        reads and writes
-//   thread_load(p), thread_store(p, v)          one pack, global instructions
-//   thread_load(row, thread_cols, out), thread_store(row, thread_cols, v)   a Tile row: every load
-//   issued, stores
-//                                               only inside the row
-//   thread_load_uncached(p), thread_store_uncached(p, v)   one pack past every cache (system
-//                                               scope); no kernel uses them now
-//   peers_load<T, ngpus>(read, i), peers_load<T, ngpus>(read, row, packs, thread_cols)   every
-//   source's
-//                                               pack (or Tile row) in flight; waits at its use
-// elementwise.cuh
-//   thread_unpack(v, x), thread_pack(x)         a pack to fp32 and back, rounding once
+// THE TILE IS THE INTERFACE: a kernel names tiles and what a thread holds of one; packs, rows and
+// pack offsets are common's. The one-pack forms below remain for the flat all-reduce loops until
+// they are tiles too (PLAN), and nothing new uses them.
+//
+// tile.cuh
+//   Tile<E, TILE_M, TILE_N, THREADS>{M, N, offs_m, offs_n}   TILE_M rows x TILE_N columns
+//                         (elements) of an M x N tensor from (offs_m, offs_n), and this thread's
+//                         elements of it; to<U>() converts them, like<U>() is the same place empty
+// memory.cuh
+//   thread_load(tile, data, row_stride), thread_store(data, row_stride, tile)   one round trip a
+//                         tile; a row past M reads the last, stores only rows below M
+//   peers_load(tiles[ngpus], data(r), row_stride)   every rank's tile in flight together
+//   sliced_load<ngpus>(tile, data(r), row_stride, slice)   each column from the rank owning it
+//   one pack, for the flat loops: thread_load(p), thread_store(p, v), peers_load<T, ngpus>(read, i)
 // reduce.cuh
-//   peers_reduce(packs) -> V, peers_reduce(packs, sum)   each pack summed over its sources, fp32,
-//                                               source order, rounded once
+//   peers_reduce(tiles[ngpus]) -> tile           summed in rank order in fp32, rounded once
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
-//   thread_dot(a, b, thread_cols)                         this thread's share of a row's dot
+//   thread_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
+//                                                one row, a weight)
 //   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its tile (TILE_M rows, TILE_K, SLICE_K;

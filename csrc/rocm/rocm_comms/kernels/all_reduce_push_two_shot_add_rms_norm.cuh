@@ -26,13 +26,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
     T* __restrict__ out, T* __restrict__ residual_out, const T* __restrict__ residual,
     const W* __restrict__ weight, float eps, int rows, int packs) {
-  constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
-  const V* res_in        = reinterpret_cast<const V*>(residual);
-  const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
-  V* res_out             = reinterpret_cast<V*>(residual_out);
-  V* o                   = reinterpret_cast<V*>(out);
+  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<float, 1, TILE_N, THREADS_PER_BLOCK, NL>;
+  using Weight           = Tile<W, 1, TILE_N, THREADS_PER_BLOCK, NL>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice        = (packs + ngpus - 1) / ngpus;
   const int col0         = rank * slice;
@@ -41,7 +39,6 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
   const int cols = packs * NL;  // the row, in elements
-  const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -77,44 +74,36 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    starts only once this one has finished).
   const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const int64_t base = int64_t{row} * packs;
+    const Row at{rows, cols, row, 0};
     // Every load of the row before any store: the scratch's and the residual together, the weight
     // under the reduction.
-    V own[kRowPacks];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k)
-      own[k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
-    V res[kRowPacks];
-    if constexpr (kAdd) thread_load(res_in + base, thread_cols, res);
-    float s[kRowPacks][NL];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(own[k], s[k]);
+    Row own = at, res = at;
+    thread_load(own, own_scratch.data(), cols);
+    if constexpr (kAdd) thread_load(res, residual, cols);
+    RowF s = own.template to<float>();
     if constexpr (kAdd) {
-      V added[kRowPacks];
+      const RowF r = res.template to<float>();
 #pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        float r[NL];
-        thread_unpack<T>(res[k], r);
+      for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        added[k] = thread_pack<T>(s[k]);
-      }
-      thread_store(res_out + base, thread_cols, added);
+        for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
+      thread_store(residual_out, cols, s.template to<T>());
     }
-    vec<W, NL> w[kRowPacks];
-    thread_load(wv, thread_cols, w);
-    float ss[1] = {thread_dot(s, s, thread_cols)};
+    Weight w{1, cols, 0, 0};
+    thread_load(w, weight, 0);
+    float ss[1];
+    thread_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
-    V normed[kRowPacks];
+    Row normed = at;
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k)
+    for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x  = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed[k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
+        const float x       = static_cast<float>(static_cast<W>(s.v[0][k].d[j] * scale));
+        normed.v[0][k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w.v[0][k].d[j])));
       }
-    thread_store(o + base, thread_cols, normed);
+    thread_store(out, cols, normed);
   }
   block_stamp(4);
 }
