@@ -22,13 +22,23 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import ClassVar, get_args
 
 import torch
 
-from .base import Communicator, Error, Op, Ran
+from .base import Communicator, Error, Ran
 
 logger = logging.getLogger(__name__)
+
+
+def _require_capture(state: str) -> None:
+    """Raise on a launch being recorded into a cudagraph outside `capture()`: peers are
+    registered when that context exits, and a graph captured without it replays against
+    addresses that were never registered."""
+    if torch.cuda.is_current_stream_capturing() and state != "capturing":
+        raise RuntimeError(
+            "HipCommunicator is being captured into a cudagraph without `capture()`. "
+            "Use `with comm.capture(), torch.cuda.graph(g): ...`"
+        )
 
 
 def _answer(got: tuple[str | int | None, ...]) -> Ran | Error:
@@ -49,8 +59,6 @@ class HipCommunicator(Communicator):
     handles it is handed. Missing ops are an error, not a disable: falling back quietly
     would let vLLM run its own all-reduce and report the arm ready.
     """
-
-    OPS: ClassVar[frozenset[Op]] = frozenset(get_args(Op))
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
@@ -94,6 +102,9 @@ class HipCommunicator(Communicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce(
                 self._handle,
@@ -136,6 +147,9 @@ class HipCommunicator(Communicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_norm(
                 self._handle,
@@ -217,6 +231,9 @@ class HipCommunicator(Communicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
                 self._handle,
@@ -293,6 +310,9 @@ class HipCommunicator(Communicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_norm_gemm(
                 self._handle,
@@ -361,6 +381,9 @@ class HipCommunicator(Communicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
         return _answer(
             torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_scale_add(
                 self._handle,

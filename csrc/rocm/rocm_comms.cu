@@ -497,7 +497,7 @@ OpenWire rocm_comms_open(const std::string& cpu_group, const std::string& device
 SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
   const auto got = hip_comms::supported(static_cast<int>(device), static_cast<int>(world));
   if (const auto* e = std::get_if<hip_comms::Error>(&got))
-    return {std::nullopt, std::nullopt, static_cast<int64_t>(*e)};
+    return {std::nullopt, static_cast<int64_t>(*e)};
   return {std::get<hip_comms::Supported>(got).arch, std::nullopt};
 }
 

@@ -13,11 +13,11 @@ import functools
 import logging
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar, Literal, final
+from typing import Literal, final
 
 import torch
 from torch.distributed import ProcessGroup
@@ -167,11 +167,11 @@ Ran = tuple[str | int | None, ...]
 
 
 class Refused(RuntimeError):
-    """A call this backend does not take, raised by the op (its `should_` said so first):
-    the Error, and the call it was."""
+    """A call this backend does not take, raised by the op (its `should_` said so
+    first): the Error, and the input it was asked to run on."""
 
-    def __init__(self, error: Error, what: str) -> None:
-        super().__init__(f"{what}: {error.name}")
+    def __init__(self, error: Error, inp: torch.Tensor) -> None:
+        super().__init__(f"{error.name}: shape={tuple(inp.shape)} dtype={inp.dtype}")
         self.error = error
 
 
@@ -206,9 +206,6 @@ class Communicator(ABC):
 
     state: State = "disabled"
 
-    # THE OPS THIS BACKEND RUNS; every other is `no_such_op`.
-    OPS: ClassVar[frozenset[Op]] = frozenset({"all_reduce"})
-
     @final
     @property
     def disabled(self) -> bool:
@@ -234,9 +231,8 @@ class Communicator(ABC):
     # Each op and its `should_` take the same arguments: the op's own tensors and values,
     # then, keyword-only, what the sweep and the tests force (the algorithm, `one_shot` or
     # `two_shot`, the direction, `pull` or `push`, and that op's own config fields, each None
-    # for the backend's choice); the model forces none.
-    # `should_` answers whether the op runs; the op runs and returns what ran, or raises
-    # Refused for a call its `should_` would have refused.
+    # for the backend's choice); the model forces none. `should_` is the op's check; the op
+    # runs its check, raises Refused on an Error, and returns what ran.
 
     @final
     def should_allreduce(
@@ -249,11 +245,8 @@ class Communicator(ABC):
         blocks_per_grid: int | None = None,
     ) -> bool:
         """Whether `all_reduce(inp)` runs here."""
-        ran = self._checked(
-            "all_reduce",
-            lambda: self._check_all_reduce(
-                inp, algorithm, direction, threads_per_block, blocks_per_grid
-            ),
+        ran = self._check_all_reduce(
+            inp, algorithm, direction, threads_per_block, blocks_per_grid
         )
         return not isinstance(ran, Error)
 
@@ -270,13 +263,11 @@ class Communicator(ABC):
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
         picks among a backend's own paths (hip's in C++), never whether it is ours.
         Returns the sum and what ran."""
-        ran = self._required(
-            "all_reduce",
-            inp,
-            lambda: self._check_all_reduce(
-                inp, algorithm, direction, threads_per_block, blocks_per_grid
-            ),
+        ran = self._check_all_reduce(
+            inp, algorithm, direction, threads_per_block, blocks_per_grid
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         out = torch.empty_like(inp)
         if not self._warming_up():
             self._all_reduce(
@@ -297,18 +288,15 @@ class Communicator(ABC):
         blocks_per_grid: int | None = None,
     ) -> bool:
         """Whether `all_reduce_rms_norm(inp, weight, ...)` runs here."""
-        ran = self._checked(
-            "all_reduce_rms_norm",
-            lambda: self._check_all_reduce_rms_norm(
-                inp,
-                weight,
-                False,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_rms_norm(
+            inp,
+            weight,
+            False,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -327,20 +315,18 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, Ran]:
         """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel. Returns
         the normed sum and what ran."""
-        ran = self._required(
-            "all_reduce_rms_norm",
+        ran = self._check_all_reduce_rms_norm(
             inp,
-            lambda: self._check_all_reduce_rms_norm(
-                inp,
-                weight,
-                False,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            weight,
+            False,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         out = torch.empty_like(inp)
         if not self._warming_up():
             self._all_reduce_rms_norm(
@@ -369,18 +355,15 @@ class Communicator(ABC):
         blocks_per_grid: int | None = None,
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(inp, ..., weight, ...)` runs here."""
-        ran = self._checked(
-            "all_reduce_add_rms_norm",
-            lambda: self._check_all_reduce_rms_norm(
-                inp,
-                weight,
-                True,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_rms_norm(
+            inp,
+            weight,
+            True,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -400,20 +383,18 @@ class Communicator(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, the sum plus residual, and what ran."""
-        ran = self._required(
-            "all_reduce_add_rms_norm",
+        ran = self._check_all_reduce_rms_norm(
             inp,
-            lambda: self._check_all_reduce_rms_norm(
-                inp,
-                weight,
-                True,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            weight,
+            True,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
         if not self._warming_up():
             self._all_reduce_add_rms_norm(
@@ -446,19 +427,16 @@ class Communicator(ABC):
         blocks_per_grid: int | None = None,
     ) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(inp, ...)` runs here."""
-        ran = self._checked(
-            "all_reduce_add_attn_res_rms_norm",
-            lambda: self._check_all_reduce_add_attn_res_rms_norm(
-                inp,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                reduce_scatter_blocks,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_add_attn_res_rms_norm(
+            inp,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            reduce_scatter_blocks,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -489,21 +467,19 @@ class Communicator(ABC):
         `prefix` the sum starting one. Returns the prefix (updated in place when given),
         the AttnRes output, and what ran. `write_idx` >= 0 also stores the prefix as
         that block."""
-        ran = self._required(
-            "all_reduce_add_attn_res_rms_norm",
+        ran = self._check_all_reduce_add_attn_res_rms_norm(
             inp,
-            lambda: self._check_all_reduce_add_attn_res_rms_norm(
-                inp,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                reduce_scatter_blocks,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            reduce_scatter_blocks,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
         prefix_out = torch.empty_like(inp) if prefix is None else prefix
         out = torch.empty_like(inp)
@@ -550,21 +526,18 @@ class Communicator(ABC):
     ) -> bool:
         """Whether `all_reduce_rms_norm_gemm(inp, ..., gemm_weight, ...)` runs here;
         `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        ran = self._checked(
-            "all_reduce_rms_norm_gemm",
-            lambda: self._check_all_reduce_rms_norm_gemm(
-                inp,
-                gemm_weight,
-                False,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_rms_norm_gemm(
+            inp,
+            gemm_weight,
+            False,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            slice_k,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -589,23 +562,21 @@ class Communicator(ABC):
         """`out = rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
         wider buffer is fine). Returns what ran."""
-        ran = self._required(
-            "all_reduce_rms_norm_gemm",
+        ran = self._check_all_reduce_rms_norm_gemm(
             inp,
-            lambda: self._check_all_reduce_rms_norm_gemm(
-                inp,
-                gemm_weight,
-                False,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            gemm_weight,
+            False,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            slice_k,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         if not self._warming_up():
             self._all_reduce_rms_norm_gemm(
                 False,
@@ -642,21 +613,18 @@ class Communicator(ABC):
     ) -> bool:
         """Whether `all_reduce_rms_norm_gemm_add(inp, ..., gemm_weight, ...)` runs here;
         `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        ran = self._checked(
-            "all_reduce_rms_norm_gemm_add",
-            lambda: self._check_all_reduce_rms_norm_gemm(
-                inp,
-                gemm_weight,
-                True,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_rms_norm_gemm(
+            inp,
+            gemm_weight,
+            True,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            slice_k,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -681,23 +649,21 @@ class Communicator(ABC):
         """`out += rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
         wider buffer is fine). Returns what ran."""
-        ran = self._required(
-            "all_reduce_rms_norm_gemm_add",
+        ran = self._check_all_reduce_rms_norm_gemm(
             inp,
-            lambda: self._check_all_reduce_rms_norm_gemm(
-                inp,
-                gemm_weight,
-                True,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            gemm_weight,
+            True,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            slice_k,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         if not self._warming_up():
             self._all_reduce_rms_norm_gemm(
                 True,
@@ -731,17 +697,14 @@ class Communicator(ABC):
     ) -> bool:
         """Whether `all_reduce_rms_scale_add(inp, out, ...)` runs here: `out` [rows,
         hidden] from `inp`'s row [shared | projected | latent]."""
-        ran = self._checked(
-            "all_reduce_rms_scale_add",
-            lambda: self._check_all_reduce_rms_scale_add(
-                inp,
-                out,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+        ran = self._check_all_reduce_rms_scale_add(
+            inp,
+            out,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
         return not isinstance(ran, Error)
 
@@ -760,19 +723,17 @@ class Communicator(ABC):
     ) -> Ran:
         """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
         + projected * rsqrt(mean(latent^2) + eps)` in one kernel. Returns what ran."""
-        ran = self._required(
-            "all_reduce_rms_scale_add",
+        ran = self._check_all_reduce_rms_scale_add(
             inp,
-            lambda: self._check_all_reduce_rms_scale_add(
-                inp,
-                out,
-                algorithm,
-                direction,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-            ),
+            out,
+            algorithm,
+            direction,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
+        if isinstance(ran, Error):
+            raise Refused(ran, inp)
         if not self._warming_up():
             self._all_reduce_rms_scale_add(
                 inp,
@@ -850,36 +811,6 @@ class Communicator(ABC):
 
     # ---- The rules a caller can get wrong, enforced once. ----
 
-    def _checked(self, op: Op, check: Callable[[], Ran | Error]) -> Ran | Error:
-        """What runs `op` here, or the Error it meets: disabled, an op this backend does
-        not run, or the backend's own `check`."""
-        if self.disabled:
-            return Error.disabled
-        if op not in self.OPS:
-            return Error.no_such_op
-        return check()
-
-    def _required(
-        self, op: Op, inp: torch.Tensor, check: Callable[[], Ran | Error]
-    ) -> Ran:
-        """What runs `op` here, or Refused, raised, naming the call. Also raised: a launch
-        being recorded into a cudagraph outside `capture()`, since a backend may defer
-        peer registration until that context exits, and a graph captured without it
-        replays against addresses that were never registered."""
-        if torch.cuda.is_current_stream_capturing() and self.state != "capturing":
-            raise RuntimeError(
-                f"{type(self).__name__}.{op} is being captured into a cudagraph "
-                f"without `capture()`. Use `with comm.capture(), torch.cuda.graph(g): ...`"
-            )
-        got = self._checked(op, check)
-        if isinstance(got, Error):
-            raise Refused(
-                got,
-                f"{type(self).__name__} cannot run {op} over "
-                f"shape={tuple(inp.shape)} dtype={inp.dtype}",
-            )
-        return got
-
     def _warming_up(self) -> bool:
         """Whether this is a capture's WARMUP: inside `capture()`, the stream not
         recording. vLLM discards its outputs, so an op returns unwritten ones of the
@@ -889,9 +820,9 @@ class Communicator(ABC):
         )
 
     # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or the
-    # Error) and its launch, both taking the op's own arguments. Every op's outputs are the
-    # base's, so a capture's warmup returns them without calling here. The fused ops are
-    # not abstract: a backend without one leaves it out of OPS. ----
+    # Error; disabled when it is) and its launch, both taking the op's own arguments. Every
+    # op's outputs are the base's, so a capture's warmup returns them without calling here.
+    # The fused ops are not abstract: a backend without one keeps its check, no_such_op. ----
 
     def _check_all_reduce(
         self,
@@ -904,6 +835,8 @@ class Communicator(ABC):
         """By default (torch, iris) the build's envelope, so a control admits what our
         kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
         having no template to force. Ours overrides it with its C++'s answer."""
+        if self.disabled:
+            return Error.disabled
         if (
             algorithm is not None
             or direction is not None
@@ -944,9 +877,7 @@ class Communicator(ABC):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
-        raise NotImplementedError(
-            f"{type(self).__name__} lists a norm op it has no check for"
-        )
+        return Error.no_such_op
 
     def _all_reduce_rms_norm(
         self,
@@ -994,9 +925,7 @@ class Communicator(ABC):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
-        raise NotImplementedError(
-            f"{type(self).__name__} lists AttnRes with no check for it"
-        )
+        return Error.no_such_op
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
@@ -1039,9 +968,7 @@ class Communicator(ABC):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
-        raise NotImplementedError(
-            f"{type(self).__name__} lists a GEMM tail with no check for it"
-        )
+        return Error.no_such_op
 
     def _all_reduce_rms_norm_gemm(
         self,
@@ -1072,9 +999,7 @@ class Communicator(ABC):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
     ) -> Ran | Error:
-        raise NotImplementedError(
-            f"{type(self).__name__} lists scale-add with no check for it"
-        )
+        return Error.no_such_op
 
     def _all_reduce_rms_scale_add(
         self,

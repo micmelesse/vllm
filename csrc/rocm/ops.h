@@ -79,7 +79,7 @@ void rocm_comms_dispose(fptr_t handle_ptr);
 using RocmCommsField = std::optional<int64_t>;
 template <typename... Fields>
 using RocmCommsPlan =
-    std::tuple<std::optional<int64_t>, std::optional<std::string>, Fields...,
+    std::tuple<std::optional<std::string>, std::optional<std::string>, Fields...,
                std::optional<int64_t>>;
 using RocmCommsAllReducePlan = RocmCommsPlan<RocmCommsField, RocmCommsField>;
 using RocmCommsRowPlan =
