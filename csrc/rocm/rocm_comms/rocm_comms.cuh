@@ -12,12 +12,13 @@
 //   handle.cuh      Handle: the peers' memory, mapped once (run time; kBuild's twin), and
 //                   supported(device, world): whether one can exist there
 //   types.cuh       the vocabulary: Template, each family's KernelConfig, OpType, Algorithm,
-//                   Direction, and each op's launch (the normal form select returns)
+//                   Direction, each op's kernel signatures, and each op's launch (the normal
+//                   form select returns)
 // How a call runs:
-//   launch.cuh      what is built (each template's configs), a launch's compiled instance, and
-//                   each op's launch_<op>
-//   select.cuh      what was tuned (each op's kernels), and the steps every select takes: forced or
-//                   picked, fitted, checked
+//   select.cuh      what is built (each template's configs) and what was tuned (each op's
+//                   kernels), and each op's select_<op>: forced or picked, fitted, checked, its
+//                   compiled kernel found; everything decided
+//   launch.cuh      each op's launch_<op>: the launch's kernel run, nothing decided
 //   interface.cuh   THE API: each op's select_<op>, and the op (select then launch)
 
 #pragma once
@@ -38,7 +39,7 @@
 #include "machine/hardware.cuh"
 
 #define HIP_COMMS_INTERFACE
-#include "launch.cuh"
 #include "select.cuh"
+#include "launch.cuh"
 #include "interface.cuh"
 #undef HIP_COMMS_INTERFACE

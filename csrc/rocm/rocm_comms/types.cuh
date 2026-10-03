@@ -15,6 +15,7 @@
 #include <variant>
 
 #include "build.cuh"
+#include "p2p/p2p.cuh"
 
 namespace hip_comms {
 
@@ -150,9 +151,50 @@ constexpr KernelConfig zero_config(size_t family) {
 }
 
 
+
+constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
+// A row of `elems` of `dtype` in 16-byte packs.
+constexpr int64_t packs_of(int64_t elems, DType dtype) {
+  return elems * elem_bytes(dtype) / kBuild.memory.pack_bytes;
+}
+
 // =================================================================================================
-// EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel
-// (algorithm, direction), what is compiled in (the tile, threads_per_block), the grid
+// EACH OP'S KERNEL SIGNATURES, element pointers as void*: every compiled instance of the op's
+// templates has one of these (select asserts it when it picks the instance), so a launch calls the
+// kernel select chose through it, with the kernel's own arguments.
+// =================================================================================================
+
+// The plain all-reduce: in place, out and the input's packs; staged, out, the packs (in 64 bits),
+// its own input and the packs a staging holds.
+using AllReduceKernel       = void (*)(p2p::DevComm, void*, int);
+using AllReduceStagedKernel = void (*)(p2p::DevComm, void*, int64_t, const void*, int64_t);
+// out, weight, eps, rows, packs.
+using RmsNormKernel = void (*)(p2p::DevComm, void*, const void*, float, int, int);
+// out, residual_out, residual, weight, eps, rows, packs.
+using AddRmsNormKernel =
+    void (*)(p2p::DevComm, void*, void*, const void*, const void*, float, int, int);
+// prefix, blocks, block_stride_m, block_stride_r, norm_w, qk_w, out_norm_w, out, num_blocks,
+// write_idx, eps, out_eps, rows, packs; the pull two-shot's then its reduce_scatter_blocks.
+using AttnResKernel = void (*)(p2p::DevComm, void*, void*, int64_t, int64_t, const void*,
+                               const void*, const void*, void*, int, int, float, float, int, int);
+using AttnResPullKernel =
+    void (*)(p2p::DevComm, void*, void*, int64_t, int64_t, const void*, const void*, const void*,
+             void*, int, int, float, float, int, int, int);
+// norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs.
+using GemmTailKernel =
+    void (*)(p2p::DevComm, const void*, float, const void*, int, void*, int64_t, void*, int, int);
+// out, eps, rows, hidden_packs, latent_packs.
+using RmsScaleAddKernel = void (*)(p2p::DevComm, void*, float, int, int, int);
+// Experimental, no peers: prefix, delta, blocks, block_stride_m, block_stride_r, norm_w, qk_w,
+// out_norm_w, out, num_blocks, write_idx, eps, out_eps, rows, packs.
+using AddAttnResKernel = void (*)(void*, const void*, void*, int64_t, int64_t, const void*,
+                                  const void*, const void*, void*, int, int, float, float, int,
+                                  int);
+
+// =================================================================================================
+// EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel (the
+// compiled instance, `kernel`, one of its op's signatures above; and what it is: its algorithm,
+// direction and world), what is compiled in (the tile, threads_per_block), the grid
 // (blocks_per_grid, and the pull's reduce_scatter_blocks), the stream (select decides on it: a
 // stream being captured reads its input in place), then the kernel's arguments.
 // =================================================================================================
@@ -160,8 +202,10 @@ constexpr KernelConfig zero_config(size_t family) {
 // `staged`: the build that copies an eager input through the staging a pass at a time, not the
 // one that reads a registered or captured input in place.
 struct AllReduceLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int threads_per_block;
   int blocks_per_grid;
   bool staged;
@@ -174,8 +218,10 @@ struct AllReduceLaunch {
 
 // `weight_dtype`: dtype, or f32.
 struct AllReduceRmsNormLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -191,8 +237,10 @@ struct AllReduceRmsNormLaunch {
 };
 
 struct AllReduceAddRmsNormLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -213,8 +261,10 @@ struct AllReduceAddRmsNormLaunch {
 // on the others. `blocks` is [rows, sources, hidden] at its strides in elements; `write_idx` < 0
 // writes no block; `out_norm_weight` null: no output norm.
 struct AllReduceAddAttnResRmsNormLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_m;
   int tile_n;
   int tile_k;
@@ -243,8 +293,10 @@ struct AllReduceAddAttnResRmsNormLaunch {
 
 // out [rows, n_cols] at `out_stride`; gemm_weight [n_cols, hidden]; `workspace` inp's shape.
 struct AllReduceRmsNormGemmLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_m;
   int tile_n;
   int tile_k;
@@ -266,8 +318,10 @@ struct AllReduceRmsNormGemmLaunch {
 };
 
 struct AllReduceRmsNormGemmAddLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_m;
   int tile_n;
   int tile_k;
@@ -290,8 +344,10 @@ struct AllReduceRmsNormGemmAddLaunch {
 
 // inp's row [shared | projected | latent], widths hidden, hidden, latent; out [rows, hidden].
 struct AllReduceRmsScaleAddLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -307,8 +363,10 @@ struct AllReduceRmsScaleAddLaunch {
 
 // Experimental, one rank: its one template is the pull one-shot by name only (it reads no peer).
 struct AddAttnResRmsNormLaunch {
+  const void* kernel;
   Algorithm algorithm;
   Direction direction;
+  int world;
   int tile_n;
   int tile_k;
   int threads_per_block;
