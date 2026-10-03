@@ -33,7 +33,6 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
   using RowsF   = Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>;
   using Weight  = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
   using WeightF = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
-  constexpr int NL = Rows::kPack;
   const int64_t stride = sum.N;
   const Weight at_cols{1, sum.N, 0, sum.offs_n};
 
@@ -43,14 +42,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
   if constexpr (HAS_PREFIX) {
     Rows old = sum.template like<DTYPE>();
     thread_load(old, prefix, stride);
-#pragma unroll
-    for (int m = 0; m < TILE_M; ++m)
-#pragma unroll
-      for (int k = 0; k < Rows::K; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j)
-          np.v[m][k][j] = static_cast<DTYPE>(static_cast<float>(old.v[m][k][j]) +
-                                           static_cast<float>(sum.v[m][k][j]));
+    np = thread_add(old.template to<float>(), sum.template to<float>()).template to<DTYPE>();
   }
   thread_store(prefix, stride, np);
   if (write_idx >= 0) thread_store(blocks + write_idx * block_stride_r, block_stride_m, np);
@@ -61,12 +53,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
     Weight nw = at_cols, qk = at_cols;
     thread_load(nw, norm_w, 0);
     thread_load(qk, qk_w, 0);
-    WeightF w = nw.template to<float>();
-    const WeightF q = qk.template to<float>();
-#pragma unroll
-    for (int k = 0; k < WeightF::K; ++k)
-#pragma unroll
-      for (int j = 0; j < NL; ++j) w.v[0][k][j] *= q.v[0][k][j];
+    const WeightF w = thread_mul(nw.template to<float>(), qk.template to<float>());
     acc = u.template like<float>();
     OnlineSoftmax softmax[TILE_M];
     for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
@@ -92,6 +79,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
         }
       }
       block_reduce<Sum>(sums);
+      float old_scale[TILE_M], scale[TILE_K][TILE_M];
 #pragma unroll
       for (int m = 0; m < TILE_M; ++m) {
         float logit[TILE_K];
@@ -101,27 +89,19 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
                          ? sums[(m * TILE_K + s) * 2 + 1] *
                                rsqrtf(sums[(m * TILE_K + s) * 2] * inv_hidden + eps)
                          : -INFINITY;
-        float scale[TILE_K];
-        const float old_scale = thread_softmax_fold(softmax[m], logit, scale);
+        float row_scale[TILE_K];
+        old_scale[m] = thread_softmax_fold(softmax[m], logit, row_scale);
 #pragma unroll
-        for (int k = 0; k < RowsF::K; ++k)
-#pragma unroll
-          for (int j = 0; j < NL; ++j) {
-            float a = acc.v[m][k][j] * old_scale;
-#pragma unroll
-            for (int s = 0; s < TILE_K; ++s) a += scale[s] * v[s].v[m][k][j];
-            acc.v[m][k][j] = a;
-          }
+        for (int s = 0; s < TILE_K; ++s) scale[s][m] = row_scale[s];
       }
+      acc = thread_mul(acc, old_scale);
+#pragma unroll
+      for (int s = 0; s < TILE_K; ++s) acc = thread_add(acc, thread_mul(v[s], scale[s]));
     }
+    float inv_den[TILE_M];
 #pragma unroll
-    for (int m = 0; m < TILE_M; ++m) {
-      const float inv_den = 1.0f / softmax[m].denominator;
-#pragma unroll
-      for (int k = 0; k < RowsF::K; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) acc.v[m][k][j] *= inv_den;
-    }
+    for (int m = 0; m < TILE_M; ++m) inv_den[m] = 1.0f / softmax[m].denominator;
+    acc = thread_mul(acc, inv_den);
   }
 
   // The output, normed when out_norm_w is given: its weight in flight under the one reduction for
@@ -133,16 +113,10 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
     float ss[TILE_M];
     thread_dot(acc, acc, ss);
     block_reduce<Sum>(ss);
-    const WeightF g = g_in.template to<float>();
+    float scale[TILE_M];
 #pragma unroll
-    for (int m = 0; m < TILE_M; ++m) {
-      const float scale = rsqrtf(ss[m] * inv_hidden + out_eps);
-#pragma unroll
-      for (int k = 0; k < Rows::K; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j)
-          result.v[m][k][j] = static_cast<DTYPE>(acc.v[m][k][j] * scale * g.v[0][k][j]);
-    }
+    for (int m = 0; m < TILE_M; ++m) scale[m] = rsqrtf(ss[m] * inv_hidden + out_eps);
+    result = thread_mul(thread_mul(acc, scale), g_in.template to<float>()).template to<DTYPE>();
   } else {
     result = acc.template to<DTYPE>();
   }

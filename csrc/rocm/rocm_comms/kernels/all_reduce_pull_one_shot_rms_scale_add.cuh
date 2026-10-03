@@ -73,12 +73,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
     const RowF s = peers_reduce(sh).template to<float>();
     const RowF q = peers_reduce(pj).template to<float>();
-    Row r = hid;
-#pragma unroll
-    for (int k = 0; k < Row::K; ++k)
-#pragma unroll
-      for (int j = 0; j < NL; ++j)
-        r.v[0][k][j] = static_cast<DTYPE>(s.v[0][k][j] + q.v[0][k][j] * scale);
+    Row r = thread_add(s, thread_mul(q, scale)).template to<DTYPE>();
     thread_store(out, hidden, r);
   }
 

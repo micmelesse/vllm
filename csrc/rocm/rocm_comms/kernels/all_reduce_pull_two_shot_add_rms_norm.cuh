@@ -85,11 +85,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
     if constexpr (ADD_RESIDUAL) {
-      const RowF r = res.template to<float>();
-#pragma unroll
-      for (int k = 0; k < RowF::K; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) s.v[0][k][j] += r.v[0][k][j];
+      s = thread_add(s, res.template to<float>());
       Row added = s.template to<DTYPE>();
       added.offs_m = row - first;
       thread_store(own_scratch.data(), cols, added);
@@ -110,14 +106,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       }
       return;
     }
-    Row normed{rows, cols, row - first, 0};
-#pragma unroll
-    for (int k = 0; k < Row::K; ++k)
-#pragma unroll
-      for (int j = 0; j < NL; ++j) {
-        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k][j] * scale));
-        normed.v[0][k][j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k][j])));
-      }
+    // out = T(W(W(s * scale) * float(w))), as the reference rounds
+    Row normed = thread_mul(thread_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
+                            w.template to<float>())
+                     .template to<WEIGHT_DTYPE>()
+                     .template to<DTYPE>();
+    normed.offs_m = row - first;
     thread_store(own_scratch.data(), cols, normed);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other

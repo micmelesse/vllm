@@ -55,13 +55,10 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     const RowF w = wk.template to<float>();
-    RowF x{rows, cols, row, 0};
-#pragma unroll
-    for (int k = 0; k < RowF::K; ++k)
-#pragma unroll
-      for (int j = 0; j < NL; ++j)
-        x.v[0][k][j] = static_cast<float>(static_cast<DTYPE>(s.v[0][k][j] * scale)) * w.v[0][k][j];
-    thread_store(workspace, cols, x.template to<DTYPE>());
+    // out = T(T(s * scale) * float(w)), as the reference rounds
+    Row x = thread_mul(thread_mul(s, scale).template to<DTYPE>().template to<float>(), w)
+                .template to<DTYPE>();
+    thread_store(workspace, cols, x);
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.

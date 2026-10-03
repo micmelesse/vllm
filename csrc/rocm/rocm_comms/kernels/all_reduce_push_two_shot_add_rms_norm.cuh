@@ -82,11 +82,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
-      const RowF r = res.template to<float>();
-#pragma unroll
-      for (int k = 0; k < RowF::K; ++k)
-#pragma unroll
-        for (int j = 0; j < NL; ++j) s.v[0][k][j] += r.v[0][k][j];
+      s = thread_add(s, res.template to<float>());
       thread_store(residual_out, cols, s.template to<DTYPE>());
     }
     Weight w{1, cols, 0, 0};
@@ -95,14 +91,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     thread_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
-    Row normed = at;
-#pragma unroll
-    for (int k = 0; k < Row::K; ++k)
-#pragma unroll
-      for (int j = 0; j < NL; ++j) {
-        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k][j] * scale));
-        normed.v[0][k][j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k][j])));
-      }
+    // out = T(W(W(s * scale) * float(w))), as the reference rounds
+    Row normed = thread_mul(thread_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
+                            w.template to<float>())
+                     .template to<WEIGHT_DTYPE>()
+                     .template to<DTYPE>();
     thread_store(out, cols, normed);
   }
   block_stamp(4);
