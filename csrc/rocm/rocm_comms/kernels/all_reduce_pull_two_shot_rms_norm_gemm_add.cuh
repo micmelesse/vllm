@@ -77,23 +77,20 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
-  // 4. Every owner's normed rows out of its scratch, into the workspace.
+  // 4. Every owner's normed rows out of its scratch, into the workspace: EVERY OWNER'S TILE LOADED
+  //    BEFORE ANY IS STORED (the compiler cannot prove the output and the peers' scratch apart, so
+  //    a store between two loads held the next load back, and the eight owners' round trips ran one
+  //    after another).
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-    // EVERY OWNER'S PACK LOADED BEFORE ANY IS STORED: the compiler cannot prove the output
-    // and the peers' scratch apart, so a store between two loads holds the next load back
-    // until the store is done, and the eight owners' round trips run one after another.
-      // Every load unconditional: each rank's scratch holds slice_rows rows, so a slot past the
-      // last row is real, and a load under an `if` waits on the one before.
-      V got[WORLD];
+    Row got[WORLD];
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        got[r] = p2p::read_scratch(scratches[r], int64_t{l} * packs + i);
+    for (int r = 0; r < WORLD; ++r) got[r] = Row{slice_rows, cols, l, 0};
+    peers_load(got, [&](int r) { return scratches[r].data(); }, cols);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        const int row = r * slice_rows + l;
-        if (row < rows) thread_store(normed + int64_t{row} * packs + i, got[r]);
-      }
+    for (int r = 0; r < WORLD; ++r) {
+      got[r].M      = rows;
+      got[r].offs_m = r * slice_rows + l;
+      thread_store(workspace, cols, got[r]);
     }
   }
 

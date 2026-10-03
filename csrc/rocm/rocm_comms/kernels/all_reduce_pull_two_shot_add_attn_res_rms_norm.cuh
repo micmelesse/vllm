@@ -39,6 +39,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                                    int rows, int packs, int reduce_scatter_blocks) {
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
+  constexpr int NL = traits<DTYPE>::N;
+  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows of this rank's columns, a wave a row.
+  constexpr int SLICE_N = (TILE_N / WORLD + kWaveSize * NL - 1) / (kWaveSize * NL) * (kWaveSize * NL);
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, SLICE_N, THREADS_PER_BLOCK / kWaveSize,
+                     kWaveSize>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
@@ -53,29 +58,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
   const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
   const auto own_scratch  = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
   //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (its config, select.cuh). THE
-  //    (ROW, COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every
-  //    16 bytes.
+  //    only: reads queue behind the links past a few dozen blocks (its config, select.cuh). Tiles
+  //    of a reducer's rows (every reducers-th), a wave a row.
   const int reducers = min(static_cast<int>(gridDim.x), reduce_scatter_blocks);
   if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
-    int q = threadIdx.x / own_packs;  // this thread's row among the block's, and its column
-    int c = threadIdx.x - q * own_packs;
-    const int dq = blockDim.x / own_packs, dc = blockDim.x - dq * own_packs;
-    for (; q < reduce_rows;) {
-      const int64_t i = (int64_t{blockIdx.x} + int64_t{q} * reducers) * packs + col0 + c;
-      p2p::write_scratch(own_scratch, i, peers_reduce(peers_load<DTYPE, WORLD>(read, i)));
-      q += dq;
-      c += dc;
-      if (c >= own_packs) {
-        c -= own_packs;
-        ++q;
-      }
+    for (int q = 0; q < reduce_rows; q += Slice::kThreadsM) {
+      const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x) + q * reducers,
+                     col0 * NL, reducers};
+      Slice peers[WORLD];
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) peers[r] = at;
+      peers_load(peers, input, cols);
+      thread_store(own_scratch.data(), cols, peers_reduce(peers));
     }
   }
   block_stamp(2);

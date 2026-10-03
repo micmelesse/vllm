@@ -30,9 +30,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
-  const auto* wv         = reinterpret_cast<const vec<WEIGHT_DTYPE, NL>*>(weight);
-  V* res_out             = reinterpret_cast<V*>(residual_out);
-  V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice_rows   = (rows + WORLD - 1) / WORLD;
   // ADD_RESIDUAL: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
@@ -136,45 +133,40 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
   //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
-  //    ADD_RESIDUAL: the owners' rows are the new residual; each is normed here by its owner's scale. Every
-  //    thread loads the 8 scales after its 8 packs, all in flight before any wait (a wave's lanes
-  //    read one scale address: one request a wave). Left to the compiler, the scales were loaded
-  //    and waited on before the packs were issued, two round trips a row (ISA
-  //    2026-10-01T02-33-11Z).
-  const auto gathered = [&](int r, int64_t i) { return p2p::read_scratch(scratches[r], i); };
+  //    ADD_RESIDUAL: the owners' rows are the new residual; each is normed here by its owner's
+  //    scale (the weight loaded once, before the loop). Every thread loads the 8 scales after the 8
+  //    tiles, all in flight before any wait (a wave's lanes read one scale address: one request a
+  //    wave). Left to the compiler, the scales were loaded and waited on before the packs were
+  //    issued, two round trips a row (ISA 2026-10-01T02-33-11Z).
+  const auto gathered = [&](int r) { return scratches[r].data(); };
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    for (int i = threadIdx.x; i < packs; i += blockDim.x) {
-      const int64_t at = int64_t{l} * packs + i;
-      const PeerPacks<DTYPE, WORLD> rows_of = peers_load<DTYPE, WORLD>(gathered, at);
-      V sc[WORLD];
+    Row got[WORLD];
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) got[r] = Row{slice_rows, cols, l, 0};
+    peers_load(got, gathered, cols);
+    V sc[WORLD];
+    if constexpr (ADD_RESIDUAL) {
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
+    }
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) {
+      const int row = r * slice_rows + l;
+      if (row >= rows) continue;
+      Row at = got[r];
+      at.M      = rows;
+      at.offs_m = row;
       if constexpr (ADD_RESIDUAL) {
-#pragma unroll
-        for (int r = 0; r < WORLD; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
-      }
-      V got[WORLD];
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) got[r] = rows_of.p[r][0];
-      vec<WEIGHT_DTYPE, NL> w;
-      if constexpr (ADD_RESIDUAL) w = wv[i];
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        const int row = r * slice_rows + l;
-        if (row >= rows) continue;
-        if constexpr (ADD_RESIDUAL) {
-          thread_store(res_out + int64_t{row} * packs + i, got[r]);
-          const float scale = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
-          float x[NL];
-          thread_unpack<DTYPE>(got[r], x);
-          V normed;
-#pragma unroll
-          for (int j = 0; j < NL; ++j) {
-            const float y = static_cast<float>(static_cast<WEIGHT_DTYPE>(x[j] * scale));
-            normed.d[j]   = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(y * static_cast<float>(w.d[j])));
-          }
-          thread_store(o + int64_t{row} * packs + i, normed);
-        } else {
-          thread_store(o + int64_t{row} * packs + i, got[r]);
-        }
+        thread_store(residual_out, cols, at);
+        const float scale = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
+        const Row normed =
+            thread_mul(thread_mul(at.template to<float>(), scale).template to<WEIGHT_DTYPE>().template to<float>(),
+                       w.template to<float>())
+                .template to<WEIGHT_DTYPE>()
+                .template to<DTYPE>();
+        thread_store(out, cols, normed);
+      } else {
+        thread_store(out, cols, at);
       }
     }
   }

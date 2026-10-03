@@ -26,7 +26,6 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
     DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
-  using V                = typename traits<DTYPE>::V;
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
@@ -39,6 +38,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
   const int cols = packs * NL;  // the row, in elements
+  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows of this rank's columns, a wave a row.
+  constexpr int SLICE_N = (TILE_N / WORLD + kWaveSize * NL - 1) / (kWaveSize * NL) * (kWaveSize * NL);
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, SLICE_N, THREADS_PER_BLOCK / kWaveSize,
+                     kWaveSize>;
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -49,17 +52,23 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
   const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
   const auto scratches = p2p::scratches<DTYPE, WORLD>(peer_scratch);
-  const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
+  const auto input = [&](int r) { return inputs[r].data(); };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
-  //    to every rank (itself too), at their place in the tensor.
-  for (int64_t e = threadIdx.x; e < int64_t{my_rows} * own_packs; e += blockDim.x) {
-    const int64_t q = e / own_packs;
-    const int64_t row = blockIdx.x + q * gridDim.x;
-    const int64_t i = row * packs + col0 + (e - q * own_packs);
-    const V sum       = peers_reduce(peers_load<DTYPE, WORLD>(read, i));
+  //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
+  //    gridDim.x-th), A WAVE A ROW, since a rank's columns are a narrow slice.
+  if (own_packs > 0) {
+    for (int q = 0; q < my_rows; q += Slice::kThreadsM) {
+      const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x + q * gridDim.x),
+                     col0 * NL, static_cast<int>(gridDim.x)};
+      Slice peers[WORLD];
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) p2p::write_scratch(scratches[r], i, sum);
+      for (int r = 0; r < WORLD; ++r) peers[r] = at;
+      peers_load(peers, input, cols);
+      const Slice sum = peers_reduce(peers);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) thread_store(scratches[r].data(), cols, sum);
+    }
   }
   block_stamp(2);
 

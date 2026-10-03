@@ -96,8 +96,10 @@ DINLINE PeerPacks<DTYPE, WORLD> peers_load(READ_PEER read, int64_t i) {
 }
 
 // A TILE'S LOAD AND STORE, `data` the tensor's first element and `row_stride` elements between its
-// rows: every load issued together, ONE ROUND TRIP A TILE (a row past M reads row M - 1, a pack
-// past N the last one), and a store of only the rows below M and the packs below N (stores do not
+// rows: every load issued together, ONE ROUND TRIP A TILE (a row past M is not read: a row is a
+// wave's or the block's, so the branch never splits a wave, where re-reading the last row cost a
+// whole round trip again; a pack past N reads the last one), and a store of only the rows below M
+// and the packs below N (stores do not
 // hold up loads, so the guard costs nothing). LOAD A TILE WHOLE BEFORE STORING ANYTHING: a pack
 // loaded between stores waits a round trip, since a store may alias it. A 16-byte pack goes through
 // the one-pack global instructions above; an fp32 tile's pack is 32 bytes and loads as the compiler
@@ -130,6 +132,7 @@ DINLINE void thread_load(TILE& t, const typename TILE::Acc* data,
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
+    if (!t.live(m)) continue;
     const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
@@ -166,7 +169,8 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
                         int64_t row_stride) {
   using P = typename TILE::Pack;
 #pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m)
+  for (int m = 0; m < TILE::kRows; ++m) {
+    if (!t[0].live(m)) continue;
 #pragma unroll
     for (int k = 0; k < t[0].K; ++k) {
       const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
@@ -174,6 +178,7 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
       for (int r = 0; r < WORLD; ++r)
         impl::held(t[r], m, k, impl::pack_load(reinterpret_cast<const P*>(data(r)) + i));
     }
+  }
   impl::issued();
 }
 
@@ -185,7 +190,8 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                          int slice) {
   using P = typename TILE::Pack;
 #pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m)
+  for (int m = 0; m < TILE::kRows; ++m) {
+    if (!t.live(m)) continue;
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
       const int owner = min(t.col(k) / (slice / t.kPack), WORLD - 1);
@@ -193,6 +199,7 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                  impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
                                  int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k)));
     }
+  }
   impl::issued();
 }
 
