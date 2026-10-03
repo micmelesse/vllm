@@ -128,12 +128,6 @@ void check_device_contiguous(std::initializer_list<const torch::Tensor*> ts) {
 }
 }  // namespace
 
-// AN OP'S ERROR RAISED.
-template <typename Launch>
-void ran(const std::variant<Launch, hip_comms::Error>& result) {
-  if (const hip_comms::Error* e = std::get_if<hip_comms::Error>(&result)) raise(*e);
-}
-
 // WHAT CROSSES THE TORCH BOUNDARY, as the tuples an op schema can return.
 using Names         = std::vector<std::string>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
@@ -422,7 +416,8 @@ torch::Tensor rocm_comms_stamps() {
 
 // THE PROBE'S OPS (experimental): calibrate.py times them, every rank together.
 void rocm_comms_probe_barrier(fptr_t handle_ptr) {
-  ran(hip_comms::experimental::probe_barrier(handle_of(handle_ptr), current_stream()));
+  const auto got = hip_comms::experimental::probe_barrier(handle_of(handle_ptr), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 // `ticks` an int64 [1] on device: the device clock ticks of `iters` round trips to `peer`.
@@ -430,8 +425,9 @@ void rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters, torch:
   check_device_contiguous({&ticks});
   TORCH_CHECK(ticks.scalar_type() == at::ScalarType::Long && ticks.numel() == 1,
               "ticks must be one int64");
-  ran(hip_comms::experimental::ping_pong(handle_of(handle_ptr), *narrowed(peer),
-                                         *narrowed(iters), ticks.data_ptr(), current_stream()));
+  const auto got = hip_comms::experimental::ping_pong(
+      handle_of(handle_ptr), *narrowed(peer), *narrowed(iters), ticks.data_ptr(), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 // `buffer` registered with the peers, or none for the staging; `mode` pull, push, split or each;
@@ -452,9 +448,10 @@ void rocm_comms_link_traffic(fptr_t handle_ptr, const std::optional<torch::Tenso
                     : mode == "push" ? Traffic::push
                     : mode == "split" ? Traffic::split
                                       : Traffic::each;
-  ran(hip_comms::experimental::link_traffic(
-      handle_of(handle_ptr), buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer),
-      *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream()));
+  const auto got = hip_comms::experimental::link_traffic(
+      handle_of(handle_ptr),
+      buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer), *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 // `buffer` registered with every rank's over the process group named `group`, a collective: the
@@ -495,11 +492,11 @@ void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor&
   check_device_contiguous({&out, &inp});
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
-  ran(hip_comms::all_reduce(handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(),
-                            inp.numel() * inp.element_size(), dtype_of(inp),
-                            algorithm_from(algorithm), direction_from(direction),
-                            narrowed(threads_per_block), narrowed(blocks_per_grid),
-                            current_stream()));
+  const auto got = hip_comms::all_reduce(
+      handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(), inp.numel() * inp.element_size(),
+      dtype_of(inp), algorithm_from(algorithm), direction_from(direction),
+      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 namespace {
@@ -541,11 +538,12 @@ void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch
                                     std::optional<int64_t> threads_per_block,
                                     std::optional<int64_t> blocks_per_grid) {
   norm_tensors(out, inp, weight, nullptr, nullptr);
-  ran(hip_comms::all_reduce_rms_norm(
+  const auto got = hip_comms::all_reduce_rms_norm(
       handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(), weight.data_ptr(), dtype_of(inp),
       dtype_of(weight), inp.size(0), inp.size(1), static_cast<float>(eps),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_n),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream()));
+      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 void rocm_comms_all_reduce_add_rms_norm(
@@ -555,12 +553,12 @@ void rocm_comms_all_reduce_add_rms_norm(
     std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid) {
   norm_tensors(out, inp, weight, &residual, &residual_out);
-  ran(hip_comms::all_reduce_add_rms_norm(
+  const auto got = hip_comms::all_reduce_add_rms_norm(
       handle_of(handle_ptr), out.data_ptr(), residual_out.data_ptr(), inp.data_ptr(),
       residual.data_ptr(), weight.data_ptr(), dtype_of(inp), dtype_of(weight), inp.size(0),
       inp.size(1), static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      current_stream()));
+      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 namespace {
@@ -615,15 +613,11 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
     std::optional<int64_t> blocks_per_grid) {
   attn_res_tensors(prefix, out, inp, blocks, norm_weight, qk_weight, out_norm_weight,
                    num_blocks, write_idx);
-  ran(hip_comms::all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr), prefix.data_ptr(), out.data_ptr(), inp.data_ptr(),
-      blocks.data_ptr(), blocks.stride(0), blocks.stride(1), norm_weight.data_ptr(),
-      qk_weight.data_ptr(), out_norm_weight ? out_norm_weight->data_ptr() : nullptr,
-      dtype_of(inp), inp.size(0), inp.size(1), static_cast<int>(num_blocks),
-      static_cast<int>(write_idx), static_cast<float>(eps), static_cast<float>(out_eps),
-      has_prefix, algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
-      narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream()));
+  const auto got = hip_comms::all_reduce_add_attn_res_rms_norm(
+      handle_of(handle_ptr), prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(),
+      blocks.stride(0), blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0), inp.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), static_cast<float>(out_eps), has_prefix, algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 namespace {
@@ -659,13 +653,13 @@ void rocm_comms_all_reduce_rms_norm_gemm(
     std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid) {
   gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
-  ran(hip_comms::all_reduce_rms_norm_gemm(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(),
-      norm_weight.data_ptr(), static_cast<float>(eps), gemm_weight.data_ptr(),
-      gemm_weight.size(0), workspace.data_ptr(), dtype_of(inp), inp.size(0), inp.size(1),
-      algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n),
-      narrowed(tile_k), narrowed(slice_k), narrowed(threads_per_block),
-      narrowed(blocks_per_grid), current_stream()));
+  const auto got = hip_comms::all_reduce_rms_norm_gemm(
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(),
+      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.size(0), workspace.data_ptr(),
+      dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
+      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
+      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 void rocm_comms_all_reduce_rms_norm_gemm_add(
@@ -676,13 +670,13 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid) {
   gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
-  ran(hip_comms::all_reduce_rms_norm_gemm_add(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(),
-      norm_weight.data_ptr(), static_cast<float>(eps), gemm_weight.data_ptr(),
-      gemm_weight.size(0), workspace.data_ptr(), dtype_of(inp), inp.size(0), inp.size(1),
-      algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n),
-      narrowed(tile_k), narrowed(slice_k), narrowed(threads_per_block),
-      narrowed(blocks_per_grid), current_stream()));
+  const auto got = hip_comms::all_reduce_rms_norm_gemm_add(
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(),
+      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.size(0), workspace.data_ptr(),
+      dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
+      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
+      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
@@ -701,11 +695,11 @@ void rocm_comms_all_reduce_rms_scale_add(
   TORCH_CHECK(latent > 0,
               "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  ran(hip_comms::all_reduce_rms_scale_add(
+  const auto got = hip_comms::all_reduce_rms_scale_add(
       handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden,
       latent, static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      current_stream()));
+      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
 // EXPERIMENTAL: AttnRes on a local `delta` (no all-reduce), prefix updated in place to
@@ -718,11 +712,9 @@ void rocm_comms_add_attn_res_rms_norm(
     std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid) {
   attn_res_tensors(prefix, out, delta, blocks, norm_weight, qk_weight, out_norm_weight,
                    num_blocks, write_idx);
-  ran(hip_comms::experimental::add_attn_res_rms_norm(
+  const auto got = hip_comms::experimental::add_attn_res_rms_norm(
       prefix.data_ptr(), out.data_ptr(), delta.data_ptr(), blocks.data_ptr(), blocks.stride(0),
       blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0),
-      delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
-      static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_n), narrowed(tile_k),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream()));
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0), delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx), static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_n), narrowed(tile_k), narrowed(threads_per_block), narrowed(blocks_per_grid), current_stream());
+  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
