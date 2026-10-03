@@ -41,7 +41,7 @@ def _summed(input_: torch.Tensor) -> torch.Tensor:
     """The all-reduce half of the fallback, through our backend where it takes it."""
     comm = _rocm_comm()
     if comm is not None and not comm.disabled and comm.should_allreduce(input_):
-        return comm.all_reduce(input_)
+        return comm.all_reduce(input_)[0]  # the sum, without what ran
     return tensor_model_parallel_all_reduce(input_)
 
 
@@ -64,7 +64,7 @@ def _all_reduce_rms_norm_impl(
 ) -> torch.Tensor:
     comm = _rocm_comm()
     if comm is not None and comm.should_allreduce_rms_norm(input_, weight):
-        return comm.all_reduce_rms_norm(input_, weight, epsilon)
+        return comm.all_reduce_rms_norm(input_, weight, epsilon)[0]
     _warn_unfused("rocm_comms_all_reduce_rms_norm")
     return vllm.ir.ops.rms_norm(_summed(input_), weight, epsilon)
 
@@ -83,7 +83,10 @@ def _all_reduce_add_rms_norm_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     comm = _rocm_comm()
     if comm is not None and comm.should_allreduce_add_rms_norm(input_, weight):
-        return comm.all_reduce_add_rms_norm(input_, residual, weight, epsilon)
+        out, residual_out, _ = comm.all_reduce_add_rms_norm(
+            input_, residual, weight, epsilon
+        )
+        return out, residual_out
     _warn_unfused("rocm_comms_all_reduce_add_rms_norm")
     return vllm.ir.ops.fused_add_rms_norm(_summed(input_), residual, weight, epsilon)
 
