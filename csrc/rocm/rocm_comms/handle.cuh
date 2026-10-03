@@ -4,7 +4,7 @@
 // THE RUNTIME STATE, one `Handle` per communicator: everything the running program learns, as
 // machine/build.cuh's `BuildInfo` is everything fixed at compile time. It maps every peer's signal
 // block, scratch and registered buffers once over HIP IPC handles, and hands a launch the
-// `DevComm` its kernel reads. The collective that exchanges the handles is the caller's
+// buffers its kernel reads. The collective that exchanges the handles is the caller's
 // (`Gather`), so this names no process group.
 
 #pragma once
@@ -94,7 +94,7 @@ class Handle {
   int64_t staging_bytes() const { return staging_bytes_; }
 
   // THE BUFFERS A CAPTURE RECORDED, registered, every rank together. During capture an input's
-  // address is not registered yet, so `dev_comm` reserves a slot and remembers the pointer; this
+  // address is not registered yet, so `peer_inputs` reserves a slot and remembers the pointer; this
   // gathers every rank's handle for each and fills the slots in. Sound because a captured address
   // is fixed for the graph's life: the kernel reads a slot filled AFTER the capture that recorded
   // the launch. False, with nothing registered, when the ranks captured different numbers (every
@@ -149,28 +149,31 @@ class Handle {
     buffer_handles_.erase(it);
   }
 
-  // What a launch over `input` (`bytes` long) on `stream` passes to its kernel.
-  p2p::DevComm dev_comm(const void* input, int64_t bytes, hipStream_t stream) {
-    p2p::DevComm p = dev_comm();
-    p.inputs       = slot_for(const_cast<void*>(input), bytes, stream);
-    p.input_packs  = bytes / 16;
+  // WHAT A KERNEL IS HANDED, each its own argument. Every rank's input for a launch over `input`
+  // (`bytes` long) on `stream`: a device table, filled after the capture for a captured launch
+  // (an eager input is copied into the staging, and the table is the staging's).
+  const p2p::PeerPtrs* peer_inputs(const void* input, int64_t bytes, hipStream_t stream) {
+    return slot_for(const_cast<void*>(input), bytes, stream);
+  }
+  // Every rank's scratch and staging, fixed for the handle's life: each rank's symmetric memory is
+  // [ Signal | scratch | staging ].
+  p2p::PeerPtrs peer_scratch() const {
+    p2p::PeerPtrs p{};
+    for (int r = 0; r < world_size_; ++r)
+      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(p2p::Signal);
     return p;
   }
-
-  // What a STAGED kernel's launch passes: no peer reads its input where it is, so it needs no
-  // slot; the kernel takes its own input and the staging's size as arguments and copies it in a
-  // pass at a time, any size.
-  p2p::DevComm dev_comm_staged(int64_t bytes) const {
-    p2p::DevComm p = dev_comm();
-    p.input_packs  = bytes / 16;
+  p2p::PeerPtrs peer_staging() const {
+    p2p::PeerPtrs p{};
+    for (int r = 0; r < world_size_; ++r)
+      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(p2p::Signal) + scratch_bytes_;
     return p;
   }
-
-  // A launch with no input: only the signals, for a kernel that moves no data.
-  p2p::DevComm dev_comm() const {
-    return p2p::DevComm{rank_, nullptr, signals_, self_signal_, 0, scratch_bytes_ / 16,
-                        timeout_ticks_};
-  }
+  // The synchronization state: every rank's signal block, this rank's, and how long a wait may
+  // last before it traps.
+  p2p::PeerSignals peer_signals() const { return signals_; }
+  p2p::Signal* self_signal() const { return self_signal_; }
+  uint64_t timeout_ticks() const { return timeout_ticks_; }
 
   // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is
   // registered at capture exit, before any replay). Otherwise it goes through the staging.

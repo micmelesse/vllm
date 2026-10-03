@@ -24,11 +24,19 @@ namespace hip_comms {
 template <typename T, int ngpus, bool kPrefix, int TILE_M, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_add_attn_res_rms_norm(
-        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
-        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
-        float eps, float out_eps, int rows, int packs, int reduce_scatter_blocks) {
+    all_reduce_pull_two_shot_add_attn_res_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                                   p2p::PeerPtrs peer_scratch,
+                                                   p2p::PeerSignals peer_signals,
+                                                   p2p::Signal* self_signal, int rank,
+                                                   uint64_t timeout_ticks, T* __restrict__ prefix,
+                                                   T* __restrict__ blocks, int64_t block_stride_m,
+                                                   int64_t block_stride_r,
+                                                   const T* __restrict__ norm_w,
+                                                   const T* __restrict__ qk_w,
+                                                   const T* __restrict__ out_norm_w,
+                                                   T* __restrict__ out, int num_blocks,
+                                                   int write_idx, float eps, float out_eps,
+                                                   int rows, int packs, int reduce_scatter_blocks) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -37,7 +45,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   V* o                   = reinterpret_cast<V*>(out);
   const int per_rank     = (packs + ngpus - 1) / ngpus;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
-  const int col0         = min(p.rank * slice, packs);
+  const int col0         = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));  // a late rank's may be short or none
   const int cols = packs * NL;                             // the row, in elements
   const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
@@ -50,19 +58,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
-  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
-  const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto own_scratch  = p2p::scratch<T, ngpus>(peer_scratch, rank);
 
   // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
   //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (its config, launch.cuh). THE (ROW,
-  //    COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every 16
-  //    bytes.
+  //    only: reads queue behind the links past a few dozen blocks (its config, select.cuh). THE
+  //    (ROW, COLUMN) STEPS, NOT DIVIDED: a 64-bit division a pack was a software routine on every
+  //    16 bytes.
   const int reducers = min(static_cast<int>(gridDim.x), reduce_scatter_blocks);
   if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
@@ -84,7 +93,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // 3. Every rank's columns are in its scratch, and every peer has read this rank's input: A WORLD
   //    BARRIER, since the blocks that wrote a row's columns are not the ones that read them.
-  p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
   // 4. This block's tiles of TILE_M rows: each pack from the rank that owns its columns, then
@@ -101,7 +111,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       for (int k = 0; k < kRowPacks; ++k) {
         const int owner = min(thread_cols.offs_n[k] / slice, ngpus - 1);
         sum[m][k] =
-            p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + thread_cols.offs_n[k]);
+            p2p::read_scratch(p2p::scratch<T, ngpus>(peer_scratch, owner),
+                              base + thread_cols.offs_n[k]);
       }
     }
     block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,

@@ -17,12 +17,11 @@ namespace hip_comms {
 // SLICE_K is the GEMM's lanes a column, TILE_K its K staged in LDS a pass.
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, bool kAdd>
-DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
-                                                         const T* __restrict__ norm_w, float eps,
-                                                         const T* __restrict__ gemm_w, int n_cols,
-                                                         T* __restrict__ out, int64_t out_stride,
-                                                         T* __restrict__ workspace, int rows,
-                                                         int packs) {
+DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
+    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerSignals peer_signals,
+    p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, const T* __restrict__ norm_w,
+    float eps, const T* __restrict__ gemm_w, int n_cols, T* __restrict__ out, int64_t out_stride,
+    T* __restrict__ workspace, int rows, int packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -33,9 +32,10 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
   const auto thread_cols = thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, cols, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
@@ -67,7 +67,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
   block_stamp(2);
-  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
   // 4. The GEMM over every row.
@@ -78,7 +79,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
 
   block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+                                                            timeout_ticks);
 }
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
@@ -86,14 +88,19 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(p2p::DevComm p,
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_rms_norm_gemm(p2p::DevComm p, const T* __restrict__ norm_w, float eps,
+    all_reduce_pull_one_shot_rms_norm_gemm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+                                           int rank, uint64_t timeout_ticks,
+                                           const T* __restrict__ norm_w, float eps,
                                            const T* __restrict__ gemm_w, int n_cols,
                                            T* __restrict__ out, int64_t out_stride,
                                            T* __restrict__ workspace, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, false>(
-        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+                                                     peer_inputs, peer_signals, self_signal, rank,
+                                                    timeout_ticks, norm_w, eps, gemm_w, n_cols, out,
+                                                    out_stride, workspace, rows, packs);
   else
     __builtin_trap();
 }
@@ -101,14 +108,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_rms_norm_gemm_add(p2p::DevComm p, const T* __restrict__ norm_w,
+    all_reduce_pull_one_shot_rms_norm_gemm_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                               p2p::PeerSignals peer_signals,
+                                               p2p::Signal* self_signal, int rank,
+                                               uint64_t timeout_ticks, const T* __restrict__ norm_w,
                                                float eps, const T* __restrict__ gemm_w, int n_cols,
                                                T* __restrict__ out, int64_t out_stride,
                                                T* __restrict__ workspace, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, true>(
-        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+                                                     peer_inputs, peer_signals, self_signal, rank,
+                                                    timeout_ticks, norm_w, eps, gemm_w, n_cols, out,
+                                                    out_stride, workspace, rows, packs);
   else
     __builtin_trap();
 }

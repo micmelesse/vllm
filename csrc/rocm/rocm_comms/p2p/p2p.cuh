@@ -6,7 +6,7 @@
 // way, and what they keep in `p2p::impl` is theirs.
 //
 // p2p::                     all one GPU does with another; a peer's address never leaves it
-//   A RANK'S BUFFERS, one view per kind, a rank only its index (this rank's own: r = p.rank):
+//   A RANK'S BUFFERS, one view per kind, a rank only its index (this rank's own: r = rank):
 //   input<T, ngpus>(p, r), inputs<T, ngpus>(p)          its input, read where it is (in place)
 //   staging<T, ngpus>(p, r), stagings<T, ngpus>(p)      its staging: a staged kernel copies its
 //                                                       rank's input there
@@ -34,7 +34,7 @@
 //                              quantized kernel that will use it
 //
 // and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks. The host side, which maps
-// the peers' memory and fills a DevComm per launch, is ../handle.cuh's Handle.
+// the peers' memory and hands a launch its buffers, is ../handle.cuh's Handle.
 
 #pragma once
 

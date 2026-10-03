@@ -20,11 +20,11 @@ namespace hip_comms {
 // bytes, so every rank holds the same result. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH
 // PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
-                                                        T* __restrict__ residual_out,
-                                                        const T* __restrict__ residual,
-                                                        const W* __restrict__ weight, float eps,
-                                                        int rows, int packs) {
+DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
+    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
+    p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+    T* __restrict__ out, T* __restrict__ residual_out, const T* __restrict__ residual,
+    const W* __restrict__ weight, float eps, int rows, int packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -41,15 +41,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = p2p::inputs<T, ngpus>(p);
-  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
   const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
-  const auto own_scratch  = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto own_scratch  = p2p::scratch<T, ngpus>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
@@ -57,7 +58,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   //    PIPELINED: the next row's loads go out before this row's reduction and norm, so a block's
   //    compute runs under its next round trip instead of between them (a block had ~14 rows at
   //    4096 tokens, each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
-  const int first = p.rank * slice_rows;
+  const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   // Row `row`'s packs from every rank.
   const auto load = [&](int row) { return peers_load<T, ngpus>(read, row, packs, thread_cols); };
@@ -140,7 +141,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
@@ -196,22 +198,29 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_norm(p2p::DevComm p, T* __restrict__ out,
-                                      const W* __restrict__ weight, float eps, int rows,
-                                      int packs) {
+    all_reduce_pull_two_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                      p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
+                                      p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+                                      T* __restrict__ out, const W* __restrict__ weight, float eps,
+                                      int rows, int packs) {
   all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, false, TILE_N, THREADS_PER_BLOCK>(
-      p, out, nullptr, nullptr, weight, eps, rows, packs);
+       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
+      nullptr, weight, eps, rows, packs);
 }
 
 template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_add_rms_norm(p2p::DevComm p, T* __restrict__ out,
+    all_reduce_pull_two_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                          p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
+                                          p2p::Signal* self_signal, int rank,
+                                          uint64_t timeout_ticks, T* __restrict__ out,
                                           T* __restrict__ residual_out,
                                           const T* __restrict__ residual,
                                           const W* __restrict__ weight, float eps, int rows,
                                           int packs) {
   all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, true, TILE_N, THREADS_PER_BLOCK>(
-      p, out, residual_out, residual, weight, eps, rows, packs);
+       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
+      residual, weight, eps, rows, packs);
 }
 
 }  // namespace hip_comms

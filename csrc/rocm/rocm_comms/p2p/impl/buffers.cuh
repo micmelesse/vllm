@@ -9,9 +9,12 @@
 // A RANK'S MEMORY, two places:
 //   ours, one allocation (Handle's symmetric memory), mapped by every peer at startup:
 //     [ Signal | scratch | staging ]
+//   each handed to a kernel as its own argument: every rank's signal block, scratch and
+//   staging (PeerPtrs by value);
 //   the caller's, one tensor a call:
-//     [ input ]   read in place only when registered or captured; otherwise a staged kernel
-//                 copies it into the staging
+//     [ input ]   read in place only when registered or captured, its peers' addresses a device
+//                 table (`const PeerPtrs*`: a captured launch's are filled after the capture);
+//                 otherwise a staged kernel copies it into the staging
 // The Signal block is its synchronization state (`Signals`): never read as data.
 
 #pragma once
@@ -32,34 +35,17 @@ namespace hip_comms::p2p {
 
 namespace impl {
 
-// Rank r's scratch, the bytes after its signal block, picked from the kernel's arguments: BY
-// SELECT, never an index, since a runtime index into a pointer array puts the array in scratch
-// memory (seen in the ISA: 152 bytes a lane and a scratch load per read).
+// RANK r'S BUFFER from the kernel's pointer array for its kind (every rank's input, scratch or
+// staging), BY SELECT, never an index: a runtime index into a pointer array puts the array in
+// scratch memory (seen in the ISA: 152 bytes a lane and a scratch load per read), where a constant
+// index keeps the loads scalar and issued together.
 template <typename T, int ngpus>
-DINLINE typename traits<T>::V* scratch_of(const DevComm& p, int r) {
+DINLINE typename traits<T>::V* rank_of(const PeerPtrs& ptrs, int r) {
   using V = typename traits<T>::V;
-  V* at   = reinterpret_cast<V*>(p.signals.s[0] + 1);
+  V* at   = reinterpret_cast<V*>(ptrs.p[0]);
 #pragma unroll
   for (int k = 1; k < ngpus; ++k)
-    if (r == k) at = reinterpret_cast<V*>(p.signals.s[k] + 1);
-  return at;
-}
-
-// Rank r's staging, the same way: it follows the rank's scratch.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V* staging_of(const DevComm& p, int r) {
-  return scratch_of<T, ngpus>(p, r) + p.scratch_packs;
-}
-
-// Rank r's input for this launch, the same way: each rank's pointer by a constant index, so the
-// loads are scalar and issue together (a runtime index made them one dependent vector load).
-template <typename T, int ngpus>
-DINLINE const typename traits<T>::V* input_of(const DevComm& p, int r) {
-  using V     = typename traits<T>::V;
-  const V* at = reinterpret_cast<const V*>(p.inputs->p[0]);
-#pragma unroll
-  for (int k = 1; k < ngpus; ++k)
-    if (r == k) at = reinterpret_cast<const V*>(p.inputs->p[k]);
+    if (r == k) at = reinterpret_cast<V*>(ptrs.p[k]);
   return at;
 }
 
@@ -82,11 +68,8 @@ class Buffer {
   DINLINE Buffer() = default;
   // `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane,
   // the compiler knows it, and the pointer loads are scalar rather than one per lane.
-  DINLINE Buffer(const DevComm& p, int r) {
-    const int first = __builtin_amdgcn_readfirstlane(r);
-    if constexpr (kKind == Kind::input) at_ = const_cast<V*>(impl::input_of<T, ngpus>(p, first));
-    if constexpr (kKind == Kind::staging) at_ = impl::staging_of<T, ngpus>(p, first);
-    if constexpr (kKind == Kind::scratch) at_ = impl::scratch_of<T, ngpus>(p, first);
+  DINLINE Buffer(const PeerPtrs& ptrs, int r) {
+    at_ = impl::rank_of<T, ngpus>(ptrs, __builtin_amdgcn_readfirstlane(r));
   }
   DINLINE V* at() const { return at_; }
 };
@@ -101,7 +84,7 @@ using Scratch = Buffer<T, ngpus, Kind::scratch>;
 // ONE RANK'S BUFFER OF A KIND, and EVERY RANK'S: how a kernel begins, before its start barrier so
 // the pointer loads hide under the wait.
 template <typename T, int ngpus, Kind kKind>
-DINLINE std::array<Buffer<T, ngpus, kKind>, ngpus> every(const DevComm& p) {
+DINLINE std::array<Buffer<T, ngpus, kKind>, ngpus> every(const PeerPtrs& p) {
   std::array<Buffer<T, ngpus, kKind>, ngpus> all;
 #pragma unroll
   for (int r = 0; r < ngpus; ++r) all[r] = Buffer<T, ngpus, kKind>(p, r);
@@ -109,21 +92,21 @@ DINLINE std::array<Buffer<T, ngpus, kKind>, ngpus> every(const DevComm& p) {
 }
 
 template <typename T, int ngpus>
-DINLINE Input<T, ngpus> input(const DevComm& p, int r) { return Input<T, ngpus>(p, r); }
+DINLINE Input<T, ngpus> input(const PeerPtrs& p, int r) { return Input<T, ngpus>(p, r); }
 template <typename T, int ngpus>
-DINLINE Staging<T, ngpus> staging(const DevComm& p, int r) { return Staging<T, ngpus>(p, r); }
+DINLINE Staging<T, ngpus> staging(const PeerPtrs& p, int r) { return Staging<T, ngpus>(p, r); }
 template <typename T, int ngpus>
-DINLINE Scratch<T, ngpus> scratch(const DevComm& p, int r) { return Scratch<T, ngpus>(p, r); }
+DINLINE Scratch<T, ngpus> scratch(const PeerPtrs& p, int r) { return Scratch<T, ngpus>(p, r); }
 template <typename T, int ngpus>
-DINLINE std::array<Input<T, ngpus>, ngpus> inputs(const DevComm& p) {
+DINLINE std::array<Input<T, ngpus>, ngpus> inputs(const PeerPtrs& p) {
   return every<T, ngpus, Kind::input>(p);
 }
 template <typename T, int ngpus>
-DINLINE std::array<Staging<T, ngpus>, ngpus> stagings(const DevComm& p) {
+DINLINE std::array<Staging<T, ngpus>, ngpus> stagings(const PeerPtrs& p) {
   return every<T, ngpus, Kind::staging>(p);
 }
 template <typename T, int ngpus>
-DINLINE std::array<Scratch<T, ngpus>, ngpus> scratches(const DevComm& p) {
+DINLINE std::array<Scratch<T, ngpus>, ngpus> scratches(const PeerPtrs& p) {
   return every<T, ngpus, Kind::scratch>(p);
 }
 
@@ -208,11 +191,11 @@ class Signals {
 namespace impl {
 
 // Rank r's signal block, by select.
-DINLINE Signal* signal_of(const DevComm& p, int r) {
-  Signal* at = p.signals.s[0];
+DINLINE Signal* signal_of(const PeerSignals& peer_signals, int r) {
+  Signal* at = peer_signals.s[0];
 #pragma unroll
   for (int k = 1; k < kMaxRanks; ++k)
-    if (r == k) at = p.signals.s[k];
+    if (r == k) at = peer_signals.s[k];
   return at;
 }
 
@@ -220,11 +203,13 @@ DINLINE Signal* signal_of(const DevComm& p, int r) {
 
 // This rank's signal block; rank r's, r the same across the wave (by select); and thread i's peer
 // i's, each thread its own (a per-lane load, as the pairing barrier issues it).
-DINLINE Signals own_signals(const DevComm& p) { return Signals(p.self); }
-DINLINE Signals signals(const DevComm& p, int r) { return Signals(impl::signal_of(p, r)); }
+DINLINE Signals own_signals(Signal* self_signal) { return Signals(self_signal); }
+DINLINE Signals signals(const PeerSignals& peer_signals, int r) {
+  return Signals(impl::signal_of(peer_signals, r));
+}
 template <typename I>
-DINLINE Signals lane_signals(const DevComm& p, I i) {
-  return Signals(p.signals.s[i]);
+DINLINE Signals lane_signals(const PeerSignals& peer_signals, I i) {
+  return Signals(peer_signals.s[i]);
 }
 
 }  // namespace hip_comms::p2p

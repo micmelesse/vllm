@@ -19,7 +19,10 @@ namespace hip_comms {
 // float(projected) * scale).
 template <typename T, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
+    all_reduce_pull_one_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+                                           int rank, uint64_t timeout_ticks, T* __restrict__ out,
+                                           float eps, int rows,
                                            int hidden_packs, int latent_packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
@@ -34,9 +37,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       thread_offs<T, THREADS_PER_BLOCK>(Tile<1, TILE_N>{rows, latent_packs * NL, 0, 0});
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto shared = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
   const auto proj   = [&](int r, int64_t i) {
@@ -86,7 +90,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+                                                            timeout_ticks);
   block_stamp(5);
 }
 

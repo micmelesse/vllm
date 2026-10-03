@@ -908,12 +908,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       using T = typename decltype(t)::t;
       switch (fn) {
         case Template::all_reduce_pull_one_shot:
-          kernel = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_one_shot_staged<T, NG>)
-                          : instance<AllReduceKernel>(all_reduce_pull_one_shot<T, NG>);
+          kernel = staged ? instance<AllReduceOneShotStagedKernel>(
+                                all_reduce_pull_one_shot_staged<T, NG>)
+                          : instance<AllReduceOneShotKernel>(all_reduce_pull_one_shot<T, NG>);
           return;
         case Template::all_reduce_pull_two_shot:
-          kernel = staged ? instance<AllReduceStagedKernel>(all_reduce_pull_two_shot_staged<T, NG>)
-                          : instance<AllReduceKernel>(all_reduce_pull_two_shot<T, NG>);
+          kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
+                                all_reduce_pull_two_shot_staged<T, NG>)
+                          : instance<AllReduceTwoShotKernel>(all_reduce_pull_two_shot<T, NG>);
           return;
         default: not_this_ops(fn);
       }
@@ -979,21 +981,21 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
             return by_config<K::all_reduce_pull_one_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<RmsNormKernel>(
+              kernel = instance<RmsNormOneShotKernel>(
                   all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB>);
             });
           case K::all_reduce_pull_two_shot_rms_norm:
             return by_config<K::all_reduce_pull_two_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<RmsNormKernel>(
+              kernel = instance<RmsNormTwoShotKernel>(
                   all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB>);
             });
           case K::all_reduce_push_two_shot_rms_norm:
             return by_config<K::all_reduce_push_two_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<RmsNormKernel>(
+              kernel = instance<RmsNormTwoShotKernel>(
                   all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB>);
             });
           default: not_this_ops(fn);
@@ -1066,21 +1068,21 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
             return by_config<K::all_reduce_pull_one_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<AddRmsNormKernel>(
+              kernel = instance<AddRmsNormOneShotKernel>(
                   all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB>);
             });
           case K::all_reduce_pull_two_shot_add_rms_norm:
             return by_config<K::all_reduce_pull_two_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<AddRmsNormKernel>(
+              kernel = instance<AddRmsNormTwoShotKernel>(
                   all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
             });
           case K::all_reduce_push_two_shot_add_rms_norm:
             return by_config<K::all_reduce_push_two_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
               constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
-              kernel = instance<AddRmsNormKernel>(
+              kernel = instance<AddRmsNormTwoShotKernel>(
                   all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
             });
           default: not_this_ops(fn);
@@ -1164,10 +1166,10 @@ select_all_reduce_add_attn_res_rms_norm(
             constexpr AttnResConfig C = decltype(cc)::value;
             constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
             kernel = has_prefix
-                         ? instance<AttnResKernel>(
+                         ? instance<AttnResOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN,
                                                                               TK, TPB>)
-                         : instance<AttnResKernel>(
+                         : instance<AttnResOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, TN,
                                                                               TK, TPB>);
           });
@@ -1189,10 +1191,10 @@ select_all_reduce_add_attn_res_rms_norm(
             constexpr AttnResConfig C = decltype(cc)::value;
             constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
             kernel = has_prefix
-                         ? instance<AttnResKernel>(
+                         ? instance<AttnResPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN,
                                                                               TK, TPB>)
-                         : instance<AttnResKernel>(
+                         : instance<AttnResPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, TN,
                                                                               TK, TPB>);
           });
@@ -1282,11 +1284,11 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
                       TPB = C.launch.threads_per_block;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm:
-            kernel = instance<GemmTailKernel>(
+            kernel = instance<GemmTailOneShotKernel>(
                 all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
             return;
           case K::all_reduce_pull_two_shot_rms_norm_gemm:
-            kernel = instance<GemmTailKernel>(
+            kernel = instance<GemmTailTwoShotKernel>(
                 all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
             return;
           default: not_this_ops(fn);
@@ -1365,11 +1367,11 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
                       TPB = C.launch.threads_per_block;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm_add:
-            kernel = instance<GemmTailKernel>(
+            kernel = instance<GemmTailOneShotKernel>(
                 all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
             return;
           case K::all_reduce_pull_two_shot_rms_norm_gemm_add:
-            kernel = instance<GemmTailKernel>(
+            kernel = instance<GemmTailTwoShotKernel>(
                 all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
             return;
           default: not_this_ops(fn);
@@ -1456,11 +1458,11 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
         constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_scale_add:
-            kernel = instance<RmsScaleAddKernel>(
+            kernel = instance<RmsScaleAddOneShotKernel>(
                 all_reduce_pull_one_shot_rms_scale_add<T, NG, TN, TPB>);
             return;
           case K::all_reduce_pull_two_shot_rms_scale_add:
-            kernel = instance<RmsScaleAddKernel>(
+            kernel = instance<RmsScaleAddTwoShotKernel>(
                 all_reduce_pull_two_shot_rms_scale_add<T, NG, TN, TPB>);
             return;
           default: not_this_ops(fn);

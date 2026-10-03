@@ -13,14 +13,17 @@
 
 namespace hip_comms {
 
-// EVERY THREAD STREAMING 16-byte packs: pulled from the buffer `p.inputs` names on `peer` (a pull
-// only) or every other rank (the staging, or a registered buffer), pushed into every other rank's
-// staging, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
+// EVERY THREAD STREAMING 16-byte packs: pulled from the buffer `peer_inputs` names on `peer` (a
+// pull only) or every other rank (the staging, or a registered buffer), pushed into every other
+// rank's staging, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
 // `each` block doing both, pack by pack. The pulled packs are folded into `sink` only if they
 // equal an impossible value, which keeps the loads without a store per load.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
-    link_traffic(p2p::DevComm p, int mode, int peer, int pullers, int64_t packs, uint32_t* sink) {
+    link_traffic(const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_staging,
+                 p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
+                 uint64_t timeout_ticks, int mode, int peer, int pullers, int64_t packs,
+                 uint32_t* sink) {
   using V              = typename traits<T>::V;
   const auto traffic   = static_cast<Traffic>(mode);
   const bool split     = traffic == Traffic::split;
@@ -33,8 +36,9 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int blocks     = !split ? grid : puller ? pullers : grid - pullers;
   const int64_t first  = int64_t{index} * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t{blocks} * blockDim.x;
-  const auto buffers   = p2p::inputs<T, ngpus>(p);
-  const auto stagings  = p2p::stagings<T, ngpus>(p);  // a push's target: never the pulled buffer
+  const auto buffers   = p2p::inputs<T, ngpus>(*peer_inputs);
+  // A push's target: never the pulled buffer.
+  const auto stagings  = p2p::stagings<T, ngpus>(peer_staging);
   V v;
   uint32_t* w = reinterpret_cast<uint32_t*>(&v);
 #pragma unroll
@@ -44,7 +48,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     if (pulls) {
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
-        if (r != p.rank && (peer < 0 || r == peer)) {
+        if (r != rank && (peer < 0 || r == peer)) {
           const V got       = p2p::read_input(buffers[r], i);
           const uint32_t* g = reinterpret_cast<const uint32_t*>(&got);
 #pragma unroll
@@ -54,7 +58,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     if (pushes) {
 #pragma unroll
       for (int r = 0; r < ngpus; ++r)
-        if (r != p.rank) p2p::write_staging(stagings[r], i, v);
+        if (r != rank) p2p::write_staging(stagings[r], i, v);
     }
   }
   if (acc == 0x9e3779b9u) *sink = acc;

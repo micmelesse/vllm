@@ -21,11 +21,11 @@ namespace hip_comms {
 // in the same order), so every rank holds the same result. ROW q BELONGS TO BLOCK q % gridDim.x
 // IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, typename W, int ngpus, bool kAdd, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __restrict__ out,
-                                                        T* __restrict__ residual_out,
-                                                        const T* __restrict__ residual,
-                                                        const W* __restrict__ weight, float eps,
-                                                        int rows, int packs) {
+DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
+    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
+    p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+    T* __restrict__ out, T* __restrict__ residual_out, const T* __restrict__ residual,
+    const W* __restrict__ weight, float eps, int rows, int packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -35,7 +35,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice        = (packs + ngpus - 1) / ngpus;
-  const int col0         = p.rank * slice;
+  const int col0         = rank * slice;
   const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
@@ -45,12 +45,13 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = p2p::inputs<T, ngpus>(p);
-  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
   const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
@@ -66,14 +67,15 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
   // 4. This block's rows out of this rank's scratch: (kAdd) add the residual, then RMSNorm,
   //    rounding as the reference does (the one-shot kernel spells it out). The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
-  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
     float s[kRowPacks][NL];
@@ -112,22 +114,29 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(p2p::DevComm p, T* __res
 // THE KERNELS, one per op, both the body above.
 template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_push_two_shot_rms_norm(p2p::DevComm p, T* __restrict__ out,
-                                      const W* __restrict__ weight, float eps, int rows,
-                                      int packs) {
+    all_reduce_push_two_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                      p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
+                                      p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+                                      T* __restrict__ out, const W* __restrict__ weight, float eps,
+                                      int rows, int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<T, W, ngpus, false, TILE_N, THREADS_PER_BLOCK>(
-      p, out, nullptr, nullptr, weight, eps, rows, packs);
+       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
+      nullptr, weight, eps, rows, packs);
 }
 
 template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_push_two_shot_add_rms_norm(p2p::DevComm p, T* __restrict__ out,
+    all_reduce_push_two_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                          p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
+                                          p2p::Signal* self_signal, int rank,
+                                          uint64_t timeout_ticks, T* __restrict__ out,
                                           T* __restrict__ residual_out,
                                           const T* __restrict__ residual,
                                           const W* __restrict__ weight, float eps, int rows,
                                           int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<T, W, ngpus, true, TILE_N, THREADS_PER_BLOCK>(
-      p, out, residual_out, residual, weight, eps, rows, packs);
+       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
+      residual, weight, eps, rows, packs);
 }
 
 }  // namespace hip_comms

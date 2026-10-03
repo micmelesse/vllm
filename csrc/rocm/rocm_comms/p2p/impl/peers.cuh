@@ -49,17 +49,4 @@ struct Signal {
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
 struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
-// THE DEVICE COMMUNICATOR, what a launch passes by value (NCCL's ncclDevComm): every rank's input
-// (through a slot of the peer-pointer slab), every rank's signal block and scratch, and this
-// launch's limits. Plain fields; `Handle::dev_comm` fills one per launch.
-struct DevComm {
-  int rank;
-  const PeerPtrs* inputs;      // device memory: every rank's input for this launch
-  PeerSignals signals;         // every rank's signal block; its scratch follows it
-  Signal* self;                // this rank's
-  int64_t input_packs;         // 16-byte packs of the input
-  int64_t scratch_packs;       // of each rank's scratch
-  uint64_t timeout_ticks;      // a wait longer than this traps
-};
-
 }  // namespace hip_comms::p2p

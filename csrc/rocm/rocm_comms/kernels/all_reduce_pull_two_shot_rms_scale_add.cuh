@@ -20,7 +20,11 @@ namespace hip_comms {
 // the same block on each owner finished, which is what a peers barrier makes visible.
 template <typename T, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_scale_add(p2p::DevComm p, T* __restrict__ out, float eps, int rows,
+    all_reduce_pull_two_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                           p2p::PeerPtrs peer_scratch,
+                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+                                           int rank, uint64_t timeout_ticks, T* __restrict__ out,
+                                           float eps, int rows,
                                            int hidden_packs, int latent_packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
@@ -44,11 +48,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs      = p2p::inputs<T, ngpus>(p);
-  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
-  const auto scratches   = p2p::scratches<T, ngpus>(p);
+  const auto inputs      = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
+  const auto scratches   = p2p::scratches<T, ngpus>(peer_scratch);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto shared = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
   const auto proj   = [&](int r, int64_t i) {
@@ -60,8 +65,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   // 2. This rank's rows, finished: each (row, slice) from every rank, the latent's sum of squares
   //    over the block, then the slice into this rank's scratch, at the row's place among its own.
-  const int first_row = p.rank * slice_rows;
-  for (int w = blockIdx.x; w < rows_of(p.rank) * splits; w += gridDim.x) {
+  const int first_row = rank * slice_rows;
+  for (int w = blockIdx.x; w < rows_of(rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
     const auto hidden_cols = slice_of(w);
     const auto sh = peers_load<T, ngpus>(shared, row, packs, hidden_cols);
@@ -96,7 +101,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   block_stamp(3);
   // 3. Every rank's finished rows are visible to its peers, and every peer has read this rank's
   //    input.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(4);
 
   // 4. Every owner's finished rows out of its scratch, at their place in the output: this block's

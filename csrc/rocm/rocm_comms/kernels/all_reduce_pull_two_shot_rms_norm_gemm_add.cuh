@@ -18,12 +18,11 @@ namespace hip_comms {
 // PACK IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, bool kAdd>
-DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
-                                                         const T* __restrict__ norm_w, float eps,
-                                                         const T* __restrict__ gemm_w, int n_cols,
-                                                         T* __restrict__ out, int64_t out_stride,
-                                                         T* __restrict__ workspace, int rows,
-                                                         int packs) {
+DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
+    const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
+    p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+    const T* __restrict__ norm_w, float eps, const T* __restrict__ gemm_w, int n_cols,
+    T* __restrict__ out, int64_t out_stride, T* __restrict__ workspace, int rows, int packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -36,19 +35,20 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = p2p::inputs<T, ngpus>(p);
-  const auto scratches = p2p::scratches<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
-  const auto own_scratch = p2p::scratch<T, ngpus>(p, p.rank);
+  const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
-  const int first = p.rank * slice_rows;
+  const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
     const int64_t at = int64_t{row - first} * packs;
@@ -76,7 +76,8 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
 
   // 3. Every rank's normed rows are visible to its peers.
   block_stamp(2);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
   // 4. Every owner's normed rows out of its scratch, into the workspace.
@@ -101,7 +102,8 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
 
   // 5. The GEMM reads rows other blocks of this rank copied.
   block_stamp(4);
-  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
+  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(5);
 
   // 6. The GEMM over every row, TILE_M per pass.
@@ -118,14 +120,21 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(p2p::DevComm p,
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_norm_gemm(p2p::DevComm p, const T* __restrict__ norm_w, float eps,
+    all_reduce_pull_two_shot_rms_norm_gemm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                           p2p::PeerPtrs peer_scratch,
+                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
+                                           int rank, uint64_t timeout_ticks,
+                                           const T* __restrict__ norm_w, float eps,
                                            const T* __restrict__ gemm_w, int n_cols,
                                            T* __restrict__ out, int64_t out_stride,
                                            T* __restrict__ workspace, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, false>(
-        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+                                                     peer_inputs, peer_scratch, peer_signals,
+                                                    self_signal, rank, timeout_ticks, norm_w, eps,
+                                                    gemm_w, n_cols, out, out_stride, workspace,
+                                                    rows, packs);
   else
     __builtin_trap();
 }
@@ -133,14 +142,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 template <typename T, int ngpus, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_two_shot_rms_norm_gemm_add(p2p::DevComm p, const T* __restrict__ norm_w,
+    all_reduce_pull_two_shot_rms_norm_gemm_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                               p2p::PeerPtrs peer_scratch,
+                                               p2p::PeerSignals peer_signals,
+                                               p2p::Signal* self_signal, int rank,
+                                               uint64_t timeout_ticks, const T* __restrict__ norm_w,
                                                float eps, const T* __restrict__ gemm_w, int n_cols,
                                                T* __restrict__ out, int64_t out_stride,
                                                T* __restrict__ workspace, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_two_shot_rms_norm_gemm_body<T, ngpus, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, true>(
-        p, norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs);
+                                                     peer_inputs, peer_scratch, peer_signals,
+                                                    self_signal, rank, timeout_ticks, norm_w, eps,
+                                                    gemm_w, n_cols, out, out_stride, workspace,
+                                                    rows, packs);
   else
     __builtin_trap();
 }

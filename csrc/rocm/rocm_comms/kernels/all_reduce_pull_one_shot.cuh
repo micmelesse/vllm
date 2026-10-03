@@ -16,13 +16,16 @@ namespace hip_comms {
 // `num_packs` packs, a thread a pack at a time over the whole grid.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
-    all_reduce_pull_one_shot(p2p::DevComm p, T* __restrict__ out, int num_packs) {
+    all_reduce_pull_one_shot(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                             p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
+                             uint64_t timeout_ticks, T* __restrict__ out, int num_packs) {
   using V = typename traits<T>::V;
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<T, ngpus>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
@@ -33,7 +36,8 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+                                                            timeout_ticks);
   block_stamp(5);
 }
 
@@ -43,14 +47,16 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 // visible.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
-    all_reduce_pull_one_shot_staged(p2p::DevComm p, T* __restrict__ out, int64_t num_packs,
+    all_reduce_pull_one_shot_staged(p2p::PeerPtrs peer_staging, p2p::PeerSignals peer_signals,
+                                    p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
+                                    T* __restrict__ out, int64_t num_packs,
                                     const T* __restrict__ own_input, int64_t stage_packs) {
   using V             = typename traits<T>::V;
   const V* own        = reinterpret_cast<const V*>(own_input);
   const int64_t first = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
   const int64_t step  = int64_t{gridDim.x} * blockDim.x;
-  const auto stagings = p2p::stagings<T, ngpus>(p);
-  const auto own_staging = p2p::staging<T, ngpus>(p, p.rank);
+  const auto stagings = p2p::stagings<T, ngpus>(peer_staging);
+  const auto own_staging = p2p::staging<T, ngpus>(peer_staging, rank);
   const auto read     = [&](int r, int64_t i) { return p2p::read_staging(stagings[r], i); };
   V* dst              = reinterpret_cast<V*>(out);
 
@@ -59,14 +65,16 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     block_stamp(0);
     // 1. This rank's pass into its staging, then visible to the peers (each has staged its own).
     for (int64_t i = first; i < n; i += step) p2p::write_staging(own_staging, i, own[c0 + i]);
-    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(p);
+    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+        peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(1);
     // 2. Read every rank's staged pass, in rank order, and sum.
     for (int64_t i = first; i < n; i += step)
       thread_store(dst + c0 + i, peers_reduce(peers_load<T, ngpus>(read, i)));
     block_stamp(2);
     // 3. No rank may stage its next pass until every peer has read this one.
-    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(
+        peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(5);
   }
 }

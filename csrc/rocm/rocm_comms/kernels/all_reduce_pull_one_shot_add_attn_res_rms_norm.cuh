@@ -17,11 +17,18 @@ namespace hip_comms {
 // in elements; `write_idx` < 0 writes no block.
 template <typename T, int ngpus, bool kPrefix, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    all_reduce_pull_one_shot_add_attn_res_rms_norm(
-        p2p::DevComm p, T* __restrict__ prefix, T* __restrict__ blocks, int64_t block_stride_m,
-        int64_t block_stride_r, const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-        const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks, int write_idx,
-        float eps, float out_eps, int rows, int packs) {
+    all_reduce_pull_one_shot_add_attn_res_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
+                                                   p2p::PeerSignals peer_signals,
+                                                   p2p::Signal* self_signal, int rank,
+                                                   uint64_t timeout_ticks, T* __restrict__ prefix,
+                                                   T* __restrict__ blocks, int64_t block_stride_m,
+                                                   int64_t block_stride_r,
+                                                   const T* __restrict__ norm_w,
+                                                   const T* __restrict__ qk_w,
+                                                   const T* __restrict__ out_norm_w,
+                                                   T* __restrict__ out, int num_blocks,
+                                                   int write_idx, float eps, float out_eps,
+                                                   int rows, int packs) {
   constexpr int kRowPacks = packs_per_thread<T, TILE_N, THREADS_PER_BLOCK>();
   using V                = typename traits<T>::V;
   constexpr int NL       = traits<T>::N;
@@ -38,8 +45,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<T, ngpus>(p);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(p);
+  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+      peer_signals, self_signal, rank, timeout_ticks);
   const auto read = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
@@ -54,7 +62,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(p);
+  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+                                                            timeout_ticks);
 }
 
 }  // namespace hip_comms
