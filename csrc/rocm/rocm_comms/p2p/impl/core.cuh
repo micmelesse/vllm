@@ -5,9 +5,10 @@
 // of. A rank's buffers and their reads and writes are buffers.cuh's.
 //
 // HIP_COMMS_DEBUG=1 BUILDS THE TESTS' MACHINERY IN: a wait that outlives the timeout prints where
-// it was and traps, so a hang is an error, and every wait is skewed by a random per-block
-// delay, so a race shows on every run. Off (the default), none of it is in the kernels: a clock
-// read on every poll and a printf path in every kernel are not free.
+// it was before it traps, and every wait is skewed by a random per-block delay, so a race shows
+// on every run. Off (the default), a wait still backs off and traps at the timeout, but reads the
+// clock every 256 polls and prints nothing: a clock read a poll and a printf path in every kernel
+// are not free.
 
 #pragma once
 
@@ -78,8 +79,15 @@ DINLINE void wait(const DevComm& p, const Counter& flag, uint32_t want, const ch
     }
   }
 #else
-  (void)p, (void)what, (void)peer;
-  while (flag.load<__ATOMIC_RELAXED, kScope>() < want) {
+  // A RELEASE BUILD BACKS OFF AND TIMES OUT. A sleep a poll (64 cycles) keeps a spinning block
+  // from hammering the link with polls; a clock read every 256 polls bounds a hang to the build's
+  // timeout, a trap rather than every rank's blocks spinning until the process is killed. Neither
+  // costs what the debug build's clock read a poll and printf path do.
+  (void)what, (void)peer;
+  const uint64_t t0 = wall_clock64();
+  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, kScope>() < want; ++n) {
+    __builtin_amdgcn_s_sleep(1);
+    if ((n & 255u) == 0 && wall_clock64() - t0 > p.timeout_ticks) __builtin_trap();
   }
 #endif
   if constexpr (kAcquire) fence<__ATOMIC_ACQUIRE, kScope>();

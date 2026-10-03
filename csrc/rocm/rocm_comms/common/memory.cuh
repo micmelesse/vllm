@@ -55,12 +55,12 @@ DINLINE V thread_load_uncached(const V* p) {
   return v;
 }
 
-// WHAT A RANK WRITES INTO A PEER, stored past every cache: one 16-byte store at system scope
-// (`sc0 sc1`, written through to the peer), the twin of `thread_load_uncached`. A plain store to a
-// peer's memory can be acknowledged before the peer can see it, so a wave's `s_waitcnt
-// vmcnt(0)` before the barrier did not mean the data had landed, and the slowest rank's
-// writes arrived after its barrier flag (readers read the previous call's values). With the
-// scope bits the same wait covers it. IN ASM because no builtin spells this store: a
+// A STORE PAST EVERY CACHE: one 16-byte store at system scope (`sc0 sc1`, written through), the
+// twin of `thread_load_uncached`. Unused today: it was the push's store into a peer while scratch
+// was allocated cached (a plain store there could be acknowledged before the peer saw it, and the
+// slowest rank's writes landed after its barrier flag). Scratch is now allocated uncached and the
+// push stores plainly into it, as aiter's does (500dd54535; tests passed and timings were about
+// equal, 2026-09-30T23-10-02Z). IN ASM because no builtin spells this store: a
 // system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
 template <typename V>
 DINLINE void thread_store_uncached(V* p, const V& v) {
