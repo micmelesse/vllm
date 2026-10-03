@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                                    DTYPE* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs, int reduce_scatter_blocks) {
-  using Rows             = Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK>;
+  using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;

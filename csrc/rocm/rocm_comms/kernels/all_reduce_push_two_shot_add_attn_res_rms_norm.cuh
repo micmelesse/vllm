@@ -36,7 +36,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs) {
   using V                = typename traits<DTYPE>::V;
-  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int slice        = (packs + WORLD - 1) / WORLD;

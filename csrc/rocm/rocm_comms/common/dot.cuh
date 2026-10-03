@@ -20,20 +20,19 @@ namespace hip_comms {
 // This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
 // partials a block_reduce turns into the rows' dots (a sum of squares is thread_dot(x, x)). A
 // one-row b (a weight) is every row's.
-template <typename DTYPE, int TILE_M, int B_TILE_M, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void thread_dot(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>& a,
-                        const Tile<DTYPE, B_TILE_M, TILE_N, THREADS_PER_BLOCK, float>& b, float (&d)[TILE_M]) {
-  static_assert(B_TILE_M == TILE_M || B_TILE_M == 1, "b is a's shape or one row");
-  constexpr int NL = Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>::kPack;
+template <typename A, typename B>
+DINLINE void thread_dot(const A& a, const B& b, float (&d)[A::kRows]) {
+  static_assert(A::kThreadsM == 1, "a dot's partials reduce over the block, so a row is the block's");
+  static_assert(B::kRows == A::kRows || B::kRows == 1, "b is a's shape or one row");
 #pragma unroll
-  for (int m = 0; m < TILE_M; ++m) {
-    const int mb = B_TILE_M == 1 ? 0 : m;
+  for (int m = 0; m < A::kRows; ++m) {
+    const int mb = B::kRows == 1 ? 0 : m;
     d[m] = 0.0f;
 #pragma unroll
-    for (int k = 0; k < a.K; ++k) {
+    for (int k = 0; k < A::K; ++k) {
       float dk = 0.0f;
 #pragma unroll
-      for (int j = 0; j < NL; ++j) dk += a.v[m][k][j] * b.v[mb][k][j];
+      for (int j = 0; j < A::kPack; ++j) dk += a.v[m][k][j] * b.v[mb][k][j];
       d[m] += a.mask(k) * dk;
     }
   }

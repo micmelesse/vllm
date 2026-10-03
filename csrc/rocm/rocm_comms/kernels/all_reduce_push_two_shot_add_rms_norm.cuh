@@ -28,9 +28,9 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
   using V                = typename traits<DTYPE>::V;
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice        = (packs + WORLD - 1) / WORLD;
   const int col0         = rank * slice;

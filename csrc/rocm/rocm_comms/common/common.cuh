@@ -18,16 +18,21 @@
 // they are tiles too (PLAN), and nothing new uses them.
 //
 // tile.cuh
-//   Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n}   TILE_M
-//                         rows x TILE_N columns (elements) of an M x N tensor from (offs_m,
-//                         offs_n), and this thread's elements of it held as ACC_DTYPE;
-//                         to<U>() holds them as U, like<U>() is the same place empty
+//   Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n,
+//                         row_step = 1}   a chunk of an M x N tensor, the block's: TILE_M rows from
+//                         offs_m (every row_step-th) x TILE_N columns from offs_n, the block's
+//                         threads over it THREADS_M x THREADS_N (the layout), and this thread's
+//                         elements of it held as ACC_DTYPE; to<U>() holds them as U, like<U>() is
+//                         the same place empty, TileAs<TILE, U> its type
 // memory.cuh
 //   thread_load(tile, data, row_stride), thread_store(data, row_stride, tile)   one round trip a
 //                         tile; a row past M reads the last, stores only rows below M
 //   peers_load(tiles[ngpus], data(r), row_stride)   every rank's tile in flight together
 //   sliced_load<ngpus>(tile, data(r), row_stride, slice)   each column from the rank owning it
 //   one pack, for the flat loops: thread_load(p), thread_store(p, v), peers_load<T, ngpus>(read, i)
+// elementwise.cuh
+//   thread_add(a, b), thread_mul(a, b), thread_mul(a, scale or row_scale)   float tile math, b
+//                         a's shape or one row
 // reduce.cuh
 //   peers_reduce(tiles[ngpus]) -> tile           summed in rank order in fp32, rounded once
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max

@@ -27,9 +27,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
   using V                = typename traits<DTYPE>::V;
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const auto* wv         = reinterpret_cast<const vec<WEIGHT_DTYPE, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);

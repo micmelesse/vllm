@@ -23,8 +23,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     float eps, const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out, int64_t out_stride,
     DTYPE* __restrict__ workspace, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   using V                = typename traits<DTYPE>::V;
   V* normed              = reinterpret_cast<V*>(workspace);
