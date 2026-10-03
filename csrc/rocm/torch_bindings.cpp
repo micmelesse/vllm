@@ -117,7 +117,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "rocm_comms_plan_all_reduce_rms_norm_gemm(int handle_ptr, Tensor inp, "
       "Tensor gemm_weight, bool add, str? algorithm, str? direction, int? tile_m, int? tile_n, "
-      "int? tile_k, int? slice_k, int? threads_per_block, int? blocks_per_grid) -> (int?, "
+      "int? tile_k, int? slice_k, int? threads_per_block, int? blocks_per_grid) -> (str?, "
       "str?, int?, int?, int?, int?, int?, int?, int?)",
       &rocm_comms_plan_all_reduce_rms_norm_gemm);
   rocm_ops.def(
