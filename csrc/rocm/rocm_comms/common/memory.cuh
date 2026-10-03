@@ -71,12 +71,17 @@ DINLINE void thread_store_uncached(V* p, const V& v) {
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
-// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no instruction is scheduled across this point, so
-// every load above it is in flight before anything below it runs. Without it the scheduler sank
-// some of a reduce's peer loads past the adds of the first ones, so their round trips ran partly
-// one after another (0.4 us at 4-16 tokens: ISA 2026-10-01T00-39-51Z).
+// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no memory operation moves across this point (the
+// empty asm's memory clobber) and no instruction is scheduled across it (sched_barrier), so every
+// load above it is in flight before anything below it runs. The scheduler alone sank a reduce's
+// peer loads past the adds of the first ones (ISA 2026-10-01T00-39-51Z); with sched_barrier alone,
+// a tile's weight loads were sunk to their uses, one register quad and one round trip each (ISA
+// 2026-10-03T21-00-27Z).
 namespace impl {
-DINLINE void issued() { __builtin_amdgcn_sched_barrier(0); }
+DINLINE void issued() {
+  asm volatile("" ::: "memory");
+  __builtin_amdgcn_sched_barrier(0);
+}
 }  // namespace impl
 
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
