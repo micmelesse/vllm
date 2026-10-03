@@ -13,6 +13,10 @@
 #include <torch/all.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 
+// THE DECLARATIONS torch_bindings.cpp registers, so a definition here that differs is a compile
+// error, not a mismatch at run time.
+#include "ops.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -402,15 +406,16 @@ BuildInfoWire rocm_comms_build_info() {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
-  // Each template's op and config family, and its configs (what dispatch instantiates: the
-  // tuner's search space), flat: a config's fields in kConfigFields' order, 0 where its family
-  // has none.
-  Names templates, template_ops, families;
+  // Each template's op, and its configs (what dispatch instantiates: the
+  // tuner's search space), flat: a config's fields in `fields`' order, 0 where its family has
+  // none.
+  const Names fields = {"tile_m",  "tile_n", "tile_k", "slice_k", "reduce_scatter_blocks",
+                        "threads_per_block", "blocks_per_grid"};
+  Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
     templates.push_back(t.name);
     template_ops.push_back(to_string(op_of(t.fn)));
-    families.push_back(kConfigFamilies[family_of(t.fn)]);
     counts.push_back(static_cast<int64_t>(t.configs.size()));
     for (const KernelConfig& c : t.configs)
       std::visit(
@@ -427,7 +432,7 @@ BuildInfoWire rocm_comms_build_info() {
           c);
   }
   return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
-          templates, template_ops, families, configs, counts};
+          templates, template_ops, fields, configs, counts};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }

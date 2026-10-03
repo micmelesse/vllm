@@ -129,8 +129,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rocm_comms_supported(int device, int world) -> (str?, int?)",
                &rocm_comms_supported);
   rocm_ops.def(
-      "rocm_comms_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], int[], "
-      "int[])",
+      "rocm_comms_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
+      "int[], int[])",
       &rocm_comms_build_info);
   rocm_ops.def(
       "rocm_comms_register_captured", &rocm_comms_register_captured);

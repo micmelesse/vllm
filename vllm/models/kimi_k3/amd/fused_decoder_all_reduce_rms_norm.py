@@ -260,7 +260,7 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
                 f"the fused latent tail needs an RMSNorm: {transform.norm!r}"
             )
         # The op raises, naming why, for an input it cannot run.
-        latent = backend.all_reduce_rms_norm(
+        latent, _ = backend.all_reduce_rms_norm(
             fused_output, transform.norm.weight, transform.norm.variance_epsilon
         )
 

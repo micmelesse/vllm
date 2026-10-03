@@ -282,7 +282,7 @@ def _fused_attn_res(
     assert backend is not None, (
         "the all_reduce_add_attn_res_rms_norm path runs only with rocm_comms live"
     )
-    return backend.all_reduce_add_attn_res_rms_norm(
+    prefix, out, _ = backend.all_reduce_add_attn_res_rms_norm(
         delta,
         prefix_sum,
         block_residual,
@@ -294,6 +294,7 @@ def _fused_attn_res(
         norm.variance_epsilon,
         output_norm.variance_epsilon,
     )
+    return prefix, out
 
 
 def _comm() -> Any | None:

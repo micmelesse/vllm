@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from .base import Communicator, Error, Options, supported
+from .base import Communicator, Error, supported
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,9 @@ class IrisCommunicator(Communicator):
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        options: Options,
+        template: str | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         assert self._shmem is not None
         try:

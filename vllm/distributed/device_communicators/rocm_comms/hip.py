@@ -4,14 +4,15 @@
 """The HIP backend: our kernels in `_rocm_C` (`csrc/rocm/rocm_comms.cu`) and the peer
 memory they run over.
 
-The caller names an op and C++ picks the kernel and its launch geometry
-(`csrc/rocm/rocm_comms/rocm_comms.cuh`); `Options` passed with a call are the one way to
-force one, for the sweep and the tests.
+The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
+keyword arguments an op takes after its own (a template by name, that op's config fields)
+are the one way to force one, for the sweep and the tests. Every one is passed through as
+it came: C++ builds the config, checks it, and answers.
 
-TWO MEMORY PATHS, split by lifetime, both C++'s (`p2p::host::Group::dev_comm`). A
-captured buffer is held by vLLM for the graph's life, so it is registered once at
-capture exit and read in place. An eager input is the caching allocator's, borrowed for
-the call, so C++ copies it into a staging buffer it owns.
+TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
+is held by vLLM for the graph's life, so it is registered once at capture exit and read
+in place. An eager input is the caching allocator's, borrowed for the call, so C++ copies
+it into a staging buffer it owns.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -24,123 +25,19 @@ from typing import ClassVar, get_args
 
 import torch
 
-from .base import (
-    AllReduceArgs,
-    Args,
-    AttnResArgs,
-    Communicator,
-    Error,
-    GemmTailArgs,
-    NormArgs,
-    Op,
-    Options,
-    Plan,
-    ScaleAddArgs,
-    AllReduceConfig,
-    AttnResConfig,
-    AttnResPullConfig,
-    GemmConfig,
-    LaunchConfig,
-    RowConfig,
-)
+from .base import Communicator, Error, Op, Ran
 
 logger = logging.getLogger(__name__)
 
 
-# EACH OP FAMILY'S FORCING, as its schemas take it last: the template by name, then that
-# family's own config fields (a schema has no struct), each None for select's or the
-# template's own.
-def _all_reduce_forcing(o: Options) -> tuple[str | None, int | None, int | None]:
-    c = o.kernel_config
-    if c is None:
-        return o.template, None, None
-    assert isinstance(c, AllReduceConfig), c
-    return o.template, c.launch.threads_per_block, c.launch.blocks_per_grid
-
-
-def _row_forcing(o: Options) -> tuple[str | None, int | None, int | None, int | None]:
-    c = o.kernel_config
-    if c is None:
-        return o.template, None, None, None
-    assert isinstance(c, RowConfig), c
-    return o.template, c.tile_n, c.launch.threads_per_block, c.launch.blocks_per_grid
-
-
-def _attn_res_forcing(
-    o: Options,
-) -> tuple[str | None, int | None, int | None, int | None, int | None, int | None, int | None]:
-    c = o.kernel_config
-    if c is None:
-        return o.template, None, None, None, None, None, None
-    launch = c.launch
-    if isinstance(c, AttnResPullConfig):
-        return (o.template, c.tile_m, c.tile_n, c.tile_k, c.reduce_scatter_blocks,
-                launch.threads_per_block, launch.blocks_per_grid)
-    assert isinstance(c, AttnResConfig), c
-    return (o.template, None, c.tile_n, c.tile_k, None, launch.threads_per_block,
-            launch.blocks_per_grid)
-
-
-def _gemm_forcing(
-    o: Options,
-) -> tuple[str | None, int | None, int | None, int | None, int | None, int | None, int | None]:
-    c = o.kernel_config
-    if c is None:
-        return o.template, None, None, None, None, None, None
-    assert isinstance(c, GemmConfig), c
-    return (o.template, c.tile_m, c.tile_n, c.tile_k, c.slice_k,
-            c.launch.threads_per_block, c.launch.blocks_per_grid)
-
-
-# EACH OP FAMILY'S PLANNER ANSWER: the template and its config, or the Error's number.
-def _all_reduce_plan(got: tuple[str | None, int | None, int | None, int | None]) -> Plan | Error:
-    template, threads, blocks, err = got
+def _answer(got: tuple[str | int | None, ...]) -> Ran | Error:
+    """A C++ planner's answer: what would run (the template and the op's config fields),
+    or its last value, the Error's number."""
+    err = got[-1]
     if err is not None:
+        assert isinstance(err, int)
         return Error(err)
-    assert template is not None and threads is not None and blocks is not None
-    return Plan(template, AllReduceConfig(LaunchConfig(threads, blocks)))
-
-
-def _row_plan(
-    got: tuple[str | None, int | None, int | None, int | None, int | None],
-) -> Plan | Error:
-    template, tile_n, threads, blocks, err = got
-    if err is not None:
-        return Error(err)
-    assert template is not None and threads is not None and blocks is not None
-    return Plan(template, RowConfig(LaunchConfig(threads, blocks), tile_n))
-
-
-def _attn_res_plan(
-    got: tuple[
-        str | None, int | None, int | None, int | None, int | None, int | None, int | None,
-        int | None,
-    ],
-) -> Plan | Error:
-    template, tile_m, tile_n, tile_k, reduce_scatter_blocks, threads, blocks, err = got
-    if err is not None:
-        return Error(err)
-    assert template is not None and threads is not None and blocks is not None
-    launch = LaunchConfig(threads, blocks)
-    if reduce_scatter_blocks is not None:
-        return Plan(
-            template,
-            AttnResPullConfig(launch, tile_m, tile_n, tile_k, reduce_scatter_blocks),
-        )
-    return Plan(template, AttnResConfig(launch, tile_n, tile_k))
-
-
-def _gemm_plan(
-    got: tuple[
-        str | None, int | None, int | None, int | None, int | None, int | None, int | None,
-        int | None,
-    ],
-) -> Plan | Error:
-    template, tile_m, tile_n, tile_k, slice_k, threads, blocks, err = got
-    if err is not None:
-        return Error(err)
-    assert template is not None and threads is not None and blocks is not None
-    return Plan(template, GemmConfig(LaunchConfig(threads, blocks), tile_m, tile_n, tile_k, slice_k))
+    return tuple(got[:-1])
 
 
 class HipCommunicator(Communicator):
@@ -188,52 +85,54 @@ class HipCommunicator(Communicator):
                 self._handle, self.cpu_group.group_name
             )
 
+    def _check_all_reduce(
+        self,
+        inp: torch.Tensor,
+        template: str | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        return _answer(
+            torch.ops._rocm_C.rocm_comms_plan_all_reduce(
+                self._handle, inp, template, threads_per_block, blocks_per_grid
+            )
+        )
+
     def _all_reduce(
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        options: Options,
+        template: str | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce(
-            self._handle, out, inp, *_all_reduce_forcing(options)
+            self._handle, out, inp, template, threads_per_block, blocks_per_grid
         )
 
-    def _plan(self, args: Args, options: Options) -> Plan | Error:
-        """C++'s answer (`hip_comms::plan`): the op family's planner, handed the call's
-        own tensors. Every rule about what our kernels run is there, none here."""
-        ops = torch.ops._rocm_C
-        if isinstance(args, AllReduceArgs):
-            return _all_reduce_plan(
-                ops.rocm_comms_plan_all_reduce(
-                    self._handle, args.inp, *_all_reduce_forcing(options)
-                )
+    def _check_all_reduce_rms_norm(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        add: bool,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        return _answer(
+            torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_norm(
+                self._handle,
+                inp,
+                weight,
+                add,
+                template,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             )
-        if isinstance(args, NormArgs):
-            return _row_plan(
-                ops.rocm_comms_plan_all_reduce_rms_norm(
-                    self._handle, args.inp, args.weight, args.add, *_row_forcing(options)
-                )
-            )
-        if isinstance(args, AttnResArgs):
-            return _attn_res_plan(
-                ops.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
-                    self._handle, args.inp, *_attn_res_forcing(options)
-                )
-            )
-        if isinstance(args, GemmTailArgs):
-            return _gemm_plan(
-                ops.rocm_comms_plan_all_reduce_rms_norm_gemm(
-                    self._handle, args.inp, args.gemm_weight, args.add, *_gemm_forcing(options)
-                )
-            )
-        if isinstance(args, ScaleAddArgs):
-            return _row_plan(
-                ops.rocm_comms_plan_all_reduce_rms_scale_add(
-                    self._handle, args.inp, args.out, *_row_forcing(options)
-                )
-            )
-        raise AssertionError(f"{type(args).__name__} is an Args with no planner")
+        )
 
     def _all_reduce_rms_norm(
         self,
@@ -241,7 +140,10 @@ class HipCommunicator(Communicator):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        options: Options,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
             self._handle,
@@ -249,64 +151,63 @@ class HipCommunicator(Communicator):
             inp,
             weight,
             eps,
-            *_row_forcing(options),
+            template,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
 
-    def _all_reduce_rms_norm_gemm(
+    def _all_reduce_add_rms_norm(
         self,
-        inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        options: Options,
+        residual_out: torch.Tensor,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm(
+        """The normed result into `out`, the sum plus residual into `residual_out`."""
+        torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
             self._handle,
             out,
+            residual_out,
             inp,
-            norm_weight,
+            residual,
+            weight,
             eps,
-            gemm_weight,
-            # The normed rows, which the GEMM reads over and over.
-            torch.empty_like(inp),
-            *_gemm_forcing(options),
+            template,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
 
-    def _all_reduce_rms_norm_gemm_add(
+    def _check_all_reduce_add_attn_res_rms_norm(
         self,
         inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
-        out: torch.Tensor,
-        options: Options,
-    ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add(
-            self._handle,
-            out,
-            inp,
-            norm_weight,
-            eps,
-            gemm_weight,
-            # The normed rows, which the GEMM reads over and over.
-            torch.empty_like(inp),
-            *_gemm_forcing(options),
-        )
-
-    def _all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        eps: float,
-        options: Options,
-    ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
-            self._handle,
-            out,
-            inp,
-            eps,
-            *_row_forcing(options),
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        reduce_scatter_blocks: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        return _answer(
+            torch.ops._rocm_C.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
+                self._handle,
+                inp,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                reduce_scatter_blocks,
+                threads_per_block,
+                blocks_per_grid,
+            )
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -323,7 +224,13 @@ class HipCommunicator(Communicator):
         write_idx: int,
         eps: float,
         out_eps: float,
-        options: Options,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        reduce_scatter_blocks: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
@@ -339,29 +246,123 @@ class HipCommunicator(Communicator):
             eps,
             out_eps,
             has_prefix,
-            *_attn_res_forcing(options),
+            template,
+            tile_m,
+            tile_n,
+            tile_k,
+            reduce_scatter_blocks,
+            threads_per_block,
+            blocks_per_grid,
         )
 
-    def _all_reduce_add_rms_norm(
+    def _check_all_reduce_rms_norm_gemm(
         self,
-        out: torch.Tensor,
-        residual_out: torch.Tensor,
         inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        add: bool,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        slice_k: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        return _answer(
+            torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_norm_gemm(
+                self._handle,
+                inp,
+                gemm_weight,
+                add,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            )
+        )
+
+    def _all_reduce_rms_norm_gemm(
+        self,
+        add: bool,
+        inp: torch.Tensor,
+        norm_weight: torch.Tensor,
         eps: float,
-        options: Options,
+        gemm_weight: torch.Tensor,
+        out: torch.Tensor,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        slice_k: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
-        """The normed result into `out`, the sum plus residual into `residual_out`."""
-        torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
+        op = (
+            torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add
+            if add
+            else torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm
+        )
+        op(
             self._handle,
             out,
-            residual_out,
             inp,
-            residual,
-            weight,
+            norm_weight,
             eps,
-            *_row_forcing(options),
+            gemm_weight,
+            # The normed rows, which the GEMM reads over and over.
+            torch.empty_like(inp),
+            template,
+            tile_m,
+            tile_n,
+            tile_k,
+            slice_k,
+            threads_per_block,
+            blocks_per_grid,
+        )
+
+    def _check_all_reduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        return _answer(
+            torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_scale_add(
+                self._handle,
+                inp,
+                out,
+                template,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
+            )
+        )
+
+    def _all_reduce_rms_scale_add(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        eps: float,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> None:
+        torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
+            self._handle,
+            out,
+            inp,
+            eps,
+            template,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
         )
 
     def _on_close(self) -> None:

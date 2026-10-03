@@ -55,14 +55,10 @@ from vllm.distributed.device_communicators.rocm_comms import (
     make_communicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.base import (
-    AllReduceArgs,
-    LaunchConfig,
-    NormArgs,
     Op,
-    Options,
+    Refused,
     Supported,
     build_info,
-    knob,
     supported,
 )
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
@@ -712,11 +708,14 @@ def _chunks(
     return [list(shapes[i : i + size]) for i in range(0, len(shapes), size)]
 
 
-def _forced(template: str) -> Options:
+# A FORCED CALL'S KEYWORD ARGUMENTS, as every op takes them.
+Forced = dict[str, str | int]
+
+
+def _forced(template: str) -> Forced:
     """`template` forced at a launch every template admits (16 blocks of 512 threads),
     its own tile, for a case that forces one only to check it."""
-    family = build_info().templates[template].family
-    return Options(template=template, kernel_config=family(LaunchConfig(512, 16)))
+    return {"template": template, "threads_per_block": 512, "blocks_per_grid": 16}
 
 
 def declined(
@@ -724,7 +723,7 @@ def declined(
     op_name: str,
     shape: tuple[int, ...],
     dtype: torch.dtype,
-    options: Options | None,
+    forced: Forced | None,
 ) -> str | None:
     """Why the communicator will not take `shape`, or None if it will.
 
@@ -734,7 +733,8 @@ def declined(
     could not; this one was asked a question.
     """
     one = torch.empty(shape, dtype=dtype)
-    if not getattr(comm, f"should_{op_name.replace('_', '')}")(one, options):
+    should = getattr(comm, f"should_{op_name.replace('_', '')}")
+    if not should(one, **(forced or {})):
         return "declined by the communicator"
     return None
 
@@ -787,7 +787,7 @@ def run_collective(
     op_name: str,
     mine: Sequence[Sequence[torch.Tensor]],
     sched: Schedule,
-    options: Options | None,
+    forced: Forced | None,
 ) -> list[list[torch.Tensor]]:
     """One output per (shape, SLOT): `mine[s][j]` in, the result out. Slot j is replay
     `j // buffers`
@@ -825,14 +825,15 @@ def run_collective(
     # restate what the callee guarantees.
     ops = [
         [
-            partial(getattr(comm, op_name), st[: sh[0]], options=options)
+            partial(getattr(comm, op_name), st[: sh[0]], **(forced or {}))
             for st in statics
         ]
         for sh in shapes
     ]
 
     def body(s: int) -> list[torch.Tensor]:
-        return [op() for op in ops[s]]
+        # Each op returns its output and what ran.
+        return [op()[0] for op in ops[s]]
 
     def feed(s: int, replay: int) -> None:
         for m, st in enumerate(statics):
@@ -977,7 +978,7 @@ def exercise(
         within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0, rtol=0.0
     )
     ran = 0
-    options = None if kernel is None else _forced(kernel)
+    forced = None if kernel is None else _forced(kernel)
     comm = ctx.comm(backend)
     for op_name, dtype_name, group in product(OPS, dtypes, groups):
         dtype = D_DTYPES[dtype_name]
@@ -989,7 +990,7 @@ def exercise(
             # ones that were admitted.
             shapes = []
             for sh in chunk:
-                why = declined(comm, op_name, sh, dtype, options)
+                why = declined(comm, op_name, sh, dtype, forced)
                 if why is None:
                     shapes.append(sh)
                 else:
@@ -1018,7 +1019,7 @@ def exercise(
                 slots = sched.slots(len(shapes))
                 inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
                 got = run_collective(
-                    comm, op_name, [i[rank] for i in inputs], sched, options
+                    comm, op_name, [i[rank] for i in inputs], sched, forced
                 )
                 expected = [expected_outputs(op_name, i, slots) for i in inputs]
                 return [compare(g, e, atol, RTOL) for g, e in zip(got, expected)], None
@@ -1322,25 +1323,23 @@ def run_fused_rank(
     inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
     residual = _one_input(world, 1, shape, dtype)
     weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-    options = _forced(f"{shot}_{form}")
+    forced = _forced(f"{shot}_{form}")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if form == "rms_norm":
-        if not comm.should_allreduce_rms_norm(mine, weight, options):
+        if not comm.should_allreduce_rms_norm(mine, weight, **forced):
             return False, NO_FUSED_KERNEL
-        got = comm.all_reduce_rms_norm(
-            mine, weight.to(device), FUSED_EPS, options=options
-        )
+        got, _ = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS, **forced)
         got_residual = None
     else:
-        if not comm.should_allreduce_add_rms_norm(mine, weight, options):
+        if not comm.should_allreduce_add_rms_norm(mine, weight, **forced):
             return False, NO_FUSED_KERNEL
-        got, got_residual = comm.all_reduce_add_rms_norm(
+        got, got_residual, _ = comm.all_reduce_add_rms_norm(
             mine,
             residual.to(device),
             weight.to(device),
             FUSED_EPS,
-            options=options,
+            **forced,
         )
     want, want_residual = _fused_reference(form, inputs, residual, weight)
     atol, rtol = _fused_tolerance(dtype)
@@ -1449,7 +1448,7 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
 
 def run_weight_plan_rank(ctx: RankContext) -> tuple[bool, str | None]:
     """ONE rank: a norm's weight in neither the call's dtype nor fp32 is C++'s refusal,
-    `weight_not_built`; in either, a Plan."""
+    `weight_not_built`; in either, the op runs."""
     comm = ctx.comm("hip")
     x = torch.randn(16, 7168, device=ctx.device).to(torch.bfloat16)
     for add in (False, True):
@@ -1459,8 +1458,15 @@ def run_weight_plan_rank(ctx: RankContext) -> tuple[bool, str | None]:
             (torch.float32, None),
         ):
             weight = torch.ones(7168, dtype=dtype, device=ctx.device)
-            got = comm.plan(NormArgs(x, weight, add=add))
-            if (got if isinstance(got, Error) else None) is not want:
+            got: Error | None = None
+            try:
+                if add:
+                    comm.all_reduce_add_rms_norm(x, torch.zeros_like(x), weight, 1e-5)
+                else:
+                    comm.all_reduce_rms_norm(x, weight, 1e-5)
+            except Refused as refused:
+                got = refused.error
+            if got is not want:
                 return False, f"add={add} with a {dtype} weight: {got}, not {want}"
     return True, None
 
@@ -1582,13 +1588,13 @@ def run_add_attn_res_rms_norm_rank(
     )
     torch.cuda.synchronize()
 
-    options = _forced(f"{shot}_add_attn_res_rms_norm")
+    forced = _forced(f"{shot}_add_attn_res_rms_norm")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
-    if not comm.should_allreduce_add_attn_res_rms_norm(mine, options):
+    if not comm.should_allreduce_add_attn_res_rms_norm(mine, **forced):
         return False, NO_FUSED_KERNEL
     got_blocks = blocks.to(device).clone()
-    got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
+    got_prefix, got, _ = comm.all_reduce_add_attn_res_rms_norm(
         mine,
         prefix.to(device).clone() if has_prefix else None,
         got_blocks,
@@ -1599,7 +1605,7 @@ def run_add_attn_res_rms_norm_rank(
         write_idx,
         1e-6,
         1e-5,
-        options=options,
+        **forced,
     )
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
@@ -1692,7 +1698,7 @@ def run_rms_norm_gemm_rank(
     torch.cuda.synchronize()
 
     op = "rms_norm_gemm_add" if add else "rms_norm_gemm"
-    options = _forced(f"{shot}_{op}")
+    forced = _forced(f"{shot}_{op}")
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     admits = (
@@ -1700,11 +1706,11 @@ def run_rms_norm_gemm_rank(
         if add
         else comm.should_allreduce_rms_norm_gemm
     )
-    if not admits(mine, gemm_w, options):
+    if not admits(mine, gemm_w, **forced):
         return False, NO_FUSED_KERNEL
     got = shared.clone()
     run = comm.all_reduce_rms_norm_gemm_add if add else comm.all_reduce_rms_norm_gemm
-    run(mine, norm_w, FUSED_EPS, gemm_w, got.narrow(-1, col0, shard), options=options)
+    run(mine, norm_w, FUSED_EPS, gemm_w, got.narrow(-1, col0, shard), **forced)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float().cpu()
@@ -1787,10 +1793,10 @@ def run_rms_scale_add_rank(
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     got = torch.empty(rows, hidden, dtype=dtype, device=device)
-    options = _forced(shot)
-    if not comm.should_allreduce_rms_scale_add(mine, got, options):
+    forced = _forced(shot)
+    if not comm.should_allreduce_rms_scale_add(mine, got, **forced):
         return False, NO_FUSED_KERNEL
-    comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS, options)
+    comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS, **forced)
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     a32, b32 = got.float().cpu(), want.float()
@@ -1855,10 +1861,8 @@ def test_build_info_lists_every_template_with_its_configs() -> None:
             continue
         assert t.configs, name
         for c in t.configs:
-            assert isinstance(c, t.family), (name, c)
-            assert c.launch.threads_per_block > 0 and c.launch.blocks_per_grid > 0, (name, c)
-            tile_n = knob(c, "tile_n")
-            assert tile_n is not None and tile_n > 0, (name, c)
+            assert c["threads_per_block"] > 0 and c["blocks_per_grid"] > 0, (name, c)
+            assert c.get("tile_n", 0) > 0, (name, c)
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
@@ -1897,10 +1901,10 @@ def run_eager_beyond_staging_rank(
     want = x.float()
     dist.all_reduce(want, group=ctx.device_group)
     comm = ctx.comm("hip")
-    options = _forced(shot)
-    if not comm.should_allreduce(x, options):
-        return False, f"refused: {comm.plan(AllReduceArgs(x), options)}"
-    got = comm.all_reduce(x, options).float()
+    forced = _forced(shot)
+    if not comm.should_allreduce(x, **forced):
+        return False, "refused"
+    got = comm.all_reduce(x, **forced)[0].float()
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
@@ -1934,10 +1938,11 @@ def run_warmup_rank(ctx: RankContext) -> tuple[bool, str | None]:
     done = torch.cuda.Event()
     with comm.capture(), torch.cuda.stream(torch.cuda.Stream()):
         if ctx.rank == 0:
+            # Each op's outputs, without what ran.
             outs = [
-                comm.all_reduce(x),
-                comm.all_reduce_rms_norm(x, weight, 1e-6),
-                *comm.all_reduce_add_rms_norm(x, x, weight, 1e-6),
+                comm.all_reduce(x)[0],
+                comm.all_reduce_rms_norm(x, weight, 1e-6)[0],
+                *comm.all_reduce_add_rms_norm(x, x, weight, 1e-6)[:2],
             ]
             done.record()
     if ctx.rank == 0:

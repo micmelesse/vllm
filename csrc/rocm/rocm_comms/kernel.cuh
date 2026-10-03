@@ -113,11 +113,6 @@ struct GemmConfig {
 using KernelConfig =
     std::variant<AllReduceConfig, RowConfig, AttnResConfig, AttnResPullConfig, GemmConfig>;
 
-// EVERY FAMILY'S NAME, in KernelConfig's order, as Python names its dataclasses.
-constexpr const char* kConfigFamilies[] = {"all_reduce", "row", "attn_res", "attn_res_pull",
-                                           "gemm"};
-static_assert(sizeof(kConfigFamilies) / sizeof(const char*) == std::variant_size_v<KernelConfig>);
-
 // THE FIELDS EVERY FAMILY SHARES, and those it may have: 0 where it has none (the plain
 // all-reduce's tile; one row a tile is TILE_M 1).
 constexpr const LaunchConfig& launch_of(const KernelConfig& c) {

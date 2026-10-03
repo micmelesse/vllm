@@ -13,7 +13,7 @@ import functools
 import logging
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
@@ -55,91 +55,6 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 # A communicator's life: `__init__` -> open | disabled; open <-> capturing; open |
 # disabled -> closed. Only `Communicator` moves it.
 State = Literal["disabled", "open", "capturing", "closed"]
-
-
-@dataclass(frozen=True)
-class LaunchConfig:
-    """HOW A KERNEL IS LAUNCHED, C++'s `hip_comms::LaunchConfig`: the threads a block and
-    the blocks a grid. Every kernel has one."""
-
-    threads_per_block: int
-    blocks_per_grid: int
-
-
-# EACH KERNEL FAMILY'S CONFIG, C++'s (kernel.cuh): its launch and its own fields, nothing
-# it lacks (Triton's autotune config). TILE_M rows x TILE_N columns a tile, TILE_K of the
-# reduced dimension (the GEMM's K a pass, AttnRes's sources a step), SLICE_K lanes
-# splitting one output's K, and the AttnRes pull's reduce-scatter on its grid's first
-# `reduce_scatter_blocks` blocks. Forced, a field left None is the template's own.
-
-
-@dataclass(frozen=True)
-class AllReduceConfig:
-    """The plain all-reduce: no tile."""
-
-    launch: LaunchConfig
-
-
-@dataclass(frozen=True)
-class RowConfig:
-    """The norms and the one-all-reduce tail: one row a tile."""
-
-    launch: LaunchConfig
-    tile_n: int | None = None
-
-
-@dataclass(frozen=True)
-class AttnResConfig:
-    """AttnRes's one-shot and push."""
-
-    launch: LaunchConfig
-    tile_n: int | None = None
-    tile_k: int | None = None
-
-
-@dataclass(frozen=True)
-class AttnResPullConfig:
-    """AttnRes's pull two-shot."""
-
-    launch: LaunchConfig
-    tile_m: int | None = None
-    tile_n: int | None = None
-    tile_k: int | None = None
-    reduce_scatter_blocks: int | None = None
-
-
-@dataclass(frozen=True)
-class GemmConfig:
-    """The GEMM tails."""
-
-    launch: LaunchConfig
-    tile_m: int | None = None
-    tile_n: int | None = None
-    tile_k: int | None = None
-    slice_k: int | None = None
-
-
-KernelConfig = (
-    AllReduceConfig | RowConfig | AttnResConfig | AttnResPullConfig | GemmConfig
-)
-# Each family by C++'s name for it (`kConfigFamilies`).
-CONFIG_FAMILIES: Mapping[str, type[KernelConfig]] = {
-    "all_reduce": AllReduceConfig,
-    "row": RowConfig,
-    "attn_res": AttnResConfig,
-    "attn_res_pull": AttnResPullConfig,
-    "gemm": GemmConfig,
-}
-@dataclass(frozen=True)
-class Options:
-    """WHAT A CALL FORCES, beside what it computes: C++'s `hip_comms::Options`. The model
-    passes none. `template` (a C++ template's name, `kTemplates` in
-    `csrc/rocm/rocm_comms/op.cuh`) forces the kernel at select's launch, and
-    `kernel_config` (that template's family's) with it forces its fields; none is select's
-    choice."""
-
-    template: str | None = None
-    kernel_config: KernelConfig | None = None
 
 
 class Error(IntEnum):
@@ -184,13 +99,12 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 @dataclass(frozen=True)
 class TemplateBuild:
-    """One C++ template as built: its op, its config family, and the KernelConfigs
-    dispatch instantiates (its catalog list; none for the plain all-reduce), each at its
-    listed grid."""
+    """One C++ template as built: its op, and the configs dispatch instantiates (its
+    catalog list; none for the plain all-reduce), each its fields by name at its listed
+    grid: what an op takes as keyword arguments to force it."""
 
     op: str
-    family: type[KernelConfig]
-    configs: tuple[KernelConfig, ...]
+    configs: tuple[dict[str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -210,38 +124,31 @@ class BuildInfo:
     templates: dict[str, TemplateBuild]
 
 
-def _built_config(family: type[KernelConfig], fields: list[int]) -> KernelConfig:
-    """One config of build_info's flat list (C++'s order: tile_m, tile_n, tile_k,
-    slice_k, reduce_scatter_blocks, threads_per_block, blocks_per_grid; 0 where its family
-    has none) as its family's."""
-    tile_m, tile_n, tile_k, slice_k, reduce_scatter_blocks, threads, blocks = fields
-    launch = LaunchConfig(threads, blocks)
-    if family is AllReduceConfig:
-        return AllReduceConfig(launch)
-    if family is RowConfig:
-        return RowConfig(launch, tile_n)
-    if family is AttnResConfig:
-        return AttnResConfig(launch, tile_n, tile_k)
-    if family is AttnResPullConfig:
-        return AttnResPullConfig(launch, tile_m, tile_n, tile_k, reduce_scatter_blocks)
-    assert family is GemmConfig
-    return GemmConfig(launch, tile_m, tile_n, tile_k, slice_k)
-
-
 @functools.cache
 def build_info() -> BuildInfo:
     """The build's facts, read once: they are fixed when it is compiled."""
-    (dtypes, worlds, pack, staging, ops, errors, names, template_ops, families, flat,
-     counts) = torch.ops._rocm_C.rocm_comms_build_info()
+    (
+        dtypes,
+        worlds,
+        pack,
+        staging,
+        ops,
+        errors,
+        names,
+        template_ops,
+        fields,
+        flat,
+        counts,
+    ) = torch.ops._rocm_C.rocm_comms_build_info()
     templates: dict[str, TemplateBuild] = {}
-    at = 0
-    for name, op, family_name, count in zip(names, template_ops, families, counts):
-        family = CONFIG_FAMILIES[family_name]
+    at, width = 0, len(fields)
+    for name, op, count in zip(names, template_ops, counts):
         configs = []
         for _ in range(count):
-            configs.append(_built_config(family, flat[at : at + 7]))
-            at += 7
-        templates[name] = TemplateBuild(op, family, tuple(configs))
+            values = flat[at : at + width]
+            configs.append({f: v for f, v in zip(fields, values) if v != 0})
+            at += width
+        templates[name] = TemplateBuild(op, tuple(configs))
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
@@ -253,80 +160,18 @@ def build_info() -> BuildInfo:
     )
 
 
-@dataclass(frozen=True)
-class Plan:
-    """WHAT RUNS on a call this backend takes: hip's template and its KernelConfig; none for a
-    backend with no kernels to choose (torch, iris)."""
-
-    template: str | None = None
-    config: KernelConfig | None = None
+# WHAT RAN: the template's name and the op's config fields as its kernel had them, in the
+# op's argument order; all None from a backend with no kernels to choose (torch, iris).
+Ran = tuple[str | int | None, ...]
 
 
-# A CALL'S INPUTS AND OUTPUTS, one type per op family, as C++'s `AllReduceArgs`,
-# `NormArgs`, `AttnResArgs`, `GemmTailArgs` and `ScaleAddArgs`: what `plan` is asked
-# about. Each holds the tensors the decision reads, and the backend reads their facts.
+class Refused(RuntimeError):
+    """A call this backend does not take, raised by the op (its `should_` said so first):
+    the Error, and the call it was."""
 
-
-@dataclass(frozen=True)
-class AllReduceArgs:
-    inp: torch.Tensor
-
-    @property
-    def op(self) -> Op:
-        return "all_reduce"
-
-
-@dataclass(frozen=True)
-class NormArgs:
-    """All-reduce then `rms_norm`, or `fused_add_rms_norm` with `add`."""
-
-    inp: torch.Tensor
-    weight: torch.Tensor
-    add: bool
-
-    @property
-    def op(self) -> Op:
-        return "all_reduce_add_rms_norm" if self.add else "all_reduce_rms_norm"
-
-
-@dataclass(frozen=True)
-class AttnResArgs:
-    inp: torch.Tensor
-
-    @property
-    def op(self) -> Op:
-        return "all_reduce_add_attn_res_rms_norm"
-
-
-@dataclass(frozen=True)
-class GemmTailArgs:
-    """All-reduce, `rms_norm`, then a GEMM by `gemm_weight` [N, hidden], written or
-    added (`add`)."""
-
-    inp: torch.Tensor
-    gemm_weight: torch.Tensor
-    add: bool
-
-    @property
-    def op(self) -> Op:
-        return (
-            "all_reduce_rms_norm_gemm_add" if self.add else "all_reduce_rms_norm_gemm"
-        )
-
-
-@dataclass(frozen=True)
-class ScaleAddArgs:
-    """`inp`'s row [shared | projected | latent] into `out` [rows, hidden]."""
-
-    inp: torch.Tensor
-    out: torch.Tensor
-
-    @property
-    def op(self) -> Op:
-        return "all_reduce_rms_scale_add"
-
-
-Args = AllReduceArgs | NormArgs | AttnResArgs | GemmTailArgs | ScaleAddArgs
+    def __init__(self, error: Error, what: str) -> None:
+        super().__init__(f"{what}: {error.name}")
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -385,60 +230,73 @@ class Communicator(ABC):
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
-    # Every op and every `should_*` takes `options`, per call, none meaning the
-    # defaults: a forced template and its config, which the sweep and the tests pass (to
-    # hip, the one backend with kernels to choose) and the model leaves to the backend.
-
-    @final
-    def plan(self, args: Args, options: Options | None = None) -> Plan | Error:
-        """WHAT RUNS the call `args` on this backend, or the Error it meets: the one
-        place a refusal is decided, the options' included. Every `should_*` is this, a
-        Plan."""
-        if self.disabled:
-            return Error.disabled
-        if args.op not in self.OPS:
-            return Error.no_such_op
-        return self._plan(args, Options() if options is None else options)
+    # Each op and its `should_` take the same arguments: the op's own tensors and values,
+    # then, keyword-only, what the sweep and the tests force (a template by name and that
+    # op's own config fields, each None for the backend's choice); the model forces none.
+    # `should_` answers whether the op runs; the op runs and returns what ran, or raises
+    # Refused for a call its `should_` would have refused.
 
     @final
     def should_allreduce(
-        self, inp: torch.Tensor, options: Options | None = None
+        self,
+        inp: torch.Tensor,
+        *,
+        template: str | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """Whether this backend takes `inp`: `plan` is a Plan."""
-        return isinstance(self.plan(AllReduceArgs(inp), options), Plan)
+        """Whether `all_reduce(inp)` runs here."""
+        ran = self._checked(
+            "all_reduce",
+            lambda: self._check_all_reduce(
+                inp, template, threads_per_block, blocks_per_grid
+            ),
+        )
+        return not isinstance(ran, Error)
+
+    @final
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        template: str | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> tuple[torch.Tensor, Ran]:
+        """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
+        picks among a backend's own paths (hip's in C++), never whether it is ours.
+        Returns the sum and what ran."""
+        ran = self._required(
+            "all_reduce",
+            inp,
+            lambda: self._check_all_reduce(
+                inp, template, threads_per_block, blocks_per_grid
+            ),
+        )
+        out = torch.empty_like(inp)
+        if not self._warming_up("all_reduce"):
+            self._all_reduce(out, inp, template, threads_per_block, blocks_per_grid)
+        return out, ran
 
     @final
     def should_allreduce_rms_norm(
         self,
         inp: torch.Tensor,
         weight: torch.Tensor,
-        options: Options | None = None,
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """Whether this backend can all-reduce then `rms_norm` `inp` by `weight` in one
-        kernel: `plan` is a Plan."""
-        return isinstance(self.plan(NormArgs(inp, weight, add=False), options), Plan)
-
-    @final
-    def should_allreduce_add_rms_norm(
-        self,
-        inp: torch.Tensor,
-        weight: torch.Tensor,
-        options: Options | None = None,
-    ) -> bool:
-        """As `should_allreduce_rms_norm`, for all-reduce then `fused_add_rms_norm`."""
-        return isinstance(self.plan(NormArgs(inp, weight, add=True), options), Plan)
-
-    @final
-    def all_reduce(
-        self, inp: torch.Tensor, options: Options | None = None
-    ) -> torch.Tensor:
-        """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
-        picks among a backend's own paths (hip's in C++), never whether it is ours."""
-        options = self._require(AllReduceArgs(inp), options)
-        out = torch.empty_like(inp)
-        if not self._warming_up("all_reduce"):
-            self._all_reduce(out, inp, options)
-        return out
+        """Whether `all_reduce_rms_norm(inp, weight, ...)` runs here."""
+        ran = self._checked(
+            "all_reduce_rms_norm",
+            lambda: self._check_all_reduce_rms_norm(
+                inp, weight, False, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_rms_norm(
@@ -446,17 +304,54 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        options: Options | None = None,
-    ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel.
-
-        A variant of the collective, so it goes through the same two doors: the capture
-        check and the admission check."""
-        options = self._require(NormArgs(inp, weight, add=False), options)
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> tuple[torch.Tensor, Ran]:
+        """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel. Returns
+        the normed sum and what ran."""
+        ran = self._required(
+            "all_reduce_rms_norm",
+            inp,
+            lambda: self._check_all_reduce_rms_norm(
+                inp, weight, False, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
         out = torch.empty_like(inp)
         if not self._warming_up("all_reduce_rms_norm"):
-            self._all_reduce_rms_norm(out, inp, weight, eps, options)
-        return out
+            self._all_reduce_rms_norm(
+                out,
+                inp,
+                weight,
+                eps,
+                template,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
+            )
+        return out, ran
+
+    @final
+    def should_allreduce_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> bool:
+        """Whether `all_reduce_add_rms_norm(inp, ..., weight, ...)` runs here."""
+        ran = self._checked(
+            "all_reduce_add_rms_norm",
+            lambda: self._check_all_reduce_rms_norm(
+                inp, weight, True, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_add_rms_norm(
@@ -465,24 +360,65 @@ class Communicator(ABC):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        options: Options | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
-        one kernel. Returns the normed result, then the sum plus residual."""
-        options = self._require(NormArgs(inp, weight, add=True), options)
+        one kernel. Returns the normed result, the sum plus residual, and what ran."""
+        ran = self._required(
+            "all_reduce_add_rms_norm",
+            inp,
+            lambda: self._check_all_reduce_rms_norm(
+                inp, weight, True, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
         if not self._warming_up("all_reduce_add_rms_norm"):
             self._all_reduce_add_rms_norm(
-                out, residual_out, inp, residual, weight, eps, options
+                out,
+                residual_out,
+                inp,
+                residual,
+                weight,
+                eps,
+                template,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
             )
-        return out, residual_out
+        return out, residual_out, ran
 
     @final
     def should_allreduce_add_attn_res_rms_norm(
-        self, inp: torch.Tensor, options: Options | None = None
+        self,
+        inp: torch.Tensor,
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        reduce_scatter_blocks: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """As `should_allreduce_rms_norm`, for all-reduce then Kimi-K3's AttnRes."""
-        return isinstance(self.plan(AttnResArgs(inp), options), Plan)
+        """Whether `all_reduce_add_attn_res_rms_norm(inp, ...)` runs here."""
+        ran = self._checked(
+            "all_reduce_add_attn_res_rms_norm",
+            lambda: self._check_all_reduce_add_attn_res_rms_norm(
+                inp,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                reduce_scatter_blocks,
+                threads_per_block,
+                blocks_per_grid,
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_add_attn_res_rms_norm(
@@ -497,18 +433,38 @@ class Communicator(ABC):
         write_idx: int,
         eps: float,
         out_eps: float,
-        options: Options | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        reduce_scatter_blocks: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
         """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
-        `prefix` the sum starting one. Returns the prefix (updated in place when given)
-        and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
-        block."""
-        options = self._require(AttnResArgs(inp), options)
+        `prefix` the sum starting one. Returns the prefix (updated in place when given),
+        the AttnRes output, and what ran. `write_idx` >= 0 also stores the prefix as
+        that block."""
+        ran = self._required(
+            "all_reduce_add_attn_res_rms_norm",
+            inp,
+            lambda: self._check_all_reduce_add_attn_res_rms_norm(
+                inp,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                reduce_scatter_blocks,
+                threads_per_block,
+                blocks_per_grid,
+            ),
+        )
         # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
         prefix_out = torch.empty_like(inp) if prefix is None else prefix
         out = torch.empty_like(inp)
         if self._warming_up("all_reduce_add_attn_res_rms_norm"):
-            return prefix_out, out
+            return prefix_out, out, ran
         self._all_reduce_add_attn_res_rms_norm(
             prefix_out,
             out,
@@ -522,22 +478,48 @@ class Communicator(ABC):
             write_idx,
             eps,
             out_eps,
-            options,
+            template,
+            tile_m,
+            tile_n,
+            tile_k,
+            reduce_scatter_blocks,
+            threads_per_block,
+            blocks_per_grid,
         )
-        return prefix_out, out
+        return prefix_out, out, ran
 
     @final
     def should_allreduce_rms_norm_gemm(
         self,
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
-        options: Options | None = None,
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        slice_k: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM
-        written into an output; `gemm_weight` is [N, hidden], and its N shapes the
-        launch."""
-        args = GemmTailArgs(inp, gemm_weight, add=False)
-        return isinstance(self.plan(args, options), Plan)
+        """Whether `all_reduce_rms_norm_gemm(inp, ..., gemm_weight, ...)` runs here;
+        `gemm_weight` is [N, hidden], and its N shapes the launch."""
+        ran = self._checked(
+            "all_reduce_rms_norm_gemm",
+            lambda: self._check_all_reduce_rms_norm_gemm(
+                inp,
+                gemm_weight,
+                False,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_rms_norm_gemm(
@@ -547,27 +529,84 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        options: Options | None = None,
-    ) -> None:
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        slice_k: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> Ran:
         """`out = rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
-        wider buffer is fine)."""
-        options = self._require(GemmTailArgs(inp, gemm_weight, add=False), options)
-        if self._warming_up("all_reduce_rms_norm_gemm"):
-            return
-        self._all_reduce_rms_norm_gemm(inp, norm_weight, eps, gemm_weight, out, options)
+        wider buffer is fine). Returns what ran."""
+        ran = self._required(
+            "all_reduce_rms_norm_gemm",
+            inp,
+            lambda: self._check_all_reduce_rms_norm_gemm(
+                inp,
+                gemm_weight,
+                False,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            ),
+        )
+        if not self._warming_up("all_reduce_rms_norm_gemm"):
+            self._all_reduce_rms_norm_gemm(
+                False,
+                inp,
+                norm_weight,
+                eps,
+                gemm_weight,
+                out,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            )
+        return ran
 
     @final
     def should_allreduce_rms_norm_gemm_add(
         self,
         inp: torch.Tensor,
         gemm_weight: torch.Tensor,
-        options: Options | None = None,
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        slice_k: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """As `should_allreduce_rms_norm`, for all-reduce then RMSNorm then a GEMM added
-        into an output; `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        args = GemmTailArgs(inp, gemm_weight, add=True)
-        return isinstance(self.plan(args, options), Plan)
+        """Whether `all_reduce_rms_norm_gemm_add(inp, ..., gemm_weight, ...)` runs here;
+        `gemm_weight` is [N, hidden], and its N shapes the launch."""
+        ran = self._checked(
+            "all_reduce_rms_norm_gemm_add",
+            lambda: self._check_all_reduce_rms_norm_gemm(
+                inp,
+                gemm_weight,
+                True,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_rms_norm_gemm_add(
@@ -577,28 +616,72 @@ class Communicator(ABC):
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        options: Options | None = None,
-    ) -> None:
+        *,
+        template: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        slice_k: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> Ran:
         """`out += rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
-        wider buffer is fine)."""
-        options = self._require(GemmTailArgs(inp, gemm_weight, add=True), options)
-        if self._warming_up("all_reduce_rms_norm_gemm_add"):
-            return
-        self._all_reduce_rms_norm_gemm_add(
-            inp, norm_weight, eps, gemm_weight, out, options
+        wider buffer is fine). Returns what ran."""
+        ran = self._required(
+            "all_reduce_rms_norm_gemm_add",
+            inp,
+            lambda: self._check_all_reduce_rms_norm_gemm(
+                inp,
+                gemm_weight,
+                True,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            ),
         )
+        if not self._warming_up("all_reduce_rms_norm_gemm_add"):
+            self._all_reduce_rms_norm_gemm(
+                True,
+                inp,
+                norm_weight,
+                eps,
+                gemm_weight,
+                out,
+                template,
+                tile_m,
+                tile_n,
+                tile_k,
+                slice_k,
+                threads_per_block,
+                blocks_per_grid,
+            )
+        return ran
 
     @final
     def should_allreduce_rms_scale_add(
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
-        options: Options | None = None,
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
     ) -> bool:
-        """As `should_allreduce_rms_norm`, for writing `out` [rows, hidden] from `inp`'s
-        row [shared | projected | latent], the widths out's, out's and the rest."""
-        return isinstance(self.plan(ScaleAddArgs(inp, out), options), Plan)
+        """Whether `all_reduce_rms_scale_add(inp, out, ...)` runs here: `out` [rows,
+        hidden] from `inp`'s row [shared | projected | latent]."""
+        ran = self._checked(
+            "all_reduce_rms_scale_add",
+            lambda: self._check_all_reduce_rms_scale_add(
+                inp, out, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
+        return not isinstance(ran, Error)
 
     @final
     def all_reduce_rms_scale_add(
@@ -606,14 +689,26 @@ class Communicator(ABC):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        options: Options | None = None,
-    ) -> None:
+        *,
+        template: str | None = None,
+        tile_n: int | None = None,
+        threads_per_block: int | None = None,
+        blocks_per_grid: int | None = None,
+    ) -> Ran:
         """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
-        + projected * rsqrt(mean(latent^2) + eps)` in one kernel."""
-        options = self._require(ScaleAddArgs(inp, out), options)
-        if self._warming_up("all_reduce_rms_scale_add"):
-            return
-        self._all_reduce_rms_scale_add(inp, out, eps, options)
+        + projected * rsqrt(mean(latent^2) + eps)` in one kernel. Returns what ran."""
+        ran = self._required(
+            "all_reduce_rms_scale_add",
+            inp,
+            lambda: self._check_all_reduce_rms_scale_add(
+                inp, out, template, tile_n, threads_per_block, blocks_per_grid
+            ),
+        )
+        if not self._warming_up("all_reduce_rms_scale_add"):
+            self._all_reduce_rms_scale_add(
+                inp, out, eps, template, tile_n, threads_per_block, blocks_per_grid
+            )
+        return ran
 
     @final
     def close(self) -> None:
@@ -677,15 +772,29 @@ class Communicator(ABC):
         finally:
             self.state = "open"
 
-    # ---- The two rules a caller can get wrong, enforced once. ----
+    # ---- The rules a caller can get wrong, enforced once. ----
 
-    def _require(self, args: Args, options: Options | None) -> Options:
-        """The call's options, resolved, unless this backend refuses `args`: then
-        `plan`'s Error, raised."""
-        got = self.plan(args, options)
+    def _checked(self, op: Op, check: Callable[[], Ran | Error]) -> Ran | Error:
+        """What runs `op` here, or the Error it meets: disabled, an op this backend does
+        not run, or the backend's own `check`."""
+        if self.disabled:
+            return Error.disabled
+        if op not in self.OPS:
+            return Error.no_such_op
+        return check()
+
+    def _required(
+        self, op: Op, inp: torch.Tensor, check: Callable[[], Ran | Error]
+    ) -> Ran:
+        """What runs `op` here, or Refused, raised, naming the call."""
+        got = self._checked(op, check)
         if isinstance(got, Error):
-            raise RuntimeError(self._rejected(args, got))
-        return Options() if options is None else options
+            raise Refused(
+                got,
+                f"{type(self).__name__} cannot run {op} over "
+                f"shape={tuple(inp.shape)} dtype={inp.dtype}",
+            )
+        return got
 
     def _warming_up(self, op: str) -> bool:
         """Whether this is a capture's WARMUP: inside `capture()`, the stream not
@@ -704,28 +813,61 @@ class Communicator(ABC):
             )
         return capturing and not recording
 
-    def _rejected(self, args: Args, err: Error) -> str:
-        """A refused call's message: the op, its input, and `plan`'s Error."""
-        return (
-            f"{type(self).__name__} cannot run {args.op} over "
-            f"shape={tuple(args.inp.shape)} dtype={args.inp.dtype}: {err.name}"
-        )
+    # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or the
+    # Error) and its launch, both taking the op's own arguments. Every op's outputs are the
+    # base's, so a capture's warmup returns them without calling here. The fused ops are
+    # not abstract: a backend without one leaves it out of OPS. ----
 
-    # ---- What a BACKEND supplies. ----
+    def _check_all_reduce(
+        self,
+        inp: torch.Tensor,
+        template: str | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        """By default (torch, iris) the build's envelope, so a control admits what our
+        kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
+        having no template to force. Ours overrides it with its C++'s answer."""
+        if (
+            template is not None
+            or threads_per_block is not None
+            or blocks_per_grid is not None
+        ):
+            return Error.no_such_template
+        if not _is_weak_contiguous(inp):
+            return Error.not_contiguous
+        built = build_info()
+        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
+            return Error.row_not_packs
+        if inp.dtype not in built.dtypes:
+            return Error.dtype_not_built
+        return (None, None, None)
 
     @abstractmethod
     def _all_reduce(
         self,
         out: torch.Tensor,
         inp: torch.Tensor,
-        options: Options,
+        template: str | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         """SUM across ranks into `out`, which the base allocated: input untouched.
-        Assume `inp` is admitted -- the base checked. Every op's outputs are the base's,
-        so a capture's warmup returns them without calling here."""
+        Assume `inp` is admitted -- the base checked."""
 
-    # The fused variants. Not abstract: a backend without them is one the fusion pass
-    # leaves alone, and overriding one is how a backend says it has it.
+    def _check_all_reduce_rms_norm(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        add: bool,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        raise NotImplementedError(
+            f"{type(self).__name__} lists a norm op it has no check for"
+        )
 
     def _all_reduce_rms_norm(
         self,
@@ -733,11 +875,13 @@ class Communicator(ABC):
         inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        options: Options,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms_norm; "
-            f"ask should_allreduce_rms_norm first."
+            f"{type(self).__name__} has no fused all-reduce + rms_norm"
         )
 
     def _all_reduce_add_rms_norm(
@@ -748,11 +892,28 @@ class Communicator(ABC):
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        options: Options,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm; "
-            f"ask should_allreduce_add_rms_norm first."
+            f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm"
+        )
+
+    def _check_all_reduce_add_attn_res_rms_norm(
+        self,
+        inp: torch.Tensor,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        reduce_scatter_blocks: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        raise NotImplementedError(
+            f"{type(self).__name__} lists AttnRes with no check for it"
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -769,39 +930,64 @@ class Communicator(ABC):
         write_idx: int,
         eps: float,
         out_eps: float,
-        options: Options,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        reduce_scatter_blocks: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + AttnRes; "
-            f"ask should_allreduce_add_attn_res_rms_norm first."
+            f"{type(self).__name__} has no fused all-reduce + AttnRes"
+        )
+
+    def _check_all_reduce_rms_norm_gemm(
+        self,
+        inp: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        add: bool,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        slice_k: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
+        raise NotImplementedError(
+            f"{type(self).__name__} lists a GEMM tail with no check for it"
         )
 
     def _all_reduce_rms_norm_gemm(
         self,
+        add: bool,
         inp: torch.Tensor,
         norm_weight: torch.Tensor,
         eps: float,
         gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        options: Options,
+        template: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        slice_k: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm; "
-            f"ask should_allreduce_rms_norm_gemm first."
-        )
+        raise NotImplementedError(f"{type(self).__name__} has no fused GEMM tail")
 
-    def _all_reduce_rms_norm_gemm_add(
+    def _check_all_reduce_rms_scale_add(
         self,
         inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
         out: torch.Tensor,
-        options: Options,
-    ) -> None:
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+    ) -> Ran | Error:
         raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms_norm + gemm + add; "
-            f"ask should_allreduce_rms_norm_gemm_add first."
+            f"{type(self).__name__} lists scale-add with no check for it"
         )
 
     def _all_reduce_rms_scale_add(
@@ -809,29 +995,14 @@ class Communicator(ABC):
         inp: torch.Tensor,
         out: torch.Tensor,
         eps: float,
-        options: Options,
+        template: str | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
     ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms scale + add; "
-            f"ask should_allreduce_rms_scale_add first."
+            f"{type(self).__name__} has no fused all-reduce + rms scale + add"
         )
-
-    def _plan(self, args: Args, options: Options) -> Plan | Error:
-        """A backend's own rules, the options among them: what runs the call `args`, or
-        the Error it meets. By default (torch, iris) the build's envelope, so a control
-        admits what our kernels do: weak-contiguous, whole packs, a dtype built; and no
-        options, having no template to force. Ours overrides it with its C++'s answer."""
-        if options.template is not None or options.kernel_config is not None:
-            return Error.no_such_template
-        inp = args.inp
-        if not _is_weak_contiguous(inp):
-            return Error.not_contiguous
-        built = build_info()
-        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
-            return Error.row_not_packs
-        if inp.dtype not in built.dtypes:
-            return Error.dtype_not_built
-        return Plan()
 
     @abstractmethod
     def _open(self) -> bool:

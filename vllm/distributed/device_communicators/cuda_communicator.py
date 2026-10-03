@@ -393,8 +393,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not rocm_comm.disabled
             and rocm_comm.should_allreduce(input_)
         ):
-            out = rocm_comm.all_reduce(input_)
-            assert out is not None
+            out, _ = rocm_comm.all_reduce(input_)  # the sum, and what ran
             return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)

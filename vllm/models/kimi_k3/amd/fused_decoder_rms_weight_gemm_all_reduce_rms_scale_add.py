@@ -296,7 +296,7 @@ class ROCmLatentMoERunnerRmsWeightGemmAllReduceRmsScaleAdd(ROCmLatentMoERunner):
         transform = self.routed_output_transform
         assert transform is not None
         out = _rms_weight_gemm_all_reduce_rms_scale_add(
-            backend.all_reduce,
+            lambda row: backend.all_reduce(row)[0],
             fused_output,
             shared_output,
             transform.norm,
