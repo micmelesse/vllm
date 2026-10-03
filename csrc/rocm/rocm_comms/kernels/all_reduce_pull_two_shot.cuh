@@ -13,63 +13,46 @@
 
 namespace hip_comms {
 
-// A BLOCK IS ONE WAVE PER PEER. `num_packs` packs cut into one slice of `slice_packs` per rank
-// (the last one short); a block's wave w works with peer (rank + w) % ngpus, and its lane l with
-// pack blockIdx.x x lanes + l of the slice (then every grid's worth after it). ROTATED, SO THE
-// RANKS SPREAD OVER THE LINKS: at any moment the eight GPUs read eight different peers, where in
-// rank order every GPU reads rank 0 first. The sum's order differs by rank, which is harmless:
-// each slice is summed by one rank, so every rank copies the same bytes.
-//
-// THE SAME BLOCK AND LANE INDEX A PACK IN BOTH PHASES: wave 0's lane l writes it, the peers' wave
-// w lane l of the same block read it, after that block's sync.
-template <typename DTYPE, int WORLD>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+// THE BUFFER AS ONE ROW CUT INTO ONE SLICE A RANK (the last one short), each in chunks of
+// THREADS_PER_BLOCK groups, the grid striding over them. A rank sums its slice over every rank into
+// its scratch, every thread its own columns from all of them, aiter's two-stage; then copies every
+// rank's summed slice out. ROTATED, SO THE RANKS SPREAD OVER THE LINKS: a rank reads rank + w for
+// w = 0.. in order, where in rank order every GPU reads rank 0 first; the sum's order differs by
+// rank, which is harmless, since each slice is summed by one rank. THE SAME BLOCK READS IN THE
+// SECOND PHASE WHAT THE SAME BLOCK ON EACH RANK WROTE IN THE FIRST: both stride over chunks alike.
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot(const p2p::PeerPtrs* __restrict__ peer_inputs,
                              p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                              p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out, int num_packs) {
-  using V               = typename traits<DTYPE>::V;
-  constexpr int N       = traits<DTYPE>::N;
-  const int lanes       = blockDim.x / WORLD;  // host: blockDim is WORLD whole waves
-  const int wave        = threadIdx.x / lanes;
-  const int lane        = threadIdx.x % lanes;
-  const int peer        = (rank + wave) % WORLD;
-  const int slice_packs = (num_packs + WORLD - 1) / WORLD;
-  const int first       = blockIdx.x * lanes + lane;
-  const int stride      = gridDim.x * lanes;
-  __shared__ V got[kBuild.kernels.max_threads];
+  using Chunk     = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
+  constexpr int NL = traits<DTYPE>::N;
+  const int len   = num_packs * NL;                              // the buffer, in elements
+  const int slice = (num_packs + WORLD - 1) / WORLD * NL;        // a rank's, in elements
+  const int first = rank * slice;
+  const int mine  = max(0, min(slice, len - first));             // a late rank's may be short
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto their_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, peer);
-  const auto their_input = p2p::input<DTYPE, WORLD>(*peer_inputs, peer);
+  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
+  const DTYPE* rotated[WORLD];
+#pragma unroll
+  for (int w = 0; w < WORLD; ++w)
+    rotated[w] = p2p::input<DTYPE, WORLD>(*peer_inputs, (rank + w) % WORLD).data() + first;
   block_stamp(0);
   p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
-  // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
-  //    the WORLD loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
-  //    lane's packs, so they leave the loop together and the barriers inside it match.
-  const int base    = rank * slice_packs;
-  const int mine    = min(slice_packs, num_packs - base);
-  for (int i = first; i < mine; i += stride) {
-    got[threadIdx.x] = p2p::read_input(their_input, base + i);
-    __syncthreads();
-    if (wave == 0) {
-      float acc[N];
+  // 2. Reduce-scatter: this rank's slice, summed over every rank, into its scratch.
+  for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < mine;
+       offs_n += gridDim.x * Chunk::kTileN) {
+    Chunk peers[WORLD];
 #pragma unroll
-      for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(got[lane].d[j]);
-#pragma unroll
-      for (int w = 1; w < WORLD; ++w)
-#pragma unroll
-        for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(got[w * lanes + lane].d[j]);
-      V s;
-#pragma unroll
-      for (int j = 0; j < N; ++j) s.d[j] = static_cast<DTYPE>(acc[j]);
-      p2p::write_scratch(own_scratch, i, s);
-    }
-    __syncthreads();
+    for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
+    peers_load(peers, [&](int w) { return rotated[w]; }, mine);
+    tile_store(own_scratch.data(), mine, peers_reduce(peers));
   }
 
   block_stamp(2);
@@ -78,82 +61,80 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
-  // 4. All-gather: wave w copies its peer's slice out of that peer's scratch, at its place in the
-  //    output. The next call's first sync keeps a rank from overwriting its scratch while it is
-  //    read.
-  V* dst = reinterpret_cast<V*>(out);
-  for (int i = first; i < slice_packs; i += stride)
-    if (peer * slice_packs + i < num_packs)
-      thread_store(dst + peer * slice_packs + i, p2p::read_scratch(their_scratch, i));
+  // 4. All-gather: every rank's slice out of its scratch, at its place in the output, every
+  //    rank's chunk loaded before any is stored. The next call's first sync keeps a rank from
+  //    overwriting its scratch while it is read.
+  for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
+       offs_n += gridDim.x * Chunk::kTileN) {
+    Chunk got[WORLD];
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
+    peers_load(got, [&](int r) { return scratches[r].data(); }, slice);
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) {
+      got[r].N = max(0, min(slice, len - r * slice));  // the rank's slice, a late one short
+      if (got[r].N > 0) tile_store(out + r * slice, slice, got[r]);
+    }
+  }
   block_stamp(5);
 }
 
 // STAGED: each rank copies `own_input` into its staging a pass at a time and each pass reads the
 // peers' staging, so any size runs in one launch; `num_packs` in 64 bits. A pass is at most what a
-// staging holds (`stage_packs`) and what the scratch holds (a slice a rank). WAVE W STAGES THE
-// SLICE ITS PEER READS, at the packs the peer's same block reads, so a peers barrier makes it
+// staging holds (`stage_packs`) and what the scratch holds (a slice a rank). EACH BLOCK STAGES, OF
+// EVERY RANK'S SLICE, THE CHUNKS THAT RANK'S SAME BLOCK READS, so a peers barrier makes them
 // visible.
-template <typename DTYPE, int WORLD>
-__global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_staged(p2p::PeerPtrs peer_scratch, p2p::PeerPtrs peer_staging,
                                     p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
-  using V            = typename traits<DTYPE>::V;
-  constexpr int N    = traits<DTYPE>::N;
-  const int lanes    = blockDim.x / WORLD;  // host: blockDim is WORLD whole waves
-  const int wave     = threadIdx.x / lanes;
-  const int lane     = threadIdx.x % lanes;
-  const int peer     = (rank + wave) % WORLD;
-  const int first    = blockIdx.x * lanes + lane;
-  const int stride   = gridDim.x * lanes;
-  const V* own       = reinterpret_cast<const V*>(own_input);
+  using Chunk        = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
+  constexpr int NL   = traits<DTYPE>::N;
   const int64_t pass = min(stage_packs, scratch_packs * WORLD);
-  __shared__ V got[kBuild.kernels.max_threads];
-
-  const auto own_scratch    = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto their_scratch    = p2p::scratch<DTYPE, WORLD>(peer_scratch, peer);
+  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
   const auto own_staging = p2p::staging<DTYPE, WORLD>(peer_staging, rank);
-  const auto their_staging = p2p::staging<DTYPE, WORLD>(peer_staging, peer);
-  V* dst             = reinterpret_cast<V*>(out);
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
-    const int64_t n       = min(pass, num_packs - c0);
-    const int slice_packs = static_cast<int>((n + WORLD - 1) / WORLD);
+    const int len    = static_cast<int>(min(pass, num_packs - c0)) * NL;  // this pass, elements
+    const int slice  = (len / NL + WORLD - 1) / WORLD * NL;
+    const int first  = rank * slice;
+    const int mine   = max(0, min(slice, len - first));
+    const int64_t at = c0 * NL;
+    const DTYPE* rotated[WORLD];
+#pragma unroll
+    for (int w = 0; w < WORLD; ++w)
+      rotated[w] = p2p::staging<DTYPE, WORLD>(peer_staging, (rank + w) % WORLD).data() + first;
     block_stamp(0);
-    // 1. Wave w stages the slice its peer reads, then it is visible (and, past the first pass,
-    //    every peer has read this rank's scratch).
-    for (int i = first; i < slice_packs; i += stride) {
-      const int64_t at = int64_t{peer} * slice_packs + i;
-      if (at < n) p2p::write_staging(own_staging, at, own[c0 + at]);
+    // 1. Every rank's slice of this pass into this rank's staging, the chunks each rank's same
+    //    block reads, then visible (and, past the first pass, every peer has read this rank's
+    //    scratch).
+    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
+         offs_n += gridDim.x * Chunk::kTileN) {
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) {
+        const int n = max(0, min(slice, len - r * slice));
+        if (offs_n >= n) continue;
+        Chunk part{1, n, 0, offs_n};
+        tile_load(part, own_input + at + r * slice, n);
+        tile_store(own_staging.data() + r * slice, n, part);
+      }
     }
     p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(1);
 
-    // 2. Reduce-scatter: each wave loads this rank's slice from its peer's staging into LDS, and
-    //    wave 0 sums the WORLD loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the
-    //    waves share a lane's packs, so they leave the loop together and the barriers match.
-    const int64_t base = int64_t{rank} * slice_packs;
-    const int count    = static_cast<int>(min(int64_t{slice_packs}, n - base));
-    for (int i = first; i < count; i += stride) {
-      got[threadIdx.x] = p2p::read_staging(their_staging, base + i);
-      __syncthreads();
-      if (wave == 0) {
-        float acc[N];
+    // 2. Reduce-scatter: this rank's slice from every rank's staging, into its scratch.
+    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < mine;
+         offs_n += gridDim.x * Chunk::kTileN) {
+      Chunk peers[WORLD];
 #pragma unroll
-        for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(got[lane].d[j]);
-#pragma unroll
-        for (int w = 1; w < WORLD; ++w)
-#pragma unroll
-          for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(got[w * lanes + lane].d[j]);
-        V s;
-#pragma unroll
-        for (int j = 0; j < N; ++j) s.d[j] = static_cast<DTYPE>(acc[j]);
-        p2p::write_scratch(own_scratch, i, s);
-      }
-      __syncthreads();
+      for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
+      peers_load(peers, [&](int w) { return rotated[w]; }, mine);
+      tile_store(own_scratch.data(), mine, peers_reduce(peers));
     }
 
     block_stamp(2);
@@ -163,13 +144,19 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(3);
 
-    // 4. All-gather: wave w copies its peer's slice out of that peer's scratch, at its place in
-    //    the output. The next pass's (or call's) first sync keeps a rank from overwriting its
-    //    scratch while it is read.
-    for (int i = first; i < slice_packs; i += stride)
-      if (int64_t{peer} * slice_packs + i < n)
-        thread_store(dst + c0 + int64_t{peer} * slice_packs + i,
-                     p2p::read_scratch(their_scratch, i));
+    // 4. All-gather: every rank's slice out of its scratch, at its place in the output.
+    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
+         offs_n += gridDim.x * Chunk::kTileN) {
+      Chunk got[WORLD];
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
+      peers_load(got, [&](int r) { return scratches[r].data(); }, slice);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) {
+        got[r].N = max(0, min(slice, len - r * slice));
+        if (got[r].N > 0) tile_store(out + at + r * slice, slice, got[r]);
+      }
+    }
     block_stamp(5);
   }
 }

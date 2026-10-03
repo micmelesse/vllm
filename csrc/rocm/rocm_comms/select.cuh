@@ -72,6 +72,13 @@ constexpr KernelConfig kAllReduceOneShotConfigs[] = {
     AllReduceConfig{{256, 0}},
     AllReduceConfig{{512, 0}},
 };
+// The plain two-shot: the same chunks (512, a wave per peer at eight ranks, its own).
+constexpr KernelConfig kAllReduceTwoShotConfigs[] = {
+    AllReduceConfig{{64, 0}},
+    AllReduceConfig{{128, 0}},
+    AllReduceConfig{{256, 0}},
+    AllReduceConfig{{512, 0}},
+};
 constexpr KernelConfig kRmsNormOneShotConfigs[] = {
     RowConfig{{512, 16}, 4096},
     RowConfig{{512, 16}, 8192},
@@ -206,7 +213,7 @@ constexpr TemplateInfo kTemplates[] = {
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot), OpType::all_reduce,
      false, false, kAllReduceOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot), OpType::all_reduce,
-     true, false, {}},
+     true, false, kAllReduceTwoShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), OpType::all_reduce_rms_norm,
      false, false, kRmsNormOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm), OpType::all_reduce_rms_norm,
@@ -851,9 +858,6 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (has_tiles(fn) && tile_n_of(c) == 0) return Error::row_too_wide;
   if (has_tiles(fn) && !built(fn, c)) return Error::tile_not_built;
   if (has_tiles(fn) && tile_n_of(c) < tile_cols) return Error::row_too_wide;
-  // TWO-SHOT'S BLOCK IS ONE WAVE PER PEER, so anything else would leave a peer unread.
-  if (fn == Template::all_reduce_pull_two_shot && threads % (world * kWaveSize) != 0)
-    return Error::block_not_a_wave_per_peer;
   if (const GemmConfig* g = std::get_if<GemmConfig>(&c);
       g && !gemm_fits(kTarget, g->tile_m, g->tile_k, g->slice_k, threads))
     return Error::block_exceeds_lds;
@@ -930,9 +934,13 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
           });
           return;
         case Template::all_reduce_pull_two_shot:
-          kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
-                                all_reduce_pull_two_shot_staged<T, NG>)
-                          : instance<AllReduceTwoShotKernel>(all_reduce_pull_two_shot<T, NG>);
+          by_config<Template::all_reduce_pull_two_shot>(c, [&](auto built) {
+            constexpr int THREADS = decltype(built)::value.launch.threads_per_block;
+            kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
+                                  all_reduce_pull_two_shot_staged<T, NG, THREADS>)
+                            : instance<AllReduceTwoShotKernel>(
+                                  all_reduce_pull_two_shot<T, NG, THREADS>);
+          });
           return;
         default: not_this_ops(fn);
       }
