@@ -126,7 +126,7 @@ DINLINE typename TILE::Pack pack(const TILE& t, int m, int k) {
 }  // namespace impl
 
 template <typename TILE>
-DINLINE void thread_load(TILE& t, const typename TILE::Acc* data,
+DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
                          int64_t row_stride) {
   using P = typename TILE::Pack;
   const P* at = reinterpret_cast<const P*>(data);
@@ -141,7 +141,7 @@ DINLINE void thread_load(TILE& t, const typename TILE::Acc* data,
 }
 
 template <typename TILE>
-DINLINE void thread_store(typename TILE::Acc* data, int64_t row_stride, const TILE& t) {
+DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride, const TILE& t) {
   using P = typename TILE::Pack;
   P* at   = reinterpret_cast<P*>(data);
 #pragma unroll

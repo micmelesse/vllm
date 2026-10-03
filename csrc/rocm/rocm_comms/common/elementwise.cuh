@@ -15,8 +15,8 @@
 
 namespace hip_comms {
 
-// A FLOAT TILE'S MATH, element by element: thread_add and thread_mul with a tile of its shape or a
-// one-row tile (a weight, every row's), and thread_mul by one scalar or a scalar a row (a row's norm
+// A FLOAT TILE'S MATH, element by element: tile_add and tile_mul with a tile of its shape or a
+// one-row tile (a weight, every row's), and tile_mul by one scalar or a scalar a row (a row's norm
 // scale).
 namespace impl {
 template <typename A, typename B, typename OP>
@@ -38,17 +38,17 @@ DINLINE A zip(const A& a, const B& b, OP op) {
 }  // namespace impl
 
 template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
-DINLINE A thread_add(const A& a, const B& b) {
+DINLINE A tile_add(const A& a, const B& b) {
   return impl::zip(a, b, [](float x, float y) { return x + y; });
 }
 
 template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
-DINLINE A thread_mul(const A& a, const B& b) {
+DINLINE A tile_mul(const A& a, const B& b) {
   return impl::zip(a, b, [](float x, float y) { return x * y; });
 }
 
 template <typename A>
-DINLINE A thread_mul(const A& a, const float (&row_scale)[A::kRows]) {
+DINLINE A tile_mul(const A& a, const float (&row_scale)[A::kRows]) {
   static_assert(std::is_same_v<typename A::Acc, float>, "tile math is on float tiles");
   A out = a;
 #pragma unroll
@@ -61,11 +61,11 @@ DINLINE A thread_mul(const A& a, const float (&row_scale)[A::kRows]) {
 }
 
 template <typename A>
-DINLINE A thread_mul(const A& a, float scale) {
+DINLINE A tile_mul(const A& a, float scale) {
   float row_scale[A::kRows];
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m) row_scale[m] = scale;
-  return thread_mul(a, row_scale);
+  return tile_mul(a, row_scale);
 }
 
 // A pack as fp32, and fp32 rounded once back to a pack of T.

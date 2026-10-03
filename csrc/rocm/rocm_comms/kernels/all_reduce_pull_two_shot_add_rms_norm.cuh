@@ -67,13 +67,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
   Weight w{1, cols, 0, 0};
-  thread_load(w, weight, 0);
+  tile_load(w, weight, 0);
   // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
   // wait covers only its own, older, loads), so the next round trip runs under the reduction and
   // norm. Its rows land in this rank's scratch at row - first.
   const auto one_row = [&](int row, const Peers& cur, Peers& next) {
     Row res{rows, cols, row, 0};
-    if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
     // again; at 256 tokens every block has one row: 2026-10-01T01-07-56Z).
@@ -82,13 +82,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
     if constexpr (ADD_RESIDUAL) {
-      s = thread_add(s, res.template to<float>());
+      s = tile_add(s, res.template to<float>());
       Row added = s.template to<DTYPE>();
       added.offs_m = row - first;
-      thread_store(own_scratch.data(), cols, added);
+      tile_store(own_scratch.data(), cols, added);
     }
     float ss[1];
-    thread_dot(s, s, ss);
+    partial_dot(s, s, ss);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
@@ -104,12 +104,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    Row normed = thread_mul(thread_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
+    Row normed = tile_mul(tile_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
     normed.offs_m = row - first;
-    thread_store(own_scratch.data(), cols, normed);
+    tile_store(own_scratch.data(), cols, normed);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other
   // (a copy cost 32 moves a row at one pack a thread: ISA 2026-10-01T00-58-37Z).
@@ -157,16 +157,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       at.M      = rows;
       at.offs_m = row;
       if constexpr (ADD_RESIDUAL) {
-        thread_store(residual_out, cols, at);
+        tile_store(residual_out, cols, at);
         const float scale = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
         const Row normed =
-            thread_mul(thread_mul(at.template to<float>(), scale).template to<WEIGHT_DTYPE>().template to<float>(),
+            tile_mul(tile_mul(at.template to<float>(), scale).template to<WEIGHT_DTYPE>().template to<float>(),
                        w.template to<float>())
                 .template to<WEIGHT_DTYPE>()
                 .template to<DTYPE>();
-        thread_store(out, cols, normed);
+        tile_store(out, cols, normed);
       } else {
-        thread_store(out, cols, at);
+        tile_store(out, cols, at);
       }
     }
   }

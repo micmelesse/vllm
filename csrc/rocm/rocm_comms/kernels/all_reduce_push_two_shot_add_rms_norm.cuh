@@ -67,7 +67,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       peers_load(peers, input, cols);
       const Slice sum = peers_reduce(peers);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) thread_store(scratches[r].data(), cols, sum);
+      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r].data(), cols, sum);
     }
   }
   block_stamp(2);
@@ -87,25 +87,25 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     // Every load of the row before any store: the scratch's and the residual together, the weight
     // under the reduction.
     Row own = at, res = at;
-    thread_load(own, own_scratch.data(), cols);
-    if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
+    tile_load(own, own_scratch.data(), cols);
+    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
-      s = thread_add(s, res.template to<float>());
-      thread_store(residual_out, cols, s.template to<DTYPE>());
+      s = tile_add(s, res.template to<float>());
+      tile_store(residual_out, cols, s.template to<DTYPE>());
     }
     Weight w{1, cols, 0, 0};
-    thread_load(w, weight, 0);
+    tile_load(w, weight, 0);
     float ss[1];
-    thread_dot(s, s, ss);
+    partial_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    Row normed = thread_mul(thread_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
+    Row normed = tile_mul(tile_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    thread_store(out, cols, normed);
+    tile_store(out, cols, normed);
   }
   block_stamp(4);
 }

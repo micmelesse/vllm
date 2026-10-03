@@ -49,16 +49,16 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    thread_load(wk, norm_w, 0);  // under the reduction
+    tile_load(wk, norm_w, 0);  // under the reduction
     float ss[1];
-    thread_dot(s, s, ss);
+    partial_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     const RowF w = wk.template to<float>();
     // out = T(T(s * scale) * float(w)), as the reference rounds
-    Row x = thread_mul(thread_mul(s, scale).template to<DTYPE>().template to<float>(), w)
+    Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
-    thread_store(workspace, cols, x);
+    tile_store(workspace, cols, x);
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.

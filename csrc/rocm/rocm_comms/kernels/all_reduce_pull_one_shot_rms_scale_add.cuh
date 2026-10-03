@@ -66,15 +66,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     peers_load(lt, latent, stride);
     const RowF l = peers_reduce(lt).template to<float>();
     float ss[1];
-    thread_dot(l, l, ss);
+    partial_dot(l, l, ss);
     block_stamp(2);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
     const RowF s = peers_reduce(sh).template to<float>();
     const RowF q = peers_reduce(pj).template to<float>();
-    Row r = thread_add(s, thread_mul(q, scale)).template to<DTYPE>();
-    thread_store(out, hidden, r);
+    Row r = tile_add(s, tile_mul(q, scale)).template to<DTYPE>();
+    tile_store(out, hidden, r);
   }
 
   block_stamp(4);

@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};
-    thread_load(sum, delta, cols);
+    tile_load(sum, delta, cols);
     block_attn_res_tile<true, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
                                       write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
                                       out_eps, inv_hidden);

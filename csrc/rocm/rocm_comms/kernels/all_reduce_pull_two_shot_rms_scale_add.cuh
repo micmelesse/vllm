@@ -76,15 +76,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     peers_load(lt, latent, stride);
     const RowF l = peers_reduce(lt).template to<float>();
     float ss[1];
-    thread_dot(l, l, ss);
+    partial_dot(l, l, ss);
     block_stamp(2);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
     const RowF s = peers_reduce(sh).template to<float>();
     const RowF q = peers_reduce(pj).template to<float>();
-    Row r = thread_add(s, thread_mul(q, scale)).template to<DTYPE>();
+    Row r = tile_add(s, tile_mul(q, scale)).template to<DTYPE>();
     r.offs_m = w / splits;  // at the row's place among this rank's
-    thread_store(own_scratch.data(), hidden, r);
+    tile_store(own_scratch.data(), hidden, r);
   }
 
   block_stamp(3);
@@ -107,7 +107,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int r = 0; r < WORLD; ++r) {
       if (l >= rows_of(r)) continue;
       got[r].offs_m = r * slice_rows + l;
-      thread_store(out, hidden, got[r]);
+      tile_store(out, hidden, got[r]);
     }
   }
   block_stamp(5);

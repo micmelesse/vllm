@@ -41,19 +41,19 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   Rows np = sum;
   if constexpr (HAS_PREFIX) {
     Rows old = sum.template like<DTYPE>();
-    thread_load(old, prefix, stride);
-    np = thread_add(old.template to<float>(), sum.template to<float>()).template to<DTYPE>();
+    tile_load(old, prefix, stride);
+    np = tile_add(old.template to<float>(), sum.template to<float>()).template to<DTYPE>();
   }
-  thread_store(prefix, stride, np);
-  if (write_idx >= 0) thread_store(blocks + write_idx * block_stride_r, block_stride_m, np);
+  tile_store(prefix, stride, np);
+  if (write_idx >= 0) tile_store(blocks + write_idx * block_stride_r, block_stride_m, np);
   const RowsF u = np.template to<float>();
 
   RowsF acc = u;
   if (num_blocks != 0) {
     Weight nw = at_cols, qk = at_cols;
-    thread_load(nw, norm_w, 0);
-    thread_load(qk, qk_w, 0);
-    const WeightF w = thread_mul(nw.template to<float>(), qk.template to<float>());
+    tile_load(nw, norm_w, 0);
+    tile_load(qk, qk_w, 0);
+    const WeightF w = tile_mul(nw.template to<float>(), qk.template to<float>());
     acc = u.template like<float>();
     OnlineSoftmax softmax[TILE_M];
     for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
@@ -64,14 +64,14 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
         const int src = src0 + s;
         if (src < num_blocks) {
           Rows raw = sum.template like<DTYPE>();
-          thread_load(raw, blocks + src * block_stride_r, block_stride_m);
+          tile_load(raw, blocks + src * block_stride_r, block_stride_m);
           v[s] = raw.template to<float>();
         } else {
           v[s] = src == num_blocks ? u : u.template like<float>();
         }
         float ss[TILE_M], dw[TILE_M];
-        thread_dot(v[s], v[s], ss);
-        thread_dot(v[s], w, dw);
+        partial_dot(v[s], v[s], ss);
+        partial_dot(v[s], w, dw);
 #pragma unroll
         for (int m = 0; m < TILE_M; ++m) {
           sums[(m * TILE_K + s) * 2]     = ss[m];
@@ -94,14 +94,14 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s) scale[s][m] = row_scale[s];
       }
-      acc = thread_mul(acc, old_scale);
+      acc = tile_mul(acc, old_scale);
 #pragma unroll
-      for (int s = 0; s < TILE_K; ++s) acc = thread_add(acc, thread_mul(v[s], scale[s]));
+      for (int s = 0; s < TILE_K; ++s) acc = tile_add(acc, tile_mul(v[s], scale[s]));
     }
     float inv_den[TILE_M];
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) inv_den[m] = 1.0f / softmax[m].denominator;
-    acc = thread_mul(acc, inv_den);
+    acc = tile_mul(acc, inv_den);
   }
 
   // The output, normed when out_norm_w is given: its weight in flight under the one reduction for
@@ -109,18 +109,18 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   Rows result = sum.template like<DTYPE>();
   if (out_norm_w != nullptr) {
     Weight g_in = at_cols;
-    thread_load(g_in, out_norm_w, 0);
+    tile_load(g_in, out_norm_w, 0);
     float ss[TILE_M];
-    thread_dot(acc, acc, ss);
+    partial_dot(acc, acc, ss);
     block_reduce<Sum>(ss);
     float scale[TILE_M];
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) scale[m] = rsqrtf(ss[m] * inv_hidden + out_eps);
-    result = thread_mul(thread_mul(acc, scale), g_in.template to<float>()).template to<DTYPE>();
+    result = tile_mul(tile_mul(acc, scale), g_in.template to<float>()).template to<DTYPE>();
   } else {
     result = acc.template to<DTYPE>();
   }
-  thread_store(out, stride, result);
+  tile_store(out, stride, result);
 }
 
 }  // namespace hip_comms

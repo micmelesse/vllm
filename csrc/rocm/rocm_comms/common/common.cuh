@@ -2,13 +2,14 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // COMMON, THE OPS' ONE INTERFACE: the only common/ header anything includes, and below, the whole
-// of what a kernel may use. Every op is named for its scope (thread, wave, block, grid, peers), as
-// hipCUB names its own; each prevents a footgun its comment names. Its parts refuse to be included
-// any other way.
+// of what a kernel may use. An op on a tile is named for it (tile_load, tile_add), a partial
+// result for being one (partial_dot), and an op that synchronizes or reaches other ranks for its
+// scope (block_reduce, peers_load); each prevents a footgun its comment names. Its parts refuse to
+// be included any other way.
 //
 // CONCURRENCY IS PART OF EACH OP'S CONTRACT, so a kernel keeps it by using them:
-//   1. Global memory only through memory.cuh's loads and stores: a kernel never indexes a row.
-//   2. A row is loaded whole (thread_load, peers_load: one round trip) before anything is stored;
+//   1. Global memory only through memory.cuh's tile loads and stores: a kernel never indexes a row.
+//   2. A tile is loaded whole (tile_load, peers_load: one round trip) before anything is stored;
 //      a pack loaded between stores waits a round trip, since a store may alias it.
 //   3. A load that does not depend on a reduction is issued before it (weights, the next row or
 //      source), so its round trip runs under the reduction.
@@ -25,19 +26,19 @@
 //                         elements of it held as ACC_DTYPE; to<U>() holds them as U, like<U>() is
 //                         the same place empty, TileAs<TILE, U> its type
 // memory.cuh
-//   thread_load(tile, data, row_stride), thread_store(data, row_stride, tile)   one round trip a
+//   tile_load(tile, data, row_stride), tile_store(data, row_stride, tile)   one round trip a
 //                         tile; a row past M reads the last, stores only rows below M
 //   peers_load(tiles[ngpus], data(r), row_stride)   every rank's tile in flight together
 //   sliced_load<ngpus>(tile, data(r), row_stride, slice)   each column from the rank owning it
-//   one pack, for the flat loops: thread_load(p), thread_store(p, v), peers_load<T, ngpus>(read, i)
+//   one pack, for the flat loops: thread_load(p), thread_store(p, v), peers_load<DTYPE, WORLD>(read, i)
 // elementwise.cuh
-//   thread_add(a, b), thread_mul(a, b), thread_mul(a, scale or row_scale)   float tile math, b
+//   tile_add(a, b), tile_mul(a, b), tile_mul(a, scale or row_scale)   float tile math, b
 //                         a's shape or one row
 // reduce.cuh
 //   peers_reduce(tiles[ngpus]) -> tile           summed in rank order in fp32, rounded once
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
-//   thread_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
+//   partial_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
 //                                                one row, a weight)
 //   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
 //                                               skinny GEMM, written or accumulated,

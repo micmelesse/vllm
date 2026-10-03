@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       peers_load(peers, input, cols);
       const Slice sum = peers_reduce(peers);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) thread_store(scratches[r].data(), cols, sum);
+      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r].data(), cols, sum);
     }
   }
   block_stamp(2);
@@ -90,7 +90,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};
-    thread_load(sum, own_scratch.data(), cols);
+    tile_load(sum, own_scratch.data(), cols);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
                                          out_eps, inv_hidden);

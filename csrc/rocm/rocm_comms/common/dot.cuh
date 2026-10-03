@@ -18,10 +18,10 @@
 namespace hip_comms {
 
 // This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
-// partials a block_reduce turns into the rows' dots (a sum of squares is thread_dot(x, x)). A
+// partials a block_reduce turns into the rows' dots (a sum of squares is partial_dot(x, x)). A
 // one-row b (a weight) is every row's.
 template <typename A, typename B>
-DINLINE void thread_dot(const A& a, const B& b, float (&d)[A::kRows]) {
+DINLINE void partial_dot(const A& a, const B& b, float (&d)[A::kRows]) {
   static_assert(A::kThreadsM == 1, "a dot's partials reduce over the block, so a row is the block's");
   static_assert(B::kRows == A::kRows || B::kRows == 1, "b is a's shape or one row");
 #pragma unroll

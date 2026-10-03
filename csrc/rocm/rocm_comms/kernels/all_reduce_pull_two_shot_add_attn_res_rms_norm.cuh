@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;
       peers_load(peers, input, cols);
-      thread_store(own_scratch.data(), cols, peers_reduce(peers));
+      tile_store(own_scratch.data(), cols, peers_reduce(peers));
     }
   }
   block_stamp(2);

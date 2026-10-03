@@ -52,26 +52,26 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
     peers_load(peers, input, cols);
     Row res = at;
-    if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
-      s = thread_add(s, res.template to<float>());
-      thread_store(residual_out, cols, s.template to<DTYPE>());
+      s = tile_add(s, res.template to<float>());
+      tile_store(residual_out, cols, s.template to<DTYPE>());
     }
     Weight w{1, cols, 0, 0};
-    thread_load(w, weight, 0);
+    tile_load(w, weight, 0);
     float ss[1];
-    thread_dot(s, s, ss);
+    partial_dot(s, s, ss);
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    Row normed = thread_mul(thread_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
+    Row normed = tile_mul(tile_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    thread_store(out, cols, normed);
+    tile_store(out, cols, normed);
   }
 
   block_stamp(4);

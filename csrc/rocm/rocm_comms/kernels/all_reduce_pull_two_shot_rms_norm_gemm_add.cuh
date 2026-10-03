@@ -58,17 +58,17 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    thread_load(wk, norm_w, 0);  // under the reduction
+    tile_load(wk, norm_w, 0);  // under the reduction
     float ss[1];
-    thread_dot(s, s, ss);
+    partial_dot(s, s, ss);
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     const RowF w = wk.template to<float>();
     // out = T(T(s * scale) * float(w)), as the reference rounds
-    Row x = thread_mul(thread_mul(s, scale).template to<DTYPE>().template to<float>(), w)
+    Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
     x.offs_m = row - first;
-    thread_store(own_scratch.data(), cols, x);
+    tile_store(own_scratch.data(), cols, x);
   }
 
   // 3. Every rank's normed rows are visible to its peers.
@@ -90,7 +90,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     for (int r = 0; r < WORLD; ++r) {
       got[r].M      = rows;
       got[r].offs_m = r * slice_rows + l;
-      thread_store(workspace, cols, got[r]);
+      tile_store(workspace, cols, got[r]);
     }
   }
 
