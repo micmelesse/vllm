@@ -29,10 +29,6 @@
 //                                  each touched only atomically; the barriers' and flags' only
 //                                  way in
 //
-// p2p::impl::Codec<T, kBits>   a group of kCodecGroupPacks packs on the wire: T itself (16) or
-//                              QuickReduce's integers (8, 4) under one fp32 scale; for the
-//                              quantized kernel that will use it
-//
 // and in p2p::, for sizing: Signal, PeerPtrs, kMaxBlocks, kMaxRanks. The host side, which maps
 // the peers' memory and hands a launch its buffers, is ../handle.cuh's Handle.
 
@@ -42,5 +38,4 @@
 #include "impl/peers.cuh"
 #include "impl/buffers.cuh"
 #include "impl/core.cuh"
-#include "impl/codec.cuh"
 #undef HIP_COMMS_P2P_INTERFACE
