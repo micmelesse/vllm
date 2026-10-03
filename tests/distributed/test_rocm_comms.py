@@ -1854,8 +1854,9 @@ def test_python_names_cpps_errors_and_ops() -> None:
 
 
 def test_build_info_lists_every_template_with_its_configs() -> None:
-    """Every template the build holds names one of its ops, and every tiled one lists at
-    least one config whose launch is legal; the plain all-reduce's lists none."""
+    """Every template the build holds names one of its ops and lists at least one config at a
+    legal block size; a tiled one's has a tile and a grid, the plain all-reduce's its threads
+    alone (its grid is the call's)."""
     # example-based: one fixed catalog
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
@@ -1863,10 +1864,11 @@ def test_build_info_lists_every_template_with_its_configs() -> None:
     assert built.templates
     for name, t in built.templates.items():
         assert t.op in built.op_names, name
-        if t.op == "all_reduce":
-            assert t.configs == (), name
-            continue
         assert t.configs, name
+        if t.op == "all_reduce":
+            for c in t.configs:
+                assert c["threads_per_block"] > 0 and c.get("tile_n", 0) == 0, (name, c)
+            continue
         for c in t.configs:
             assert c["threads_per_block"] > 0 and c["blocks_per_grid"] > 0, (name, c)
             assert c.get("tile_n", 0) > 0, (name, c)
