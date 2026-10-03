@@ -110,6 +110,17 @@ DINLINE PACK pack_load(const PACK* p) {
   else
     return *p;
 }
+// A loaded group into the tile's elements, and a held group out as one load or store's worth.
+template <typename TILE>
+DINLINE void held(TILE& t, int m, int k, const typename TILE::Pack& p) {
+  __builtin_memcpy(t.v[m][k], &p, sizeof(p));
+}
+template <typename TILE>
+DINLINE typename TILE::Pack pack(const TILE& t, int m, int k) {
+  typename TILE::Pack p;
+  __builtin_memcpy(&p, t.v[m][k], sizeof(p));
+  return p;
+}
 }  // namespace impl
 
 template <typename TILE>
@@ -121,7 +132,7 @@ DINLINE void thread_load(TILE& t, const typename TILE::Acc* data,
   for (int m = 0; m < TILE::kRows; ++m) {
     const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
-    for (int k = 0; k < t.K; ++k) t.v[m][k] = impl::pack_load(row + t.col(k));
+    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
   }
   impl::issued();
 }
@@ -138,9 +149,9 @@ DINLINE void thread_store(typename TILE::Acc* data, int64_t row_stride, const TI
     for (int k = 0; k < t.K; ++k) {
       if (t.mask(k) == 0.0f) continue;
       if constexpr (sizeof(P) == 16)
-        thread_store(row + t.col(k), t.v[m][k]);
+        thread_store(row + t.col(k), impl::pack(t, m, k));
       else
-        row[t.col(k)] = t.v[m][k];
+        row[t.col(k)] = impl::pack(t, m, k);
     }
   }
 }
@@ -161,7 +172,7 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
       const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        t[r].v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(r)) + i);
+        impl::held(t[r], m, k, impl::pack_load(reinterpret_cast<const P*>(data(r)) + i));
     }
   impl::issued();
 }
@@ -178,8 +189,9 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
       const int owner = min(t.col(k) / (slice / t.kPack), WORLD - 1);
-      t.v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
-                                  int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k));
+      impl::held(t, m, k,
+                 impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
+                                 int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k)));
     }
   impl::issued();
 }

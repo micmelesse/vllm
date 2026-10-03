@@ -33,7 +33,7 @@ DINLINE void thread_dot(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, flo
     for (int k = 0; k < a.K; ++k) {
       float dk = 0.0f;
 #pragma unroll
-      for (int j = 0; j < NL; ++j) dk += a.v[m][k].d[j] * b.v[mb][k].d[j];
+      for (int j = 0; j < NL; ++j) dk += a.v[m][k][j] * b.v[mb][k][j];
       d[m] += a.mask(k) * dk;
     }
   }

@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j)
-        r.v[0][k].d[j] = static_cast<DTYPE>(s.v[0][k].d[j] + q.v[0][k].d[j] * scale);
+        r.v[0][k][j] = static_cast<DTYPE>(s.v[0][k][j] + q.v[0][k][j] * scale);
     thread_store(own_scratch.data(), hidden, r);
   }
 

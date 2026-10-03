@@ -60,7 +60,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j)
-        x.v[0][k].d[j] = static_cast<float>(static_cast<DTYPE>(s.v[0][k].d[j] * scale)) * w.v[0][k].d[j];
+        x.v[0][k][j] = static_cast<float>(static_cast<DTYPE>(s.v[0][k][j] * scale)) * w.v[0][k][j];
     thread_store(workspace, cols, x.template to<DTYPE>());
   }
 

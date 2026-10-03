@@ -51,13 +51,13 @@ DINLINE TILE peers_reduce(const TILE (&t)[WORLD]) {
     for (int k = 0; k < sum.K; ++k) {
       float acc[NL];
 #pragma unroll
-      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k].d[j]);
+      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k][j]);
 #pragma unroll
       for (int r = 1; r < WORLD; ++r)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(t[r].v[m][k].d[j]);
+        for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(t[r].v[m][k][j]);
 #pragma unroll
-      for (int j = 0; j < NL; ++j) sum.v[m][k].d[j] = static_cast<typename TILE::Acc>(acc[j]);
+      for (int j = 0; j < NL; ++j) sum.v[m][k][j] = static_cast<typename TILE::Acc>(acc[j]);
     }
   return sum;
 }

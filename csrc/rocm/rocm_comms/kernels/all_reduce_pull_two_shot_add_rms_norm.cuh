@@ -89,7 +89,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 #pragma unroll
       for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
+        for (int j = 0; j < NL; ++j) s.v[0][k][j] += r.v[0][k][j];
       Row added = s.template to<DTYPE>();
       added.offs_m = row - first;
       thread_store(own_scratch.data(), cols, added);
@@ -115,8 +115,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k].d[j] * scale));
-        normed.v[0][k].d[j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k].d[j])));
+        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k][j] * scale));
+        normed.v[0][k][j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k][j])));
       }
     thread_store(own_scratch.data(), cols, normed);
   };

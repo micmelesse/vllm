@@ -33,10 +33,10 @@ struct Tile {
   static constexpr int K = TILE_N / (kPack * THREADS_PER_BLOCK);  // groups of a row this thread holds
   static constexpr int kRows = TILE_M;
   using Acc  = ACC_DTYPE;
-  using Pack = vec<ACC_DTYPE, kPack>;
+  using Pack = vec<ACC_DTYPE, kPack>;  // how a group is loaded and stored, not how it is held
   int M, N;
   int offs_m, offs_n;
-  Pack v[TILE_M][K];
+  ACC_DTYPE v[TILE_M][K][kPack];
 
   // THIS THREAD'S GROUP k OF A ROW, in groups from the row's start: past N clamped to the last, so
   // every load stays in bounds; its mask is 1 below N and 0 past it (a float, multiplied in, so
@@ -63,7 +63,7 @@ struct Tile {
 #pragma unroll
       for (int k = 0; k < K; ++k)
 #pragma unroll
-        for (int j = 0; j < kPack; ++j) t.v[m][k].d[j] = static_cast<AS_DTYPE>(v[m][k].d[j]);
+        for (int j = 0; j < kPack; ++j) t.v[m][k][j] = static_cast<AS_DTYPE>(v[m][k][j]);
     return t;
   }
   template <typename AS_DTYPE>

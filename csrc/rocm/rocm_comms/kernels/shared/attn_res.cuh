@@ -49,8 +49,8 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
       for (int k = 0; k < Rows::K; ++k)
 #pragma unroll
         for (int j = 0; j < NL; ++j)
-          np.v[m][k].d[j] = static_cast<DTYPE>(static_cast<float>(old.v[m][k].d[j]) +
-                                           static_cast<float>(sum.v[m][k].d[j]));
+          np.v[m][k][j] = static_cast<DTYPE>(static_cast<float>(old.v[m][k][j]) +
+                                           static_cast<float>(sum.v[m][k][j]));
   }
   thread_store(prefix, stride, np);
   if (write_idx >= 0) thread_store(blocks + write_idx * block_stride_r, block_stride_m, np);
@@ -66,7 +66,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
 #pragma unroll
     for (int k = 0; k < WeightF::K; ++k)
 #pragma unroll
-      for (int j = 0; j < NL; ++j) w.v[0][k].d[j] *= q.v[0][k].d[j];
+      for (int j = 0; j < NL; ++j) w.v[0][k][j] *= q.v[0][k][j];
     acc = u.template like<float>();
     OnlineSoftmax softmax[TILE_M];
     for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
@@ -107,10 +107,10 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
         for (int k = 0; k < RowsF::K; ++k)
 #pragma unroll
           for (int j = 0; j < NL; ++j) {
-            float a = acc.v[m][k].d[j] * old_scale;
+            float a = acc.v[m][k][j] * old_scale;
 #pragma unroll
-            for (int s = 0; s < TILE_K; ++s) a += scale[s] * v[s].v[m][k].d[j];
-            acc.v[m][k].d[j] = a;
+            for (int s = 0; s < TILE_K; ++s) a += scale[s] * v[s].v[m][k][j];
+            acc.v[m][k][j] = a;
           }
       }
     }
@@ -120,7 +120,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
 #pragma unroll
       for (int k = 0; k < RowsF::K; ++k)
 #pragma unroll
-        for (int j = 0; j < NL; ++j) acc.v[m][k].d[j] *= inv_den;
+        for (int j = 0; j < NL; ++j) acc.v[m][k][j] *= inv_den;
     }
   }
 
@@ -141,7 +141,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_B
       for (int k = 0; k < Rows::K; ++k)
 #pragma unroll
         for (int j = 0; j < NL; ++j)
-          result.v[m][k].d[j] = static_cast<DTYPE>(acc.v[m][k].d[j] * scale * g.v[0][k].d[j]);
+          result.v[m][k][j] = static_cast<DTYPE>(acc.v[m][k][j] * scale * g.v[0][k][j]);
     }
   } else {
     result = acc.template to<DTYPE>();
