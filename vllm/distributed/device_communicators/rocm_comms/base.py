@@ -278,7 +278,7 @@ class Communicator(ABC):
             ),
         )
         out = torch.empty_like(inp)
-        if not self._warming_up("all_reduce"):
+        if not self._warming_up():
             self._all_reduce(
                 out, inp, algorithm, direction, threads_per_block, blocks_per_grid
             )
@@ -342,7 +342,7 @@ class Communicator(ABC):
             ),
         )
         out = torch.empty_like(inp)
-        if not self._warming_up("all_reduce_rms_norm"):
+        if not self._warming_up():
             self._all_reduce_rms_norm(
                 out,
                 inp,
@@ -415,7 +415,7 @@ class Communicator(ABC):
             ),
         )
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
-        if not self._warming_up("all_reduce_add_rms_norm"):
+        if not self._warming_up():
             self._all_reduce_add_rms_norm(
                 out,
                 residual_out,
@@ -507,7 +507,7 @@ class Communicator(ABC):
         # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
         prefix_out = torch.empty_like(inp) if prefix is None else prefix
         out = torch.empty_like(inp)
-        if self._warming_up("all_reduce_add_attn_res_rms_norm"):
+        if self._warming_up():
             return prefix_out, out, ran
         self._all_reduce_add_attn_res_rms_norm(
             prefix_out,
@@ -606,7 +606,7 @@ class Communicator(ABC):
                 blocks_per_grid,
             ),
         )
-        if not self._warming_up("all_reduce_rms_norm_gemm"):
+        if not self._warming_up():
             self._all_reduce_rms_norm_gemm(
                 False,
                 inp,
@@ -698,7 +698,7 @@ class Communicator(ABC):
                 blocks_per_grid,
             ),
         )
-        if not self._warming_up("all_reduce_rms_norm_gemm_add"):
+        if not self._warming_up():
             self._all_reduce_rms_norm_gemm(
                 True,
                 inp,
@@ -773,7 +773,7 @@ class Communicator(ABC):
                 blocks_per_grid,
             ),
         )
-        if not self._warming_up("all_reduce_rms_scale_add"):
+        if not self._warming_up():
             self._all_reduce_rms_scale_add(
                 inp,
                 out,
@@ -862,7 +862,15 @@ class Communicator(ABC):
     def _required(
         self, op: Op, inp: torch.Tensor, check: Callable[[], Ran | Error]
     ) -> Ran:
-        """What runs `op` here, or Refused, raised, naming the call."""
+        """What runs `op` here, or Refused, raised, naming the call. Also raised: a launch
+        being recorded into a cudagraph outside `capture()`, since a backend may defer
+        peer registration until that context exits, and a graph captured without it
+        replays against addresses that were never registered."""
+        if torch.cuda.is_current_stream_capturing() and self.state != "capturing":
+            raise RuntimeError(
+                f"{type(self).__name__}.{op} is being captured into a cudagraph "
+                f"without `capture()`. Use `with comm.capture(), torch.cuda.graph(g): ...`"
+            )
         got = self._checked(op, check)
         if isinstance(got, Error):
             raise Refused(
@@ -872,22 +880,13 @@ class Communicator(ABC):
             )
         return got
 
-    def _warming_up(self, op: str) -> bool:
+    def _warming_up(self) -> bool:
         """Whether this is a capture's WARMUP: inside `capture()`, the stream not
         recording. vLLM discards its outputs, so an op returns unwritten ones of the
-        right shape and launches nothing, as vLLM's and aiter's custom all-reduce do.
-        Raises on a recording outside `capture()`."""
-        recording = torch.cuda.is_current_stream_capturing()
-        capturing = self.state == "capturing"
-        if recording and not capturing:
-            raise RuntimeError(
-                f"{type(self).__name__}.{op} is being captured into a cudagraph "
-                f"without `capture()`. Use `with comm.capture(), torch.cuda.graph(g): "
-                f"...` -- a backend may defer peer registration until that context "
-                f"exits, and a graph captured without it "
-                f"replays against addresses that were never registered."
-            )
-        return capturing and not recording
+        right shape and launches nothing, as vLLM's and aiter's custom all-reduce do."""
+        return (
+            self.state == "capturing" and not torch.cuda.is_current_stream_capturing()
+        )
 
     # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or the
     # Error) and its launch, both taking the op's own arguments. Every op's outputs are the
