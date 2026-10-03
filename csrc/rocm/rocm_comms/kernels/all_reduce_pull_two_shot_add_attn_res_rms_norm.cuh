@@ -87,10 +87,33 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   p2p::barrier<ngpus, p2p::Among::world, p2p::Ensure::visible>(p);
   block_stamp(3);
 
-  // 4. This block's tiles of TILE_M rows: each pack from the rank that owns its columns, then
-  //    AttnRes for every row of the tile at once. The next call's first sync keeps a rank from
-  //    overwriting its scratch while it is read (a peer's next kernel starts only once this one has
-  //    finished).
+  // 4. THE GATHER, ITS OWN PHASE: the same blocks copy the other ranks' columns of their rows from
+  //    the owners' scratch into this rank's, a pure copy that keeps the links full (the plain
+  //    two-shot's second shot). Fused into AttnRes's loads instead, the links idled while each
+  //    block computed: 4096 x 7168 took ~199 us for that phase against ~117 for a copy and ~88
+  //    for AttnRes from local memory (2026-10-03T04-34-50Z, 04-44-18Z). A wave's 64 packs have one
+  //    owner: the slices and the rows are whole waves of packs.
+  if (static_cast<int>(blockIdx.x) < reducers) {
+    const int gather_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
+    for (int e = threadIdx.x; e < gather_rows * packs; e += blockDim.x) {
+      const int q = e / packs, c = e - q * packs;
+      const int owner = min(c / slice, ngpus - 1);
+      if (owner == p.rank) continue;
+      const int64_t i = (int64_t{blockIdx.x} + int64_t{q} * reducers) * packs + c;
+      p2p::write_scratch(own_scratch, i,
+                         p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), i));
+    }
+  }
+  block_stamp(4);
+
+  // 5. Every row whole in this rank's scratch, for every block here.
+  p2p::barrier<ngpus, p2p::Among::grid, p2p::Ensure::visible>(p);
+  block_stamp(5);
+
+  // 6. This block's tiles of TILE_M rows from this rank's own scratch, then AttnRes for every row
+  //    of the tile at once, on the whole grid. The next call's first sync keeps a rank from
+  //    overwriting its scratch while a peer still gathers from it (a peer's next kernel starts only
+  //    once this one has finished).
   for (int offs_m = blockIdx.x * TILE_M; offs_m < rows; offs_m += gridDim.x * TILE_M) {
     const Tile<TILE_M, TILE_N> tile{rows, cols, offs_m, 0};
     V sum[TILE_M][kRowPacks];
@@ -98,17 +121,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int m = 0; m < TILE_M; ++m) {
       const int64_t base = int64_t{min(offs_m + m, rows - 1)} * packs;
 #pragma unroll
-      for (int k = 0; k < kRowPacks; ++k) {
-        const int owner = min(thread_cols.offs_n[k] / slice, ngpus - 1);
-        sum[m][k] =
-            p2p::read_scratch(p2p::scratch<T, ngpus>(p, owner), base + thread_cols.offs_n[k]);
-      }
+      for (int k = 0; k < kRowPacks; ++k)
+        sum[m][k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
     }
     block_attn_res_tile<T, kPrefix, TILE_K>(sum, tile, thread_cols, pre, written, blocks,
                                             block_stride_m, block_stride_r, norm_w, qk_w,
                                             out_norm_w, o, num_blocks, eps, out_eps, inv_hidden);
   }
-  block_stamp(4);
+  block_stamp(6);
 }
 
 }  // namespace hip_comms
