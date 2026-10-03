@@ -16,8 +16,6 @@
 
 namespace hip_comms {
 
-namespace impl {
-
 // The kernel at its grid and block, on the stream. hipify reads `<<<...>>>` as text, so it
 // is spelled out.
 template <typename... P, typename... A>
@@ -28,35 +26,40 @@ void start(void (*kernel)(P...), const Kernel& k, hipStream_t stream, A&&... arg
 }
 
 template <typename Args>
-void run(Handle& h, const Kernel& k, const Args& a, const p2p::DevComm& p, hipStream_t s) {
+void launch_on(const Kernel& k, const Args& a, const p2p::DevComm& p, hipStream_t s) {
   dispatch(k, a, [&](auto kernel, const auto& bind) {
     std::apply([&](auto&&... xs) { start(kernel, k, s, xs...); }, bind(p));
   });
 }
 
-}  // namespace impl
-
 // A STAGED BUILD copies the input in itself, so no peer reads it where it is.
 inline void launch(Handle& h, const Kernel& k, const AllReduceArgs& a, hipStream_t s) {
   const p2p::DevComm p =
       is_staged(k) ? h.dev_comm_staged(a.bytes) : h.dev_comm(a.inp, a.bytes, s);
-  impl::run(h, k, a, p, s);
+  launch_on(k, a, p, s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const NormArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
+  launch_on(k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const AttnResArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
+  launch_on(k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const GemmTailArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
+  launch_on(k, a, h.dev_comm(a.inp, a.rows * a.hidden * elem_bytes(a.dtype), s), s);
 }
 
 inline void launch(Handle& h, const Kernel& k, const ScaleAddArgs& a, hipStream_t s) {
-  impl::run(h, k, a, h.dev_comm(a.inp, bytes_of(a), s), s);
+  launch_on(k, a, h.dev_comm(a.inp, bytes_of(a), s), s);
+}
+
+// EXPERIMENTAL, no peers.
+inline void launch(const Kernel& k, const AddAttnResArgs& a, hipStream_t s) {
+  dispatch(k, a, [&](auto kernel, const auto& bind) {
+    std::apply([&](auto&&... xs) { start(kernel, k, s, xs...); }, bind());
+  });
 }
 
 }  // namespace hip_comms

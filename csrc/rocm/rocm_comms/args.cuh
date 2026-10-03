@@ -70,6 +70,27 @@ struct AttnResArgs {
   bool has_prefix;
 };
 
+// EXPERIMENTAL, no all-reduce: AttnRes on a local delta (Triton's attn_res with a delta), the
+// prefix updated in place to prefix + delta.
+struct AddAttnResArgs {
+  void* prefix;
+  void* out;
+  const void* delta;
+  void* blocks;  // [rows, sources, hidden]
+  int64_t block_stride_m;
+  int64_t block_stride_r;
+  const void* norm_weight;
+  const void* qk_weight;
+  const void* out_norm_weight;  // null: none
+  DType dtype;
+  int64_t rows;
+  int64_t hidden;
+  int num_blocks;
+  int write_idx;
+  float eps;
+  float out_eps;
+};
+
 // add: out += the product (rms_norm_gemm_add, Kimi-K3's latent tail); otherwise it is written
 // (rms_norm_gemm). out is [rows, n_cols] at out_stride, so a column slice of a wider buffer.
 struct GemmTailArgs {

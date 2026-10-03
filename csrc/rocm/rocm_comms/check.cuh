@@ -95,4 +95,23 @@ std::variant<Kernel, Error> plan(const Handle& h, const Args& a, const Options& 
   return k;
 }
 
+// EXPERIMENTAL, no Handle: check's Errors less those that need peers, and its plan.
+inline std::optional<Error> check(const Kernel& k, const AddAttnResArgs& a) {
+  if (!dtype_built(a.dtype)) return Error::dtype_not_built;
+  if (hidden_of(a) * elem_bytes(a.dtype) % kBuild.memory.pack_bytes != 0)
+    return Error::row_not_packs;
+  if (op_of(k.fn) != op_of(a)) return Error::template_not_this_ops;
+  if (k.config.index() != family_of(k.fn)) return Error::tile_not_built;
+  if (!built_at(k.fn, launch_of(k.config).threads_per_block)) return Error::threads_not_built;
+  if (tile_n_of(k.config) == 0) return Error::row_too_wide;
+  if (!built(k.fn, k.config)) return Error::tile_not_built;
+  if (tile_n_of(k.config) < tile_cols(a)) return Error::row_too_wide;
+  return std::nullopt;
+}
+inline std::variant<Kernel, Error> plan(const AddAttnResArgs& a, const Options& o) {
+  const Kernel k = select(a, 1, o);
+  if (const std::optional<Error> err = check(k, a)) return *err;
+  return k;
+}
+
 }  // namespace hip_comms

@@ -14,14 +14,17 @@
 //                   supported(device, world): whether one can exist there
 //   kernel.cuh      Kernel: a Template, its arguments, its family's KernelConfig (LaunchConfig and
 //                   the family's fields)
-//   args.cuh        each op's call (AllReduceArgs ... ScaleAddArgs), and the Options it runs under
+//   args.cuh        each op's call (AllReduceArgs ... AddAttnResArgs), and the Options it runs
+//                   under
 // How a call becomes a kernel:
 //   op.cuh          the ops: the template catalog (each Template's built KernelConfigs), and each
-//                   op's name, templates, tuned kernels, and entry point
+//                   op's name, templates and tuned kernels
 //   select.cuh      select: the op's tuned kernel for the call (or the forced one), fitted to it
 //   dispatch.cuh    a Kernel to its compiled instance
 //   check.cuh       check and plan: the first Error a kernel meets on a call, or none
 //   launch.cuh      launch: the kernel on the stream
+// The API:
+//   interface.cuh   every op a caller can run (hip_comms::experimental: no stability promise)
 
 #pragma once
 
@@ -47,4 +50,5 @@
 #include "dispatch.cuh"
 #include "check.cuh"
 #include "launch.cuh"
+#include "interface.cuh"
 #undef HIP_COMMS_INTERFACE

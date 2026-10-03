@@ -7,6 +7,7 @@
     hip       our own kernel, built into `_rocm_C` (csrc/rocm/rocm_comms.cu)
     iris      iris's GPU-initiated collectives
     torch     torch.distributed, the oracle the others are measured against
+    experimental  ops with no stability promise, run on one rank (no backend)
 
 WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN: this package takes process groups,
 a device and a backend name, and reads no environment variable and no vLLM config.

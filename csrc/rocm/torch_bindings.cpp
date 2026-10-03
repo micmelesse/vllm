@@ -165,6 +165,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("rocm_comms_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_attn_res_rms_norm);
 
+  // Experimental: AttnRes on a local delta, no all-reduce and no handle.
+  rocm_ops.def(
+      "rocm_comms_add_attn_res_rms_norm(Tensor! prefix, Tensor! out, Tensor delta, "
+      "Tensor! blocks, Tensor norm_weight, Tensor qk_weight, Tensor? out_norm_weight, "
+      "int num_blocks, int write_idx, float eps, float out_eps, int? tile_n, int? tile_k, "
+      "int? threads_per_block, int? blocks_per_grid) -> ()");
+  rocm_ops.impl("rocm_comms_add_attn_res_rms_norm", torch::kCUDA,
+                &rocm_comms_add_attn_res_rms_norm);
+
   rocm_ops.def(
       "rocm_comms_all_reduce_rms_norm_gemm(int handle_ptr, Tensor! out, Tensor inp, "
       "Tensor norm_weight, float eps, Tensor gemm_weight, Tensor! workspace, str? algorithm, "

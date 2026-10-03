@@ -584,7 +584,7 @@ ProbeWire rocm_comms_probe(fptr_t handle_ptr, const std::string& group, int64_t 
   HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
   void (*barrier)(hip_comms::p2p::DevComm)                                     = nullptr;
   void (*traffic)(hip_comms::p2p::DevComm, int, int, int, int64_t, uint32_t*)  = nullptr;
-  hip_comms::impl::by_world(world, [&](auto ng) {
+  hip_comms::by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     barrier          = hip_comms::probe_barrier<NG>;
     traffic          = hip_comms::link_traffic<c10::BFloat16, NG>;
@@ -798,21 +798,14 @@ void rocm_comms_all_reduce_add_rms_norm(
                        row_config(tile_n, threads_per_block, blocks_per_grid)));
 }
 
-// With `has_prefix` the sum is added to `prefix` in place; without, the sum IS
-// the new prefix.
-void rocm_comms_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
-    torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
-    torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
-    int64_t write_idx, double eps, double out_eps, bool has_prefix,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid) {
-  const Forced forced = forced_template(
-      hip_comms::OpType::all_reduce_add_attn_res_rms_norm, algorithm, direction);
+namespace {
+// AN ATTNRES CALL'S TENSORS, as every AttnRes op takes them: `inp` (the partial sum, or the delta)
+// [tokens, hidden], prefix and out its shape, blocks [tokens, sources, hidden], every one its dtype.
+void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
+                      const torch::Tensor& inp, const torch::Tensor& blocks,
+                      const torch::Tensor& norm_weight, const torch::Tensor& qk_weight,
+                      const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
+                      int64_t write_idx) {
   check_device_contiguous({&prefix, &out, &inp, &norm_weight, &qk_weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ",
               inp.dim(), "-D");
@@ -850,6 +843,27 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
                           hip_comms::kBuild.memory.pack_bytes ==
                       0,
               "blocks must be 16-byte aligned in every row and source");
+}
+}  // namespace
+
+// With `has_prefix` the sum is added to `prefix` in place; without, the sum IS
+// the new prefix.
+void rocm_comms_all_reduce_add_attn_res_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
+    torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
+    int64_t write_idx, double eps, double out_eps, bool has_prefix,
+    std::optional<std::string> algorithm, std::optional<std::string> direction,
+    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
+    std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
+    std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid) {
+  const Forced forced = forced_template(
+      hip_comms::OpType::all_reduce_add_attn_res_rms_norm, algorithm, direction);
+  attn_res_tensors(prefix, out, inp, blocks, norm_weight, qk_weight, out_norm_weight,
+                   num_blocks, write_idx);
+  const int64_t hidden = inp.size(1);
   ran(hip_comms::all_reduce_add_attn_res_rms_norm(
       handle_of(handle_ptr),
       {prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(),
@@ -970,4 +984,28 @@ void rocm_comms_all_reduce_rms_scale_add(
        latent, static_cast<float>(eps)},
       options_or_raise(
           forced, row_config(tile_n, threads_per_block, blocks_per_grid))));
+}
+
+// EXPERIMENTAL: AttnRes on a local `delta` (no all-reduce), prefix updated in place to
+// prefix + delta; the forcing is its config alone (it has one template).
+void rocm_comms_add_attn_res_rms_norm(
+    torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& delta, torch::Tensor& blocks,
+    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
+    double eps, double out_eps, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid) {
+  attn_res_tensors(prefix, out, delta, blocks, norm_weight, qk_weight, out_norm_weight,
+                   num_blocks, write_idx);
+  const auto config = attn_res_config(Forced{std::optional<hip_comms::Template>{}}, std::nullopt,
+                                      tile_n, tile_k, std::nullopt, threads_per_block,
+                                      blocks_per_grid);
+  const Forced forced = config ? Forced{std::optional{hip_comms::Template::add_attn_res_rms_norm}}
+                               : Forced{std::optional<hip_comms::Template>{}};
+  ran(hip_comms::experimental::add_attn_res_rms_norm(
+      {prefix.data_ptr(), out.data_ptr(), delta.data_ptr(), blocks.data_ptr(), blocks.stride(0),
+       blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
+       out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0),
+       delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
+       static_cast<float>(eps), static_cast<float>(out_eps)},
+      options_or_raise(forced, config)));
 }

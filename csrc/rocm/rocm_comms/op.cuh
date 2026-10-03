@@ -7,8 +7,7 @@
 // picks among on the target: for each world and row width, the template and KernelConfig that won
 // from a number of rows up, data the tuner writes (the bench in tune mode, from a sweep of every
 // template's configs); select reads them (select.cuh). An entry says what ran fastest, not
-// why: the why is the sweep's figure, cited beside it. Then each op's entry point: plan, then
-// launch.
+// why: the why is the sweep's figure, cited beside it. The ops' entry points are interface.cuh's.
 
 #pragma once
 
@@ -148,6 +147,16 @@ constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {
     RowConfig{{512, 32}, 8192},
 };
 
+// EXPERIMENTAL, AttnRes on a local delta: a row a block, the grid striding over rows. 512 blocks
+// took the AttnRes phase from local scratch to 86.0 us at 4096 x 7168 (192: 192.8; stamps
+// 2026-10-02T20-36-56Z); not swept.
+constexpr KernelConfig kAddAttnResConfigs[] = {
+    AttnResConfig{{512, 512}, 4096, 1},
+    AttnResConfig{{512, 512}, 8192, 1},
+    AttnResConfig{{256, 512}, 4096, 1},
+    AttnResConfig{{256, 512}, 8192, 1},
+};
+
 // What each template is, in Template's order: its op, its shot, and its builds (none for the plain
 // all-reduce, which has no tile).
 struct TemplateInfo {
@@ -192,6 +201,7 @@ constexpr TemplateInfo kTemplates[] = {
      kRmsScaleAddOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), true, false,
      kRmsScaleAddTwoShotConfigs},
+    {HIP_COMMS_NAMED(add_attn_res_rms_norm), false, false, kAddAttnResConfigs},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -267,6 +277,7 @@ enum class OpType : int {
   all_reduce_rms_norm_gemm_add     = 4,
   all_reduce_rms_norm_gemm         = 5,
   all_reduce_rms_scale_add         = 6,
+  add_attn_res_rms_norm            = 7,  // experimental: no all-reduce
 };
 
 // From `rows` rows up (to the next entry's), at `world` ranks and rows `hidden` elements wide:
@@ -322,6 +333,9 @@ constexpr Template kRmsNormGemmTemplates[] = {
 constexpr Template kRmsScaleAddTemplates[] = {
     Template::all_reduce_pull_one_shot_rms_scale_add,
     Template::all_reduce_pull_two_shot_rms_scale_add,
+};
+constexpr Template kAddAttnResTemplates[] = {
+    Template::add_attn_res_rms_norm,
 };
 
 // =================================================================================================
@@ -401,6 +415,12 @@ constexpr TunedKernel kRmsScaleAddKernels[] = {
     {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, RowConfig{{512, 32}, 4096}},
 };
 
+// Experimental, one rank (world 1: there are no peers): not swept.
+constexpr TunedKernel kAddAttnResKernels[] = {
+    {1, 1, 3584, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512}, 4096, 1}},
+    {1, 1, 7168, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512}, 8192, 1}},
+};
+
 // =================================================================================================
 // THE OPS, in OpType's order.
 // =================================================================================================
@@ -417,6 +437,7 @@ constexpr Op kOps[] = {
      kRmsNormGemmAddKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_norm_gemm), kRmsNormGemmTemplates, kRmsNormGemmKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_scale_add), kRmsScaleAddTemplates, kRmsScaleAddKernels},
+    {HIP_COMMS_NAMED(add_attn_res_rms_norm), kAddAttnResTemplates, kAddAttnResKernels},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
@@ -450,6 +471,7 @@ constexpr OpType op_of(const GemmTailArgs& a) {
   return a.add ? OpType::all_reduce_rms_norm_gemm_add : OpType::all_reduce_rms_norm_gemm;
 }
 constexpr OpType op_of(const ScaleAddArgs&) { return OpType::all_reduce_rms_scale_add; }
+constexpr OpType op_of(const AddAttnResArgs&) { return OpType::add_attn_res_rms_norm; }
 
 // A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
 constexpr bool gemms(OpType op) {
@@ -486,65 +508,5 @@ constexpr bool ops_have_kernels() {
   return true;
 }
 static_assert(ops_have_kernels(), "an op has no kernels, or one is another op's or not built");
-
-// =================================================================================================
-// EACH OP'S ENTRY POINT: the plan's kernel launched, or its Error and nothing launched. plan
-// (check.cuh) and launch (launch.cuh) come later in the interface.
-// =================================================================================================
-
-template <typename Args>
-std::variant<Kernel, Error> plan(const Handle& h, const Args& a, const Options& o);
-inline void launch(Handle& h, const Kernel& k, const AllReduceArgs& a, hipStream_t s);
-inline void launch(Handle& h, const Kernel& k, const NormArgs& a, hipStream_t s);
-inline void launch(Handle& h, const Kernel& k, const AttnResArgs& a, hipStream_t s);
-inline void launch(Handle& h, const Kernel& k, const GemmTailArgs& a, hipStream_t s);
-inline void launch(Handle& h, const Kernel& k, const ScaleAddArgs& a, hipStream_t s);
-
-namespace impl {
-
-template <typename Args>
-std::variant<Kernel, Error> run(Handle& h, const Args& a, const Options& o) {
-  std::variant<Kernel, Error> p = plan(h, a, o);
-  if (const Kernel* k = std::get_if<Kernel>(&p)) launch(h, *k, a, o.stream);
-  return p;
-}
-
-}  // namespace impl
-
-inline std::variant<Kernel, Error> all_reduce(Handle& h, const AllReduceArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
-
-// rms_norm(all_reduce(inp)), or with a residual fused_add_rms_norm: vLLM's roundings exactly.
-inline std::variant<Kernel, Error> all_reduce_rms_norm(Handle& h, const NormArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
-
-// Kimi-K3's AttnRes and its RMSNorm on each row of the all-reduced sum (the kernels spell it out).
-inline std::variant<Kernel, Error> all_reduce_add_attn_res_rms_norm(Handle& h, const AttnResArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
-
-// RMSNorm of the sum, then out = normed @ gemm_weight^T.
-inline std::variant<Kernel, Error> all_reduce_rms_norm_gemm(Handle& h, const GemmTailArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
-
-// The latent MoE tail: RMSNorm of the sum, then out += normed @ gemm_weight^T.
-inline std::variant<Kernel, Error> all_reduce_rms_norm_gemm_add(Handle& h, const GemmTailArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
-
-// Kimi-K3's latent MoE tail with one all-reduce: out = shared + projected * 1/rms(latent), all
-// three summed over the ranks.
-inline std::variant<Kernel, Error> all_reduce_rms_scale_add(Handle& h, const ScaleAddArgs& a,
-                                                 const Options& o) {
-  return impl::run(h, a, o);
-}
 
 }  // namespace hip_comms

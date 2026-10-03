@@ -33,6 +33,7 @@ enum class Template : int {
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
   all_reduce_pull_one_shot_rms_scale_add         = 15,
   all_reduce_pull_two_shot_rms_scale_add         = 16,
+  add_attn_res_rms_norm                          = 17,  // experimental: no all-reduce
 };
 
 // A TEMPLATE'S ARGUMENTS, one struct per family: only the parameters that family has; the tile and

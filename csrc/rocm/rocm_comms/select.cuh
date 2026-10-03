@@ -36,10 +36,12 @@ constexpr int64_t rows_of(const NormArgs& a) { return a.rows; }
 constexpr int64_t rows_of(const AttnResArgs& a) { return a.rows; }
 constexpr int64_t rows_of(const GemmTailArgs& a) { return a.rows; }
 constexpr int64_t rows_of(const ScaleAddArgs& a) { return a.rows; }
+constexpr int64_t rows_of(const AddAttnResArgs& a) { return a.rows; }
 constexpr int64_t hidden_of(const AllReduceArgs& a) { return a.bytes / elem_bytes(a.dtype); }
 constexpr int64_t hidden_of(const NormArgs& a) { return a.hidden; }
 constexpr int64_t hidden_of(const AttnResArgs& a) { return a.hidden; }
 constexpr int64_t hidden_of(const GemmTailArgs& a) { return a.hidden; }
+constexpr int64_t hidden_of(const AddAttnResArgs& a) { return a.hidden; }
 // The row reduced, [shared | projected | latent].
 constexpr int64_t hidden_of(const ScaleAddArgs& a) { return 2 * a.hidden + a.latent; }
 template <typename Args>
@@ -93,6 +95,9 @@ constexpr TemplateArgs template_args(const GemmTailArgs& a, int world) {
 }
 constexpr TemplateArgs template_args(const ScaleAddArgs& a, int world) {
   return ScaleAddTemplateArgs{world, a.dtype};
+}
+constexpr TemplateArgs template_args(const AddAttnResArgs& a, int world) {
+  return AttnResTemplateArgs{world, a.dtype, true};
 }
 
 // =================================================================================================
@@ -294,6 +299,8 @@ constexpr bool selections_fit() {
                                  nullptr, bf, rows, hidden, 0, -1, 0.f, 0.f, true}, w, o)))
       return false;
     if (!fits(select(ScaleAddArgs{nullptr, nullptr, bf, rows, hidden, hidden / 2, 0.f}, w, o)))
+      return false;
+    if (!fits(select(AddAttnResArgs{.dtype = bf, .rows = rows, .hidden = hidden}, 1, o)))
       return false;
   }
   return true;
