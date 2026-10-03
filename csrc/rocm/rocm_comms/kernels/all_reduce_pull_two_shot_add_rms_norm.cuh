@@ -19,7 +19,7 @@ namespace hip_comms {
 // (kAdd) norming them by their scales as it goes. Every rank does the same arithmetic on the same
 // bytes, so every rank holds the same result. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH
 // PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
@@ -34,23 +34,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int slice_rows   = (rows + NGPUS - 1) / NGPUS;
+  const int slice_rows   = (rows + WORLD - 1) / WORLD;
   // ADD_RESIDUAL: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
-  const auto scratches = p2p::scratches<DTYPE, NGPUS>(peer_scratch);
+  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto scratches = p2p::scratches<DTYPE, WORLD>(peer_scratch);
   const auto input = [&](int r) { return inputs[r].data(); };
-  const auto own_scratch  = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
+  const auto own_scratch  = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (ADD_RESIDUAL) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
@@ -61,10 +61,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   // Row `row` from every rank.
-  using Peers = Row[NGPUS];
+  using Peers = Row[WORLD];
   const auto load = [&](int row, Peers& got) {
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) got[r] = Row{rows, cols, row, 0};
+    for (int r = 0; r < WORLD; ++r) got[r] = Row{rows, cols, row, 0};
     peers_load(got, input, cols);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
@@ -133,7 +133,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(5);
 
@@ -151,19 +151,19 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
-      const PeerPacks<DTYPE, NGPUS> rows_of = peers_load<DTYPE, NGPUS>(gathered, at);
-      V sc[NGPUS];
+      const PeerPacks<DTYPE, WORLD> rows_of = peers_load<DTYPE, WORLD>(gathered, at);
+      V sc[WORLD];
       if constexpr (ADD_RESIDUAL) {
 #pragma unroll
-        for (int r = 0; r < NGPUS; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
+        for (int r = 0; r < WORLD; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
       }
-      V got[NGPUS];
+      V got[WORLD];
 #pragma unroll
-      for (int r = 0; r < NGPUS; ++r) got[r] = rows_of.p[r][0];
+      for (int r = 0; r < WORLD; ++r) got[r] = rows_of.p[r][0];
       vec<WEIGHT_DTYPE, NL> w;
       if constexpr (ADD_RESIDUAL) w = wv[i];
 #pragma unroll
-      for (int r = 0; r < NGPUS; ++r) {
+      for (int r = 0; r < WORLD; ++r) {
         const int row = r * slice_rows + l;
         if (row >= rows) continue;
         if constexpr (ADD_RESIDUAL) {
@@ -188,19 +188,19 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                       p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                                       p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
                                       DTYPE* __restrict__ out, const WEIGHT_DTYPE* __restrict__ weight, float eps,
                                       int rows, int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, false, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
       nullptr, weight, eps, rows, packs);
 }
 
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                           p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                           const DTYPE* __restrict__ residual,
                                           const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, true, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
       residual, weight, eps, rows, packs);
 }

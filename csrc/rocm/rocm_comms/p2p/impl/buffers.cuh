@@ -39,12 +39,12 @@ namespace impl {
 // staging), BY SELECT, never an index: a runtime index into a pointer array puts the array in
 // scratch memory (seen in the ISA: 152 bytes a lane and a scratch load per read), where a constant
 // index keeps the loads scalar and issued together.
-template <typename DTYPE, int NGPUS>
+template <typename DTYPE, int WORLD>
 DINLINE typename traits<DTYPE>::V* rank_of(const PeerPtrs& ptrs, int r) {
   using V = typename traits<DTYPE>::V;
   V* at   = reinterpret_cast<V*>(ptrs.p[0]);
 #pragma unroll
-  for (int k = 1; k < NGPUS; ++k)
+  for (int k = 1; k < WORLD; ++k)
     if (r == k) at = reinterpret_cast<V*>(ptrs.p[k]);
   return at;
 }
@@ -59,7 +59,7 @@ DINLINE typename traits<DTYPE>::V* rank_of(const PeerPtrs& ptrs, int r) {
 // index and puts it in scratch, 144 B a lane). Nothing takes a runtime index into a set of ranks.
 enum class Kind { input, staging, scratch };
 
-template <typename DTYPE, int NGPUS, Kind KIND>
+template <typename DTYPE, int WORLD, Kind KIND>
 class Buffer {
   using V = typename traits<DTYPE>::V;
   V* at_  = nullptr;
@@ -69,47 +69,47 @@ class Buffer {
   // `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane,
   // the compiler knows it, and the pointer loads are scalar rather than one per lane.
   DINLINE Buffer(const PeerPtrs& ptrs, int r) {
-    at_ = impl::rank_of<DTYPE, NGPUS>(ptrs, __builtin_amdgcn_readfirstlane(r));
+    at_ = impl::rank_of<DTYPE, WORLD>(ptrs, __builtin_amdgcn_readfirstlane(r));
   }
   DINLINE V* at() const { return at_; }
   // The rank's tensor, for a tile's load or store (common/memory.cuh).
   DINLINE DTYPE* data() const { return reinterpret_cast<DTYPE*>(at_); }
 };
 
-template <typename DTYPE, int NGPUS>
-using Input = Buffer<DTYPE, NGPUS, Kind::input>;
-template <typename DTYPE, int NGPUS>
-using Staging = Buffer<DTYPE, NGPUS, Kind::staging>;
-template <typename DTYPE, int NGPUS>
-using Scratch = Buffer<DTYPE, NGPUS, Kind::scratch>;
+template <typename DTYPE, int WORLD>
+using Input = Buffer<DTYPE, WORLD, Kind::input>;
+template <typename DTYPE, int WORLD>
+using Staging = Buffer<DTYPE, WORLD, Kind::staging>;
+template <typename DTYPE, int WORLD>
+using Scratch = Buffer<DTYPE, WORLD, Kind::scratch>;
 
 // ONE RANK'S BUFFER OF A KIND, and EVERY RANK'S: how a kernel begins, before its start barrier so
 // the pointer loads hide under the wait.
-template <typename DTYPE, int NGPUS, Kind KIND>
-DINLINE std::array<Buffer<DTYPE, NGPUS, KIND>, NGPUS> every(const PeerPtrs& p) {
-  std::array<Buffer<DTYPE, NGPUS, KIND>, NGPUS> all;
+template <typename DTYPE, int WORLD, Kind KIND>
+DINLINE std::array<Buffer<DTYPE, WORLD, KIND>, WORLD> every(const PeerPtrs& p) {
+  std::array<Buffer<DTYPE, WORLD, KIND>, WORLD> all;
 #pragma unroll
-  for (int r = 0; r < NGPUS; ++r) all[r] = Buffer<DTYPE, NGPUS, KIND>(p, r);
+  for (int r = 0; r < WORLD; ++r) all[r] = Buffer<DTYPE, WORLD, KIND>(p, r);
   return all;
 }
 
-template <typename DTYPE, int NGPUS>
-DINLINE Input<DTYPE, NGPUS> input(const PeerPtrs& p, int r) { return Input<DTYPE, NGPUS>(p, r); }
-template <typename DTYPE, int NGPUS>
-DINLINE Staging<DTYPE, NGPUS> staging(const PeerPtrs& p, int r) { return Staging<DTYPE, NGPUS>(p, r); }
-template <typename DTYPE, int NGPUS>
-DINLINE Scratch<DTYPE, NGPUS> scratch(const PeerPtrs& p, int r) { return Scratch<DTYPE, NGPUS>(p, r); }
-template <typename DTYPE, int NGPUS>
-DINLINE std::array<Input<DTYPE, NGPUS>, NGPUS> inputs(const PeerPtrs& p) {
-  return every<DTYPE, NGPUS, Kind::input>(p);
+template <typename DTYPE, int WORLD>
+DINLINE Input<DTYPE, WORLD> input(const PeerPtrs& p, int r) { return Input<DTYPE, WORLD>(p, r); }
+template <typename DTYPE, int WORLD>
+DINLINE Staging<DTYPE, WORLD> staging(const PeerPtrs& p, int r) { return Staging<DTYPE, WORLD>(p, r); }
+template <typename DTYPE, int WORLD>
+DINLINE Scratch<DTYPE, WORLD> scratch(const PeerPtrs& p, int r) { return Scratch<DTYPE, WORLD>(p, r); }
+template <typename DTYPE, int WORLD>
+DINLINE std::array<Input<DTYPE, WORLD>, WORLD> inputs(const PeerPtrs& p) {
+  return every<DTYPE, WORLD, Kind::input>(p);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE std::array<Staging<DTYPE, NGPUS>, NGPUS> stagings(const PeerPtrs& p) {
-  return every<DTYPE, NGPUS, Kind::staging>(p);
+template <typename DTYPE, int WORLD>
+DINLINE std::array<Staging<DTYPE, WORLD>, WORLD> stagings(const PeerPtrs& p) {
+  return every<DTYPE, WORLD, Kind::staging>(p);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE std::array<Scratch<DTYPE, NGPUS>, NGPUS> scratches(const PeerPtrs& p) {
-  return every<DTYPE, NGPUS, Kind::scratch>(p);
+template <typename DTYPE, int WORLD>
+DINLINE std::array<Scratch<DTYPE, WORLD>, WORLD> scratches(const PeerPtrs& p) {
+  return every<DTYPE, WORLD, Kind::scratch>(p);
 }
 
 // PACK i OF A RANK'S BUFFER. Read after a barrier that made what its writer wrote visible: an
@@ -117,24 +117,24 @@ DINLINE std::array<Scratch<DTYPE, NGPUS>, NGPUS> scratches(const PeerPtrs& p) {
 // the peers to read after such a barrier: a rank's own staging and scratch, or (the push send, a
 // plain store, since scratch is allocated uncached as aiter pushes into its own) a peer's scratch.
 // What one block writes, the same block on the other side sees.
-template <typename DTYPE, int NGPUS>
-DINLINE typename traits<DTYPE>::V read_input(const Input<DTYPE, NGPUS>& b, int64_t i) {
+template <typename DTYPE, int WORLD>
+DINLINE typename traits<DTYPE>::V read_input(const Input<DTYPE, WORLD>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE typename traits<DTYPE>::V read_staging(const Staging<DTYPE, NGPUS>& b, int64_t i) {
+template <typename DTYPE, int WORLD>
+DINLINE typename traits<DTYPE>::V read_staging(const Staging<DTYPE, WORLD>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE void write_staging(const Staging<DTYPE, NGPUS>& b, int64_t i, const typename traits<DTYPE>::V& v) {
+template <typename DTYPE, int WORLD>
+DINLINE void write_staging(const Staging<DTYPE, WORLD>& b, int64_t i, const typename traits<DTYPE>::V& v) {
   thread_store(b.at() + i, v);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE typename traits<DTYPE>::V read_scratch(const Scratch<DTYPE, NGPUS>& b, int64_t i) {
+template <typename DTYPE, int WORLD>
+DINLINE typename traits<DTYPE>::V read_scratch(const Scratch<DTYPE, WORLD>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename DTYPE, int NGPUS>
-DINLINE void write_scratch(const Scratch<DTYPE, NGPUS>& b, int64_t i, const typename traits<DTYPE>::V& v) {
+template <typename DTYPE, int WORLD>
+DINLINE void write_scratch(const Scratch<DTYPE, WORLD>& b, int64_t i, const typename traits<DTYPE>::V& v) {
   thread_store(b.at() + i, v);
 }
 

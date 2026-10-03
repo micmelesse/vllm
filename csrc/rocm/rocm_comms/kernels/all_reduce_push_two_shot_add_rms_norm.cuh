@@ -20,7 +20,7 @@ namespace hip_comms {
 // norm repeated on every rank instead of sent. Every rank computes the same bytes (the same sums
 // in the same order), so every rank holds the same result. ROW q BELONGS TO BLOCK q % gridDim.x
 // IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
@@ -32,7 +32,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int slice        = (packs + NGPUS - 1) / NGPUS;
+  const int slice        = (packs + WORLD - 1) / WORLD;
   const int col0         = rank * slice;
   const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
   const int my_rows      = rows > static_cast<int>(blockIdx.x)
@@ -42,13 +42,13 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
-  const auto scratches = p2p::scratches<DTYPE, NGPUS>(peer_scratch);
+  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto scratches = p2p::scratches<DTYPE, WORLD>(peer_scratch);
   const auto read  = [&](int r, int64_t i) { return p2p::read_input(inputs[r], i); };
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
@@ -57,14 +57,14 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const int64_t q = e / own_packs;
     const int64_t row = blockIdx.x + q * gridDim.x;
     const int64_t i = row * packs + col0 + (e - q * own_packs);
-    const V sum       = peers_reduce(peers_load<DTYPE, NGPUS>(read, i));
+    const V sum       = peers_reduce(peers_load<DTYPE, WORLD>(read, i));
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) p2p::write_scratch(scratches[r], i, sum);
+    for (int r = 0; r < WORLD; ++r) p2p::write_scratch(scratches[r], i, sum);
   }
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch.
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
@@ -72,7 +72,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    rounding as the reference does (the one-shot kernel spells it out). The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
-  const auto own_scratch = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
+  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
     // Every load of the row before any store: the scratch's and the residual together, the weight
@@ -109,19 +109,19 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_push_two_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                       p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                                       p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
                                       DTYPE* __restrict__ out, const WEIGHT_DTYPE* __restrict__ weight, float eps,
                                       int rows, int packs) {
-  all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, false, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
       nullptr, weight, eps, rows, packs);
 }
 
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_push_two_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                           p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                           const DTYPE* __restrict__ residual,
                                           const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, true, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
       residual, weight, eps, rows, packs);
 }

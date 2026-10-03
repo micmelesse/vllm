@@ -86,11 +86,11 @@ DINLINE void issued() {
 
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
 // waits until a pack is used (peers_reduce), so loads issued here can run under other work.
-template <typename DTYPE, int NGPUS, typename READ_PEER>
-DINLINE PeerPacks<DTYPE, NGPUS> peers_load(READ_PEER read, int64_t i) {
-  PeerPacks<DTYPE, NGPUS> out;
+template <typename DTYPE, int WORLD, typename READ_PEER>
+DINLINE PeerPacks<DTYPE, WORLD> peers_load(READ_PEER read, int64_t i) {
+  PeerPacks<DTYPE, WORLD> out;
 #pragma unroll
-  for (int r = 0; r < NGPUS; ++r) out.p[r][0] = read(r, i);
+  for (int r = 0; r < WORLD; ++r) out.p[r][0] = read(r, i);
   impl::issued();
   return out;
 }
@@ -150,8 +150,8 @@ DINLINE void thread_store(typename TILE::Acc* data, int64_t row_stride, const TI
 // computed once a position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until a tile is used (peers_reduce), so loads issued here
 // can run under other work.
-template <typename TILE, int NGPUS, typename RANK_DATA>
-DINLINE void peers_load(TILE (&t)[NGPUS], RANK_DATA data,
+template <typename TILE, int WORLD, typename RANK_DATA>
+DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
                         int64_t row_stride) {
   using P = typename TILE::Pack;
 #pragma unroll
@@ -160,7 +160,7 @@ DINLINE void peers_load(TILE (&t)[NGPUS], RANK_DATA data,
     for (int k = 0; k < t[0].K; ++k) {
       const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
 #pragma unroll
-      for (int r = 0; r < NGPUS; ++r)
+      for (int r = 0; r < WORLD; ++r)
         t[r].v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(r)) + i);
     }
   impl::issued();
@@ -169,7 +169,7 @@ DINLINE void peers_load(TILE (&t)[NGPUS], RANK_DATA data,
 // A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
 // end): each pack from its owner's tensor, `data(r)`. A SLICE IS WHOLE WAVES, so a wave's packs
 // have one owner.
-template <int NGPUS, typename TILE, typename RANK_DATA>
+template <int WORLD, typename TILE, typename RANK_DATA>
 DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                          int slice) {
   using P = typename TILE::Pack;
@@ -177,7 +177,7 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
   for (int m = 0; m < TILE::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
-      const int owner = min(t.col(k) / (slice / t.kPack), NGPUS - 1);
+      const int owner = min(t.col(k) / (slice / t.kPack), WORLD - 1);
       t.v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
                                   int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k));
     }

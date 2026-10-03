@@ -22,8 +22,8 @@ namespace hip_comms {
 
 // EACH PACK SUMMED OVER ITS `ngpus` SOURCES, in fp32 in source order and rounded once to T, into
 // sum[k]: callers whose sources are the ranks agree bitwise. Waits on the loads only here.
-template <typename DTYPE, int NGPUS, int PACKS>
-DINLINE void peers_reduce(const PeerPacks<DTYPE, NGPUS, PACKS>& packs, typename traits<DTYPE>::V (&sum)[PACKS]) {
+template <typename DTYPE, int WORLD, int PACKS>
+DINLINE void peers_reduce(const PeerPacks<DTYPE, WORLD, PACKS>& packs, typename traits<DTYPE>::V (&sum)[PACKS]) {
   constexpr int N = traits<DTYPE>::N;
 #pragma unroll
   for (int k = 0; k < PACKS; ++k) {
@@ -31,7 +31,7 @@ DINLINE void peers_reduce(const PeerPacks<DTYPE, NGPUS, PACKS>& packs, typename 
 #pragma unroll
     for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(packs.p[0][k].d[j]);
 #pragma unroll
-    for (int r = 1; r < NGPUS; ++r)
+    for (int r = 1; r < WORLD; ++r)
 #pragma unroll
       for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(packs.p[r][k].d[j]);
 #pragma unroll
@@ -41,8 +41,8 @@ DINLINE void peers_reduce(const PeerPacks<DTYPE, NGPUS, PACKS>& packs, typename 
 
 // One pack, the same.
 // EVERY PEER'S TILE SUMMED, in rank order in fp32 and rounded once, as a pack's is.
-template <typename TILE, int NGPUS>
-DINLINE TILE peers_reduce(const TILE (&t)[NGPUS]) {
+template <typename TILE, int WORLD>
+DINLINE TILE peers_reduce(const TILE (&t)[WORLD]) {
   constexpr int NL = TILE::kPack;
   TILE sum = t[0].template like<typename TILE::Acc>();
 #pragma unroll
@@ -53,7 +53,7 @@ DINLINE TILE peers_reduce(const TILE (&t)[NGPUS]) {
 #pragma unroll
       for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k].d[j]);
 #pragma unroll
-      for (int r = 1; r < NGPUS; ++r)
+      for (int r = 1; r < WORLD; ++r)
 #pragma unroll
         for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(t[r].v[m][k].d[j]);
 #pragma unroll
@@ -62,8 +62,8 @@ DINLINE TILE peers_reduce(const TILE (&t)[NGPUS]) {
   return sum;
 }
 
-template <typename DTYPE, int NGPUS>
-DINLINE typename traits<DTYPE>::V peers_reduce(const PeerPacks<DTYPE, NGPUS>& packs) {
+template <typename DTYPE, int WORLD>
+DINLINE typename traits<DTYPE>::V peers_reduce(const PeerPacks<DTYPE, WORLD>& packs) {
   typename traits<DTYPE>::V sum[1];
   peers_reduce(packs, sum);
   return sum[0];

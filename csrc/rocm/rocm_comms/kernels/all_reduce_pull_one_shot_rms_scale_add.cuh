@@ -17,7 +17,7 @@ namespace hip_comms {
 // latent for the row's RMS (its 1/rms is the same in every slice). Rounds as the reference does:
 // each span's sum lands as T, the all-reduce output, then out = T(float(shared) +
 // float(projected) * scale).
-template <typename DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                            p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
@@ -36,9 +36,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
+  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto shared = [&](int r) { return inputs[r].data(); };
@@ -54,9 +54,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const int len   = min(slice, hidden_packs - first);
     const Row hid{rows, (first + len) * NL, row, first * NL};
     const Row lat{rows, latent_packs * NL, row, 0};
-    Row sh[NGPUS], pj[NGPUS], lt[NGPUS];
+    Row sh[WORLD], pj[WORLD], lt[WORLD];
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) {
+    for (int r = 0; r < WORLD; ++r) {
       sh[r] = hid;
       pj[r] = hid;
       lt[r] = lat;
@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
   block_stamp(5);
 }

@@ -16,7 +16,7 @@ namespace hip_comms {
 // trip and a launch against an all-reduce then a norm kernel. A block owns a row. `residual` and
 // `residual_out` are unused (null) unless kAdd; `weight` keeps its own dtype W (T or fp32), as
 // vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`).
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerSignals peer_signals,
     p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
@@ -30,9 +30,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
+  const auto inputs = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto input = [&](int r) { return inputs[r].data(); };
@@ -47,9 +47,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const Row at{rows, cols, row, 0};
     // Every load of the row before any store: the peers' and the residual together, the weight
     // under the reduction.
-    Row peers[NGPUS];
+    Row peers[WORLD];
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) peers[r] = at;
+    for (int r = 0; r < WORLD; ++r) peers[r] = at;
     peers_load(peers, input, cols);
     Row res = at;
     if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
@@ -83,25 +83,25 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
   block_stamp(5);
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                       p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
                                       int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                       const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                       int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, false, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, nullptr, nullptr, weight,
       eps, rows, packs);
 }
 
-template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                           const DTYPE* __restrict__ residual,
                                           const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, true, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, residual_out, residual,
       weight, eps, rows, packs);
 }

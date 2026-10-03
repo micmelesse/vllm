@@ -18,7 +18,7 @@ namespace hip_comms {
 // A BLOCK OWNS ONE (ROW, SLICE) OF THIS RANK'S ROWS, `splits` slices a row, as in the one-shot.
 // THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: a block gathers exactly the (row, slice)s
 // the same block on each owner finished, which is what a peers barrier makes visible.
-template <typename DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_scale_add(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                            p2p::PeerPtrs peer_scratch,
@@ -36,7 +36,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
-  const int slice_rows   = (rows + NGPUS - 1) / NGPUS;
+  const int slice_rows   = (rows + WORLD - 1) / WORLD;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
   const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
   // (Row, slice) w's tile of the hidden at row `row`: one row cut to the slice's columns.
@@ -46,11 +46,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs      = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
-  const auto own_scratch = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
-  const auto scratches   = p2p::scratches<DTYPE, NGPUS>(peer_scratch);
+  const auto inputs      = p2p::inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto own_scratch = p2p::scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto scratches   = p2p::scratches<DTYPE, WORLD>(peer_scratch);
   block_stamp(0);
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto shared = [&](int r) { return inputs[r].data(); };
@@ -64,9 +64,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const int row                = first_row + w / splits;
     const Row hid = slice_of(w, row);
     const Row lat{rows, latent_packs * NL, row, 0};
-    Row sh[NGPUS], pj[NGPUS], lt[NGPUS];
+    Row sh[WORLD], pj[WORLD], lt[WORLD];
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) {
+    for (int r = 0; r < WORLD; ++r) {
       sh[r] = hid;
       pj[r] = hid;
       lt[r] = lat;
@@ -94,7 +94,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   block_stamp(3);
   // 3. Every rank's finished rows are visible to its peers, and every peer has read this rank's
   //    input.
-  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
+  p2p::barrier<WORLD, p2p::Among::peers, p2p::Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(4);
 
@@ -103,12 +103,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   //    first sync keeps a rank from overwriting its scratch while it is read.
   for (int w = blockIdx.x; w < slice_rows * splits; w += gridDim.x) {
     const int l = w / splits;
-    Row got[NGPUS];
+    Row got[WORLD];
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) got[r] = slice_of(w, l);
+    for (int r = 0; r < WORLD; ++r) got[r] = slice_of(w, l);
     peers_load(got, [&](int r) { return scratches[r].data(); }, hidden);
 #pragma unroll
-    for (int r = 0; r < NGPUS; ++r) {
+    for (int r = 0; r < WORLD; ++r) {
       if (l >= rows_of(r)) continue;
       got[r].offs_m = r * slice_rows + l;
       thread_store(out, hidden, got[r]);

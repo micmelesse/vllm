@@ -99,7 +99,7 @@ DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_
 // releases and the wait acquires, so what the block put before is visible to its peers'
 // same-numbered block after (a peer_barrier). Unordered, it only says when
 // (start: every peer has launched; close: every peer is done reading us).
-template <int NGPUS, bool ORDERED>
+template <int WORLD, bool ORDERED>
 DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                          uint64_t timeout_ticks, bool start) {
   if (!start) {
@@ -108,7 +108,7 @@ DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, i
   }
   const Signals own = own_signals(self_signal);
   const uint32_t f  = own.seq(blockIdx.x) + 1;
-  if (threadIdx.x < NGPUS) {
+  if (threadIdx.x < WORLD) {
     const Signals peer   = lane_signals(peer_signals, threadIdx.x);
     const Counter theirs = start ? peer.start(blockIdx.x, rank) : peer.end(blockIdx.x, rank);
     const Counter mine   = start ? own.start(blockIdx.x, threadIdx.x)
@@ -126,7 +126,7 @@ DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, i
 // barrier: every wave first waits for its own stores (`wait_stores`), and a release
 // writes back the whole L2, so one covers the block where one per thread wrote it back
 // 512 times.
-template <int NGPUS, bool PEERS>
+template <int WORLD, bool PEERS>
 DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                      uint64_t timeout_ticks) {
   constexpr int kScope = PEERS ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
@@ -144,12 +144,12 @@ DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int r
         own.set_epoch(e);
         fence<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>();
 #pragma unroll
-        for (int i = 0; i < NGPUS; ++i)
+        for (int i = 0; i < WORLD; ++i)
           lane_signals(peer_signals, i)
               .peer(rank)
               .store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(e);
 #pragma unroll
-        for (int i = 0; i < NGPUS; ++i)
+        for (int i = 0; i < WORLD; ++i)
           wait<true, __MEMORY_SCOPE_SYSTEM>(timeout_ticks, rank, own.peer(i), e,
                                             "world_barrier: peer", i);
       }
@@ -182,18 +182,18 @@ enum class Ensure { launched, visible, read };
 // both sides must index the same data by the same block.
 // Every rank's signal block, this rank's, its rank, and how long a wait may last before it traps:
 // what every kernel that synchronizes is handed.
-template <int NGPUS, Among AMONG, Ensure ENSURE>
+template <int WORLD, Among AMONG, Ensure ENSURE>
 DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                      uint64_t timeout_ticks) {
   static_assert(AMONG == Among::peers || ENSURE == Ensure::visible,
                 "a grid or world barrier is a visibility barrier");
   if constexpr (AMONG == Among::grid) {
-    impl::barrier<NGPUS, false>(peer_signals, self_signal, rank, timeout_ticks);
+    impl::barrier<WORLD, false>(peer_signals, self_signal, rank, timeout_ticks);
   } else if constexpr (AMONG == Among::world) {
-    impl::barrier<NGPUS, true>(peer_signals, self_signal, rank, timeout_ticks);
+    impl::barrier<WORLD, true>(peer_signals, self_signal, rank, timeout_ticks);
   } else {
     impl::skew(self_signal, rank);
-    impl::pair_blocks<NGPUS, ENSURE == Ensure::visible>(peer_signals, self_signal, rank,
+    impl::pair_blocks<WORLD, ENSURE == Ensure::visible>(peer_signals, self_signal, rank,
                                                          timeout_ticks,
                                                          ENSURE == Ensure::launched);
   }
