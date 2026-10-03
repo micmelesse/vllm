@@ -44,28 +44,35 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
     base[m] = int64_t{at} * (tile.N / NL);  // the row, in packs
     row_blocks[m] = blocks + int64_t{at} * block_stride_m;
   }
-  // The new prefix: the sum over the ranks added to the old one, rounded once to T.
+  // The new prefix: the sum over the ranks added to the old one, rounded once to T; every row's
+  // old prefix loaded before any is stored.
+  V np[TILE_M][kRowPacks];
+  if constexpr (kPrefix) {
+    V old[TILE_M][kRowPacks];
+#pragma unroll
+    for (int m = 0; m < TILE_M; ++m) thread_load(pre + base[m], thread_cols, old[m]);
+#pragma unroll
+    for (int m = 0; m < TILE_M; ++m)
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < NL; ++j)
+          np[m][k].d[j] = static_cast<T>(static_cast<float>(old[m][k].d[j]) +
+                                         static_cast<float>(sum[m][k].d[j]));
+  } else {
+#pragma unroll
+    for (int m = 0; m < TILE_M; ++m)
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k) np[m][k] = sum[m][k];
+  }
   float u[TILE_M][kRowPacks][NL];
 #pragma unroll
   for (int m = 0; m < TILE_M; ++m) {
-    V* w_row = live[m] ? written(tile.offs_m + m) : nullptr;
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      V np;
-      if constexpr (kPrefix) {
-        const V old = pre[base[m] + thread_cols.offs_n[k]];
-#pragma unroll
-        for (int j = 0; j < NL; ++j)
-          np.d[j] =
-              static_cast<T>(static_cast<float>(old.d[j]) + static_cast<float>(sum[m][k].d[j]));
-      } else {
-        np = sum[m][k];
-      }
-      thread_unpack<T>(np, u[m][k]);
-      if (live[m] && thread_cols.mask_n[k] != 0.0f) {
-        pre[base[m] + thread_cols.offs_n[k]] = np;
-        if (w_row) w_row[thread_cols.offs_n[k]] = np;
-      }
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(np[m][k], u[m][k]);
+    if (live[m]) {
+      thread_store(pre + base[m], thread_cols, np[m]);
+      if (V* w_row = written(tile.offs_m + m)) thread_store(w_row, thread_cols, np[m]);
     }
   }
   float acc[TILE_M][kRowPacks][NL];
@@ -78,13 +85,18 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
         for (int j = 0; j < NL; ++j) acc[m][k][j] = u[m][k][j];
   } else {
     float w[kRowPacks][NL];
+    {
+      V norm[kRowPacks], qk[kRowPacks];
+      thread_load(reinterpret_cast<const V*>(norm_w), thread_cols, norm);
+      thread_load(reinterpret_cast<const V*>(qk_w), thread_cols, qk);
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      float a[NL], b[NL];
-      thread_unpack<T>(reinterpret_cast<const V*>(norm_w)[thread_cols.offs_n[k]], a);
-      thread_unpack<T>(reinterpret_cast<const V*>(qk_w)[thread_cols.offs_n[k]], b);
+      for (int k = 0; k < kRowPacks; ++k) {
+        float a[NL], b[NL];
+        thread_unpack<T>(norm[k], a);
+        thread_unpack<T>(qk[k], b);
 #pragma unroll
-      for (int j = 0; j < NL; ++j) w[k][j] = a[j] * b[j];
+        for (int j = 0; j < NL; ++j) w[k][j] = a[j] * b[j];
+      }
     }
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m)
@@ -102,10 +114,11 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
         for (int s = 0; s < TILE_K; ++s) {
           const int src = src0 + s;
           if (src < num_blocks) {
-            const V* at_src = reinterpret_cast<const V*>(row_blocks[m] + src * block_stride_r);
+            V raw[kRowPacks];
+            thread_load(reinterpret_cast<const V*>(row_blocks[m] + src * block_stride_r),
+                        thread_cols, raw);
 #pragma unroll
-            for (int k = 0; k < kRowPacks; ++k)
-              thread_unpack<T>(at_src[thread_cols.offs_n[k]], v[m][s][k]);
+            for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(raw[k], v[m][s][k]);
           } else {
 #pragma unroll
             for (int k = 0; k < kRowPacks; ++k)
@@ -147,33 +160,38 @@ DINLINE void block_attn_res_tile(const typename traits<T>::V (&sum)[TILE_M][kRow
         for (int j = 0; j < NL; ++j) acc[m][k][j] *= inv_den;
     }
   }
-  // The output, normed when out_norm_w is given: one reduction for every row's sum of squares.
+  // The output, normed when out_norm_w is given: its weights in flight under the one reduction
+  // for every row's sum of squares.
   float scale[TILE_M];
 #pragma unroll
   for (int m = 0; m < TILE_M; ++m) scale[m] = 1.0f;
+  float g[kRowPacks][NL];
   if (out_norm_w != nullptr) {
+    V out_w[kRowPacks];
+    thread_load(reinterpret_cast<const V*>(out_norm_w), thread_cols, out_w);
     float ss[TILE_M];
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) ss[m] = thread_dot(acc[m], acc[m], thread_cols);
     block_reduce<Sum>(ss);
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) scale[m] = rsqrtf(ss[m] * inv_hidden + out_eps);
+#pragma unroll
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(out_w[k], g[k]);
   }
 #pragma unroll
   for (int m = 0; m < TILE_M; ++m) {
+    V result[kRowPacks];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
-      V result;
       if (out_norm_w != nullptr) {
-        float g[NL];
-        thread_unpack<T>(reinterpret_cast<const V*>(out_norm_w)[thread_cols.offs_n[k]], g);
 #pragma unroll
-        for (int j = 0; j < NL; ++j) result.d[j] = static_cast<T>(acc[m][k][j] * scale[m] * g[j]);
+        for (int j = 0; j < NL; ++j)
+          result[k].d[j] = static_cast<T>(acc[m][k][j] * scale[m] * g[k][j]);
       } else {
-        result = thread_pack<T>(acc[m][k]);
+        result[k] = thread_pack<T>(acc[m][k]);
       }
-      if (live[m] && thread_cols.mask_n[k] != 0.0f) o[base[m] + thread_cols.offs_n[k]] = result;
     }
+    if (live[m]) thread_store(o + base[m], thread_cols, result);
   }
 }
 

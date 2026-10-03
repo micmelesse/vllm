@@ -70,10 +70,20 @@ DINLINE void thread_store_uncached(V* p, const V& v) {
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
 }
 
-// A ROW'S LOAD AND STORE AT A THREAD'S COLUMNS: every load issued (a pack past the row reads the last one), and a
-// store only of the packs inside the row (stores do not hold up loads, so the guard costs
-// nothing). A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's
-// pack is 32 bytes and loads as the compiler chooses.
+// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no instruction is scheduled across this point, so
+// every load above it is in flight before anything below it runs. Without it the scheduler sank
+// some of a reduce's peer loads past the adds of the first ones, so their round trips ran partly
+// one after another (0.4 us at 4-16 tokens: ISA 2026-10-01T00-39-51Z).
+namespace impl {
+DINLINE void issued() { __builtin_amdgcn_sched_barrier(0); }
+}  // namespace impl
+
+// A ROW'S LOAD AND STORE AT A THREAD'S COLUMNS: every load issued together, one round trip a row
+// (a pack past the row reads the last one), and a store only of the packs inside the row (stores
+// do not hold up loads, so the guard costs nothing). Load a row whole before storing anything:
+// packs loaded between stores wait one round trip each, since a store may alias the next load.
+// A 16-byte pack goes through the one-pack global instructions above; an fp32 weight's pack is
+// 32 bytes and loads as the compiler chooses.
 template <int K, typename V>
 DINLINE void thread_load(const V* row, const ThreadOffs<K>& thread_cols, V (&out)[K]) {
 #pragma unroll
@@ -83,15 +93,8 @@ DINLINE void thread_load(const V* row, const ThreadOffs<K>& thread_cols, V (&out
     else
       out[k] = row[thread_cols.offs_n[k]];
   }
+  impl::issued();
 }
-
-// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no instruction is scheduled across this point, so
-// every load above it is in flight before anything below it runs. Without it the scheduler sank
-// some of a reduce's peer loads past the adds of the first ones, so their round trips ran partly
-// one after another (0.4 us at 4-16 tokens: ISA 2026-10-01T00-39-51Z).
-namespace impl {
-DINLINE void issued() { __builtin_amdgcn_sched_barrier(0); }
-}  // namespace impl
 
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
 // waits until a pack is used (peers_reduce), so loads issued here can run under other work.

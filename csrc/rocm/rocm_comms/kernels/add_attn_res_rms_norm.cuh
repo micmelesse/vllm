@@ -38,8 +38,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const Tile<1, TILE_N> tile{rows, cols, offs_m, 0};
     const int64_t base = int64_t{offs_m} * packs;
     V sum[1][kRowPacks];
-#pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) sum[0][k] = d[base + thread_cols.offs_n[k]];
+    thread_load(d + base, thread_cols, sum[0]);
     block_attn_res_tile<T, true, TILE_K>(sum, tile, thread_cols, reinterpret_cast<V*>(prefix),
                                          written, blocks, block_stride_m, block_stride_r, norm_w,
                                          qk_w, out_norm_w, reinterpret_cast<V*>(out), num_blocks,
