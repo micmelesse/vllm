@@ -64,6 +64,14 @@ namespace hip_comms {
 
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
 // Not swept: select cuts it to the rows, so it matters only past 16 rows.
+// The plain one-shot: a chunk THREADS_PER_BLOCK groups wide, at each block size a launch may take
+// (64, a wave, its own: all_reduce_config).
+constexpr KernelConfig kAllReduceOneShotConfigs[] = {
+    AllReduceConfig{{64, 0}},
+    AllReduceConfig{{128, 0}},
+    AllReduceConfig{{256, 0}},
+    AllReduceConfig{{512, 0}},
+};
 constexpr KernelConfig kRmsNormOneShotConfigs[] = {
     RowConfig{{512, 16}, 4096},
     RowConfig{{512, 16}, 8192},
@@ -196,7 +204,7 @@ struct TemplateInfo {
 
 constexpr TemplateInfo kTemplates[] = {
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot), OpType::all_reduce,
-     false, false, {}},
+     false, false, kAllReduceOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot), OpType::all_reduce,
      true, false, {}},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm), OpType::all_reduce_rms_norm,
@@ -247,7 +255,12 @@ constexpr const char* to_string(Template k) { return info(k).name; }
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 
 constexpr std::span<const KernelConfig> configs_of(Template k) { return info(k).configs; }
-constexpr bool has_tiles(Template k) { return !configs_of(k).empty(); }
+// Whether a template is built at listed configs (its threads compiled in), and whether those have a
+// tile's fields too (the plain all-reduce's are threads alone).
+constexpr bool has_builds(Template k) { return !configs_of(k).empty(); }
+constexpr bool has_tiles(Template k) {
+  return has_builds(k) && !std::holds_alternative<AllReduceConfig>(configs_of(k)[0]);
+}
 
 // Whether two configs are one build: the same family, the same fields compiled in, at the same
 // threads (the grid and reduce_scatter_blocks are a launch's).
@@ -834,7 +847,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (row_elems * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0) return Error::row_not_packs;
   const int threads = launch_of(c).threads_per_block;
   if (c.index() != family_of(fn)) return Error::tile_not_built;
-  if (has_tiles(fn) && !built_at(fn, threads)) return Error::threads_not_built;
+  if (has_builds(fn) && !built_at(fn, threads)) return Error::threads_not_built;
   if (has_tiles(fn) && tile_n_of(c) == 0) return Error::row_too_wide;
   if (has_tiles(fn) && !built(fn, c)) return Error::tile_not_built;
   if (has_tiles(fn) && tile_n_of(c) < tile_cols) return Error::row_too_wide;
@@ -908,9 +921,13 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       using T = typename decltype(t)::t;
       switch (fn) {
         case Template::all_reduce_pull_one_shot:
-          kernel = staged ? instance<AllReduceOneShotStagedKernel>(
-                                all_reduce_pull_one_shot_staged<T, NG>)
-                          : instance<AllReduceOneShotKernel>(all_reduce_pull_one_shot<T, NG>);
+          by_config<Template::all_reduce_pull_one_shot>(c, [&](auto built) {
+            constexpr int THREADS = decltype(built)::value.launch.threads_per_block;
+            kernel = staged ? instance<AllReduceOneShotStagedKernel>(
+                                  all_reduce_pull_one_shot_staged<T, NG, THREADS>)
+                            : instance<AllReduceOneShotKernel>(
+                                  all_reduce_pull_one_shot<T, NG, THREADS>);
+          });
           return;
         case Template::all_reduce_pull_two_shot:
           kernel = staged ? instance<AllReduceTwoShotStagedKernel>(

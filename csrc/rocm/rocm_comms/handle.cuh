@@ -342,7 +342,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   HIP_CHECK(hipSetDevice(device));
   hipFuncAttributes attrs;
   const hipError_t found = hipFuncGetAttributes(
-      &attrs, reinterpret_cast<const void*>(all_reduce_pull_one_shot<c10::BFloat16, 2>));
+      &attrs, reinterpret_cast<const void*>(all_reduce_pull_one_shot<c10::BFloat16, 2, kWaveSize>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;
