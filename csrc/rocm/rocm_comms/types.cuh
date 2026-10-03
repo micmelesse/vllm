@@ -13,7 +13,9 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <string>
 #include <variant>
+#include <vector>
 
 #include "build.cuh"
 #include "p2p/p2p.cuh"
@@ -56,8 +58,9 @@ enum class Error : int {
   field_without_launch = 30,
   field_not_positive = 31,
   field_not_this_templates = 32,
+  probe_out_of_range = 33,
 };
-constexpr int kNumErrors = 33;
+constexpr int kNumErrors = 34;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -121,6 +124,9 @@ constexpr const char* to_string(Error e) {
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
       return "field_not_this_templates: the forced template has no such config field";
+    case Error::probe_out_of_range:
+      return "probe_out_of_range: the probe's iterations and trials are positive and its bytes at "
+             "least a pack";
   }
   return "unknown";
 }
@@ -494,6 +500,14 @@ struct AddAttnResRmsNormLaunch {
   int write_idx;
   float eps;
   float out_eps;
+};
+
+// WHAT THE PROBE MEASURED (experimental::probe): the round trip to each peer in ns (by rank, this
+// rank's 0), and GB/s by name, `<buffer>_<mode>`.
+struct ProbeResult {
+  std::vector<double> ping_ns;
+  std::vector<std::string> names;
+  std::vector<double> gbytes_per_s;
 };
 
 }  // namespace hip_comms
