@@ -293,49 +293,50 @@ using AllReduceTwoShotStagedKernel =
     void (*)(p2p::PeerPtrs, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, int64_t, void*,
              int64_t, const void*, int64_t);
 // out, weight, eps, rows, packs; the two-shots (pull and push) with every rank's scratch.
-using RmsNormOneShotKernel =
+using AllReduceRmsNormOneShotKernel =
     void (*)(const void*, p2p::PeerSignals, void*, int, uint64_t, void*, const void*, float, int,
              int);
-using RmsNormTwoShotKernel =
+using AllReduceRmsNormTwoShotKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, void*, const void*,
              float, int, int);
 // out, residual_out, residual, weight, eps, rows, packs.
-using AddRmsNormOneShotKernel =
+using AllReduceAddRmsNormOneShotKernel =
     void (*)(const void*, p2p::PeerSignals, void*, int, uint64_t, void*, void*, const void*,
              const void*, float, int, int);
-using AddRmsNormTwoShotKernel =
+using AllReduceAddRmsNormTwoShotKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, void*, void*,
              const void*, const void*, float, int, int);
 // prefix, blocks, block_stride_m, block_stride_r, norm_w, qk_w, out_norm_w, out, num_blocks,
 // write_idx, eps, out_eps, rows, packs; the push with every rank's scratch; the pull with it and
 // its reduce_scatter_blocks last.
-using AttnResOneShotKernel =
+using AllReduceAddAttnResRmsNormOneShotKernel =
     void (*)(const void*, p2p::PeerSignals, void*, int, uint64_t, void*, void*, int64_t, int64_t,
              const void*, const void*, const void*, void*, int, int, float, float, int, int);
-using AttnResPushKernel =
+using AllReduceAddAttnResRmsNormPushKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, void*, void*,
              int64_t, int64_t, const void*, const void*, const void*, void*, int, int, float, float,
              int, int);
-using AttnResPullKernel =
+using AllReduceAddAttnResRmsNormPullKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, void*, void*,
              int64_t, int64_t, const void*, const void*, const void*, void*, int, int, float, float,
              int, int, int);
-// norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs.
-using GemmTailOneShotKernel =
+// norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs: written or added
+// (all_reduce_rms_norm_gemm and _gemm_add), one shape.
+using AllReduceRmsNormGemmOneShotKernel =
     void (*)(const void*, p2p::PeerSignals, void*, int, uint64_t, const void*, float, const void*,
              int, void*, int64_t, void*, int, int);
-using GemmTailTwoShotKernel =
+using AllReduceRmsNormGemmTwoShotKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, const void*, float,
              const void*, int, void*, int64_t, void*, int, int);
 // out, eps, rows, hidden_packs, latent_packs.
-using RmsScaleAddOneShotKernel =
+using AllReduceRmsScaleAddOneShotKernel =
     void (*)(const void*, p2p::PeerSignals, void*, int, uint64_t, void*, float, int, int, int);
-using RmsScaleAddTwoShotKernel =
+using AllReduceRmsScaleAddTwoShotKernel =
     void (*)(const void*, p2p::PeerPtrs, p2p::PeerSignals, void*, int, uint64_t, void*, float, int,
              int, int);
 // Experimental, no peers: prefix, delta, blocks, block_stride_m, block_stride_r, norm_w, qk_w,
 // out_norm_w, out, num_blocks, write_idx, eps, out_eps, rows, packs.
-using AddAttnResKernel =
+using AddAttnResRmsNormKernel =
     void (*)(void*, const void*, void*, int64_t, int64_t, const void*, const void*, const void*,
              void*, int, int, float, float, int, int);
 // The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the

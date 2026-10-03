@@ -70,14 +70,14 @@ inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& 
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<RmsNormOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                    inputs, h.peer_signals(), h.self_signal(), h.rank(),
-                                    h.timeout_ticks(), l.out, l.weight, l.eps, rows, packs);
+    Call<AllReduceRmsNormOneShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
+        h.self_signal(), h.rank(), h.timeout_ticks(), l.out, l.weight, l.eps, rows, packs);
   else
-    Call<RmsNormTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                    inputs, h.peer_scratch(), h.peer_signals(), h.self_signal(),
-                                    h.rank(), h.timeout_ticks(), l.out, l.weight, l.eps, rows,
-                                    packs);
+    Call<AllReduceRmsNormTwoShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
+        h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.out, l.weight, l.eps,
+        rows, packs);
 }
 
 inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
@@ -85,15 +85,15 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<AddRmsNormOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                       inputs, h.peer_signals(), h.self_signal(), h.rank(),
-                                       h.timeout_ticks(), l.out, l.residual_out, l.residual,
-                                       l.weight, l.eps, rows, packs);
+    Call<AllReduceAddRmsNormOneShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
+        h.self_signal(), h.rank(), h.timeout_ticks(), l.out, l.residual_out, l.residual, l.weight,
+        l.eps, rows, packs);
   else
-    Call<AddRmsNormTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                       inputs, h.peer_scratch(), h.peer_signals(),
-                                       h.self_signal(), h.rank(), h.timeout_ticks(), l.out,
-                                       l.residual_out, l.residual, l.weight, l.eps, rows, packs);
+    Call<AllReduceAddRmsNormTwoShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
+        h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.out, l.residual_out,
+        l.residual, l.weight, l.eps, rows, packs);
 }
 
 // THE PULL TWO-SHOT takes its reduce-scatter blocks last.
@@ -103,19 +103,19 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<AttnResOneShotKernel>::run(
+    Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
         h.self_signal(), h.rank(), h.timeout_ticks(), l.prefix, l.blocks, l.block_stride_m,
         l.block_stride_r, l.norm_weight, l.qk_weight, l.out_norm_weight, l.out, l.num_blocks,
         l.write_idx, l.eps, l.out_eps, rows, packs);
   else if (l.direction == Direction::push)
-    Call<AttnResPushKernel>::run(
+    Call<AllReduceAddAttnResRmsNormPushKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
         h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.prefix, l.blocks,
         l.block_stride_m, l.block_stride_r, l.norm_weight, l.qk_weight, l.out_norm_weight, l.out,
         l.num_blocks, l.write_idx, l.eps, l.out_eps, rows, packs);
   else
-    Call<AttnResPullKernel>::run(
+    Call<AllReduceAddAttnResRmsNormPullKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
         h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.prefix, l.blocks,
         l.block_stride_m, l.block_stride_r, l.norm_weight, l.qk_weight, l.out_norm_weight, l.out,
@@ -127,12 +127,12 @@ inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGem
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<GemmTailOneShotKernel>::run(
+    Call<AllReduceRmsNormGemmOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
         h.self_signal(), h.rank(), h.timeout_ticks(), l.norm_weight, l.eps, l.gemm_weight,
         static_cast<int>(l.n_cols), l.out, l.out_stride, l.workspace, rows, packs);
   else
-    Call<GemmTailTwoShotKernel>::run(
+    Call<AllReduceRmsNormGemmTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
         h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.norm_weight, l.eps,
         l.gemm_weight, static_cast<int>(l.n_cols), l.out, l.out_stride, l.workspace, rows,
@@ -144,12 +144,12 @@ inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNor
   const int rows = static_cast<int>(l.rows), packs = static_cast<int>(packs_of(l.hidden, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<GemmTailOneShotKernel>::run(
+    Call<AllReduceRmsNormGemmOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_signals(),
         h.self_signal(), h.rank(), h.timeout_ticks(), l.norm_weight, l.eps, l.gemm_weight,
         static_cast<int>(l.n_cols), l.out, l.out_stride, l.workspace, rows, packs);
   else
-    Call<GemmTailTwoShotKernel>::run(
+    Call<AllReduceRmsNormGemmTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inputs, h.peer_scratch(),
         h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.norm_weight, l.eps,
         l.gemm_weight, static_cast<int>(l.n_cols), l.out, l.out_stride, l.workspace, rows,
@@ -164,11 +164,11 @@ inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAd
   const int lp = static_cast<int>(packs_of(l.latent, l.dtype));
   const p2p::PeerPtrs* inputs = h.peer_inputs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<RmsScaleAddOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
+    Call<AllReduceRmsScaleAddOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inputs, h.peer_signals(), h.self_signal(),
                                         h.rank(), h.timeout_ticks(), l.out, l.eps, rows, hp, lp);
   else
-    Call<RmsScaleAddTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
+    Call<AllReduceRmsScaleAddTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inputs, h.peer_scratch(), h.peer_signals(),
                                         h.self_signal(), h.rank(), h.timeout_ticks(), l.out, l.eps,
                                         rows, hp, lp);
@@ -178,7 +178,7 @@ namespace experimental {
 
 // No peers: its own tensors only.
 inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l) {
-  Call<AddAttnResKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
+  Call<AddAttnResRmsNormKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
                               l.prefix, l.delta, l.blocks, l.block_stride_m, l.block_stride_r,
                               l.norm_weight, l.qk_weight, l.out_norm_weight, l.out, l.num_blocks,
                               l.write_idx, l.eps, l.out_eps, static_cast<int>(l.rows),
