@@ -50,13 +50,15 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     float s[kRowPacks][NL];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(sum[k], s[k]);
+    V wk[kRowPacks];
+    thread_load(weight, thread_cols, wk);  // under the reduction
     float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k) {
       float w[NL], x[NL];
-      thread_unpack<T>(weight[thread_cols.offs_n[k]], w);
+      thread_unpack<T>(wk[k], w);
 #pragma unroll
       for (int j = 0; j < NL; ++j)
         x[j] = static_cast<float>(static_cast<T>(s[k][j] * scale)) * w[j];

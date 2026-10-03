@@ -6,6 +6,13 @@
 // hipCUB names its own; each prevents a footgun its comment names. Its parts refuse to be included
 // any other way.
 //
+// CONCURRENCY IS PART OF EACH OP'S CONTRACT, so a kernel keeps it by using them:
+//   1. Global memory only through memory.cuh's loads and stores: a kernel never indexes a row.
+//   2. A row is loaded whole (thread_load, peers_load: one round trip) before anything is stored;
+//      a pack loaded between stores waits a round trip, since a store may alias it.
+//   3. A load that does not depend on a reduction is issued before it (weights, the next row or
+//      source), so its round trip runs under the reduction.
+//
 // utils.cuh         the helpers
 //   traits<T>::V                 a pack: 16 bytes, the unit everything loads, sums and stores in
 //   PeerPacks<T, ngpus, K>       every source's packs, in registers (peers_load's, peers_reduce's)

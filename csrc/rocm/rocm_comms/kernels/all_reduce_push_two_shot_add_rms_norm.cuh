@@ -78,35 +78,43 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const int64_t base = int64_t{row} * packs;
-    float s[kRowPacks][NL];
+    // Every load of the row before any store: the scratch's and the residual together, the weight
+    // under the reduction.
+    V own[kRowPacks];
 #pragma unroll
     for (int k = 0; k < kRowPacks; ++k)
-      thread_unpack<T>(p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]), s[k]);
+      own[k] = p2p::read_scratch(own_scratch, base + thread_cols.offs_n[k]);
+    V res[kRowPacks];
+    if constexpr (kAdd) thread_load(res_in + base, thread_cols, res);
+    float s[kRowPacks][NL];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      if constexpr (kAdd) {
+    for (int k = 0; k < kRowPacks; ++k) thread_unpack<T>(own[k], s[k]);
+    if constexpr (kAdd) {
+      V added[kRowPacks];
+#pragma unroll
+      for (int k = 0; k < kRowPacks; ++k) {
         float r[NL];
-        thread_unpack<T>(res_in[base + thread_cols.offs_n[k]], r);
+        thread_unpack<T>(res[k], r);
 #pragma unroll
         for (int j = 0; j < NL; ++j) s[k][j] += r[j];
-        if (thread_cols.mask_n[k] != 0.0f)
-          thread_store(res_out + base + thread_cols.offs_n[k], thread_pack<T>(s[k]));
+        added[k] = thread_pack<T>(s[k]);
       }
+      thread_store(res_out + base, thread_cols, added);
     }
+    vec<W, NL> w[kRowPacks];
+    thread_load(wv, thread_cols, w);
     float ss[1] = {thread_dot(s, s, thread_cols)};
     block_reduce<Sum>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    V normed[kRowPacks];
 #pragma unroll
-    for (int k = 0; k < kRowPacks; ++k) {
-      const vec<W, NL> w = wv[thread_cols.offs_n[k]];
-      V normed;
+    for (int k = 0; k < kRowPacks; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x = static_cast<float>(static_cast<W>(s[k][j] * scale));
-        normed.d[j]   = static_cast<T>(static_cast<W>(x * static_cast<float>(w.d[j])));
+        const float x  = static_cast<float>(static_cast<W>(s[k][j] * scale));
+        normed[k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w[k].d[j])));
       }
-      if (thread_cols.mask_n[k] != 0.0f) thread_store(o + base + thread_cols.offs_n[k], normed);
-    }
+    thread_store(o + base, thread_cols, normed);
   }
   block_stamp(4);
 }
