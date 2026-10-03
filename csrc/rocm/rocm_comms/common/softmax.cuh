@@ -24,15 +24,15 @@ struct OnlineSoftmax {
 
 // Folds N logits into `s` (a -INFINITY logit is no source). Returns the scale the weighted sum so
 // far takes, and in `scale` each logit's weight; the sum is final once divided by s.denominator.
-template <int N>
-DINLINE float thread_softmax_fold(OnlineSoftmax& s, const float (&logit)[N], float (&scale)[N]) {
+template <int NUM_LOGITS>
+DINLINE float thread_softmax_fold(OnlineSoftmax& s, const float (&logit)[NUM_LOGITS], float (&scale)[NUM_LOGITS]) {
   float new_max = s.max;
 #pragma unroll
-  for (int t = 0; t < N; ++t) new_max = fmaxf(new_max, logit[t]);
+  for (int t = 0; t < NUM_LOGITS; ++t) new_max = fmaxf(new_max, logit[t]);
   const float old_scale = __expf(s.max - new_max);
   s.denominator *= old_scale;
 #pragma unroll
-  for (int t = 0; t < N; ++t) {
+  for (int t = 0; t < NUM_LOGITS; ++t) {
     scale[t] = __expf(logit[t] - new_max);
     s.denominator += scale[t];
   }

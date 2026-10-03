@@ -51,10 +51,10 @@ DINLINE void skew(Signal* self_signal, int rank) {
 DINLINE void wait_stores() { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); }
 
 // The builtin takes the ordering as a literal, so each case is spelled out.
-template <int kOrder, int kScope>
+template <int MEMORY_ORDER, int MEMORY_SCOPE>
 DINLINE void fence() {
-  constexpr bool system = kScope == __MEMORY_SCOPE_SYSTEM;
-  if constexpr (kOrder == __ATOMIC_RELEASE) {
+  constexpr bool system = MEMORY_SCOPE == __MEMORY_SCOPE_SYSTEM;
+  if constexpr (MEMORY_ORDER == __ATOMIC_RELEASE) {
     if constexpr (system) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
     else __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else {
@@ -65,13 +65,13 @@ DINLINE void fence() {
 
 // Spins relaxed and acquires once, after: an acquire per poll would invalidate the
 // caches on every iteration of every spinning block.
-template <bool kAcquire, int kScope>
+template <bool ACQUIRE, int MEMORY_SCOPE>
 DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_t want,
                   const char* what, int peer) {
 #if HIP_COMMS_DEBUG
   const uint64_t t0 = wall_clock64();
   uint32_t seen;
-  while ((seen = flag.load<__ATOMIC_RELAXED, kScope>()) < want) {
+  while ((seen = flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>()) < want) {
     if (wall_clock64() - t0 > timeout_ticks) {
       printf("rocm_comms: rank %d block %d timed out in %s, peer %d: flag %u, want %u\n",
              rank, blockIdx.x, what, peer, seen, want);
@@ -85,12 +85,12 @@ DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_
   // costs what the debug build's clock read a poll and printf path do.
   (void)what, (void)peer, (void)rank;
   const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, kScope>() < want; ++n) {
+  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want; ++n) {
     __builtin_amdgcn_s_sleep(1);
     if ((n & 255u) == 0 && wall_clock64() - t0 > timeout_ticks) __builtin_trap();
   }
 #endif
-  if constexpr (kAcquire) fence<__ATOMIC_ACQUIRE, kScope>();
+  if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
 }
 
 // Block b waits for block b on every rank, and for no other block: enough at the ends,
@@ -99,22 +99,22 @@ DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_
 // releases and the wait acquires, so what the block put before is visible to its peers'
 // same-numbered block after (a peer_barrier). Unordered, it only says when
 // (start: every peer has launched; close: every peer is done reading us).
-template <int ngpus, bool kOrdered>
+template <int NGPUS, bool ORDERED>
 DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                          uint64_t timeout_ticks, bool start) {
   if (!start) {
-    if constexpr (kOrdered) wait_stores();
+    if constexpr (ORDERED) wait_stores();
     __syncthreads();
   }
   const Signals own = own_signals(self_signal);
   const uint32_t f  = own.seq(blockIdx.x) + 1;
-  if (threadIdx.x < ngpus) {
+  if (threadIdx.x < NGPUS) {
     const Signals peer   = lane_signals(peer_signals, threadIdx.x);
     const Counter theirs = start ? peer.start(blockIdx.x, rank) : peer.end(blockIdx.x, rank);
     const Counter mine   = start ? own.start(blockIdx.x, threadIdx.x)
                                  : own.end(blockIdx.x, threadIdx.x);
-    theirs.store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(f);
-    wait<kOrdered, __MEMORY_SCOPE_DEVICE>(timeout_ticks, rank, mine, f,
+    theirs.store<ORDERED ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(f);
+    wait<ORDERED, __MEMORY_SCOPE_DEVICE>(timeout_ticks, rank, mine, f,
                                           start ? "start" : "peer barrier", threadIdx.x);
   }
   __syncthreads();
@@ -126,10 +126,10 @@ DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, i
 // barrier: every wave first waits for its own stores (`wait_stores`), and a release
 // writes back the whole L2, so one covers the block where one per thread wrote it back
 // 512 times.
-template <int ngpus, bool kPeers>
+template <int NGPUS, bool PEERS>
 DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                      uint64_t timeout_ticks) {
-  constexpr int kScope = kPeers ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
+  constexpr int kScope = PEERS ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
   skew(self_signal, rank);
   wait_stores();
   __syncthreads();
@@ -139,24 +139,24 @@ DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int r
     const uint32_t g  = own.gen().load<__ATOMIC_ACQUIRE, kScope>();
     if (own.arrive().fetch_add<__ATOMIC_ACQ_REL, __MEMORY_SCOPE_DEVICE>(1u) == gridDim.x - 1) {
       own.arrive().store<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(0u);
-      if constexpr (kPeers) {
+      if constexpr (PEERS) {
         const uint32_t e = own.epoch() + 1;
         own.set_epoch(e);
         fence<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>();
 #pragma unroll
-        for (int i = 0; i < ngpus; ++i)
+        for (int i = 0; i < NGPUS; ++i)
           lane_signals(peer_signals, i)
               .peer(rank)
               .store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(e);
 #pragma unroll
-        for (int i = 0; i < ngpus; ++i)
+        for (int i = 0; i < NGPUS; ++i)
           wait<true, __MEMORY_SCOPE_SYSTEM>(timeout_ticks, rank, own.peer(i), e,
                                             "world_barrier: peer", i);
       }
       own.gen().fetch_add<__ATOMIC_RELEASE, kScope>(1u);
     } else {
       wait<true, kScope>(timeout_ticks, rank, own.gen(), g + 1,
-                         kPeers ? "world_barrier" : "grid_barrier", -1);
+                         PEERS ? "world_barrier" : "grid_barrier", -1);
     }
   }
   __syncthreads();
@@ -182,20 +182,20 @@ enum class Ensure { launched, visible, read };
 // both sides must index the same data by the same block.
 // Every rank's signal block, this rank's, its rank, and how long a wait may last before it traps:
 // what every kernel that synchronizes is handed.
-template <int ngpus, Among kAmong, Ensure kEnsure>
+template <int NGPUS, Among AMONG, Ensure ENSURE>
 DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                      uint64_t timeout_ticks) {
-  static_assert(kAmong == Among::peers || kEnsure == Ensure::visible,
+  static_assert(AMONG == Among::peers || ENSURE == Ensure::visible,
                 "a grid or world barrier is a visibility barrier");
-  if constexpr (kAmong == Among::grid) {
-    impl::barrier<ngpus, false>(peer_signals, self_signal, rank, timeout_ticks);
-  } else if constexpr (kAmong == Among::world) {
-    impl::barrier<ngpus, true>(peer_signals, self_signal, rank, timeout_ticks);
+  if constexpr (AMONG == Among::grid) {
+    impl::barrier<NGPUS, false>(peer_signals, self_signal, rank, timeout_ticks);
+  } else if constexpr (AMONG == Among::world) {
+    impl::barrier<NGPUS, true>(peer_signals, self_signal, rank, timeout_ticks);
   } else {
     impl::skew(self_signal, rank);
-    impl::pair_blocks<ngpus, kEnsure == Ensure::visible>(peer_signals, self_signal, rank,
+    impl::pair_blocks<NGPUS, ENSURE == Ensure::visible>(peer_signals, self_signal, rank,
                                                          timeout_ticks,
-                                                         kEnsure == Ensure::launched);
+                                                         ENSURE == Ensure::launched);
   }
 }
 

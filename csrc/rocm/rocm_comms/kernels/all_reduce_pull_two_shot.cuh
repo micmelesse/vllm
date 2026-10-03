@@ -22,34 +22,34 @@ namespace hip_comms {
 //
 // THE SAME BLOCK AND LANE INDEX A PACK IN BOTH PHASES: wave 0's lane l writes it, the peers' wave
 // w lane l of the same block read it, after that block's sync.
-template <typename T, int ngpus>
+template <typename DTYPE, int NGPUS>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_two_shot(const p2p::PeerPtrs* __restrict__ peer_inputs,
                              p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                              p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
-                             T* __restrict__ out, int num_packs) {
-  using V               = typename traits<T>::V;
-  constexpr int N       = traits<T>::N;
-  const int lanes       = blockDim.x / ngpus;  // host: blockDim is ngpus whole waves
+                             DTYPE* __restrict__ out, int num_packs) {
+  using V               = typename traits<DTYPE>::V;
+  constexpr int N       = traits<DTYPE>::N;
+  const int lanes       = blockDim.x / NGPUS;  // host: blockDim is NGPUS whole waves
   const int wave        = threadIdx.x / lanes;
   const int lane        = threadIdx.x % lanes;
-  const int peer        = (rank + wave) % ngpus;
-  const int slice_packs = (num_packs + ngpus - 1) / ngpus;
+  const int peer        = (rank + wave) % NGPUS;
+  const int slice_packs = (num_packs + NGPUS - 1) / NGPUS;
   const int first       = blockIdx.x * lanes + lane;
   const int stride      = gridDim.x * lanes;
   __shared__ V got[kBuild.kernels.max_threads];
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto own_scratch = p2p::scratch<T, ngpus>(peer_scratch, rank);
-  const auto their_scratch = p2p::scratch<T, ngpus>(peer_scratch, peer);
-  const auto their_input = p2p::input<T, ngpus>(*peer_inputs, peer);
+  const auto own_scratch = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
+  const auto their_scratch = p2p::scratch<DTYPE, NGPUS>(peer_scratch, peer);
+  const auto their_input = p2p::input<DTYPE, NGPUS>(*peer_inputs, peer);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // 2. Reduce-scatter: each wave loads this rank's slice from its peer into LDS, and wave 0 sums
-  //    the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
+  //    the NGPUS loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the waves share a
   //    lane's packs, so they leave the loop together and the barriers inside it match.
   const int base    = rank * slice_packs;
   const int mine    = min(slice_packs, num_packs - base);
@@ -61,12 +61,12 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 #pragma unroll
       for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(got[lane].d[j]);
 #pragma unroll
-      for (int w = 1; w < ngpus; ++w)
+      for (int w = 1; w < NGPUS; ++w)
 #pragma unroll
         for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(got[w * lanes + lane].d[j]);
       V s;
 #pragma unroll
-      for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
+      for (int j = 0; j < N; ++j) s.d[j] = static_cast<DTYPE>(acc[j]);
       p2p::write_scratch(own_scratch, i, s);
     }
     __syncthreads();
@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
@@ -93,34 +93,34 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 // staging holds (`stage_packs`) and what the scratch holds (a slice a rank). WAVE W STAGES THE
 // SLICE ITS PEER READS, at the packs the peer's same block reads, so a peers barrier makes it
 // visible.
-template <typename T, int ngpus>
+template <typename DTYPE, int NGPUS>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     all_reduce_pull_two_shot_staged(p2p::PeerPtrs peer_scratch, p2p::PeerPtrs peer_staging,
                                     p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,
-                                    T* __restrict__ out, int64_t num_packs,
-                                    const T* __restrict__ own_input, int64_t stage_packs) {
-  using V            = typename traits<T>::V;
-  constexpr int N    = traits<T>::N;
-  const int lanes    = blockDim.x / ngpus;  // host: blockDim is ngpus whole waves
+                                    DTYPE* __restrict__ out, int64_t num_packs,
+                                    const DTYPE* __restrict__ own_input, int64_t stage_packs) {
+  using V            = typename traits<DTYPE>::V;
+  constexpr int N    = traits<DTYPE>::N;
+  const int lanes    = blockDim.x / NGPUS;  // host: blockDim is NGPUS whole waves
   const int wave     = threadIdx.x / lanes;
   const int lane     = threadIdx.x % lanes;
-  const int peer     = (rank + wave) % ngpus;
+  const int peer     = (rank + wave) % NGPUS;
   const int first    = blockIdx.x * lanes + lane;
   const int stride   = gridDim.x * lanes;
   const V* own       = reinterpret_cast<const V*>(own_input);
-  const int64_t pass = min(stage_packs, scratch_packs * ngpus);
+  const int64_t pass = min(stage_packs, scratch_packs * NGPUS);
   __shared__ V got[kBuild.kernels.max_threads];
 
-  const auto own_scratch    = p2p::scratch<T, ngpus>(peer_scratch, rank);
-  const auto their_scratch    = p2p::scratch<T, ngpus>(peer_scratch, peer);
-  const auto own_staging = p2p::staging<T, ngpus>(peer_staging, rank);
-  const auto their_staging = p2p::staging<T, ngpus>(peer_staging, peer);
+  const auto own_scratch    = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
+  const auto their_scratch    = p2p::scratch<DTYPE, NGPUS>(peer_scratch, peer);
+  const auto own_staging = p2p::staging<DTYPE, NGPUS>(peer_staging, rank);
+  const auto their_staging = p2p::staging<DTYPE, NGPUS>(peer_staging, peer);
   V* dst             = reinterpret_cast<V*>(out);
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
     const int64_t n       = min(pass, num_packs - c0);
-    const int slice_packs = static_cast<int>((n + ngpus - 1) / ngpus);
+    const int slice_packs = static_cast<int>((n + NGPUS - 1) / NGPUS);
     block_stamp(0);
     // 1. Wave w stages the slice its peer reads, then it is visible (and, past the first pass,
     //    every peer has read this rank's scratch).
@@ -128,12 +128,12 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       const int64_t at = int64_t{peer} * slice_packs + i;
       if (at < n) p2p::write_staging(own_staging, at, own[c0 + at]);
     }
-    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+    p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(1);
 
     // 2. Reduce-scatter: each wave loads this rank's slice from its peer's staging into LDS, and
-    //    wave 0 sums the ngpus loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the
+    //    wave 0 sums the NGPUS loads into this rank's scratch. EVERY WAVE RUNS EVERY PASS: the
     //    waves share a lane's packs, so they leave the loop together and the barriers match.
     const int64_t base = int64_t{rank} * slice_packs;
     const int count    = static_cast<int>(min(int64_t{slice_packs}, n - base));
@@ -145,12 +145,12 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
 #pragma unroll
         for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(got[lane].d[j]);
 #pragma unroll
-        for (int w = 1; w < ngpus; ++w)
+        for (int w = 1; w < NGPUS; ++w)
 #pragma unroll
           for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(got[w * lanes + lane].d[j]);
         V s;
 #pragma unroll
-        for (int j = 0; j < N; ++j) s.d[j] = static_cast<T>(acc[j]);
+        for (int j = 0; j < N; ++j) s.d[j] = static_cast<DTYPE>(acc[j]);
         p2p::write_scratch(own_scratch, i, s);
       }
       __syncthreads();
@@ -159,7 +159,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
     //    pass, so the next one may overwrite it.
-    p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+    p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(3);
 

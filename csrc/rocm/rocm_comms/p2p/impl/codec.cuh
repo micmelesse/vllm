@@ -22,24 +22,24 @@ namespace impl {
 
 // A group's kCodecGroupPacks packs as floats and back, rounding to T: what a quantizing kernel
 // reduces and encodes in, against the packs a row helper takes.
-template <typename T>
-DINLINE void floats_of(const typename traits<T>::V (&v)[kCodecGroupPacks],
-                       float (&x)[kCodecGroupPacks * traits<T>::N]) {
-  constexpr int N = traits<T>::N;
+template <typename DTYPE>
+DINLINE void floats_of(const typename traits<DTYPE>::V (&v)[kCodecGroupPacks],
+                       float (&x)[kCodecGroupPacks * traits<DTYPE>::N]) {
+  constexpr int N = traits<DTYPE>::N;
 #pragma unroll
   for (int u = 0; u < kCodecGroupPacks; ++u)
 #pragma unroll
     for (int j = 0; j < N; ++j) x[u * N + j] = static_cast<float>(v[u].d[j]);
 }
 
-template <typename T>
-DINLINE void packs_of(const float (&x)[kCodecGroupPacks * traits<T>::N],
-                      typename traits<T>::V (&v)[kCodecGroupPacks]) {
-  constexpr int N = traits<T>::N;
+template <typename DTYPE>
+DINLINE void packs_of(const float (&x)[kCodecGroupPacks * traits<DTYPE>::N],
+                      typename traits<DTYPE>::V (&v)[kCodecGroupPacks]) {
+  constexpr int N = traits<DTYPE>::N;
 #pragma unroll
   for (int u = 0; u < kCodecGroupPacks; ++u)
 #pragma unroll
-    for (int j = 0; j < N; ++j) v[u].d[j] = static_cast<T>(x[u * N + j]);
+    for (int j = 0; j < N; ++j) v[u].d[j] = static_cast<DTYPE>(x[u * N + j]);
 }
 
 // ---------------------------------------------------------------------------------
@@ -48,23 +48,23 @@ DINLINE void packs_of(const float (&x)[kCodecGroupPacks * traits<T>::N],
 // QuickReduce's symmetric integers with one fp32 scale per group.
 // ---------------------------------------------------------------------------------
 
-template <typename T, int kBits>
+template <typename DTYPE, int NUM_BITS>
 struct Codec {
-  using V                    = typename traits<T>::V;
-  static constexpr int N     = traits<T>::N;
+  using V                    = typename traits<DTYPE>::V;
+  static constexpr int N     = traits<DTYPE>::N;
   static constexpr int kVals = kCodecGroupPacks * N;
-  static_assert(sizeof(T) == 2, "the codec is built for 2-byte T");
-  static_assert(kBits == 16 || kBits == 8 || kBits == 4, "16 (T), INT8 and INT4 are built");
-  static constexpr bool kScaled = kBits < 16;
-  // The payload of one group, in 16-byte packs: 32 values x kBits.
-  static constexpr int kPayloadPacks = kVals * kBits / 8 / 16;
-  static constexpr int kMax          = kScaled ? (1 << (kBits - 1)) - 1 : 0;
+  static_assert(sizeof(DTYPE) == 2, "the codec is built for 2-byte DTYPE");
+  static_assert(NUM_BITS == 16 || NUM_BITS == 8 || NUM_BITS == 4, "16 (DTYPE), INT8 and INT4 are built");
+  static constexpr bool kScaled = NUM_BITS < 16;
+  // The payload of one group, in 16-byte packs: 32 values x NUM_BITS.
+  static constexpr int kPayloadPacks = kVals * NUM_BITS / 8 / 16;
+  static constexpr int kMax          = kScaled ? (1 << (NUM_BITS - 1)) - 1 : 0;
 
   // x -> payload; returns the scale, absmax / kMax (0 for an all-zero group; unused at 16).
   static DINLINE float encode(const float (&x)[kVals], V (&payload)[kPayloadPacks]) {
     if constexpr (!kScaled) {
 #pragma unroll
-      for (int i = 0; i < kVals; ++i) payload[i / N].d[i % N] = static_cast<T>(x[i]);
+      for (int i = 0; i < kVals; ++i) payload[i / N].d[i % N] = static_cast<DTYPE>(x[i]);
       return 1.0f;
     } else {
       float amax = 0.0f;
@@ -77,7 +77,7 @@ struct Codec {
       for (int i = 0; i < kVals; ++i) {
         const int q =
             static_cast<int>(fminf(fmaxf(rintf(x[i] * inv), -kMax - 1.0f), kMax));
-        if constexpr (kBits == 8) {
+        if constexpr (NUM_BITS == 8) {
           bytes[i] = static_cast<unsigned char>(q & 0xFF);
         } else if (i % 2 == 0) {
           bytes[i / 2] = static_cast<unsigned char>(q & 0xF);
@@ -102,7 +102,7 @@ struct Codec {
 #pragma unroll
       for (int i = 0; i < kVals; ++i) {
         int q;
-        if constexpr (kBits == 8) {
+        if constexpr (NUM_BITS == 8) {
           q = static_cast<signed char>(bytes[i]);
         } else {
           const int nib = (bytes[i / 2] >> (4 * (i % 2))) & 0xF;

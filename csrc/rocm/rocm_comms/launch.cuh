@@ -20,11 +20,11 @@ namespace hip_comms {
 // A KERNEL CALLED THROUGH ITS OP'S SIGNATURE (types.cuh): each argument is converted to its
 // parameter, so a wrong one is a compile error, then launched as `kernel<<<blocks, threads, 0,
 // stream>>>(args...)` launches it.
-template <typename Signature>
+template <typename SIGNATURE>
 struct Call;
-template <typename... P>
-struct Call<void (*)(P...)> {
-  static void run(const void* kernel, int blocks, int threads, hipStream_t stream, P... args) {
+template <typename... PARAMS>
+struct Call<void (*)(PARAMS...)> {
+  static void run(const void* kernel, int blocks, int threads, hipStream_t stream, PARAMS... args) {
     void* argv[] = {static_cast<void*>(&args)...};
     HIP_CHECK(hipLaunchKernel(kernel, dim3(blocks), dim3(threads), argv, 0, stream));
   }

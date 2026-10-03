@@ -16,52 +16,52 @@ namespace hip_comms {
 // trip and a launch against an all-reduce then a norm kernel. A block owns a row. `residual` and
 // `residual_out` are unused (null) unless kAdd; `weight` keeps its own dtype W (T or fp32), as
 // vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`).
-template <typename T, typename W, int ngpus, bool kAdd, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerSignals peer_signals,
-    p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, T* __restrict__ out,
-    T* __restrict__ residual_out, const T* __restrict__ residual, const W* __restrict__ weight,
+    p2p::Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
+    DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual, const WEIGHT_DTYPE* __restrict__ weight,
     float eps, int rows, int packs) {
-  constexpr int NL       = traits<T>::N;
-  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, W>;
+  constexpr int NL       = traits<DTYPE>::N;
+  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const int cols         = packs * NL;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
   const auto input = [&](int r) { return inputs[r].data(); };
 
-  // 2. Each of this block's rows: read it from every rank in rank order and sum, then (kAdd) add
+  // 2. Each of this block's rows: read it from every rank in rank order and sum, then (ADD_RESIDUAL) add
   //    the residual, then RMSNorm, rounding as the reference does:
-  //      s   = float(T(sum over ranks))             the all-reduce output, as it would land
-  //      s  += float(residual); residual_out = T(s) kAdd only (fused_add_rms_norm)
-  //      out = T(W(W(s * rsqrt(mean(s^2) + eps)) * float(w)))
+  //      s   = float(DTYPE(sum over ranks))             the all-reduce output, as it would land
+  //      s  += float(residual); residual_out = DTYPE(s) ADD_RESIDUAL only (fused_add_rms_norm)
+  //      out = DTYPE(WEIGHT_DTYPE(WEIGHT_DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)))
   //    The variance is of `s` before any further rounding, kept in registers between the passes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
     // Every load of the row before any store: the peers' and the residual together, the weight
     // under the reduction.
-    Row peers[ngpus];
+    Row peers[NGPUS];
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) peers[r] = at;
+    for (int r = 0; r < NGPUS; ++r) peers[r] = at;
     peers_load(peers, input, cols);
     Row res = at;
-    if constexpr (kAdd) thread_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
-    if constexpr (kAdd) {
+    if constexpr (ADD_RESIDUAL) {
       const RowF r = res.template to<float>();
 #pragma unroll
       for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
         for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
-      thread_store(residual_out, cols, s.template to<T>());
+      thread_store(residual_out, cols, s.template to<DTYPE>());
     }
     Weight w{1, cols, 0, 0};
     thread_load(w, weight, 0);
@@ -75,42 +75,42 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x       = static_cast<float>(static_cast<W>(s.v[0][k].d[j] * scale));
-        normed.v[0][k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w.v[0][k].d[j])));
+        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k].d[j] * scale));
+        normed.v[0][k].d[j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k].d[j])));
       }
     thread_store(out, cols, normed);
   }
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::read>(peer_signals, self_signal, rank,
                                                             timeout_ticks);
   block_stamp(5);
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                       p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
-                                      int rank, uint64_t timeout_ticks, T* __restrict__ out,
-                                      const W* __restrict__ weight, float eps, int rows,
+                                      int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
+                                      const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                       int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, false, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, false, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, nullptr, nullptr, weight,
       eps, rows, packs);
 }
 
-template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_one_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                           p2p::PeerSignals peer_signals, p2p::Signal* self_signal,
-                                          int rank, uint64_t timeout_ticks, T* __restrict__ out,
-                                          T* __restrict__ residual_out,
-                                          const T* __restrict__ residual,
-                                          const W* __restrict__ weight, float eps, int rows,
+                                          int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
+                                          DTYPE* __restrict__ residual_out,
+                                          const DTYPE* __restrict__ residual,
+                                          const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_one_shot_add_rms_norm_body<T, W, ngpus, true, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, true, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, residual_out, residual,
       weight, eps, rows, packs);
 }

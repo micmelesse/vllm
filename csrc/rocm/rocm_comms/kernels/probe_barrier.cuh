@@ -12,10 +12,10 @@
 namespace hip_comms {
 
 // One block, its twin on every rank: so the measurement after it starts on every rank together.
-template <int ngpus>
+template <int NGPUS>
 __global__ void probe_barrier(p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
                               uint64_t timeout_ticks) {
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
 }
 

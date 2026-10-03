@@ -92,9 +92,9 @@ constexpr BuildInfo derive(const Hardware& hw) {
 constexpr BuildInfo kBuild = derive(kDevice);
 
 // WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly these.
-template <typename T, size_t N>
-constexpr bool built_in(const std::array<T, N>& built, T x) {
-  for (const T& b : built)
+template <typename ELEMENT, size_t NUM_BUILT>
+constexpr bool built_in(const std::array<ELEMENT, NUM_BUILT>& built, ELEMENT x) {
+  for (const ELEMENT& b : built)
     if (b == x) return true;
   return false;
 }

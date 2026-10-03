@@ -39,12 +39,12 @@ namespace impl {
 // staging), BY SELECT, never an index: a runtime index into a pointer array puts the array in
 // scratch memory (seen in the ISA: 152 bytes a lane and a scratch load per read), where a constant
 // index keeps the loads scalar and issued together.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V* rank_of(const PeerPtrs& ptrs, int r) {
-  using V = typename traits<T>::V;
+template <typename DTYPE, int NGPUS>
+DINLINE typename traits<DTYPE>::V* rank_of(const PeerPtrs& ptrs, int r) {
+  using V = typename traits<DTYPE>::V;
   V* at   = reinterpret_cast<V*>(ptrs.p[0]);
 #pragma unroll
-  for (int k = 1; k < ngpus; ++k)
+  for (int k = 1; k < NGPUS; ++k)
     if (r == k) at = reinterpret_cast<V*>(ptrs.p[k]);
   return at;
 }
@@ -59,9 +59,9 @@ DINLINE typename traits<T>::V* rank_of(const PeerPtrs& ptrs, int r) {
 // index and puts it in scratch, 144 B a lane). Nothing takes a runtime index into a set of ranks.
 enum class Kind { input, staging, scratch };
 
-template <typename T, int ngpus, Kind kKind>
+template <typename DTYPE, int NGPUS, Kind KIND>
 class Buffer {
-  using V = typename traits<T>::V;
+  using V = typename traits<DTYPE>::V;
   V* at_  = nullptr;
 
  public:
@@ -69,47 +69,47 @@ class Buffer {
   // `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane,
   // the compiler knows it, and the pointer loads are scalar rather than one per lane.
   DINLINE Buffer(const PeerPtrs& ptrs, int r) {
-    at_ = impl::rank_of<T, ngpus>(ptrs, __builtin_amdgcn_readfirstlane(r));
+    at_ = impl::rank_of<DTYPE, NGPUS>(ptrs, __builtin_amdgcn_readfirstlane(r));
   }
   DINLINE V* at() const { return at_; }
   // The rank's tensor, for a tile's load or store (common/memory.cuh).
-  DINLINE T* data() const { return reinterpret_cast<T*>(at_); }
+  DINLINE DTYPE* data() const { return reinterpret_cast<DTYPE*>(at_); }
 };
 
-template <typename T, int ngpus>
-using Input = Buffer<T, ngpus, Kind::input>;
-template <typename T, int ngpus>
-using Staging = Buffer<T, ngpus, Kind::staging>;
-template <typename T, int ngpus>
-using Scratch = Buffer<T, ngpus, Kind::scratch>;
+template <typename DTYPE, int NGPUS>
+using Input = Buffer<DTYPE, NGPUS, Kind::input>;
+template <typename DTYPE, int NGPUS>
+using Staging = Buffer<DTYPE, NGPUS, Kind::staging>;
+template <typename DTYPE, int NGPUS>
+using Scratch = Buffer<DTYPE, NGPUS, Kind::scratch>;
 
 // ONE RANK'S BUFFER OF A KIND, and EVERY RANK'S: how a kernel begins, before its start barrier so
 // the pointer loads hide under the wait.
-template <typename T, int ngpus, Kind kKind>
-DINLINE std::array<Buffer<T, ngpus, kKind>, ngpus> every(const PeerPtrs& p) {
-  std::array<Buffer<T, ngpus, kKind>, ngpus> all;
+template <typename DTYPE, int NGPUS, Kind KIND>
+DINLINE std::array<Buffer<DTYPE, NGPUS, KIND>, NGPUS> every(const PeerPtrs& p) {
+  std::array<Buffer<DTYPE, NGPUS, KIND>, NGPUS> all;
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r) all[r] = Buffer<T, ngpus, kKind>(p, r);
+  for (int r = 0; r < NGPUS; ++r) all[r] = Buffer<DTYPE, NGPUS, KIND>(p, r);
   return all;
 }
 
-template <typename T, int ngpus>
-DINLINE Input<T, ngpus> input(const PeerPtrs& p, int r) { return Input<T, ngpus>(p, r); }
-template <typename T, int ngpus>
-DINLINE Staging<T, ngpus> staging(const PeerPtrs& p, int r) { return Staging<T, ngpus>(p, r); }
-template <typename T, int ngpus>
-DINLINE Scratch<T, ngpus> scratch(const PeerPtrs& p, int r) { return Scratch<T, ngpus>(p, r); }
-template <typename T, int ngpus>
-DINLINE std::array<Input<T, ngpus>, ngpus> inputs(const PeerPtrs& p) {
-  return every<T, ngpus, Kind::input>(p);
+template <typename DTYPE, int NGPUS>
+DINLINE Input<DTYPE, NGPUS> input(const PeerPtrs& p, int r) { return Input<DTYPE, NGPUS>(p, r); }
+template <typename DTYPE, int NGPUS>
+DINLINE Staging<DTYPE, NGPUS> staging(const PeerPtrs& p, int r) { return Staging<DTYPE, NGPUS>(p, r); }
+template <typename DTYPE, int NGPUS>
+DINLINE Scratch<DTYPE, NGPUS> scratch(const PeerPtrs& p, int r) { return Scratch<DTYPE, NGPUS>(p, r); }
+template <typename DTYPE, int NGPUS>
+DINLINE std::array<Input<DTYPE, NGPUS>, NGPUS> inputs(const PeerPtrs& p) {
+  return every<DTYPE, NGPUS, Kind::input>(p);
 }
-template <typename T, int ngpus>
-DINLINE std::array<Staging<T, ngpus>, ngpus> stagings(const PeerPtrs& p) {
-  return every<T, ngpus, Kind::staging>(p);
+template <typename DTYPE, int NGPUS>
+DINLINE std::array<Staging<DTYPE, NGPUS>, NGPUS> stagings(const PeerPtrs& p) {
+  return every<DTYPE, NGPUS, Kind::staging>(p);
 }
-template <typename T, int ngpus>
-DINLINE std::array<Scratch<T, ngpus>, ngpus> scratches(const PeerPtrs& p) {
-  return every<T, ngpus, Kind::scratch>(p);
+template <typename DTYPE, int NGPUS>
+DINLINE std::array<Scratch<DTYPE, NGPUS>, NGPUS> scratches(const PeerPtrs& p) {
+  return every<DTYPE, NGPUS, Kind::scratch>(p);
 }
 
 // PACK i OF A RANK'S BUFFER. Read after a barrier that made what its writer wrote visible: an
@@ -117,24 +117,24 @@ DINLINE std::array<Scratch<T, ngpus>, ngpus> scratches(const PeerPtrs& p) {
 // the peers to read after such a barrier: a rank's own staging and scratch, or (the push send, a
 // plain store, since scratch is allocated uncached as aiter pushes into its own) a peer's scratch.
 // What one block writes, the same block on the other side sees.
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V read_input(const Input<T, ngpus>& b, int64_t i) {
+template <typename DTYPE, int NGPUS>
+DINLINE typename traits<DTYPE>::V read_input(const Input<DTYPE, NGPUS>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V read_staging(const Staging<T, ngpus>& b, int64_t i) {
+template <typename DTYPE, int NGPUS>
+DINLINE typename traits<DTYPE>::V read_staging(const Staging<DTYPE, NGPUS>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename T, int ngpus>
-DINLINE void write_staging(const Staging<T, ngpus>& b, int64_t i, const typename traits<T>::V& v) {
+template <typename DTYPE, int NGPUS>
+DINLINE void write_staging(const Staging<DTYPE, NGPUS>& b, int64_t i, const typename traits<DTYPE>::V& v) {
   thread_store(b.at() + i, v);
 }
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V read_scratch(const Scratch<T, ngpus>& b, int64_t i) {
+template <typename DTYPE, int NGPUS>
+DINLINE typename traits<DTYPE>::V read_scratch(const Scratch<DTYPE, NGPUS>& b, int64_t i) {
   return thread_load(b.at() + i);
 }
-template <typename T, int ngpus>
-DINLINE void write_scratch(const Scratch<T, ngpus>& b, int64_t i, const typename traits<T>::V& v) {
+template <typename DTYPE, int NGPUS>
+DINLINE void write_scratch(const Scratch<DTYPE, NGPUS>& b, int64_t i, const typename traits<DTYPE>::V& v) {
   thread_store(b.at() + i, v);
 }
 
@@ -145,17 +145,17 @@ class Counter {
 
  public:
   explicit DINLINE Counter(uint32_t* at) : at_(at) {}
-  template <int kOrder, int kScope>
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
   DINLINE void store(uint32_t v) const {
-    __scoped_atomic_store_n(at_, v, kOrder, kScope);
+    __scoped_atomic_store_n(at_, v, MEMORY_ORDER, MEMORY_SCOPE);
   }
-  template <int kOrder, int kScope>
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
   DINLINE uint32_t load() const {
-    return __scoped_atomic_load_n(at_, kOrder, kScope);
+    return __scoped_atomic_load_n(at_, MEMORY_ORDER, MEMORY_SCOPE);
   }
-  template <int kOrder, int kScope>
+  template <int MEMORY_ORDER, int MEMORY_SCOPE>
   DINLINE uint32_t fetch_add(uint32_t v) const {
-    return __scoped_atomic_fetch_add(at_, v, kOrder, kScope);
+    return __scoped_atomic_fetch_add(at_, v, MEMORY_ORDER, MEMORY_SCOPE);
   }
 };
 
@@ -170,12 +170,12 @@ class Signals {
   // Block `block`'s pairing slot for rank `rank`, at a launch's start or at its other barriers.
   // AN INDEX KEEPS ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as passed): an int
   // where the caller had an unsigned costs a sign extension in every kernel.
-  template <typename R>
-  DINLINE Counter start(unsigned block, R rank) const {
+  template <typename RANK_TYPE>
+  DINLINE Counter start(unsigned block, RANK_TYPE rank) const {
     return Counter(&s_->start[block][rank]);
   }
-  template <typename R>
-  DINLINE Counter end(unsigned block, R rank) const {
+  template <typename RANK_TYPE>
+  DINLINE Counter end(unsigned block, RANK_TYPE rank) const {
     return Counter(&s_->end[block][rank]);
   }
   // The grid barrier's: rank `rank`'s epoch here, the arrivals, the generation.
@@ -209,8 +209,8 @@ DINLINE Signals own_signals(Signal* self_signal) { return Signals(self_signal); 
 DINLINE Signals signals(const PeerSignals& peer_signals, int r) {
   return Signals(impl::signal_of(peer_signals, r));
 }
-template <typename I>
-DINLINE Signals lane_signals(const PeerSignals& peer_signals, I i) {
+template <typename INDEX_TYPE>
+DINLINE Signals lane_signals(const PeerSignals& peer_signals, INDEX_TYPE i) {
   return Signals(peer_signals.s[i]);
 }
 

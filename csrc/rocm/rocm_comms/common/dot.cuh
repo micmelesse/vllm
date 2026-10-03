@@ -20,14 +20,14 @@ namespace hip_comms {
 // This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
 // partials a block_reduce turns into the rows' dots (a sum of squares is thread_dot(x, x)). A
 // one-row b (a weight) is every row's.
-template <typename DTYPE, int TILE_M, int B_M, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, int TILE_M, int B_TILE_M, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void thread_dot(const Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>& a,
-                        const Tile<DTYPE, B_M, TILE_N, THREADS_PER_BLOCK, float>& b, float (&d)[TILE_M]) {
-  static_assert(B_M == TILE_M || B_M == 1, "b is a's shape or one row");
+                        const Tile<DTYPE, B_TILE_M, TILE_N, THREADS_PER_BLOCK, float>& b, float (&d)[TILE_M]) {
+  static_assert(B_TILE_M == TILE_M || B_TILE_M == 1, "b is a's shape or one row");
   constexpr int NL = Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, float>::kPack;
 #pragma unroll
   for (int m = 0; m < TILE_M; ++m) {
-    const int mb = B_M == 1 ? 0 : m;
+    const int mb = B_TILE_M == 1 ? 0 : m;
     d[m] = 0.0f;
 #pragma unroll
     for (int k = 0; k < a.K; ++k) {
@@ -84,11 +84,11 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 // kWaveSize / SLICE_K columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <int TILE_M, int TILE_K, int SLICE_K, bool kAccumulate, typename T, typename Row>
-DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_cols, int packs,
-                       T* __restrict__ out, int64_t out_stride) {
-  using V          = typename traits<T>::V;
-  constexpr int NL = traits<T>::N;
+template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, typename DTYPE, typename ROW_FN>
+DINLINE void grid_gemm(ROW_FN row, int rows, const DTYPE* __restrict__ gemm_w, int n_cols, int packs,
+                       DTYPE* __restrict__ out, int64_t out_stride) {
+  using V          = typename traits<DTYPE>::V;
+  constexpr int NL = traits<DTYPE>::N;
   constexpr int kTile = kWaveSize / SLICE_K;
   static_assert(kTile * SLICE_K == kWaveSize, "a column's lanes must divide a wave");
   __shared__ float partial[gemm_max_waves(kDevice, TILE_M, TILE_K, SLICE_K)][TILE_M][kTile];
@@ -145,9 +145,9 @@ DINLINE void grid_gemm(Row row, int rows, const T* __restrict__ gemm_w, int n_co
       if (r < rows && col < n_cols) {
         float v = 0.0f;
         for (int q = 0; q < waves; ++q) v += partial[q][r][i % kTile];
-        T* at = out + r * out_stride + col;
-        if constexpr (kAccumulate) *at = static_cast<T>(static_cast<float>(*at) + v);
-        else *at = static_cast<T>(v);
+        DTYPE* at = out + r * out_stride + col;
+        if constexpr (ACCUMULATE) *at = static_cast<DTYPE>(static_cast<float>(*at) + v);
+        else *at = static_cast<DTYPE>(v);
       }
     }
     // Before the next tile overwrites `partial`.

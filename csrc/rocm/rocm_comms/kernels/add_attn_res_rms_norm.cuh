@@ -14,15 +14,15 @@ namespace hip_comms {
 // A ROW A TILE, the grid striding over rows: each row's delta read from local memory, then the
 // tile every AttnRes kernel computes (shared/attn_res.cuh), so its instructions are the fused
 // kernels' AttnRes.
-template <typename T, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
+template <typename DTYPE, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    add_attn_res_rms_norm(T* __restrict__ prefix, const T* __restrict__ delta,
-                          T* __restrict__ blocks, int64_t block_stride_m, int64_t block_stride_r,
-                          const T* __restrict__ norm_w, const T* __restrict__ qk_w,
-                          const T* __restrict__ out_norm_w, T* __restrict__ out, int num_blocks,
+    add_attn_res_rms_norm(DTYPE* __restrict__ prefix, const DTYPE* __restrict__ delta,
+                          DTYPE* __restrict__ blocks, int64_t block_stride_m, int64_t block_stride_r,
+                          const DTYPE* __restrict__ norm_w, const DTYPE* __restrict__ qk_w,
+                          const DTYPE* __restrict__ out_norm_w, DTYPE* __restrict__ out, int num_blocks,
                           int write_idx, float eps, float out_eps, int rows, int packs) {
-  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  const int cols         = packs * traits<T>::N;  // the row, in elements
+  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
+  const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};

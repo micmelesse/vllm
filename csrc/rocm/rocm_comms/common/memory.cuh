@@ -24,18 +24,18 @@ namespace hip_comms {
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
-template <typename V>
-DINLINE V thread_load(const V* p) {
-  static_assert(sizeof(V) == 16, "a pack is 16 bytes");
+template <typename PACK>
+DINLINE PACK thread_load(const PACK* p) {
+  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   const u32x4 raw = *(const global_u32x4*)(p);
-  V v;
+  PACK v;
   __builtin_memcpy(&v, &raw, 16);
   return v;
 }
 
-template <typename V>
-DINLINE void thread_store(V* p, const V& v) {
-  static_assert(sizeof(V) == 16, "a pack is 16 bytes");
+template <typename PACK>
+DINLINE void thread_store(PACK* p, const PACK& v) {
+  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
   *(global_u32x4*)(p) = raw;
@@ -44,14 +44,14 @@ DINLINE void thread_store(V* p, const V& v) {
 // WHAT A PEER PUSHED, read past every cache (system-scope loads, `sc0 sc1`), as
 // QuickReduce reads what it receives: a peer's stores into this GPU's memory do not reach
 // this GPU's L2, so a plain load could return a line cached before they landed.
-template <typename V>
-DINLINE V thread_load_uncached(const V* p) {
-  static_assert(sizeof(V) == 16, "a pack is 16 bytes");
+template <typename PACK>
+DINLINE PACK thread_load_uncached(const PACK* p) {
+  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   const auto* q     = reinterpret_cast<const uint64_t*>(p);
   const uint64_t raw[2] = {
       __scoped_atomic_load_n(q, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM),
       __scoped_atomic_load_n(q + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)};
-  V v;
+  PACK v;
   __builtin_memcpy(&v, raw, 16);
   return v;
 }
@@ -63,9 +63,9 @@ DINLINE V thread_load_uncached(const V* p) {
 // push stores plainly into it, as aiter's does (500dd54535; tests passed and timings were about
 // equal, 2026-09-30T23-10-02Z). IN ASM because no builtin spells this store: a
 // system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
-template <typename V>
-DINLINE void thread_store_uncached(V* p, const V& v) {
-  static_assert(sizeof(V) == 16, "a pack is 16 bytes");
+template <typename PACK>
+DINLINE void thread_store_uncached(PACK* p, const PACK& v) {
+  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
@@ -86,11 +86,11 @@ DINLINE void issued() {
 
 // PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
 // waits until a pack is used (peers_reduce), so loads issued here can run under other work.
-template <typename T, int ngpus, typename Read>
-DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
-  PeerPacks<T, ngpus> out;
+template <typename DTYPE, int NGPUS, typename READ_PEER>
+DINLINE PeerPacks<DTYPE, NGPUS> peers_load(READ_PEER read, int64_t i) {
+  PeerPacks<DTYPE, NGPUS> out;
 #pragma unroll
-  for (int r = 0; r < ngpus; ++r) out.p[r][0] = read(r, i);
+  for (int r = 0; r < NGPUS; ++r) out.p[r][0] = read(r, i);
   impl::issued();
   return out;
 }
@@ -103,22 +103,22 @@ DINLINE PeerPacks<T, ngpus> peers_load(Read read, int64_t i) {
 // the one-pack global instructions above; an fp32 tile's pack is 32 bytes and loads as the compiler
 // chooses.
 namespace impl {
-template <typename P>
-DINLINE P pack_load(const P* p) {
-  if constexpr (sizeof(P) == 16)
+template <typename PACK>
+DINLINE PACK pack_load(const PACK* p) {
+  if constexpr (sizeof(PACK) == 16)
     return thread_load(p);
   else
     return *p;
 }
 }  // namespace impl
 
-template <typename Tl>
-DINLINE void thread_load(Tl& t, const typename Tl::Acc* data,
+template <typename TILE>
+DINLINE void thread_load(TILE& t, const typename TILE::Acc* data,
                          int64_t row_stride) {
-  using P = typename Tl::Pack;
+  using P = typename TILE::Pack;
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
-  for (int m = 0; m < Tl::kRows; ++m) {
+  for (int m = 0; m < TILE::kRows; ++m) {
     const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) t.v[m][k] = impl::pack_load(row + t.col(k));
@@ -126,12 +126,12 @@ DINLINE void thread_load(Tl& t, const typename Tl::Acc* data,
   impl::issued();
 }
 
-template <typename Tl>
-DINLINE void thread_store(typename Tl::Acc* data, int64_t row_stride, const Tl& t) {
-  using P = typename Tl::Pack;
+template <typename TILE>
+DINLINE void thread_store(typename TILE::Acc* data, int64_t row_stride, const TILE& t) {
+  using P = typename TILE::Pack;
   P* at   = reinterpret_cast<P*>(data);
 #pragma unroll
-  for (int m = 0; m < Tl::kRows; ++m) {
+  for (int m = 0; m < TILE::kRows; ++m) {
     if (!t.live(m)) continue;
     P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
@@ -150,17 +150,17 @@ DINLINE void thread_store(typename Tl::Acc* data, int64_t row_stride, const Tl& 
 // computed once a position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until a tile is used (peers_reduce), so loads issued here
 // can run under other work.
-template <typename Tl, int ngpus, typename Data>
-DINLINE void peers_load(Tl (&t)[ngpus], Data data,
+template <typename TILE, int NGPUS, typename RANK_DATA>
+DINLINE void peers_load(TILE (&t)[NGPUS], RANK_DATA data,
                         int64_t row_stride) {
-  using P = typename Tl::Pack;
+  using P = typename TILE::Pack;
 #pragma unroll
-  for (int m = 0; m < Tl::kRows; ++m)
+  for (int m = 0; m < TILE::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < t[0].K; ++k) {
       const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r)
+      for (int r = 0; r < NGPUS; ++r)
         t[r].v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(r)) + i);
     }
   impl::issued();
@@ -169,15 +169,15 @@ DINLINE void peers_load(Tl (&t)[ngpus], Data data,
 // A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
 // end): each pack from its owner's tensor, `data(r)`. A SLICE IS WHOLE WAVES, so a wave's packs
 // have one owner.
-template <int ngpus, typename Tl, typename Data>
-DINLINE void sliced_load(Tl& t, Data data, int64_t row_stride,
+template <int NGPUS, typename TILE, typename RANK_DATA>
+DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                          int slice) {
-  using P = typename Tl::Pack;
+  using P = typename TILE::Pack;
 #pragma unroll
-  for (int m = 0; m < Tl::kRows; ++m)
+  for (int m = 0; m < TILE::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
-      const int owner = min(t.col(k) / (slice / t.kPack), ngpus - 1);
+      const int owner = min(t.col(k) / (slice / t.kPack), NGPUS - 1);
       t.v[m][k] = impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
                                   int64_t{t.row(m)} * (row_stride / t.kPack) + t.col(k));
     }

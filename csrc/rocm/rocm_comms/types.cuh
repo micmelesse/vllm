@@ -256,11 +256,11 @@ constexpr void set_tile_n(KernelConfig& c, int n) {
       c);
 }
 // FAMILY `i`'S CONFIG WITH EVERY FIELD 0: a forced template's own, all left to it.
-template <size_t I = 0>
+template <size_t FAMILY_INDEX = 0>
 constexpr KernelConfig zero_config(size_t family) {
-  if constexpr (I + 1 < std::variant_size_v<KernelConfig>)
-    if (family != I) return zero_config<I + 1>(family);
-  return KernelConfig{std::in_place_index<I>};
+  if constexpr (FAMILY_INDEX + 1 < std::variant_size_v<KernelConfig>)
+    if (family != FAMILY_INDEX) return zero_config<FAMILY_INDEX + 1>(family);
+  return KernelConfig{std::in_place_index<FAMILY_INDEX>};
 }
 
 

@@ -55,19 +55,19 @@ struct Tile {
   DINLINE int row(int m) const { return live(m) ? offs_m + m : M - 1; }
 
   // The same place held as U, its elements converted (rounded once) or empty.
-  template <typename U>
-  DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, U> to() const {
-    Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, U> t{M, N, offs_m, offs_n};
+  template <typename AS_DTYPE>
+  DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, AS_DTYPE> to() const {
+    Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, AS_DTYPE> t{M, N, offs_m, offs_n};
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m)
 #pragma unroll
       for (int k = 0; k < K; ++k)
 #pragma unroll
-        for (int j = 0; j < kPack; ++j) t.v[m][k].d[j] = static_cast<U>(v[m][k].d[j]);
+        for (int j = 0; j < kPack; ++j) t.v[m][k].d[j] = static_cast<AS_DTYPE>(v[m][k].d[j]);
     return t;
   }
-  template <typename U>
-  DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, U> like() const {
+  template <typename AS_DTYPE>
+  DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_PER_BLOCK, AS_DTYPE> like() const {
     return {M, N, offs_m, offs_n};
   }
 };

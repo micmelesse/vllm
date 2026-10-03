@@ -178,11 +178,11 @@ RocmCommsAllReducePlan all_reduce_plan_of(
   return {name_of(l.algorithm), name_of(l.direction), l.threads_per_block, l.blocks_per_grid,
           std::nullopt};
 }
-template <typename Launch>
-RocmCommsRowPlan row_plan_of(const std::variant<Launch, hip_comms::Error>& p) {
+template <typename LAUNCH>
+RocmCommsRowPlan row_plan_of(const std::variant<LAUNCH, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
     return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
-  const Launch& l = std::get<Launch>(p);
+  const LAUNCH& l = std::get<LAUNCH>(p);
   return {name_of(l.algorithm), name_of(l.direction), l.tile_n, l.threads_per_block,
           l.blocks_per_grid, std::nullopt};
 }
@@ -205,12 +205,12 @@ RocmCommsAttnResPlan attn_res_plan_of(
           l.blocks_per_grid,
           std::nullopt};
 }
-template <typename Launch>
-RocmCommsGemmPlan gemm_plan_of(const std::variant<Launch, hip_comms::Error>& p) {
+template <typename LAUNCH>
+RocmCommsGemmPlan gemm_plan_of(const std::variant<LAUNCH, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
     return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
-  const Launch& l = std::get<Launch>(p);
+  const LAUNCH& l = std::get<LAUNCH>(p);
   return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.tile_k, l.slice_k,
           l.threads_per_block, l.blocks_per_grid, std::nullopt};
 }

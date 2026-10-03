@@ -19,52 +19,52 @@ namespace hip_comms {
 // (kAdd) norming them by their scales as it goes. Every rank does the same arithmetic on the same
 // bytes, so every rank holds the same result. THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH
 // PHASES: after the sync a block may read only what the same block on a peer wrote.
-template <typename T, typename W, int ngpus, bool kAdd, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_scratch,
     p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
-    T* __restrict__ out, T* __restrict__ residual_out, const T* __restrict__ residual,
-    const W* __restrict__ weight, float eps, int rows, int packs) {
-  using V                = typename traits<T>::V;
-  constexpr int NL       = traits<T>::N;
-  using Row              = Tile<T, 1, TILE_N, THREADS_PER_BLOCK>;
-  using RowF             = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<T, 1, TILE_N, THREADS_PER_BLOCK, W>;
-  const auto* wv         = reinterpret_cast<const vec<W, NL>*>(weight);
+    DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
+    const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
+  using V                = typename traits<DTYPE>::V;
+  constexpr int NL       = traits<DTYPE>::N;
+  using Row              = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  const auto* wv         = reinterpret_cast<const vec<WEIGHT_DTYPE, NL>*>(weight);
   V* res_out             = reinterpret_cast<V*>(residual_out);
   V* o                   = reinterpret_cast<V*>(out);
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int slice_rows   = (rows + ngpus - 1) / ngpus;
-  // kAdd: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
+  const int slice_rows   = (rows + NGPUS - 1) / NGPUS;
+  // ADD_RESIDUAL: each owned row's RMS scale, a pack a row (the float in its first lane), after the rows.
   const int64_t scale_at = int64_t{slice_rows} * packs;
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::launched>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = p2p::inputs<T, ngpus>(*peer_inputs);
-  const auto scratches = p2p::scratches<T, ngpus>(peer_scratch);
+  const auto inputs = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
+  const auto scratches = p2p::scratches<DTYPE, NGPUS>(peer_scratch);
   const auto input = [&](int r) { return inputs[r].data(); };
-  const auto own_scratch  = p2p::scratch<T, ngpus>(peer_scratch, rank);
+  const auto own_scratch  = p2p::scratch<DTYPE, NGPUS>(peer_scratch, rank);
 
-  // 2. This rank's rows: read each from every rank in rank order and sum, then (kAdd) add the
+  // 2. This rank's rows: read each from every rank in rank order and sum, then (ADD_RESIDUAL) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
-  //    and leave the normed rows or (kAdd) the residual rows and scales in this rank's scratch.
+  //    and leave the normed rows or (ADD_RESIDUAL) the residual rows and scales in this rank's scratch.
   //    PIPELINED: the next row's loads go out before this row's reduction and norm, so a block's
   //    compute runs under its next round trip instead of between them (a block had ~14 rows at
   //    4096 tokens, each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
   const int first = rank * slice_rows;
   const int last  = min(first + slice_rows, rows);
   // Row `row` from every rank.
-  using Peers = Row[ngpus];
+  using Peers = Row[NGPUS];
   const auto load = [&](int row, Peers& got) {
 #pragma unroll
-    for (int r = 0; r < ngpus; ++r) got[r] = Row{rows, cols, row, 0};
+    for (int r = 0; r < NGPUS; ++r) got[r] = Row{rows, cols, row, 0};
     peers_load(got, input, cols);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
@@ -76,7 +76,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // norm. Its rows land in this rank's scratch at row - first.
   const auto one_row = [&](int row, const Peers& cur, Peers& next) {
     Row res{rows, cols, row, 0};
-    if constexpr (kAdd) thread_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) thread_load(res, residual, cols);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
     // again; at 256 tokens every block has one row: 2026-10-01T01-07-56Z).
@@ -84,13 +84,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     RowF s = peers_reduce(cur).template to<float>();
     block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
-    if constexpr (kAdd) {
+    if constexpr (ADD_RESIDUAL) {
       const RowF r = res.template to<float>();
 #pragma unroll
       for (int k = 0; k < RowF::K; ++k)
 #pragma unroll
         for (int j = 0; j < NL; ++j) s.v[0][k].d[j] += r.v[0][k].d[j];
-      Row added = s.template to<T>();
+      Row added = s.template to<DTYPE>();
       added.offs_m = row - first;
       thread_store(own_scratch.data(), cols, added);
     }
@@ -99,11 +99,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     block_reduce<Sum>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
-    // kAdd LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW: every rank norms it while
+    // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW: every rank norms it while
     // gathering, so the link carries one row a row, as a plain all-reduce does (gathering both the
     // normed row and the residual was twice that: 215.9 against 155.2 us at 4096 tokens,
     // 2026-10-01T02-17-54Z).
-    if constexpr (kAdd) {
+    if constexpr (ADD_RESIDUAL) {
       if (threadIdx.x == 0) {
         const vec<float, 4> sc = {{scale, 0.0f, 0.0f, 0.0f}};
         p2p::write_scratch(own_scratch, scale_at + (row - first), __builtin_bit_cast(V, sc));
@@ -115,8 +115,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     for (int k = 0; k < Row::K; ++k)
 #pragma unroll
       for (int j = 0; j < NL; ++j) {
-        const float x       = static_cast<float>(static_cast<W>(s.v[0][k].d[j] * scale));
-        normed.v[0][k].d[j] = static_cast<T>(static_cast<W>(x * static_cast<float>(w.v[0][k].d[j])));
+        const float x       = static_cast<float>(static_cast<WEIGHT_DTYPE>(s.v[0][k].d[j] * scale));
+        normed.v[0][k].d[j] = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(x * static_cast<float>(w.v[0][k].d[j])));
       }
     thread_store(own_scratch.data(), cols, normed);
   };
@@ -133,7 +133,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
-  p2p::barrier<ngpus, p2p::Among::peers, p2p::Ensure::visible>(
+  p2p::barrier<NGPUS, p2p::Among::peers, p2p::Ensure::visible>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(5);
 
@@ -142,7 +142,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
   //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
-  //    kAdd: the owners' rows are the new residual; each is normed here by its owner's scale. Every
+  //    ADD_RESIDUAL: the owners' rows are the new residual; each is normed here by its owner's scale. Every
   //    thread loads the 8 scales after its 8 packs, all in flight before any wait (a wave's lanes
   //    read one scale address: one request a wave). Left to the compiler, the scales were loaded
   //    and waited on before the packs were issued, two round trips a row (ISA
@@ -151,31 +151,31 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     for (int i = threadIdx.x; i < packs; i += blockDim.x) {
       const int64_t at = int64_t{l} * packs + i;
-      const PeerPacks<T, ngpus> rows_of = peers_load<T, ngpus>(gathered, at);
-      V sc[ngpus];
-      if constexpr (kAdd) {
+      const PeerPacks<DTYPE, NGPUS> rows_of = peers_load<DTYPE, NGPUS>(gathered, at);
+      V sc[NGPUS];
+      if constexpr (ADD_RESIDUAL) {
 #pragma unroll
-        for (int r = 0; r < ngpus; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
+        for (int r = 0; r < NGPUS; ++r) sc[r] = p2p::read_scratch(scratches[r], scale_at + l);
       }
-      V got[ngpus];
+      V got[NGPUS];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) got[r] = rows_of.p[r][0];
-      vec<W, NL> w;
-      if constexpr (kAdd) w = wv[i];
+      for (int r = 0; r < NGPUS; ++r) got[r] = rows_of.p[r][0];
+      vec<WEIGHT_DTYPE, NL> w;
+      if constexpr (ADD_RESIDUAL) w = wv[i];
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r) {
+      for (int r = 0; r < NGPUS; ++r) {
         const int row = r * slice_rows + l;
         if (row >= rows) continue;
-        if constexpr (kAdd) {
+        if constexpr (ADD_RESIDUAL) {
           thread_store(res_out + int64_t{row} * packs + i, got[r]);
           const float scale = __builtin_bit_cast(vec<float, 4>, sc[r]).d[0];
           float x[NL];
-          thread_unpack<T>(got[r], x);
+          thread_unpack<DTYPE>(got[r], x);
           V normed;
 #pragma unroll
           for (int j = 0; j < NL; ++j) {
-            const float y = static_cast<float>(static_cast<W>(x[j] * scale));
-            normed.d[j]   = static_cast<T>(static_cast<W>(y * static_cast<float>(w.d[j])));
+            const float y = static_cast<float>(static_cast<WEIGHT_DTYPE>(x[j] * scale));
+            normed.d[j]   = static_cast<DTYPE>(static_cast<WEIGHT_DTYPE>(y * static_cast<float>(w.d[j])));
           }
           thread_store(o + int64_t{row} * packs + i, normed);
         } else {
@@ -188,29 +188,29 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                       p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                                       p2p::Signal* self_signal, int rank, uint64_t timeout_ticks,
-                                      T* __restrict__ out, const W* __restrict__ weight, float eps,
+                                      DTYPE* __restrict__ out, const WEIGHT_DTYPE* __restrict__ weight, float eps,
                                       int rows, int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, false, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, false, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
       nullptr, weight, eps, rows, packs);
 }
 
-template <typename T, typename W, int ngpus, int TILE_N, int THREADS_PER_BLOCK>
+template <typename DTYPE, typename WEIGHT_DTYPE, int NGPUS, int TILE_N, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot_add_rms_norm(const p2p::PeerPtrs* __restrict__ peer_inputs,
                                           p2p::PeerPtrs peer_scratch, p2p::PeerSignals peer_signals,
                                           p2p::Signal* self_signal, int rank,
-                                          uint64_t timeout_ticks, T* __restrict__ out,
-                                          T* __restrict__ residual_out,
-                                          const T* __restrict__ residual,
-                                          const W* __restrict__ weight, float eps, int rows,
+                                          uint64_t timeout_ticks, DTYPE* __restrict__ out,
+                                          DTYPE* __restrict__ residual_out,
+                                          const DTYPE* __restrict__ residual,
+                                          const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
                                           int packs) {
-  all_reduce_pull_two_shot_add_rms_norm_body<T, W, ngpus, true, TILE_N, THREADS_PER_BLOCK>(
+  all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, NGPUS, true, TILE_N, THREADS_PER_BLOCK>(
        peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
       residual, weight, eps, rows, packs);
 }

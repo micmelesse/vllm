@@ -20,26 +20,26 @@
 
 namespace hip_comms {
 
-template <typename T, int N>
-struct __align__(sizeof(T) * N) vec {
-  T d[N];
+template <typename DTYPE, int VEC_SIZE>
+struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {
+  DTYPE d[VEC_SIZE];
 };
 
 // A PACK: kBuild.memory.pack_bytes (machine/build.cuh: the widest load, 8 bf16), the unit every
 // kernel loads, sums and stores in. `num_packs` counts them.
 
-template <typename T>
+template <typename DTYPE>
 struct traits {
-  static constexpr int N = kBuild.memory.pack_bytes / sizeof(T);
-  using V = vec<T, N>;
+  static constexpr int N = kBuild.memory.pack_bytes / sizeof(DTYPE);
+  using V = vec<DTYPE, N>;
 };
 
 // EVERY SOURCE'S PACKS IN REGISTERS: a pack from each of `ngpus` sources (the ranks), K of them a
 // source for a row of a Tile (tile.cuh). What peers_load issues and peers_reduce consumes, so a
 // kernel can start one row's loads and work on another's while they are in flight.
-template <typename T, int ngpus, int K = 1>
+template <typename DTYPE, int NGPUS, int PACKS = 1>
 struct PeerPacks {
-  typename traits<T>::V p[ngpus][K];
+  typename traits<DTYPE>::V p[NGPUS][PACKS];
 };
 
 // PER-PHASE TIMESTAMPS, for finding where a kernel's time goes: thread 0 of each block records the

@@ -18,13 +18,13 @@ namespace hip_comms {
 // rank's staging, both at once with the blocks `split` (the first `pullers` pull, the rest push) or with
 // `each` block doing both, pack by pack. The pulled packs are folded into `sink` only if they
 // equal an impossible value, which keeps the loads without a store per load.
-template <typename T, int ngpus>
+template <typename DTYPE, int NGPUS>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     link_traffic(const p2p::PeerPtrs* __restrict__ peer_inputs, p2p::PeerPtrs peer_staging,
                  p2p::PeerSignals peer_signals, p2p::Signal* self_signal, int rank,
                  uint64_t timeout_ticks, int mode, int peer, int pullers, int64_t packs,
                  uint32_t* sink) {
-  using V              = typename traits<T>::V;
+  using V              = typename traits<DTYPE>::V;
   const auto traffic   = static_cast<Traffic>(mode);
   const bool split     = traffic == Traffic::split;
   const bool puller    = static_cast<int>(blockIdx.x) < pullers;
@@ -36,9 +36,9 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int blocks     = !split ? grid : puller ? pullers : grid - pullers;
   const int64_t first  = int64_t{index} * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t{blocks} * blockDim.x;
-  const auto buffers   = p2p::inputs<T, ngpus>(*peer_inputs);
+  const auto buffers   = p2p::inputs<DTYPE, NGPUS>(*peer_inputs);
   // A push's target: never the pulled buffer.
-  const auto stagings  = p2p::stagings<T, ngpus>(peer_staging);
+  const auto stagings  = p2p::stagings<DTYPE, NGPUS>(peer_staging);
   V v;
   uint32_t* w = reinterpret_cast<uint32_t*>(&v);
 #pragma unroll
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   for (int64_t i = first; i < packs; i += stride) {
     if (pulls) {
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r)
+      for (int r = 0; r < NGPUS; ++r)
         if (r != rank && (peer < 0 || r == peer)) {
           const V got       = p2p::read_input(buffers[r], i);
           const uint32_t* g = reinterpret_cast<const uint32_t*>(&got);
@@ -57,7 +57,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     }
     if (pushes) {
 #pragma unroll
-      for (int r = 0; r < ngpus; ++r)
+      for (int r = 0; r < NGPUS; ++r)
         if (r != rank) p2p::write_staging(stagings[r], i, v);
     }
   }

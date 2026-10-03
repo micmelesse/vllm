@@ -22,49 +22,49 @@ namespace hip_comms {
 
 // EACH PACK SUMMED OVER ITS `ngpus` SOURCES, in fp32 in source order and rounded once to T, into
 // sum[k]: callers whose sources are the ranks agree bitwise. Waits on the loads only here.
-template <typename T, int ngpus, int K>
-DINLINE void peers_reduce(const PeerPacks<T, ngpus, K>& packs, typename traits<T>::V (&sum)[K]) {
-  constexpr int N = traits<T>::N;
+template <typename DTYPE, int NGPUS, int PACKS>
+DINLINE void peers_reduce(const PeerPacks<DTYPE, NGPUS, PACKS>& packs, typename traits<DTYPE>::V (&sum)[PACKS]) {
+  constexpr int N = traits<DTYPE>::N;
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
+  for (int k = 0; k < PACKS; ++k) {
     float acc[N];
 #pragma unroll
     for (int j = 0; j < N; ++j) acc[j] = static_cast<float>(packs.p[0][k].d[j]);
 #pragma unroll
-    for (int r = 1; r < ngpus; ++r)
+    for (int r = 1; r < NGPUS; ++r)
 #pragma unroll
       for (int j = 0; j < N; ++j) acc[j] += static_cast<float>(packs.p[r][k].d[j]);
 #pragma unroll
-    for (int j = 0; j < N; ++j) sum[k].d[j] = static_cast<T>(acc[j]);
+    for (int j = 0; j < N; ++j) sum[k].d[j] = static_cast<DTYPE>(acc[j]);
   }
 }
 
 // One pack, the same.
 // EVERY PEER'S TILE SUMMED, in rank order in fp32 and rounded once, as a pack's is.
-template <typename Tl, int ngpus>
-DINLINE Tl peers_reduce(const Tl (&t)[ngpus]) {
-  constexpr int NL = Tl::kPack;
-  Tl sum = t[0].template like<typename Tl::Acc>();
+template <typename TILE, int NGPUS>
+DINLINE TILE peers_reduce(const TILE (&t)[NGPUS]) {
+  constexpr int NL = TILE::kPack;
+  TILE sum = t[0].template like<typename TILE::Acc>();
 #pragma unroll
-  for (int m = 0; m < Tl::kRows; ++m)
+  for (int m = 0; m < TILE::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < sum.K; ++k) {
       float acc[NL];
 #pragma unroll
       for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k].d[j]);
 #pragma unroll
-      for (int r = 1; r < ngpus; ++r)
+      for (int r = 1; r < NGPUS; ++r)
 #pragma unroll
         for (int j = 0; j < NL; ++j) acc[j] += static_cast<float>(t[r].v[m][k].d[j]);
 #pragma unroll
-      for (int j = 0; j < NL; ++j) sum.v[m][k].d[j] = static_cast<typename Tl::Acc>(acc[j]);
+      for (int j = 0; j < NL; ++j) sum.v[m][k].d[j] = static_cast<typename TILE::Acc>(acc[j]);
     }
   return sum;
 }
 
-template <typename T, int ngpus>
-DINLINE typename traits<T>::V peers_reduce(const PeerPacks<T, ngpus>& packs) {
-  typename traits<T>::V sum[1];
+template <typename DTYPE, int NGPUS>
+DINLINE typename traits<DTYPE>::V peers_reduce(const PeerPacks<DTYPE, NGPUS>& packs) {
+  typename traits<DTYPE>::V sum[1];
   peers_reduce(packs, sum);
   return sum[0];
 }
@@ -81,10 +81,10 @@ struct Max {
 
 // ONE DPP STEP: `v` from the lane `ctrl` names, as a VALU operand, no LDS. `row_mask` picks which
 // 16-lane rows take it; the others read `identity`, which leaves them as they were.
-template <int kCtrl, int kRowMask, typename Op>
+template <int DPP_CTRL, int DPP_ROW_MASK, typename REDUCE_OP>
 DINLINE float dpp(float v) {
-  const int moved = __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, Op::kIdentity),
-                                                __builtin_bit_cast(int, v), kCtrl, kRowMask, 0xf,
+  const int moved = __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, REDUCE_OP::kIdentity),
+                                                __builtin_bit_cast(int, v), DPP_CTRL, DPP_ROW_MASK, 0xf,
                                                 false);
   return __builtin_bit_cast(float, moved);
 }
@@ -97,18 +97,18 @@ DINLINE float dpp(float v) {
 //   mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror): each row holds its sum
 //   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
 //   holds the wave's, and readlane hands it to every lane.
-template <typename Op, int N>
-DINLINE void wave_reduce(float (&v)[N]) {
+template <typename REDUCE_OP, int NUM_VALUES>
+DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
   static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
 #pragma unroll
-  for (int n = 0; n < N; ++n) {
+  for (int n = 0; n < NUM_VALUES; ++n) {
     float x = v[n];
-    x = Op::apply(x, dpp<0xb1, 0xf, Op>(x));   // quad_perm [1,0,3,2]
-    x = Op::apply(x, dpp<0x4e, 0xf, Op>(x));   // quad_perm [2,3,0,1]
-    x = Op::apply(x, dpp<0x141, 0xf, Op>(x));  // row_half_mirror
-    x = Op::apply(x, dpp<0x140, 0xf, Op>(x));  // row_mirror
-    x = Op::apply(x, dpp<0x142, 0xa, Op>(x));  // row_bcast15 into rows 1, 3
-    x = Op::apply(x, dpp<0x143, 0xc, Op>(x));  // row_bcast31 into rows 2, 3
+    x = REDUCE_OP::apply(x, dpp<0xb1, 0xf, REDUCE_OP>(x));   // quad_perm [1,0,3,2]
+    x = REDUCE_OP::apply(x, dpp<0x4e, 0xf, REDUCE_OP>(x));   // quad_perm [2,3,0,1]
+    x = REDUCE_OP::apply(x, dpp<0x141, 0xf, REDUCE_OP>(x));  // row_half_mirror
+    x = REDUCE_OP::apply(x, dpp<0x140, 0xf, REDUCE_OP>(x));  // row_mirror
+    x = REDUCE_OP::apply(x, dpp<0x142, 0xa, REDUCE_OP>(x));  // row_bcast15 into rows 1, 3
+    x = REDUCE_OP::apply(x, dpp<0x143, 0xc, REDUCE_OP>(x));  // row_bcast31 into rows 2, 3
     v[n] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), 63));
   }
 }
@@ -116,30 +116,30 @@ DINLINE void wave_reduce(float (&v)[N]) {
 // N VALUES OVER THE BLOCK, in place: each wave reduces its N, one wave combines the waves' partials
 // the same way (not every thread reading every partial: that was N x waves LDS reads a thread),
 // and the N totals are broadcast through LDS once.
-template <typename Op, int N>
-DINLINE void block_reduce(float (&v)[N]) {
-  __shared__ float partial[kBuild.kernels.max_waves][N];
-  __shared__ float total[N];
+template <typename REDUCE_OP, int NUM_VALUES>
+DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
+  __shared__ float partial[kBuild.kernels.max_waves][NUM_VALUES];
+  __shared__ float total[NUM_VALUES];
   const int lane  = threadIdx.x % kWaveSize;
   const int wave  = threadIdx.x / kWaveSize;
   const int waves = (blockDim.x + kWaveSize - 1) / kWaveSize;
-  wave_reduce<Op>(v);
+  wave_reduce<REDUCE_OP>(v);
   if (lane == 0) {
 #pragma unroll
-    for (int n = 0; n < N; ++n) partial[wave][n] = v[n];
+    for (int n = 0; n < NUM_VALUES; ++n) partial[wave][n] = v[n];
   }
   __syncthreads();
   if (wave == 0) {
 #pragma unroll
-    for (int n = 0; n < N; ++n) {
-      float x[1] = {lane < waves ? partial[lane][n] : Op::kIdentity};
-      wave_reduce<Op>(x);
+    for (int n = 0; n < NUM_VALUES; ++n) {
+      float x[1] = {lane < waves ? partial[lane][n] : REDUCE_OP::kIdentity};
+      wave_reduce<REDUCE_OP>(x);
       if (lane == 0) total[n] = x[0];
     }
   }
   __syncthreads();
 #pragma unroll
-  for (int n = 0; n < N; ++n) v[n] = total[n];
+  for (int n = 0; n < NUM_VALUES; ++n) v[n] = total[n];
 }
 
 // The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.

@@ -323,20 +323,20 @@ static_assert(one_template_a_shot(), "an op has two templates at one algorithm a
 // built raises.
 // =================================================================================================
 
-template <typename T>
+template <typename WRAPPED>
 struct type {
-  using t = T;
+  using t = WRAPPED;
 };
 
-template <int N>
-using constant = std::integral_constant<int, N>;
+template <int INT_VALUE>
+using constant = std::integral_constant<int, INT_VALUE>;
 
 [[noreturn]] inline void not_built(const std::string& what) {
   throw std::runtime_error("hip_comms: " + what + " not built");
 }
 
 // THE C++ TYPE OF A BUILT DTYPE.
-template <DType D>
+template <DType DTYPE_ID>
 struct of_dtype;
 template <>
 struct of_dtype<DType::f16> {
@@ -348,34 +348,34 @@ struct of_dtype<DType::bf16> {
 };
 
 // OVER THE BUILT LISTS (kBuild.supports), so what is compiled is what they say.
-template <typename F, size_t... I>
-void by_world_in(int world, F& f, std::index_sequence<I...>) {
+template <typename VISITOR, size_t... INDICES>
+void by_world_in(int world, VISITOR& f, std::index_sequence<INDICES...>) {
   constexpr auto& built = kBuild.supports.worlds;
-  if (!((world == built[I] && (f(constant<built[I]>{}), true)) || ...))
+  if (!((world == built[INDICES] && (f(constant<built[INDICES]>{}), true)) || ...))
     not_built("world size " + std::to_string(world));
 }
 
-template <typename F>
-void by_world(int world, F&& f) {
+template <typename VISITOR>
+void by_world(int world, VISITOR&& f) {
   by_world_in(world, f, std::make_index_sequence<kBuild.supports.worlds.size()>{});
 }
 
-template <typename F, size_t... I>
-void by_dtype_in(DType d, F& f, std::index_sequence<I...>) {
+template <typename VISITOR, size_t... INDICES>
+void by_dtype_in(DType d, VISITOR& f, std::index_sequence<INDICES...>) {
   constexpr auto& built = kBuild.supports.dtypes;
-  if (!((d == built[I] && (f(type<typename of_dtype<built[I]>::t>{}), true)) || ...))
+  if (!((d == built[INDICES] && (f(type<typename of_dtype<built[INDICES]>::t>{}), true)) || ...))
     not_built("dtype");
 }
 
-template <typename F>
-void by_dtype(DType d, F&& f) {
+template <typename VISITOR>
+void by_dtype(DType d, VISITOR&& f) {
   by_dtype_in(d, f, std::make_index_sequence<kBuild.supports.dtypes.size()>{});
 }
 
 // A norm's weight: T itself, or fp32.
-template <typename T, typename F>
-void by_weight(DType weight, DType dtype, F&& f) {
-  if (weight == dtype) return f(type<T>{});
+template <typename DTYPE, typename VISITOR>
+void by_weight(DType weight, DType dtype, VISITOR&& f) {
+  if (weight == dtype) return f(type<DTYPE>{});
   if (weight == DType::f32) return f(type<float>{});
   not_built("weight dtype");
 }
@@ -383,25 +383,25 @@ void by_weight(DType weight, DType dtype, F&& f) {
 // A TEMPLATE'S BUILD, compiled in: the one of template K's configs (the catalog above) `c` names
 // (all but its launch's grid and reduce_scatter_blocks, which are run time), and only those. f is
 // handed it as config_constant<C>, C its family's config, every field a constant expression.
-template <Template K>
-using family_t = std::variant_alternative_t<family_of(K), KernelConfig>;
-template <Template K, size_t I>
-constexpr family_t<K> built_config = std::get<family_t<K>>(configs_of(K)[I]);
-template <auto C>
+template <Template TEMPLATE>
+using family_t = std::variant_alternative_t<family_of(TEMPLATE), KernelConfig>;
+template <Template TEMPLATE, size_t CONFIG_INDEX>
+constexpr family_t<TEMPLATE> built_config = std::get<family_t<TEMPLATE>>(configs_of(TEMPLATE)[CONFIG_INDEX]);
+template <auto BUILT_CONFIG>
 struct config_constant {
-  static constexpr auto value = C;
+  static constexpr auto value = BUILT_CONFIG;
 };
 
-template <Template K, typename F, size_t... I>
-void by_config_in(const KernelConfig& c, F& f, std::index_sequence<I...>) {
-  if (!((same_build(c, configs_of(K)[I]) && (f(config_constant<built_config<K, I>>{}), true)) ||
+template <Template TEMPLATE, typename VISITOR, size_t... INDICES>
+void by_config_in(const KernelConfig& c, VISITOR& f, std::index_sequence<INDICES...>) {
+  if (!((same_build(c, configs_of(TEMPLATE)[INDICES]) && (f(config_constant<built_config<TEMPLATE, INDICES>>{}), true)) ||
         ...))
-    not_built(std::string("template ") + to_string(K) + " at that tile and threads");
+    not_built(std::string("template ") + to_string(TEMPLATE) + " at that tile and threads");
 }
 
-template <Template K, typename F>
-void by_config(const KernelConfig& c, F&& f) {
-  by_config_in<K>(c, f, std::make_index_sequence<configs_of(K).size()>{});
+template <Template TEMPLATE, typename VISITOR>
+void by_config(const KernelConfig& c, VISITOR&& f) {
+  by_config_in<TEMPLATE>(c, f, std::make_index_sequence<configs_of(TEMPLATE).size()>{});
 }
 
 [[noreturn]] inline void not_this_ops(Template k) {
@@ -417,29 +417,29 @@ void by_config(const KernelConfig& c, F&& f) {
 // element pointers erased, which is what a launch calls it through.
 // =================================================================================================
 
-template <typename P>
+template <typename PARAM>
 struct erase {
-  using t = P;
+  using t = PARAM;
 };
-template <typename P>
-struct erase<P*> {
+template <typename PARAM>
+struct erase<PARAM*> {
   using t = void*;
 };
-template <typename P>
-struct erase<const P*> {
+template <typename PARAM>
+struct erase<const PARAM*> {
   using t = const void*;
 };
-template <typename F>
+template <typename KERNEL_PTR>
 struct erased;
-template <typename... P>
-struct erased<void (*)(P...)> {
-  using t = void (*)(typename erase<P>::t...);
+template <typename... PARAMS>
+struct erased<void (*)(PARAMS...)> {
+  using t = void (*)(typename erase<PARAMS>::t...);
 };
 
 // `kernel`, as the launch holds it, once it is checked to be callable as `Signature`.
-template <typename Signature, typename... P>
-const void* instance(void (*kernel)(P...)) {
-  static_assert(std::is_same_v<typename erased<void (*)(P...)>::t, Signature>,
+template <typename SIGNATURE, typename... PARAMS>
+const void* instance(void (*kernel)(PARAMS...)) {
+  static_assert(std::is_same_v<typename erased<void (*)(PARAMS...)>::t, SIGNATURE>,
                 "a compiled kernel does not have its op's signature");
   return reinterpret_cast<const void*>(kernel);
 }
@@ -627,13 +627,13 @@ constexpr bool slices_columns(Template k) {
 
 using Forced = std::optional<std::pair<Template, std::optional<KernelConfig>>>;
 
-template <typename Config>
+template <typename CONFIG_TYPE>
 constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> algorithm,
                                              std::optional<Direction> direction,
                                              std::optional<int> threads_per_block,
                                              std::optional<int> blocks_per_grid,
                                              std::initializer_list<std::optional<int>> fields,
-                                             Config config) {
+                                             CONFIG_TYPE config) {
   if (direction && !algorithm) return Error::direction_without_algorithm;
   if (threads_per_block.has_value() != blocks_per_grid.has_value())
     return Error::launch_incomplete;
