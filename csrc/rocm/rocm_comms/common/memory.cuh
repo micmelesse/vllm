@@ -54,6 +54,16 @@ DINLINE void issued() {
 }  // namespace impl
 
 namespace impl {
+// A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form global_load and
+// global_store take with the base in scalar registers (saddr), so every tensor sharing the
+// columns shares one offset register. A signed column added to the pointer was a 64-bit vector
+// address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness, 2026-10-04T15-28-51Z).
+template <typename PACK, typename TILE>
+DINLINE PACK* at_col(PACK* row, const TILE& t, int k) {
+  using Byte = std::conditional_t<std::is_const_v<PACK>, const char, char>;
+  const uint32_t offset = static_cast<uint32_t>(t.col(k)) * uint32_t{sizeof(PACK)};
+  return reinterpret_cast<PACK*>(reinterpret_cast<Byte*>(row) + offset);
+}
 template <typename PACK>
 DINLINE PACK pack_load(const PACK* p) {
   if constexpr (sizeof(PACK) == 16)
@@ -94,7 +104,7 @@ DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
     if (impl::skipped(t, m)) continue;
     const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
-    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
+    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(impl::at_col(row, t, k)));
   }
   impl::issued();
 }
@@ -112,9 +122,9 @@ DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride, const TILE
     for (int k = 0; k < t.K; ++k) {
       if (t.mask(k) == 0.0f) continue;
       if constexpr (sizeof(P) == 16)
-        impl::global_store(row + t.col(k), impl::pack(t, m, k));
+        impl::global_store(impl::at_col(row, t, k), impl::pack(t, m, k));
       else
-        row[t.col(k)] = impl::pack(t, m, k);
+        *impl::at_col(row, t, k) = impl::pack(t, m, k);
     }
   }
 }
@@ -175,7 +185,7 @@ DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
   for (int m = 0; m < TILE::kRows; ++m) {
     const P* row = reinterpret_cast<const P*>(row_data(t.tile_row(m)));
 #pragma unroll
-    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
+    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(impl::at_col(row, t, k)));
   }
   impl::issued();
 }
