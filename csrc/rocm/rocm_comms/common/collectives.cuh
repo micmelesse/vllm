@@ -13,6 +13,11 @@
 
 namespace hip_comms {
 
+// THE LOADS ARE THE COMMUNICATION: `rank_chunk(w)` points into rank + w's memory, mapped into this
+// GPU's (peers.cuh), so loading the chunk reads it over the links; the sum and the store are local.
+// The kernel syncs around these calls (Sync): before, every peer's data is ready; between the
+// reduce-scatter and the all-gather, every rank's sums are visible.
+//
 // THE COLLECTIVES WORK A CHUNK AT A TIME, as a tile whose ROWS ARE THE RANKS: row w is rank + w's
 // copy of the chunk (ROTATED, so at any moment the GPUs read different peers), a row of threads a
 // rank (TILE::kThreadsM == WORLD). `chunk` is the place: its N the slice's end, its offs_n the
