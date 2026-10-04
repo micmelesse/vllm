@@ -38,14 +38,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
+  // A ROW'S RANK WHEN IT IS READ: a row is a wave's, so its pointer is one scalar select (every
+  // rank's, rotated, up front was ~20 scalar loads before the first barrier).
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const DTYPE* inputs[WORLD];
-  DTYPE* scratches[WORLD];
-#pragma unroll
-  for (int w = 0; w < WORLD; ++w) {
-    inputs[w]    = rank_input<DTYPE, WORLD>(*peer_inputs, rotated(w)) + first;
-    scratches[w] = rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w));
-  }
+  const auto input       = [&](int w) {
+    return rank_input<DTYPE, WORLD>(*peer_inputs, rotated(w)) + first;
+  };
+  const auto scratch = [&](int w) { return rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w)); };
   block_stamp(0);
   barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
@@ -55,9 +54,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
        offs_n += gridDim.x * Ranks::kTileN) {
     Ranks got{WORLD, mine, 0, offs_n};
-    tile_gather(got, [&](int w) { return inputs[w]; });
-    tile_store(own_scratch, mine,
-               block_reduce<Sum, Axis::m>(got.template to<float>()).template to<DTYPE>());
+    tile_gather(got, input);
+    tile_store(own_scratch, mine, block_reduce<Sum, Axis::m>(got).template to<DTYPE>());
   }
 
   block_stamp(2);
@@ -71,7 +69,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
        offs_n += gridDim.x * Ranks::kTileN) {
     Ranks got{WORLD, slice, 0, offs_n};
-    tile_gather(got, [&](int w) { return scratches[w]; });
+    tile_gather(got, scratch);
     tile_scatter([&](int w) { return out + rotated(w) * slice; },
                  [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); }, got);
   }
@@ -98,13 +96,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
   const auto own_staging = rank_staging<DTYPE, WORLD>(peer_staging, rank);
-  DTYPE* stagings[WORLD];
-  DTYPE* scratches[WORLD];
-#pragma unroll
-  for (int w = 0; w < WORLD; ++w) {
-    stagings[w]  = rank_staging<DTYPE, WORLD>(peer_staging, rotated(w));
-    scratches[w] = rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w));
-  }
+  const auto staging     = [&](int w) { return rank_staging<DTYPE, WORLD>(peer_staging, rotated(w)); };
+  const auto scratch     = [&](int w) { return rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w)); };
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
     const int len    = static_cast<int>(min(pass, num_packs - c0)) * NL;  // this pass, elements
@@ -131,9 +124,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
          offs_n += gridDim.x * Ranks::kTileN) {
       Ranks got{WORLD, mine, 0, offs_n};
-      tile_gather(got, [&](int w) { return stagings[w] + first; });
-      tile_store(own_scratch, mine,
-                 block_reduce<Sum, Axis::m>(got.template to<float>()).template to<DTYPE>());
+      tile_gather(got, [&](int w) { return staging(w) + first; });
+      tile_store(own_scratch, mine, block_reduce<Sum, Axis::m>(got).template to<DTYPE>());
     }
 
     block_stamp(2);
@@ -147,7 +139,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
          offs_n += gridDim.x * Ranks::kTileN) {
       Ranks got{WORLD, slice, 0, offs_n};
-      tile_gather(got, [&](int w) { return scratches[w]; });
+      tile_gather(got, scratch);
       tile_scatter([&](int w) { return out + at + rotated(w) * slice; }, slice_n, got);
     }
     block_stamp(5);

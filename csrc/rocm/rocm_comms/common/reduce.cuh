@@ -144,8 +144,9 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
 }
 
 // A TILE REDUCED OVER AN AXIS, Triton's tl.sum(x, axis) for a float tile:
-//   Axis::m  over the rows, every column's: the rows meet in LDS and are reduced in row order, and
-//            the one-row result is the first THREADS_N threads' (a Tile of one row of threads)
+//   Axis::m  over the rows, every column's: the rows meet in LDS as they are held (a bf16 tile's
+//            16 bytes a group, as the old two-shot's), reduced in fp32 in row order, and the
+//            one-row fp32 result is the first THREADS_N threads' (a Tile of one row of threads)
 //   Axis::n  over the columns, every row's, into `out` (a row's value in every thread of the row):
 //            each thread's groups, then the row's threads (a wave's or the block's)
 enum class Axis { m, n };
@@ -154,19 +155,17 @@ template <typename REDUCE_OP, Axis AXIS, typename TILE>
 DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> block_reduce(
     const TILE& t) {
   static_assert(AXIS == Axis::m, "a row's reduction (Axis::n) writes `out`");
-  static_assert(std::is_same_v<typename TILE::Acc, float>, "a reduction is of a float tile");
+  static_assert(TILE::kRows == 1, "a thread holds one row of the rows reduced");
   constexpr int kRowLanes = TILE::kThreadsM;
-  __shared__ float part[kRowLanes][TILE::kTileN];
+  using Acc = typename TILE::Acc;
+  __shared__ Acc part[kRowLanes][TILE::kTileN];
   Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> out{1, t.N, 0, t.offs_n};
   const int lane_row = static_cast<int>(threadIdx.x) / TILE::kThreadsN;
 #pragma unroll
   for (int k = 0; k < TILE::K; ++k)
 #pragma unroll
     for (int j = 0; j < TILE::kPack; ++j) {
-      float x = t.v[0][k][j];
-#pragma unroll
-      for (int m = 1; m < TILE::kRows; ++m) x = REDUCE_OP::apply(x, t.v[m][k][j]);
-      part[lane_row][(t.lane() + k * TILE::kThreadsN) * TILE::kPack + j] = x;
+      part[lane_row][(t.lane() + k * TILE::kThreadsN) * TILE::kPack + j] = t.v[0][k][j];
     }
   __syncthreads();
   if (out.participates()) {
@@ -175,9 +174,9 @@ DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> b
 #pragma unroll
       for (int j = 0; j < TILE::kPack; ++j) {
         const int c = (out.lane() + k * TILE::kThreadsN) * TILE::kPack + j;
-        float x = part[0][c];
+        float x = static_cast<float>(part[0][c]);
 #pragma unroll
-        for (int r = 1; r < kRowLanes; ++r) x = REDUCE_OP::apply(x, part[r][c]);
+        for (int r = 1; r < kRowLanes; ++r) x = REDUCE_OP::apply(x, static_cast<float>(part[r][c]));
         out.v[0][k][j] = x;
       }
   }
