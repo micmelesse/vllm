@@ -26,9 +26,9 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice        = (packs + WORLD - 1) / WORLD;
   const int col0         = rank * slice;
@@ -44,7 +44,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   constexpr int kSliceWaves = (TILE_N / WORLD / NL + kWaveSize - 1) / kWaveSize * kWaveSize;
   constexpr int SLICE_LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
   using Slice = Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
-                     THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES>;
+                     THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -88,18 +88,18 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
-    // Every load of the row before any store: the scratch's and the residual together, the weight
-    // under the reduction.
+    // Every load of the row before any store, in flight together: the scratch's, the residual's
+    // and the weight's (one-shot's).
     Row own = at, res = at;
     tile_load(own, own_scratch, cols);
     if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
+    Weight w{1, cols, 0, 0};
+    tile_load(w, weight, 0);
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
       tile_store(residual_out, cols, s.template to<DTYPE>());
     }
-    Weight w{1, cols, 0, 0};
-    tile_load(w, weight, 0);
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);

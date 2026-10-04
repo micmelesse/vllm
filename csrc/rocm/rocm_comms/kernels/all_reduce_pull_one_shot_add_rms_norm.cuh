@@ -22,9 +22,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual, const WEIGHT_DTYPE* __restrict__ weight,
     float eps, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const int cols         = packs * NL;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
@@ -44,22 +44,24 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   //    The variance is of `s` before any further rounding, kept in registers between the passes.
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
-    // Every load of the row before any store: the peers' and the residual together, the weight
-    // under the reduction.
+    // Every load of the row before any store, in flight together: the peers', the residual's and
+    // the weight's. A load issues where it is written (an address is built at its load), and the
+    // weight after the peers' sum was a round trip of its own (+0.34 us at 16 x 3584,
+    // 2026-10-04T17-25-35Z).
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
     peers_load(peers, input, cols);
     Row res = at;
     if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
+    Weight w{1, cols, 0, 0};
+    tile_load(w, weight, 0);
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
       tile_store(residual_out, cols, s.template to<DTYPE>());
     }
-    Weight w{1, cols, 0, 0};
-    tile_load(w, weight, 0);
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
