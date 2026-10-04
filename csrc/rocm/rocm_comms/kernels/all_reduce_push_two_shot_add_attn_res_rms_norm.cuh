@@ -37,10 +37,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
-  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows of this rank's columns, a wave a row.
-  constexpr int SLICE_N = (TILE_N / WORLD + kWaveSize * NL - 1) / (kWaveSize * NL) * (kWaveSize * NL);
-  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, SLICE_N, THREADS_PER_BLOCK / kWaveSize,
-                     kWaveSize>;
+  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows, a wave a row, a group a thread of this
+  // rank's columns, stepping across them (a slice wide, a thread held every peer's groups of it:
+  // 32 packs at 16384, spilling).
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, kWaveSize * NL,
+                     THREADS_PER_BLOCK / kWaveSize, kWaveSize>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int slice        = (packs + WORLD - 1) / WORLD;
   const int col0         = rank * slice;
@@ -64,9 +65,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
   //    gridDim.x-th), A WAVE A ROW, since a rank's columns are a narrow slice.
   if (own_packs > 0) {
-    for (int q = 0; q < my_rows; q += Slice::kThreadsM) {
+    for (int q = 0; q < my_rows; q += Slice::kThreadsM)
+    for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
       const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x + q * gridDim.x),
-                     col0 * NL, static_cast<int>(gridDim.x)};
+                     c, static_cast<int>(gridDim.x)};
       Slice peers[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;

@@ -37,10 +37,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
   const int cols = packs * NL;  // the row, in elements
-  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows of this rank's columns, a wave a row.
-  constexpr int SLICE_N = (TILE_N / WORLD + kWaveSize * NL - 1) / (kWaveSize * NL) * (kWaveSize * NL);
-  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, SLICE_N, THREADS_PER_BLOCK / kWaveSize,
-                     kWaveSize>;
+  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows, a wave a row, a group a thread of this
+  // rank's columns, stepping across them (a slice wide, a thread held every peer's groups of it:
+  // 32 packs at 16384, spilling).
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, kWaveSize * NL,
+                     THREADS_PER_BLOCK / kWaveSize, kWaveSize>;
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -57,9 +58,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
   //    gridDim.x-th), A WAVE A ROW, since a rank's columns are a narrow slice.
   if (own_packs > 0) {
-    for (int q = 0; q < my_rows; q += Slice::kThreadsM) {
+    for (int q = 0; q < my_rows; q += Slice::kThreadsM)
+    for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
       const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x + q * gridDim.x),
-                     col0 * NL, static_cast<int>(gridDim.x)};
+                     c, static_cast<int>(gridDim.x)};
       Slice peers[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;
