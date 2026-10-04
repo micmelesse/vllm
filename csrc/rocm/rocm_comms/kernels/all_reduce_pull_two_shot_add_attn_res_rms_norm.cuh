@@ -43,14 +43,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   constexpr int NL = traits<DTYPE>::N;
-  // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a TILE_N row (in whole
-  // waves), a group a thread, so a row's slice is one round trip (a wave a row took two at 7168,
-  // 0.8 us at 16-32 tokens), and as many rows at once as the block holds. A group a thread, not
-  // a slice's worth: every peer's groups of a whole slice were 32 packs at 16384, spilling.
-  constexpr int kSliceWaves = (TILE_N / WORLD / NL + kWaveSize - 1) / kWaveSize * kWaveSize;
-  constexpr int SLICE_LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
-  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
-                     THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
+  // THE REDUCE-SCATTER'S CHUNK, the plain two-shot's: its rows are the ranks, a row of threads a
+  // rank (common's reduce_scatter).
+  constexpr int LANES = THREADS_PER_BLOCK / WORLD;
+  static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+  using Ranks = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
@@ -71,23 +68,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto input = [&](int r) { return inputs[(rank + r) % WORLD]; };
   const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
 
-  // 2. This rank's columns of this block's rows (every gridDim.x-th, AttnRes's below), summed
-  //    over the ranks in rank order, into this rank's scratch at their place in the tensor.
+  // 2. Reduce-scatter: this rank's columns of this block's rows (every gridDim.x-th, AttnRes's
+  //    below) summed over the ranks into this rank's scratch, at their place in the tensor, a
+  //    chunk at a time.
   (void)reduce_scatter_blocks;
-  const int reducers = static_cast<int>(gridDim.x);
-  if (own_packs > 0) {
-    const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
-    for (int q = 0; q < reduce_rows; q += Slice::kThreadsM)
-    for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
-      const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x) + q * reducers,
-                     c, reducers};
-      Slice peers[WORLD];
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) peers[r] = at;
-      peers_load(peers, input, cols);
-      tile_store(own_scratch, cols, peers_reduce(peers));
+  const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements
+  for (int row = blockIdx.x; row < rows; row += gridDim.x)
+    for (int c = col0 * NL; c < end; c += Ranks::kTileN) {
+      Ranks chunk{WORLD, end, 0, c};
+      reduce_scatter(chunk, [&](int w) { return input(w) + int64_t{row} * cols; },
+                     own_scratch + int64_t{row} * cols);
     }
-  }
   block_stamp(2);
 
   // 3. This block's rows' columns are in every rank's scratch: its twin on every rank wrote them.
