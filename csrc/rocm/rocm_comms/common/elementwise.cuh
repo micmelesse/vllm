@@ -69,13 +69,12 @@ DINLINE A tile_mul(const A& a, float scale) {
 }
 
 // a x a_row_scale + b x b_row_scale, element by element, as fused multiply-adds (a softmax's fold:
-// the old sum rescaled plus a new source weighted). Two multiplies and an add were three VALU an
+// the old sum rescaled plus a new source weighted). b may be held in its stored dtype, converted here. Two multiplies and an add were three VALU an
 // element and, vectorized, packed multiplies with a chain of adds (ISA 2026-10-04T02-22-41Z).
 template <typename A, typename B>
 DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
                    const float (&b_row_scale)[A::kRows]) {
-  static_assert(std::is_same_v<typename A::Acc, float> && std::is_same_v<typename B::Acc, float>,
-                "tile math is on float tiles");
+  static_assert(std::is_same_v<typename A::Acc, float>, "the sum is a float tile");
   A out = a;
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m)
@@ -83,7 +82,7 @@ DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
     for (int k = 0; k < A::K; ++k)
 #pragma unroll
       for (int j = 0; j < A::kPack; ++j)
-        out.v[m][k][j] = fmaf(b.v[m][k][j], b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
+        out.v[m][k][j] = fmaf(static_cast<float>(b.v[m][k][j]), b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
   return out;
 }
 

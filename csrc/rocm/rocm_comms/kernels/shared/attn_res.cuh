@@ -62,23 +62,20 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
     // moves a step at 3584, ISA 2026-10-04T03-31-28Z).
     const int full = num_blocks / TILE_K * TILE_K;
     const auto step = [&](int src0, auto last) {
-      RowsF v[TILE_K];
+      Rows v[TILE_K];
       float sums[TILE_M * 2 * TILE_K];
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
         if constexpr (!decltype(last)::value) {
-          Rows raw = sum.template like<DTYPE>();
-          tile_load(raw, blocks + src * block_stride_r, block_stride_m);
-          v[s] = raw.template to<float>();
+          v[s] = sum.template like<DTYPE>();
+          tile_load(v[s], blocks + src * block_stride_r, block_stride_m);
         } else if (src < num_blocks) {
-          Rows raw = sum.template like<DTYPE>();
-          tile_load(raw, blocks + src * block_stride_r, block_stride_m);
-          v[s] = raw.template to<float>();
+          v[s] = sum.template like<DTYPE>();
+          tile_load(v[s], blocks + src * block_stride_r, block_stride_m);
         } else {
-          Rows again = sum.template zeros<DTYPE>();
-          if (src == num_blocks) tile_load(again, prefix, stride);
-          v[s] = again.template to<float>();
+          v[s] = sum.template zeros<DTYPE>();
+          if (src == num_blocks) tile_load(v[s], prefix, stride);
         }
         float ss[TILE_M], dw[TILE_M];
         partial_dot(v[s], v[s], ss);

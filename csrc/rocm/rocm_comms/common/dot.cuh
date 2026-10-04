@@ -32,7 +32,7 @@ DINLINE void partial_dot(const A& a, const B& b, float (&d)[A::kRows]) {
     for (int k = 0; k < A::K; ++k) {
       float dk = 0.0f;
 #pragma unroll
-      for (int j = 0; j < A::kPack; ++j) dk = fmaf(a.v[m][k][j], b.v[mb][k][j], dk);
+      for (int j = 0; j < A::kPack; ++j) dk = fmaf(static_cast<float>(a.v[m][k][j]), static_cast<float>(b.v[mb][k][j]), dk);
       d[m] += a.mask(k) * dk;
     }
   }
