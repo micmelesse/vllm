@@ -696,8 +696,9 @@ constexpr int own(std::optional<int> v) { return v.value_or(0); }
 // 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and 10.9 at 512 (bench, 2026-09-29T19-24-48Z).
 // One-shot reads every peer's whole buffer ((N-1)P) in one round trip; two-shot moves less
 // (2(N-1)/N P) in two: one-shot won at 56 KiB (7.12 vs 7.83 us), two-shot at 112 KiB (7.87 vs
-// 8.19), uncached scratch (2026-09-30T18-00-30Z). BOTH ARE A WAVE A BLOCK, a thread reading
-// every peer (aiter's two-stage). A GRID THE SIZE OF THE WORK, as aiter sizes its own: every block pays for every sync
+// 8.19), uncached scratch (2026-09-30T18-00-30Z). TWO-SHOT'S BLOCK IS A ROW OF THREADS A RANK
+// (aiter's two-stage, a wave a peer). A GRID THE SIZE OF THE WORK, as aiter sizes its own: every
+// block pays for every sync
 // (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64), capped at what keeps the links
 // busy: their bandwidth-delay product, 7 x 76.8 GB/s x 1334 ns = 717 KB, 88 blocks of 512 threads
 // (the sweep: flat from 80 to 128). Every pass full: 3.7 MB at 88 blocks took 5.09 passes, 23.78
@@ -715,12 +716,11 @@ constexpr KernelConfig all_reduce_config(Template t, int64_t bytes, int world) {
   const int64_t packs   = (bytes + kBuild.memory.pack_bytes - 1) / kBuild.memory.pack_bytes;
   const int64_t work    = one_shot ? packs : (packs + world - 1) / world;
   const int64_t need    = (work + hw.wave_size - 1) / hw.wave_size;
-  const int threads     = hw.wave_size;
-  // THE TWO-SHOT'S THREAD READS EVERY PEER, so its block has world x threads packs in flight: sized
-  // as threads alone, a tiled two-shot put 5.6 MB in flight, 8x the links' 717 KB, and ran 35%
-  // slower (2026-10-04T00-39-28Z). The one-shot's stays as it was swept.
-  const int loads       = one_shot ? threads : threads * world;
-  const int fill        = link_filling_blocks(hw, kTargetCalibration, loads);
+  // THE TWO-SHOT'S BLOCK IS A ROW OF THREADS A RANK (a wave each at eight), a thread one load: a
+  // tiled two-shot whose thread read every rank put 8x the links' bytes in flight on this grid and
+  // lost 0.8 us at 16-64 tokens however launched (2026-10-04T01-07-11Z).
+  const int threads     = one_shot ? hw.wave_size : hw.wave_size * world;
+  const int fill        = link_filling_blocks(hw, kTargetCalibration, threads);
   const int64_t passes  = need > fill ? need / fill : 1;
   const int64_t even    = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.

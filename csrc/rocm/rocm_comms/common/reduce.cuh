@@ -13,6 +13,7 @@
 #endif
 
 #include <cmath>
+#include <type_traits>
 
 #include "build.cuh"
 #include "memory.cuh"
@@ -140,6 +141,70 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
   __syncthreads();
 #pragma unroll
   for (int n = 0; n < NUM_VALUES; ++n) v[n] = total[n];
+}
+
+// A TILE REDUCED OVER AN AXIS, Triton's tl.sum(x, axis) for a float tile:
+//   Axis::m  over the rows, every column's: the rows meet in LDS and are reduced in row order, and
+//            the one-row result is the first THREADS_N threads' (a Tile of one row of threads)
+//   Axis::n  over the columns, every row's, into `out` (a row's value in every thread of the row):
+//            each thread's groups, then the row's threads (a wave's or the block's)
+enum class Axis { m, n };
+
+template <typename REDUCE_OP, Axis AXIS, typename TILE>
+DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> block_reduce(
+    const TILE& t) {
+  static_assert(AXIS == Axis::m, "a row's reduction (Axis::n) writes `out`");
+  static_assert(std::is_same_v<typename TILE::Acc, float>, "a reduction is of a float tile");
+  constexpr int kRowLanes = TILE::kThreadsM;
+  __shared__ float part[kRowLanes][TILE::kTileN];
+  Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> out{1, t.N, 0, t.offs_n};
+  const int lane_row = static_cast<int>(threadIdx.x) / TILE::kThreadsN;
+#pragma unroll
+  for (int k = 0; k < TILE::K; ++k)
+#pragma unroll
+    for (int j = 0; j < TILE::kPack; ++j) {
+      float x = t.v[0][k][j];
+#pragma unroll
+      for (int m = 1; m < TILE::kRows; ++m) x = REDUCE_OP::apply(x, t.v[m][k][j]);
+      part[lane_row][(t.lane() + k * TILE::kThreadsN) * TILE::kPack + j] = x;
+    }
+  __syncthreads();
+  if (out.participates()) {
+#pragma unroll
+    for (int k = 0; k < TILE::K; ++k)
+#pragma unroll
+      for (int j = 0; j < TILE::kPack; ++j) {
+        const int c = (out.lane() + k * TILE::kThreadsN) * TILE::kPack + j;
+        float x = part[0][c];
+#pragma unroll
+        for (int r = 1; r < kRowLanes; ++r) x = REDUCE_OP::apply(x, part[r][c]);
+        out.v[0][k][j] = x;
+      }
+  }
+  __syncthreads();  // before the next reduction writes `part`
+  return out;
+}
+
+template <typename REDUCE_OP, Axis AXIS, typename TILE>
+DINLINE void block_reduce(const TILE& t, float (&out)[TILE::kRows]) {
+  static_assert(AXIS == Axis::n, "a column's reduction (Axis::m) returns a tile");
+  static_assert(std::is_same_v<typename TILE::Acc, float>, "a reduction is of a float tile");
+#pragma unroll
+  for (int m = 0; m < TILE::kRows; ++m) {
+    float x = REDUCE_OP::kIdentity;
+#pragma unroll
+    for (int k = 0; k < TILE::K; ++k)
+#pragma unroll
+      for (int j = 0; j < TILE::kPack; ++j)
+        x = t.mask(k) != 0.0f ? REDUCE_OP::apply(x, t.v[m][k][j]) : x;
+    out[m] = x;
+  }
+  if constexpr (TILE::kThreadsM == 1)
+    block_reduce<REDUCE_OP>(out);
+  else if constexpr (TILE::kThreadsN == kWaveSize)
+    wave_reduce<REDUCE_OP>(out);
+  else
+    static_assert(TILE::kThreadsN == kWaveSize, "a row is the block's or a wave's");
 }
 
 // The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.

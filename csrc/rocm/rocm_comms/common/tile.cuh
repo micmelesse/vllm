@@ -39,11 +39,13 @@ struct Tile {
   static constexpr int kTileN   = TILE_N;
   static constexpr int kThreads = THREADS_M * THREADS_N;  // the block
   static constexpr int kThreadsM = THREADS_M;
+  static constexpr int kThreadsN = THREADS_N;
   static_assert(TILE_M % THREADS_M == 0, "a tile's rows are whole for every row of threads");
   static_assert(TILE_N % (kPack * THREADS_N) == 0,
                 "a tile's columns are whole groups for every thread of a row");
   static constexpr int kRows = TILE_M / THREADS_M;          // rows this thread holds
   static constexpr int K     = TILE_N / (kPack * THREADS_N);  // groups of a row it holds
+  using Dtype = DTYPE;
   using Acc  = ACC_DTYPE;
   using Pack = vec<ACC_DTYPE, kPack>;  // how a group is loaded and stored, not how it is held
   int M, N;
@@ -55,6 +57,10 @@ struct Tile {
   // every load stays in bounds; its mask is 1 below N and 0 past it (a float, multiplied in, so
   // nothing reading it branches: a load under a runtime `if` cannot be hoisted past the branch, and
   // loads meant to be in flight together then wait one at a time).
+  // WHETHER THIS THREAD HOLDS ANY OF THE TILE: a layout may cover fewer threads than the block (a
+  // reduction's one row, the first THREADS_N's); the others load and store nothing. Free when the
+  // layout is the block, which the launch bounds tell the compiler.
+  DINLINE bool participates() const { return static_cast<int>(threadIdx.x) < kThreads; }
   DINLINE int lane() const { return static_cast<int>(threadIdx.x) % THREADS_N; }
   DINLINE int col(int k) const {
     const int n = offs_n / kPack + lane() + k * THREADS_N;

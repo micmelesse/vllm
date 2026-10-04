@@ -138,6 +138,7 @@ template <typename TILE>
 DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
                          int64_t row_stride) {
   using P = typename TILE::Pack;
+  if (!t.participates()) return;
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
@@ -152,6 +153,7 @@ DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
 template <typename TILE>
 DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride, const TILE& t) {
   using P = typename TILE::Pack;
+  if (!t.participates()) return;
   P* at   = reinterpret_cast<P*>(data);
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
@@ -210,6 +212,65 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
     }
   }
   impl::issued();
+}
+
+// A TILE WHOSE ROWS ARE DIFFERENT TENSORS' (a row a peer): row m's at `row_data(m)`, its first
+// element, the tile's columns counted from it. tile_gather loads every row together, one round trip;
+// tile_scatter stores row m into `row_data(m)` up to its own `row_n(m)` columns (a short last
+// slice).
+template <typename TILE, typename ROW_DATA>
+DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
+  using P = typename TILE::Pack;
+  if (!t.participates()) return;
+#pragma unroll
+  for (int m = 0; m < TILE::kRows; ++m) {
+    const P* row = reinterpret_cast<const P*>(row_data(t.tile_row(m)));
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
+  }
+  impl::issued();
+}
+
+// ...a row only `row_n(m)` columns long (a short last slice): its columns past that read its last
+// group, and an empty row reads nothing.
+template <typename TILE, typename ROW_DATA, typename ROW_N>
+DINLINE void tile_gather(TILE& t, ROW_DATA row_data, ROW_N row_n) {
+  using P = typename TILE::Pack;
+  if (!t.participates()) return;
+#pragma unroll
+  for (int m = 0; m < TILE::kRows; ++m) {
+    const int r = t.tile_row(m);
+    const int n = row_n(r) / t.kPack;
+    if (n == 0) continue;
+    const P* row = reinterpret_cast<const P*>(row_data(r));
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
+      impl::held(t, m, k, impl::pack_load(row + (c < n ? c : n - 1)));
+    }
+  }
+  impl::issued();
+}
+
+template <typename TILE, typename ROW_DATA, typename ROW_N>
+DINLINE void tile_scatter(ROW_DATA row_data, ROW_N row_n, const TILE& t) {
+  using P = typename TILE::Pack;
+  if (!t.participates()) return;
+#pragma unroll
+  for (int m = 0; m < TILE::kRows; ++m) {
+    const int r = t.tile_row(m);
+    P* row      = reinterpret_cast<P*>(row_data(r));
+    const int n = row_n(r) / t.kPack;
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
+      if (c >= n) continue;
+      if constexpr (sizeof(P) == 16)
+        thread_store(row + c, impl::pack(t, m, k));
+      else
+        row[c] = impl::pack(t, m, k);
+    }
+  }
 }
 
 // A ROW'S SCALAR (a norm's scale), one float a row of `scalars`: thread 0 stores row `row`'s; every

@@ -12,46 +12,52 @@
 
 namespace hip_comms {
 
-// THE BUFFER AS ONE ROW CUT INTO ONE SLICE A RANK (the last one short), each in chunks of
-// THREADS_PER_BLOCK groups, the grid striding over them. A rank sums its slice over every rank into
-// its scratch, every thread its own columns from all of them, aiter's two-stage; then copies every
-// rank's summed slice out. ROTATED, SO THE RANKS SPREAD OVER THE LINKS: a rank reads rank + w for
-// w = 0.. in order, where in rank order every GPU reads rank 0 first; the sum's order differs by
-// rank, which is harmless, since each slice is summed by one rank. THE SAME BLOCK READS IN THE
-// SECOND PHASE WHAT THE SAME BLOCK ON EACH RANK WROTE IN THE FIRST: both stride over chunks alike.
+// THE BUFFER AS ONE ROW CUT INTO ONE SLICE A RANK (the last one short), moved a chunk at a time
+// as a tile whose ROWS ARE THE RANKS: row w is rank + w's (ROTATED, SO THE RANKS SPREAD OVER THE
+// LINKS: at any moment the eight GPUs read eight different peers, where in rank order every GPU
+// reads rank 0 first), a row's threads a wave (THREADS_PER_BLOCK / WORLD lanes) each loading one
+// group. A rank sums its slice's chunk over the rows (block_reduce over M, in row order, the rows
+// meeting in LDS) into its scratch, then copies every rank's summed chunk out. The sum's order
+// differs by rank, which is harmless: each slice is summed by one rank, so every rank copies the
+// same bytes. THE SAME BLOCK READS IN THE SECOND PHASE WHAT THE SAME BLOCK ON EACH RANK WROTE IN
+// THE FIRST: both stride over chunks alike.
 template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     all_reduce_pull_two_shot(const PeerPtrs* __restrict__ peer_inputs,
                              PeerPtrs peer_scratch, PeerSignals peer_signals,
                              Signal* self_signal, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out, int num_packs) {
-  using Chunk     = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
-  constexpr int NL = traits<DTYPE>::N;
+  constexpr int NL    = traits<DTYPE>::N;
+  constexpr int LANES = THREADS_PER_BLOCK / WORLD;
+  static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+  using Ranks     = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES>;
   const int len   = num_packs * NL;                              // the buffer, in elements
   const int slice = (num_packs + WORLD - 1) / WORLD * NL;        // a rank's, in elements
   const int first = rank * slice;
   const int mine  = max(0, min(slice, len - first));             // a late rank's may be short
+  const auto rotated = [&](int w) { return (rank + w) % WORLD; };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
-  const DTYPE* rotated[WORLD];
+  const DTYPE* inputs[WORLD];
+  DTYPE* scratches[WORLD];
 #pragma unroll
-  for (int w = 0; w < WORLD; ++w)
-    rotated[w] = rank_input<DTYPE, WORLD>(*peer_inputs, (rank + w) % WORLD) + first;
+  for (int w = 0; w < WORLD; ++w) {
+    inputs[w]    = rank_input<DTYPE, WORLD>(*peer_inputs, rotated(w)) + first;
+    scratches[w] = rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w));
+  }
   block_stamp(0);
   barrier<WORLD, Among::peers, Ensure::launched>(
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(1);
 
   // 2. Reduce-scatter: this rank's slice, summed over every rank, into its scratch.
-  for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < mine;
-       offs_n += gridDim.x * Chunk::kTileN) {
-    Chunk peers[WORLD];
-#pragma unroll
-    for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
-    peers_load(peers, [&](int w) { return rotated[w]; }, mine);
-    tile_store(own_scratch, mine, peers_reduce(peers));
+  for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
+       offs_n += gridDim.x * Ranks::kTileN) {
+    Ranks got{WORLD, mine, 0, offs_n};
+    tile_gather(got, [&](int w) { return inputs[w]; });
+    tile_store(own_scratch, mine,
+               block_reduce<Sum, Axis::m>(got.template to<float>()).template to<DTYPE>());
   }
 
   block_stamp(2);
@@ -60,20 +66,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       peer_signals, self_signal, rank, timeout_ticks);
   block_stamp(3);
 
-  // 4. All-gather: every rank's slice out of its scratch, at its place in the output, every
-  //    rank's chunk loaded before any is stored. The next call's first sync keeps a rank from
-  //    overwriting its scratch while it is read.
-  for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
-       offs_n += gridDim.x * Chunk::kTileN) {
-    Chunk got[WORLD];
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
-    peers_load(got, [&](int r) { return scratches[r]; }, slice);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) {
-      got[r].N = max(0, min(slice, len - r * slice));  // the rank's slice, a late one short
-      if (got[r].N > 0) tile_store(out + r * slice, slice, got[r]);
-    }
+  // 4. All-gather: every rank's summed chunk out of its scratch, at its place in the output. The
+  //    next call's first sync keeps a rank from overwriting its scratch while it is read.
+  for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
+       offs_n += gridDim.x * Ranks::kTileN) {
+    Ranks got{WORLD, slice, 0, offs_n};
+    tile_gather(got, [&](int w) { return scratches[w]; });
+    tile_scatter([&](int w) { return out + rotated(w) * slice; },
+                 [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); }, got);
   }
   block_stamp(5);
 }
@@ -90,12 +90,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
-  using Chunk        = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
-  constexpr int NL   = traits<DTYPE>::N;
+  constexpr int NL    = traits<DTYPE>::N;
+  constexpr int LANES = THREADS_PER_BLOCK / WORLD;
+  static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+  using Ranks        = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES>;
   const int64_t pass = min(stage_packs, scratch_packs * WORLD);
+  const auto rotated = [&](int w) { return (rank + w) % WORLD; };
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
-  const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
   const auto own_staging = rank_staging<DTYPE, WORLD>(peer_staging, rank);
+  DTYPE* stagings[WORLD];
+  DTYPE* scratches[WORLD];
+#pragma unroll
+  for (int w = 0; w < WORLD; ++w) {
+    stagings[w]  = rank_staging<DTYPE, WORLD>(peer_staging, rotated(w));
+    scratches[w] = rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w));
+  }
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
     const int len    = static_cast<int>(min(pass, num_packs - c0)) * NL;  // this pass, elements
@@ -103,37 +112,28 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
     const int first  = rank * slice;
     const int mine   = max(0, min(slice, len - first));
     const int64_t at = c0 * NL;
-    const DTYPE* rotated[WORLD];
-#pragma unroll
-    for (int w = 0; w < WORLD; ++w)
-      rotated[w] = rank_staging<DTYPE, WORLD>(peer_staging, (rank + w) % WORLD) + first;
+    const auto slice_n = [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); };
     block_stamp(0);
     // 1. Every rank's slice of this pass into this rank's staging, the chunks each rank's same
     //    block reads, then visible (and, past the first pass, every peer has read this rank's
     //    scratch).
-    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
-         offs_n += gridDim.x * Chunk::kTileN) {
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        const int n = max(0, min(slice, len - r * slice));
-        if (offs_n >= n) continue;
-        Chunk part{1, n, 0, offs_n};
-        tile_load(part, own_input + at + r * slice, n);
-        tile_store(own_staging + r * slice, n, part);
-      }
+    for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
+         offs_n += gridDim.x * Ranks::kTileN) {
+      Ranks part{WORLD, slice, 0, offs_n};
+      tile_gather(part, [&](int w) { return own_input + at + rotated(w) * slice; }, slice_n);
+      tile_scatter([&](int w) { return own_staging + rotated(w) * slice; }, slice_n, part);
     }
     barrier<WORLD, Among::peers, Ensure::visible>(
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(1);
 
     // 2. Reduce-scatter: this rank's slice from every rank's staging, into its scratch.
-    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < mine;
-         offs_n += gridDim.x * Chunk::kTileN) {
-      Chunk peers[WORLD];
-#pragma unroll
-      for (int w = 0; w < WORLD; ++w) peers[w] = Chunk{1, mine, 0, offs_n};
-      peers_load(peers, [&](int w) { return rotated[w]; }, mine);
-      tile_store(own_scratch, mine, peers_reduce(peers));
+    for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
+         offs_n += gridDim.x * Ranks::kTileN) {
+      Ranks got{WORLD, mine, 0, offs_n};
+      tile_gather(got, [&](int w) { return stagings[w] + first; });
+      tile_store(own_scratch, mine,
+                 block_reduce<Sum, Axis::m>(got.template to<float>()).template to<DTYPE>());
     }
 
     block_stamp(2);
@@ -143,18 +143,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
         peer_signals, self_signal, rank, timeout_ticks);
     block_stamp(3);
 
-    // 4. All-gather: every rank's slice out of its scratch, at its place in the output.
-    for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < slice;
-         offs_n += gridDim.x * Chunk::kTileN) {
-      Chunk got[WORLD];
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{1, slice, 0, offs_n};
-      peers_load(got, [&](int r) { return scratches[r]; }, slice);
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        got[r].N = max(0, min(slice, len - r * slice));
-        if (got[r].N > 0) tile_store(out + at + r * slice, slice, got[r]);
-      }
+    // 4. All-gather: every rank's summed chunk out of its scratch, at its place in the output.
+    for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
+         offs_n += gridDim.x * Ranks::kTileN) {
+      Ranks got{WORLD, slice, 0, offs_n};
+      tile_gather(got, [&](int w) { return scratches[w]; });
+      tile_scatter([&](int w) { return out + at + rotated(w) * slice; }, slice_n, got);
     }
     block_stamp(5);
   }
