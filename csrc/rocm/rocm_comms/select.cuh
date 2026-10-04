@@ -189,6 +189,7 @@ constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {
 // took the AttnRes phase from local scratch to 86.0 us at 4096 x 7168 (192: 192.8; stamps
 // 2026-10-02T20-36-56Z); not swept. Each build also one wave a EU past its own (72, 102, 104 and
 // 186 VGPRs at 1): 256 threads spilled 8 and 18 there (2026-10-04T15-40-07Z), 512 not tried.
+// 128 threads at 3584 only: twice the loads a wave and the registers (7168's 64 a thread spill).
 constexpr KernelConfig kAddAttnResConfigs[] = {
     AttnResConfig{{512, 512, 1}, 4096, 1},
     AttnResConfig{{512, 512, 1}, 8192, 1},
@@ -198,6 +199,7 @@ constexpr KernelConfig kAddAttnResConfigs[] = {
     AttnResConfig{{512, 512, 5}, 8192, 1},
     AttnResConfig{{256, 512, 5}, 4096, 1},
     AttnResConfig{{256, 512, 3}, 8192, 1},
+    AttnResConfig{{128, 512, 1}, 4096, 1},
 };
 
 // What each template is, in Template's order: its op, its shot, and its builds (none for the plain
