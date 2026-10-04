@@ -99,33 +99,34 @@ DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
   }
 }
 
-// N VALUES OVER THE BLOCK, in place: each wave reduces its N, one wave combines the waves' partials
-// the same way (not every thread reading every partial: that was N x waves LDS reads a thread),
-// and the N totals are broadcast through LDS once.
+// N VALUES OVER THE BLOCK, in place: each wave reduces its N, then every thread sums the waves'
+// partials in wave order (the same order in every thread, so every thread holds the same totals).
+// One wave reducing the partials over all 64 lanes, then broadcasting them, was a second DPP pass a
+// value, a second barrier and an LDS round trip to add 4 numbers at 256 threads: half of AttnRes's
+// loop (ISA 2026-10-04T03-31-28Z). The trailing barrier keeps the next call from overwriting
+// partials still being read.
 template <typename REDUCE_OP, int NUM_VALUES>
 DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
-  __shared__ float partial[kBuild.kernels.max_waves][NUM_VALUES];
-  __shared__ float total[NUM_VALUES];
+  constexpr int kMaxWaves = kBuild.kernels.max_waves;
+  __shared__ float partial[NUM_VALUES][kMaxWaves];
   const int lane  = threadIdx.x % kWaveSize;
   const int wave  = threadIdx.x / kWaveSize;
   const int waves = (blockDim.x + kWaveSize - 1) / kWaveSize;
   wave_reduce<REDUCE_OP>(v);
   if (lane == 0) {
 #pragma unroll
-    for (int n = 0; n < NUM_VALUES; ++n) partial[wave][n] = v[n];
-  }
-  __syncthreads();
-  if (wave == 0) {
-#pragma unroll
-    for (int n = 0; n < NUM_VALUES; ++n) {
-      float x[1] = {lane < waves ? partial[lane][n] : REDUCE_OP::kIdentity};
-      wave_reduce<REDUCE_OP>(x);
-      if (lane == 0) total[n] = x[0];
-    }
+    for (int n = 0; n < NUM_VALUES; ++n) partial[n][wave] = v[n];
   }
   __syncthreads();
 #pragma unroll
-  for (int n = 0; n < NUM_VALUES; ++n) v[n] = total[n];
+  for (int n = 0; n < NUM_VALUES; ++n) {
+    float x = partial[n][0];
+#pragma unroll
+    for (int w = 1; w < kMaxWaves; ++w)
+      if (w < waves) x = REDUCE_OP::apply(x, partial[n][w]);
+    v[n] = x;
+  }
+  __syncthreads();
 }
 
 // A TILE REDUCED OVER AN AXIS, Triton's tl.sum(x, axis) for a float tile:
@@ -193,7 +194,7 @@ DINLINE void block_reduce(const TILE& t, float (&out)[TILE::kRows]) {
 
 // The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.
 constexpr int64_t block_reduce_lds_bytes(int n) {
-  return (int64_t{kBuild.kernels.max_waves} + 1) * n * sizeof(float);
+  return int64_t{kBuild.kernels.max_waves} * n * sizeof(float);
 }
 
 }  // namespace hip_comms

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "../../common/common.cuh"
 
 namespace hip_comms {
@@ -55,13 +57,21 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
     const WeightF w = tile_mul(nw.template to<float>(), qk.template to<float>());
     acc = sum.template zeros<float>();
     OnlineSoftmax softmax[TILE_M];
-    for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
+    // FULL STEPS OF SOURCES, THEN ONE LAST STEP with what remains, the prefix and any padding: in
+    // the loop every source is a block's, so it has no branch and no zeroed tile a source (16
+    // moves a step at 3584, ISA 2026-10-04T03-31-28Z).
+    const int full = num_blocks / TILE_K * TILE_K;
+    const auto step = [&](int src0, auto last) {
       RowsF v[TILE_K];
       float sums[TILE_M * 2 * TILE_K];
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
-        if (src < num_blocks) {
+        if constexpr (!decltype(last)::value) {
+          Rows raw = sum.template like<DTYPE>();
+          tile_load(raw, blocks + src * block_stride_r, block_stride_m);
+          v[s] = raw.template to<float>();
+        } else if (src < num_blocks) {
           Rows raw = sum.template like<DTYPE>();
           tile_load(raw, blocks + src * block_stride_r, block_stride_m);
           v[s] = raw.template to<float>();
@@ -103,7 +113,9 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
 #pragma unroll
         for (int s = 1; s < TILE_K; ++s) acc = tile_fma(acc, ones, v[s], scale[s]);
       }
-    }
+    };
+    for (int src0 = 0; src0 < full; src0 += TILE_K) step(src0, std::false_type{});
+    step(full, std::true_type{});
     float inv_den[TILE_M];
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) inv_den[m] = 1.0f / softmax[m].denominator;
