@@ -67,16 +67,13 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
-        if constexpr (!decltype(last)::value) {
-          v[s] = sum.template like<DTYPE>();
-          tile_load(v[s], blocks + src * block_stride_r, block_stride_m);
-        } else if (src < num_blocks) {
-          v[s] = sum.template like<DTYPE>();
-          tile_load(v[s], blocks + src * block_stride_r, block_stride_m);
-        } else {
-          v[s] = sum.template zeros<DTYPE>();
-          if (src == num_blocks) tile_load(v[s], prefix, stride);
-        }
+        // THE LAST STEP'S SOURCE IS A BLOCK OR THE PREFIX, picked by its pointer and loaded once: a
+        // zeroed tile and a load under a branch held 16 VGPRs at the kernel's peak (ISA
+        // 2026-10-04T16-26-29Z). A padding source re-reads the prefix; its logit is -inf.
+        const bool block = !decltype(last)::value || src < num_blocks;
+        v[s]             = sum.template like<DTYPE>();
+        tile_load(v[s], block ? blocks + src * block_stride_r : prefix,
+                  block ? block_stride_m : stride);
         float ss[TILE_M], dw[TILE_M];
         partial_dot(v[s], v[s], ss);
         partial_dot(v[s], w, dw);
