@@ -43,11 +43,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   constexpr int NL = traits<DTYPE>::N;
-  // THE REDUCE-SCATTER'S CHUNK, the plain two-shot's: its rows are the ranks, a row of threads a
-  // rank (common's reduce_scatter).
+  // THE REDUCE-SCATTER'S CHUNK: its rows are the ranks, a row of threads a rank (common's
+  // reduce_scatter), and a row's whole slice at once, so a thread has every load of the row in
+  // flight (a pack a step was a round trip a pack, 95% stalled, thread trace 2026-10-04T22-41-39Z).
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
-  using Ranks = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
+  using Ranks = Tile<DTYPE, WORLD, TILE_N / WORLD, WORLD, LANES, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
