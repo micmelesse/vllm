@@ -14,17 +14,8 @@ namespace hip_comms {
 // A ROW A TILE, the grid striding over rows: each row's delta read from local memory, then the
 // tile every AttnRes kernel computes (shared/attn_res.cuh), so its instructions are the fused
 // kernels' AttnRes.
-// ITS OCCUPANCY STATED, NOT LEFT TO THE REGISTER ALLOCATOR: waves a SIMD for each build, Triton's
-// at 256 threads (3 at 7168, 6 at 3584), where they already sit at 512. Left to it, 7168 x 256
-// swung 166 -> 221 VGPRs with changes unrelated to it, 3 waves to 2 (2026-10-04T03-19-22Z).
-template <int TILE_N, int THREADS_PER_BLOCK>
-constexpr int attn_res_waves() {
-  return THREADS_PER_BLOCK == 256 ? (TILE_N > 4096 ? 3 : 6) : (TILE_N > 4096 ? 5 : 8);
-}
-
 template <typename DTYPE, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
-    __attribute__((amdgpu_waves_per_eu(attn_res_waves<TILE_N, THREADS_PER_BLOCK>())))
     add_attn_res_rms_norm(DTYPE* __restrict__ prefix, const DTYPE* __restrict__ delta,
                           DTYPE* __restrict__ blocks, int64_t block_stride_m, int64_t block_stride_r,
                           const DTYPE* __restrict__ norm_w, const DTYPE* __restrict__ qk_w,
