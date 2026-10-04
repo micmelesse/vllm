@@ -39,11 +39,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   constexpr int NL = traits<DTYPE>::N;
-  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows, a wave a row, a group a thread of this
-  // rank's columns, stepping across them (a slice wide, a thread held every peer's groups of it:
-  // 32 packs at 16384, spilling).
-  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, kWaveSize * NL,
-                     THREADS_PER_BLOCK / kWaveSize, kWaveSize>;
+  // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a TILE_N row (in whole
+  // waves), a group a thread, so a row's slice is one round trip (a wave a row took two at 7168,
+  // 0.8 us at 16-32 tokens), and as many rows at once as the block holds. A group a thread, not
+  // a slice's worth: every peer's groups of a whole slice were 32 packs at 16384, spilling.
+  constexpr int kSliceWaves = (TILE_N / WORLD / NL + kWaveSize - 1) / kWaveSize * kWaveSize;
+  constexpr int SLICE_LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
+                     THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;
   const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;

@@ -37,11 +37,14 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                                ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
   const int cols = packs * NL;  // the row, in elements
-  // A REDUCE-SCATTER TILE: THREADS_PER_BLOCK / 64 rows, a wave a row, a group a thread of this
-  // rank's columns, stepping across them (a slice wide, a thread held every peer's groups of it:
-  // 32 packs at 16384, spilling).
-  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / kWaveSize, kWaveSize * NL,
-                     THREADS_PER_BLOCK / kWaveSize, kWaveSize>;
+  // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a TILE_N row (in whole
+  // waves), a group a thread, so a row's slice is one round trip (a wave a row took two at 7168,
+  // 0.8 us at 16-32 tokens), and as many rows at once as the block holds. A group a thread, not
+  // a slice's worth: every peer's groups of a whole slice were 32 packs at 16384, spilling.
+  constexpr int kSliceWaves = (TILE_N / WORLD / NL + kWaveSize - 1) / kWaveSize * kWaveSize;
+  constexpr int SLICE_LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
+  using Slice = Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
+                     THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES>;
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
