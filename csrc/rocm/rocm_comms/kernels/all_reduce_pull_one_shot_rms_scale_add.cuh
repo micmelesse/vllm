@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     float ss[1];
     partial_dot(l, l, ss);
     block_stamp(2);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_latent + eps);
     const RowF s = peers_reduce(sh).template to<float>();

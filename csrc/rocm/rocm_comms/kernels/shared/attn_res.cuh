@@ -83,7 +83,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
           sums[(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      block_reduce<Sum>(sums);
+      block_reduce<Sum, THREADS_PER_BLOCK>(sums);
       float old_scale[TILE_M], scale[TILE_K][TILE_M];
 #pragma unroll
       for (int m = 0; m < TILE_M; ++m) {
@@ -124,7 +124,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
     tile_load(g_in, out_norm_w, 0);
     float ss[TILE_M];
     partial_dot(acc, acc, ss);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     float scale[TILE_M];
 #pragma unroll
     for (int m = 0; m < TILE_M; ++m) scale[m] = rsqrtf(ss[m] * inv_hidden + out_eps);

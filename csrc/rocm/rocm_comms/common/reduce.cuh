@@ -104,14 +104,14 @@ DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
 // One wave reducing the partials over all 64 lanes, then broadcasting them, was a second DPP pass a
 // value, a second barrier and an LDS round trip to add 4 numbers at 256 threads: half of AttnRes's
 // loop (ISA 2026-10-04T03-31-28Z). The trailing barrier keeps the next call from overwriting
-// partials still being read.
-template <typename REDUCE_OP, int NUM_VALUES>
+// partials still being read. THE BLOCK'S WAVES ARE COMPILED IN: read from blockDim, every thread
+// loaded the widest block's partials and kept 12 VGPRs at AttnRes's peak (ISA 2026-10-04T16-39-15Z).
+template <typename REDUCE_OP, int THREADS_PER_BLOCK, int NUM_VALUES>
 DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
-  constexpr int kMaxWaves = kBuild.kernels.max_waves;
-  __shared__ float partial[NUM_VALUES][kMaxWaves];
-  const int lane  = threadIdx.x % kWaveSize;
-  const int wave  = threadIdx.x / kWaveSize;
-  const int waves = (blockDim.x + kWaveSize - 1) / kWaveSize;
+  constexpr int kWaves = (THREADS_PER_BLOCK + kWaveSize - 1) / kWaveSize;
+  __shared__ float partial[NUM_VALUES][kWaves];
+  const int lane = threadIdx.x % kWaveSize;
+  const int wave = threadIdx.x / kWaveSize;
   wave_reduce<REDUCE_OP>(v);
   if (lane == 0) {
 #pragma unroll
@@ -122,8 +122,7 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
   for (int n = 0; n < NUM_VALUES; ++n) {
     float x = partial[n][0];
 #pragma unroll
-    for (int w = 1; w < kMaxWaves; ++w)
-      if (w < waves) x = REDUCE_OP::apply(x, partial[n][w]);
+    for (int w = 1; w < kWaves; ++w) x = REDUCE_OP::apply(x, partial[n][w]);
     v[n] = x;
   }
   __syncthreads();
@@ -185,7 +184,7 @@ DINLINE void block_reduce(const TILE& t, float (&out)[TILE::kRows]) {
     out[m] = x;
   }
   if constexpr (TILE::kThreadsM == 1)
-    block_reduce<REDUCE_OP>(out);
+    block_reduce<REDUCE_OP, TILE::kThreads>(out);
   else if constexpr (TILE::kThreadsN == kWaveSize)
     wave_reduce<REDUCE_OP>(out);
   else

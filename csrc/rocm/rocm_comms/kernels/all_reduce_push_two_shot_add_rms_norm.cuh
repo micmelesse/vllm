@@ -102,7 +102,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     tile_load(w, weight, 0);
     float ss[1];
     partial_dot(s, s, ss);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
     Row normed = tile_mul(tile_mul(s, scale).template to<WEIGHT_DTYPE>().template to<float>(),

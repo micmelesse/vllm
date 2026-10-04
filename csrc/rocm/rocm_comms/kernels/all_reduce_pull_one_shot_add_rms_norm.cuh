@@ -62,7 +62,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     tile_load(w, weight, 0);
     float ss[1];
     partial_dot(s, s, ss);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds

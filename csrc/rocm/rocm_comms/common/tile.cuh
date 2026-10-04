@@ -65,8 +65,8 @@ struct Tile {
   // nothing reading it branches: a load under a runtime `if` cannot be hoisted past the branch, and
   // loads meant to be in flight together then wait one at a time).
   // WHETHER THIS THREAD HOLDS ANY OF THE TILE: a layout may cover fewer threads than the block (a
-  // reduction's one row, the first THREADS_N's); the others load and store nothing. Free when the
-  // layout is the block, which the launch bounds tell the compiler.
+  // reduction's one row, the first THREADS_N's); the others store nothing. A runtime compare even
+  // when the layout is the block (the launch bounds do not fold it), so loads do not branch on it.
   DINLINE bool participates() const { return static_cast<int>(threadIdx.x) < kThreads; }
   DINLINE int lane() const { return static_cast<int>(threadIdx.x) % THREADS_N; }
   DINLINE int col(int k) const {

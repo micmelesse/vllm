@@ -88,7 +88,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     }
     float ss[1];
     partial_dot(s, s, ss);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW: every rank norms it while

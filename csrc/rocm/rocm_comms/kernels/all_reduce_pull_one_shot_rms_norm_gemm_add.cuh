@@ -49,7 +49,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     tile_load(wk, norm_w, 0);  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
-    block_reduce<Sum>(ss);
+    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     const RowF w = wk.template to<float>();
     // out = T(T(s * scale) * float(w)), as the reference rounds

@@ -58,10 +58,13 @@ namespace impl {
 // global_store take with the base in scalar registers (saddr), so every tensor sharing the
 // columns shares one offset register. A signed column added to the pointer was a 64-bit vector
 // address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness, 2026-10-04T15-28-51Z).
+// THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so the 64-bit sum is not hoisted
+// and held a tensor a pack (an add a load; AttnRes 90 -> 70 VGPRs, 2026-10-04 compile).
 template <typename PACK, typename TILE>
 DINLINE PACK* at_col(PACK* row, const TILE& t, int k) {
-  using Byte = std::conditional_t<std::is_const_v<PACK>, const char, char>;
-  const uint32_t offset = static_cast<uint32_t>(t.col(k)) * uint32_t{sizeof(PACK)};
+  using Byte      = std::conditional_t<std::is_const_v<PACK>, const char, char>;
+  uint32_t offset = static_cast<uint32_t>(t.col(k)) * uint32_t{sizeof(PACK)};
+  asm volatile("" : "+v"(offset));
   return reinterpret_cast<PACK*>(reinterpret_cast<Byte*>(row) + offset);
 }
 template <typename PACK>
@@ -93,11 +96,14 @@ DINLINE typename TILE::Pack pack(const TILE& t, int m, int k) {
 }
 }  // namespace impl
 
+// A LOAD NEVER BRANCHES: a thread outside a narrow tile loads its clamped, in-bounds place and
+// its values go unused. Under participates() the load was an exec branch, so every tile's old
+// registers stayed live across AttnRes's loops (threadIdx < 256 is not folded from the launch
+// bounds; ISA 2026-10-04T16-39-15Z).
 template <typename TILE>
 DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
                          int64_t row_stride) {
   using P = typename TILE::Pack;
-  if (!t.participates()) return;
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {

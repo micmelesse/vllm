@@ -42,7 +42,7 @@
 //   peers_reduce(tiles[WORLD]) -> tile           summed in rank order in fp32, rounded once
 //   block_reduce<Op, Axis::m>(tile) -> one row, block_reduce<Op, Axis::n>(tile, out[rows])   a
 //                         tile reduced over its rows or each row over its columns
-//   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
+//   wave_reduce<Op, N>(v), block_reduce<Op, THREADS_PER_BLOCK>(v)   N values at once; Op is Sum or Max
 // dot.cuh
 //   partial_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
 //                                                one row, a weight)
