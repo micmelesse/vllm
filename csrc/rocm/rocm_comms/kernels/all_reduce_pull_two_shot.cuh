@@ -67,9 +67,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
        offs_n += gridDim.x * Ranks::kTileN) {
     Ranks got{WORLD, slice, 0, offs_n};
-    tile_gather(got, scratch);
-    tile_scatter([&](int w) { return out + rotated(w) * slice; },
-                 [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); }, got);
+    all_gather(got, scratch, [&](int w) { return out + rotated(w) * slice; },
+               [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); });
   }
   block_stamp(5);
   sync.finish();
@@ -136,8 +135,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < slice;
          offs_n += gridDim.x * Ranks::kTileN) {
       Ranks got{WORLD, slice, 0, offs_n};
-      tile_gather(got, scratch);
-      tile_scatter([&](int w) { return out + at + rotated(w) * slice; }, slice_n, got);
+      all_gather(got, scratch, [&](int w) { return out + at + rotated(w) * slice; }, slice_n);
     }
     block_stamp(5);
   }
