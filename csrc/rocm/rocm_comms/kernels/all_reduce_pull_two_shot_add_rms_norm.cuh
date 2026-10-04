@@ -25,9 +25,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
-  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
+  using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int slice_rows   = (rows + WORLD - 1) / WORLD;
   // ADD_RESIDUAL: each owned row's RMS scale, a float a row, after the rows in scratch.
@@ -137,7 +137,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const auto gathered = [&](int r) { return scratches[r]; };
   // A CHUNK A GROUP A THREAD, stepping across the row: every owner's chunk in flight is WORLD packs
   // a thread, as the pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
-  using Chunk  = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK>;
+  using Chunk  = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using ChunkW = TileAs<Chunk, WEIGHT_DTYPE>;
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     float sc[WORLD];

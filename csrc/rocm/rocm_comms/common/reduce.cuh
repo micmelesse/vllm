@@ -137,14 +137,14 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
 enum class Axis { m, n };
 
 template <typename REDUCE_OP, Axis AXIS, typename TILE>
-DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> block_reduce(
+DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kThreadsPerBlock, float> block_reduce(
     const TILE& t) {
   static_assert(AXIS == Axis::m, "a row's reduction (Axis::n) writes `out`");
   static_assert(TILE::kRows == 1, "a thread holds one row of the rows reduced");
   constexpr int kRowLanes = TILE::kThreadsM;
   using Acc = typename TILE::Acc;
   __shared__ Acc part[kRowLanes][TILE::kTileN];
-  Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, float> out{1, t.N, 0, t.offs_n};
+  Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kThreadsPerBlock, float> out{1, t.N, 0, t.offs_n};
   const int lane_row = static_cast<int>(threadIdx.x) / TILE::kThreadsN;
 #pragma unroll
   for (int k = 0; k < TILE::K; ++k)

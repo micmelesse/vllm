@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
                  uint64_t timeout_ticks, int mode, int peer, int pullers, int64_t packs,
                  uint32_t* sink) {
   constexpr int THREADS = kBuild.kernels.max_threads;
-  using Chunk           = Tile<DTYPE, 1, THREADS * traits<DTYPE>::N, 1, THREADS>;
+  using Chunk           = Tile<DTYPE, 1, THREADS * traits<DTYPE>::N, 1, THREADS, THREADS>;
   const auto traffic    = static_cast<Traffic>(mode);
   const bool split      = traffic == Traffic::split;
   const bool puller     = static_cast<int>(blockIdx.x) < pullers;

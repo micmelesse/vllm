@@ -30,7 +30,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
-  using Ranks     = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES>;
+  using Ranks     = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
   const int len   = num_packs * NL;                              // the buffer, in elements
   const int slice = (num_packs + WORLD - 1) / WORLD * NL;        // a rank's, in elements
   const int first = rank * slice;
@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
-  using Ranks        = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES>;
+  using Ranks        = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
   const int64_t pass = min(stage_packs, scratch_packs * WORLD);
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);

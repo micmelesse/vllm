@@ -19,7 +19,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(const PeerPtrs* __restrict__ peer_inputs,
                              PeerSignals peer_signals, Signal* self_signal, int rank,
                              uint64_t timeout_ticks, DTYPE* __restrict__ out, int num_packs) {
-  using Chunk   = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
+  using Chunk   = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int len = num_packs * traits<DTYPE>::N;  // the buffer, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     Signal* self_signal, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
-  using Chunk            = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK>;
+  using Chunk            = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   constexpr int NL       = traits<DTYPE>::N;
   const auto stagings    = rank_stagings<DTYPE, WORLD>(peer_staging);
   const auto own_staging = rank_staging<DTYPE, WORLD>(peer_staging, rank);

@@ -28,16 +28,20 @@ namespace hip_comms {
 //                      TILE_N elements: THREADS_N threads share a row's columns, every THREADS_N-th
 //                      group each, and THREADS_M rows go at once. 1 x the block for a norm, reducing
 //                      along the row; 8 x 64 (a wave a row) for a narrow slice of many rows.
-//                      Compile-time, since it sizes the registers; THREADS_M x THREADS_N is the block
+//                      Compile-time, since it sizes the registers
+//   THREADS_PER_BLOCK  the kernel's block: a layout of all of it holds a place in every thread, so
+//                      nothing compares threadIdx (the launch bounds do not tell the compiler)
 //   ACC_DTYPE          what the elements are held as: DTYPE as loaded, float for the math
 //                      (`to<float>()` keeps every element where it is), or a weight's own dtype
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          typename ACC_DTYPE = DTYPE>
+          int THREADS_PER_BLOCK, typename ACC_DTYPE = DTYPE>
 struct Tile {
   static constexpr int kPack     = traits<DTYPE>::N;                  // elements in a group
   static constexpr int kTileM   = TILE_M;  // the chunk, rows x columns in elements
   static constexpr int kTileN   = TILE_N;
-  static constexpr int kThreads = THREADS_M * THREADS_N;  // the block
+  static constexpr int kThreads = THREADS_M * THREADS_N;  // the layout's
+  static constexpr int kThreadsPerBlock = THREADS_PER_BLOCK;
+  static_assert(kThreads <= THREADS_PER_BLOCK, "a layout is the block's threads or fewer");
   static constexpr int kThreadsM = THREADS_M;
   static constexpr int kThreadsN = THREADS_N;
   static_assert(TILE_M % THREADS_M == 0, "a tile's rows are whole for every row of threads");
@@ -65,9 +69,12 @@ struct Tile {
   // nothing reading it branches: a load under a runtime `if` cannot be hoisted past the branch, and
   // loads meant to be in flight together then wait one at a time).
   // WHETHER THIS THREAD HOLDS ANY OF THE TILE: a layout may cover fewer threads than the block (a
-  // reduction's one row, the first THREADS_N's); the others store nothing. A runtime compare even
-  // when the layout is the block (the launch bounds do not fold it), so loads do not branch on it.
-  DINLINE bool participates() const { return static_cast<int>(threadIdx.x) < kThreads; }
+  // reduction's one row, the first THREADS_N's); the others store nothing. A compare only for a
+  // layout narrower than the block, and loads do not branch on it either way.
+  DINLINE bool participates() const {
+    if constexpr (kThreads == THREADS_PER_BLOCK) return true;
+    else return static_cast<int>(threadIdx.x) < kThreads;
+  }
   DINLINE int lane() const { return static_cast<int>(threadIdx.x) % THREADS_N; }
   DINLINE int col(int k) const {
     const int n = offs_n / kPack + lane() + k * THREADS_N;
@@ -87,7 +94,7 @@ struct Tile {
 
   // The same place held as AS_DTYPE, its elements converted (rounded once), unset, or zero.
   template <typename AS_DTYPE>
-  using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, AS_DTYPE>;
+  using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, AS_DTYPE>;
   template <typename AS_DTYPE>
   DINLINE As<AS_DTYPE> like() const {
     return As<AS_DTYPE>(M, N, offs_m, offs_n, row_step);
@@ -122,8 +129,9 @@ template <typename TILE, typename AS_DTYPE>
 using TileAs = typename TILE::template As<AS_DTYPE>;
 template <typename X>
 struct is_tile : std::false_type {};
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, typename ACC_DTYPE>
-struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, ACC_DTYPE>>
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
+          int THREADS_PER_BLOCK, typename ACC_DTYPE>
+struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>>
     : std::true_type {};
 
 }  // namespace hip_comms

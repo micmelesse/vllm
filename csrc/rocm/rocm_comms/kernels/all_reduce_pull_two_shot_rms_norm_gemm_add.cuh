@@ -23,8 +23,8 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     const DTYPE* __restrict__ norm_w, float eps, const DTYPE* __restrict__ gemm_w, int n_cols,
     DTYPE* __restrict__ out, int64_t out_stride, DTYPE* __restrict__ workspace, int rows, int packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
   const int cols = packs * NL;  // the row, in elements
   const int slice_rows   = (rows + WORLD - 1) / WORLD;
@@ -78,7 +78,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   //    BEFORE ANY IS STORED (the compiler cannot prove the output and the peers' scratch apart, so
   //    a store between two loads held the next load back, and the eight owners' round trips ran one
   //    after another).
-  using Chunk = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK>;  // WORLD packs a thread
+  using Chunk = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;  // WORLD packs a thread
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x)
     for (int c = 0; c < cols; c += Chunk::kTileN) {
       Chunk got[WORLD];
@@ -101,7 +101,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 6. The GEMM over every row, TILE_M per pass.
   for (int r0 = 0; r0 < rows; r0 += TILE_M) {
-    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL>(workspace + int64_t{r0} * cols, cols,
+    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL, THREADS_PER_BLOCK>(workspace + int64_t{r0} * cols, cols,
                                                      min(TILE_M, rows - r0), cols, gemm_w, n_cols,
                                                      out + r0 * out_stride, out_stride);
   }

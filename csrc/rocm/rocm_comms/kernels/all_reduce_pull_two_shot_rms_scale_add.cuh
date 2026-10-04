@@ -26,8 +26,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
   constexpr int NL       = traits<DTYPE>::N;
-  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
-  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
+  using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   const int packs        = 2 * hidden_packs + latent_packs;
   const int hidden       = hidden_packs * NL;  // in elements
   const int64_t stride   = int64_t{packs} * NL;

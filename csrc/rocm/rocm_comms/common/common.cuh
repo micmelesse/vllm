@@ -21,7 +21,7 @@
 //                   registers, LDS), kDevice / kTarget, kWaveSize
 // build.cuh         the build: kBuild, what is compiled for the device, fixed at compile time
 // tile.cuh
-//   Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n,
+//   Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE = DTYPE>{M, N, offs_m, offs_n,
 //                         row_step = 1}   a chunk of an M x N tensor, the block's: TILE_M rows from
 //                         offs_m (every row_step-th) x TILE_N columns from offs_n, the block's
 //                         threads over it THREADS_M x THREADS_N (the layout), and this thread's
@@ -46,7 +46,7 @@
 // dot.cuh
 //   partial_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
 //                                                one row, a weight)
-//   grid_gemm<TILE_M, TILE_K, SLICE_K, ACCUMULATE>(x, x_stride, rows, cols, w, n_cols, out, stride)  the
+//   grid_gemm<TILE_M, TILE_K, SLICE_K, ACCUMULATE, THREADS_PER_BLOCK>(x, x_stride, rows, cols, w, n_cols, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its tile (TILE_M rows, TILE_K, SLICE_K;
 //                                               gemm_max_threads)

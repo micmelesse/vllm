@@ -84,7 +84,8 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 // kWaveSize / SLICE_K columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, typename DTYPE>
+template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
+          typename DTYPE>
 DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
                        const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
                        int64_t out_stride) {
@@ -98,7 +99,7 @@ DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
   __shared__ V xs[TILE_M][TILE_K];
   const int lane   = threadIdx.x % kWaveSize;
   const int wave   = threadIdx.x / kWaveSize;
-  const int waves  = blockDim.x / kWaveSize;
+  constexpr int waves = THREADS_PER_BLOCK / kWaveSize;
   const int column = lane % kTile;
   const int splits = waves * SLICE_K;
   const int split = wave * SLICE_K + lane / kTile;
@@ -113,7 +114,7 @@ DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
     for (int k0 = 0; k0 < packs; k0 += TILE_K) {
       const int chunk = min(TILE_K, packs - k0);
       // Rows past `rows` are never staged; their sums read stale LDS and are never stored.
-      for (int i = threadIdx.x; i < rows * chunk; i += blockDim.x)
+      for (int i = threadIdx.x; i < rows * chunk; i += THREADS_PER_BLOCK)
         xs[i / chunk][i % chunk] = row(i / chunk)[k0 + i % chunk];
       __syncthreads();
       for (int k = split; k < chunk; k += splits) {
@@ -142,7 +143,7 @@ DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
       for (int r = 0; r < TILE_M; ++r) partial[wave][r][column] = acc[r];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < TILE_M * kTile; i += blockDim.x) {
+    for (int i = threadIdx.x; i < TILE_M * kTile; i += THREADS_PER_BLOCK) {
       const int r   = i / kTile;
       const int col = tile * kTile + i % kTile;
       if (r < rows && col < n_cols) {
