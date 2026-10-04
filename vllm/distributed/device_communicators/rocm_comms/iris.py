@@ -140,6 +140,7 @@ class IrisCommunicator(Communicator):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         assert self._shmem is not None
         try:

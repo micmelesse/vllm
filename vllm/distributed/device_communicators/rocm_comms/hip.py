@@ -101,6 +101,7 @@ class HipCommunicator(Communicator):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         if self.disabled:
             return Error.disabled
@@ -113,6 +114,7 @@ class HipCommunicator(Communicator):
                 direction,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         )
 
@@ -124,6 +126,7 @@ class HipCommunicator(Communicator):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce(
@@ -134,6 +137,7 @@ class HipCommunicator(Communicator):
             direction,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _check_all_reduce_rms_norm(
@@ -146,6 +150,7 @@ class HipCommunicator(Communicator):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         if self.disabled:
             return Error.disabled
@@ -161,6 +166,7 @@ class HipCommunicator(Communicator):
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         )
 
@@ -175,6 +181,7 @@ class HipCommunicator(Communicator):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
             self._handle,
@@ -187,6 +194,7 @@ class HipCommunicator(Communicator):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _all_reduce_add_rms_norm(
@@ -202,6 +210,7 @@ class HipCommunicator(Communicator):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         """The normed result into `out`, the sum plus residual into `residual_out`."""
         torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
@@ -217,6 +226,7 @@ class HipCommunicator(Communicator):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _check_all_reduce_add_attn_res_rms_norm(
@@ -230,6 +240,7 @@ class HipCommunicator(Communicator):
         reduce_scatter_blocks: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         if self.disabled:
             return Error.disabled
@@ -246,6 +257,7 @@ class HipCommunicator(Communicator):
                 reduce_scatter_blocks,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         )
 
@@ -271,6 +283,7 @@ class HipCommunicator(Communicator):
         reduce_scatter_blocks: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
@@ -294,6 +307,7 @@ class HipCommunicator(Communicator):
             reduce_scatter_blocks,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _check_all_reduce_rms_norm_gemm(
@@ -309,6 +323,7 @@ class HipCommunicator(Communicator):
         slice_k: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         if self.disabled:
             return Error.disabled
@@ -327,6 +342,7 @@ class HipCommunicator(Communicator):
                 slice_k,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         )
 
@@ -346,6 +362,7 @@ class HipCommunicator(Communicator):
         slice_k: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         op = (
             torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm_gemm_add
@@ -369,6 +386,7 @@ class HipCommunicator(Communicator):
             slice_k,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _check_all_reduce_rms_scale_add(
@@ -380,6 +398,7 @@ class HipCommunicator(Communicator):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         if self.disabled:
             return Error.disabled
@@ -394,6 +413,7 @@ class HipCommunicator(Communicator):
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         )
 
@@ -407,6 +427,7 @@ class HipCommunicator(Communicator):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
             self._handle,
@@ -418,6 +439,7 @@ class HipCommunicator(Communicator):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
 
     def _on_close(self) -> None:

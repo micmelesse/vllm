@@ -31,6 +31,7 @@ def add_attn_res_rms_norm(
     tile_k: int | None = None,
     threads_per_block: int | None = None,
     blocks_per_grid: int | None = None,
+    waves_per_eu: int | None = None,
 ) -> torch.Tensor:
     """Triton's `attn_res` with a delta (`vllm/models/kimi_k3/amd/ops/attn_res.py`), on
     our AttnRes kernel: `prefix += delta` in place, then the output. The config fields
@@ -54,5 +55,6 @@ def add_attn_res_rms_norm(
         tile_k,
         threads_per_block,
         blocks_per_grid,
+        waves_per_eu,
     )
     return out

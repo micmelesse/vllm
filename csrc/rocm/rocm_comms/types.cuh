@@ -370,6 +370,7 @@ struct AllReduceLaunch {
   int world;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   bool staged;
   hipStream_t stream;
   void* out;
@@ -387,6 +388,7 @@ struct AllReduceRmsNormLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* out;
   const void* inp;
@@ -406,6 +408,7 @@ struct AllReduceAddRmsNormLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* out;
   void* residual_out;
@@ -432,6 +435,7 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int tile_k;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   int reduce_scatter_blocks;
   hipStream_t stream;
   void* prefix;
@@ -465,6 +469,7 @@ struct AllReduceRmsNormGemmLaunch {
   int slice_k;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* out;
   int64_t out_stride;
@@ -490,6 +495,7 @@ struct AllReduceRmsNormGemmAddLaunch {
   int slice_k;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* out;
   int64_t out_stride;
@@ -513,6 +519,7 @@ struct AllReduceRmsScaleAddLaunch {
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* out;
   const void* inp;
@@ -533,6 +540,7 @@ struct AddAttnResRmsNormLaunch {
   int tile_k;
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
   hipStream_t stream;
   void* prefix;
   void* out;

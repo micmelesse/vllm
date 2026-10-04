@@ -253,10 +253,11 @@ class Communicator(ABC):
         direction: str | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce(inp)` runs here."""
         ran = self._check_all_reduce(
-            inp, algorithm, direction, threads_per_block, blocks_per_grid
+            inp, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu
         )
         return not isinstance(ran, Error)
 
@@ -269,19 +270,26 @@ class Communicator(ABC):
         direction: str | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, Ran]:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
         picks among a backend's own paths (hip's in C++), never whether it is ours.
         Returns the sum and what ran."""
         ran = self._check_all_reduce(
-            inp, algorithm, direction, threads_per_block, blocks_per_grid
+            inp, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
         out = torch.empty_like(inp)
         if not self._warming_up():
             self._all_reduce(
-                out, inp, algorithm, direction, threads_per_block, blocks_per_grid
+                out,
+                inp,
+                algorithm,
+                direction,
+                threads_per_block,
+                blocks_per_grid,
+                waves_per_eu,
             )
         return out, ran
 
@@ -296,6 +304,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_rms_norm(inp, weight, ...)` runs here."""
         ran = self._check_all_reduce_rms_norm(
@@ -307,6 +316,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -322,6 +332,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, Ran]:
         """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel. Returns
         the normed sum and what ran."""
@@ -334,6 +345,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -349,6 +361,7 @@ class Communicator(ABC):
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         return out, ran
 
@@ -363,6 +376,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(inp, ..., weight, ...)` runs here."""
         ran = self._check_all_reduce_rms_norm(
@@ -374,6 +388,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -390,6 +405,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
         one kernel. Returns the normed result, the sum plus residual, and what ran."""
@@ -402,6 +418,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -419,6 +436,7 @@ class Communicator(ABC):
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         return out, residual_out, ran
 
@@ -435,6 +453,7 @@ class Communicator(ABC):
         reduce_scatter_blocks: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(inp, ...)` runs here."""
         ran = self._check_all_reduce_add_attn_res_rms_norm(
@@ -447,6 +466,7 @@ class Communicator(ABC):
             reduce_scatter_blocks,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -472,6 +492,7 @@ class Communicator(ABC):
         reduce_scatter_blocks: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
         """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
         `prefix` the sum starting one. Returns the prefix (updated in place when given),
@@ -487,6 +508,7 @@ class Communicator(ABC):
             reduce_scatter_blocks,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -516,6 +538,7 @@ class Communicator(ABC):
             reduce_scatter_blocks,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return prefix_out, out, ran
 
@@ -533,6 +556,7 @@ class Communicator(ABC):
         slice_k: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_rms_norm_gemm(inp, ..., gemm_weight, ...)` runs here;
         `gemm_weight` is [N, hidden], and its N shapes the launch."""
@@ -548,6 +572,7 @@ class Communicator(ABC):
             slice_k,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -568,6 +593,7 @@ class Communicator(ABC):
         slice_k: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> Ran:
         """`out = rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
@@ -584,6 +610,7 @@ class Communicator(ABC):
             slice_k,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -603,6 +630,7 @@ class Communicator(ABC):
                 slice_k,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         return ran
 
@@ -620,6 +648,7 @@ class Communicator(ABC):
         slice_k: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_rms_norm_gemm_add(inp, ..., gemm_weight, ...)` runs here;
         `gemm_weight` is [N, hidden], and its N shapes the launch."""
@@ -635,6 +664,7 @@ class Communicator(ABC):
             slice_k,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -655,6 +685,7 @@ class Communicator(ABC):
         slice_k: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> Ran:
         """`out += rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
         kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
@@ -671,6 +702,7 @@ class Communicator(ABC):
             slice_k,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -690,6 +722,7 @@ class Communicator(ABC):
                 slice_k,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         return ran
 
@@ -704,6 +737,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce_rms_scale_add(inp, out, ...)` runs here: `out` [rows,
         hidden] from `inp`'s row [shared | projected | latent]."""
@@ -715,6 +749,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -730,6 +765,7 @@ class Communicator(ABC):
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
+        waves_per_eu: int | None = None,
     ) -> Ran:
         """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
         + projected * rsqrt(mean(latent^2) + eps)` in one kernel. Returns what ran."""
@@ -741,6 +777,7 @@ class Communicator(ABC):
             tile_n,
             threads_per_block,
             blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -754,6 +791,7 @@ class Communicator(ABC):
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
+                waves_per_eu,
             )
         return ran
 
@@ -842,6 +880,7 @@ class Communicator(ABC):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         """By default (torch, iris) the build's envelope, so a control admits what our
         kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
@@ -853,6 +892,7 @@ class Communicator(ABC):
             or direction is not None
             or threads_per_block is not None
             or blocks_per_grid is not None
+            or waves_per_eu is not None
         ):
             return Error.no_such_template
         if not _is_weak_contiguous(inp):
@@ -862,7 +902,7 @@ class Communicator(ABC):
             return Error.row_not_packs
         if inp.dtype not in built.dtypes:
             return Error.dtype_not_built
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
     @abstractmethod
     def _all_reduce(
@@ -873,6 +913,7 @@ class Communicator(ABC):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         """SUM across ranks into `out`, which the base allocated: input untouched.
         Assume `inp` is admitted -- the base checked."""
@@ -887,6 +928,7 @@ class Communicator(ABC):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         return Error.no_such_op
 
@@ -901,6 +943,7 @@ class Communicator(ABC):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms_norm"
@@ -919,6 +962,7 @@ class Communicator(ABC):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm"
@@ -935,6 +979,7 @@ class Communicator(ABC):
         reduce_scatter_blocks: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         return Error.no_such_op
 
@@ -960,6 +1005,7 @@ class Communicator(ABC):
         reduce_scatter_blocks: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes"
@@ -978,6 +1024,7 @@ class Communicator(ABC):
         slice_k: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         return Error.no_such_op
 
@@ -997,6 +1044,7 @@ class Communicator(ABC):
         slice_k: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         raise NotImplementedError(f"{type(self).__name__} has no fused GEMM tail")
 
@@ -1009,6 +1057,7 @@ class Communicator(ABC):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> Ran | Error:
         return Error.no_such_op
 
@@ -1022,6 +1071,7 @@ class Communicator(ABC):
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + rms scale + add"

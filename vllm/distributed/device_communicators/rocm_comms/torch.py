@@ -45,6 +45,7 @@ class TorchCommunicator(Communicator):
         direction: str | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
+        waves_per_eu: int | None,
     ) -> None:
         out.copy_(inp)
         dist.all_reduce(out, group=self.device_group)  # SUM

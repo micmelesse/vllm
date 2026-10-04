@@ -1868,9 +1868,11 @@ def test_build_info_lists_every_template_with_its_configs() -> None:
         if t.op == "all_reduce":
             for c in t.configs:
                 assert c["threads_per_block"] > 0 and c.get("tile_n", 0) == 0, (name, c)
+                assert c["waves_per_eu"] >= 1, (name, c)
             continue
         for c in t.configs:
             assert c["threads_per_block"] > 0 and c["blocks_per_grid"] > 0, (name, c)
+            assert c["waves_per_eu"] >= 1, (name, c)
             assert c.get("tile_n", 0) > 0, (name, c)
 
 

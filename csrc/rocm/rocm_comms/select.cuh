@@ -660,6 +660,7 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
                                              std::optional<Direction> direction,
                                              std::optional<int> threads_per_block,
                                              std::optional<int> blocks_per_grid,
+                                             std::optional<int> waves_per_eu,
                                              std::initializer_list<std::optional<int>> fields,
                                              CONFIG_TYPE config) {
   if (direction && !algorithm) return Error::direction_without_algorithm;
@@ -670,6 +671,10 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
                    *threads_per_block < kWaveSize ||
                    *threads_per_block > kBuild.kernels.max_threads ||
                    *threads_per_block % kWaveSize != 0))
+    return Error::launch_out_of_range;
+  if (waves_per_eu && !launched) return Error::field_without_launch;
+  if (waves_per_eu && (*waves_per_eu < 1 ||
+                       *waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu))
     return Error::launch_out_of_range;
   for (const std::optional<int>& f : fields) {
     if (f && !launched) return Error::field_without_launch;
@@ -684,7 +689,7 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
   if (!fn && templates_of(o) == 1) fn = only_template(o);
   if (!fn) return Error::config_without_algorithm;
   const std::variant<KernelConfig, Error> c =
-      config(LaunchConfig{*threads_per_block, *blocks_per_grid, 0}, *fn);
+      config(LaunchConfig{*threads_per_block, *blocks_per_grid, waves_per_eu.value_or(0)}, *fn);
   if (const Error* e = std::get_if<Error>(&c)) return *e;
   return Forced{{*fn, std::get<KernelConfig>(c)}};
 }
@@ -909,11 +914,13 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, void* out, const void* inp, int64_t bytes, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> waves_per_eu,
     hipStream_t stream) {
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid, {},
+      forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid,
+             waves_per_eu, {},
              [](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return AllReduceConfig{l};
              });
@@ -972,6 +979,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                           .world             = world,
                           .threads_per_block = g.threads_per_block,
                           .blocks_per_grid   = g.blocks_per_grid,
+                          .waves_per_eu      = g.waves_per_eu,
                           .staged            = staged,
                           .stream            = stream,
                           .out               = out,
@@ -990,13 +998,13 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
     DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   using K         = Template;
   const OpType op = OpType::all_reduce_rms_norm;
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_n},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return RowConfig{l, own(tile_n)};
              });
@@ -1059,6 +1067,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .tile_n            = r.tile_n,
                                  .threads_per_block = r.launch.threads_per_block,
                                  .blocks_per_grid   = r.launch.blocks_per_grid,
+                                 .waves_per_eu      = r.launch.waves_per_eu,
                                  .stream            = stream,
                                  .out               = out,
                                  .inp               = inp,
@@ -1080,13 +1089,13 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
     const void* weight, DType dtype, DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   using K         = Template;
   const OpType op = OpType::all_reduce_add_rms_norm;
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_n},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return RowConfig{l, own(tile_n)};
              });
@@ -1149,6 +1158,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
                                     .tile_n            = r.tile_n,
                                     .threads_per_block = r.launch.threads_per_block,
                                     .blocks_per_grid   = r.launch.blocks_per_grid,
+                                    .waves_per_eu      = r.launch.waves_per_eu,
                                     .stream            = stream,
                                     .out               = out,
                                     .residual_out      = residual_out,
@@ -1178,13 +1188,13 @@ select_all_reduce_add_attn_res_rms_norm(
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   using K         = Template;
   const OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
              {tile_m, tile_n, tile_k, reduce_scatter_blocks},
              [&](LaunchConfig l, Template t) -> std::variant<KernelConfig, Error> {
                if (t == K::all_reduce_pull_two_shot_add_attn_res_rms_norm)
@@ -1270,6 +1280,7 @@ select_all_reduce_add_attn_res_rms_norm(
                                            .tile_k                = tk,
                                            .threads_per_block     = g.threads_per_block,
                                            .blocks_per_grid       = g.blocks_per_grid,
+                                           .waves_per_eu          = g.waves_per_eu,
                                            .reduce_scatter_blocks = rs,
                                            .stream                = stream,
                                            .prefix                = prefix,
@@ -1303,13 +1314,13 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
     int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   using K         = Template;
   const OpType op = OpType::all_reduce_rms_norm_gemm;
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
              {tile_m, tile_n, tile_k, slice_k},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return GemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
@@ -1362,6 +1373,7 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
                                      .slice_k           = g.slice_k,
                                      .threads_per_block = g.launch.threads_per_block,
                                      .blocks_per_grid   = g.launch.blocks_per_grid,
+                                     .waves_per_eu      = g.launch.waves_per_eu,
                                      .stream            = stream,
                                      .out               = out,
                                      .out_stride        = out_stride,
@@ -1387,13 +1399,13 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   using K         = Template;
   const OpType op = OpType::all_reduce_rms_norm_gemm_add;
   const int world = h.world_size();
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid,
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
              {tile_m, tile_n, tile_k, slice_k},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return GemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
@@ -1446,6 +1458,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
                                         .slice_k           = g.slice_k,
                                         .threads_per_block = g.launch.threads_per_block,
                                         .blocks_per_grid   = g.launch.blocks_per_grid,
+                                        .waves_per_eu      = g.launch.waves_per_eu,
                                         .stream            = stream,
                                         .out               = out,
                                         .out_stride        = out_stride,
@@ -1472,6 +1485,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
     int64_t latent, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> waves_per_eu,
     hipStream_t stream) {
   using K           = Template;
   const OpType op   = OpType::all_reduce_rms_scale_add;
@@ -1479,7 +1493,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   const int64_t row = 2 * hidden + latent;
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, {tile_n},
+      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_n},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return RowConfig{l, own(tile_n)};
              });
@@ -1535,6 +1549,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
                                      .tile_n            = r.tile_n,
                                      .threads_per_block = r.launch.threads_per_block,
                                      .blocks_per_grid   = r.launch.blocks_per_grid,
+                                     .waves_per_eu      = r.launch.waves_per_eu,
                                      .stream            = stream,
                                      .out               = out,
                                      .inp               = inp,
@@ -1560,12 +1575,13 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
     const void* out_norm_weight, DType dtype, int64_t rows, int64_t hidden, int num_blocks,
     int write_idx, float eps, float out_eps, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, hipStream_t stream) {
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   const OpType op = OpType::add_attn_res_rms_norm;
   const int world = 1;
   // 1.
   const std::variant<Forced, Error> forcing =
-      forced(op, std::nullopt, std::nullopt, threads_per_block, blocks_per_grid, {tile_n, tile_k},
+      forced(op, std::nullopt, std::nullopt, threads_per_block, blocks_per_grid, waves_per_eu,
+             {tile_n, tile_k},
              [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
                return AttnResConfig{l, own(tile_n), own(tile_k)};
              });
@@ -1601,6 +1617,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
                                  .tile_k            = a.tile_k,
                                  .threads_per_block = a.launch.threads_per_block,
                                  .blocks_per_grid   = a.launch.blocks_per_grid,
+                                 .waves_per_eu      = a.launch.waves_per_eu,
                                  .stream            = stream,
                                  .prefix            = prefix,
                                  .out               = out,
