@@ -26,8 +26,6 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, float>;
   const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  using V                = typename traits<DTYPE>::V;
-  V* normed              = reinterpret_cast<V*>(workspace);
   const int cols = packs * NL;  // the row, in elements
   const int slice_rows   = (rows + WORLD - 1) / WORLD;
 
@@ -103,9 +101,9 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 6. The GEMM over every row, TILE_M per pass.
   for (int r0 = 0; r0 < rows; r0 += TILE_M) {
-    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL, DTYPE>([&](int r) { return normed + (r0 + r) * packs; },
-                                                min(TILE_M, rows - r0), gemm_w, n_cols, packs,
-                                                out + r0 * out_stride, out_stride);
+    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL>(workspace + int64_t{r0} * cols, cols,
+                                                     min(TILE_M, rows - r0), cols, gemm_w, n_cols,
+                                                     out + r0 * out_stride, out_stride);
   }
   block_stamp(6);
 }

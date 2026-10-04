@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE ELEMENTWISE OPS, at thread scope: TILE MATH, on float tiles (a fused op spells each rounding
-// its reference does as a to<>() between them), and the one-pack forms the flat loops still use.
+// its reference does as a to<>() between them).
 
 #pragma once
 
@@ -66,21 +66,6 @@ DINLINE A tile_mul(const A& a, float scale) {
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m) row_scale[m] = scale;
   return tile_mul(a, row_scale);
-}
-
-// A pack as fp32, and fp32 rounded once back to a pack of T.
-template <typename DTYPE>
-DINLINE void thread_unpack(const typename traits<DTYPE>::V& v, float (&x)[traits<DTYPE>::N]) {
-#pragma unroll
-  for (int j = 0; j < traits<DTYPE>::N; ++j) x[j] = static_cast<float>(v.d[j]);
-}
-
-template <typename DTYPE>
-DINLINE typename traits<DTYPE>::V thread_pack(const float (&x)[traits<DTYPE>::N]) {
-  typename traits<DTYPE>::V v;
-#pragma unroll
-  for (int j = 0; j < traits<DTYPE>::N; ++j) v.d[j] = static_cast<DTYPE>(x[j]);
-  return v;
 }
 
 }  // namespace hip_comms

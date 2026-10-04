@@ -15,8 +15,7 @@
 //      source), so its round trip runs under the reduction.
 //
 // THE TILE IS THE INTERFACE: a kernel names tiles and what a thread holds of one; packs, rows and
-// pack offsets are common's. The one-pack forms below remain for the flat all-reduce loops until
-// they are tiles too (PLAN), and nothing new uses them.
+// pack offsets are common's, and no kernel reaches them (dev/lint_kernels.sh).
 //
 // hardware.cuh      the device: Hardware (documented facts), the machine model over it (residency,
 //                   registers, LDS), kDevice / kTarget, kWaveSize
@@ -33,17 +32,21 @@
 //                         tile; a row past M reads the last, stores only rows below M
 //   peers_load(tiles[ngpus], data(r), row_stride)   every rank's tile in flight together
 //   sliced_load<ngpus>(tile, data(r), row_stride, slice)   each column from the rank owning it
-//   one pack, for the flat loops: thread_load(p), thread_store(p, v), peers_load<DTYPE, WORLD>(read, i)
+//   tile_gather(tile, row_data(m) [, row_n(m)]), tile_scatter(row_data, row_n, tile)   a tile
+//                         whose rows are tensors (a row a rank)
+//   block_store_row_scalar, peers_load_row_scalars   a row's scalar (a norm's scale)
 // elementwise.cuh
 //   tile_add(a, b), tile_mul(a, b), tile_mul(a, scale or row_scale)   float tile math, b
 //                         a's shape or one row
 // reduce.cuh
-//   peers_reduce(tiles[ngpus]) -> tile           summed in rank order in fp32, rounded once
+//   peers_reduce(tiles[WORLD]) -> tile           summed in rank order in fp32, rounded once
+//   block_reduce<Op, Axis::m>(tile) -> one row, block_reduce<Op, Axis::n>(tile, out[rows])   a
+//                         tile reduced over its rows or each row over its columns
 //   wave_reduce<Op, N>(v), block_reduce<Op, N>(v)   N values at once; Op is Sum or Max
 // dot.cuh
 //   partial_dot(a, b, d[TILE_M])                  this thread's share of each row's dot (b may be
 //                                                one row, a weight)
-//   grid_gemm<kLanesPerCol, kAccumulate, T>(row, rows, w, n_cols, packs, out, stride)  the
+//   grid_gemm<TILE_M, TILE_K, SLICE_K, ACCUMULATE>(x, x_stride, rows, cols, w, n_cols, out, stride)  the
 //                                               skinny GEMM, written or accumulated,
 //                                               with its tile (TILE_M rows, TILE_K, SLICE_K;
 //                                               gemm_max_threads)

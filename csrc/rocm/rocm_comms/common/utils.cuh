@@ -34,13 +34,6 @@ struct traits {
   using V = vec<DTYPE, N>;
 };
 
-// EVERY SOURCE'S PACKS IN REGISTERS: a pack from each of `ngpus` sources (the ranks), K of them a
-// source for a row of a Tile (tile.cuh). What peers_load issues and peers_reduce consumes, so a
-// kernel can start one row's loads and work on another's while they are in flight.
-template <typename DTYPE, int WORLD, int PACKS = 1>
-struct PeerPacks {
-  typename traits<DTYPE>::V p[WORLD][PACKS];
-};
 
 // PER-PHASE TIMESTAMPS, for finding where a kernel's time goes: thread 0 of each block records the
 // device clock (100 MHz) at a phase boundary, after the block's threads have all reached it, into a

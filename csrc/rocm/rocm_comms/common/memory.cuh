@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE READS AND WRITES: how a pack is loaded and stored, each pair with who can see a store and
-// when (the global pair for this GPU's memory and a peer's read after a sync, the uncached pair for
-// what a rank writes into a peer and the peer reads back: no kernel does today, a remote write
-// must), and a row's load and store at a thread's columns.
+// THE READS AND WRITES, ON TILES: a tile's load and store (one round trip a tile), every rank's
+// tile, a tile whose rows are tensors, and a row's scalar. How a group is loaded (one 16-byte
+// global instruction, issued together) is impl's.
 
 #pragma once
 
@@ -24,8 +23,15 @@ namespace hip_comms {
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
+// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no memory operation moves across this point (the
+// empty asm's memory clobber) and no instruction is scheduled across it (sched_barrier), so every
+// load above it is in flight before anything below it runs. The scheduler alone sank a reduce's
+// peer loads past the adds of the first ones (ISA 2026-10-01T00-39-51Z); with sched_barrier alone,
+// a tile's weight loads were sunk to their uses, one register quad and one round trip each (ISA
+// 2026-10-03T21-00-27Z).
+namespace impl {
 template <typename PACK>
-DINLINE PACK thread_load(const PACK* p) {
+DINLINE PACK global_load(const PACK* p) {
   static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   const u32x4 raw = *(const global_u32x4*)(p);
   PACK v;
@@ -34,81 +40,24 @@ DINLINE PACK thread_load(const PACK* p) {
 }
 
 template <typename PACK>
-DINLINE void thread_store(PACK* p, const PACK& v) {
+DINLINE void global_store(PACK* p, const PACK& v) {
   static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
   u32x4 raw;
   __builtin_memcpy(&raw, &v, 16);
   *(global_u32x4*)(p) = raw;
 }
 
-// WHAT A PEER PUSHED, read past every cache (system-scope loads, `sc0 sc1`), as
-// QuickReduce reads what it receives: a peer's stores into this GPU's memory do not reach
-// this GPU's L2, so a plain load could return a line cached before they landed.
-template <typename PACK>
-DINLINE PACK thread_load_uncached(const PACK* p) {
-  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
-  const auto* q     = reinterpret_cast<const uint64_t*>(p);
-  const uint64_t raw[2] = {
-      __scoped_atomic_load_n(q, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM),
-      __scoped_atomic_load_n(q + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)};
-  PACK v;
-  __builtin_memcpy(&v, raw, 16);
-  return v;
-}
-
-// A STORE PAST EVERY CACHE: one 16-byte store at system scope (`sc0 sc1`, written through), the
-// twin of `thread_load_uncached`. Unused today: it was the push's store into a peer while scratch
-// was allocated cached (a plain store there could be acknowledged before the peer saw it, and the
-// slowest rank's writes landed after its barrier flag). Scratch is now allocated uncached and the
-// push stores plainly into it, as aiter's does (500dd54535; tests passed and timings were about
-// equal, 2026-09-30T23-10-02Z). IN ASM because no builtin spells this store: a
-// system-scope atomic store compiled to a compare-and-swap loop and an L2 writeback each.
-template <typename PACK>
-DINLINE void thread_store_uncached(PACK* p, const PACK& v) {
-  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
-  u32x4 raw;
-  __builtin_memcpy(&raw, &v, 16);
-  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(raw) : "memory");
-}
-
-// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no memory operation moves across this point (the
-// empty asm's memory clobber) and no instruction is scheduled across it (sched_barrier), so every
-// load above it is in flight before anything below it runs. The scheduler alone sank a reduce's
-// peer loads past the adds of the first ones (ISA 2026-10-01T00-39-51Z); with sched_barrier alone,
-// a tile's weight loads were sunk to their uses, one register quad and one round trip each (ISA
-// 2026-10-03T21-00-27Z).
-namespace impl {
 DINLINE void issued() {
   asm volatile("" ::: "memory");
   __builtin_amdgcn_sched_barrier(0);
 }
 }  // namespace impl
 
-// PACK i OF EVERY SOURCE, all in flight together; `read(r, i)` is pack i of source r. Nothing
-// waits until a pack is used (peers_reduce), so loads issued here can run under other work.
-template <typename DTYPE, int WORLD, typename READ_PEER>
-DINLINE PeerPacks<DTYPE, WORLD> peers_load(READ_PEER read, int64_t i) {
-  PeerPacks<DTYPE, WORLD> out;
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) out.p[r][0] = read(r, i);
-  impl::issued();
-  return out;
-}
-
-// A TILE'S LOAD AND STORE, `data` the tensor's first element and `row_stride` elements between its
-// rows: every load issued together, ONE ROUND TRIP A TILE (a row past M is not read: a row is a
-// wave's or the block's, so the branch never splits a wave, where re-reading the last row cost a
-// whole round trip again; a pack past N reads the last one), and a store of only the rows below M
-// and the packs below N (stores do not
-// hold up loads, so the guard costs nothing). LOAD A TILE WHOLE BEFORE STORING ANYTHING: a pack
-// loaded between stores waits a round trip, since a store may alias it. A 16-byte pack goes through
-// the one-pack global instructions above; an fp32 tile's pack is 32 bytes and loads as the compiler
-// chooses.
 namespace impl {
 template <typename PACK>
 DINLINE PACK pack_load(const PACK* p) {
   if constexpr (sizeof(PACK) == 16)
-    return thread_load(p);
+    return global_load(p);
   else
     return *p;
 }
@@ -163,7 +112,7 @@ DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride, const TILE
     for (int k = 0; k < t.K; ++k) {
       if (t.mask(k) == 0.0f) continue;
       if constexpr (sizeof(P) == 16)
-        thread_store(row + t.col(k), impl::pack(t, m, k));
+        impl::global_store(row + t.col(k), impl::pack(t, m, k));
       else
         row[t.col(k)] = impl::pack(t, m, k);
     }
@@ -266,7 +215,7 @@ DINLINE void tile_scatter(ROW_DATA row_data, ROW_N row_n, const TILE& t) {
       const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
       if (c >= n) continue;
       if constexpr (sizeof(P) == 16)
-        thread_store(row + c, impl::pack(t, m, k));
+        impl::global_store(row + c, impl::pack(t, m, k));
       else
         row[c] = impl::pack(t, m, k);
     }

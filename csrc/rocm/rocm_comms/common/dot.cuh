@@ -72,7 +72,8 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 
 // out[r, n] = T(sum_k x[r][k] * w[n][k]), or with kAccumulate
 // T(float(out[r, n]) + sum_k x[r][k] * w[n][k]), for r < rows, rows <= TILE_M,
-// the sum in fp32 and rounded once. `row(r)` points at row r of x, wherever it lives.
+// the sum in fp32 and rounded once. x is `rows` rows of `cols` elements at `x_stride` elements
+// apart; how it is read (a pack a lane, staged in LDS) is this function's.
 //
 // x is staged in LDS TILE_K packs at a time (coalesced, once per block per chunk), so the hot
 // loop's row reads are LDS reads, not a global round trip per K-step.
@@ -83,11 +84,14 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 // kWaveSize / SLICE_K columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
-template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, typename DTYPE, typename ROW_FN>
-DINLINE void grid_gemm(ROW_FN row, int rows, const DTYPE* __restrict__ gemm_w, int n_cols, int packs,
-                       DTYPE* __restrict__ out, int64_t out_stride) {
+template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, typename DTYPE>
+DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
+                       const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
+                       int64_t out_stride) {
   using V          = typename traits<DTYPE>::V;
   constexpr int NL = traits<DTYPE>::N;
+  const int packs  = cols / NL;
+  const auto row   = [&](int r) { return reinterpret_cast<const V*>(x + r * x_stride); };
   constexpr int kTile = kWaveSize / SLICE_K;
   static_assert(kTile * SLICE_K == kWaveSize, "a column's lanes must divide a wave");
   __shared__ float partial[gemm_max_waves(kDevice, TILE_M, TILE_K, SLICE_K)][TILE_M][kTile];
