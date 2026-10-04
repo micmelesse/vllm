@@ -80,18 +80,20 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
   //    BEFORE ANY IS STORED (the compiler cannot prove the output and the peers' scratch apart, so
   //    a store between two loads held the next load back, and the eight owners' round trips ran one
   //    after another).
-  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    Row got[WORLD];
+  using Chunk = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK>;  // WORLD packs a thread
+  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x)
+    for (int c = 0; c < cols; c += Chunk::kTileN) {
+      Chunk got[WORLD];
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) got[r] = Row{slice_rows, cols, l, 0};
-    peers_load(got, [&](int r) { return scratches[r]; }, cols);
+      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_rows, cols, l, c};
+      peers_load(got, [&](int r) { return scratches[r]; }, cols);
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) {
-      got[r].M      = rows;
-      got[r].offs_m = r * slice_rows + l;
-      tile_store(workspace, cols, got[r]);
+      for (int r = 0; r < WORLD; ++r) {
+        got[r].M      = rows;
+        got[r].offs_m = r * slice_rows + l;
+        tile_store(workspace, cols, got[r]);
+      }
     }
-  }
 
   // 5. The GEMM reads rows other blocks of this rank copied.
   block_stamp(4);

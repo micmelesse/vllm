@@ -135,32 +135,39 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    wave). Left to the compiler, the scales were loaded and waited on before the packs were
   //    issued, two round trips a row (ISA 2026-10-01T02-33-11Z).
   const auto gathered = [&](int r) { return scratches[r]; };
+  // A CHUNK A GROUP A THREAD, stepping across the row: every owner's chunk in flight is WORLD packs
+  // a thread, as the pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
+  using Chunk  = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK>;
+  using ChunkW = TileAs<Chunk, WEIGHT_DTYPE>;
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
-    Row got[WORLD];
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) got[r] = Row{slice_rows, cols, l, 0};
-    peers_load(got, gathered, cols);
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
       peers_load_row_scalars<WORLD>([&](int r) { return scales(scratches[r]); }, l, sc);
+    for (int c = 0; c < cols; c += Chunk::kTileN) {
+      Chunk got[WORLD];
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) {
-      const int row = r * slice_rows + l;
-      if (row >= rows) continue;
-      Row at = got[r];
-      at.M      = rows;
-      at.offs_m = row;
-      if constexpr (ADD_RESIDUAL) {
-        tile_store(residual_out, cols, at);
-        const float scale = sc[r];
-        const Row normed =
-            tile_mul(tile_mul(at.template to<float>(), scale).template to<WEIGHT_DTYPE>().template to<float>(),
-                       w.template to<float>())
-                .template to<WEIGHT_DTYPE>()
-                .template to<DTYPE>();
-        tile_store(out, cols, normed);
-      } else {
-        tile_store(out, cols, at);
+      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_rows, cols, l, c};
+      peers_load(got, gathered, cols);
+      ChunkW wc{1, cols, 0, c};
+      if constexpr (ADD_RESIDUAL) tile_load(wc, weight, 0);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) {
+        const int row = r * slice_rows + l;
+        if (row >= rows) continue;
+        Chunk at = got[r];
+        at.M      = rows;
+        at.offs_m = row;
+        if constexpr (ADD_RESIDUAL) {
+          tile_store(residual_out, cols, at);
+          const Chunk normed =
+              tile_mul(tile_mul(at.template to<float>(), sc[r]).template to<WEIGHT_DTYPE>().template to<float>(),
+                       wc.template to<float>())
+                  .template to<WEIGHT_DTYPE>()
+                  .template to<DTYPE>();
+          tile_store(out, cols, normed);
+        } else {
+          tile_store(out, cols, at);
+        }
       }
     }
   }
