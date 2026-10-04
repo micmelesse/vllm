@@ -14,8 +14,15 @@ namespace hip_comms {
 // A ROW A TILE, the grid striding over rows: each row's delta read from local memory, then the
 // tile every AttnRes kernel computes (shared/attn_res.cuh), so its instructions are the fused
 // kernels' AttnRes.
+// WAVES A SIMD THE ALLOCATOR AIMS FOR: Triton's at its widths (80 and 168 VGPRs). At 1 it packs
+// nothing, and the spare registers cost a wave a SIMD (counters 2026-10-04T15-21-40Z).
+template <int TILE_N, int THREADS_PER_BLOCK>
+constexpr int attn_res_waves() {
+  return THREADS_PER_BLOCK != 256 ? 1 : TILE_N <= 4096 ? 5 : TILE_N <= 8192 ? 3 : 1;
+}
+
 template <typename DTYPE, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, (attn_res_waves<TILE_N, THREADS_PER_BLOCK>()))
     add_attn_res_rms_norm(DTYPE* __restrict__ prefix, const DTYPE* __restrict__ delta,
                           DTYPE* __restrict__ blocks, int64_t block_stride_m, int64_t block_stride_r,
                           const DTYPE* __restrict__ norm_w, const DTYPE* __restrict__ qk_w,

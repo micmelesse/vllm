@@ -93,7 +93,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
         float logit[TILE_K];
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s)
-          logit[s] = src0 + s <= num_blocks
+          logit[s] = !decltype(last)::value || src0 + s <= num_blocks
                          ? sums[(m * TILE_K + s) * 2 + 1] *
                                rsqrtf(sums[(m * TILE_K + s) * 2] * inv_hidden + eps)
                          : -INFINITY;
