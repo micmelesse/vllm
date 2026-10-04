@@ -55,28 +55,19 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
     const WeightF w = tile_mul(nw.template to<float>(), qk.template to<float>());
     acc = u.template like<float>();
     OnlineSoftmax softmax[TILE_M];
-    // PIPELINED: a step issues the next step's sources before its own reduction, so their round
-    // trip runs under it (the reduction is a block's sync, the loads' wait only their own). Two
-    // buffers of sources as loaded trade roles each step, so nothing is copied.
-    using Sources     = Rows[TILE_K];
-    const auto issue = [&](int src0, Sources& got) {
-#pragma unroll
-      for (int s = 0; s < TILE_K; ++s)
-        if (src0 + s < num_blocks) {
-          got[s] = sum.template like<DTYPE>();
-          tile_load(got[s], blocks + (src0 + s) * block_stride_r, block_stride_m);
-        }
-    };
-    const auto step = [&](int src0, const Sources& cur, Sources& next) {
-      if (src0 + TILE_K < num_blocks) issue(src0 + TILE_K, next);
+    for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
       RowsF v[TILE_K];
       float sums[TILE_M * 2 * TILE_K];
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
-        v[s] = src < num_blocks    ? cur[s].template to<float>()
-               : src == num_blocks ? u
-                                   : u.template like<float>();
+        if (src < num_blocks) {
+          Rows raw = sum.template like<DTYPE>();
+          tile_load(raw, blocks + src * block_stride_r, block_stride_m);
+          v[s] = raw.template to<float>();
+        } else {
+          v[s] = src == num_blocks ? u : u.template like<float>();
+        }
         float ss[TILE_M], dw[TILE_M];
         partial_dot(v[s], v[s], ss);
         partial_dot(v[s], w, dw);
@@ -105,13 +96,6 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
       acc = tile_mul(acc, old_scale);
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) acc = tile_add(acc, tile_mul(v[s], scale[s]));
-    };
-    Sources a, b;
-    issue(0, a);
-    for (int src0 = 0; src0 <= num_blocks; src0 += 2 * TILE_K) {
-      step(src0, a, b);
-      if (src0 + TILE_K > num_blocks) break;
-      step(src0 + TILE_K, b, a);
     }
     float inv_den[TILE_M];
 #pragma unroll
