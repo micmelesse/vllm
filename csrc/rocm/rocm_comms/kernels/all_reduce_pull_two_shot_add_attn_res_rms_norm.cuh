@@ -16,10 +16,12 @@ namespace hip_comms {
 // block reads its rows' columns from their owners and computes AttnRes on them itself. So the links
 // carry what an all-reduce's do, AttnRes's two outputs (the prefix and out) are never gathered, and
 // every rank does the AttnRes the unfused path would. A SLICE IS WHOLE WAVES (64 packs), so every
-// wave's packs have one owner and scratch's rank is the same across the wave. EACH PHASE AT
-// ITS OWN GRID: the reduce-scatter on a few blocks (reads), AttnRes on all of them (compute a
-// row), so a world barrier between them. `blocks` is [rows, num_sources, hidden] with row and
-// source strides in elements; `write_idx` < 0 writes no block.
+// wave's packs have one owner and scratch's rank is the same across the wave. A BLOCK REDUCES
+// THE ROWS IT THEN NORMS, so it waits only for its twin on every rank (a peers barrier, as the
+// plain two-shot's) and the grid is AttnRes's to size. The reduce-scatter on 32 blocks behind a
+// world barrier left every other block waiting as long as it then computed, on a grid the barrier
+// capped at the 192 blocks resident (thread trace 2026-10-04T20-14-36Z). `blocks` is [rows,
+// num_sources, hidden] with row and source strides in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_M, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
@@ -36,6 +38,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    DTYPE* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs, int reduce_scatter_blocks) {
+  static_assert(TILE_M == 1, "a block reduces the rows it norms, one a tile");
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
@@ -64,12 +67,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto input = [&](int r) { return inputs[r]; };
   const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
 
-  // 2. This rank's columns of every row, summed over the ranks in rank order, into this rank's
-  //    scratch at their place in the tensor, BY THE FIRST reduce_scatter_blocks BLOCKS
-  //    only: reads queue behind the links past a few dozen blocks (its config, select.cuh). Tiles
-  //    of a reducer's rows (every reducers-th), a wave a row.
-  const int reducers = min(static_cast<int>(gridDim.x), reduce_scatter_blocks);
-  if (own_packs > 0 && static_cast<int>(blockIdx.x) < reducers) {
+  // 2. This rank's columns of this block's rows (every gridDim.x-th, AttnRes's below), summed
+  //    over the ranks in rank order, into this rank's scratch at their place in the tensor.
+  (void)reduce_scatter_blocks;
+  const int reducers = static_cast<int>(gridDim.x);
+  if (own_packs > 0) {
     const int reduce_rows = (rows - static_cast<int>(blockIdx.x) + reducers - 1) / reducers;
     for (int q = 0; q < reduce_rows; q += Slice::kThreadsM)
     for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
@@ -84,9 +86,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
   block_stamp(2);
 
-  // 3. Every rank's columns are in its scratch, and every peer has read this rank's input: A WORLD
-  //    BARRIER, since the blocks that wrote a row's columns are not the ones that read them.
-  barrier<Group::world, Until::visible>(sync);
+  // 3. This block's rows' columns are in every rank's scratch: its twin on every rank wrote them.
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
 
   // 4. This block's tiles of TILE_M rows: each pack from the rank that owns its columns, then
