@@ -112,6 +112,15 @@ DINLINE PACK pack_load(const PACK* p) {
   else
     return *p;
 }
+// WHETHER A LOAD SKIPS ROW m: only a tile of several rows a thread or of rows (a reduce-scatter's
+// at decode), whose rows past M would re-read the last over the links. A one-row tile's row is
+// real wherever a kernel makes one, and a branch around its loads cost registers: the zeros the
+// tile starts with live beside the loads (126 -> 178 VGPRs, spilling at 16384: 23-46-07Z).
+template <typename TILE>
+DINLINE bool skipped(const TILE& t, int m) {
+  if constexpr (TILE::kRows == 1 && TILE::kThreadsM == 1) return false;
+  return !t.live(m);
+}
 // A loaded group into the tile's elements, and a held group out as one load or store's worth.
 template <typename TILE>
 DINLINE void held(TILE& t, int m, int k, const typename TILE::Pack& p) {
@@ -132,7 +141,7 @@ DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
   const P* at = reinterpret_cast<const P*>(data);
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
-    if (!t.live(m)) continue;
+    if (impl::skipped(t, m)) continue;
     const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) impl::held(t, m, k, impl::pack_load(row + t.col(k)));
@@ -170,7 +179,7 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
   using P = typename TILE::Pack;
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
-    if (!t[0].live(m)) continue;
+    if (impl::skipped(t[0], m)) continue;
 #pragma unroll
     for (int k = 0; k < t[0].K; ++k) {
       const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
@@ -191,7 +200,7 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
   using P = typename TILE::Pack;
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
-    if (!t.live(m)) continue;
+    if (impl::skipped(t, m)) continue;
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
       const int owner = min(t.col(k) / (slice / t.kPack), WORLD - 1);
