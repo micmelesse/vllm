@@ -135,4 +135,12 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   tile_store(out, stride, result);
 }
 
+// THE BLOCK BARRIERS ONE block_attn_res_tile PASSES, so waves doing other work beside it pass as
+// many (gfx9 has one barrier a block): two a block_reduce, one reduction a step of sources and
+// one for the output norm. Kept beside the tile, which it must match.
+template <int TILE_K>
+DINLINE int attn_res_tile_barriers(int num_blocks, bool out_norm) {
+  return (num_blocks != 0 ? 2 * (num_blocks / TILE_K + 1) : 0) + (out_norm ? 2 : 0);
+}
+
 }  // namespace hip_comms

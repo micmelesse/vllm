@@ -89,13 +89,58 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes for every row of the tile at once. The next call's first sync keeps a rank from
   //    overwriting its scratch while it is read (a peer's next kernel starts only once this one has
   //    finished).
-  for (int offs_m = blockIdx.x * TILE_M; offs_m < rows; offs_m += gridDim.x * TILE_M) {
-    Rows sum{rows, cols, offs_m, 0};
-    sliced_load<WORLD>(sum, [&](int r) { return rank_scratch<DTYPE, WORLD>(peer_scratch, r); },
-                       cols, slice * traits<DTYPE>::N);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
-                                         write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
-                                         out_eps, inv_hidden);
+  const auto scratch_of = [&](int r) { return rank_scratch<DTYPE, WORLD>(peer_scratch, r); };
+  if constexpr (THREADS_PER_BLOCK < 512) {
+    for (int offs_m = blockIdx.x * TILE_M; offs_m < rows; offs_m += gridDim.x * TILE_M) {
+      Rows sum{rows, cols, offs_m, 0};
+      sliced_load<WORLD>(sum, scratch_of, cols, slice * NL);
+      block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
+                                           write_idx, norm_w, qk_w, out_norm_w, out, num_blocks,
+                                           eps, out_eps, inv_hidden);
+    }
+  } else {
+    // A PRODUCER HALF AND A CONSUMER HALF: the first half's waves compute AttnRes on a row while
+    // the second's gather the next one from its owners into registers, then stage it in LDS. A
+    // wave's loads return in order, so one wave gathering ahead waited for the gather at its first
+    // source (the gather's link wait was ~31% of AttnRes's stall, thread trace 2026-10-04T22-41-39Z).
+    // The producers pass the consumers' barriers one for one (one barrier a block).
+    constexpr int HALF = THREADS_PER_BLOCK / 2;
+    using Half = Tile<DTYPE, 1, TILE_N, 1, HALF, HALF>;
+    __shared__ uint32_t staged[TILE_N / NL][4];
+    const bool consumer = __builtin_amdgcn_readfirstlane(threadIdx.x / kWaveSize) < HALF / kWaveSize;
+    const int barriers = attn_res_tile_barriers<TILE_K>(num_blocks, out_norm_w != nullptr);
+    const auto stage = [&](const Half& t) {
+#pragma unroll
+      for (int k = 0; k < Half::K; ++k)
+        __builtin_memcpy(staged[t.lane() + k * HALF], t.v[0][k], sizeof(staged[0]));
+    };
+    if (!consumer && blockIdx.x < rows) {
+      Half first{rows, cols, static_cast<int>(blockIdx.x), 0};
+      sliced_load<WORLD>(first, scratch_of, cols, slice * NL);
+      stage(first);
+    }
+    __syncthreads();
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+      Half sum{rows, cols, row, 0};
+      if (consumer) {
+#pragma unroll
+        for (int k = 0; k < Half::K; ++k)
+          __builtin_memcpy(sum.v[0][k], staged[sum.lane() + k * HALF], sizeof(staged[0]));
+      }
+      __syncthreads();  // the stage is free
+      if (consumer) {
+        block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m,
+                                             block_stride_r, write_idx, norm_w, qk_w, out_norm_w,
+                                             out, num_blocks, eps, out_eps, inv_hidden);
+      } else {
+        const bool more = row + static_cast<int>(gridDim.x) < rows;
+        Half next{rows, cols, more ? row + static_cast<int>(gridDim.x) : row, 0};
+        sliced_load<WORLD>(next, scratch_of, cols, slice * NL);
+        for (int b = 0; b < barriers; ++b) __syncthreads();
+        stage(next);
+      }
+      __syncthreads();  // the next row staged
+    }
   }
   block_stamp(4);
   sync.finish();
