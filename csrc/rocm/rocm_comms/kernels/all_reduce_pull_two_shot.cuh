@@ -54,8 +54,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
        offs_n += gridDim.x * Ranks::kTileN) {
     Ranks got{WORLD, mine, 0, offs_n};
-    tile_gather(got, input);
-    tile_store(own_scratch, mine, block_reduce<Sum, Axis::m>(got).template to<DTYPE>());
+    reduce_scatter(got, input, own_scratch);
   }
 
   block_stamp(2);
@@ -124,8 +123,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     for (int offs_n = blockIdx.x * Ranks::kTileN; offs_n < mine;
          offs_n += gridDim.x * Ranks::kTileN) {
       Ranks got{WORLD, mine, 0, offs_n};
-      tile_gather(got, [&](int w) { return staging(w) + first; });
-      tile_store(own_scratch, mine, block_reduce<Sum, Axis::m>(got).template to<DTYPE>());
+      reduce_scatter(got, [&](int w) { return staging(w) + first; }, own_scratch);
     }
 
     block_stamp(2);

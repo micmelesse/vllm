@@ -67,6 +67,9 @@
 //   sync.write_flag(peer, v), sync.wait_flag(peer, v)   v into `peer`'s slot for this rank; until
 //                         it reaches v
 //   sync.finish()         the block's sequence stored for the next call: the kernel's last statement
+// collectives.cuh   the collectives' steps, one tested way each
+//   reduce_scatter(chunk, rank_chunk, sum_out)   a chunk of this rank's slice summed over the ranks
+//   all_gather(chunk, rank_chunk, out_chunk, out_len)   every rank's summed chunk into the output
 //   own_signals(p), signals(p, r), lane_signals(p, i)   a rank's Signal block as `Signals`, its
 //                         counters (`Counter`) touched only atomically
 
@@ -82,4 +85,5 @@
 #include "softmax.cuh"
 #include "peers.cuh"
 #include "barrier.cuh"
+#include "collectives.cuh"
 #undef HIP_COMMS_COMMON_INTERFACE
