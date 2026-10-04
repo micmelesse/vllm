@@ -27,6 +27,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                              PeerPtrs peer_scratch, PeerSignals peer_signals,
                              Signal* self_signal, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out, int num_packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
@@ -46,8 +47,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   };
   const auto scratch = [&](int w) { return rank_scratch<DTYPE, WORLD>(peer_scratch, rotated(w)); };
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
   // 2. Reduce-scatter: this rank's slice, summed over every rank, into its scratch.
@@ -60,8 +60,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
 
   // 4. All-gather: every rank's summed chunk out of its scratch, at its place in the output. The
@@ -74,6 +73,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                  [&](int w) { return max(0, min(slice, len - rotated(w) * slice)); }, got);
   }
   block_stamp(5);
+  sync.finish();
 }
 
 // STAGED: each rank copies `own_input` into its staging a pass at a time and each pass reads the
@@ -88,6 +88,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
@@ -116,8 +117,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       tile_gather(part, [&](int w) { return own_input + at + rotated(w) * slice; }, slice_n);
       tile_scatter([&](int w) { return own_staging + rotated(w) * slice; }, slice_n, part);
     }
-    barrier<WORLD, Among::peers, Ensure::visible>(
-        peer_signals, self_signal, rank, timeout_ticks);
+    barrier<Group::peers, Until::visible>(sync);
     block_stamp(1);
 
     // 2. Reduce-scatter: this rank's slice from every rank's staging, into its scratch.
@@ -131,8 +131,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
     //    pass, so the next one may overwrite it.
-    barrier<WORLD, Among::peers, Ensure::visible>(
-        peer_signals, self_signal, rank, timeout_ticks);
+    barrier<Group::peers, Until::visible>(sync);
     block_stamp(3);
 
     // 4. All-gather: every rank's summed chunk out of its scratch, at its place in the output.
@@ -144,6 +143,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     block_stamp(5);
   }
+  sync.finish();
 }
 
 }  // namespace hip_comms

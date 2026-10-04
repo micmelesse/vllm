@@ -15,8 +15,9 @@ namespace hip_comms {
 template <int WORLD>
 __global__ void probe_barrier(PeerSignals peer_signals, Signal* self_signal, int rank,
                               uint64_t timeout_ticks) {
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  barrier<Group::peers, Until::launched>(sync);
+  sync.finish();
 }
 
 }  // namespace hip_comms

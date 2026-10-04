@@ -19,14 +19,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(const PeerPtrs* __restrict__ peer_inputs,
                              PeerSignals peer_signals, Signal* self_signal, int rank,
                              uint64_t timeout_ticks, DTYPE* __restrict__ out, int num_packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   using Chunk   = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int len = num_packs * traits<DTYPE>::N;  // the buffer, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
   const auto input = [&](int r) { return inputs[r]; };
 
@@ -41,9 +41,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
-                                                            timeout_ticks);
+  barrier<Group::peers, Until::read>(sync);
   block_stamp(5);
+  sync.finish();
 }
 
 // STAGED: each rank copies `own_input` into its staging `stage_packs` at a time and every rank
@@ -56,6 +56,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     Signal* self_signal, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out, int64_t num_packs,
                                     const DTYPE* __restrict__ own_input, int64_t stage_packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   using Chunk            = Tile<DTYPE, 1, THREADS_PER_BLOCK * traits<DTYPE>::N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   constexpr int NL       = traits<DTYPE>::N;
   const auto stagings    = rank_stagings<DTYPE, WORLD>(peer_staging);
@@ -73,8 +74,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       tile_load(mine, own_input + at, len);
       tile_store(own_staging, len, mine);
     }
-    barrier<WORLD, Among::peers, Ensure::visible>(
-        peer_signals, self_signal, rank, timeout_ticks);
+    barrier<Group::peers, Until::visible>(sync);
     block_stamp(1);
     // 2. Read every rank's staged pass, in rank order, and sum.
     for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < len;
@@ -87,10 +87,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     block_stamp(2);
     // 3. No rank may stage its next pass until every peer has read this one.
-    barrier<WORLD, Among::peers, Ensure::read>(
-        peer_signals, self_signal, rank, timeout_ticks);
+    barrier<Group::peers, Until::read>(sync);
     block_stamp(5);
   }
+  sync.finish();
 }
 
 }  // namespace hip_comms

@@ -21,6 +21,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     Signal* self_signal, int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w,
     float eps, const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out, int64_t out_stride,
     DTYPE* __restrict__ workspace, int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -30,8 +31,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
   const auto input = [&](int r) { return inputs[r]; };
 
@@ -60,8 +60,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
   block_stamp(2);
-  barrier<WORLD, Among::grid, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::grid, Until::visible>(sync);
   block_stamp(3);
 
   // 4. The GEMM over every row.
@@ -72,8 +71,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 
   block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
-                                                            timeout_ticks);
+  barrier<Group::peers, Until::read>(sync);
+  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or

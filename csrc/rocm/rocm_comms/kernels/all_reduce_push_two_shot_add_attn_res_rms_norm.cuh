@@ -35,6 +35,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    DTYPE* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
@@ -56,8 +57,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
@@ -85,8 +85,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read this rank's input.
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
 
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
@@ -101,6 +100,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                          out_eps, inv_hidden);
   }
   block_stamp(4);
+  sync.finish();
 }
 
 }  // namespace hip_comms

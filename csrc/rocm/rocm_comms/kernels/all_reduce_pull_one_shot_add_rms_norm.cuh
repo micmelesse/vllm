@@ -21,6 +21,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
     DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual, const WEIGHT_DTYPE* __restrict__ weight,
     float eps, int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -31,8 +32,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
   const auto input = [&](int r) { return inputs[r]; };
 
@@ -77,9 +77,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
-                                                            timeout_ticks);
+  barrier<Group::peers, Until::read>(sync);
   block_stamp(5);
+  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

@@ -22,6 +22,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     const DTYPE* __restrict__ norm_w, float eps, const DTYPE* __restrict__ gemm_w, int n_cols,
     DTYPE* __restrict__ out, int64_t out_stride, DTYPE* __restrict__ workspace, int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -31,8 +32,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
@@ -70,8 +70,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 3. Every rank's normed rows are visible to its peers.
   block_stamp(2);
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
 
   // 4. Every owner's normed rows out of its scratch, into the workspace: EVERY OWNER'S TILE LOADED
@@ -95,8 +94,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // 5. The GEMM reads rows other blocks of this rank copied.
   block_stamp(4);
-  barrier<WORLD, Among::grid, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::grid, Until::visible>(sync);
   block_stamp(5);
 
   // 6. The GEMM over every row, TILE_M per pass.
@@ -106,6 +104,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
                                                      out + r0 * out_stride, out_stride);
   }
   block_stamp(6);
+  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or

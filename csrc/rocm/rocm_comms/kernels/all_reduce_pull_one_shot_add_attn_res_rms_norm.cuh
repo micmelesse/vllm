@@ -29,14 +29,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    DTYPE* __restrict__ out, int num_blocks,
                                                    int write_idx, float eps, float out_eps,
                                                    int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
@@ -52,8 +52,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Among::peers, Ensure::read>(peer_signals, self_signal, rank,
-                                                            timeout_ticks);
+  barrier<Group::peers, Until::read>(sync);
+  sync.finish();
 }
 
 }  // namespace hip_comms

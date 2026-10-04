@@ -59,12 +59,14 @@
 //   rank_staging(p, r), rank_stagings(p)   a rank's staging: a staged kernel copies its input there
 //   rank_scratch(p, r), rank_scratches(p)  a rank's scratch: a two-shot's partial sums
 // barrier.cuh       the ranks' synchronization
-//   barrier<WORLD, Among, Ensure>(...)   Among::peers (this block and the same block on every
-//                         rank), grid (every block of this rank) or world; Ensure::launched (every
-//                         peer's input is ready), visible (what was written before is seen after),
-//                         read (every peer is done reading this rank)
-//   write_flag(p, rank, peer, v), wait_flag(...)   v into `peer`'s slot for this rank; until it
-//                         reaches v
+//   Sync<WORLD> sync{p, self, rank, timeout}   a kernel's synchronization, one per kernel
+//   barrier<Group, Until>(sync)   Group::peers (this block and the same block on every rank),
+//                         grid (every block of this rank) or world; Until::launched (every peer's
+//                         input is ready), visible (what was written before is seen after), read
+//                         (every peer is done reading this rank)
+//   sync.write_flag(peer, v), sync.wait_flag(peer, v)   v into `peer`'s slot for this rank; until
+//                         it reaches v
+//   sync.finish()         the block's sequence stored for the next call: the kernel's last statement
 //   own_signals(p), signals(p, r), lane_signals(p, i)   a rank's Signal block as `Signals`, its
 //                         counters (`Counter`) touched only atomically
 

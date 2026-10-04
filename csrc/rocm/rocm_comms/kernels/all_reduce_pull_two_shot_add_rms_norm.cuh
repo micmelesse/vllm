@@ -24,6 +24,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -37,8 +38,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
@@ -120,8 +120,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
@@ -172,6 +171,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     }
   }
   block_stamp(6);
+  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

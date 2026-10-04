@@ -16,17 +16,19 @@ __global__ void ping_pong(PeerSignals peer_signals, Signal* self_signal, int ran
                           uint64_t timeout_ticks, int peer, uint32_t base, int iters,
                           uint64_t* ticks) {
   constexpr int kWarm = 16;
+  Sync<2> sync{peer_signals, self_signal, rank, timeout_ticks};  // two ranks, flags only
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   const bool first = rank < peer;
   uint64_t t0      = 0;
   for (int i = 1; i <= kWarm + iters; ++i) {
     if (i == kWarm + 1) t0 = wall_clock64();
     const uint32_t v = base + static_cast<uint32_t>(i);
-    if (!first) wait_flag(self_signal, rank, timeout_ticks, peer, v);
-    write_flag(peer_signals, rank, peer, v);
-    if (first) wait_flag(self_signal, rank, timeout_ticks, peer, v);
+    if (!first) sync.wait_flag(peer, v);
+    sync.write_flag(peer, v);
+    if (first) sync.wait_flag(peer, v);
   }
   *ticks = wall_clock64() - t0;
+  sync.finish();
 }
 
 // The flag values a launch with `iters` uses past its warm-up.

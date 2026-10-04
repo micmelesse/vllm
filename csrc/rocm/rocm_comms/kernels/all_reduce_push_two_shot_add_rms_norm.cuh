@@ -25,6 +25,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
     const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -48,8 +49,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
@@ -77,8 +77,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch.
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
 
   // 4. This block's rows out of this rank's scratch: (ADD_RESIDUAL) add the residual, then RMSNorm,
@@ -112,6 +111,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     tile_store(out, cols, normed);
   }
   block_stamp(4);
+  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

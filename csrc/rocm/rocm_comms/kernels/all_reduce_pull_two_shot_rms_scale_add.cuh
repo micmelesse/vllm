@@ -25,6 +25,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                            int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
                                            float eps, int rows,
                                            int hidden_packs, int latent_packs) {
+  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -49,8 +50,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
   const auto scratches   = rank_scratches<DTYPE, WORLD>(peer_scratch);
   block_stamp(0);
-  barrier<WORLD, Among::peers, Ensure::launched>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
   const auto shared = [&](int r) { return inputs[r]; };
   const auto proj   = [&](int r) { return inputs[r] + hidden; };
@@ -89,8 +89,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(3);
   // 3. Every rank's finished rows are visible to its peers, and every peer has read this rank's
   //    input.
-  barrier<WORLD, Among::peers, Ensure::visible>(
-      peer_signals, self_signal, rank, timeout_ticks);
+  barrier<Group::peers, Until::visible>(sync);
   block_stamp(4);
 
   // 4. Every owner's finished rows out of its scratch, at their place in the output: this block's
@@ -110,6 +109,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   }
   block_stamp(5);
+  sync.finish();
 }
 
 }  // namespace hip_comms
