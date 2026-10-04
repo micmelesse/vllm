@@ -66,7 +66,9 @@ DINLINE float dpp(float v) {
   return __builtin_bit_cast(float, moved);
 }
 
-// N VALUES OVER THE WAVE, in place, every lane left holding the results. DPP, as rocPRIM's and
+// N VALUES OVER THE WAVE, in place, every lane left holding the results. The moved value first:
+// only a VOP2's src0 takes DPP, so (dpp(x), x) fuses each step into one v_add_f32_dpp where
+// (x, dpp(x)) was a v_mov_b32_dpp and an add (ISA 2026-10-04T02-22-41Z). DPP, as rocPRIM's and
 // Composable Kernel's wave reductions do: each step is a VALU operand from another lane. The
 // butterfly __shfl_xor it replaced compiled to ds_bpermute, an LDS round trip a step, six of them
 // waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for one block_reduce).
@@ -80,12 +82,12 @@ DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
 #pragma unroll
   for (int n = 0; n < NUM_VALUES; ++n) {
     float x = v[n];
-    x = REDUCE_OP::apply(x, dpp<0xb1, 0xf, REDUCE_OP>(x));   // quad_perm [1,0,3,2]
-    x = REDUCE_OP::apply(x, dpp<0x4e, 0xf, REDUCE_OP>(x));   // quad_perm [2,3,0,1]
-    x = REDUCE_OP::apply(x, dpp<0x141, 0xf, REDUCE_OP>(x));  // row_half_mirror
-    x = REDUCE_OP::apply(x, dpp<0x140, 0xf, REDUCE_OP>(x));  // row_mirror
-    x = REDUCE_OP::apply(x, dpp<0x142, 0xa, REDUCE_OP>(x));  // row_bcast15 into rows 1, 3
-    x = REDUCE_OP::apply(x, dpp<0x143, 0xc, REDUCE_OP>(x));  // row_bcast31 into rows 2, 3
+    x = REDUCE_OP::apply(dpp<0xb1, 0xf, REDUCE_OP>(x), x);   // quad_perm [1,0,3,2]
+    x = REDUCE_OP::apply(dpp<0x4e, 0xf, REDUCE_OP>(x), x);   // quad_perm [2,3,0,1]
+    x = REDUCE_OP::apply(dpp<0x141, 0xf, REDUCE_OP>(x), x);  // row_half_mirror
+    x = REDUCE_OP::apply(dpp<0x140, 0xf, REDUCE_OP>(x), x);  // row_mirror
+    x = REDUCE_OP::apply(dpp<0x142, 0xa, REDUCE_OP>(x), x);  // row_bcast15 into rows 1, 3
+    x = REDUCE_OP::apply(dpp<0x143, 0xc, REDUCE_OP>(x), x);  // row_bcast31 into rows 2, 3
     v[n] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), 63));
   }
 }
