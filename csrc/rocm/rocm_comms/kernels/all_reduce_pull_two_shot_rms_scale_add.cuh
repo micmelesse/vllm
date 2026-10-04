@@ -17,8 +17,8 @@ namespace hip_comms {
 // A BLOCK OWNS ONE (ROW, SLICE) OF THIS RANK'S ROWS, `splits` slices a row, as in the one-shot.
 // THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: a block gathers exactly the (row, slice)s
 // the same block on each owner finished, which is what a peers barrier makes visible.
-template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_scale_add(const PeerPtrs* __restrict__ peer_inputs,
                                            PeerPtrs peer_scratch,
                                            PeerSignals peer_signals, Signal* self_signal,

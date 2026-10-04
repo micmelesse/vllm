@@ -95,6 +95,7 @@ class Error(IntEnum):
     field_not_positive = 31
     field_not_this_templates = 32
     probe_out_of_range = 33
+    waves_not_built = 34
 
 
 # C++'s `DType` names, as torch's dtypes.

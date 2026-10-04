@@ -79,8 +79,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 // THE KERNELS, one per op, both the body above: the GEMM's result written (rms_norm_gemm) or
 // added into `out` (rms_norm_gemm_add).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
-          int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm_gemm(const PeerPtrs* __restrict__ peer_inputs,
                                            PeerSignals peer_signals, Signal* self_signal,
                                            int rank, uint64_t timeout_ticks,
@@ -99,8 +99,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 }
 
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
-          int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm_gemm_add(const PeerPtrs* __restrict__ peer_inputs,
                                                PeerSignals peer_signals,
                                                Signal* self_signal, int rank,

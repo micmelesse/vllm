@@ -21,8 +21,8 @@ namespace hip_comms {
 // differs by rank, which is harmless: each slice is summed by one rank, so every rank copies the
 // same bytes. THE SAME BLOCK READS IN THE SECOND PHASE WHAT THE SAME BLOCK ON EACH RANK WROTE IN
 // THE FIRST: both stride over chunks alike.
-template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(const PeerPtrs* __restrict__ peer_inputs,
                              PeerPtrs peer_scratch, PeerSignals peer_signals,
                              Signal* self_signal, int rank, uint64_t timeout_ticks,
@@ -81,8 +81,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 // staging holds (`stage_packs`) and what the scratch holds (a slice a rank). EACH BLOCK STAGES, OF
 // EVERY RANK'S SLICE, THE CHUNKS THAT RANK'S SAME BLOCK READS, so a peers barrier makes them
 // visible.
-template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_staged(PeerPtrs peer_scratch, PeerPtrs peer_staging,
                                     PeerSignals peer_signals, Signal* self_signal,
                                     int rank, uint64_t timeout_ticks, int64_t scratch_packs,

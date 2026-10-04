@@ -67,61 +67,61 @@ namespace hip_comms {
 // The plain one-shot: a chunk THREADS_PER_BLOCK groups wide, at each block size a launch may take
 // (64, a wave, its own: all_reduce_config).
 constexpr KernelConfig kAllReduceOneShotConfigs[] = {
-    AllReduceConfig{{64, 0}},
-    AllReduceConfig{{128, 0}},
-    AllReduceConfig{{256, 0}},
-    AllReduceConfig{{512, 0}},
+    AllReduceConfig{{64, 0, 1}},
+    AllReduceConfig{{128, 0, 1}},
+    AllReduceConfig{{256, 0, 1}},
+    AllReduceConfig{{512, 0, 1}},
 };
 // The plain two-shot: the same chunks (512, a wave per peer at eight ranks, its own).
 constexpr KernelConfig kAllReduceTwoShotConfigs[] = {
-    AllReduceConfig{{64, 0}},
-    AllReduceConfig{{128, 0}},
-    AllReduceConfig{{256, 0}},
-    AllReduceConfig{{512, 0}},
+    AllReduceConfig{{64, 0, 1}},
+    AllReduceConfig{{128, 0, 1}},
+    AllReduceConfig{{256, 0, 1}},
+    AllReduceConfig{{512, 0, 1}},
 };
 constexpr KernelConfig kRmsNormOneShotConfigs[] = {
-    RowConfig{{512, 16}, 4096},
-    RowConfig{{512, 16}, 8192},
-    RowConfig{{512, 16}, 16384},
+    RowConfig{{512, 16, 1}, 4096},
+    RowConfig{{512, 16, 1}, 8192},
+    RowConfig{{512, 16, 1}, 16384},
 };
 // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at 128;
 // 2026-10-01T03-26-44Z); a row a block below that.
 constexpr KernelConfig kRmsNormPushConfigs[] = {
-    RowConfig{{512, 256}, 4096},
-    RowConfig{{512, 256}, 8192},
-    RowConfig{{512, 256}, 16384},
+    RowConfig{{512, 256, 1}, 4096},
+    RowConfig{{512, 256, 1}, 8192},
+    RowConfig{{512, 256, 1}, 16384},
 };
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and 147.6 at
 // 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
 constexpr KernelConfig kRmsNormPullConfigs[] = {
-    RowConfig{{512, 48}, 4096},
-    RowConfig{{512, 48}, 8192},
+    RowConfig{{512, 48, 1}, 4096},
+    RowConfig{{512, 48, 1}, 8192},
 };
 // Not swept: rms_norm's.
 constexpr KernelConfig kAddRmsNormOneShotConfigs[] = {
-    RowConfig{{512, 16}, 4096},
-    RowConfig{{512, 16}, 8192},
-    RowConfig{{512, 16}, 16384},
+    RowConfig{{512, 16, 1}, 4096},
+    RowConfig{{512, 16, 1}, 8192},
+    RowConfig{{512, 16, 1}, 16384},
 };
 // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128; 2026-10-01T03-26-44Z).
 constexpr KernelConfig kAddRmsNormPushConfigs[] = {
-    RowConfig{{512, 256}, 4096},
-    RowConfig{{512, 256}, 8192},
-    RowConfig{{512, 256}, 16384},
+    RowConfig{{512, 256, 1}, 4096},
+    RowConfig{{512, 256, 1}, 8192},
+    RowConfig{{512, 256, 1}, 16384},
 };
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at 2048 and 4096
 // against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
 constexpr KernelConfig kAddRmsNormPullConfigs[] = {
-    RowConfig{{512, 48}, 4096},
-    RowConfig{{512, 48}, 8192},
+    RowConfig{{512, 48, 1}, 4096},
+    RowConfig{{512, 48, 1}, 8192},
 };
 
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got slower, 6.48 -> 8.16 us a
 // row and 147.5 -> 171.0 at 4096 tokens, with 100 -> 166 VGPRs (stamps 2026-10-01T06-26-55Z
 // against 04-15-48Z). The one-shot's grid not swept: the norms'.
 constexpr KernelConfig kAttnResOneShotConfigs[] = {
-    AttnResConfig{{512, 16}, 4096, 1},
-    AttnResConfig{{512, 16}, 8192, 1},
+    AttnResConfig{{512, 16, 1}, 4096, 1},
+    AttnResConfig{{512, 16, 1}, 8192, 1},
 };
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15, 159.33 at
 // 128), a row a block below that (2026-10-01T03-57-23Z).
@@ -129,10 +129,10 @@ constexpr KernelConfig kAttnResOneShotConfigs[] = {
 // from local memory took 192.8 / 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps
 // 2026-10-02T20-36-56Z); its grid not swept yet.
 constexpr KernelConfig kAttnResPushConfigs[] = {
-    AttnResConfig{{512, 256}, 4096, 1},
-    AttnResConfig{{512, 256}, 8192, 1},
-    AttnResConfig{{256, 512}, 4096, 1},
-    AttnResConfig{{256, 512}, 8192, 1},
+    AttnResConfig{{512, 256, 1}, 4096, 1},
+    AttnResConfig{{512, 256, 1}, 8192, 1},
+    AttnResConfig{{256, 512, 1}, 4096, 1},
+    AttnResConfig{{256, 512, 1}, 8192, 1},
 };
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within about 5% of
 // the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7 at the 36 it had
@@ -145,10 +145,10 @@ constexpr KernelConfig kAttnResPushConfigs[] = {
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4 are no longer
 // built: they lost at every grid, and 4 spilled 25-30 VGPRs.
 constexpr KernelConfig kAttnResPullConfigs[] = {
-    AttnResPullConfig{{512, 192}, 1, 4096, 1, 32},
-    AttnResPullConfig{{512, 192}, 1, 8192, 1, 32},
-    AttnResPullConfig{{256, 384}, 1, 4096, 1, 32},
-    AttnResPullConfig{{256, 384}, 1, 8192, 1, 32},
+    AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 32},
+    AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 32},
+    AttnResPullConfig{{256, 384, 1}, 1, 4096, 1, 32},
+    AttnResPullConfig{{256, 384, 1}, 1, 8192, 1, 32},
 };
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
@@ -157,9 +157,9 @@ constexpr KernelConfig kAttnResPullConfigs[] = {
 // (2026-09-28, log). Not swept for the rest, which copy it.
 constexpr int kGemmTileK = gemm_tile_k_fit(kTarget, 16);
 constexpr KernelConfig kGemmTailConfigs[] = {
-    GemmConfig{{512, 56}, 16, 4096, kGemmTileK, 4},
-    GemmConfig{{512, 56}, 16, 8192, kGemmTileK, 4},
-    GemmConfig{{512, 56}, 16, 16384, kGemmTileK, 4},
+    GemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4},
+    GemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4},
+    GemmConfig{{512, 56, 1}, 16, 16384, kGemmTileK, 4},
 };
 constexpr bool gemm_tail_configs_fit() {
   for (const KernelConfig& k : kGemmTailConfigs) {
@@ -174,25 +174,25 @@ static_assert(gemm_tail_configs_fit(),
 
 // The one-all-reduce tail. The one-shot: a block a (row, slice) up to one a compute unit.
 constexpr KernelConfig kRmsScaleAddOneShotConfigs[] = {
-    RowConfig{{512, 256}, 4096},
-    RowConfig{{512, 256}, 8192},
+    RowConfig{{512, 256, 1}, 4096},
+    RowConfig{{512, 256, 1}, 8192},
 };
 // About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of the
 // best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4 at 256
 // (2026-10-01T22-07-13Z).
 constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {
-    RowConfig{{512, 32}, 4096},
-    RowConfig{{512, 32}, 8192},
+    RowConfig{{512, 32, 1}, 4096},
+    RowConfig{{512, 32, 1}, 8192},
 };
 
 // EXPERIMENTAL, AttnRes on a local delta: a row a block, the grid striding over rows. 512 blocks
 // took the AttnRes phase from local scratch to 86.0 us at 4096 x 7168 (192: 192.8; stamps
 // 2026-10-02T20-36-56Z); not swept.
 constexpr KernelConfig kAddAttnResConfigs[] = {
-    AttnResConfig{{512, 512}, 4096, 1},
-    AttnResConfig{{512, 512}, 8192, 1},
-    AttnResConfig{{256, 512}, 4096, 1},
-    AttnResConfig{{256, 512}, 8192, 1},
+    AttnResConfig{{512, 512, 1}, 4096, 1},
+    AttnResConfig{{512, 512, 1}, 8192, 1},
+    AttnResConfig{{256, 512, 1}, 4096, 1},
+    AttnResConfig{{256, 512, 1}, 8192, 1},
 };
 
 // What each template is, in Template's order: its op, its shot, and its builds (none for the plain
@@ -276,7 +276,8 @@ constexpr bool same_build(const KernelConfig& a, const KernelConfig& b) {
   return std::visit(
       [&](const auto& x) {
         const auto& y = std::get<std::decay_t<decltype(x)>>(b);
-        bool same     = x.launch.threads_per_block == y.launch.threads_per_block;
+        bool same     = x.launch.threads_per_block == y.launch.threads_per_block &&
+                    x.launch.waves_per_eu == y.launch.waves_per_eu;
         if constexpr (requires { x.tile_m; }) same = same && x.tile_m == y.tile_m;
         if constexpr (requires { x.tile_n; }) same = same && x.tile_n == y.tile_n;
         if constexpr (requires { x.tile_k; }) same = same && x.tile_k == y.tile_k;
@@ -294,6 +295,13 @@ constexpr bool built(Template k, const KernelConfig& c) {
 constexpr bool built_at(Template k, int threads_per_block) {
   for (const KernelConfig& b : configs_of(k))
     if (launch_of(b).threads_per_block == threads_per_block) return true;
+  return false;
+}
+constexpr bool built_at(Template k, int threads_per_block, int waves_per_eu) {
+  for (const KernelConfig& b : configs_of(k))
+    if (launch_of(b).threads_per_block == threads_per_block &&
+        launch_of(b).waves_per_eu == waves_per_eu)
+      return true;
   return false;
 }
 // THE FAMILY A TEMPLATE'S CONFIGS ARE (KernelConfig's index): its list's, and every entry the same
@@ -490,24 +498,24 @@ struct TunedKernel {
 // 2026-09-30T21-06-57Z); the push through 1.75 MiB (256 tokens of 3584: 18.04 against the
 // pull's 18.41), the pull from 2.6 MiB (2026-10-01T03-26-44Z).
 constexpr TunedKernel kRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm, RowConfig{{512, 16}, 4096}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm, RowConfig{{512, 256}, 4096}},
-    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm, RowConfig{{512, 48}, 4096}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm, RowConfig{{512, 16}, 8192}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm, RowConfig{{512, 256}, 8192}},
-    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm, RowConfig{{512, 48}, 8192}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm, RowConfig{{512, 16, 1}, 4096}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm, RowConfig{{512, 256, 1}, 4096}},
+    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm, RowConfig{{512, 48, 1}, 4096}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm, RowConfig{{512, 16, 1}, 8192}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm, RowConfig{{512, 256, 1}, 8192}},
+    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm, RowConfig{{512, 48, 1}, 8192}},
 };
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB (192 tokens of
 // 3584: 15.48 against the pull's 16.28), the pull at 1.75 MiB (18.36 against the push's 18.46;
 // 2026-10-01T03-26-44Z).
 constexpr TunedKernel kAddRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm, RowConfig{{512, 16}, 4096}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm, RowConfig{{512, 256}, 4096}},
-    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm, RowConfig{{512, 48}, 4096}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm, RowConfig{{512, 16}, 8192}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm, RowConfig{{512, 256}, 8192}},
-    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm, RowConfig{{512, 48}, 8192}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm, RowConfig{{512, 16, 1}, 4096}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm, RowConfig{{512, 256, 1}, 4096}},
+    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm, RowConfig{{512, 48, 1}, 4096}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm, RowConfig{{512, 16, 1}, 8192}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm, RowConfig{{512, 256, 1}, 8192}},
+    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm, RowConfig{{512, 48, 1}, 8192}},
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68 us; 14.03 against
@@ -515,52 +523,52 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
 // of 7168: 34.8 against 35.8-38.7 us; 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
 constexpr TunedKernel kAttnResKernels[] = {
     {8, 1, 3584, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     AttnResConfig{{512, 256}, 4096, 1}},
+     AttnResConfig{{512, 256, 1}, 4096, 1}},
     {8, 513, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192}, 1, 4096, 1, 32}},
+     AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 32}},
     {8, 1, 7168, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     AttnResConfig{{512, 256}, 8192, 1}},
+     AttnResConfig{{512, 256, 1}, 8192, 1}},
     {8, 257, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192}, 1, 8192, 1, 32}},
+     AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 32}},
 };
 
 // The GEMM tails: the one-shot through one GEMM pass of rows (16), where the one-shot kernel
 // once had to stop; not swept.
 constexpr TunedKernel kRmsNormGemmKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     GemmConfig{{512, 56}, 16, 4096, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
     {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     GemmConfig{{512, 56}, 16, 4096, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     GemmConfig{{512, 56}, 16, 8192, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
     {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     GemmConfig{{512, 56}, 16, 8192, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
 };
 
 // As rms_norm_gemm's.
 constexpr TunedKernel kRmsNormGemmAddKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     GemmConfig{{512, 56}, 16, 4096, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
     {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     GemmConfig{{512, 56}, 16, 4096, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     GemmConfig{{512, 56}, 16, 8192, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
     {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     GemmConfig{{512, 56}, 16, 8192, kGemmTileK, 4}},
+     GemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
 };
 
 // The one-all-reduce tail, [T, 17920] (a latent of 3584): the one-shot while there are fewer
 // rows than ranks, the row two-shot from a row a rank (10.8 against 12.3 us at 1 token, 13.2
 // against 14.3 at 8 the other way; 2026-10-01T21-20-57Z).
 constexpr TunedKernel kRmsScaleAddKernels[] = {
-    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add, RowConfig{{512, 256}, 4096}},
-    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, RowConfig{{512, 32}, 4096}},
+    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add, RowConfig{{512, 256, 1}, 4096}},
+    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, RowConfig{{512, 32, 1}, 4096}},
 };
 
 // Experimental, one rank (world 1: there are no peers): not swept.
 constexpr TunedKernel kAddAttnResKernels[] = {
-    {1, 1, 3584, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512}, 4096, 1}},
-    {1, 1, 7168, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512}, 8192, 1}},
+    {1, 1, 3584, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512, 1}, 4096, 1}},
+    {1, 1, 7168, Template::add_attn_res_rms_norm, AttnResConfig{{512, 512, 1}, 8192, 1}},
 };
 
 // =================================================================================================
@@ -676,7 +684,7 @@ constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> 
   if (!fn && templates_of(o) == 1) fn = only_template(o);
   if (!fn) return Error::config_without_algorithm;
   const std::variant<KernelConfig, Error> c =
-      config(LaunchConfig{*threads_per_block, *blocks_per_grid}, *fn);
+      config(LaunchConfig{*threads_per_block, *blocks_per_grid, 0}, *fn);
   if (const Error* e = std::get_if<Error>(&c)) return *e;
   return Forced{{*fn, std::get<KernelConfig>(c)}};
 }
@@ -725,7 +733,7 @@ constexpr KernelConfig all_reduce_config(Template t, int64_t bytes, int world) {
   const int64_t even    = (need + passes - 1) / passes;
   // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
   const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
-  return AllReduceConfig{{threads, blocks}};
+  return AllReduceConfig{{threads, blocks, 1}};
 }
 constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b; }
 
@@ -810,6 +818,7 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t 
         };
         filled(f.launch.threads_per_block, o.launch.threads_per_block);
         filled(f.launch.blocks_per_grid, o.launch.blocks_per_grid);
+        filled(f.launch.waves_per_eu, o.launch.waves_per_eu);
         if constexpr (requires { f.tile_m; }) filled(f.tile_m, o.tile_m);
         if constexpr (requires { f.tile_k; }) filled(f.tile_k, o.tile_k);
         if constexpr (requires { f.slice_k; }) filled(f.slice_k, o.slice_k);
@@ -860,6 +869,8 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   const int threads = launch_of(c).threads_per_block;
   if (c.index() != family_of(fn)) return Error::tile_not_built;
   if (has_builds(fn) && !built_at(fn, threads)) return Error::threads_not_built;
+  if (has_builds(fn) && !built_at(fn, threads, launch_of(c).waves_per_eu))
+    return Error::waves_not_built;
   if (has_tiles(fn) && tile_n_of(c) == 0) return Error::row_too_wide;
   if (has_tiles(fn) && !built(fn, c)) return Error::tile_not_built;
   if (has_tiles(fn) && tile_n_of(c) < tile_cols) return Error::row_too_wide;
@@ -912,11 +923,12 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                         : bytes <= kTargetCalibration.all_reduce_one_shot_max_bytes
                               ? Template::all_reduce_pull_one_shot
                               : Template::all_reduce_pull_two_shot;
-  KernelConfig c = f && f->second ? *f->second : AllReduceConfig{{0, 0}};
+  KernelConfig c = f && f->second ? *f->second : AllReduceConfig{{0, 0, 1}};
   const LaunchConfig derived = launch_of(all_reduce_config(fn, bytes, world));
   LaunchConfig& g            = launch_of(c);
   if (g.threads_per_block == 0) g.threads_per_block = derived.threads_per_block;
   if (g.blocks_per_grid == 0) g.blocks_per_grid = derived.blocks_per_grid;
+  if (g.waves_per_eu == 0) g.waves_per_eu = derived.waves_per_eu;
   const bool staged = !h.reads_in_place(inp, stream);
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, 1, bytes / elem_bytes(dtype), 0,
@@ -932,19 +944,21 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
         case Template::all_reduce_pull_one_shot:
           by_config<Template::all_reduce_pull_one_shot>(c, [&](auto built) {
             constexpr int THREADS = decltype(built)::value.launch.threads_per_block;
+            constexpr int WAVES   = decltype(built)::value.launch.waves_per_eu;
             kernel = staged ? instance<AllReduceOneShotStagedKernel>(
-                                  all_reduce_pull_one_shot_staged<T, NG, THREADS>)
+                                  all_reduce_pull_one_shot_staged<T, NG, THREADS, WAVES>)
                             : instance<AllReduceOneShotKernel>(
-                                  all_reduce_pull_one_shot<T, NG, THREADS>);
+                                  all_reduce_pull_one_shot<T, NG, THREADS, WAVES>);
           });
           return;
         case Template::all_reduce_pull_two_shot:
           by_config<Template::all_reduce_pull_two_shot>(c, [&](auto built) {
             constexpr int THREADS = decltype(built)::value.launch.threads_per_block;
+            constexpr int WAVES   = decltype(built)::value.launch.waves_per_eu;
             kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
-                                  all_reduce_pull_two_shot_staged<T, NG, THREADS>)
+                                  all_reduce_pull_two_shot_staged<T, NG, THREADS, WAVES>)
                             : instance<AllReduceTwoShotKernel>(
-                                  all_reduce_pull_two_shot<T, NG, THREADS>);
+                                  all_reduce_pull_two_shot<T, NG, THREADS, WAVES>);
           });
           return;
         default: not_this_ops(fn);
@@ -1010,23 +1024,26 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
           case K::all_reduce_pull_one_shot_rms_norm:
             return by_config<K::all_reduce_pull_one_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceRmsNormOneShotKernel>(
-                  all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_pull_two_shot_rms_norm:
             return by_config<K::all_reduce_pull_two_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceRmsNormTwoShotKernel>(
-                  all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_push_two_shot_rms_norm:
             return by_config<K::all_reduce_push_two_shot_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceRmsNormTwoShotKernel>(
-                  all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           default: not_this_ops(fn);
         }
@@ -1097,23 +1114,26 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
           case K::all_reduce_pull_one_shot_add_rms_norm:
             return by_config<K::all_reduce_pull_one_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormOneShotKernel>(
-                  all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_pull_two_shot_add_rms_norm:
             return by_config<K::all_reduce_pull_two_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormTwoShotKernel>(
-                  all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_push_two_shot_add_rms_norm:
             return by_config<K::all_reduce_push_two_shot_add_rms_norm>(c, [&](auto cc) {
               constexpr RowConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormTwoShotKernel>(
-                  all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB>);
+                  all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           default: not_this_ops(fn);
         }
@@ -1194,39 +1214,42 @@ select_all_reduce_add_attn_res_rms_norm(
         case K::all_reduce_pull_one_shot_add_attn_res_rms_norm:
           return by_config<K::all_reduce_pull_one_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
             constexpr AttnResConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN,
-                                                                              TK, TPB>)
+                                                                              TK, TPB, WPE>)
                          : instance<AllReduceAddAttnResRmsNormOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, false, TN,
-                                                                              TK, TPB>);
+                                                                              TK, TPB, WPE>);
           });
         case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
           return by_config<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
             constexpr AttnResPullConfig C = decltype(cc)::value;
             constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
-                          TPB = C.launch.threads_per_block;
+                          TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormPullKernel>(
                                all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN,
-                                                                              TK, TPB>)
+                                                                              TK, TPB, WPE>)
                          : instance<AllReduceAddAttnResRmsNormPullKernel>(
                                all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, false, TM,
-                                                                              TN, TK, TPB>);
+                                                                              TN, TK, TPB, WPE>);
           });
         case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
           return by_config<K::all_reduce_push_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
             constexpr AttnResConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN,
-                                                                              TK, TPB>)
+                                                                              TK, TPB, WPE>)
                          : instance<AllReduceAddAttnResRmsNormPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, false, TN,
-                                                                              TK, TPB>);
+                                                                              TK, TPB, WPE>);
           });
         default: not_this_ops(fn);
       }
@@ -1311,15 +1334,16 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
       by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
         constexpr GemmConfig C = decltype(cc)::value;
         constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.launch.threads_per_block;
+                      TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm:
             kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
+                all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB, WPE>);
             return;
           case K::all_reduce_pull_two_shot_rms_norm_gemm:
             kernel = instance<AllReduceRmsNormGemmTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB>);
+                all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB, WPE>);
             return;
           default: not_this_ops(fn);
         }
@@ -1394,15 +1418,16 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
       by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
         constexpr GemmConfig C = decltype(cc)::value;
         constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.launch.threads_per_block;
+                      TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm_add:
             kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
+                all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB, WPE>);
             return;
           case K::all_reduce_pull_two_shot_rms_norm_gemm_add:
             kernel = instance<AllReduceRmsNormGemmTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB>);
+                all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB, WPE>);
             return;
           default: not_this_ops(fn);
         }
@@ -1485,15 +1510,16 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
       using T = typename decltype(t)::t;
       by_config<K::all_reduce_pull_one_shot_rms_scale_add>(c, [&](auto cc) {
         constexpr RowConfig C = decltype(cc)::value;
-        constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block;
+        constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_scale_add:
             kernel = instance<AllReduceRmsScaleAddOneShotKernel>(
-                all_reduce_pull_one_shot_rms_scale_add<T, NG, TN, TPB>);
+                all_reduce_pull_one_shot_rms_scale_add<T, NG, TN, TPB, WPE>);
             return;
           case K::all_reduce_pull_two_shot_rms_scale_add:
             kernel = instance<AllReduceRmsScaleAddTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_scale_add<T, NG, TN, TPB>);
+                all_reduce_pull_two_shot_rms_scale_add<T, NG, TN, TPB, WPE>);
             return;
           default: not_this_ops(fn);
         }
@@ -1560,8 +1586,9 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
     using T = typename decltype(t)::t;
     by_config<Template::add_attn_res_rms_norm>(c, [&](auto cc) {
       constexpr AttnResConfig C = decltype(cc)::value;
-      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block;
-      kernel = instance<AddAttnResRmsNormKernel>(add_attn_res_rms_norm<T, TN, TK, TPB>);
+      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
+                WPE = C.launch.waves_per_eu;
+      kernel = instance<AddAttnResRmsNormKernel>(add_attn_res_rms_norm<T, TN, TK, TPB, WPE>);
     });
   });
   // 4.

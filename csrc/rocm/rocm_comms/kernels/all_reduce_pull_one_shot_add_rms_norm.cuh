@@ -81,8 +81,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 }
 
 // THE KERNELS, one per op, both the body above.
-template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
                                       PeerSignals peer_signals, Signal* self_signal,
                                       int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
@@ -93,8 +94,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
       eps, rows, packs);
 }
 
-template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
                                           PeerSignals peer_signals, Signal* self_signal,
                                           int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,

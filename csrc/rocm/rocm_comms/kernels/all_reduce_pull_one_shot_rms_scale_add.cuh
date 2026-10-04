@@ -16,8 +16,8 @@ namespace hip_comms {
 // latent for the row's RMS (its 1/rms is the same in every slice). Rounds as the reference does:
 // each span's sum lands as T, the all-reduce output, then out = T(float(shared) +
 // float(projected) * scale).
-template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_scale_add(const PeerPtrs* __restrict__ peer_inputs,
                                            PeerSignals peer_signals, Signal* self_signal,
                                            int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,

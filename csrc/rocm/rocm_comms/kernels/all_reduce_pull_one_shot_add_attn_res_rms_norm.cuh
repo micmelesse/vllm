@@ -14,8 +14,9 @@ namespace hip_comms {
 // A block owns a row, as the fused norm does: every rank reduces every row, so there is
 // nothing to gather. `blocks` is [rows, num_sources, hidden] with row and source strides
 // in elements; `write_idx` < 0 writes no block.
-template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
                                                    PeerSignals peer_signals,
                                                    Signal* self_signal, int rank,

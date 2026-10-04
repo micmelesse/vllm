@@ -14,8 +14,8 @@ namespace hip_comms {
 
 // THE BUFFER AS ONE ROW, a block's chunk THREADS_PER_BLOCK groups of it, the grid striding over
 // chunks: thread t of block b holds group b x THREADS_PER_BLOCK + t, as a pack a thread did.
-template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(const PeerPtrs* __restrict__ peer_inputs,
                              PeerSignals peer_signals, Signal* self_signal, int rank,
                              uint64_t timeout_ticks, DTYPE* __restrict__ out, int num_packs) {
@@ -50,8 +50,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
 // reads every peer's staging, so any size runs in one launch; `num_packs` in 64 bits. EACH BLOCK
 // STAGES THE CHUNKS IT READS: what the same block on a peer copied is what a peers barrier makes
 // visible.
-template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 1)
+template <typename DTYPE, int WORLD, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_staged(PeerPtrs peer_staging, PeerSignals peer_signals,
                                     Signal* self_signal, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out, int64_t num_packs,

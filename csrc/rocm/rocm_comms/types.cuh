@@ -56,8 +56,9 @@ enum class Error : int {
   field_not_positive = 31,
   field_not_this_templates = 32,
   probe_out_of_range = 33,
+  waves_not_built = 34,
 };
-constexpr int kNumErrors = 34;
+constexpr int kNumErrors = 35;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -102,6 +103,8 @@ constexpr const char* to_string(Error e) {
       return "groups_disagree: the CPU and device groups differ in size or in this rank";
     case Error::threads_not_built:
       return "threads_not_built: no build of the template runs at that block size";
+    case Error::waves_not_built:
+      return "waves_not_built: no build of the template at that block size has those waves a EU";
     case Error::tile_not_built:
       return "tile_not_built: no build of the template has that TILE_M or TILE_N";
     case Error::direction_without_algorithm:
@@ -173,11 +176,14 @@ enum class OpType : int {
   add_attn_res_rms_norm            = 7,  // experimental: no all-reduce
 };
 
-// HOW A KERNEL IS LAUNCHED: its block's threads (Triton's num_warps x 64) and its grid. Every
-// kernel has one; the grid is the launch's alone, never compiled in.
+// HOW A KERNEL IS LAUNCHED: its block's threads (Triton's num_warps x 64), its grid, and the waves
+// a SIMD (an EU) the compiler fits its registers to (__launch_bounds__'s second value, Triton's
+// waves_per_eu; 1 asks nothing). Every kernel has one; the grid is the launch's alone, never
+// compiled in.
 struct LaunchConfig {
   int threads_per_block;
   int blocks_per_grid;
+  int waves_per_eu;
 };
 
 // EACH KERNEL FAMILY'S CONFIG, Triton's autotune config: its launch and its own fields, nothing it
