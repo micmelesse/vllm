@@ -45,9 +45,8 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   }
   tile_store(prefix, stride, np);
   if (write_idx >= 0) tile_store(blocks + write_idx * block_stride_r, block_stride_m, np);
-  // THE PREFIX IS HELD AS ITS DTYPE ACROSS THE LOOP, its last source: in fp32 it was 32 VGPRs at
-  // 7168 x 256 threads, a wave a SIMD; read back where it was stored (Triton's way) the extra round
-  // trip cost 3584 more than the wave gained (47.7 against 45.5 us, 2026-10-04T02-22-41Z).
+  // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back where it was just
+  // stored (Triton's kernel does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
   RowsF acc = np.template to<float>();
   if (num_blocks != 0) {
     Weight nw = at_cols, qk = at_cols;
@@ -67,7 +66,9 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
           tile_load(raw, blocks + src * block_stride_r, block_stride_m);
           v[s] = raw.template to<float>();
         } else {
-          v[s] = src == num_blocks ? np.template to<float>() : sum.template like<float>();
+          Rows again = sum.template like<DTYPE>();
+          if (src == num_blocks) tile_load(again, prefix, stride);
+          v[s] = again.template to<float>();
         }
         float ss[TILE_M], dw[TILE_M];
         partial_dot(v[s], v[s], ss);
