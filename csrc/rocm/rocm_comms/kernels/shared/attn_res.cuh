@@ -53,7 +53,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
     tile_load(nw, norm_w, 0);
     tile_load(qk, qk_w, 0);
     const WeightF w = tile_mul(nw.template to<float>(), qk.template to<float>());
-    acc = sum.template like<float>();
+    acc = sum.template zeros<float>();
     OnlineSoftmax softmax[TILE_M];
     for (int src0 = 0; src0 <= num_blocks; src0 += TILE_K) {
       RowsF v[TILE_K];
@@ -66,7 +66,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
           tile_load(raw, blocks + src * block_stride_r, block_stride_m);
           v[s] = raw.template to<float>();
         } else {
-          Rows again = sum.template like<DTYPE>();
+          Rows again = sum.template zeros<DTYPE>();
           if (src == num_blocks) tile_load(again, prefix, stride);
           v[s] = again.template to<float>();
         }
@@ -95,9 +95,14 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s) scale[s][m] = row_scale[s];
       }
-      acc = tile_mul(acc, old_scale);
+      acc = tile_fma(acc, old_scale, v[0], scale[0]);
+      if constexpr (TILE_K > 1) {
+        float ones[TILE_M];
 #pragma unroll
-      for (int s = 0; s < TILE_K; ++s) acc = tile_add(acc, tile_mul(v[s], scale[s]));
+        for (int m = 0; m < TILE_M; ++m) ones[m] = 1.0f;
+#pragma unroll
+        for (int s = 1; s < TILE_K; ++s) acc = tile_fma(acc, ones, v[s], scale[s]);
+      }
     }
     float inv_den[TILE_M];
 #pragma unroll

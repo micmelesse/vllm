@@ -53,6 +53,13 @@ struct Tile {
   int row_step = 1;
   ACC_DTYPE v[kRows][K][kPack];
 
+  // A TILE IS ITS PLACE; ITS ELEMENTS START UNSET, as registers do: zeroed by default they were 32
+  // moves a source in AttnRes's loop, every tile then loaded over them (ISA 2026-10-04T02-22-41Z).
+  // zeros<U>() where a sum starts.
+  Tile() = default;
+  DINLINE Tile(int m, int n, int offs_m_, int offs_n_, int row_step_ = 1)
+      : M(m), N(n), offs_m(offs_m_), offs_n(offs_n_), row_step(row_step_) {}
+
   // THIS THREAD'S GROUP k OF A ROW, in groups from the row's start: past N clamped to the last, so
   // every load stays in bounds; its mask is 1 below N and 0 past it (a float, multiplied in, so
   // nothing reading it branches: a load under a runtime `if` cannot be hoisted past the branch, and
@@ -78,12 +85,23 @@ struct Tile {
   DINLINE bool live(int m) const { return offs_m + tile_row(m) * row_step < M; }
   DINLINE int row(int m) const { return live(m) ? offs_m + tile_row(m) * row_step : M - 1; }
 
-  // The same place held as AS_DTYPE, its elements converted (rounded once) or empty.
+  // The same place held as AS_DTYPE, its elements converted (rounded once), unset, or zero.
   template <typename AS_DTYPE>
   using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, AS_DTYPE>;
   template <typename AS_DTYPE>
   DINLINE As<AS_DTYPE> like() const {
-    return {M, N, offs_m, offs_n, row_step};
+    return As<AS_DTYPE>(M, N, offs_m, offs_n, row_step);
+  }
+  template <typename AS_DTYPE>
+  DINLINE As<AS_DTYPE> zeros() const {
+    As<AS_DTYPE> t = like<AS_DTYPE>();
+#pragma unroll
+    for (int m = 0; m < kRows; ++m)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < kPack; ++j) t.v[m][k][j] = AS_DTYPE(0);
+    return t;
   }
   template <typename AS_DTYPE>
   DINLINE As<AS_DTYPE> to() const {

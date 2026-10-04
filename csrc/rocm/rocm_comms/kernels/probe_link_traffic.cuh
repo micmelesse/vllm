@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     others[i] = rank_input<DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD);
   const DTYPE* one      = peer < 0 ? nullptr : rank_input<DTYPE, WORLD>(*peer_inputs, peer);
   const auto stagings   = rank_stagings<DTYPE, WORLD>(peer_staging);
-  auto sum              = Chunk{1, len, 0, 0}.template to<float>();
+  auto sum              = Chunk{1, len, 0, 0}.template zeros<float>();
   for (int offs_n = index * Chunk::kTileN; offs_n < len; offs_n += blocks * Chunk::kTileN) {
     const Chunk at{1, len, 0, offs_n};
     if (pulls && peer < 0) {
