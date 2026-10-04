@@ -58,11 +58,18 @@ struct Max {
 
 // ONE DPP STEP: `v` from the lane `ctrl` names, as a VALU operand, no LDS. `row_mask` picks which
 // 16-lane rows take it; the others read `identity`, which leaves them as they were.
+// A FULL ROW MASK NEEDS NO `old`: left undefined (mov_dpp), the compiler fuses the move into the
+// add that uses it (v_add_f32_dpp); an explicit identity kept a v_mov_b32_dpp and an add a step
+// (ISA 2026-10-04T03-07-41Z).
 template <int DPP_CTRL, int DPP_ROW_MASK, typename REDUCE_OP>
 DINLINE float dpp(float v) {
-  const int moved = __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, REDUCE_OP::kIdentity),
-                                                __builtin_bit_cast(int, v), DPP_CTRL, DPP_ROW_MASK, 0xf,
-                                                false);
+  int moved;
+  if constexpr (DPP_ROW_MASK == 0xf)
+    moved = __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), DPP_CTRL, 0xf, 0xf, false);
+  else
+    moved = __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, REDUCE_OP::kIdentity),
+                                        __builtin_bit_cast(int, v), DPP_CTRL, DPP_ROW_MASK, 0xf,
+                                        false);
   return __builtin_bit_cast(float, moved);
 }
 
