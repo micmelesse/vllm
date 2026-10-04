@@ -64,7 +64,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto input = [&](int r) { return inputs[r]; };
+  // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
+  // GPU read rank 0 first, a link at a time carrying the machine's reads, and the reduce-scatter
+  // took 1.6x the plain two-shot's cycles for its bytes (thread traces 2026-10-04T21-03-09Z,
+  // 21-26-11Z). Each slice is summed by one rank, so the order differing by rank is harmless.
+  const auto input = [&](int r) { return inputs[(rank + r) % WORLD]; };
   const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
 
   // 2. This rank's columns of this block's rows (every gridDim.x-th, AttnRes's below), summed
