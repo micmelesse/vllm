@@ -23,16 +23,13 @@ namespace hip_comms {
 // `blocks` [rows, sources, hidden] at row and source strides in elements, and `write_idx` < 0
 // writes no block. A row past M (the last tile's) reads row M - 1 and writes nothing, so every
 // thread still reaches every reduction.
-// `old` is the tile's prefix as loaded (unused without one): block_attn_res_tile below loads it
-// here, and a caller that loads the next tile's ahead passes it in.
 template <bool HAS_PREFIX, int TILE_K, typename DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void block_attn_res_tile_from(
-    const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& sum,
-    const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& old, DTYPE* prefix,
-    DTYPE* blocks, int64_t block_stride_m, int64_t block_stride_r, int write_idx,
-    const DTYPE* __restrict__ norm_w, const DTYPE* __restrict__ qk_w,
-    const DTYPE* __restrict__ out_norm_w, DTYPE* out, int num_blocks, float eps, float out_eps,
-    float inv_hidden) {
+DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& sum, DTYPE* prefix,
+                                 DTYPE* blocks, int64_t block_stride_m, int64_t block_stride_r,
+                                 int write_idx, const DTYPE* __restrict__ norm_w,
+                                 const DTYPE* __restrict__ qk_w, const DTYPE* __restrict__ out_norm_w,
+                                 DTYPE* out, int num_blocks, float eps, float out_eps,
+                                 float inv_hidden) {
   using Rows    = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowsF   = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight  = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -40,10 +37,14 @@ DINLINE void block_attn_res_tile_from(
   const int64_t stride = sum.N;
   const Weight at_cols{1, sum.N, 0, sum.offs_n};
 
-  // The new prefix: the sum over the ranks added to the old one, rounded once to DTYPE.
+  // The new prefix: the sum over the ranks added to the old one, rounded once to DTYPE; the old
+  // prefix loaded whole before anything is stored.
   Rows np = sum;
-  if constexpr (HAS_PREFIX)
+  if constexpr (HAS_PREFIX) {
+    Rows old = sum.template like<DTYPE>();
+    tile_load(old, prefix, stride);
     np = tile_add(old.template to<float>(), sum.template to<float>()).template to<DTYPE>();
+  }
   tile_store(prefix, stride, np);
   if (write_idx >= 0) tile_store(blocks + write_idx * block_stride_r, block_stride_m, np);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back where it was just
@@ -132,21 +133,6 @@ DINLINE void block_attn_res_tile_from(
     result = acc.template to<DTYPE>();
   }
   tile_store(out, stride, result);
-}
-
-// A tile of AttnRes, its old prefix loaded here, whole before anything is stored.
-template <bool HAS_PREFIX, int TILE_K, typename DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void block_attn_res_tile(
-    const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& sum, DTYPE* prefix,
-    DTYPE* blocks, int64_t block_stride_m, int64_t block_stride_r, int write_idx,
-    const DTYPE* __restrict__ norm_w, const DTYPE* __restrict__ qk_w,
-    const DTYPE* __restrict__ out_norm_w, DTYPE* out, int num_blocks, float eps, float out_eps,
-    float inv_hidden) {
-  auto old = sum.template like<DTYPE>();
-  if constexpr (HAS_PREFIX) tile_load(old, prefix, sum.N);
-  block_attn_res_tile_from<HAS_PREFIX, TILE_K>(sum, old, prefix, blocks, block_stride_m,
-                                               block_stride_r, write_idx, norm_w, qk_w, out_norm_w,
-                                               out, num_blocks, eps, out_eps, inv_hidden);
 }
 
 }  // namespace hip_comms
