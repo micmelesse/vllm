@@ -17,7 +17,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include <hip/hip_runtime.h>
@@ -82,14 +82,16 @@ DINLINE std::array<DTYPE*, WORLD> every(const PeerPtrs& p) {
   for (int r = 0; r < WORLD; ++r) all[r] = rank_of<DTYPE, WORLD>(p, r);
   return all;
 }
-}  // namespace impl
 
 template <typename DTYPE, int WORLD>
 DINLINE const DTYPE* rank_input(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
+
 template <typename DTYPE, int WORLD>
 DINLINE DTYPE* rank_staging(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
+
 template <typename DTYPE, int WORLD>
 DINLINE DTYPE* rank_scratch(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
+
 template <typename DTYPE, int WORLD>
 DINLINE std::array<const DTYPE*, WORLD> rank_inputs(const PeerPtrs& p) {
   std::array<const DTYPE*, WORLD> all;
@@ -97,9 +99,12 @@ DINLINE std::array<const DTYPE*, WORLD> rank_inputs(const PeerPtrs& p) {
   for (int r = 0; r < WORLD; ++r) all[r] = impl::rank_of<DTYPE, WORLD>(p, r);
   return all;
 }
+
 template <typename DTYPE, int WORLD>
 DINLINE std::array<DTYPE*, WORLD> rank_stagings(const PeerPtrs& p) { return impl::every<DTYPE, WORLD>(p); }
+
 template <typename DTYPE, int WORLD>
 DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& p) { return impl::every<DTYPE, WORLD>(p); }
+}  // namespace impl
 
 }  // namespace hip_comms

@@ -8,7 +8,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include "build.cuh"
@@ -20,6 +20,7 @@ namespace hip_comms {
 // This thread's share of dot(a, b) over each row of the tile, columns past N counting zero: the
 // partials a block_reduce turns into the rows' dots (a sum of squares is partial_dot(x, x)). A
 // one-row b (a weight) is every row's.
+namespace impl {
 template <typename A, typename B>
 DINLINE void partial_dot(const A& a, const B& b, float (&d)[A::kRows]) {
   static_assert(A::kThreadsM == 1, "a dot's partials reduce over the block, so a row is the block's");
@@ -37,6 +38,7 @@ DINLINE void partial_dot(const A& a, const B& b, float (&d)[A::kRows]) {
     }
   }
 }
+}  // namespace impl
 
 // THE GEMM TAIL'S LDS, for its tile: a TILE_M x TILE_K chunk of x staged, a norm's block_reduce,
 // and a [TILE_M][wave / SLICE_K] fp32 partial per wave. The device decides how many waves fit.
@@ -86,6 +88,7 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 // the last bits, not bitwise.
 template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
           typename DTYPE>
+namespace impl {
 DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
                        const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
                        int64_t out_stride) {
@@ -158,5 +161,6 @@ DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
     __syncthreads();
   }
 }
+}  // namespace impl
 
 }  // namespace hip_comms

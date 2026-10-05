@@ -8,7 +8,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 namespace hip_comms {
@@ -28,6 +28,7 @@ namespace hip_comms {
 //   rank_chunk(w)  where rank + w's copy of the chunk starts
 //   sum_out        where this rank's summed chunk goes (its scratch)
 // The sum's order differs by rank, which is harmless: each chunk is summed by one rank.
+namespace impl {
 template <typename TILE, typename RANK_CHUNK>
 DINLINE void reduce_scatter(TILE& chunk, RANK_CHUNK rank_chunk, typename TILE::Dtype* sum_out) {
   // 1. Every rank's copy of the chunk, a row each, in one round trip.
@@ -37,11 +38,13 @@ DINLINE void reduce_scatter(TILE& chunk, RANK_CHUNK rank_chunk, typename TILE::D
   // 3. Stored as DTYPE in this rank's slice.
   tile_store(sum_out, chunk.N, sum.template to<typename TILE::Dtype>());
 }
+}  // namespace impl
 
 // ALL-GATHER: every rank's summed slice into the output, a chunk a call.
 //   rank_chunk(w)  where rank + w's summed copy of the chunk starts (its scratch)
 //   out_chunk(w)   where that chunk goes in the output
 //   out_len(w)     how many of its columns are real there (a late rank's slice is short)
+namespace impl {
 template <typename TILE, typename RANK_CHUNK, typename OUT_CHUNK, typename OUT_LEN>
 DINLINE void all_gather(TILE& chunk, RANK_CHUNK rank_chunk, OUT_CHUNK out_chunk, OUT_LEN out_len) {
   // 1. Every rank's summed copy of the chunk, a row each, in one round trip.
@@ -49,5 +52,6 @@ DINLINE void all_gather(TILE& chunk, RANK_CHUNK rank_chunk, OUT_CHUNK out_chunk,
   // 2. Each row stored where its rank's slice goes.
   tile_scatter(out_chunk, out_len, chunk);
 }
+}  // namespace impl
 
 }  // namespace hip_comms

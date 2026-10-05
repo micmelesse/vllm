@@ -9,7 +9,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include <cmath>
@@ -24,6 +24,7 @@ namespace hip_comms {
 // EACH PACK SUMMED OVER ITS `ngpus` SOURCES, in fp32 in source order and rounded once to T, into
 // sum[k]: callers whose sources are the ranks agree bitwise. Waits on the loads only here.
 // EVERY PEER'S TILE SUMMED, in rank order in fp32 and rounded once, as a pack's is.
+namespace impl {
 template <typename TILE, int WORLD>
 DINLINE TILE peers_reduce(const TILE (&t)[WORLD]) {
   constexpr int NL = TILE::kPack;
@@ -44,6 +45,7 @@ DINLINE TILE peers_reduce(const TILE (&t)[WORLD]) {
     }
   return sum;
 }
+}  // namespace impl
 
 
 // THE OPERATIONS a wave or block reduction combines with.
@@ -61,6 +63,7 @@ struct Max {
 // A FULL ROW MASK NEEDS NO `old`: left undefined (mov_dpp), the compiler fuses the move into the
 // add that uses it (v_add_f32_dpp); an explicit identity kept a v_mov_b32_dpp and an add a step
 // (ISA 2026-10-04T03-07-41Z).
+namespace impl {
 template <int DPP_CTRL, int DPP_ROW_MASK, typename REDUCE_OP>
 DINLINE float dpp(float v) {
   int moved;
@@ -72,6 +75,7 @@ DINLINE float dpp(float v) {
                                         false);
   return __builtin_bit_cast(float, moved);
 }
+}  // namespace impl
 
 // N VALUES OVER THE WAVE, in place, every lane left holding the results. The moved value first:
 // only a VOP2's src0 takes DPP, so (dpp(x), x) fuses each step into one v_add_f32_dpp where
@@ -83,6 +87,7 @@ DINLINE float dpp(float v) {
 //   mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror): each row holds its sum
 //   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
 //   holds the wave's, and readlane hands it to every lane.
+namespace impl {
 template <typename REDUCE_OP, int NUM_VALUES>
 DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
   static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
@@ -98,6 +103,7 @@ DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
     v[n] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), 63));
   }
 }
+}  // namespace impl
 
 // N VALUES OVER THE BLOCK, in place: each wave reduces its N, then every thread sums the waves'
 // partials in wave order (the same order in every thread, so every thread holds the same totals).
@@ -106,6 +112,7 @@ DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
 // loop (ISA 2026-10-04T03-31-28Z). The trailing barrier keeps the next call from overwriting
 // partials still being read. THE BLOCK'S WAVES ARE COMPILED IN: read from blockDim, every thread
 // loaded the widest block's partials and kept 12 VGPRs at AttnRes's peak (ISA 2026-10-04T16-39-15Z).
+namespace impl {
 template <typename REDUCE_OP, int THREADS_PER_BLOCK, int NUM_VALUES>
 DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
   constexpr int kWaves = (THREADS_PER_BLOCK + kWaveSize - 1) / kWaveSize;
@@ -127,6 +134,7 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
   }
   __syncthreads();
 }
+}  // namespace impl
 
 // A TILE REDUCED OVER AN AXIS, Triton's tl.sum(x, axis) for a float tile:
 //   Axis::m  over the rows, every column's: the rows meet in LDS as they are held (a bf16 tile's
@@ -136,6 +144,7 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
 //            each thread's groups, then the row's threads (a wave's or the block's)
 enum class Axis { m, n };
 
+namespace impl {
 template <typename REDUCE_OP, Axis AXIS, typename TILE>
 DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kThreadsPerBlock, float> block_reduce(
     const TILE& t) {
@@ -190,6 +199,7 @@ DINLINE void block_reduce(const TILE& t, float (&out)[TILE::kRows]) {
   else
     static_assert(TILE::kThreadsN == kWaveSize, "a row is the block's or a wave's");
 }
+}  // namespace impl
 
 // The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.
 constexpr int64_t block_reduce_lds_bytes(int n) {

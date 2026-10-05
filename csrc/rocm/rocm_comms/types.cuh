@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <variant>
 
-#include "common/common.cuh"
+#include "common/interface.cuh"
 
 namespace hip_comms {
 

@@ -22,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-#include "common/common.cuh"
+#include "common/interface.cuh"
 #include "types.cuh"
 #include "kernels/all_reduce_pull_one_shot.cuh"
 

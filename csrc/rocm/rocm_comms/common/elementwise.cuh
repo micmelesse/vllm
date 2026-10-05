@@ -7,7 +7,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include "tile.cuh"
@@ -35,7 +35,6 @@ DINLINE A zip(const A& a, const B& b, OP op) {
         out.v[m][k][j] = op(a.v[m][k][j], b.v[B::kRows == 1 ? 0 : m][k][j]);
   return out;
 }
-}  // namespace impl
 
 template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
 DINLINE A tile_add(const A& a, const B& b) {
@@ -67,10 +66,12 @@ DINLINE A tile_mul(const A& a, float scale) {
   for (int m = 0; m < A::kRows; ++m) row_scale[m] = scale;
   return tile_mul(a, row_scale);
 }
+}  // namespace impl
 
 // a x a_row_scale + b x b_row_scale, element by element, as fused multiply-adds (a softmax's fold:
 // the old sum rescaled plus a new source weighted). b may be held in its stored dtype, converted here. Two multiplies and an add were three VALU an
 // element and, vectorized, packed multiplies with a chain of adds (ISA 2026-10-04T02-22-41Z).
+namespace impl {
 template <typename A, typename B>
 DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
                    const float (&b_row_scale)[A::kRows]) {
@@ -85,5 +86,6 @@ DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
         out.v[m][k][j] = fmaf(static_cast<float>(b.v[m][k][j]), b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
   return out;
 }
+}  // namespace impl
 
 }  // namespace hip_comms

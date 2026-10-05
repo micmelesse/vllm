@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include "../common/common.cuh"
+#include "../common/interface.cuh"
 #include "shared/attn_res.cuh"
 
 namespace hip_comms {

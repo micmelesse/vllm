@@ -7,7 +7,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include <cmath>
@@ -24,6 +24,7 @@ struct OnlineSoftmax {
 
 // Folds N logits into `s` (a -INFINITY logit is no source). Returns the scale the weighted sum so
 // far takes, and in `scale` each logit's weight; the sum is final once divided by s.denominator.
+namespace impl {
 template <int NUM_LOGITS>
 DINLINE float thread_softmax_fold(OnlineSoftmax& s, const float (&logit)[NUM_LOGITS], float (&scale)[NUM_LOGITS]) {
   float new_max = s.max;
@@ -39,5 +40,6 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s, const float (&logit)[NUM_LOG
   s.max = new_max;
   return old_scale;
 }
+}  // namespace impl
 
 }  // namespace hip_comms

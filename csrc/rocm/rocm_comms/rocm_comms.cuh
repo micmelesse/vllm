@@ -10,7 +10,7 @@
 //   common/         everything a kernel uses and the machine under it: the device (hardware.cuh:
 //                   its Hardware, and the machine model over it), the build (build.cuh: kBuild,
 //                   what is compiled for it, fixed at compile time), tiles, the peers' memory and
-//                   barriers (common.cuh lists it all)
+//                   barriers (common/interface.cuh lists it all)
 //   handle.cuh      Handle: the peers' memory, mapped once (run time; kBuild's twin), and
 //                   supported(device, world): whether one can exist there
 //   types.cuh       the vocabulary: Error, Template, each family's KernelConfig, OpType, Algorithm,
@@ -33,7 +33,7 @@
 #include <string>
 #include <variant>
 
-#include "common/common.cuh"
+#include "common/interface.cuh"
 #include "handle.cuh"
 #include "types.cuh"
 

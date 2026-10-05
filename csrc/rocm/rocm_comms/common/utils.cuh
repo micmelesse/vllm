@@ -7,7 +7,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include <hip/hip_runtime.h>
@@ -46,6 +46,7 @@ constexpr int kStampBlocks = kMaxComputeUnits;
 constexpr int kStampPhases = 8;
 __device__ uint64_t g_stamps[kStampBlocks][kStampPhases];
 
+namespace impl {
 DINLINE void block_stamp(int phase) {
   if constexpr (HIP_COMMS_STAMPS) {
     // Every outstanding load landed first, so a phase owns its own memory latency.
@@ -54,5 +55,6 @@ DINLINE void block_stamp(int phase) {
     if (threadIdx.x == 0 && blockIdx.x < kStampBlocks) g_stamps[blockIdx.x][phase] = wall_clock64();
   }
 }
+}  // namespace impl
 
 }  // namespace hip_comms

@@ -14,7 +14,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include <hip/hip_runtime.h>
@@ -93,14 +93,18 @@ DINLINE Signal* signal_of(const PeerSignals& peer_signals, int r) {
 
 // This rank's signal block; rank r's, r the same across the wave (by select); and thread i's peer
 // i's, each thread its own (a per-lane load, as the pairing barrier issues it).
+namespace impl {
 DINLINE Signals own_signals(Signal* self_signal) { return Signals(self_signal); }
+
 DINLINE Signals signals(const PeerSignals& peer_signals, int r) {
   return Signals(impl::signal_of(peer_signals, r));
 }
+
 template <typename INDEX_TYPE>
 DINLINE Signals lane_signals(const PeerSignals& peer_signals, INDEX_TYPE i) {
   return Signals(peer_signals.s[i]);
 }
+}  // namespace impl
 
 
 
@@ -207,7 +211,7 @@ DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, i
 // writes back the whole L2, so one covers the block where one per thread wrote it back
 // 512 times.
 template <int WORLD, bool PEERS>
-DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
+DINLINE void grid_barrier(const PeerSignals& peer_signals, Signal* self_signal, int rank,
                      uint64_t timeout_ticks) {
   constexpr int kScope = PEERS ? __MEMORY_SCOPE_SYSTEM : __MEMORY_SCOPE_DEVICE;
   skew(rank, 0);
@@ -245,7 +249,7 @@ DINLINE void barrier(const PeerSignals& peer_signals, Signal* self_signal, int r
 }  // namespace impl
 
 // =================================================================================
-// HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in common.cuh): the barriers and flags, written
+// HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in interface.cuh): the barriers and flags, written
 // against a rank's Signals (buffers.cuh); a rank's data buffers are ordered only by `barrier`.
 // =================================================================================
 
@@ -267,6 +271,13 @@ enum class Until { launched, visible, read };
 // A read after a peers barrier may see only what the SAME BLOCK on the peer wrote before it, so
 // both sides must index the same data by the same block.
 template <int WORLD>
+class Sync;
+namespace impl {
+template <Group GROUP, Until UNTIL, int WORLD>
+DINLINE void barrier(Sync<WORLD>& sync);
+}  // namespace impl
+
+template <int WORLD>
 class Sync {
   const PeerSignals& peer_signals_;
   Signal* self_signal_;
@@ -275,7 +286,7 @@ class Sync {
   uint32_t seq_;
 
   template <Group GROUP, Until UNTIL, int W>
-  friend DINLINE void barrier(Sync<W>& sync);
+  friend DINLINE void impl::barrier(Sync<W>& sync);
 
  public:
   DINLINE Sync(const PeerSignals& peer_signals, Signal* self_signal, int rank,
@@ -284,37 +295,38 @@ class Sync {
         self_signal_(self_signal),
         rank_(rank),
         timeout_ticks_(timeout_ticks),
-        seq_(own_signals(self_signal).seq(blockIdx.x)) {}
+        seq_(impl::own_signals(self_signal).seq(blockIdx.x)) {}
 
   // A FLAG TO ONE PEER, with the barriers' own store and spin: `v` lands in `peer`'s signal block,
   // in its slot for this rank, and wait_flag spins until `peer`'s flag here reaches `v`. Flags
   // only grow, so a caller counts on from the last value it used.
   DINLINE void write_flag(int peer, uint32_t v) const {
-    signals(peer_signals_, peer).flag(rank_).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(v);
+    impl::signals(peer_signals_, peer).flag(rank_).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(v);
   }
   DINLINE void wait_flag(int peer, uint32_t v) const {
     impl::wait<false, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, rank_,
-                                             own_signals(self_signal_).flag(peer), v, "flag", peer);
+                                             impl::own_signals(self_signal_).flag(peer), v, "flag", peer);
   }
 
   // THE SEQUENCE FOR THE NEXT CALL, once, after every barrier: a kernel that does not call it
   // pairs its next call's blocks against stale numbers and hangs (lint_kernels.sh checks).
   DINLINE void finish() const {
-    if (threadIdx.x == 0) own_signals(self_signal_).set_seq(blockIdx.x, seq_);
+    if (threadIdx.x == 0) impl::own_signals(self_signal_).set_seq(blockIdx.x, seq_);
   }
 };
 
 // THE BARRIER, one for every case: barrier<Group::peers, Until::read>(sync). A namespace function,
 // as std::get is, so a kernel templated on WORLD calls it without `sync.template barrier<...>`.
+namespace impl {
 template <Group GROUP, Until UNTIL, int WORLD>
 DINLINE void barrier(Sync<WORLD>& sync) {
   static_assert(GROUP == Group::peers || UNTIL == Until::visible,
                 "a grid or world barrier is a visibility barrier");
   if constexpr (GROUP == Group::grid) {
-    impl::barrier<WORLD, false>(sync.peer_signals_, sync.self_signal_, sync.rank_,
+    impl::grid_barrier<WORLD, false>(sync.peer_signals_, sync.self_signal_, sync.rank_,
                                 sync.timeout_ticks_);
   } else if constexpr (GROUP == Group::world) {
-    impl::barrier<WORLD, true>(sync.peer_signals_, sync.self_signal_, sync.rank_,
+    impl::grid_barrier<WORLD, true>(sync.peer_signals_, sync.self_signal_, sync.rank_,
                                sync.timeout_ticks_);
   } else {
     impl::skew(sync.rank_, sync.seq_);
@@ -324,5 +336,6 @@ DINLINE void barrier(Sync<WORLD>& sync) {
                                                       UNTIL == Until::launched, sync.seq_);
   }
 }
+}  // namespace impl
 
 }  // namespace hip_comms

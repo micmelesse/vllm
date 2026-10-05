@@ -8,7 +8,7 @@
 #pragma once
 
 #ifndef HIP_COMMS_COMMON_INTERFACE
-#error "include common/common.cuh, common's one interface, not its parts"
+#error "include common/interface.cuh, common's one interface, not its parts"
 #endif
 
 #include "tile.cuh"
@@ -51,9 +51,7 @@ DINLINE void issued() {
   asm volatile("" ::: "memory");
   __builtin_amdgcn_sched_barrier(0);
 }
-}  // namespace impl
 
-namespace impl {
 // A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form global_load and
 // global_store take with the base in scalar registers (saddr), so every tensor sharing the
 // columns shares one offset register. A signed column added to the pointer was a 64-bit vector
@@ -100,6 +98,7 @@ DINLINE typename TILE::Pack pack(const TILE& t, int m, int k) {
 // its values go unused. Under participates() the load was an exec branch, so every tile's old
 // registers stayed live across AttnRes's loops (threadIdx < 256 is not folded from the launch
 // bounds; ISA 2026-10-04T16-39-15Z).
+namespace impl {
 template <typename TILE>
 DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
                          int64_t row_stride) {
@@ -134,12 +133,14 @@ DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride, const TILE
     }
   }
 }
+}  // namespace impl
 
 // EVERY PEER'S TILE, all in flight together: `data(r)` is rank r's tensor, `row_stride` its
 // elements between rows. A pack position at a time, every rank's for it, so the address is
 // computed once a position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until a tile is used (peers_reduce), so loads issued here
 // can run under other work.
+namespace impl {
 template <typename TILE, int WORLD, typename RANK_DATA>
 DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
                         int64_t row_stride) {
@@ -157,10 +158,12 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
   }
   impl::issued();
 }
+}  // namespace impl
 
 // A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
 // end): each pack from its owner's tensor, `data(r)`, `r` the owner in each lane (a wave's packs
 // may have two owners).
+namespace impl {
 template <int WORLD, typename TILE, typename RANK_DATA>
 DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                          int slice) {
@@ -178,11 +181,13 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
   }
   impl::issued();
 }
+}  // namespace impl
 
 // A TILE WHOSE ROWS ARE DIFFERENT TENSORS' (a row a peer): row m's at `row_data(m)`, its first
 // element, the tile's columns counted from it. tile_gather loads every row together, one round trip;
 // tile_scatter stores row m into `row_data(m)` up to its own `row_n(m)` columns (a short last
 // slice).
+namespace impl {
 template <typename TILE, typename ROW_DATA>
 DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
   using P = typename TILE::Pack;
@@ -195,9 +200,11 @@ DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
   }
   impl::issued();
 }
+}  // namespace impl
 
 // ...a row only `row_n(m)` columns long (a short last slice): its columns past that read its last
 // group, and an empty row reads nothing.
+namespace impl {
 template <typename TILE, typename ROW_DATA, typename ROW_N>
 DINLINE void tile_gather(TILE& t, ROW_DATA row_data, ROW_N row_n) {
   using P = typename TILE::Pack;
@@ -237,13 +244,16 @@ DINLINE void tile_scatter(ROW_DATA row_data, ROW_N row_n, const TILE& t) {
     }
   }
 }
+}  // namespace impl
 
 // A ROW'S SCALAR (a norm's scale), one float a row of `scalars`: thread 0 stores row `row`'s; every
 // rank's for row `row`, `data(r)` its scalars, loaded by every thread, all in flight together (a
 // wave's lanes read one address: one request a wave), issued after any tile loads before them.
+namespace impl {
 DINLINE void block_store_row_scalar(float* scalars, int row, float v) {
   if (threadIdx.x == 0) *(__attribute__((address_space(1))) float*)(scalars + row) = v;
 }
+
 template <int WORLD, typename RANK_DATA>
 DINLINE void peers_load_row_scalars(RANK_DATA data, int row, float (&out)[WORLD]) {
 #pragma unroll
@@ -251,5 +261,6 @@ DINLINE void peers_load_row_scalars(RANK_DATA data, int row, float (&out)[WORLD]
     out[r] = *(const __attribute__((address_space(1))) float*)(data(r) + row);
   impl::issued();
 }
+}  // namespace impl
 
 }  // namespace hip_comms
