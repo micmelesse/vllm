@@ -74,6 +74,12 @@ class Signals {
   DINLINE Counter flag(int rank) const { return Counter(&s_->flag[rank]); }
   DINLINE uint32_t seq(unsigned block) const { return s_->seq[block]; }
   DINLINE void set_seq(unsigned block, uint32_t v) const { s_->seq[block] = v; }
+  // Block `block` of rank `rank`'s published steps (Sync::publish), and this launch's finished blocks.
+  template <typename RANK_TYPE>
+  DINLINE Counter ready(unsigned block, RANK_TYPE rank) const {
+    return Counter(&s_->ready[block][rank]);
+  }
+  DINLINE Counter done() const { return Counter(&s_->done); }
   DINLINE uint32_t epoch() const { return s_->epoch; }
   DINLINE void set_epoch(uint32_t v) const { s_->epoch = v; }
 };
@@ -271,8 +277,6 @@ class Sync {
 
   template <Group GROUP, Until UNTIL, int W>
   friend DINLINE void barrier(Sync<W>& sync);
-  template <int FIRST_THREAD, int THREADS, int W>
-  friend DINLINE void part_barrier(Sync<W>& sync, uint32_t* met, uint32_t& gen);
 
  public:
   DINLINE Sync(const PeerSignals& peer_signals, Signal* self_signal, int rank,
@@ -294,9 +298,41 @@ class Sync {
                                              own_signals(self_signal_).flag(peer), v, "flag", peer);
   }
 
-  // A PEERS BARRIER THIS THREAD SITS OUT (part_barrier, another part of the block's): counted, so
-  // every thread's sequence agrees at finish().
-  DINLINE void skip() { ++seq_; }
+  // A BLOCK'S PROGRESS FOR OTHER BLOCKS, with no barrier between them (a producer block and the
+  // consumer blocks waiting on its steps): publish(k) tells every peer that this block has stored
+  // its first k steps, after every wave's stores (released); wait_published(block, k) spins until
+  // `block` has published k on every rank (acquired), then the block meets. Counts start at 0 each
+  // launch: its last block clears them (clear_published, before finish()), and a peer publishes
+  // only after the next launch's first barrier, so never into a launch still reading them.
+  DINLINE void publish(uint32_t k) const {
+    impl::wait_stores();
+    __syncthreads();
+    if (threadIdx.x < WORLD)
+      lane_signals(peer_signals_, threadIdx.x)
+          .ready(blockIdx.x, rank_)
+          .template store<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>(k);
+  }
+  DINLINE void wait_published(unsigned block, uint32_t k) const {
+    if (threadIdx.x < WORLD)
+      impl::wait<true, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, rank_,
+                                              own_signals(self_signal_).ready(block, threadIdx.x),
+                                              k, "published", threadIdx.x);
+    __syncthreads();
+  }
+  DINLINE void clear_published() const {
+    __shared__ bool last;
+    __syncthreads();
+    const Signals own = own_signals(self_signal_);
+    if (threadIdx.x == 0)
+      last = own.done().template fetch_add<__ATOMIC_ACQ_REL, __MEMORY_SCOPE_DEVICE>(1u) ==
+             gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    for (unsigned i = threadIdx.x; i < gridDim.x * WORLD; i += kWaveSize)
+      if (threadIdx.x < kWaveSize)
+        own.ready(i / WORLD, i % WORLD).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(0u);
+    if (threadIdx.x == 0) own.done().template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(0u);
+  }
 
   // THE SEQUENCE FOR THE NEXT CALL, once, after every barrier: a kernel that does not call it
   // pairs its next call's blocks against stale numbers and hangs (lint_kernels.sh checks).
@@ -324,42 +360,6 @@ DINLINE void barrier(Sync<WORLD>& sync) {
                                                       sync.rank_, sync.timeout_ticks_,
                                                       UNTIL == Until::launched, sync.seq_);
   }
-}
-
-// A PEERS BARRIER FOR PART OF A BLOCK, its THREADS threads from FIRST_THREAD, while the block's
-// other waves compute and hold the block's one hardware barrier: the part's waves meet in LDS
-// (`met`, zeroed before its first use; `gen`, every part thread's count of meetings), its first
-// WORLD threads exchange with the same block on every peer, and the part meets again. What the
-// part stored before is visible to the peers' same part after. The block's other threads call
-// sync.skip() for each.
-namespace impl {
-template <int WAVES>
-DINLINE void part_meet(uint32_t* met, uint32_t& gen) {
-  gen += WAVES;
-  if (threadIdx.x % kWaveSize == 0)
-    __hip_atomic_fetch_add(met, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
-  while (__hip_atomic_load(met, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP) < gen)
-    __builtin_amdgcn_s_sleep(1);
-}
-}  // namespace impl
-
-template <int FIRST_THREAD, int THREADS, int WORLD>
-DINLINE void part_barrier(Sync<WORLD>& sync, uint32_t* met, uint32_t& gen) {
-  static_assert(FIRST_THREAD % kWaveSize == 0 && THREADS % kWaveSize == 0, "whole waves");
-  static_assert(THREADS >= WORLD, "a thread a peer");
-  impl::skew(sync.rank_, sync.seq_);
-  ++sync.seq_;
-  impl::wait_stores();
-  impl::part_meet<THREADS / kWaveSize>(met, gen);
-  const int t = static_cast<int>(threadIdx.x) - FIRST_THREAD;
-  if (t < WORLD) {
-    const Signals own  = own_signals(sync.self_signal_);
-    const Signals peer = lane_signals(sync.peer_signals_, t);
-    peer.end(blockIdx.x, sync.rank_).template store<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>(sync.seq_);
-    impl::wait<true, __MEMORY_SCOPE_DEVICE>(sync.timeout_ticks_, sync.rank_, own.end(blockIdx.x, t),
-                                            sync.seq_, "part barrier", t);
-  }
-  impl::part_meet<THREADS / kWaveSize>(met, gen);
 }
 
 }  // namespace hip_comms

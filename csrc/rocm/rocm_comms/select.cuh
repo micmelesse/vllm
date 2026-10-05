@@ -145,12 +145,10 @@ constexpr KernelConfig kAttnResPushConfigs[] = {
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4 are no longer
 // built: they lost at every grid, and 4 spilled 25-30 VGPRs.
 constexpr KernelConfig kAttnResPullConfigs[] = {
-    AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 32},
-    AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 32},
-    AttnResPullConfig{{256, 384, 1}, 1, 4096, 1, 32},
-    AttnResPullConfig{{256, 384, 1}, 1, 8192, 1, 32},
-    AttnResPullConfig{{512, 128, 1}, 2, 4096, 1, 32},
-    AttnResPullConfig{{512, 64, 1}, 4, 4096, 1, 32},
+    AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 0},
+    AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 0},
+    AttnResPullConfig{{256, 384, 1}, 1, 4096, 1, 0},
+    AttnResPullConfig{{256, 384, 1}, 1, 8192, 1, 0},
 };
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
@@ -534,11 +532,11 @@ constexpr TunedKernel kAttnResKernels[] = {
     {8, 1, 3584, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 4096, 1}},
     {8, 513, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 32}},
+     AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 0}},
     {8, 1, 7168, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 8192, 1}},
     {8, 257, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 32}},
+     AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 0}},
 };
 
 // The GEMM tails: the one-shot through one GEMM pass of rows (16), where the one-shot kernel
