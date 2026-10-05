@@ -532,16 +532,21 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68 us; 14.03 against
-// 15.18 at 8; 2026-10-01T03-57-23Z), through 3.5 MiB against the pull at its grid (256 tokens
-// of 7168: 34.8 against 35.8-38.7 us; 2026-10-01T22-56-58Z, 2026-10-01T23-00-47Z).
+// 15.18 at 8; 2026-10-01T03-57-23Z); the pull past 256 tokens at 3584 and 192 at 7168, with
+// balanced slices (2026-10-05T03-40-33Z: 3584 x 384 27.7 against the push's 30.4; 7168 x 192
+// 27.3 against 27.7).
 constexpr TunedKernel kAttnResKernels[] = {
     {8, 1, 3584, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 4096, 1}},
-    {8, 513, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{256, 256, 1}, 1, 4096, 2, 0}},
+    {8, 257, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     AttnResPullConfig{{256, 256, 1}, 1, 4096, 3, 0}},
     {8, 1, 7168, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 8192, 1}},
-    {8, 257, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+    {8, 193, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     AttnResPullConfig{{256, 256, 1}, 1, 8192, 3, 0}},
+    {8, 512, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     AttnResPullConfig{{256, 256, 1}, 1, 8192, 1, 0}},
+    {8, 1024, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      AttnResPullConfig{{256, 192, 1}, 1, 8192, 1, 0}},
 };
 
