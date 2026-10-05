@@ -854,6 +854,13 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t 
   const int64_t tiles = tiles_of(t, c, rows, grid_cols, world);
   int& blocks         = launch_of(c).blocks_per_grid;
   if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
+  // THE FUSED ATTNRES PULL'S GRID DIVIDES ITS TILES: each block's most tiles kept, the blocks cut
+  // until every block but the last has that many (384 rows on 256 blocks left half the blocks one
+  // row: 32.2 against 27.7 us on 192, 2026-10-05T03-45-51Z). The other templates' not yet measured.
+  if (t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm && tiles > 0) {
+    const int64_t most = (tiles + blocks - 1) / blocks;
+    blocks = static_cast<int>((tiles + most - 1) / most);
+  }
   return c;
 }
 
