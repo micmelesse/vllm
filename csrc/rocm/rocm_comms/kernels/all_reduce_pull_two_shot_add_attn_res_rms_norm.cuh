@@ -106,27 +106,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // The producers pass the consumers' barriers one for one (one barrier a block).
     constexpr int HALF = THREADS_PER_BLOCK / 2;
     using Half = Tile<DTYPE, 1, TILE_N, 1, HALF, HALF>;
-    __shared__ uint32_t staged[TILE_N / NL][4];
+    __shared__ LdsRow<Half> staged;
     const bool consumer = __builtin_amdgcn_readfirstlane(threadIdx.x / kWaveSize) < HALF / kWaveSize;
     const int barriers = attn_res_tile_barriers<TILE_K>(num_blocks, out_norm_w != nullptr);
-    const auto stage = [&](const Half& t) {
-#pragma unroll
-      for (int k = 0; k < Half::K; ++k)
-        __builtin_memcpy(staged[t.lane() + k * HALF], t.v[0][k], sizeof(staged[0]));
-    };
     if (!consumer && blockIdx.x < rows) {
       Half first{rows, cols, static_cast<int>(blockIdx.x), 0};
       sliced_load<WORLD>(first, scratch_of, cols, slice * NL);
-      stage(first);
+      lds_store(staged, first);
     }
     __syncthreads();
     for (int row = blockIdx.x; row < rows; row += gridDim.x) {
       Half sum{rows, cols, row, 0};
-      if (consumer) {
-#pragma unroll
-        for (int k = 0; k < Half::K; ++k)
-          __builtin_memcpy(sum.v[0][k], staged[sum.lane() + k * HALF], sizeof(staged[0]));
-      }
+      if (consumer) lds_load(sum, staged);
       __syncthreads();  // the stage is free
       if (consumer) {
         block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m,
@@ -137,7 +128,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         Half next{rows, cols, more ? row + static_cast<int>(gridDim.x) : row, 0};
         sliced_load<WORLD>(next, scratch_of, cols, slice * NL);
         for (int b = 0; b < barriers; ++b) __syncthreads();
-        stage(next);
+        lds_store(staged, next);
       }
       __syncthreads();  // the next row staged
     }
