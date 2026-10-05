@@ -87,37 +87,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks,
                                          eps, out_eps, inv_hidden);
   };
+  // Every block its own tiles: reduce-scatter them, meet its twins, AttnRes on them.
+  (void)reduce_scatter_blocks;
   const int tiles = (rows + TILE_M - 1) / TILE_M;
-  if (reduce_scatter_blocks == 0 || gridDim.x < 2) {
-    // EVERY BLOCK BOTH, its own tiles: reduce-scatter them, meet its twins, AttnRes on them.
-    for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
-    block_stamp(2);
-    barrier<Group::peers, Until::visible>(sync);
-    block_stamp(3);
-    for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
-  } else {
-    // PRODUCER BLOCKS AND CONSUMER BLOCKS, the links under AttnRes: the first
-    // `reduce_scatter_blocks` reduce-scatter the tiles in order, publishing each (tile t is
-    // producer t % P's (t / P)-th); every other block runs AttnRes on a tile once its producer has
-    // published it on every rank. No barrier joins the two, so neither waits on the other's steps,
-    // only on the data. In one block, halves joined by its one hardware barrier ran chained (thread
-    // trace 2026-10-05T01-00-59Z). The grid is resident (select), so every producer runs.
-    const int producers = min(reduce_scatter_blocks, static_cast<int>(gridDim.x) - 1);
-    const int consumers = static_cast<int>(gridDim.x) - producers;
-    if (static_cast<int>(blockIdx.x) < producers) {
-      uint32_t k = 0;
-      for (int t = blockIdx.x; t < tiles; t += producers) {
-        reduce_tile(t * TILE_M);
-        sync.publish(++k);
-      }
-    } else {
-      for (int t = blockIdx.x - producers; t < tiles; t += consumers) {
-        sync.wait_published(t % producers, t / producers + 1);
-        attn_res_tile(t * TILE_M);
-      }
-    }
-    sync.clear_published();
-  }
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
+  block_stamp(2);
+  barrier<Group::peers, Until::visible>(sync);
+  block_stamp(3);
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
   block_stamp(4);
   sync.finish();
 }

@@ -74,12 +74,6 @@ class Signals {
   DINLINE Counter flag(int rank) const { return Counter(&s_->flag[rank]); }
   DINLINE uint32_t seq(unsigned block) const { return s_->seq[block]; }
   DINLINE void set_seq(unsigned block, uint32_t v) const { s_->seq[block] = v; }
-  // Block `block` of rank `rank`'s published steps (Sync::publish), and this launch's finished blocks.
-  template <typename RANK_TYPE>
-  DINLINE Counter ready(unsigned block, RANK_TYPE rank) const {
-    return Counter(&s_->ready[block][rank]);
-  }
-  DINLINE Counter done() const { return Counter(&s_->done); }
   DINLINE uint32_t epoch() const { return s_->epoch; }
   DINLINE void set_epoch(uint32_t v) const { s_->epoch = v; }
 };
@@ -296,42 +290,6 @@ class Sync {
   DINLINE void wait_flag(int peer, uint32_t v) const {
     impl::wait<false, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, rank_,
                                              own_signals(self_signal_).flag(peer), v, "flag", peer);
-  }
-
-  // A BLOCK'S PROGRESS FOR OTHER BLOCKS, with no barrier between them (a producer block and the
-  // consumer blocks waiting on its steps): publish(k) tells every peer that this block has stored
-  // its first k steps, after every wave's stores (released); wait_published(block, k) spins until
-  // `block` has published k on every rank (acquired), then the block meets. Counts start at 0 each
-  // launch: its last block clears them (clear_published, before finish()), and a peer publishes
-  // only after the next launch's first barrier, so never into a launch still reading them.
-  DINLINE void publish(uint32_t k) const {
-    impl::wait_stores();
-    __syncthreads();
-    if (threadIdx.x < WORLD)
-      lane_signals(peer_signals_, threadIdx.x)
-          .ready(blockIdx.x, rank_)
-          .template store<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>(k);
-  }
-  DINLINE void wait_published(unsigned block, uint32_t k) const {
-    if (threadIdx.x < WORLD)
-      impl::wait<true, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, rank_,
-                                              own_signals(self_signal_).ready(block, threadIdx.x),
-                                              k, "published", threadIdx.x);
-    __syncthreads();
-  }
-  DINLINE void clear_published() const {
-    __shared__ bool last;
-    __syncthreads();
-    const Signals own = own_signals(self_signal_);
-    if (threadIdx.x == 0)
-      last = own.done().template fetch_add<__ATOMIC_ACQ_REL, __MEMORY_SCOPE_DEVICE>(1u) ==
-             gridDim.x - 1;
-    __syncthreads();
-    if (!last) return;
-    for (unsigned i = threadIdx.x; i < gridDim.x * WORLD; i += kWaveSize)
-      if (threadIdx.x < kWaveSize)
-        own.ready(i / WORLD, i % WORLD).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(0u);
-    if (threadIdx.x == 0) own.done().template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE>(0u);
   }
 
   // THE SEQUENCE FOR THE NEXT CALL, once, after every barrier: a kernel that does not call it

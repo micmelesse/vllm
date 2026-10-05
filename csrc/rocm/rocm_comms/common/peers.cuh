@@ -55,10 +55,6 @@ struct Signal {
   alignas(128) uint32_t arrive;
   alignas(128) uint32_t gen;
   alignas(128) uint32_t epoch;
-  // `ready[b][r]`: how many steps block b of rank r has published here (Sync::publish), and
-  // `done` the blocks of this launch finished; the launch's last block clears both.
-  alignas(128) uint32_t ready[kMaxBlocks][kMaxRanks];
-  alignas(128) uint32_t done;
 };
 
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
