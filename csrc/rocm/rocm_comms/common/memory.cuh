@@ -159,8 +159,8 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
 }
 
 // A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the last rank's to the
-// end): each pack from its owner's tensor, `data(r)`. A SLICE IS WHOLE WAVES, so a wave's packs
-// have one owner.
+// end): each pack from its owner's tensor, `data(r)`, `r` the owner in each lane (a wave's packs
+// may have two owners).
 template <int WORLD, typename TILE, typename RANK_DATA>
 DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
                          int slice) {

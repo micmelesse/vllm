@@ -49,7 +49,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   using Ranks = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(cols);
   const int per_rank     = (packs + WORLD - 1) / WORLD;
-  const int slice        = (per_rank + kWaveSize - 1) / kWaveSize * kWaveSize;
+  // EVERY RANK AN EQUAL SLICE: rounded up to whole waves (so a wave's packs had one owner), rank 7
+  // owned nothing at 3584 and 7168 and the others reduce-scattered 8/7 of the row.
+  const int slice        = per_rank;
   const int col0         = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));  // a late rank's may be short or none
 
@@ -67,7 +69,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto input = [&](int r) { return inputs[(rank + r) % WORLD]; };
   const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
 
-  const auto scratch_of = [&](int r) { return rank_scratch<DTYPE, WORLD>(peer_scratch, r); };
+  // A WAVE'S PACKS MAY HAVE TWO OWNERS, so the owner's scratch is picked in each lane.
+  const auto scratches  = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto scratch_of = [&](int r) {
+    DTYPE* at = scratches[0];
+#pragma unroll
+    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k] : at;
+    return at;
+  };
   const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements
   // One tile's reduce-scatter: this rank's columns of its rows summed over the ranks into this
   // rank's scratch, a chunk at a time.
