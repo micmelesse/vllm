@@ -538,11 +538,11 @@ constexpr TunedKernel kAttnResKernels[] = {
     {8, 1, 3584, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 4096, 1}},
     {8, 513, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192, 1}, 1, 4096, 1, 0}},
+     AttnResPullConfig{{256, 256, 1}, 1, 4096, 2, 0}},
     {8, 1, 7168, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      AttnResConfig{{512, 256, 1}, 8192, 1}},
     {8, 257, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 0}},
+     AttnResPullConfig{{256, 192, 1}, 1, 8192, 1, 0}},
 };
 
 // The GEMM tails: the one-shot through one GEMM pass of rows (16), where the one-shot kernel
