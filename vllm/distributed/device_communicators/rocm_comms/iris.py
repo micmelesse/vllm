@@ -70,15 +70,13 @@ class IrisCommunicator(Communicator):
         """How big iris's symmetric heap is. See `heap_bytes` for why it is a constant."""
         return self.iris.heap_bytes
 
-    def _open(self) -> bool:
+    def _open(self) -> str | None:
         world = dist.get_world_size(self.device_group)
         got = supported(self.device, world)
         if isinstance(got, Error):
-            logger.info("IrisCommunicator disabled: %s", got.name)
-            return False
+            return got.name
         if not _iris_available():
-            logger.warning("IrisCommunicator disabled: the iris package is not here")
-            return False
+            return "the iris package is not here"
         try:
             import iris
             from iris.ccl.config import Config as CclConfig
@@ -87,41 +85,33 @@ class IrisCommunicator(Communicator):
             self._shmem = iris.iris(heap_size=self._heap)
             self._gluon_config = CclConfig(use_gluon=self.iris.use_gluon)
         except Exception as e:
-            logger.warning("IrisCommunicator disabled: iris failed to start: %s", e)
-            return False
+            return f"iris failed to start: {e}"
 
         # ITS RANKS AND OURS MUST AGREE. iris counts its own, and every buffer below is
         # sized by `world`, which came from the device group. They match in
         # any arrangement we run; a mismatch would be a silently wrong shape, so it is
         # a disable and not an assumption.
         if self._shmem.num_ranks != world:
-            logger.warning(
-                "IrisCommunicator disabled: iris has %d ranks, the device group %d",
-                self._shmem.num_ranks,
-                world,
+            return (
+                f"iris has {self._shmem.num_ranks} ranks, the device group {world}"
             )
-            return False
 
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size
         # -- so a large enough input can still exhaust the heap at call time.
         small = self.iris.small_limit
         if small * 2 > self._heap or small > self.iris.slab_bytes:
-            logger.warning(
-                "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back a "
-                "%dMB small path",
-                self._heap >> 30,
-                self.iris.slab_bytes >> 20,
-                small >> 20,
+            return (
+                f"heap={self._heap >> 30}GB / slab={self.iris.slab_bytes >> 20}MB "
+                f"cannot back a {small >> 20}MB small path"
             )
-            return False
         logger.info(
             "IrisCommunicator ready: world_size=%d heap=%dGB small_limit=%dMB",
             world,
             self._heap >> 30,
             small >> 20,
         )
-        return True
+        return None
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:

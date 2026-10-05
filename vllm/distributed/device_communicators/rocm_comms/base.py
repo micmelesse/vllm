@@ -52,9 +52,35 @@ def _as_device(device: int | str | torch.device) -> torch.device:
     return device
 
 
-# A communicator's life: `__init__` -> open | disabled; open <-> capturing; open |
-# disabled -> closed. Only `Communicator` moves it.
-State = Literal["disabled", "open", "capturing", "broken", "closed"]
+# A COMMUNICATOR'S LIFE, each state holding what is true in it alone: `__init__` -> Open
+# | Disabled(why); Open <-> Capturing, or Capturing -> Broken(cause) when a capture
+# raises; any -> Closed. Only `Communicator` moves it.
+@dataclass(frozen=True)
+class Disabled:
+    why: str  # the backend's reason it cannot run here (not an error)
+
+
+@dataclass(frozen=True)
+class Open:
+    pass
+
+
+@dataclass(frozen=True)
+class Capturing:
+    pass
+
+
+@dataclass(frozen=True)
+class Broken:
+    cause: str  # what left the peers' state half-done
+
+
+@dataclass(frozen=True)
+class Closed:
+    pass
+
+
+State = Disabled | Open | Capturing | Broken | Closed
 
 
 class Error(IntEnum):
@@ -213,8 +239,7 @@ class Communicator(ABC):
     out-of-place.
     """
 
-    state: State = "disabled"
-    _broken_by: str = ""
+    state: State = Disabled("not opened")
 
     @final
     @property
@@ -222,12 +247,16 @@ class Communicator(ABC):
         """The flag every vLLM communicator has: no call may run. A BROKEN one
         raises instead: its peers' state is half-done (a capture that failed part
         way), so a quiet fallback would leave the next call on a rank to hang."""
-        if self.state == "broken":
-            raise RuntimeError(
-                f"{type(self).__name__} is broken: {self._broken_by}. Close it "
-                f"and build a new one on every rank."
-            )
-        return self.state in ("disabled", "closed")
+        match self.state:
+            case Broken(cause):
+                raise RuntimeError(
+                    f"{type(self).__name__} is broken: {cause}. Close it and build "
+                    f"a new one on every rank."
+                )
+            case Disabled() | Closed():
+                return True
+            case Open() | Capturing():
+                return False
 
     @final
     def __init__(
@@ -241,7 +270,12 @@ class Communicator(ABC):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
-        self.state = "open" if self._open() else "disabled"
+        why = self._open()
+        if why is None:
+            self.state = Open()
+        else:
+            logger.info("%s disabled: %s", type(self).__name__, why)
+            self.state = Disabled(why)
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
@@ -819,15 +853,15 @@ class Communicator(ABC):
         caller's -- close before the process group is destroyed, and after any captured
         graph is gone.
         """
-        if self.state == "closed":
+        if isinstance(self.state, Closed):
             return
-        if self.state == "capturing":
+        if isinstance(self.state, Capturing):
             raise RuntimeError(
                 f"{type(self).__name__}.close() inside `capture()`: the graph being "
                 f"recorded would "
                 f"replay against released buffers. Leave the capture first."
             )
-        self.state = "closed"
+        self.state = Closed()
         self._on_close()
 
     @final
@@ -843,7 +877,7 @@ class Communicator(ABC):
         # moment -- interpreter shutdown included, where the runtime may already be gone
         # -- so this only reports that a release was left to chance. Same bargain as an
         # unclosed file's ResourceWarning.
-        if self.state == "open":
+        if isinstance(self.state, Open):
             warnings.warn(
                 f"{type(self).__name__} was never closed; its peer handles and buffers "
                 f"were left to garbage collection. Use `with make_communicator(...) as "
@@ -860,17 +894,18 @@ class Communicator(ABC):
         address that is not valid yet, so a backend has to be told. From `open`
         only (not nested, not closed); a capture that raises leaves it broken,
         since its peers may have registered what this rank did not."""
-        if self.state != "open":
-            raise RuntimeError(f"{type(self).__name__}.capture() while {self.state}")
-        self.state = "capturing"
+        if not isinstance(self.state, Open):
+            raise RuntimeError(
+                f"{type(self).__name__}.capture() while {type(self.state).__name__}"
+            )
+        self.state = Capturing()
         try:
             with self._on_capture():
                 yield
         except BaseException as e:
-            self.state = "broken"
-            self._broken_by = f"a capture raised {type(e).__name__}: {e}"
+            self.state = Broken(f"a capture raised {type(e).__name__}: {e}")
             raise
-        self.state = "open"
+        self.state = Open()
 
     # ---- The rules a caller can get wrong, enforced once. ----
 
@@ -879,7 +914,8 @@ class Communicator(ABC):
         recording. vLLM discards its outputs, so an op returns unwritten ones of the
         right shape and launches nothing, as vLLM's and aiter's custom all-reduce do."""
         return (
-            self.state == "capturing" and not torch.cuda.is_current_stream_capturing()
+            isinstance(self.state, Capturing)
+            and not torch.cuda.is_current_stream_capturing()
         )
 
     # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or
@@ -1093,9 +1129,9 @@ class Communicator(ABC):
         )
 
     @abstractmethod
-    def _open(self) -> bool:
-        """Bring this backend up, its availability checks included. True when it is
-        usable; False leaves it disabled, which is not an error."""
+    def _open(self) -> str | None:
+        """Bring this backend up, its availability checks included. None when it is
+        usable; otherwise why not, which leaves it disabled and is not an error."""
 
     def _on_capture(self) -> AbstractContextManager[None]:
         """What this backend needs around a capture. Nothing, by default."""

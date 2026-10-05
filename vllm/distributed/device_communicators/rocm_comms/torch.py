@@ -28,14 +28,11 @@ class TorchCommunicator(Communicator):
     Supplies no `_on_capture`: there is nothing to do around a capture.
     """
 
-    def _open(self) -> bool:
+    def _open(self) -> str | None:
         """Nothing to bring up, but gated on the device and world like hip: a control
         is only wanted where the backends run."""
         got = supported(self.device, dist.get_world_size(self.device_group))
-        if isinstance(got, Error):
-            logger.info("TorchCommunicator disabled: %s", got.name)
-            return False
-        return True
+        return got.name if isinstance(got, Error) else None
 
     def _all_reduce(
         self,

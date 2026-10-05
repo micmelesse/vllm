@@ -55,7 +55,12 @@ from vllm.distributed.device_communicators.rocm_comms import (
     make_communicator,
 )
 from vllm.distributed.device_communicators.rocm_comms.base import (
+    Broken,
+    Capturing,
+    Closed,
+    Disabled,
     Op,
+    Open,
     Refused,
     State,
     Supported,
@@ -1123,16 +1128,28 @@ def ranks(world: int) -> Iterator[World]:
         ranks.stop()
 
 
-@pytest.mark.parametrize("state", get_args(State))
-def test_capture_only_from_open(state: State) -> None:
-    """A capture is entered from `open` only; from any other state it raises before
-    touching the backend. Every state, so a new one is covered when it is added."""
+# One of each STATE variant: get_args(State) is every variant, so a new one fails here
+# until it has an instance.
+_A_STATE: dict[type, State] = {
+    Disabled: Disabled("not supported"),
+    Open: Open(),
+    Capturing: Capturing(),
+    Broken: Broken("a capture raised"),
+    Closed: Closed(),
+}
+
+
+@pytest.mark.parametrize("variant", get_args(State))
+def test_capture_only_from_open(variant: type) -> None:
+    """A capture is entered from Open only; from any other state it raises before
+    touching the backend. Every variant, so a new one is covered when it is added."""
     comm = object.__new__(TorchCommunicator)
+    state = _A_STATE[variant]
     comm.state = state
-    if state == "open":
+    if isinstance(state, Open):
         with comm.capture():
-            assert comm.state == "capturing"
-        assert comm.state == "open"
+            assert isinstance(comm.state, Capturing)
+        assert isinstance(comm.state, Open)
         return
     with pytest.raises(RuntimeError), comm.capture():
         pass
@@ -1144,10 +1161,10 @@ def test_a_failed_capture_leaves_it_broken() -> None:
     raises (through `disabled`, which every op checks first) naming why, rather than
     falling back while its peers hold half a registration."""
     comm = object.__new__(TorchCommunicator)
-    comm.state = "open"
+    comm.state = Open()
     with pytest.raises(ValueError), comm.capture():
         raise ValueError("graph capture failed")
-    assert comm.state == "broken"
+    assert isinstance(comm.state, Broken)
     with pytest.raises(RuntimeError, match="graph capture failed"):
         _ = comm.disabled
     with pytest.raises(RuntimeError):
@@ -1165,7 +1182,7 @@ def test_admission_matches_the_baseline() -> None:
     only, so closing it needs a kernel.
     """
     ours = object.__new__(TorchCommunicator)
-    ours.state = "open"
+    ours.state = Open()
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real

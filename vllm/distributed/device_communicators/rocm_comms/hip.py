@@ -25,16 +25,16 @@ from contextlib import contextmanager
 
 import torch
 
-from .base import Communicator, Error, Ran
+from .base import Capturing, Communicator, Error, Ran, State
 
 logger = logging.getLogger(__name__)
 
 
-def _require_capture(state: str) -> None:
+def _require_capture(state: State) -> None:
     """Raise on a launch being recorded into a cudagraph outside `capture()`: peers are
     registered when that context exits, and a graph captured without it replays against
     addresses that were never registered."""
-    if torch.cuda.is_current_stream_capturing() and state != "capturing":
+    if torch.cuda.is_current_stream_capturing() and not isinstance(state, Capturing):
         raise RuntimeError(
             "HipCommunicator is being captured into a cudagraph without `capture()`. "
             "Use `with comm.capture(), torch.cuda.graph(g): ...`"
@@ -63,7 +63,7 @@ class HipCommunicator(Communicator):
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
 
-    def _open(self) -> bool:
+    def _open(self) -> str | None:
         """Open the peer memory. A collective, so every rank must reach it.
 
         Eager, and before any capture: doing this inside a cudagraph capture is not
@@ -75,11 +75,10 @@ class HipCommunicator(Communicator):
             self.cpu_group.group_name, self.device_group.group_name, self.device.index
         )
         if err is not None:
-            logger.info("HipCommunicator disabled: %s", Error(err).name)
-            return False
+            return Error(err).name
         self._handle = handle
         logger.info("HipCommunicator ready")
-        return True
+        return None
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
