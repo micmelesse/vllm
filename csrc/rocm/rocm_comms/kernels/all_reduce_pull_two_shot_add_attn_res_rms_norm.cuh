@@ -79,13 +79,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                        own_scratch + int64_t{row} * cols);
       }
   };
-  // One tile's packs from the ranks that own them, then AttnRes on it.
-  const auto attn_res_tile = [&](int offs_m) {
-    Rows sum{rows, cols, offs_m, 0};
+  // A tile's loads: its packs from the ranks that own them, and its old prefix.
+  const auto load_tile = [&](Rows& sum, Rows& old) {
     sliced_load<WORLD>(sum, scratch_of, cols, slice * NL);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
-                                         write_idx, norm_w, qk_w, out_norm_w, out, num_blocks,
-                                         eps, out_eps, inv_hidden);
+    if constexpr (HAS_PREFIX) tile_load(old, prefix, cols);
   };
   // Every block its own tiles: reduce-scatter them, meet its twins, AttnRes on them.
   (void)reduce_scatter_blocks;
@@ -94,7 +91,26 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(2);
   barrier<Group::peers, Until::visible>(sync);
   block_stamp(3);
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
+  // THE NEXT TILE'S LOADS ISSUED BEFORE THIS TILE'S ATTNRES: its sum over the links and its prefix
+  // were waited for at their first use, a link and an HBM round trip a tile before its first source
+  // (31% of AttnRes's stall at 1024 x 7168, thread trace 2026-10-04T22-41-39Z); now they are in
+  // flight under the tile before.
+  int t = blockIdx.x;
+  Rows sum{rows, cols, min(t, tiles - 1) * TILE_M, 0};
+  Rows old = sum.template like<DTYPE>();
+  if (t < tiles) load_tile(sum, old);
+  for (; t < tiles; t += gridDim.x) {
+    const int after = t + static_cast<int>(gridDim.x);
+    Rows next{rows, cols, min(after, tiles - 1) * TILE_M, 0};
+    Rows next_old = next.template like<DTYPE>();
+    if (after < tiles) load_tile(next, next_old);
+    block_attn_res_tile_from<HAS_PREFIX, TILE_K>(sum, old, prefix, blocks, block_stride_m,
+                                                 block_stride_r, write_idx, norm_w, qk_w,
+                                                 out_norm_w, out, num_blocks, eps, out_eps,
+                                                 inv_hidden);
+    sum = next;
+    old = next_old;
+  }
   block_stamp(4);
   sync.finish();
 }
