@@ -149,6 +149,8 @@ constexpr KernelConfig kAttnResPullConfigs[] = {
     AttnResPullConfig{{512, 192, 1}, 1, 8192, 1, 32},
     AttnResPullConfig{{256, 384, 1}, 1, 4096, 1, 32},
     AttnResPullConfig{{256, 384, 1}, 1, 8192, 1, 32},
+    AttnResPullConfig{{512, 128, 1}, 2, 4096, 1, 32},
+    AttnResPullConfig{{512, 64, 1}, 4, 4096, 1, 32},
 };
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
