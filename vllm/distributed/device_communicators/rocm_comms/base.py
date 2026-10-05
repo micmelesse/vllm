@@ -54,7 +54,7 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 
 # A communicator's life: `__init__` -> open | disabled; open <-> capturing; open |
 # disabled -> closed. Only `Communicator` moves it.
-State = Literal["disabled", "open", "capturing", "closed"]
+State = Literal["disabled", "open", "capturing", "broken", "closed"]
 
 
 class Error(IntEnum):
@@ -214,11 +214,19 @@ class Communicator(ABC):
     """
 
     state: State = "disabled"
+    _broken_by: str = ""
 
     @final
     @property
     def disabled(self) -> bool:
-        """The flag every vLLM communicator has: no call may run."""
+        """The flag every vLLM communicator has: no call may run. A BROKEN one
+        raises instead: its peers' state is half-done (a capture that failed part
+        way), so a quiet fallback would leave the next call on a rank to hang."""
+        if self.state == "broken":
+            raise RuntimeError(
+                f"{type(self).__name__} is broken: {self._broken_by}. Close it "
+                f"and build a new one on every rank."
+            )
         return self.state in ("disabled", "closed")
 
     @final
@@ -849,13 +857,20 @@ class Communicator(ABC):
     @contextmanager
     def capture(self) -> Iterator[None]:
         """Enter around a cudagraph capture. Required: a captured launch records an
-        address that is not valid yet, so a backend has to be told."""
+        address that is not valid yet, so a backend has to be told. From `open`
+        only (not nested, not closed); a capture that raises leaves it broken,
+        since its peers may have registered what this rank did not."""
+        if self.state != "open":
+            raise RuntimeError(f"{type(self).__name__}.capture() while {self.state}")
         self.state = "capturing"
         try:
             with self._on_capture():
                 yield
-        finally:
-            self.state = "open"
+        except BaseException as e:
+            self.state = "broken"
+            self._broken_by = f"a capture raised {type(e).__name__}: {e}"
+            raise
+        self.state = "open"
 
     # ---- The rules a caller can get wrong, enforced once. ----
 

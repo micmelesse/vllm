@@ -57,6 +57,7 @@ from vllm.distributed.device_communicators.rocm_comms import (
 from vllm.distributed.device_communicators.rocm_comms.base import (
     Op,
     Refused,
+    State,
     Supported,
     build_info,
     supported,
@@ -1120,6 +1121,37 @@ def ranks(world: int) -> Iterator[World]:
         yield ranks
     finally:
         ranks.stop()
+
+
+@pytest.mark.parametrize("state", get_args(State))
+def test_capture_only_from_open(state: State) -> None:
+    """A capture is entered from `open` only; from any other state it raises before
+    touching the backend. Every state, so a new one is covered when it is added."""
+    comm = object.__new__(TorchCommunicator)
+    comm.state = state
+    if state == "open":
+        with comm.capture():
+            assert comm.state == "capturing"
+        assert comm.state == "open"
+        return
+    with pytest.raises(RuntimeError), comm.capture():
+        pass
+    assert comm.state == state
+
+
+def test_a_failed_capture_leaves_it_broken() -> None:
+    """A capture that raises leaves the communicator broken, and every call after
+    raises (through `disabled`, which every op checks first) naming why, rather than
+    falling back while its peers hold half a registration."""
+    comm = object.__new__(TorchCommunicator)
+    comm.state = "open"
+    with pytest.raises(ValueError), comm.capture():
+        raise ValueError("graph capture failed")
+    assert comm.state == "broken"
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        _ = comm.disabled
+    with pytest.raises(RuntimeError):
+        comm.capture().__enter__()
 
 
 # FULL: it spawns no ranks, but it checks a rule that moves rarely, against a baseline

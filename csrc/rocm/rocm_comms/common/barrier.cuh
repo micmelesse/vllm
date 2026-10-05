@@ -158,13 +158,18 @@ DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_
 #else
   // A RELEASE BUILD BACKS OFF AND TIMES OUT. A sleep a poll (64 cycles) keeps a spinning block
   // from hammering the link with polls; a clock read every 256 polls bounds a hang to the build's
-  // timeout, a trap rather than every rank's blocks spinning until the process is killed. Neither
-  // costs what the debug build's clock read a poll and printf path do.
-  (void)what, (void)peer, (void)rank;
+  // timeout, a trap rather than every rank's blocks spinning until the process is killed. THE TRAP
+  // SAYS WHY FIRST: which rank, block, barrier and peer, and the peer's count against the one
+  // wanted (a peer short by a few is a launch one rank skipped). Printed only on the way to the
+  // trap; a bare trap was a silent HSA 0x1016 (the 2026-10-05 e2e test).
   const uint64_t t0 = wall_clock64();
   for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want; ++n) {
     __builtin_amdgcn_s_sleep(1);
-    if ((n & 255u) == 0 && wall_clock64() - t0 > timeout_ticks) __builtin_trap();
+    if ((n & 255u) == 0 && wall_clock64() - t0 > timeout_ticks) {
+      printf("rocm_comms: rank %d block %d timed out in %s, peer %d: count %u, want %u\n", rank,
+             blockIdx.x, what, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want);
+      __builtin_trap();
+    }
   }
 #endif
   if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
