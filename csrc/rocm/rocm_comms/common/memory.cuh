@@ -179,29 +179,33 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
   impl::issued();
 }
 
-// A ONE-ROW TILE HANDED BETWEEN WAVES THROUGH LDS: stored by one half of a block and loaded by
-// the other, each in its own layout. `lds` holds the row's TILE_N elements as packs, as words so
-// it can be __shared__ (a vec has constructors).
+// A TILE HANDED BETWEEN WAVES THROUGH LDS: stored by one part of a block and loaded by another,
+// each in its own layout (a row of threads over every row). `lds` holds the tile's TILE_M x TILE_N
+// elements as packs, as words so it can be __shared__ (a vec has constructors).
 template <typename TILE>
-using LdsRow = uint32_t[TILE::kTileN / TILE::kPack][sizeof(typename TILE::Pack) / 4];
+using LdsTile = uint32_t[TILE::kTileM][TILE::kTileN / TILE::kPack][sizeof(typename TILE::Pack) / 4];
 template <typename TILE>
-DINLINE void lds_store(LdsRow<TILE>& lds, const TILE& t) {
-  static_assert(TILE::kRows == 1 && TILE::kThreadsM == 1, "a one-row tile");
+DINLINE void lds_store(LdsTile<TILE>& lds, const TILE& t) {
+  static_assert(TILE::kThreadsM == 1, "a row of threads over every row");
 #pragma unroll
-  for (int k = 0; k < t.K; ++k) {
-    const auto p = impl::pack(t, 0, k);
-    __builtin_memcpy(lds[t.lane() + k * TILE::kThreadsN], &p, sizeof(p));
-  }
+  for (int m = 0; m < TILE::kRows; ++m)
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      const auto p = impl::pack(t, m, k);
+      __builtin_memcpy(lds[m][t.lane() + k * TILE::kThreadsN], &p, sizeof(p));
+    }
 }
 template <typename TILE>
-DINLINE void lds_load(TILE& t, const LdsRow<TILE>& lds) {
-  static_assert(TILE::kRows == 1 && TILE::kThreadsM == 1, "a one-row tile");
+DINLINE void lds_load(TILE& t, const LdsTile<TILE>& lds) {
+  static_assert(TILE::kThreadsM == 1, "a row of threads over every row");
 #pragma unroll
-  for (int k = 0; k < t.K; ++k) {
-    typename TILE::Pack p;
-    __builtin_memcpy(&p, lds[t.lane() + k * TILE::kThreadsN], sizeof(p));
-    impl::held(t, 0, k, p);
-  }
+  for (int m = 0; m < TILE::kRows; ++m)
+#pragma unroll
+    for (int k = 0; k < t.K; ++k) {
+      typename TILE::Pack p;
+      __builtin_memcpy(&p, lds[m][t.lane() + k * TILE::kThreadsN], sizeof(p));
+      impl::held(t, m, k, p);
+    }
 }
 
 // A TILE WHOSE ROWS ARE DIFFERENT TENSORS' (a row a peer): row m's at `row_data(m)`, its first
