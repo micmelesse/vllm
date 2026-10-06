@@ -86,9 +86,9 @@ constexpr int gemm_tile_k_fit(const Hardware& hw, int tile_m) {
 // kWaveSize / SLICE_K columns. A column's lanes read adjacent packs of its weight row.
 // The order of the sum differs from hipBLASLt's, so a result agrees to the rounding of
 // the last bits, not bitwise.
+namespace impl {
 template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
           typename DTYPE>
-namespace impl {
 DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
                        const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
                        int64_t out_stride) {
