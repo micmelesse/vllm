@@ -36,13 +36,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, stride);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
-  const auto shared = [&](int r) { return inputs[r]; };
-  const auto proj   = [&](int r) { return inputs[r] + hidden; };
-  const auto latent = [&](int r) { return inputs[r] + 2 * hidden; };
+  // EACH RANK'S THREE SPANS, the shared, the projected and the latent, as Ptrs into its input.
+  const auto& shared = inputs;
+  std::array<Ptr<const DTYPE>, WORLD> proj, latent;
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) {
+    proj[r]   = Ptr<const DTYPE>{inputs[r].data + hidden, stride, r};
+    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * hidden, stride, r};
+  }
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's
   //    latent from every rank, all in flight together; the latent's sum of squares over the block,
@@ -60,9 +65,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       pj[r] = hid;
       lt[r] = lat;
     }
-    peers_load(sh, shared, stride);
-    peers_load(pj, proj, stride);
-    peers_load(lt, latent, stride);
+    tile_load(sh, shared);
+    tile_load(pj, proj);
+    tile_load(lt, latent);
     const RowF l = peers_reduce(lt).template to<float>();
     float ss[1];
     partial_dot(l, l, ss);
@@ -73,7 +78,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const RowF s = peers_reduce(sh).template to<float>();
     const RowF q = peers_reduce(pj).template to<float>();
     Row r = tile_add(s, tile_mul(q, scale)).template to<DTYPE>();
-    tile_store(out, hidden, r);
+    tile_store(r, local_ptr(out, hidden, rank));
   }
 
   block_stamp(4);
