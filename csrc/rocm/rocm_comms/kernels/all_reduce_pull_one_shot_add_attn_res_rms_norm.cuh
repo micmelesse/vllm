@@ -35,9 +35,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
   barrier<Group::peers, Until::launched>(sync);
-  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
@@ -45,7 +44,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
-    peers_load(peers, input, cols);
+    tile_load(peers, inputs);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(peers_reduce(peers), prefix, blocks, block_stride_m,
                                          block_stride_r, write_idx, norm_w, qk_w, out_norm_w, out,
                                          num_blocks, eps, out_eps, inv_hidden);
