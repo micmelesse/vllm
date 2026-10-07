@@ -72,7 +72,7 @@ template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, 
 DINLINE void tile_store(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, const Ptr<ACC_DTYPE>& ptr) {
   impl::tile_store(ptr.data, ptr.stride, tile);
 }
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int N, typename T>
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, std::size_t N, typename T>
 DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[N], const std::array<Ptr<T>, N>& ptrs) {
   impl::peers_load(tiles, [&](int r) { return ptrs[r].data; }, ptrs[0].stride);
 }
