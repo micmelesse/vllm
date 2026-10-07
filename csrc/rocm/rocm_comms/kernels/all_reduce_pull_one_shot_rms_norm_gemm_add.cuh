@@ -29,13 +29,10 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  // THE PEERS STILL BY rank_inputs AND peers_load: as rank_ptrs before the barrier (and after it)
-  // the row stride's division by the pack was no longer folded (+1 s_ashr_i64, 2026-10-07 ISA).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
-  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
   //    workspace.
@@ -43,7 +40,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
-    peers_load(peers, input, cols);
+    tile_load(peers, inputs);
     const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
