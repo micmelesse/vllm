@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 
 #include <array>
+#include <type_traits>
 #include <cstdint>
 
 #include "hardware.cuh"
@@ -59,6 +60,16 @@ struct Signal {
 
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
 struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
+
+// A POINTER A KERNEL TOUCHES, local or another rank's: its data, the stride of its rows in
+// elements, and whose memory it is. A kernel turns its arguments into these in its first lines
+// (`rank_ptrs`, `local_ptr`) and every load and store after takes one.
+template <typename T>
+struct Ptr {
+  T* data;
+  int64_t stride;
+  int rank;
+};
 
 
 // RANK r'S BUFFER, its first element. `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave
@@ -105,6 +116,19 @@ DINLINE std::array<DTYPE*, WORLD> rank_stagings(const PeerPtrs& p) { return impl
 
 template <typename DTYPE, int WORLD>
 DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& p) { return impl::every<DTYPE, WORLD>(p); }
+
+// EVERY RANK'S BUFFER AS A Ptr, rank r's data at r (rank r the same across the wave, as rank_of
+// makes it), each with the buffer's row stride.
+template <typename T, int WORLD>
+DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& p, int64_t stride) {
+  std::array<Ptr<T>, WORLD> all;
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r)
+    all[r] = Ptr<T>{impl::rank_of<std::remove_const_t<T>, WORLD>(p, r), stride, r};
+  return all;
+}
+template <typename T>
+DINLINE Ptr<T> local_ptr(T* data, int64_t stride, int rank) { return Ptr<T>{data, stride, rank}; }
 }  // namespace impl
 
 }  // namespace hip_comms

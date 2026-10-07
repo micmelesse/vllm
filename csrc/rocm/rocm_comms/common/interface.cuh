@@ -61,6 +61,20 @@ DINLINE void tile_store(ACC_DTYPE* data, int64_t row_stride, const Tile<DTYPE, T
 }
 
 // Every rank's tile in flight together: rank r's tensor at rank_data(r).
+// TILE FIRST, POINTER SECOND: a tile from a Ptr, a tile to a Ptr; a group of tiles from a group of
+// Ptrs (every load issued together, each pack's address computed once; the group shares a stride).
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, typename T>
+DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, const Ptr<T>& ptr) {
+  impl::tile_load(tile, ptr.data, ptr.stride);
+}
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE>
+DINLINE void tile_store(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, const Ptr<ACC_DTYPE>& ptr) {
+  impl::tile_store(ptr.data, ptr.stride, tile);
+}
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int N, typename T>
+DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[N], const std::array<Ptr<T>, N>& ptrs) {
+  impl::peers_load(tiles, [&](int r) { return ptrs[r].data; }, ptrs[0].stride);
+}
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int WORLD, typename RANK_DATA>
 DINLINE void peers_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[WORLD], RANK_DATA rank_data, int64_t row_stride) {
   impl::peers_load(tiles, rank_data, row_stride);
@@ -230,6 +244,16 @@ DINLINE std::array<DTYPE*, WORLD> rank_stagings(const PeerPtrs& peer_ptrs) {
 template <typename DTYPE, int WORLD>
 DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& peer_ptrs) {
   return impl::rank_scratches<DTYPE, WORLD>(peer_ptrs);
+}
+// THE BOUNDARY, a kernel's first lines: every rank's buffer as a Ptr (rank r's at r), and a local
+// tensor as one.
+template <typename T, int WORLD>
+DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride) {
+  return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride);
+}
+template <typename T>
+DINLINE Ptr<T> local_ptr(T* data, int64_t stride, int rank) {
+  return impl::local_ptr<T>(data, stride, rank);
 }
 
 // ===============================================================================================
