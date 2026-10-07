@@ -43,10 +43,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r]; };
-  const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
+  const auto own_scratch  = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then (ADD_RESIDUAL) add the
   //    residual, then RMSNorm, rounding as the reference does (the one-shot kernel spells it out),
@@ -61,18 +60,18 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const auto load = [&](int row, Peers& got) {
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) got[r] = Row{rows, cols, row, 0};
-    peers_load(got, input, cols);
+    tile_load(got, inputs);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
   Weight w{1, cols, 0, 0};
-  tile_load(w, weight, 0);
+  tile_load(w, local_ptr(weight, 0, rank));
   // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
   // wait covers only its own, older, loads), so the next round trip runs under the reduction and
   // norm. Its rows land in this rank's scratch at row - first.
   const auto one_row = [&](int row, const Peers& cur, Peers& next) {
     Row res{rows, cols, row, 0};
-    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) tile_load(res, local_ptr(residual, cols, rank));
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
     // again; at 256 tokens every block has one row: 2026-10-01T01-07-56Z).
@@ -84,7 +83,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       s = tile_add(s, res.template to<float>());
       Row added = s.template to<DTYPE>();
       added.offs_m = row - first;
-      tile_store(own_scratch, cols, added);
+      tile_store(added, own_scratch);
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -96,7 +95,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // normed row and the residual was twice that: 215.9 against 155.2 us at 4096 tokens,
     // 2026-10-01T02-17-54Z).
     if constexpr (ADD_RESIDUAL) {
-      block_store_row_scalar(scales(own_scratch), row - first, scale);
+      block_store_row_scalar(scales(own_scratch.data), row - first, scale);
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
@@ -105,7 +104,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
     normed.offs_m = row - first;
-    tile_store(own_scratch, cols, normed);
+    tile_store(normed, own_scratch);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its packs into the other
   // (a copy cost 32 moves a row at one pack a thread: ISA 2026-10-01T00-58-37Z).
@@ -133,7 +132,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    tiles, all in flight before any wait (a wave's lanes read one scale address: one request a
   //    wave). Left to the compiler, the scales were loaded and waited on before the packs were
   //    issued, two round trips a row (ISA 2026-10-01T02-33-11Z).
-  const auto gathered = [&](int r) { return scratches[r]; };
   // A CHUNK A GROUP A THREAD, stepping across the row: every owner's chunk in flight is WORLD packs
   // a thread, as the pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
   using Chunk  = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -141,14 +139,14 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
-      peers_load_row_scalars<WORLD>([&](int r) { return scales(scratches[r]); }, l, sc);
+      peers_load_row_scalars<WORLD>([&](int r) { return scales(scratches[r].data); }, l, sc);
     for (int c = 0; c < cols; c += Chunk::kTileN) {
       Chunk got[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_rows, cols, l, c};
-      peers_load(got, gathered, cols);
+      tile_load(got, scratches);
       ChunkW wc{1, cols, 0, c};
-      if constexpr (ADD_RESIDUAL) tile_load(wc, weight, 0);
+      if constexpr (ADD_RESIDUAL) tile_load(wc, local_ptr(weight, 0, rank));
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
         const int row = r * slice_rows + l;
@@ -157,15 +155,15 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         at.M      = rows;
         at.offs_m = row;
         if constexpr (ADD_RESIDUAL) {
-          tile_store(residual_out, cols, at);
+          tile_store(at, local_ptr(residual_out, cols, rank));
           const Chunk normed =
               tile_mul(tile_mul(at.template to<float>(), sc[r]).template to<WEIGHT_DTYPE>().template to<float>(),
                        wc.template to<float>())
                   .template to<WEIGHT_DTYPE>()
                   .template to<DTYPE>();
-          tile_store(out, cols, normed);
+          tile_store(normed, local_ptr(out, cols, rank));
         } else {
-          tile_store(out, cols, at);
+          tile_store(at, local_ptr(out, cols, rank));
         }
       }
     }
