@@ -30,11 +30,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
-  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (ADD_RESIDUAL) add
   //    the residual, then RMSNorm, rounding as the reference does:
@@ -51,16 +50,16 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
-    peers_load(peers, input, cols);
+    tile_load(peers, inputs);
     Row res = at;
-    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
+    if constexpr (ADD_RESIDUAL) tile_load(res, local_ptr(residual, cols, rank));
     Weight w{1, cols, 0, 0};
-    tile_load(w, weight, 0);
+    tile_load(w, local_ptr(weight, 0, rank));
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
-      tile_store(residual_out, cols, s.template to<DTYPE>());
+      tile_store(s.template to<DTYPE>(), local_ptr(residual_out, cols, rank));
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -72,7 +71,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    tile_store(out, cols, normed);
+    tile_store(normed, local_ptr(out, cols, rank));
   }
 
   block_stamp(4);
