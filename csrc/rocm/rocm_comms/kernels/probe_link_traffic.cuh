@@ -38,12 +38,13 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   const int blocks      = !split ? grid : puller ? pullers : grid - pullers;
   const int len         = static_cast<int>(packs) * traits<DTYPE>::N;  // in elements
   // Every other rank, from the next one; a push's target is never the pulled buffer.
-  const DTYPE* others[WORLD - 1];
+  std::array<Ptr<const DTYPE>, WORLD - 1> others;
 #pragma unroll
   for (int i = 0; i < WORLD - 1; ++i)
-    others[i] = rank_input<DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD);
-  const DTYPE* one      = peer < 0 ? nullptr : rank_input<DTYPE, WORLD>(*peer_inputs, peer);
-  const auto stagings   = rank_stagings<DTYPE, WORLD>(peer_staging);
+    others[i] = rank_ptr<const DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD, len);
+  const Ptr<const DTYPE> one = peer < 0 ? Ptr<const DTYPE>{nullptr, len, peer}
+                                        : rank_ptr<const DTYPE, WORLD>(*peer_inputs, peer, len);
+  const auto stagings   = rank_ptrs<DTYPE, WORLD>(peer_staging, len);
   auto sum              = Chunk{1, len, 0, 0}.template zeros<float>();
   for (int offs_n = index * Chunk::kTileN; offs_n < len; offs_n += blocks * Chunk::kTileN) {
     const Chunk at{1, len, 0, offs_n};
@@ -51,18 +52,18 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
       Chunk got[WORLD - 1];
 #pragma unroll
       for (int i = 0; i < WORLD - 1; ++i) got[i] = at;
-      peers_load(got, [&](int i) { return others[i]; }, len);
+      tile_load(got, others);
 #pragma unroll
       for (int i = 0; i < WORLD - 1; ++i) sum = tile_add(sum, got[i].template to<float>());
     } else if (pulls) {
       Chunk got = at;
-      tile_load(got, one, len);
+      tile_load(got, one);
       sum = tile_add(sum, got.template to<float>());
     }
     if (pushes) {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        if (r != rank) tile_store(stagings[r], len, at);
+        if (r != rank) tile_store(at, stagings[r]);
     }
   }
   float d[1];
