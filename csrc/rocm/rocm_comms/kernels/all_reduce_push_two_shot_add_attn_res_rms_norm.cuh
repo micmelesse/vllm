@@ -61,9 +61,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r]; };
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
@@ -76,10 +75,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       Slice peers[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;
-      peers_load(peers, input, cols);
+      tile_load(peers, inputs);
       const Slice sum = peers_reduce(peers);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r], cols, sum);
+      for (int r = 0; r < WORLD; ++r) tile_store(sum, scratches[r]);
     }
   }
   block_stamp(2);
@@ -91,10 +90,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
   //    one-shot does. The next call's first sync keeps a peer from pushing into this scratch while
   //    it is read (a peer's next kernel starts only once this one has finished).
-  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};
-    tile_load(sum, own_scratch, cols);
+    tile_load(sum, own_scratch);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
                                          out_eps, inv_hidden);
