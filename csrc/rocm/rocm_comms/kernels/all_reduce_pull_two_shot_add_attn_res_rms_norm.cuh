@@ -61,20 +61,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
   // GPU read rank 0 first, a link at a time carrying the machine's reads, and the reduce-scatter
   // took 1.6x the plain two-shot's cycles for its bytes (thread traces 2026-10-04T21-03-09Z,
   // 21-26-11Z). Each slice is summed by one rank, so the order differing by rank is harmless.
   const auto input = [&](int r) { return inputs[(rank + r) % WORLD]; };
-  const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto own_scratch  = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
 
   // A WAVE'S PACKS MAY HAVE TWO OWNERS, so the owner's scratch is picked in each lane.
-  const auto scratches  = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto scratches  = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
   const auto scratch_of = [&](int r) {
-    DTYPE* at = scratches[0];
+    DTYPE* at = scratches[0].data;
 #pragma unroll
-    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k] : at;
+    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k].data : at;
     return at;
   };
   const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements
@@ -84,8 +84,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     for (int row = offs_m; row < min(offs_m + TILE_M, rows); ++row)
       for (int c = col0 * NL; c < end; c += Ranks::kTileN) {
         Ranks chunk{WORLD, end, 0, c};
-        reduce_scatter(chunk, [&](int w) { return input(w) + int64_t{row} * cols; },
-                       own_scratch + int64_t{row} * cols);
+        reduce_scatter(chunk, [&](int w) { return input(w).data + int64_t{row} * cols; },
+                       own_scratch.data + int64_t{row} * cols);
       }
   };
   // One tile's packs from the ranks that own them, then AttnRes on it.
