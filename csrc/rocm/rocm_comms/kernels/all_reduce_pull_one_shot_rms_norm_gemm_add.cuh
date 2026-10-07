@@ -29,10 +29,11 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
+  const auto input = [&](int r) { return inputs[r]; };
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
   //    workspace.
@@ -40,12 +41,12 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
-    tile_load(peers, inputs);
+    peers_load(peers, input, cols);
     const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    tile_load(wk, local_ptr(norm_w, 0, rank));  // under the reduction
+    tile_load(wk, norm_w, 0);  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
@@ -54,7 +55,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // out = T(T(s * scale) * float(w)), as the reference rounds
     Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
-    tile_store(x, local_ptr(workspace, cols, rank));
+    tile_store(workspace, cols, x);
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
