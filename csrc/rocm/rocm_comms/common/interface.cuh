@@ -38,6 +38,7 @@
 #include "dot.cuh"
 #include "softmax.cuh"
 #include "peers.cuh"
+#include "ptr.cuh"
 #include "barrier.cuh"
 #include "collectives.cuh"
 #undef HIP_COMMS_COMMON_INTERFACE
@@ -245,8 +246,8 @@ template <typename DTYPE, int WORLD>
 DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& peer_ptrs) {
   return impl::rank_scratches<DTYPE, WORLD>(peer_ptrs);
 }
-// THE BOUNDARY, a kernel's first lines: every rank's buffer as a Ptr (rank r's at r), and a local
-// tensor as one.
+// THE BOUNDARY, a kernel's first lines (ptr.cuh): every rank's buffer as a Ptr (rank r's at r),
+// and a local tensor as one.
 template <typename T, int WORLD>
 DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride) {
   return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride);
