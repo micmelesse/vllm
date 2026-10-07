@@ -29,6 +29,8 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
+  // THE PEERS STILL BY rank_inputs AND peers_load: as rank_ptrs before the barrier (and after it)
+  // the row stride's division by the pack was no longer folded (+1 s_ashr_i64, 2026-10-07 ISA).
   const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
@@ -46,7 +48,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    tile_load(wk, norm_w, 0);  // under the reduction
+    tile_load(wk, local_ptr(norm_w, 0, rank));  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
@@ -55,7 +57,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // out = T(T(s * scale) * float(w)), as the reference rounds
     Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
-    tile_store(workspace, cols, x);
+    tile_store(x, local_ptr(workspace, cols, rank));
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
