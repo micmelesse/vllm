@@ -252,6 +252,10 @@ template <typename T, int WORLD>
 DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride) {
   return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride);
 }
+template <typename T, int WORLD>
+DINLINE Ptr<T> rank_ptr(const PeerPtrs& peer_ptrs, int rank, int64_t stride) {
+  return impl::rank_ptr<T, WORLD>(peer_ptrs, rank, stride);
+}
 template <typename T>
 DINLINE Ptr<T> local_ptr(T* data, int64_t stride, int rank) {
   return impl::local_ptr<T>(data, stride, rank);

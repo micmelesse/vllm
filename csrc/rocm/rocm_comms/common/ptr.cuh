@@ -41,6 +41,11 @@ DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& p, int64_t stride) {
     all[r] = Ptr<T>{impl::rank_of<std::remove_const_t<T>, WORLD>(p, r), stride, r};
   return all;
 }
+// ONE RANK'S BUFFER AS A Ptr (this rank's own, most often), by the same rank_of.
+template <typename T, int WORLD>
+DINLINE Ptr<T> rank_ptr(const PeerPtrs& p, int rank, int64_t stride) {
+  return Ptr<T>{impl::rank_of<std::remove_const_t<T>, WORLD>(p, rank), stride, rank};
+}
 template <typename T>
 DINLINE Ptr<T> local_ptr(T* data, int64_t stride, int rank) { return Ptr<T>{data, stride, rank}; }
 
