@@ -44,10 +44,10 @@ from typing import Concatenate, Literal, ParamSpec, TypeVar, cast, get_args
 
 import pytest
 import torch
-from hypothesis import given, settings
-from hypothesis import strategies as st
 import torch.distributed as dist
 from _pytest.mark import ParameterSet
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from torch.distributed import ProcessGroup
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -851,8 +851,8 @@ def run_collective(
         return [op()[0] for op in ops[s]]
 
     def feed(s: int, replay: int) -> None:
-        for m, st in enumerate(statics):
-            st[: shapes[s][0]].copy_(mine[s][replay * sched.buffers + m])
+        for m, static in enumerate(statics):
+            static[: shapes[s][0]].copy_(mine[s][replay * sched.buffers + m])
 
     if not sched.captured:
         out: list[list[torch.Tensor]] = [[] for _ in shapes]
@@ -1905,9 +1905,9 @@ def test_python_names_cpps_errors_and_ops() -> None:
 
 
 def test_build_info_lists_every_template_with_its_configs() -> None:
-    """Every template the build holds names one of its ops and lists at least one config at a
-    legal block size, each with a tile; every op's but the plain all-reduce's has a grid (its grid
-    is the call's)."""
+    """Every template the build holds names one of its ops and lists at least one config
+    at a legal block size, each with a tile; every op's but the plain all-reduce's has a
+    grid (its grid is the call's)."""
     # example-based: one fixed catalog
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
@@ -1988,11 +1988,13 @@ def test_an_eager_all_reduce_wider_than_the_staging_runs_in_passes(
 def run_strided_all_reduce_rank(
     ctx: RankContext, shot: Shot, rows: int, hidden: int, pad: int, lead: int
 ) -> tuple[bool, str | None]:
-    """ONE rank: an all-reduce of a strided input, forced at `shot`, against RCCL's fp32 sum of
-    the same view: `rows` rows of `hidden` read out of rows `pad` elements wider, as `lead`
-    leading dimensions over them (a 3-D input when 2)."""
+    """ONE rank: an all-reduce of a strided input, forced at `shot`, against RCCL's fp32
+    sum of the same view: `rows` rows of `hidden` read out of rows `pad` elements wider,
+    as `lead` leading dimensions over them (a 3-D input when 2)."""
     g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
-    full = torch.randn(rows, hidden + pad, generator=g, device=ctx.device).to(torch.bfloat16)
+    full = torch.randn(rows, hidden + pad, generator=g, device=ctx.device).to(
+        torch.bfloat16
+    )
     x = full[:, :hidden].unflatten(0, (lead, rows // lead))
     want = x.float().contiguous()
     dist.all_reduce(want, group=ctx.device_group)
@@ -2005,7 +2007,11 @@ def run_strided_all_reduce_rank(
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
         worst = (got - want).abs().max().item()
-        return False, f"out differs at {tuple(x.shape)}, strides {x.stride()}: worst|diff|={worst:.4g}"
+        return (
+            False,
+            f"out differs at {tuple(x.shape)}, strides {x.stride()}: "
+            f"worst|diff|={worst:.4g}",
+        )
     return True, None
 
 
@@ -2020,14 +2026,21 @@ def run_strided_all_reduce_rank(
 def test_an_all_reduce_takes_its_inputs_strides(
     shot: Shot, rows: int, hidden: int, pad: int, lead: int, world: int, ranks: World
 ) -> None:
-    """The plain all-reduce reads its input at the input's own strides: rows wider than they read
-    (a row stride past the row) and leading dimensions folded into rows, at either shot. An
-    eager input runs the staged builds; the in-place builds' strided inputs are not covered here
-    (graph mode, test_communicator, runs them contiguous)."""
+    """The plain all-reduce reads its input at the input's own strides: rows wider than
+    they read (a row stride past the row) and leading dimensions folded into rows, at
+    either shot. An eager input runs the staged builds; the in-place builds' strided
+    inputs are not covered here (graph mode, test_communicator, runs them contiguous)."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     rows = rows * lead
-    got = ranks.run(run_strided_all_reduce_rank, shot=shot, rows=rows, hidden=hidden, pad=pad, lead=lead)
+    got = ranks.run(
+        run_strided_all_reduce_rank,
+        shot=shot,
+        rows=rows,
+        hidden=hidden,
+        pad=pad,
+        lead=lead,
+    )
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot}: " + "; ".join(bad)
 
