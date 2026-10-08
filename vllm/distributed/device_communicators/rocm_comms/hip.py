@@ -6,14 +6,13 @@ memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
 keyword arguments an op takes after its own (the algorithm, the direction, that op's
-config fields)
-are the one way to force one, for the sweep and the tests. Every one is passed through as
-it came: C++ builds the config, checks it, and answers.
+config fields) are the one way to force one, for the sweep and the tests. Every one is
+passed through as it came: C++ builds the config, checks it, and answers.
 
 TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
 is held by vLLM for the graph's life, so it is registered once at capture exit and read
-in place. An eager input is the caching allocator's, borrowed for the call, so C++ copies
-it into a staging buffer it owns.
+in place. An eager input is the caching allocator's, borrowed for the call, so C++
+copies it into a staging buffer it owns.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
