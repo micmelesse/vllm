@@ -2029,7 +2029,8 @@ def test_an_all_reduce_takes_its_inputs_strides(
     """The plain all-reduce reads its input at the input's own strides: rows wider than
     they read (a row stride past the row) and leading dimensions folded into rows, at
     either shot. An eager input runs the staged builds; the in-place builds' strided
-    inputs are not covered here (graph mode, test_communicator, runs them contiguous)."""
+    inputs are not covered here (graph mode, test_communicator, runs them
+    contiguous)."""
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     rows = rows * lead
