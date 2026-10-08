@@ -45,30 +45,39 @@ inline int64_t extent_bytes(int64_t rows, int64_t cols, int64_t stride_m, DType 
 // STAGED: the kernel copies its own input through its staging a pass at a time, so no peer reads it
 // where it is; in place, the peers read it through its input table.
 inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
-  const int64_t packs       = l.bytes / kBuild.memory.pack_bytes;
-  const int64_t stage_packs = kBuild.memory.staging_bytes / kBuild.memory.pack_bytes;
-  const int64_t scratch_packs = h.scratch_bytes() / kBuild.memory.pack_bytes;
-  const bool one_shot       = l.algorithm == Algorithm::one_shot;
+  const int rows  = static_cast<int>(l.rows);
+  const int packs = static_cast<int>(packs_of(l.cols, l.dtype));
+  const bool one_shot = l.algorithm == Algorithm::one_shot;
   if (l.staged && one_shot)
     Call<AllReduceOneShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.peer_staging(),
-        h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(), l.out, packs, l.inp,
-        stage_packs);
+        l.staging_stride_m, l.staging_stride_n, h.peer_signals(), h.self_signal(), h.rank(),
+        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m,
+        l.inp_stride_n, rows, packs, l.band_rows);
   else if (l.staged)
     Call<AllReduceTwoShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.peer_scratch(),
-        h.peer_staging(), h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(),
-        scratch_packs, l.out, packs, l.inp, stage_packs);
-  else if (one_shot)
-    Call<AllReduceOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                      h.peer_inputs(l.inp, l.bytes, l.stream), h.peer_signals(),
-                                      h.self_signal(), h.rank(), h.timeout_ticks(), l.out,
-                                      static_cast<int>(packs));
-  else
-    Call<AllReduceTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                      h.peer_inputs(l.inp, l.bytes, l.stream), h.peer_scratch(),
-                                      h.peer_signals(), h.self_signal(), h.rank(),
-                                      h.timeout_ticks(), l.out, static_cast<int>(packs));
+        l.scratch_stride_m, l.scratch_stride_n, h.peer_staging(), l.staging_stride_m,
+        l.staging_stride_n, h.peer_signals(), h.self_signal(), h.rank(), h.timeout_ticks(),
+        l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m, l.inp_stride_n, rows,
+        packs, l.band_rows);
+  else {
+    const PeerPtrs* inputs =
+        h.peer_inputs(l.inp, extent_bytes(l.rows, l.cols, l.inp_stride_m, l.dtype), l.stream);
+    if (one_shot)
+      Call<AllReduceOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
+                                        l.stream, inputs, l.inp_stride_m, l.inp_stride_n,
+                                        h.peer_signals(), h.self_signal(), h.rank(),
+                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
+                                        rows, packs);
+    else
+      Call<AllReduceTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
+                                        l.stream, inputs, l.inp_stride_m, l.inp_stride_n,
+                                        h.peer_scratch(), l.scratch_stride_m, l.scratch_stride_n,
+                                        h.peer_signals(), h.self_signal(), h.rank(),
+                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
+                                        rows, packs);
+  }
 }
 
 inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l) {

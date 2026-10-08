@@ -28,14 +28,18 @@ namespace hip_comms {
 // =================================================================================================
 
 inline std::variant<AllReduceLaunch, Error> all_reduce(
-    Handle& h, void* out, const void* inp, int64_t bytes, DType dtype,
+    Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
+    int64_t inp_stride_m, int64_t inp_stride_n, int64_t rows, int64_t cols, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu,
-    hipStream_t stream) {
+    std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
+    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
+  if (const std::optional<Error> e = layout_refused(
+          dtype, {{out_stride_m, out_stride_n}, {inp_stride_m, inp_stride_n}}))
+    return *e;
   std::variant<AllReduceLaunch, Error> l = select_all_reduce(
-      h, out, inp, bytes, dtype, algorithm, direction, threads_per_block, blocks_per_grid,
-      waves_per_eu, stream);
+      h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, rows, cols, dtype,
+      algorithm, direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu,
+      stream);
   if (const AllReduceLaunch* got = std::get_if<AllReduceLaunch>(&l))
     launch_all_reduce(h, *got);
   return l;
@@ -52,7 +56,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> all_reduce_rms_norm(
     int64_t inp_stride_m, int64_t inp_stride_n, const void* weight, int64_t weight_stride_n,
     DType dtype, DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
+    std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{out_stride_m, out_stride_n}, {inp_stride_m, inp_stride_n}}))
@@ -61,7 +65,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> all_reduce_rms_norm(
     return *e;
   std::variant<AllReduceRmsNormLaunch, Error> l = select_all_reduce_rms_norm(
       h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, weight,
-      weight_stride_n, dtype, weight_dtype, rows, hidden, eps, algorithm, direction, tile_n,
+      weight_stride_n, dtype, weight_dtype, rows, hidden, eps, algorithm, direction, tile_m, tile_n,
       threads_per_block, blocks_per_grid, waves_per_eu, stream);
   if (const AllReduceRmsNormLaunch* got = std::get_if<AllReduceRmsNormLaunch>(&l))
     launch_all_reduce_rms_norm(h, *got);
@@ -75,7 +79,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> all_reduce_add_rms_norm(
     int64_t residual_stride_n, const void* weight, int64_t weight_stride_n, DType dtype,
     DType weight_dtype, int64_t rows, int64_t hidden, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
+    std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{out_stride_m, out_stride_n},
@@ -89,7 +93,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> all_reduce_add_rms_norm(
       h, out, out_stride_m, out_stride_n, residual_out, residual_out_stride_m,
       residual_out_stride_n, inp, inp_stride_m, inp_stride_n, residual, residual_stride_m,
       residual_stride_n, weight, weight_stride_n, dtype, weight_dtype, rows, hidden, eps,
-      algorithm, direction, tile_n, threads_per_block, blocks_per_grid, waves_per_eu, stream);
+      algorithm, direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu, stream);
   if (const AllReduceAddRmsNormLaunch* got = std::get_if<AllReduceAddRmsNormLaunch>(&l))
     launch_all_reduce_add_rms_norm(h, *got);
   return l;
@@ -212,7 +216,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
     Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
     int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t rows, int64_t hidden,
     int64_t latent, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_n,
+    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     std::optional<int> waves_per_eu,
     hipStream_t stream) {
@@ -221,7 +225,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
     return *e;
   std::variant<AllReduceRmsScaleAddLaunch, Error> l = select_all_reduce_rms_scale_add(
       h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, dtype, rows, hidden,
-      latent, eps, algorithm, direction, tile_n,
+      latent, eps, algorithm, direction, tile_m, tile_n,
       threads_per_block, blocks_per_grid, waves_per_eu, stream);
   if (const AllReduceRmsScaleAddLaunch* got = std::get_if<AllReduceRmsScaleAddLaunch>(&l))
     launch_all_reduce_rms_scale_add(h, *got);
@@ -243,7 +247,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> add_attn_res_rms_norm(
     int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
     const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
     int64_t out_norm_weight_stride_n, DType dtype, int64_t rows, int64_t hidden, int num_blocks,
-    int write_idx, float eps, float out_eps, std::optional<int> tile_n,
+    int write_idx, float eps, float out_eps, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
@@ -262,7 +266,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> add_attn_res_rms_norm(
       prefix, prefix_stride_m, prefix_stride_n, out, out_stride_m, out_stride_n, delta,
       delta_stride_m, delta_stride_n, blocks, blocks_stride_m, blocks_stride_r, blocks_stride_n,
       norm_weight, norm_weight_stride_n, qk_weight, qk_weight_stride_n, out_norm_weight,
-      out_norm_weight_stride_n, dtype, rows, hidden, num_blocks, write_idx, eps, out_eps, tile_n, tile_k,
+      out_norm_weight_stride_n, dtype, rows, hidden, num_blocks, write_idx, eps, out_eps, tile_m, tile_n, tile_k,
       threads_per_block, blocks_per_grid, waves_per_eu, stream);
   if (const AddAttnResRmsNormLaunch* got = std::get_if<AddAttnResRmsNormLaunch>(&l))
     launch_add_attn_res_rms_norm(*got);

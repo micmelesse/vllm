@@ -295,13 +295,22 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
     ) -> bool:
         """Whether `all_reduce(inp)` runs here."""
         ran = self._check_all_reduce(
-            inp, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu
+            inp,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
         )
         return not isinstance(ran, Error)
 
@@ -312,6 +321,8 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
@@ -320,7 +331,14 @@ class Communicator(ABC):
         picks among a backend's own paths (hip's in C++), never whether it is ours.
         Returns the sum and what ran."""
         ran = self._check_all_reduce(
-            inp, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu
+            inp,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
         )
         if isinstance(ran, Error):
             raise Refused(ran, inp)
@@ -331,6 +349,8 @@ class Communicator(ABC):
                 inp,
                 algorithm,
                 direction,
+                tile_m,
+                tile_n,
                 threads_per_block,
                 blocks_per_grid,
                 waves_per_eu,
@@ -345,6 +365,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -357,6 +378,7 @@ class Communicator(ABC):
             False,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -373,6 +395,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -386,6 +409,7 @@ class Communicator(ABC):
             False,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -402,6 +426,7 @@ class Communicator(ABC):
                 eps,
                 algorithm,
                 direction,
+                tile_m,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -417,6 +442,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -429,6 +455,7 @@ class Communicator(ABC):
             True,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -446,6 +473,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -459,6 +487,7 @@ class Communicator(ABC):
             True,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -477,6 +506,7 @@ class Communicator(ABC):
                 eps,
                 algorithm,
                 direction,
+                tile_m,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -778,6 +808,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -790,6 +821,7 @@ class Communicator(ABC):
             out,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -806,6 +838,7 @@ class Communicator(ABC):
         *,
         algorithm: str | None = None,
         direction: str | None = None,
+        tile_m: int | None = None,
         tile_n: int | None = None,
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
@@ -818,6 +851,7 @@ class Communicator(ABC):
             out,
             algorithm,
             direction,
+            tile_m,
             tile_n,
             threads_per_block,
             blocks_per_grid,
@@ -832,6 +866,7 @@ class Communicator(ABC):
                 eps,
                 algorithm,
                 direction,
+                tile_m,
                 tile_n,
                 threads_per_block,
                 blocks_per_grid,
@@ -931,6 +966,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
@@ -943,6 +980,8 @@ class Communicator(ABC):
         if (
             algorithm is not None
             or direction is not None
+            or tile_m is not None
+            or tile_n is not None
             or threads_per_block is not None
             or blocks_per_grid is not None
             or waves_per_eu is not None
@@ -955,7 +994,7 @@ class Communicator(ABC):
             return Error.row_not_packs
         if inp.dtype not in built.dtypes:
             return Error.dtype_not_built
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
 
     @abstractmethod
     def _all_reduce(
@@ -964,6 +1003,8 @@ class Communicator(ABC):
         inp: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
@@ -978,6 +1019,7 @@ class Communicator(ABC):
         add: bool,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -993,6 +1035,7 @@ class Communicator(ABC):
         eps: float,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -1012,6 +1055,7 @@ class Communicator(ABC):
         eps: float,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -1107,6 +1151,7 @@ class Communicator(ABC):
         out: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
@@ -1121,6 +1166,7 @@ class Communicator(ABC):
         eps: float,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
         tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,

@@ -128,6 +128,8 @@ class IrisCommunicator(Communicator):
         inp: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,

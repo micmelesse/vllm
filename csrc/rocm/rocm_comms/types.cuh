@@ -192,49 +192,77 @@ struct LaunchConfig {
   int waves_per_eu;
 };
 
-// EACH KERNEL FAMILY'S CONFIG, Triton's autotune config: its launch and its own fields, nothing it
-// lacks. The tile is TILE_M rows x TILE_N columns in elements (tile_n 0 when no build holds the
-// call's row, which check refuses); TILE_K the reduced dimension a step (the GEMM's K a pass,
-// AttnRes's sources a step); SLICE_K lanes splitting one output's K (CUTLASS's sliced-K). Every
-// field is compiled in except the launch's grid and reduce_scatter_blocks.
-// The plain all-reduce: no tile (it strides over packs).
+// EACH API'S CONFIG, Triton's autotune config: one a public op (interface.cuh), shared by every
+// template of that op, its launch and its own fields. Every config has the tile, TILE_M rows x
+// TILE_N columns in elements (tile_n 0 when no build holds the call's row, which check refuses; a
+// template building only TILE_M 1 refuses another, as any tile it does not build); TILE_K is the
+// reduced dimension a step (the GEMM's K a pass, AttnRes's sources a step); SLICE_K lanes
+// splitting one output's K (CUTLASS's sliced-K). Every field is compiled in except the launch's
+// grid and reduce_scatter_blocks.
+// all_reduce: a tile a work item, the grid striding over the buffer's.
 struct AllReduceConfig {
   LaunchConfig launch;
-};
-// The norms and the one-all-reduce tail: one row a tile.
-struct RowConfig {
-  LaunchConfig launch;
+  int tile_m;
   int tile_n;
 };
-// AttnRes's one-shot and push: one row a tile, TILE_K sources a step.
-struct AttnResConfig {
+// all_reduce_rms_norm.
+struct AllReduceRmsNormConfig {
   LaunchConfig launch;
+  int tile_m;
   int tile_n;
-  int tile_k;
 };
-// AttnRes's pull two-shot: TILE_M rows a tile, and its reduce-scatter on the grid's first
-// `reduce_scatter_blocks` blocks (its reads queue behind the links past a few dozen; AttnRes after
-// it on every block).
-struct AttnResPullConfig {
+// all_reduce_add_rms_norm.
+struct AllReduceAddRmsNormConfig {
+  LaunchConfig launch;
+  int tile_m;
+  int tile_n;
+};
+// all_reduce_add_attn_res_rms_norm: TILE_K sources a step; the pull two-shot's reduce-scatter on
+// the grid's first `reduce_scatter_blocks` blocks (its reads queue behind the links past a few
+// dozen; AttnRes after it on every block), 0 on the one-shot and push.
+struct AllReduceAddAttnResRmsNormConfig {
   LaunchConfig launch;
   int tile_m;
   int tile_n;
   int tile_k;
   int reduce_scatter_blocks;
 };
-// The GEMM tails.
-struct GemmConfig {
+// all_reduce_rms_norm_gemm.
+struct AllReduceRmsNormGemmConfig {
   LaunchConfig launch;
   int tile_m;
   int tile_n;
   int tile_k;
   int slice_k;
 };
+// all_reduce_rms_norm_gemm_add.
+struct AllReduceRmsNormGemmAddConfig {
+  LaunchConfig launch;
+  int tile_m;
+  int tile_n;
+  int tile_k;
+  int slice_k;
+};
+// all_reduce_rms_scale_add.
+struct AllReduceRmsScaleAddConfig {
+  LaunchConfig launch;
+  int tile_m;
+  int tile_n;
+};
+// add_attn_res_rms_norm (experimental): TILE_K sources a step.
+struct AddAttnResRmsNormConfig {
+  LaunchConfig launch;
+  int tile_m;
+  int tile_n;
+  int tile_k;
+};
 using KernelConfig =
-    std::variant<AllReduceConfig, RowConfig, AttnResConfig, AttnResPullConfig, GemmConfig>;
+    std::variant<AllReduceConfig, AllReduceRmsNormConfig, AllReduceAddRmsNormConfig,
+                 AllReduceAddAttnResRmsNormConfig, AllReduceRmsNormGemmConfig,
+                 AllReduceRmsNormGemmAddConfig, AllReduceRmsScaleAddConfig,
+                 AddAttnResRmsNormConfig>;
 
-// THE FIELDS EVERY FAMILY SHARES, and those it may have: 0 where it has none (the plain
-// all-reduce's tile; one row a tile is TILE_M 1).
+// THE FIELDS EVERY CONFIG SHARES: its launch and its tile.
 constexpr const LaunchConfig& launch_of(const KernelConfig& c) {
   return std::visit([](const auto& f) -> const LaunchConfig& { return f.launch; }, c);
 }
@@ -242,29 +270,13 @@ constexpr LaunchConfig& launch_of(KernelConfig& c) {
   return std::visit([](auto& f) -> LaunchConfig& { return f.launch; }, c);
 }
 constexpr int tile_m_of(const KernelConfig& c) {
-  return std::visit(
-      [](const auto& f) {
-        if constexpr (requires { f.tile_m; }) return f.tile_m;
-        else if constexpr (requires { f.tile_n; }) return 1;
-        else return 0;
-      },
-      c);
+  return std::visit([](const auto& f) { return f.tile_m; }, c);
 }
 constexpr int tile_n_of(const KernelConfig& c) {
-  return std::visit(
-      [](const auto& f) {
-        if constexpr (requires { f.tile_n; }) return f.tile_n;
-        else return 0;
-      },
-      c);
+  return std::visit([](const auto& f) { return f.tile_n; }, c);
 }
-// A CONFIG'S TILE_N SET, where its family has one.
 constexpr void set_tile_n(KernelConfig& c, int n) {
-  std::visit(
-      [&](auto& f) {
-        if constexpr (requires { f.tile_n; }) f.tile_n = n;
-      },
-      c);
+  std::visit([&](auto& f) { f.tile_n = n; }, c);
 }
 // FAMILY `i`'S CONFIG WITH EVERY FIELD 0: a forced template's own, all left to it.
 template <size_t FAMILY_INDEX = 0>
@@ -293,18 +305,20 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone.
 // =================================================================================================
 
-// The plain all-reduce: out and its packs; staged, its own input and the packs a staging holds,
-// the two-shot the packs a scratch holds before them.
+// The plain all-reduce: out, rows, packs (a row's); staged, the staging first (and the two-shot's
+// scratch before it), its own input after out, and the rows a band.
 using AllReduceOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, void*, int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+             int64_t, int, int);
 using AllReduceTwoShotKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, int);
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, void*, int64_t, int64_t, int, int);
 using AllReduceOneShotStagedKernel =
-    void (*)(PeerPtrs, PeerSignals, void*, int, uint64_t, void*, int64_t, const void*,
-             int64_t);
+    void (*)(PeerPtrs, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+             int64_t, const void*, int64_t, int64_t, int, int, int);
 using AllReduceTwoShotStagedKernel =
-    void (*)(PeerPtrs, PeerPtrs, PeerSignals, void*, int, uint64_t, int64_t, void*,
-             int64_t, const void*, int64_t);
+    void (*)(PeerPtrs, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, int, int, int);
 // out, weight, eps, rows, packs; the two-shots (pull and push) with every rank's scratch.
 using AllReduceRmsNormOneShotKernel =
     void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
@@ -380,15 +394,23 @@ struct AllReduceLaunch {
   Algorithm algorithm;
   Direction direction;
   int world;
+  int tile_m;
+  int tile_n;
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
   bool staged;
   hipStream_t stream;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
-  int64_t bytes;
+  int64_t inp_stride_m, inp_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of a rank's slice a row
+  int64_t staging_stride_m, staging_stride_n;  // the staged builds': a band dense
+  int band_rows;                               // the staged builds': the rows a pass
   DType dtype;
+  int64_t rows;
+  int64_t cols;
 };
 
 // `weight_dtype`: dtype, or f32.
@@ -397,6 +419,7 @@ struct AllReduceRmsNormLaunch {
   Algorithm algorithm;
   Direction direction;
   int world;
+  int tile_m;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -421,6 +444,7 @@ struct AllReduceAddRmsNormLaunch {
   Algorithm algorithm;
   Direction direction;
   int world;
+  int tile_m;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -554,6 +578,7 @@ struct AllReduceRmsScaleAddLaunch {
   Algorithm algorithm;
   Direction direction;
   int world;
+  int tile_m;
   int tile_n;
   int threads_per_block;
   int blocks_per_grid;
@@ -577,6 +602,7 @@ struct AddAttnResRmsNormLaunch {
   Algorithm algorithm;
   Direction direction;
   int world;
+  int tile_m;
   int tile_n;
   int tile_k;
   int threads_per_block;
