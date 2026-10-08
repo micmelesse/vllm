@@ -37,10 +37,9 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
   // scratch (the ISA gate, 2026-09-30).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r]; };
-  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
 
   // 2. This rank's rows: read each from every rank in rank order, sum, norm, into this rank's
   //    scratch.
@@ -50,12 +49,12 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
-    peers_load(peers, input, cols);
+    tile_load(peers, inputs);
     const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    tile_load(wk, norm_w, 0);  // under the reduction
+    tile_load(wk, local_ptr(norm_w, 0, rank));  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
@@ -65,7 +64,7 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
     Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
     x.offs_m = row - first;
-    tile_store(own_scratch, cols, x);
+    tile_store(x, own_scratch);
   }
 
   // 3. Every rank's normed rows are visible to its peers.
@@ -83,12 +82,12 @@ DINLINE void all_reduce_pull_two_shot_rms_norm_gemm_body(
       Chunk got[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_rows, cols, l, c};
-      peers_load(got, [&](int r) { return scratches[r]; }, cols);
+      tile_load(got, scratches);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
         got[r].M      = rows;
         got[r].offs_m = r * slice_rows + l;
-        tile_store(workspace, cols, got[r]);
+        tile_store(got[r], local_ptr(workspace, cols, rank));
       }
     }
 
