@@ -53,9 +53,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
-  const auto scratches = rank_scratches<DTYPE, WORLD>(peer_scratch);
-  const auto input = [&](int r) { return inputs[r]; };
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
@@ -68,10 +67,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       Slice peers[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;
-      peers_load(peers, input, cols);
+      tile_load(peers, inputs);
       const Slice sum = peers_reduce(peers);
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) tile_store(scratches[r], cols, sum);
+      for (int r = 0; r < WORLD; ++r) tile_store(sum, scratches[r]);
     }
   }
   block_stamp(2);
@@ -84,20 +83,20 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    rounding as the reference does (the one-shot kernel spells it out). The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
-  const auto own_scratch = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
     // Every load of the row before any store, in flight together: the scratch's, the residual's
     // and the weight's (one-shot's).
     Row own = at, res = at;
-    tile_load(own, own_scratch, cols);
-    if constexpr (ADD_RESIDUAL) tile_load(res, residual, cols);
+    tile_load(own, own_scratch);
+    if constexpr (ADD_RESIDUAL) tile_load(res, local_ptr(residual, cols, rank));
     Weight w{1, cols, 0, 0};
-    tile_load(w, weight, 0);
+    tile_load(w, local_ptr(weight, 0, rank));
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
-      tile_store(residual_out, cols, s.template to<DTYPE>());
+      tile_store(s.template to<DTYPE>(), local_ptr(residual_out, cols, rank));
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -108,7 +107,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    tile_store(out, cols, normed);
+    tile_store(normed, local_ptr(out, cols, rank));
   }
   block_stamp(4);
   sync.finish();
