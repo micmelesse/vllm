@@ -1459,13 +1459,13 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
-  // 3. The four GEMM-tail templates share one config list, so one lookup serves each.
+  // 3. The op's two templates share one config list, so one lookup serves each.
   const void* kernel = nullptr;
   by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
     by_dtype(dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
+      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm>(c, [&](auto cc) {
         constexpr AllReduceRmsNormGemmConfig C = decltype(cc)::value;
         constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
                       TPB = C.launch.threads_per_block,
@@ -1557,7 +1557,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
     return *e;
-  // 3. The four GEMM-tail templates share one config list, so one lookup serves each.
+  // 3. The op's two templates share one config list, so one lookup serves each.
   const void* kernel = nullptr;
   by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
