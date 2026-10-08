@@ -41,10 +41,10 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   std::array<Ptr<const DTYPE>, WORLD - 1> others;
 #pragma unroll
   for (int i = 0; i < WORLD - 1; ++i)
-    others[i] = rank_ptr<const DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD, len);
-  const Ptr<const DTYPE> one = peer < 0 ? Ptr<const DTYPE>{nullptr, len, peer}
-                                        : rank_ptr<const DTYPE, WORLD>(*peer_inputs, peer, len);
-  const auto stagings   = rank_ptrs<DTYPE, WORLD>(peer_staging, len);
+    others[i] = rank_ptr<const DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD, int64_t{len});
+  const Ptr<const DTYPE> one = peer < 0 ? Ptr<const DTYPE>{nullptr, int64_t{len}, peer}
+                                        : rank_ptr<const DTYPE, WORLD>(*peer_inputs, peer, int64_t{len});
+  const auto stagings   = rank_ptrs<DTYPE, WORLD>(peer_staging, int64_t{len});
   auto sum              = Chunk{1, len, 0, 0}.template zeros<float>();
   for (int offs_n = index * Chunk::kTileN; offs_n < len; offs_n += blocks * Chunk::kTileN) {
     const Chunk at{1, len, 0, offs_n};
