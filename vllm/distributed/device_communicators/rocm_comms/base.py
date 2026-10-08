@@ -122,6 +122,8 @@ class Error(IntEnum):
     field_not_this_templates = 32
     probe_out_of_range = 33
     waves_not_built = 34
+    inner_stride_not_one = 35
+    row_stride_not_packs = 36
 
 
 # C++'s `DType` names, as torch's dtypes.

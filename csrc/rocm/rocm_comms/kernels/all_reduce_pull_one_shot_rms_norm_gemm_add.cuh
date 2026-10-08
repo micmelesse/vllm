@@ -17,10 +17,11 @@ namespace hip_comms {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, bool ADD_RESIDUAL>
 DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
-    const PeerPtrs* __restrict__ peer_inputs, PeerSignals peer_signals,
-    Signal* self_signal, int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w,
-    float eps, const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out, int64_t out_stride,
-    DTYPE* __restrict__ workspace, int rows, int packs) {
+    const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
+    PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+    Ptr<const DTYPE> norm_w,
+    float eps, Ptr<const DTYPE> gemm_w, int n_cols, Ptr<DTYPE> out, Ptr<DTYPE> workspace, int rows,
+    int packs) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -29,7 +30,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   const int cols = packs * NL;  // the row, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -45,7 +46,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
     Row wk{1, cols, 0, 0};
-    tile_load(wk, local_ptr(norm_w, 0, rank));  // under the reduction
+    tile_load(wk, norm_w);  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
@@ -54,7 +55,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     // out = T(T(s * scale) * float(w)), as the reference rounds
     Row x = tile_mul(tile_mul(s, scale).template to<DTYPE>().template to<float>(), w)
                 .template to<DTYPE>();
-    tile_store(x, local_ptr(workspace, cols, rank));
+    tile_store(x, workspace);
   }
 
   // 3. The GEMM reads rows other blocks of this rank wrote.
@@ -64,9 +65,9 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 
   // 4. The GEMM over every row.
   for (int r0 = 0; r0 < rows; r0 += TILE_M)
-    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL, THREADS_PER_BLOCK>(workspace + int64_t{r0} * cols, cols,
-                                                     min(TILE_M, rows - r0), cols, gemm_w, n_cols,
-                                                     out + r0 * out_stride, out_stride);
+    grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL, THREADS_PER_BLOCK>(
+        workspace.data + r0 * workspace.stride_m, workspace.stride_m, min(TILE_M, rows - r0), cols,
+        gemm_w.data, gemm_w.stride_m, n_cols, out.data + r0 * out.stride_m, out.stride_m);
 
   block_stamp(4);
   // 5. No rank may overwrite its input until every peer has read it.
@@ -79,19 +80,22 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_rms_norm_gemm(const PeerPtrs* __restrict__ peer_inputs,
-                                           PeerSignals peer_signals, Signal* self_signal,
-                                           int rank, uint64_t timeout_ticks,
-                                           const DTYPE* __restrict__ norm_w, float eps,
-                                           const DTYPE* __restrict__ gemm_w, int n_cols,
-                                           DTYPE* __restrict__ out, int64_t out_stride,
-                                           DTYPE* __restrict__ workspace, int rows, int packs) {
+    all_reduce_pull_one_shot_rms_norm_gemm(
+    const PeerPtrs* __restrict__ peer_inputs,
+    int64_t inp_stride_m, int64_t inp_stride_n, PeerSignals peer_signals, Signal* self_signal,
+    int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w_ptr,
+    int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
+    int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
+    int64_t out_stride_m, int64_t out_stride_n, DTYPE* __restrict__ workspace_ptr,
+    int64_t workspace_stride_m, int64_t workspace_stride_n, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, false>(
-                                                     peer_inputs, peer_signals, self_signal, rank,
-                                                    timeout_ticks, norm_w, eps, gemm_w, n_cols, out,
-                                                    out_stride, workspace, rows, packs);
+        peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+        local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
+        local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
+        local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
+        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), rows, packs);
   else
     __builtin_trap();
 }
@@ -99,19 +103,22 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_rms_norm_gemm_add(const PeerPtrs* __restrict__ peer_inputs,
-                                               PeerSignals peer_signals,
-                                               Signal* self_signal, int rank,
-                                               uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w,
-                                               float eps, const DTYPE* __restrict__ gemm_w, int n_cols,
-                                               DTYPE* __restrict__ out, int64_t out_stride,
-                                               DTYPE* __restrict__ workspace, int rows, int packs) {
+    all_reduce_pull_one_shot_rms_norm_gemm_add(
+    const PeerPtrs* __restrict__ peer_inputs,
+    int64_t inp_stride_m, int64_t inp_stride_n, PeerSignals peer_signals, Signal* self_signal,
+    int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w_ptr,
+    int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
+    int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
+    int64_t out_stride_m, int64_t out_stride_n, DTYPE* __restrict__ workspace_ptr,
+    int64_t workspace_stride_m, int64_t workspace_stride_n, int rows, int packs) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, true>(
-                                                     peer_inputs, peer_signals, self_signal, rank,
-                                                    timeout_ticks, norm_w, eps, gemm_w, n_cols, out,
-                                                    out_stride, workspace, rows, packs);
+        peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+        local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
+        local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
+        local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
+        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), rows, packs);
   else
     __builtin_trap();
 }

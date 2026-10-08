@@ -90,8 +90,8 @@ namespace impl {
 template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
           typename DTYPE>
 DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
-                       const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
-                       int64_t out_stride) {
+                       const DTYPE* __restrict__ gemm_w, int64_t gemm_w_stride, int n_cols,
+                       DTYPE* __restrict__ out, int64_t out_stride) {
   using V          = typename traits<DTYPE>::V;
   constexpr int NL = traits<DTYPE>::N;
   const int packs  = cols / NL;
@@ -110,7 +110,7 @@ DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
   const int tiles  = (n_cols + kTile - 1) / kTile;
   for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
     const int n   = tile * kTile + column;
-    const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * packs;
+    const V* wrow = wv + static_cast<int64_t>(n < n_cols ? n : 0) * (gemm_w_stride / NL);
     float acc[TILE_M];
 #pragma unroll
     for (int r = 0; r < TILE_M; ++r) acc[r] = 0.0f;

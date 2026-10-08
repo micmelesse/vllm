@@ -18,25 +18,24 @@ namespace hip_comms {
 // float(projected) * scale).
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_rms_scale_add(const PeerPtrs* __restrict__ peer_inputs,
-                                           PeerSignals peer_signals, Signal* self_signal,
-                                           int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
-                                           float eps, int rows,
-                                           int hidden_packs, int latent_packs) {
+    all_reduce_pull_one_shot_rms_scale_add(
+        const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
+        PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+        DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, float eps,
+        int rows, int hidden_packs, int latent_packs) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
-  const int packs        = 2 * hidden_packs + latent_packs;
   const int hidden       = hidden_packs * NL;  // in elements
-  const int64_t stride   = int64_t{packs} * NL;
   // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
   const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
+  const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, stride);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -45,8 +44,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   std::array<Ptr<const DTYPE>, WORLD> proj, latent;
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) {
-    proj[r]   = Ptr<const DTYPE>{inputs[r].data + hidden, stride, r};
-    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * hidden, stride, r};
+    proj[r]   = Ptr<const DTYPE>{inputs[r].data + hidden * inp_stride_n, inp_stride_m, inp_stride_n, r};
+    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * hidden * inp_stride_n, inp_stride_m, inp_stride_n, r};
   }
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's
@@ -78,7 +77,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const RowF s = peers_reduce(sh).template to<float>();
     const RowF q = peers_reduce(pj).template to<float>();
     Row r = tile_add(s, tile_mul(q, scale)).template to<DTYPE>();
-    tile_store(r, local_ptr(out, hidden, rank));
+    tile_store(r, out);
   }
 
   block_stamp(4);

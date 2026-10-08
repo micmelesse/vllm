@@ -14,12 +14,13 @@ namespace hip_comms {
 // Every rank reduces every row and norms it where the sum lands in registers, saving an HBM round
 // trip and a launch against an all-reduce then a norm kernel. A block owns a row. `residual` and
 // `residual_out` are unused (null) unless kAdd; `weight` keeps its own dtype W (T or fp32), as
-// vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`).
+// vLLM's reference ops round to the WEIGHT's dtype (`vllm/ir/ops/layernorm.py`). The kernels turn
+// their arguments into Ptrs; the peers' inputs become theirs after the first barrier.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
-    const PeerPtrs* __restrict__ peer_inputs, PeerSignals peer_signals,
-    Signal* self_signal, int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
-    DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual, const WEIGHT_DTYPE* __restrict__ weight,
+    const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
+    PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+    Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight,
     float eps, int rows, int packs) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
@@ -30,7 +31,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   const float inv_hidden = 1.0f / static_cast<float>(cols);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -52,14 +53,14 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
     tile_load(peers, inputs);
     Row res = at;
-    if constexpr (ADD_RESIDUAL) tile_load(res, local_ptr(residual, cols, rank));
+    if constexpr (ADD_RESIDUAL) tile_load(res, residual);
     Weight w{1, cols, 0, 0};
-    tile_load(w, local_ptr(weight, 0, rank));
+    tile_load(w, weight);
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
-      tile_store(s.template to<DTYPE>(), local_ptr(residual_out, cols, rank));
+      tile_store(s.template to<DTYPE>(), residual_out);
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -71,7 +72,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    tile_store(normed, local_ptr(out, cols, rank));
+    tile_store(normed, out);
   }
 
   block_stamp(4);
@@ -86,12 +87,17 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                      int64_t inp_stride_m, int64_t inp_stride_n,
                                       PeerSignals peer_signals, Signal* self_signal,
-                                      int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
-                                      const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
-                                      int packs) {
+                                      int rank, uint64_t timeout_ticks,
+                                      DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
+                                      int64_t out_stride_n,
+                                      const WEIGHT_DTYPE* __restrict__ weight_ptr,
+                                      int64_t weight_stride_n, float eps, int rows, int packs) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
-       peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, nullptr, nullptr, weight,
+      peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+      local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
+      Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
       eps, rows, packs);
 }
 
@@ -99,15 +105,24 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
+                                          int64_t inp_stride_m, int64_t inp_stride_n,
                                           PeerSignals peer_signals, Signal* self_signal,
-                                          int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out,
-                                          DTYPE* __restrict__ residual_out,
-                                          const DTYPE* __restrict__ residual,
-                                          const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
-                                          int packs) {
+                                          int rank, uint64_t timeout_ticks,
+                                          DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
+                                          int64_t out_stride_n,
+                                          DTYPE* __restrict__ residual_out_ptr,
+                                          int64_t residual_out_stride_m,
+                                          int64_t residual_out_stride_n,
+                                          const DTYPE* __restrict__ residual_ptr,
+                                          int64_t residual_stride_m, int64_t residual_stride_n,
+                                          const WEIGHT_DTYPE* __restrict__ weight_ptr,
+                                          int64_t weight_stride_n, float eps, int rows, int packs) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
-       peer_inputs, peer_signals, self_signal, rank, timeout_ticks, out, residual_out, residual,
-      weight, eps, rows, packs);
+      peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+      local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
+      local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
+      local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
+      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, rows, packs);
 }
 
 }  // namespace hip_comms

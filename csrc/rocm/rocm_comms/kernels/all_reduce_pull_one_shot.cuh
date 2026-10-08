@@ -24,7 +24,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int len = num_packs * traits<DTYPE>::N;  // the buffer, in elements
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, len);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, len, 1);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -35,7 +35,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Chunk{1, len, 0, offs_n};
     tile_load(peers, inputs);
-    tile_store(peers_reduce(peers), local_ptr(out, len, rank));
+    tile_store(peers_reduce(peers), local_ptr(out, len, 1, rank));
   }
   block_stamp(2);
 
@@ -62,14 +62,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int64_t c0 = 0; c0 < num_packs; c0 += stage_packs) {
     const int len = static_cast<int>(min(stage_packs, num_packs - c0)) * NL;  // this pass
     const int64_t at = c0 * NL;
-    const auto staged      = rank_ptrs<DTYPE, WORLD>(peer_staging, len);
-    const auto own_staging = rank_ptr<DTYPE, WORLD>(peer_staging, rank, len);
+    const auto staged      = rank_ptrs<DTYPE, WORLD>(peer_staging, len, 1);
+    const auto own_staging = rank_ptr<DTYPE, WORLD>(peer_staging, rank, len, 1);
     block_stamp(0);
     // 1. This rank's pass into its staging, then visible to the peers (each has staged its own).
     for (int offs_n = blockIdx.x * Chunk::kTileN; offs_n < len;
          offs_n += gridDim.x * Chunk::kTileN) {
       Chunk mine{1, len, 0, offs_n};
-      tile_load(mine, local_ptr(own_input + at, len, rank));
+      tile_load(mine, local_ptr(own_input + at, len, 1, rank));
       tile_store(mine, own_staging);
     }
     barrier<Group::peers, Until::visible>(sync);
@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = Chunk{1, len, 0, offs_n};
       tile_load(peers, staged);
-      tile_store(peers_reduce(peers), local_ptr(out + at, len, rank));
+      tile_store(peers_reduce(peers), local_ptr(out + at, len, 1, rank));
     }
     block_stamp(2);
     // 3. No rank may stage its next pass until every peer has read this one.

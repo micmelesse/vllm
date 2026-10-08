@@ -57,8 +57,10 @@ enum class Error : int {
   field_not_this_templates = 32,
   probe_out_of_range = 33,
   waves_not_built = 34,
+  inner_stride_not_one = 35,
+  row_stride_not_packs = 36,
 };
-constexpr int kNumErrors = 35;
+constexpr int kNumErrors = 37;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -126,6 +128,10 @@ constexpr const char* to_string(Error e) {
       return "field_not_this_templates: the forced template has no such config field";
     case Error::probe_out_of_range:
       return "probe_out_of_range: a probe's peer, iterations, bytes or grid is out of range";
+    case Error::inner_stride_not_one:
+      return "inner_stride_not_one: a buffer's innermost stride is not 1 (the loads are packs)";
+    case Error::row_stride_not_packs:
+      return "row_stride_not_packs: a buffer's row stride is not whole 16-byte packs";
   }
   return "unknown";
 }
@@ -282,7 +288,9 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // through it, with the kernel's own arguments. A kernel's arguments are its buffers and values,
 // in this order: every rank's input (a device table: a captured launch's are filled after the
 // capture), scratch or staging, each only where the kernel uses it; the synchronization state
-// (every rank's signal block, this rank's, its rank, the wait limit); then its own.
+// (every rank's signal block, this rank's, its rank, the wait limit); then its own. EVERY BUFFER
+// IS FOLLOWED BY ITS STRIDES, in elements, every dimension's (STANDARDS, *One file is the
+// interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone.
 // =================================================================================================
 
 // The plain all-reduce: out and its packs; staged, its own input and the packs a staging holds,
@@ -299,51 +307,55 @@ using AllReduceTwoShotStagedKernel =
              int64_t, const void*, int64_t);
 // out, weight, eps, rows, packs; the two-shots (pull and push) with every rank's scratch.
 using AllReduceRmsNormOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, void*, const void*, float, int,
-             int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+             int64_t, const void*, int64_t, float, int, int);
 using AllReduceRmsNormTwoShotKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, const void*,
-             float, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, void*, int64_t, int64_t, const void*, int64_t, float, int, int);
 // out, residual_out, residual, weight, eps, rows, packs.
 using AllReduceAddRmsNormOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, void*, void*, const void*,
-             const void*, float, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+             int64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, const void*,
+             int64_t, float, int, int);
 using AllReduceAddRmsNormTwoShotKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, void*,
-             const void*, const void*, float, int, int);
-// prefix, blocks, block_stride_m, block_stride_r, norm_w, qk_w, out_norm_w, out, num_blocks,
-// write_idx, eps, out_eps, rows, packs; the push with every rank's scratch; the pull with it and
-// its reduce_scatter_blocks last.
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, void*, int64_t, int64_t, void*, int64_t, int64_t, const void*, int64_t,
+             int64_t, const void*, int64_t, float, int, int);
+// prefix, blocks (m, r, n), norm_w, qk_w, out_norm_w, out, num_blocks, write_idx, eps, out_eps,
+// rows, packs; the push with every rank's scratch; the pull with it and its reduce_scatter_blocks
+// last.
+#define HIP_COMMS_ATTN_RES_ARGS                                                                  \
+  void*, int64_t, int64_t, void*, int64_t, int64_t, int64_t, const void*, int64_t, const void*, \
+      int64_t, const void*, int64_t, void*, int64_t, int64_t, int, int, float, float, int, int
 using AllReduceAddAttnResRmsNormOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, void*, void*, int64_t, int64_t,
-             const void*, const void*, const void*, void*, int, int, float, float, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t,
+             HIP_COMMS_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPushKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, void*,
-             int64_t, int64_t, const void*, const void*, const void*, void*, int, int, float, float,
-             int, int);
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, HIP_COMMS_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPullKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, void*,
-             int64_t, int64_t, const void*, const void*, const void*, void*, int, int, float, float,
-             int, int, int);
-// norm_w, eps, gemm_w, n_cols, out, out_stride, workspace, rows, packs: written or added
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, HIP_COMMS_ATTN_RES_ARGS, int);
+// norm_w, eps, gemm_w, n_cols, out, workspace, rows, packs: written or added
 // (all_reduce_rms_norm_gemm and _gemm_add), one shape.
 using AllReduceRmsNormGemmOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, const void*, float, const void*,
-             int, void*, int64_t, void*, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, const void*,
+             int64_t, float, const void*, int64_t, int64_t, int, void*, int64_t, int64_t, void*,
+             int64_t, int64_t, int, int);
 using AllReduceRmsNormGemmTwoShotKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, const void*, float,
-             const void*, int, void*, int64_t, void*, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, const void*, int64_t, float, const void*, int64_t, int64_t, int, void*,
+             int64_t, int64_t, void*, int64_t, int64_t, int, int);
 // out, eps, rows, hidden_packs, latent_packs.
 using AllReduceRmsScaleAddOneShotKernel =
-    void (*)(const void*, PeerSignals, void*, int, uint64_t, void*, float, int, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+             int64_t, float, int, int, int);
 using AllReduceRmsScaleAddTwoShotKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, void*, float, int,
-             int, int);
-// Experimental, no peers: prefix, delta, blocks, block_stride_m, block_stride_r, norm_w, qk_w,
-// out_norm_w, out, num_blocks, write_idx, eps, out_eps, rows, packs.
-using AddAttnResRmsNormKernel =
-    void (*)(void*, const void*, void*, int64_t, int64_t, const void*, const void*, const void*,
-             void*, int, int, float, float, int, int);
+    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+             uint64_t, void*, int64_t, int64_t, float, int, int, int);
+// Experimental, no peers: delta, then the AttnRes arguments.
+using AddAttnResRmsNormKernel = void (*)(const void*, int64_t, int64_t, HIP_COMMS_ATTN_RES_ARGS);
+#undef HIP_COMMS_ATTN_RES_ARGS
 // The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the
 // streamed buffer's) and staging, then mode, peer, pullers, packs, sink.
 using ProbeBarrierKernel = void (*)(PeerSignals, void*, int, uint64_t);
@@ -391,8 +403,12 @@ struct AllReduceRmsNormLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
   const void* weight;
+  int64_t weight_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
   DType weight_dtype;
   int64_t rows;
@@ -411,10 +427,16 @@ struct AllReduceAddRmsNormLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   void* residual_out;
+  int64_t residual_out_stride_m, residual_out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
   const void* residual;
+  int64_t residual_stride_m, residual_stride_n;
   const void* weight;
+  int64_t weight_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
   DType weight_dtype;
   int64_t rows;
@@ -439,14 +461,20 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int reduce_scatter_blocks;
   hipStream_t stream;
   void* prefix;
+  int64_t prefix_stride_m, prefix_stride_n;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
   void* blocks;
-  int64_t block_stride_m;
-  int64_t block_stride_r;
+  int64_t blocks_stride_m, blocks_stride_r, blocks_stride_n;
   const void* norm_weight;
+  int64_t norm_weight_stride_n;
   const void* qk_weight;
+  int64_t qk_weight_stride_n;
   const void* out_norm_weight;
+  int64_t out_norm_weight_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
   int64_t rows;
   int64_t hidden;
@@ -472,13 +500,18 @@ struct AllReduceRmsNormGemmLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* out;
-  int64_t out_stride;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
   const void* norm_weight;
+  int64_t norm_weight_stride_n;
   float eps;
   const void* gemm_weight;
+  int64_t gemm_weight_stride_m, gemm_weight_stride_n;
   int64_t n_cols;
   void* workspace;
+  int64_t workspace_stride_m, workspace_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
   int64_t rows;
   int64_t hidden;
@@ -498,13 +531,18 @@ struct AllReduceRmsNormGemmAddLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* out;
-  int64_t out_stride;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
   const void* norm_weight;
+  int64_t norm_weight_stride_n;
   float eps;
   const void* gemm_weight;
+  int64_t gemm_weight_stride_m, gemm_weight_stride_n;
   int64_t n_cols;
   void* workspace;
+  int64_t workspace_stride_m, workspace_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
   int64_t rows;
   int64_t hidden;
@@ -522,7 +560,10 @@ struct AllReduceRmsScaleAddLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   const void* inp;
+  int64_t inp_stride_m, inp_stride_n;
+  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
   int64_t rows;
   int64_t hidden;
@@ -543,14 +584,19 @@ struct AddAttnResRmsNormLaunch {
   int waves_per_eu;
   hipStream_t stream;
   void* prefix;
+  int64_t prefix_stride_m, prefix_stride_n;
   void* out;
+  int64_t out_stride_m, out_stride_n;
   const void* delta;
+  int64_t delta_stride_m, delta_stride_n;
   void* blocks;
-  int64_t block_stride_m;
-  int64_t block_stride_r;
+  int64_t blocks_stride_m, blocks_stride_r, blocks_stride_n;
   const void* norm_weight;
+  int64_t norm_weight_stride_n;
   const void* qk_weight;
+  int64_t qk_weight_stride_n;
   const void* out_norm_weight;
+  int64_t out_norm_weight_stride_n;
   DType dtype;
   int64_t rows;
   int64_t hidden;

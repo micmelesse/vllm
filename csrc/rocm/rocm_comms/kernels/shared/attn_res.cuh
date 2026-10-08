@@ -19,22 +19,21 @@ namespace hip_comms {
 //   logit(src) = dot(src, norm_w * qk_w) * rsqrt(mean(src^2) + eps), src the blocks, then u
 //   m = softmax(logits) . sources, online, a tile of sources at a time; out = T(m), or
 //   T(m * rsqrt(mean(m^2) + out_eps) * out_w)
-// `sum` is the tile's rows summed over the ranks; the prefix and out are rows of the tile's width,
-// `blocks` [rows, sources, hidden] at row and source strides in elements, and `write_idx` < 0
+// `sum` is the tile's rows summed over the ranks; the prefix and out are rows of the tile's width
+// at their Ptrs' strides, `blocks` [rows, sources, hidden] at its row and source strides in
+// elements (its columns contiguous, the host checks), and `write_idx` < 0
 // writes no block. A row past M (the last tile's) reads row M - 1 and writes nothing, so every
 // thread still reaches every reduction.
 template <bool HAS_PREFIX, int TILE_K, typename DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK>
-DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& sum, DTYPE* prefix,
+DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>& sum, Ptr<DTYPE> prefix,
                                  DTYPE* blocks, int64_t block_stride_m, int64_t block_stride_r,
-                                 int write_idx, const DTYPE* __restrict__ norm_w,
-                                 const DTYPE* __restrict__ qk_w, const DTYPE* __restrict__ out_norm_w,
-                                 DTYPE* out, int num_blocks, float eps, float out_eps,
-                                 float inv_hidden) {
+                                 int write_idx, Ptr<const DTYPE> norm_w, Ptr<const DTYPE> qk_w,
+                                 Ptr<const DTYPE> out_norm_w, Ptr<DTYPE> out, int num_blocks,
+                                 float eps, float out_eps, float inv_hidden) {
   using Rows    = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowsF   = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight  = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using WeightF = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
-  const int64_t stride = sum.N;
   const Weight at_cols{1, sum.N, 0, sum.offs_n};
 
   // The new prefix: the sum over the ranks added to the old one, rounded once to DTYPE; the old
@@ -42,18 +41,18 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   Rows np = sum;
   if constexpr (HAS_PREFIX) {
     Rows old = sum.template like<DTYPE>();
-    tile_load(old, prefix, stride);
+    tile_load(old, prefix);
     np = tile_add(old.template to<float>(), sum.template to<float>()).template to<DTYPE>();
   }
-  tile_store(prefix, stride, np);
+  tile_store(np, prefix);
   if (write_idx >= 0) tile_store(blocks + write_idx * block_stride_r, block_stride_m, np);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back where it was just
   // stored (Triton's kernel does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
   RowsF acc = np.template to<float>();
   if (num_blocks != 0) {
     Weight nw = at_cols, qk = at_cols;
-    tile_load(nw, norm_w, 0);
-    tile_load(qk, qk_w, 0);
+    tile_load(nw, norm_w);
+    tile_load(qk, qk_w);
     const WeightF w = tile_mul(nw.template to<float>(), qk.template to<float>());
     acc = sum.template zeros<float>();
     OnlineSoftmax softmax[TILE_M];
@@ -72,8 +71,8 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
         // 2026-10-04T16-26-29Z). A padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
         v[s]             = sum.template like<DTYPE>();
-        tile_load(v[s], block ? blocks + src * block_stride_r : prefix,
-                  block ? block_stride_m : stride);
+        tile_load(v[s], block ? blocks + src * block_stride_r : prefix.data,
+                  block ? block_stride_m : prefix.stride_m);
         float ss[TILE_M], dw[TILE_M];
         partial_dot(v[s], v[s], ss);
         partial_dot(v[s], w, dw);
@@ -119,9 +118,9 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   // The output, normed when out_norm_w is given: its weight in flight under the one reduction for
   // every row's sum of squares.
   Rows result = sum.template like<DTYPE>();
-  if (out_norm_w != nullptr) {
+  if (out_norm_w.data != nullptr) {
     Weight g_in = at_cols;
-    tile_load(g_in, out_norm_w, 0);
+    tile_load(g_in, out_norm_w);
     float ss[TILE_M];
     partial_dot(acc, acc, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
@@ -132,7 +131,7 @@ DINLINE void block_attn_res_tile(const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PE
   } else {
     result = acc.template to<DTYPE>();
   }
-  tile_store(out, stride, result);
+  tile_store(result, out);
 }
 
 }  // namespace hip_comms

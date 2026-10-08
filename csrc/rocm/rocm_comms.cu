@@ -260,13 +260,15 @@ RocmCommsAllReduceRmsNormPlan rocm_comms_plan_all_reduce_rms_norm(
   const hip_comms::DType dt = std::get<hip_comms::DType>(d);
   const auto tn = narrowed(tile_n), tpb = narrowed(threads_per_block);
   const auto bpg = narrowed(blocks_per_grid), wpe = narrowed(waves_per_eu);
+  // A plan has inp and the weight; every other buffer is absent: null, its strides 0.
+  const int64_t im = inp.stride(0), in = inp.stride(1), ws = weight.stride(0);
   if (add)
     return all_reduce_rms_norm_plan_of(hip_comms::select_all_reduce_add_rms_norm(
-        h, nullptr, nullptr, nullptr, nullptr, nullptr, dt, *w, inp.size(0), inp.size(1), 0.f,
-        alg, dir, tn, tpb, bpg, wpe, current_stream()));
+        h, nullptr, 0, 0, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0, nullptr, ws, dt, *w,
+        inp.size(0), inp.size(1), 0.f, alg, dir, tn, tpb, bpg, wpe, current_stream()));
   return all_reduce_rms_norm_plan_of(hip_comms::select_all_reduce_rms_norm(
-      h, nullptr, nullptr, nullptr, dt, *w, inp.size(0), inp.size(1), 0.f, alg, dir, tn, tpb,
-      bpg, wpe, current_stream()));
+      h, nullptr, 0, 0, nullptr, im, in, nullptr, ws, dt, *w, inp.size(0), inp.size(1), 0.f, alg,
+      dir, tn, tpb, bpg, wpe, current_stream()));
 }
 
 RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
@@ -283,8 +285,9 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
     return all_reduce_add_attn_res_rms_norm_plan_of(*e);
   return all_reduce_add_attn_res_rms_norm_plan_of(
       hip_comms::select_all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr), nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr,
-      std::get<hip_comms::DType>(d), inp.size(0), inp.size(1), 0, -1, 0.f, 0.f, false, alg, dir,
+      // A plan has inp; every other buffer is absent: null, its strides 0.
+      handle_of(handle_ptr), nullptr, 0, 0, nullptr, 0, 0, nullptr, inp.stride(0), inp.stride(1),
+      nullptr, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr, 0, std::get<hip_comms::DType>(d), inp.size(0), inp.size(1), 0, -1, 0.f, 0.f, false, alg, dir,
       narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream()));
@@ -311,12 +314,15 @@ RocmCommsAllReduceRmsNormGemmPlan rocm_comms_plan_all_reduce_rms_norm_gemm(
   const auto tm = narrowed(tile_m), tn = narrowed(tile_n), tk = narrowed(tile_k);
   const auto sk = narrowed(slice_k), tpb = narrowed(threads_per_block);
   const auto bpg = narrowed(blocks_per_grid), wpe = narrowed(waves_per_eu);
+  // A plan has inp and the gemm weight; every other buffer is absent: null, its strides 0.
+  const int64_t im = inp.stride(0), in = inp.stride(1), n = gemm_weight.size(0);
+  const int64_t gm = gemm_weight.stride(0), gn = gemm_weight.stride(1);
   if (add)
     return all_reduce_rms_norm_gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm_add(
-        h, nullptr, 0, nullptr, nullptr, 0.f, nullptr, gemm_weight.size(0), nullptr, dt,
+        h, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0.f, nullptr, gm, gn, n, nullptr, 0, 0, dt,
         inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, wpe, current_stream()));
   return all_reduce_rms_norm_gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm(
-      h, nullptr, 0, nullptr, nullptr, 0.f, nullptr, gemm_weight.size(0), nullptr, dt,
+      h, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0.f, nullptr, gm, gn, n, nullptr, 0, 0, dt,
       inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, wpe, current_stream()));
 }
 
@@ -340,8 +346,8 @@ RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
   if (latent < 1)
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
   return all_reduce_rms_scale_add_plan_of(hip_comms::select_all_reduce_rms_scale_add(
-      handle_of(handle_ptr), nullptr, nullptr, std::get<hip_comms::DType>(d), inp.size(0), hidden,
-      latent, 0.f, alg, dir, narrowed(tile_n), narrowed(threads_per_block),
+      handle_of(handle_ptr), nullptr, out.stride(0), out.stride(1), nullptr, inp.stride(0),
+      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), hidden, latent, 0.f, alg, dir, narrowed(tile_n), narrowed(threads_per_block),
       narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream()));
 }
 
@@ -563,7 +569,8 @@ void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch
     std::optional<int64_t> waves_per_eu) {
   norm_tensors(out, inp, weight, nullptr, nullptr);
   const auto got = hip_comms::all_reduce_rms_norm(
-      handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(), weight.data_ptr(), dtype_of(inp),
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
+      inp.stride(0), inp.stride(1), weight.data_ptr(), weight.stride(0), dtype_of(inp),
       dtype_of(weight), inp.size(0), inp.size(1), static_cast<float>(eps),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
@@ -580,8 +587,10 @@ void rocm_comms_all_reduce_add_rms_norm(
     std::optional<int64_t> waves_per_eu) {
   norm_tensors(out, inp, weight, &residual, &residual_out);
   const auto got = hip_comms::all_reduce_add_rms_norm(
-      handle_of(handle_ptr), out.data_ptr(), residual_out.data_ptr(), inp.data_ptr(),
-      residual.data_ptr(), weight.data_ptr(), dtype_of(inp), dtype_of(weight), inp.size(0),
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1),
+      residual_out.data_ptr(), residual_out.stride(0), residual_out.stride(1), inp.data_ptr(),
+      inp.stride(0), inp.stride(1), residual.data_ptr(), residual.stride(0), residual.stride(1),
+      weight.data_ptr(), weight.stride(0), dtype_of(inp), dtype_of(weight), inp.size(0),
       inp.size(1), static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
@@ -642,9 +651,12 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   attn_res_tensors(prefix, out, inp, blocks, norm_weight, qk_weight, out_norm_weight,
                    num_blocks, write_idx);
   const auto got = hip_comms::all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr), prefix.data_ptr(), out.data_ptr(), inp.data_ptr(), blocks.data_ptr(),
-      blocks.stride(0), blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(inp), inp.size(0),
+      handle_of(handle_ptr), prefix.data_ptr(), prefix.stride(0), prefix.stride(1), out.data_ptr(),
+      out.stride(0), out.stride(1), inp.data_ptr(), inp.stride(0), inp.stride(1),
+      blocks.data_ptr(), blocks.stride(0), blocks.stride(1), blocks.stride(2),
+      norm_weight.data_ptr(), norm_weight.stride(0), qk_weight.data_ptr(), qk_weight.stride(0),
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr,
+      out_norm_weight ? out_norm_weight->stride(0) : 0, dtype_of(inp), inp.size(0),
       inp.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
       static_cast<float>(eps), static_cast<float>(out_eps), has_prefix, algorithm_from(algorithm),
       direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
@@ -689,9 +701,11 @@ void rocm_comms_all_reduce_rms_norm_gemm(
     std::optional<int64_t> waves_per_eu) {
   gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
   const auto got = hip_comms::all_reduce_rms_norm_gemm(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(),
-      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.size(0), workspace.data_ptr(),
-      dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
+      inp.stride(0), inp.stride(1), norm_weight.data_ptr(), norm_weight.stride(0),
+      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.stride(0),
+      gemm_weight.stride(1), gemm_weight.size(0), workspace.data_ptr(), workspace.stride(0),
+      workspace.stride(1), dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream());
@@ -708,9 +722,11 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     std::optional<int64_t> waves_per_eu) {
   gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
   const auto got = hip_comms::all_reduce_rms_norm_gemm_add(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), inp.data_ptr(), norm_weight.data_ptr(),
-      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.size(0), workspace.data_ptr(),
-      dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
+      inp.stride(0), inp.stride(1), norm_weight.data_ptr(), norm_weight.stride(0),
+      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.stride(0),
+      gemm_weight.stride(1), gemm_weight.size(0), workspace.data_ptr(), workspace.stride(0),
+      workspace.stride(1), dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream());
@@ -735,8 +751,9 @@ void rocm_comms_all_reduce_rms_scale_add(
               "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
   const auto got = hip_comms::all_reduce_rms_scale_add(
-      handle_of(handle_ptr), out.data_ptr(), inp.data_ptr(), dtype_of(inp), inp.size(0), hidden,
-      latent, static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
+      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
+      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), hidden, latent,
+      static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
@@ -754,9 +771,12 @@ void rocm_comms_add_attn_res_rms_norm(
   attn_res_tensors(prefix, out, delta, blocks, norm_weight, qk_weight, out_norm_weight,
                    num_blocks, write_idx);
   const auto got = hip_comms::experimental::add_attn_res_rms_norm(
-      prefix.data_ptr(), out.data_ptr(), delta.data_ptr(), blocks.data_ptr(), blocks.stride(0),
-      blocks.stride(1), norm_weight.data_ptr(), qk_weight.data_ptr(),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr, dtype_of(delta), delta.size(0),
+      prefix.data_ptr(), prefix.stride(0), prefix.stride(1), out.data_ptr(), out.stride(0),
+      out.stride(1), delta.data_ptr(), delta.stride(0), delta.stride(1), blocks.data_ptr(),
+      blocks.stride(0), blocks.stride(1), blocks.stride(2), norm_weight.data_ptr(),
+      norm_weight.stride(0), qk_weight.data_ptr(), qk_weight.stride(0),
+      out_norm_weight ? out_norm_weight->data_ptr() : nullptr,
+      out_norm_weight ? out_norm_weight->stride(0) : 0, dtype_of(delta), delta.size(0),
       delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
       static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_n), narrowed(tile_k),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),

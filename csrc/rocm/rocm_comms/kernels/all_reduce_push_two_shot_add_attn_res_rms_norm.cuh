@@ -22,19 +22,17 @@ namespace hip_comms {
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_push_two_shot_add_attn_res_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
-                                                   PeerPtrs peer_scratch,
-                                                   PeerSignals peer_signals,
-                                                   Signal* self_signal, int rank,
-                                                   uint64_t timeout_ticks, DTYPE* __restrict__ prefix,
-                                                   DTYPE* __restrict__ blocks, int64_t block_stride_m,
-                                                   int64_t block_stride_r,
-                                                   const DTYPE* __restrict__ norm_w,
-                                                   const DTYPE* __restrict__ qk_w,
-                                                   const DTYPE* __restrict__ out_norm_w,
-                                                   DTYPE* __restrict__ out, int num_blocks,
-                                                   int write_idx, float eps, float out_eps,
-                                                   int rows, int packs) {
+    all_reduce_push_two_shot_add_attn_res_rms_norm(
+        const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
+        PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
+        PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+        DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
+        DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m, int64_t blocks_stride_r,
+        int64_t blocks_stride_n, const DTYPE* __restrict__ norm_w_ptr, int64_t norm_w_stride_n,
+        const DTYPE* __restrict__ qk_w_ptr, int64_t qk_w_stride_n,
+        const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
+        DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
+        int write_idx, float eps, float out_eps, int rows, int packs) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -61,8 +59,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
-  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, scratch_stride_m, scratch_stride_n);
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
@@ -90,11 +88,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
   //    one-shot does. The next call's first sync keeps a peer from pushing into this scratch while
   //    it is read (a peer's next kernel starts only once this one has finished).
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
+  const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
+  const auto norm_w     = local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank);
+  const auto qk_w       = local_ptr(qk_w_ptr, 0, qk_w_stride_n, rank);
+  const auto out_norm_w = local_ptr(out_norm_w_ptr, 0, out_norm_w_stride_n, rank);
+  const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     Row sum{rows, cols, row, 0};
     tile_load(sum, own_scratch);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks, block_stride_m, block_stride_r,
+    block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks_ptr, blocks_stride_m, blocks_stride_r,
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,
                                          out_eps, inv_hidden);
   }

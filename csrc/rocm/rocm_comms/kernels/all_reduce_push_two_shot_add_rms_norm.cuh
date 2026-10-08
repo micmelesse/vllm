@@ -21,10 +21,11 @@ namespace hip_comms {
 // IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
-    const PeerPtrs* __restrict__ peer_inputs, PeerPtrs peer_scratch,
+    const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
+    PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
-    DTYPE* __restrict__ out, DTYPE* __restrict__ residual_out, const DTYPE* __restrict__ residual,
-    const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows, int packs) {
+    Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual,
+    Ptr<const WEIGHT_DTYPE> weight, float eps, int rows, int packs) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -53,8 +54,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, cols);
-  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, cols);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto scratches = rank_ptrs<DTYPE, WORLD>(peer_scratch, scratch_stride_m, scratch_stride_n);
 
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
@@ -83,20 +84,20 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    rounding as the reference does (the one-shot kernel spells it out). The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, cols);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
   for (int row = blockIdx.x; row < rows; row += gridDim.x) {
     const Row at{rows, cols, row, 0};
     // Every load of the row before any store, in flight together: the scratch's, the residual's
     // and the weight's (one-shot's).
     Row own = at, res = at;
     tile_load(own, own_scratch);
-    if constexpr (ADD_RESIDUAL) tile_load(res, local_ptr(residual, cols, rank));
+    if constexpr (ADD_RESIDUAL) tile_load(res, residual);
     Weight w{1, cols, 0, 0};
-    tile_load(w, local_ptr(weight, 0, rank));
+    tile_load(w, weight);
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
-      tile_store(s.template to<DTYPE>(), local_ptr(residual_out, cols, rank));
+      tile_store(s.template to<DTYPE>(), residual_out);
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -107,7 +108,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    tile_store(normed, local_ptr(out, cols, rank));
+    tile_store(normed, out);
   }
   block_stamp(4);
   sync.finish();
@@ -118,29 +119,46 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
-                                      PeerPtrs peer_scratch, PeerSignals peer_signals,
+                                      int64_t inp_stride_m, int64_t inp_stride_n,
+                                      PeerPtrs peer_scratch, int64_t scratch_stride_m,
+                                      int64_t scratch_stride_n, PeerSignals peer_signals,
                                       Signal* self_signal, int rank, uint64_t timeout_ticks,
-                                      DTYPE* __restrict__ out, const WEIGHT_DTYPE* __restrict__ weight, float eps,
-                                      int rows, int packs) {
+                                      DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
+                                      int64_t out_stride_n,
+                                      const WEIGHT_DTYPE* __restrict__ weight_ptr,
+                                      int64_t weight_stride_n, float eps, int rows, int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
-       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, nullptr,
-      nullptr, weight, eps, rows, packs);
+      peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
+      peer_signals, self_signal, rank, timeout_ticks,
+      local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
+      Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
+      eps, rows, packs);
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(const PeerPtrs* __restrict__ peer_inputs,
-                                          PeerPtrs peer_scratch, PeerSignals peer_signals,
-                                          Signal* self_signal, int rank,
-                                          uint64_t timeout_ticks, DTYPE* __restrict__ out,
-                                          DTYPE* __restrict__ residual_out,
-                                          const DTYPE* __restrict__ residual,
-                                          const WEIGHT_DTYPE* __restrict__ weight, float eps, int rows,
-                                          int packs) {
+                                          int64_t inp_stride_m, int64_t inp_stride_n,
+                                          PeerPtrs peer_scratch, int64_t scratch_stride_m,
+                                          int64_t scratch_stride_n, PeerSignals peer_signals,
+                                          Signal* self_signal, int rank, uint64_t timeout_ticks,
+                                          DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
+                                          int64_t out_stride_n,
+                                          DTYPE* __restrict__ residual_out_ptr,
+                                          int64_t residual_out_stride_m,
+                                          int64_t residual_out_stride_n,
+                                          const DTYPE* __restrict__ residual_ptr,
+                                          int64_t residual_stride_m, int64_t residual_stride_n,
+                                          const WEIGHT_DTYPE* __restrict__ weight_ptr,
+                                          int64_t weight_stride_n, float eps, int rows, int packs) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
-       peer_inputs, peer_scratch, peer_signals, self_signal, rank, timeout_ticks, out, residual_out,
-      residual, weight, eps, rows, packs);
+      peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
+      peer_signals, self_signal, rank, timeout_ticks,
+      local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
+      local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
+      local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
+      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, rows, packs);
 }
 
 }  // namespace hip_comms

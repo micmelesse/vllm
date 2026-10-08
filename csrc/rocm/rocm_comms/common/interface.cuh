@@ -66,15 +66,15 @@ DINLINE void tile_store(ACC_DTYPE* data, int64_t row_stride, const Tile<DTYPE, T
 // Ptrs (every load issued together, each pack's address computed once; the group shares a stride).
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, typename T>
 DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, const Ptr<T>& ptr) {
-  impl::tile_load(tile, ptr.data, ptr.stride);
+  impl::tile_load(tile, ptr.data, ptr.stride_m);
 }
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE>
 DINLINE void tile_store(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, const Ptr<ACC_DTYPE>& ptr) {
-  impl::tile_store(ptr.data, ptr.stride, tile);
+  impl::tile_store(ptr.data, ptr.stride_m, tile);
 }
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, std::size_t N, typename T>
 DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[N], const std::array<Ptr<T>, N>& ptrs) {
-  impl::peers_load(tiles, [&](int r) { return ptrs[r].data; }, ptrs[0].stride);
+  impl::peers_load(tiles, [&](int r) { return ptrs[r].data; }, ptrs[0].stride_m);
 }
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int WORLD, typename RANK_DATA>
 DINLINE void peers_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[WORLD], RANK_DATA rank_data, int64_t row_stride) {
@@ -201,10 +201,10 @@ DINLINE void partial_dot(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_
 template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
           typename DTYPE>
 DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
-                       const DTYPE* __restrict__ gemm_w, int n_cols, DTYPE* __restrict__ out,
-                       int64_t out_stride) {
+                       const DTYPE* __restrict__ gemm_w, int64_t gemm_w_stride, int n_cols,
+                       DTYPE* __restrict__ out, int64_t out_stride) {
   impl::grid_gemm<TILE_M, TILE_K, SLICE_K, ACCUMULATE, THREADS_PER_BLOCK, DTYPE>(
-      x, x_stride, rows, cols, gemm_w, n_cols, out, out_stride);
+      x, x_stride, rows, cols, gemm_w, gemm_w_stride, n_cols, out, out_stride);
 }
 
 // ===============================================================================================
@@ -249,16 +249,16 @@ DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& peer_ptrs) {
 // THE BOUNDARY, a kernel's first lines (ptr.cuh): every rank's buffer as a Ptr (rank r's at r),
 // and a local tensor as one.
 template <typename T, int WORLD>
-DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride) {
-  return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride);
+DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride_m, int64_t stride_n) {
+  return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride_m, stride_n);
 }
 template <typename T, int WORLD>
-DINLINE Ptr<T> rank_ptr(const PeerPtrs& peer_ptrs, int rank, int64_t stride) {
-  return impl::rank_ptr<T, WORLD>(peer_ptrs, rank, stride);
+DINLINE Ptr<T> rank_ptr(const PeerPtrs& peer_ptrs, int rank, int64_t stride_m, int64_t stride_n) {
+  return impl::rank_ptr<T, WORLD>(peer_ptrs, rank, stride_m, stride_n);
 }
 template <typename T>
-DINLINE Ptr<T> local_ptr(T* data, int64_t stride, int rank) {
-  return impl::local_ptr<T>(data, stride, rank);
+DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n, int rank) {
+  return impl::local_ptr<T>(data, stride_m, stride_n, rank);
 }
 
 // ===============================================================================================

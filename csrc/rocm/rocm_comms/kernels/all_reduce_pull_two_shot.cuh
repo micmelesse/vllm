@@ -41,11 +41,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   // A ROW'S RANK WHEN IT IS READ: a row is a wave's, so its pointer is one scalar select (every
   // rank's, rotated, up front was ~20 scalar loads before the first barrier).
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, slice);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, slice, 1);
   const auto input       = [&](int w) {
-    return rank_ptr<const DTYPE, WORLD>(*peer_inputs, rotated(w), len).data + first;
+    return rank_ptr<const DTYPE, WORLD>(*peer_inputs, rotated(w), len, 1).data + first;
   };
-  const auto scratch = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), slice).data; };
+  const auto scratch = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), slice, 1).data; };
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -93,10 +93,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   using Ranks        = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
   const int64_t pass = min(stage_packs, scratch_packs * WORLD);
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_packs * NL);
-  const auto own_staging = rank_ptr<DTYPE, WORLD>(peer_staging, rank, pass * NL);
-  const auto staging     = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_staging, rotated(w), pass * NL).data; };
-  const auto scratch     = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), scratch_packs * NL).data; };
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_packs * NL, 1);
+  const auto own_staging = rank_ptr<DTYPE, WORLD>(peer_staging, rank, pass * NL, 1);
+  const auto staging     = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_staging, rotated(w), pass * NL, 1).data; };
+  const auto scratch     = [&](int w) { return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), scratch_packs * NL, 1).data; };
 
   for (int64_t c0 = 0; c0 < num_packs; c0 += pass) {
     const int len    = static_cast<int>(min(pass, num_packs - c0)) * NL;  // this pass, elements
