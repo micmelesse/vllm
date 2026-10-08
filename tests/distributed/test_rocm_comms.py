@@ -44,6 +44,8 @@ from typing import Concatenate, Literal, ParamSpec, TypeVar, cast, get_args
 
 import pytest
 import torch
+from hypothesis import given, settings
+from hypothesis import strategies as st
 import torch.distributed as dist
 from _pytest.mark import ParameterSet
 from torch.distributed import ProcessGroup
@@ -1979,6 +1981,53 @@ def test_an_eager_all_reduce_wider_than_the_staging_runs_in_passes(
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     got = ranks.run(run_eager_beyond_staging_rank, shot=shot)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shot}: " + "; ".join(bad)
+
+
+def run_strided_all_reduce_rank(
+    ctx: RankContext, shot: Shot, rows: int, hidden: int, pad: int, lead: int
+) -> tuple[bool, str | None]:
+    """ONE rank: an all-reduce of a strided input, forced at `shot`, against RCCL's fp32 sum of
+    the same view: `rows` rows of `hidden` read out of rows `pad` elements wider, as `lead`
+    leading dimensions over them (a 3-D input when 2)."""
+    g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
+    full = torch.randn(rows, hidden + pad, generator=g, device=ctx.device).to(torch.bfloat16)
+    x = full[:, :hidden].unflatten(0, (lead, rows // lead))
+    want = x.float().contiguous()
+    dist.all_reduce(want, group=ctx.device_group)
+    comm = ctx.comm("hip")
+    forced = _forced(shot)
+    if not comm.should_allreduce(x, **forced):
+        return False, f"refused {tuple(x.shape)} at strides {x.stride()}"
+    got = comm.all_reduce(x, **forced)[0].float()
+    torch.cuda.synchronize()
+    atol, rtol = _fused_tolerance(torch.bfloat16)
+    if not torch.allclose(got, want, atol=atol, rtol=rtol):
+        worst = (got - want).abs().max().item()
+        return False, f"out differs at {tuple(x.shape)}, strides {x.stride()}: worst|diff|={worst:.4g}"
+    return True, None
+
+
+@pytest.mark.parametrize("shot", SHOTS)
+@settings(max_examples=12, deadline=None)
+@given(
+    rows=st.integers(1, 32),
+    hidden=st.sampled_from([8, 64, 3584, 7168]),
+    pad=st.sampled_from([0, 8, 64]),
+    lead=st.sampled_from([1, 2]),
+)
+def test_an_all_reduce_takes_its_inputs_strides(
+    shot: Shot, rows: int, hidden: int, pad: int, lead: int, world: int, ranks: World
+) -> None:
+    """The plain all-reduce reads its input at the input's own strides: rows wider than they read
+    (a row stride past the row) and leading dimensions folded into rows, at either shot. An
+    eager input runs the staged builds; the in-place builds' strided inputs are not covered here
+    (graph mode, test_communicator, runs them contiguous)."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    rows = rows * lead
+    got = ranks.run(run_strided_all_reduce_rank, shot=shot, rows=rows, hidden=hidden, pad=pad, lead=lead)
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot}: " + "; ".join(bad)
 
