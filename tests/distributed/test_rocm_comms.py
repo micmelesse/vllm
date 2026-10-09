@@ -28,7 +28,6 @@ other backends, eager, the remaining shapes and the kernels tune
 declines today.
 """
 
-import logging
 import math
 import multiprocessing as mp
 import queue
@@ -85,13 +84,14 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     init_distributed_environment,
 )
+from vllm.logger import init_logger
 from vllm.utils.network_utils import get_distributed_init_method, get_open_port
 
 # WHAT A DTYPE NAME MEANS, stated here rather than imported: two names, and the table it
 # came from carried thirty more that this test has no opinion about.
 D_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 set_start_method("spawn", force=True)
 
@@ -510,6 +510,7 @@ def _serve(
     try:
         while (order := inbox.get()) is not None:
             seq, fn, args, kwargs = order
+            began = time.monotonic()
             try:
                 outcome = fn(ctx, *args, **kwargs)
             except Exception as e:
@@ -521,6 +522,14 @@ def _serve(
                 # and has to keep unwinding.
                 logger.exception("rank %d failed %s %s", rank, fn.__name__, kwargs)
                 outcome = (None, f"{type(e).__name__}: {e}")
+            # EACH RANK'S TIME for the case, so a slow or late rank shows by name.
+            logger.info(
+                "rank %d %s %s: %.2f s",
+                rank,
+                fn.__name__,
+                kwargs,
+                time.monotonic() - began,
+            )
             outbox.put((seq, rank, outcome))
     finally:
         _tear_down(ctx)
@@ -612,6 +621,7 @@ class World:
         deadline = time.monotonic() + CASE_TIMEOUT_S
         got: dict[int, tuple[CaseValue, str | None]] = {}
         dead: list[int] = []
+        failed: int | None = None
         while len(got) < self.size and time.monotonic() < deadline:
             try:
                 s, r, outcome = self._outbox.get(timeout=1.0)
@@ -628,6 +638,7 @@ class World:
                 continue  # an answer to a case already given up on
             got[r] = outcome
             if stop_on_error and outcome[1] is not None:
+                failed = r
                 break
         n = len(got)
         for r in range(self.size):
@@ -637,8 +648,10 @@ class World:
                 why = f"rank {r} died (exit code {self._procs[r].exitcode})"
             elif time.monotonic() >= deadline:
                 why = f"rank {r} still running after {CASE_TIMEOUT_S}s -- a deadlock"
+            elif dead:
+                why = f"rank {r} not waited for: rank {', '.join(map(str, dead))} died"
             else:
-                why = f"rank {r} not waited for: another rank failed to come up"
+                why = f"rank {r} not waited for: rank {failed} failed"
             got[r] = (None, f"{why}; {n} of {self.size} ranks returned")
         return [got[r] for r in range(self.size)], n == self.size
 
