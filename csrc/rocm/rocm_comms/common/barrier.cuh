@@ -5,11 +5,10 @@
 // counters, each touched only atomically; `barrier`, the flags, and in `impl` what they are made
 // of. A rank's buffers are peers.cuh's.
 //
-// HIP_COMMS_DEBUG=1 BUILDS THE TESTS' MACHINERY IN: a wait that outlives the timeout prints where
-// it was before it traps, and every wait is skewed by a random per-block delay, so a race shows
-// on every run. Off (the default), a wait still backs off and traps at the timeout, but reads the
-// clock every 256 polls and prints nothing: a clock read a poll and a printf path in every kernel
-// are not free.
+// A WAIT NEVER HANGS AND NEVER TRAPS: past the timeout it writes the rank's fault record (where,
+// which peer, the count against the one wanted) and leaves the kernel, and every wait leaves once
+// the record's `abort` is set; the host reads the record (peers.cuh's `Fault`). HIP_COMMS_DEBUG=1
+// skews every wait by a random per-block delay, so a race shows on every run.
 
 #pragma once
 
@@ -144,38 +143,50 @@ DINLINE void fence() {
   }
 }
 
-// Spins relaxed and acquires once, after: an acquire per poll would invalidate the
-// caches on every iteration of every spinning block.
-template <bool ACQUIRE, int MEMORY_SCOPE>
-DINLINE void wait(uint64_t timeout_ticks, int rank, const Counter& flag, uint32_t want,
-                  const char* what, int peer) {
-#if HIP_COMMS_DEBUG
-  const uint64_t t0 = wall_clock64();
-  uint32_t seen;
-  while ((seen = flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>()) < want) {
-    if (wall_clock64() - t0 > timeout_ticks) {
-      printf("rocm_comms: rank %d block %d timed out in %s, peer %d: flag %u, want %u\n",
-             rank, blockIdx.x, what, peer, seen, want);
-      __builtin_trap();
-    }
+// THE FAULT, written once by the first wait on this rank to give up: `state` claimed 0 -> 1, the
+// fields, then 2 released, so the host reads them only whole. Then `abort`, so every other wait on
+// this rank leaves at its next check rather than spinning out its own timeout.
+DINLINE void record_fault(Fault* f, Where where, int rank, int peer, uint32_t count,
+                          uint32_t want, uint64_t elapsed) {
+  uint32_t clear = 0;
+  if (__scoped_atomic_compare_exchange_n(&f->state, &clear, 1u, false, __ATOMIC_RELAXED,
+                                         __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
+    f->where         = static_cast<uint32_t>(where);
+    f->rank          = rank;
+    f->block         = static_cast<int32_t>(blockIdx.x);
+    f->peer          = peer;
+    f->count         = count;
+    f->want          = want;
+    f->elapsed_ticks = elapsed;
+    __scoped_atomic_store_n(&f->state, 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
   }
-#else
-  // A RELEASE BUILD BACKS OFF AND TIMES OUT. A sleep a poll (64 cycles) keeps a spinning block
-  // from hammering the link with polls; a clock read every 256 polls bounds a hang to the build's
-  // timeout, a trap rather than every rank's blocks spinning until the process is killed. THE TRAP
-  // SAYS WHY FIRST: which rank, block, barrier and peer, and the peer's count against the one
-  // wanted (a peer short by a few is a launch one rank skipped). Printed only on the way to the
-  // trap; a bare trap was a silent HSA 0x1016 (the 2026-10-05 e2e test).
+  __scoped_atomic_store_n(&f->abort, 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+}
+
+// Spins relaxed and acquires once, after: an acquire per poll would invalidate the caches on every
+// iteration of every spinning block. A sleep a poll (64 cycles) keeps a spinning block from
+// hammering the link. EVERY 256 POLLS, the slow path: the clock, and the fault record's `abort`
+// (host-mapped, so only here, never in the fast path). Past the timeout the wait records the fault;
+// timed out or aborted, the WAVE ENDS (s_endpgm): an ended wave no longer counts at the block's
+// s_barrier, so the block's other waves run on to their own next wait, see `abort`, and end too.
+// The kernel's output is then garbage and the communicator broken (the host's watchdog).
+template <bool ACQUIRE, int MEMORY_SCOPE>
+DINLINE void wait(uint64_t timeout_ticks, Signal* self_signal, int rank, const Counter& flag,
+                  uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
   for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want; ++n) {
     __builtin_amdgcn_s_sleep(1);
-    if ((n & 255u) == 0 && wall_clock64() - t0 > timeout_ticks) {
-      printf("rocm_comms: rank %d block %d timed out in %s, peer %d: count %u, want %u\n", rank,
-             blockIdx.x, what, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want);
-      __builtin_trap();
-    }
+    if ((n & 255u) != 0) continue;
+    Fault* f              = self_signal->fault;
+    const uint64_t waited = wall_clock64() - t0;
+    const bool aborted =
+        __scoped_atomic_load_n(&f->abort, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+    if (!aborted && waited <= timeout_ticks) continue;
+    if (!aborted)
+      record_fault(f, where, rank, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want,
+                   waited);
+    __builtin_amdgcn_endpgm();
   }
-#endif
   if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
 }
 
@@ -199,8 +210,9 @@ DINLINE void pair_blocks(const PeerSignals& peer_signals, Signal* self_signal, i
     const Counter mine   = start ? own.start(blockIdx.x, threadIdx.x)
                                  : own.end(blockIdx.x, threadIdx.x);
     theirs.store<ORDERED ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(f);
-    wait<ORDERED, __MEMORY_SCOPE_DEVICE>(timeout_ticks, rank, mine, f,
-                                          start ? "start" : "peer barrier", threadIdx.x);
+    wait<ORDERED, __MEMORY_SCOPE_DEVICE>(timeout_ticks, self_signal, rank, mine, f,
+                                          start ? Where::start : Where::peer_barrier,
+                                          static_cast<int>(threadIdx.x));
   }
   __syncthreads();
 }
@@ -234,13 +246,13 @@ DINLINE void grid_barrier(const PeerSignals& peer_signals, Signal* self_signal, 
               .store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(e);
 #pragma unroll
         for (int i = 0; i < WORLD; ++i)
-          wait<true, __MEMORY_SCOPE_SYSTEM>(timeout_ticks, rank, own.peer(i), e,
-                                            "world_barrier: peer", i);
+          wait<true, __MEMORY_SCOPE_SYSTEM>(timeout_ticks, self_signal, rank, own.peer(i), e,
+                                            Where::world_peer, i);
       }
       own.gen().fetch_add<__ATOMIC_RELEASE, kScope>(1u);
     } else {
-      wait<true, kScope>(timeout_ticks, rank, own.gen(), g + 1,
-                         PEERS ? "world_barrier" : "grid_barrier", -1);
+      wait<true, kScope>(timeout_ticks, self_signal, rank, own.gen(), g + 1,
+                         PEERS ? Where::world : Where::grid, -1);
     }
   }
   __syncthreads();
@@ -263,7 +275,7 @@ enum class Group { peers, grid, world };
 enum class Until { launched, visible, read };
 
 // A KERNEL'S SYNCHRONIZATION, one per kernel: every rank's signal block, this rank's, its rank and
-// how long a wait may last before it traps, and this block's sequence number, read once here and
+// how long a wait may last before it gives up, and this block's sequence number, read once here and
 // carried in a register. Each peers barrier advances it; finish() stores it for the next call, the
 // kernel's last statement; barrier<Group, Until>(sync) below. Stored by every barrier, the store sat before the kernel's first loads
 // and shared a register with their addresses: the loads waited for it (vmcnt(0), +0.18 us at
@@ -304,8 +316,9 @@ class Sync {
     impl::signals(peer_signals_, peer).flag(rank_).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(v);
   }
   DINLINE void wait_flag(int peer, uint32_t v) const {
-    impl::wait<false, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, rank_,
-                                             impl::own_signals(self_signal_).flag(peer), v, "flag", peer);
+    impl::wait<false, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, self_signal_, rank_,
+                                             impl::own_signals(self_signal_).flag(peer), v,
+                                             Where::flag, peer);
   }
 
   // THE SEQUENCE FOR THE NEXT CALL, once, after every barrier: a kernel that does not call it

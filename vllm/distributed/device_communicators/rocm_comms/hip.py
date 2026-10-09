@@ -18,15 +18,16 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
 """
 
-import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
 
-from .base import Capturing, Communicator, Error, Ran, State
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+from .base import Capturing, Communicator, Error, Fault, Ran, State, Where
+
+logger = init_logger(__name__)
 
 
 def _require_capture(state: State) -> None:
@@ -61,6 +62,9 @@ class HipCommunicator(Communicator):
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
+    # The device wall clock's rate, which the fault record counts its wait in.
+    _khz: int = 0
+    _faults = True
 
     def _open(self) -> str | None:
         """Open the peer memory. A collective, so every rank must reach it.
@@ -76,6 +80,7 @@ class HipCommunicator(Communicator):
         if err is not None:
             return Error(err).name
         self._handle = handle
+        self._khz = torch.ops._rocm_C.rocm_comms_wall_clock_khz(self.device.index)
         logger.info("HipCommunicator ready")
         return None
 
@@ -465,3 +470,26 @@ class HipCommunicator(Communicator):
             return
         torch.ops._rocm_C.rocm_comms_dispose(self._handle)
         self._handle = None
+
+    def _fault(self) -> Fault | None:
+        """The C++ handle's fault record (host-mapped, so this never waits on the
+        device)."""
+        if self._handle is None:
+            return None
+        got = torch.ops._rocm_C.rocm_comms_fault(self._handle)
+        if not got:
+            return None
+        where, rank, block, peer, count, want, ticks = got
+        return Fault(
+            where=Where(where),
+            rank=rank,
+            block=block,
+            peer=peer,
+            count=count,
+            want=want,
+            waited_s=ticks / (self._khz * 1000.0),
+        )
+
+    def _abort(self) -> None:
+        if self._handle is not None:
+            torch.ops._rocm_C.rocm_comms_abort(self._handle)

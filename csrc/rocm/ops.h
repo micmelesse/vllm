@@ -75,6 +75,10 @@ int64_t rocm_comms_wall_clock_khz(int64_t device);
 torch::Tensor rocm_comms_stamps();
 
 void rocm_comms_dispose(fptr_t handle_ptr);
+// The rank's fault record, [where, rank, block, peer, count, want, elapsed_ticks], or empty while
+// no wait has given up; and the abort every wait on the rank then leaves at.
+std::vector<int64_t> rocm_comms_fault(fptr_t handle_ptr);
+void rocm_comms_abort(fptr_t handle_ptr);
 
 // Each op takes its own forcing last: a template by name, and only the config
 // fields its kernels have (none: select's, or the template's own).
@@ -147,13 +151,14 @@ RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
 std::tuple<std::optional<std::string>, std::optional<int64_t>>
 rocm_comms_supported(int64_t device, int64_t world);
 // The build's dtypes by name, its worlds, a pack's bytes and a staging's, its
-// ops' and errors' names in their enums' order, and each template's name, op
+// ops', errors' and fault places' names in their enums' order, and each template's name, op
 // and built KernelConfigs (flat, a config's fields in the names' order, 0 where
 // its family has none, with each template's count).
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
-           std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>>
+           std::vector<std::string>, std::vector<std::string>,
+           std::vector<int64_t>, std::vector<int64_t>>
 rocm_comms_build_info();
 
 void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out,

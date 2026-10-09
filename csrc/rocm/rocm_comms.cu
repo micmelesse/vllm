@@ -147,7 +147,7 @@ using Names         = std::vector<std::string>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names,
-                                 Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
+                                 Names, Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
 
 // A torch dtype as ours, or none for one ours has no name for.
 std::optional<hip_comms::DType> dtype_from(at::ScalarType s) {
@@ -397,11 +397,12 @@ SupportedWire rocm_comms_supported(int64_t device, int64_t world) {
 }
 
 // WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its worlds, a pack's
-// bytes and a staging's, its ops and errors by name in their enums' order (each error's name
-// without its reason), which Python's `Op` and `Error` are held to, and its templates.
+// bytes and a staging's, its ops, errors and fault places by name in their enums' order (each
+// error's name without its reason), which Python's `Op`, `Error` and `Where` are held to, and its
+// templates.
 BuildInfoWire rocm_comms_build_info() {
   using namespace hip_comms;
-  Names dtypes, ops, errors;
+  Names dtypes, ops, errors, wheres;
   for (const DType d : kBuild.supports.dtypes) dtypes.push_back(to_string(d));
   const std::vector<int64_t> worlds(kBuild.supports.worlds.begin(), kBuild.supports.worlds.end());
   for (int i = 0; i < kNumOps; ++i) ops.push_back(to_string(static_cast<OpType>(i)));
@@ -409,6 +410,7 @@ BuildInfoWire rocm_comms_build_info() {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
+  for (int i = 1; i <= kNumWheres; ++i) wheres.push_back(to_string(static_cast<Where>(i)));
   // Each template's op, and its configs (what dispatch instantiates: the
   // tuner's search space), flat: a config's fields in `fields`' order, 0 where its family has
   // none.
@@ -435,10 +437,21 @@ BuildInfoWire rocm_comms_build_info() {
           c);
   }
   return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
-          templates, template_ops, fields, configs, counts};
+          wheres, templates, template_ops, fields, configs, counts};
 }
 
 void rocm_comms_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
+
+// THE FAULT RECORD AS PYTHON READS IT: polled by the communicator's watchdog, so it never waits on
+// the device.
+std::vector<int64_t> rocm_comms_fault(fptr_t handle_ptr) {
+  const auto f = handle_of(handle_ptr).fault();
+  if (!f) return {};
+  return {static_cast<int64_t>(f->where), f->rank,  f->block, f->peer,
+          static_cast<int64_t>(f->count), static_cast<int64_t>(f->want),
+          static_cast<int64_t>(f->elapsed_ticks)};
+}
+void rocm_comms_abort(fptr_t handle_ptr) { handle_of(handle_ptr).abort(); }
 
 
 

@@ -56,16 +56,19 @@ from vllm.distributed.device_communicators.rocm_comms import (
     Error,
     make_communicator,
 )
+from vllm.distributed.device_communicators.rocm_comms import base as base_module
 from vllm.distributed.device_communicators.rocm_comms.base import (
     Broken,
     Capturing,
     Closed,
     Disabled,
+    Fault,
     Op,
     Open,
     Refused,
     State,
     Supported,
+    Where,
     build_info,
     supported,
 )
@@ -1141,13 +1144,20 @@ _A_STATE: dict[type, State] = {
 }
 
 
+def _bare(state: State) -> TorchCommunicator:
+    """A TorchCommunicator in `state` without opening one (no process group): the
+    base's own fields, and no backend's."""
+    comm = object.__new__(TorchCommunicator)
+    comm._own_fields(state)
+    return comm
+
+
 @pytest.mark.parametrize("variant", get_args(State))
 def test_capture_only_from_open(variant: type) -> None:
     """A capture is entered from Open only; from any other state it raises before
     touching the backend. Every variant, so a new one is covered when it is added."""
-    comm = object.__new__(TorchCommunicator)
     state = _A_STATE[variant]
-    comm.state = state
+    comm = _bare(state)
     if isinstance(state, Open):
         with comm.capture():
             assert isinstance(comm.state, Capturing)
@@ -1162,8 +1172,7 @@ def test_a_failed_capture_leaves_it_broken() -> None:
     """A capture that raises leaves the communicator broken, and every call after
     raises (through `disabled`, which every op checks first) naming why, rather than
     falling back while its peers hold half a registration."""
-    comm = object.__new__(TorchCommunicator)
-    comm.state = Open()
+    comm = _bare(Open())
     with pytest.raises(ValueError), comm.capture():
         raise ValueError("graph capture failed")
     assert isinstance(comm.state, Broken)
@@ -1171,6 +1180,89 @@ def test_a_failed_capture_leaves_it_broken() -> None:
         _ = comm.disabled
     with pytest.raises(RuntimeError):
         comm.capture().__enter__()
+
+
+class _Faulting(TorchCommunicator):
+    """A backend whose fault record reports `fault` from its `after`-th read on, and
+    counts the aborts it is sent: the watchdog's side, with no kernel."""
+
+    _faults = True
+    fault: Fault
+    after: int
+    reads: int
+    aborts: int
+
+    def _fault(self) -> Fault | None:
+        self.reads += 1
+        return self.fault if self.reads >= self.after else None
+
+    def _abort(self) -> None:
+        self.aborts += 1
+
+
+def _faulting(state: State, fault: Fault, after: int = 1) -> _Faulting:
+    comm = object.__new__(_Faulting)
+    comm._own_fields(state)
+    comm.fault, comm.after, comm.reads, comm.aborts = fault, after, 0, 0
+    return comm
+
+
+FAULTS = st.builds(
+    Fault,
+    where=st.sampled_from(list(Where)),
+    rank=st.integers(0, 7),
+    block=st.integers(0, 1023),
+    peer=st.integers(-1, 7),
+    count=st.integers(0, 2**32 - 1),
+    want=st.integers(0, 2**32 - 1),
+    waited_s=st.floats(0.0, 100.0, allow_nan=False),
+)
+
+
+@given(fault=FAULTS, launches=st.integers(0, 100), after=st.integers(1, 3))
+@settings(max_examples=15, deadline=None)
+def test_the_watchdog_breaks_on_a_fault_and_logs_the_last_launches(
+    fault: Fault, launches: int, after: int
+) -> None:
+    """The watchdog breaks an open communicator on the first fault it reads: every call
+    after raises naming it, the device's waits are aborted once, and the log carries the
+    cause and the flight recorder's launches, the last first, at most its length."""
+    comm = _faulting(Open(), fault, after)
+    for i in range(launches):
+        comm._record("all_reduce", torch.empty(i + 1, 8), (None,) * 7)
+    logged: list[str] = []
+    real = base_module.logger.error
+    base_module.logger.error = lambda msg, *args: logged.append(msg % args)  # type: ignore[method-assign]
+    try:
+        comm._watch()
+    finally:
+        base_module.logger.error = real  # type: ignore[method-assign]
+    assert comm.reads == after
+    assert comm.state == Broken(f"a kernel's wait gave up: {fault}")
+    assert comm.aborts == 1
+    with pytest.raises(RuntimeError, match=f"rank {fault.rank} block {fault.block}"):
+        _ = comm.disabled
+    (message,) = logged
+    assert str(fault) in message
+    kept = min(launches, base_module._RECORDED)
+    seqs = [int(line.split()[0][1:]) for line in message.splitlines()[1:] if kept]
+    assert seqs == list(range(launches - 1, launches - 1 - kept, -1))
+
+
+@given(fault=FAULTS)
+@settings(max_examples=5, deadline=None)
+def test_a_fault_during_a_capture_stays_broken(fault: Fault) -> None:
+    """A watchdog break while a capture runs is not undone when it exits: the capture
+    leaves it Broken, and a second break keeps the first cause and aborts no more."""
+    comm = _faulting(Open(), fault)
+    with comm.capture():
+        comm._watch()
+    assert isinstance(comm.state, Broken)
+    first = comm.state
+    comm._break("a later cause")
+    assert comm.state == first and comm.aborts == 1
+    comm.close()
+    assert isinstance(comm.state, Closed)
 
 
 # FULL: it spawns no ranks, but it checks a rule that moves rarely, against a baseline
@@ -1183,8 +1275,7 @@ def test_admission_matches_the_baseline() -> None:
     kernels. Needs no GPU. fp32 is excluded: `hip_comms.cu` has fp16/bf16 instantiations
     only, so closing it needs a kernel.
     """
-    ours = object.__new__(TorchCommunicator)
-    ours.state = Open()
+    ours = _bare(Open())
     # Every power of two across the range PLUS the bound and one element either side.
     # Bounds alone are the edges of the rule AS IT IS, so a wrong rule that diverges in
     # the band between two of them shows up on neither: a bounds-only grid missed a real
@@ -1893,14 +1984,16 @@ def test_all_reduce_rms_scale_add_matches_the_ops_it_replaces(
 
 
 def test_python_names_cpps_errors_and_ops() -> None:
-    """Python's `Error` is C++'s, name for name in order, so an Error's number names the
-    same reason on both sides; and its `Op` names exactly C++'s ops, which cross by
-    name."""
+    """Python's `Error` and `Where` are C++'s, name for name in order, so a number names
+    the same reason or place on both sides; and its `Op` names exactly C++'s ops, which
+    cross by name."""
     # example-based: fixed tables against fixed tables, nothing to vary
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     built = build_info()
     assert tuple(e.name for e in Error) == built.error_names
+    assert tuple(w.name for w in Where) == built.where_names
+    assert [w.value for w in Where] == list(range(1, len(built.where_names) + 1))
     assert set(get_args(Op)) | set(get_args(ExperimentalOp)) == set(built.op_names)
 
 
@@ -2044,6 +2137,50 @@ def test_an_all_reduce_takes_its_inputs_strides(
     )
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot}: " + "; ".join(bad)
+
+
+def run_skipped_call_rank(ctx: RankContext) -> tuple[bool, str | None]:
+    """ONE rank of a call the last rank never makes: every other rank's kernel waits
+    for it at its start, gives up at the timeout instead of hanging, and its
+    communicator breaks with a fault naming the last rank. Its own communicator, so the
+    world's stays whole."""
+    comm = _build_communicator("hip", ctx.cpu_group, ctx.device_group, ctx.device)
+    skipper = ctx.world - 1
+    try:
+        if ctx.rank == skipper:
+            return True, None
+        comm.all_reduce(torch.ones(16, 1024, dtype=torch.bfloat16, device=ctx.device))
+        torch.cuda.synchronize()
+        deadline = time.monotonic() + 2.0
+        while not isinstance(comm.state, Broken) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not isinstance(comm.state, Broken):
+            return False, f"still {comm.state} after its kernel gave up"
+        fault = comm._fault()
+        if fault is None:
+            return False, "broken with no fault record"
+        if (fault.where, fault.peer, fault.rank) != (Where.start, skipper, ctx.rank):
+            return False, f"the fault names the wrong place: {fault}"
+        return True, None
+    finally:
+        # The last rank's memory stays mapped until every kernel that wrote to it ended.
+        dist.barrier(group=ctx.cpu_group)
+        comm.close()
+
+
+# FULL: it waits out the kernels' 10 s timeout.
+@pytest.mark.full
+def test_a_call_one_rank_skips_breaks_its_peers_instead_of_hanging(
+    world: int, ranks: World
+) -> None:
+    """A peer that never launches makes the others' kernels give up at the timeout,
+    record where, and leave; each communicator breaks naming that peer."""
+    # example-based: the fault is one fixed scenario, the same at any size
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_skipped_call_rank)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, "; ".join(bad)
 
 
 def run_warmup_rank(ctx: RankContext) -> tuple[bool, str | None]:

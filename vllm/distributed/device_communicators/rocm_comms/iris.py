@@ -3,15 +3,16 @@
 
 """The iris backend: GPU-initiated collectives over iris's own symmetric heap."""
 
-import logging
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
+from vllm.logger import init_logger
+
 from .base import Communicator, Error, supported
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,9 +93,7 @@ class IrisCommunicator(Communicator):
         # any arrangement we run; a mismatch would be a silently wrong shape, so it is
         # a disable and not an assumption.
         if self._shmem.num_ranks != world:
-            return (
-                f"iris has {self._shmem.num_ranks} ranks, the device group {world}"
-            )
+            return f"iris has {self._shmem.num_ranks} ranks, the device group {world}"
 
         # A floor on the CONFIGURATION: the heap has to back at least the small path.
         # It is no longer an upper bound on a tensor -- admission stopped gating on size

@@ -10,19 +10,23 @@ decide whether a tensor is one of ours at all.
 """
 
 import functools
-import logging
+import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal, final
+from typing import ClassVar, Literal, final
 
 import torch
 from torch.distributed import ProcessGroup
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # ---- THE CAPABILITIES EVERY BACKEND HERE IS BOUND BY. Not tunables: a tunable is a
 # number you may change with the code still correct, and changing one of these means
@@ -53,8 +57,9 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 
 
 # A COMMUNICATOR'S LIFE, each state holding what is true in it alone: `__init__` -> Open
-# | Disabled(why); Open <-> Capturing, or Capturing -> Broken(cause) when a capture
-# raises; any -> Closed. Only `Communicator` moves it.
+# | Disabled(why); Open <-> Capturing; Capturing -> Broken(cause) when a capture raises,
+# and Open or Capturing -> Broken(cause) when the watchdog finds a fault; any -> Closed.
+# Only `Communicator` moves it, under its lock (the watchdog is another thread).
 @dataclass(frozen=True)
 class Disabled:
     why: str  # the backend's reason it cannot run here (not an error)
@@ -126,6 +131,69 @@ class Error(IntEnum):
     row_stride_not_packs = 36
 
 
+class Where(IntEnum):
+    """WHERE A KERNEL'S WAIT GAVE UP: C++'s `hip_comms::Where`, number for number (a
+    test holds them equal)."""
+
+    start = 1  # a launch's first barrier: the peer had not launched
+    peer_barrier = 2  # a later peers barrier
+    world_peer = 3  # a world barrier's exchange: the peer had not posted
+    world = 4  # a world barrier on this device
+    grid = 5  # a grid barrier on this device
+    flag = 6  # a flag the peer had not written
+
+
+@dataclass(frozen=True)
+class Fault:
+    """A RANK'S FAULT RECORD: the first of its kernels' waits to outlive the timeout,
+    which then left the kernel (its output garbage) and made every other wait on the
+    rank leave."""
+
+    where: Where
+    rank: int
+    block: int
+    peer: int  # the rank it waited for, -1 for none (a wait on this device)
+    count: int  # the counter it read last
+    want: int  # the value it waited for
+    waited_s: float
+
+    def __str__(self) -> str:
+        waited_for = "" if self.peer < 0 else f" for rank {self.peer}"
+        return (
+            f"rank {self.rank} block {self.block} gave up in {self.where.name}"
+            f"{waited_for} after {self.waited_s:.1f} s: count {self.count}, "
+            f"want {self.want}"
+        )
+
+
+@dataclass(frozen=True)
+class Call:
+    """ONE LAUNCH, as the flight recorder keeps it. A graph's replays run none of this
+    code, so a captured launch is recorded once, at its capture."""
+
+    seq: int  # this communicator's launches before it
+    op: Op
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    ran: "Ran"
+    captured: bool
+    at_s: float  # time.monotonic() at the launch
+
+    def __str__(self) -> str:
+        how = " (captured)" if self.captured else ""
+        return (
+            f"#{self.seq} {self.op} {list(self.shape)} {self.dtype} "
+            f"ran {self.ran}{how} at {self.at_s:.3f}"
+        )
+
+
+# THE FLIGHT RECORDER'S LENGTH: the launches a broken communicator logs, the last first.
+_RECORDED = 64
+# How often the watchdog reads the fault record: a fault is reported within this of the
+# wait that wrote it giving up.
+_WATCH_S = 0.1
+
+
 # C++'s `DType` names, as torch's dtypes.
 _DTYPES: Mapping[str, torch.dtype] = {
     "f16": torch.float16,
@@ -147,16 +215,18 @@ class TemplateBuild:
 @dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack and staging bytes, its ops' and errors' names, and its templates."""
+    pack and staging bytes, its ops', errors' and fault places' names, and its
+    templates."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
     pack_bytes: int
     staging_bytes: int
-    # C++'s `Op` and `Error` members by name, each in its enum's order: an op crosses
-    # by name, an Error by its number.
+    # C++'s `Op`, `Error` and `Where` members by name, each in its enum's order: an op
+    # crosses by name, an Error and a Where by number.
     op_names: tuple[str, ...]
     error_names: tuple[str, ...]
+    where_names: tuple[str, ...]
     # Each template by name, in C++'s `Template` order: what a tuner searches.
     templates: dict[str, TemplateBuild]
 
@@ -171,6 +241,7 @@ def build_info() -> BuildInfo:
         staging,
         ops,
         errors,
+        wheres,
         names,
         template_ops,
         fields,
@@ -193,6 +264,7 @@ def build_info() -> BuildInfo:
         staging,
         tuple(ops),
         tuple(errors),
+        tuple(wheres),
         templates,
     )
 
@@ -272,12 +344,33 @@ class Communicator(ABC):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
+        self._own_fields()
         why = self._open()
         if why is None:
             self.state = Open()
+            if self._faults:
+                self._watchdog = threading.Thread(
+                    target=self._watch,
+                    name=f"{type(self).__name__}-watchdog",
+                    daemon=True,
+                )
+                self._watchdog.start()
         else:
             logger.info("%s disabled: %s", type(self).__name__, why)
             self.state = Disabled(why)
+
+    @final
+    def _own_fields(self, state: State | None = None) -> None:
+        """THE BASE'S OWN FIELDS: the lock its state moves under, the flight recorder
+        and the watchdog's. `__init__` sets them first; a test's bare instance (no
+        process group) sets them here too, with its `state`."""
+        self._lock = threading.Lock()
+        self._calls: deque[Call] = deque(maxlen=_RECORDED)
+        self._launches = 0
+        self._stop_watching = threading.Event()
+        self._watchdog: threading.Thread | None = None
+        if state is not None:
+            self.state = state
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
@@ -344,6 +437,7 @@ class Communicator(ABC):
             raise Refused(ran, inp)
         out = torch.empty_like(inp)
         if not self._warming_up():
+            self._record("all_reduce", inp, ran)
             self._all_reduce(
                 out,
                 inp,
@@ -419,6 +513,7 @@ class Communicator(ABC):
             raise Refused(ran, inp)
         out = torch.empty_like(inp)
         if not self._warming_up():
+            self._record("all_reduce_rms_norm", inp, ran)
             self._all_reduce_rms_norm(
                 out,
                 inp,
@@ -497,6 +592,7 @@ class Communicator(ABC):
             raise Refused(ran, inp)
         out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
         if not self._warming_up():
+            self._record("all_reduce_add_rms_norm", inp, ran)
             self._all_reduce_add_rms_norm(
                 out,
                 residual_out,
@@ -591,6 +687,7 @@ class Communicator(ABC):
         out = torch.empty_like(inp)
         if self._warming_up():
             return prefix_out, out, ran
+        self._record("all_reduce_add_attn_res_rms_norm", inp, ran)
         self._all_reduce_add_attn_res_rms_norm(
             prefix_out,
             out,
@@ -689,6 +786,7 @@ class Communicator(ABC):
         if isinstance(ran, Error):
             raise Refused(ran, inp)
         if not self._warming_up():
+            self._record("all_reduce_rms_norm_gemm", inp, ran)
             self._all_reduce_rms_norm_gemm(
                 False,
                 inp,
@@ -781,6 +879,7 @@ class Communicator(ABC):
         if isinstance(ran, Error):
             raise Refused(ran, inp)
         if not self._warming_up():
+            self._record("all_reduce_rms_norm_gemm_add", inp, ran)
             self._all_reduce_rms_norm_gemm(
                 True,
                 inp,
@@ -860,6 +959,7 @@ class Communicator(ABC):
         if isinstance(ran, Error):
             raise Refused(ran, inp)
         if not self._warming_up():
+            self._record("all_reduce_rms_scale_add", inp, ran)
             self._all_reduce_rms_scale_add(
                 inp,
                 out,
@@ -898,7 +998,13 @@ class Communicator(ABC):
                 f"recorded would "
                 f"replay against released buffers. Leave the capture first."
             )
-        self.state = Closed()
+        # THE WATCHDOG STOPS FIRST: it reads the backend's handle, which `_on_close`
+        # frees.
+        self._stop_watching.set()
+        if self._watchdog is not None:
+            self._watchdog.join()
+        with self._lock:
+            self.state = Closed()
         self._on_close()
 
     @final
@@ -931,18 +1037,68 @@ class Communicator(ABC):
         address that is not valid yet, so a backend has to be told. From `open`
         only (not nested, not closed); a capture that raises leaves it broken,
         since its peers may have registered what this rank did not."""
-        if not isinstance(self.state, Open):
-            raise RuntimeError(
-                f"{type(self).__name__}.capture() while {type(self.state).__name__}"
-            )
-        self.state = Capturing()
+        with self._lock:
+            if not isinstance(self.state, Open):
+                raise RuntimeError(
+                    f"{type(self).__name__}.capture() while {type(self.state).__name__}"
+                )
+            self.state = Capturing()
         try:
             with self._on_capture():
                 yield
         except BaseException as e:
-            self.state = Broken(f"a capture raised {type(e).__name__}: {e}")
+            self._break(f"a capture raised {type(e).__name__}: {e}")
             raise
-        self.state = Open()
+        # Open again, unless the watchdog broke it meanwhile.
+        with self._lock:
+            if isinstance(self.state, Capturing):
+                self.state = Open()
+
+    # ---- A FAULT, AND WHAT IS LOGGED WHEN ONE BREAKS IT. ----
+
+    def _watch(self) -> None:
+        """THE WATCHDOG, its own thread while open: reads the backend's fault record
+        and breaks the communicator on the first. A graph replay runs none of our host
+        code, so this is the only place a fault in one surfaces."""
+        while not self._stop_watching.wait(_WATCH_S):
+            fault = self._fault()
+            if fault is not None:
+                self._break(f"a kernel's wait gave up: {fault}")
+                return
+
+    @final
+    def _break(self, cause: str) -> None:
+        """Broken, once: every later call raises (`disabled`), every wait still on the
+        device leaves (`_abort`), and the cause and the last launches go to the log."""
+        with self._lock:
+            if isinstance(self.state, Broken | Closed):
+                return
+            self.state = Broken(cause)
+        self._abort()
+        calls = "\n".join(f"  {c}" for c in reversed(self._calls))
+        logger.error(
+            "%s broken: %s. Its last %d launches, the last first:\n%s",
+            type(self).__name__,
+            cause,
+            len(self._calls),
+            calls or "  (none)",
+        )
+
+    @final
+    def _record(self, op: Op, inp: torch.Tensor, ran: Ran) -> None:
+        """Into the flight recorder, as a launch goes out."""
+        self._calls.append(
+            Call(
+                seq=self._launches,
+                op=op,
+                shape=tuple(inp.shape),
+                dtype=inp.dtype,
+                ran=ran,
+                captured=torch.cuda.is_current_stream_capturing(),
+                at_s=time.monotonic(),
+            )
+        )
+        self._launches += 1
 
     # ---- The rules a caller can get wrong, enforced once. ----
 
@@ -1190,3 +1346,14 @@ class Communicator(ABC):
         holds nothing
         of ours, and a backend that does drops it here so its destructor runs at a known
         moment."""
+
+    # Whether this backend has a fault record for the watchdog to read (`_fault`).
+    _faults: ClassVar[bool] = False
+
+    def _fault(self) -> Fault | None:
+        """This backend's fault record, read without waiting on the device: a Fault once
+        one of its kernels' waits has given up, else None. None, by default."""
+        return None
+
+    def _abort(self) -> None:  # noqa: B027 -- an optional hook, not an abstract one
+        """Make every wait this backend's kernels are in leave. Nothing, by default."""

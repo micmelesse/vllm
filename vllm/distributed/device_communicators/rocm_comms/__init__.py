@@ -13,15 +13,16 @@ WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN: this package takes process
 a device and a backend name, and reads no environment variable and no vLLM config.
 """
 
-import logging
 from typing import Literal, get_args
 
 import torch
 from torch.distributed import ProcessGroup
 
+from vllm.logger import init_logger
+
 from .base import Communicator, Error
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # THE BACKENDS THERE ARE, one file each beside this one. `vllm.envs` states the same set
 # for the env var it reads; the two meet where the value is passed in, so a name vLLM

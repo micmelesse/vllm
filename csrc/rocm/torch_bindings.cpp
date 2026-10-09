@@ -94,6 +94,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rocm_comms_stamps", &rocm_comms_stamps);
   rocm_ops.def(
       "rocm_comms_dispose", &rocm_comms_dispose);
+  // The fault record the watchdog polls, and the abort it sets (barrier.cuh).
+  rocm_ops.def("rocm_comms_fault(int handle_ptr) -> int[]", &rocm_comms_fault);
+  rocm_ops.def("rocm_comms_abort(int handle_ptr) -> ()", &rocm_comms_abort);
   // The probe's ops (experimental): calibrate.py times them.
   rocm_ops.def("rocm_comms_probe_barrier(int handle_ptr) -> ()", &rocm_comms_probe_barrier);
   rocm_ops.def("rocm_comms_ping_pong(int handle_ptr, int peer, int iters, Tensor! ticks) -> ()",
@@ -142,7 +145,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                &rocm_comms_supported);
   rocm_ops.def(
       "rocm_comms_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
-      "int[], int[])",
+      "str[], int[], int[])",
       &rocm_comms_build_info);
   rocm_ops.def(
       "rocm_comms_register_captured", &rocm_comms_register_captured);

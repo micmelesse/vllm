@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,6 +53,16 @@ class Handle {
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
     self_signal_ = static_cast<Signal*>(alloc_symmetric());
+    // THE FAULT RECORD, host-mapped and coherent: a wait that gives up writes it with system-scope
+    // atomics while the host polls it, and the host sets its `abort` (barrier.cuh). The kernels
+    // find it through this rank's signal block.
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&fault_), sizeof(Fault),
+                            hipHostMallocMapped | hipHostMallocCoherent));
+    std::memset(fault_, 0, sizeof(Fault));
+    Fault* device_fault = nullptr;
+    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_fault), fault_, 0));
+    HIP_CHECK(hipMemcpy(&self_signal_->fault, &device_fault, sizeof(device_fault),
+                        hipMemcpyHostToDevice));
     // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
     const int64_t slots = build.memory.peer_ptr_slots;
     HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * sizeof(PeerPtrs)));
@@ -78,6 +89,7 @@ class Handle {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
     hipFree(self_signal_);
+    hipHostFree(fault_);
   }
 
   Handle(const Handle&)            = delete;
@@ -169,10 +181,18 @@ class Handle {
     return p;
   }
   // The synchronization state: every rank's signal block, this rank's, and how long a wait may
-  // last before it traps.
+  // last before it gives up.
   PeerSignals peer_signals() const { return signals_; }
   Signal* self_signal() const { return self_signal_; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
+
+  // THE FAULT RECORD, read while kernels run: whole once a wait has written it, else nothing.
+  std::optional<Fault> fault() const {
+    if (__atomic_load_n(&fault_->state, __ATOMIC_ACQUIRE) != 2) return std::nullopt;
+    return *fault_;
+  }
+  // Every wait on this rank leaves at its next check: for a communicator the host has given up on.
+  void abort() { __atomic_store_n(&fault_->abort, 1u, __ATOMIC_RELEASE); }
 
   // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is
   // registered at capture exit, before any replay). Otherwise it goes through the staging.
@@ -303,6 +323,7 @@ class Handle {
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
   Signal* self_signal_ = nullptr;
+  Fault* fault_        = nullptr;
   uint64_t timeout_ticks_   = 0;
   PeerSignals signals_{};
   PeerPtrs* slab_     = nullptr;

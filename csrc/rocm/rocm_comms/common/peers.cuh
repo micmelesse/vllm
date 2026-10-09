@@ -35,6 +35,47 @@ constexpr int kMaxRanks  = kMaxPeers;
 // never rules out a grid. Which grid is fast is select's (select.cuh).
 constexpr int kMaxBlocks = kMaxResidentBlocks;
 
+// WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's `Where`, number for
+// number. 0 is no fault.
+enum class Where : uint32_t {
+  start = 1,          // a peers barrier at the launch's start: the peer had not launched
+  peer_barrier,       // a peers barrier after it
+  world_peer,         // a world barrier's exchange: the peer had not posted its epoch
+  world,              // a world barrier on this device: the last block never released the grid
+  grid,               // a grid barrier on this device
+  flag,               // wait_flag: the peer had not written its flag
+};
+constexpr int kNumWheres = 6;  // numbered from 1
+constexpr const char* to_string(Where w) {
+  switch (w) {
+    case Where::start: return "start";
+    case Where::peer_barrier: return "peer_barrier";
+    case Where::world_peer: return "world_peer";
+    case Where::world: return "world";
+    case Where::grid: return "grid";
+    case Where::flag: return "flag";
+  }
+  return "?";
+}
+
+// A RANK'S FAULT RECORD, in HOST-MAPPED memory (the handle's), so the host reads it and sets
+// `abort` while a kernel still runs, and a graph replay, which runs none of our host code, still
+// reports. A wait that outlives the timeout writes it once (the first block to claim `state` wins)
+// and sets `abort`; every wait checks `abort` with its clock and leaves, so one fault ends the
+// rank's kernel instead of each block spinning out its own timeout. The host sets `abort` to end
+// a kernel it has given up on.
+struct Fault {
+  uint32_t abort;          // nonzero: every wait on this rank leaves
+  uint32_t state;          // 0 clear, 1 being written, 2 written (read the rest only at 2)
+  uint32_t where;          // Where
+  int32_t rank;            // this rank
+  int32_t block;           // the block that gave up
+  int32_t peer;            // the rank it waited for, -1 for none (a grid wait)
+  uint32_t count;          // the counter it read last
+  uint32_t want;           // the value it waited for
+  uint64_t elapsed_ticks;  // how long it waited, in the device wall clock's ticks
+};
+
 // One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
 // the bytes after the struct.
 //
@@ -55,6 +96,9 @@ struct Signal {
   alignas(128) uint32_t arrive;
   alignas(128) uint32_t gen;
   alignas(128) uint32_t epoch;
+  // This rank's fault record (the handle's, host-mapped), written once when the handle opens.
+  // A peer's block holds that peer's, which this rank never reads.
+  alignas(128) Fault* fault;
 };
 
 struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };

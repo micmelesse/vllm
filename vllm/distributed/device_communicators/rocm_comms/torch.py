@@ -7,14 +7,14 @@ NOT A FAST PATH. It is the oracle the other backends are checked against -- same
 interface, same admission, an implementation nobody doubts.
 """
 
-import logging
-
 import torch
 import torch.distributed as dist
 
+from vllm.logger import init_logger
+
 from .base import Communicator, Error, supported
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class TorchCommunicator(Communicator):
