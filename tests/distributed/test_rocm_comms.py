@@ -30,6 +30,7 @@ declines today.
 
 import math
 import multiprocessing as mp
+import os
 import queue
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -45,7 +46,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from _pytest.mark import ParameterSet
-from hypothesis import given, settings
+from hypothesis import event, given, settings
 from hypothesis import strategies as st
 from torch.distributed import ProcessGroup
 
@@ -2298,3 +2299,461 @@ def test_one_row_wider_than_the_staging_is_refused_by_name(
     got = ranks.run(run_row_wider_than_staging_rank, shot=shot)
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot}: " + "; ".join(bad)
+
+
+# =================================================================================
+# EVERY OP, PROPERTY-TESTED: REFUSED BY NAME, OR RIGHT. One test per op. Hypothesis
+# draws a call -- dtype, rows, width, row padding, a seed, and any forcing (algorithm,
+# direction, tile, launch; built or not) -- and every rank makes it. The call is either
+# refused with a named Error, the same on every rank, or its outputs match the
+# reference: the exact sum, then the op the fusion replaces. It never faults or hangs,
+# and a plain call (nothing forced, contiguous, whole packs, fits the staging) always
+# runs. A failing call is shrunk to the smallest, as the two-shot's empty-slice fault
+# was (2026-10-10). FULL: each example is an eight-process collective.
+# =================================================================================
+
+PROPERTY = settings(
+    max_examples=int(os.environ.get("ROCM_COMMS_PROP_EXAMPLES", "40")),
+    deadline=None,
+    print_blob=True,
+)
+
+# THE DRAWS every op shares. Rows and widths around every edge: one row, fewer rows
+# than ranks, a pack a rank (8 16-bit columns a pack on 8 ranks), the model's widths,
+# whole packs at random, and widths that are not whole packs.
+DTYPES_DRAWN = st.sampled_from(["bf16", "fp16"])
+ROWS_DRAWN = st.one_of(
+    st.sampled_from([1, 2, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 129, 512]),
+    st.integers(1, 600),
+)
+HIDDEN_DRAWN = st.one_of(
+    st.sampled_from([8, 16, 56, 64, 72, 120, 128, 136, 1024, 3584, 7168, 8192]),
+    st.integers(1, 1200).map(lambda k: 8 * k),
+    st.integers(1, 9000),
+)
+PAD_DRAWN = st.sampled_from([0, 0, 8, 64, 3])  # the row is this much wider than read
+SEED_DRAWN = st.integers(0, 2**16)
+FORCED_DRAWN = st.fixed_dictionaries(
+    {
+        "algorithm": st.sampled_from([None, None, "one_shot", "two_shot"]),
+        "direction": st.sampled_from([None, None, "pull", "push"]),
+        "tile_m": st.sampled_from([None, None, 1, 2, 4, 8, 16, 3]),
+        "tile_n": st.sampled_from([None, None, 64, 256, 1024, 4096, 100]),
+        "threads_per_block": st.sampled_from([None, None, 64, 128, 256, 512, 1024, 96]),
+        "blocks_per_grid": st.sampled_from([None, None, 1, 16, 80, 256, 4096]),
+        "waves_per_eu": st.sampled_from([None, None, 1, 2, 4]),
+    }
+)
+
+
+def _seeded(ctx: RankContext, seed: int, shape: tuple[int, ...], dtype) -> torch.Tensor:
+    """A tensor every rank draws alike from `seed`, on its own device."""
+    g = torch.Generator(device=ctx.device).manual_seed(seed)
+    return torch.randn(*shape, generator=g, device=ctx.device).to(dtype)
+
+
+def _this_ranks_input(
+    ctx: RankContext, seed: int, rows: int, hidden: int, pad: int, dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's input, `rows` x `hidden` read out of rows `pad` wider, and the
+    exact sum of every rank's (RCCL's, in fp32), landed in the input dtype as an
+    all-reduce lands it."""
+    full = _seeded(ctx, seed * 1009 + 1000 + ctx.rank, (rows, hidden + pad), dtype)
+    x = full[:, :hidden]
+    total = x.float().contiguous()
+    dist.all_reduce(total, group=ctx.device_group)
+    return x, total.to(dtype)
+
+
+def _forcing(forced: dict) -> dict:
+    return {k: v for k, v in forced.items() if v is not None}
+
+
+def _plain(forced: dict, rows: int, hidden: int, pad: int) -> bool:
+    """A call nothing about which is unusual, which must run."""
+    return (
+        not _forcing(forced)
+        and pad == 0
+        and hidden % 8 == 0
+        and rows * hidden * 2 <= build_info().staging_bytes
+    )
+
+
+def _differences(
+    outputs: Sequence[tuple[str, torch.Tensor, torch.Tensor, float]], rtol: float
+) -> str | None:
+    """The first output that is not the reference's, as `(name, got, want, atol)`."""
+    for name, got, want, atol in outputs:
+        a, b = got.float(), want.float()
+        if a.shape != b.shape:
+            return f"{name} shape {tuple(a.shape)}, expected {tuple(b.shape)}"
+        if not torch.isfinite(a).all():
+            return f"{name} is not finite"
+        if not torch.allclose(a, b, atol=atol, rtol=rtol):
+            worst = (a - b).abs().max().item()
+            return f"{name} differs: worst|diff|={worst:.4g} atol={atol}"
+    return None
+
+
+def _refused_or_right(answers: list[tuple[bool, str | None]], plain: bool) -> None:
+    """Judge one drawn call from every rank's answer: wrong on any rank fails; the
+    ranks must agree; a refusal must not be of a plain call."""
+    wrong = [why for right, why in answers if not right]
+    assert not wrong, "; ".join(str(w) for w in wrong)[:800]
+    said = {why for _, why in answers}
+    assert len(said) == 1, f"the ranks disagree: {sorted(map(str, said))}"
+    (refusal,) = said
+    if refusal is not None:
+        event(refusal)
+        assert not plain, f"a plain call was refused: {refusal}"
+
+
+def _broken_stops_the_world(comm: Communicator) -> None:
+    """A call that broke the communicator ends the world, so the next case starts
+    clean instead of inheriting the break."""
+    if isinstance(comm.state, Broken):
+        raise RuntimeError(f"the call broke the communicator: {comm.state}")
+
+
+# -- all_reduce ---------------------------------------------------------------------
+
+
+def run_all_reduce_api_rank(
+    ctx: RankContext,
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    lead: int,
+    seed: int,
+    forced: dict,
+) -> tuple[bool, str | None]:
+    """ONE rank: the all-reduce of its input, as `lead` leading dimensions over the
+    rows, against the exact sum."""
+    dt = D_DTYPES[dtype]
+    x, summed = _this_ranks_input(ctx, seed, rows, hidden, pad, dt)
+    if lead == 2:
+        x, summed = x.unflatten(0, (2, rows // 2)), summed.unflatten(0, (2, rows // 2))
+    comm = ctx.comm("hip")
+    try:
+        out, _ = comm.all_reduce(x, **_forcing(forced))
+        torch.cuda.synchronize()
+    except Refused as no:
+        return True, f"REFUSED {no.error.name}"
+    _broken_stops_the_world(comm)
+    atol, rtol = _fused_tolerance(dt)
+    return (why := _differences([("out", out, summed, atol)], rtol)) is None, why
+
+
+@pytest.mark.full
+@PROPERTY
+@given(
+    dtype=DTYPES_DRAWN,
+    rows=ROWS_DRAWN,
+    hidden=HIDDEN_DRAWN,
+    pad=PAD_DRAWN,
+    lead=st.sampled_from([1, 1, 2]),
+    seed=SEED_DRAWN,
+    forced=FORCED_DRAWN,
+)
+def test_all_reduce_api(
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    lead: int,
+    seed: int,
+    forced: dict,
+    world: int,
+    ranks: World,
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    rows *= lead
+    answers = ranks.run(
+        run_all_reduce_api_rank,
+        dtype=dtype,
+        rows=rows,
+        hidden=hidden,
+        pad=pad,
+        lead=lead,
+        seed=seed,
+        forced=forced,
+    )
+    _refused_or_right(answers, plain=lead == 1 and _plain(forced, rows, hidden, pad))
+
+
+# -- all_reduce_rms_norm --------------------------------------------------------------
+
+
+def run_all_reduce_rms_norm_api_rank(
+    ctx: RankContext,
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    fp32_weight: bool,
+    seed: int,
+    forced: dict,
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against vLLM's rms_norm of the exact sum."""
+    import vllm.ir.ops
+
+    dt = D_DTYPES[dtype]
+    x, summed = _this_ranks_input(ctx, seed, rows, hidden, pad, dt)
+    weight = _seeded(ctx, seed * 1009 + 1, (hidden,), dt)
+    if fp32_weight:
+        weight = weight.float()
+    comm = ctx.comm("hip")
+    try:
+        out, _ = comm.all_reduce_rms_norm(x, weight, FUSED_EPS, **_forcing(forced))
+        torch.cuda.synchronize()
+    except Refused as no:
+        return True, f"REFUSED {no.error.name}"
+    _broken_stops_the_world(comm)
+    want = vllm.ir.ops.rms_norm(summed, weight, FUSED_EPS)
+    atol, rtol = _fused_tolerance(dt)
+    return (why := _differences([("out", out, want, atol)], rtol)) is None, why
+
+
+@pytest.mark.full
+@PROPERTY
+@given(
+    dtype=DTYPES_DRAWN,
+    rows=ROWS_DRAWN,
+    hidden=HIDDEN_DRAWN,
+    pad=PAD_DRAWN,
+    fp32_weight=st.booleans(),
+    seed=SEED_DRAWN,
+    forced=FORCED_DRAWN,
+)
+def test_all_reduce_rms_norm_api(
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    fp32_weight: bool,
+    seed: int,
+    forced: dict,
+    world: int,
+    ranks: World,
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    answers = ranks.run(
+        run_all_reduce_rms_norm_api_rank,
+        dtype=dtype,
+        rows=rows,
+        hidden=hidden,
+        pad=pad,
+        fp32_weight=fp32_weight,
+        seed=seed,
+        forced=forced,
+    )
+    _refused_or_right(
+        answers, plain=not fp32_weight and _plain(forced, rows, hidden, pad)
+    )
+
+
+# -- all_reduce_add_rms_norm ----------------------------------------------------------
+
+
+def run_all_reduce_add_rms_norm_api_rank(
+    ctx: RankContext,
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    fp32_weight: bool,
+    seed: int,
+    forced: dict,
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against vLLM's fused_add_rms_norm of the exact sum,
+    on both outputs: the norm, and the residual (sum plus residual, unnormed)."""
+    import vllm.ir.ops
+
+    dt = D_DTYPES[dtype]
+    x, summed = _this_ranks_input(ctx, seed, rows, hidden, pad, dt)
+    weight = _seeded(ctx, seed * 1009 + 1, (hidden,), dt)
+    if fp32_weight:
+        weight = weight.float()
+    residual = _seeded(ctx, seed * 1009 + 2, (rows, hidden), dt)
+    comm = ctx.comm("hip")
+    try:
+        out, out_residual, _ = comm.all_reduce_add_rms_norm(
+            x, residual.clone(), weight, FUSED_EPS, **_forcing(forced)
+        )
+        torch.cuda.synchronize()
+    except Refused as no:
+        return True, f"REFUSED {no.error.name}"
+    _broken_stops_the_world(comm)
+    want, want_residual = vllm.ir.ops.fused_add_rms_norm(
+        summed, residual.clone(), weight, FUSED_EPS
+    )
+    atol, rtol = _fused_tolerance(dt)
+    why = _differences(
+        [
+            ("out", out, want, atol),
+            ("residual", out_residual, want_residual, _atol("all_reduce", dt)),
+        ],
+        rtol,
+    )
+    return why is None, why
+
+
+@pytest.mark.full
+@PROPERTY
+@given(
+    dtype=DTYPES_DRAWN,
+    rows=ROWS_DRAWN,
+    hidden=HIDDEN_DRAWN,
+    pad=PAD_DRAWN,
+    fp32_weight=st.booleans(),
+    seed=SEED_DRAWN,
+    forced=FORCED_DRAWN,
+)
+def test_all_reduce_add_rms_norm_api(
+    dtype: str,
+    rows: int,
+    hidden: int,
+    pad: int,
+    fp32_weight: bool,
+    seed: int,
+    forced: dict,
+    world: int,
+    ranks: World,
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    answers = ranks.run(
+        run_all_reduce_add_rms_norm_api_rank,
+        dtype=dtype,
+        rows=rows,
+        hidden=hidden,
+        pad=pad,
+        fp32_weight=fp32_weight,
+        seed=seed,
+        forced=forced,
+    )
+    _refused_or_right(
+        answers, plain=not fp32_weight and _plain(forced, rows, hidden, pad)
+    )
+
+
+# -- all_reduce_add_attn_res_rms_norm -------------------------------------------------
+
+
+def run_all_reduce_add_attn_res_rms_norm_api_rank(
+    ctx: RankContext,
+    rows: int,
+    hidden: int,
+    pad: int,
+    has_prefix: bool,
+    num_blocks: int,
+    output_norm: bool,
+    seed: int,
+    forced: dict,
+) -> tuple[bool, str | None]:
+    """ONE rank: the fused op against the model's attn_res of the exact sum, on all
+    three outputs: the normed out, the prefix, and the stored blocks."""
+    from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+
+    dt = torch.bfloat16  # the model's op, and the only dtype its reference takes
+    x, summed = _this_ranks_input(ctx, seed, rows, hidden, pad, dt)
+    prefix = _seeded(ctx, seed * 1009 + 2, (rows, hidden), dt)
+    blocks = torch.stack(
+        [
+            _seeded(ctx, seed * 1009 + 10 + s, (rows, hidden), dt)
+            for s in range(ATTN_RES_SOURCES)
+        ],
+        dim=1,
+    ).contiguous()
+    norm_w = _seeded(ctx, seed * 1009 + 3, (hidden,), dt)
+    qk_w = _seeded(ctx, seed * 1009 + 4, (hidden,), dt)
+    out_w = _seeded(ctx, seed * 1009 + 5, (hidden,), dt) if output_norm else None
+    write_idx = -1 if has_prefix else num_blocks  # no prefix: the sum starts one
+    comm = ctx.comm("hip")
+    got_blocks = blocks.clone()
+    try:
+        got_prefix, out, _ = comm.all_reduce_add_attn_res_rms_norm(
+            x,
+            prefix.clone() if has_prefix else None,
+            got_blocks,
+            norm_w,
+            qk_w,
+            out_w,
+            num_blocks,
+            write_idx,
+            1e-6,
+            1e-5,
+            **_forcing(forced),
+        )
+        torch.cuda.synchronize()
+    except Refused as no:
+        return True, f"REFUSED {no.error.name}"
+    _broken_stops_the_world(comm)
+    want_prefix = prefix.clone() if has_prefix else summed.clone()
+    want_blocks = blocks.clone()
+    want = attn_res(
+        want_prefix,
+        summed if has_prefix else None,
+        want_blocks,
+        norm_w,
+        qk_w,
+        out_w,
+        num_blocks,
+        write_idx,
+        1e-6,
+        1e-5,
+    )
+    atol, rtol = _fused_tolerance(dt)
+    sum_tol = _atol("all_reduce", dt)
+    why = _differences(
+        [
+            ("out", out, want, atol),
+            ("prefix", got_prefix, want_prefix, sum_tol),
+            ("blocks", got_blocks, want_blocks, sum_tol),
+        ],
+        rtol,
+    )
+    return why is None, why
+
+
+@pytest.mark.full
+@PROPERTY
+@given(
+    rows=ROWS_DRAWN,
+    hidden=HIDDEN_DRAWN,
+    pad=PAD_DRAWN,
+    has_prefix=st.booleans(),
+    num_blocks=st.integers(0, ATTN_RES_SOURCES - 1),
+    output_norm=st.booleans(),
+    seed=SEED_DRAWN,
+    forced=FORCED_DRAWN,
+)
+def test_all_reduce_add_attn_res_rms_norm_api(
+    rows: int,
+    hidden: int,
+    pad: int,
+    has_prefix: bool,
+    num_blocks: int,
+    output_norm: bool,
+    seed: int,
+    forced: dict,
+    world: int,
+    ranks: World,
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    answers = ranks.run(
+        run_all_reduce_add_attn_res_rms_norm_api_rank,
+        rows=rows,
+        hidden=hidden,
+        pad=pad,
+        has_prefix=has_prefix,
+        num_blocks=num_blocks,
+        output_norm=output_norm,
+        seed=seed,
+        forced=forced,
+    )
+    _refused_or_right(answers, plain=_plain(forced, rows, hidden, pad))
