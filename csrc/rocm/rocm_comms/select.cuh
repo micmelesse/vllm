@@ -519,6 +519,24 @@ struct TunedKernel {
 // EACH OP'S KERNELS.
 // =================================================================================================
 
+// all_reduce, gfx950 on n11, bf16, 8 ranks, swept on the 2-D kernels (2026-10-10T23-22-13Z decode,
+// 23-28-34Z prefill; every built config at 8-512 blocks): the one-shot while a row's tiles are few
+// (through 8 tokens of 3584, 4 of 7168), then the two-shot on 512-wide tiles, its grid growing
+// with the rows. 16 tokens of 3584: 8.0 us against the flat walk's 7.8 (be0e1f4e9c) and the
+// one-shot's 9.6, which the byte threshold this replaces had picked.
+constexpr TunedKernel kAllReduceKernels[] = {
+    {8, 1, 3584, Template::all_reduce_pull_one_shot, AllReduceConfig{{128, 32, 1}, 1, 1024}},
+    {8, 16, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 16, 1}, 1, 512}},
+    {8, 32, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 32, 1}, 1, 512}},
+    {8, 64, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 64, 1}, 1, 512}},
+    {8, 256, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 128, 1}, 1, 512}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot, AllReduceConfig{{128, 32, 1}, 1, 1024}},
+    {8, 8, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 16, 1}, 1, 512}},
+    {8, 16, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 32, 1}, 1, 512}},
+    {8, 32, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 64, 1}, 1, 512}},
+    {8, 64, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 128, 1}, 1, 512}},
+};
+
 // gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps set (each
 // crossover cites its run) at the widths we run, until the tuner writes them.
 // rms_norm: one-shot through 128 KiB (at 64 KiB it lost at 16 tokens, 11.43 against 10.56 us;
@@ -618,7 +636,7 @@ struct Op {
 #define HIP_COMMS_NAMED(o) OpType::o, #o
 
 constexpr Op kOps[] = {
-    {HIP_COMMS_NAMED(all_reduce), {}},
+    {HIP_COMMS_NAMED(all_reduce), kAllReduceKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_norm), kRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_attn_res_rms_norm), kAttnResKernels},
@@ -1000,12 +1018,13 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                return AllReduceConfig{l, own(tile_m), own(tile_n)};
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f   = std::get<Forced>(forcing);
-  const Template fn = f ? f->first
-                        : bytes <= kTargetCalibration.all_reduce_one_shot_max_bytes
-                              ? Template::all_reduce_pull_one_shot
-                              : Template::all_reduce_pull_two_shot;
-  KernelConfig c = f && f->second ? *f->second : AllReduceConfig{{0, 0, 1}, 0, 0};
+  const Forced& f = std::get<Forced>(forcing);
+  // The tuned kernel, its tile_n kept narrower than the row: the all-reduce tiles across it.
+  const TunedKernel tuned = f ? TunedKernel{} : pick(OpType::all_reduce, world, m, n, 0, dtype);
+  const Template fn       = f ? f->first : tuned.fn;
+  KernelConfig c          = !f ? tuned.config
+                            : f->second ? *f->second
+                                        : AllReduceConfig{{0, 0, 1}, 0, 0};
   const KernelConfig derived = all_reduce_config(fn, bytes, world);
   LaunchConfig& g            = launch_of(c);
   if (g.threads_per_block == 0) g.threads_per_block = launch_of(derived).threads_per_block;

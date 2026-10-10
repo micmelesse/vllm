@@ -105,12 +105,10 @@ static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same
 // MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
 // sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
 // kernels change. Each value cites the run that measured it; one not swept says so and whose it
-// copies. A kernel's launch is not here: it is its template's configs (launch.cuh).
-// What remains is the plain all-reduce's, until the tuner measures its kernels too (PLAN
-// 5.3.12.4.5.2); every other op's choices are its tuned kernels (select.cuh).
+// copies. A kernel's launch is not here: it is its template's configs (launch.cuh), and every
+// op's choice, the plain all-reduce's included, is its tuned kernels (select.cuh).
 struct Calibration {
   double ping_pong_ns;                    // a flag to a peer and back, median of every pair
-  int64_t all_reduce_one_shot_max_bytes;  // the plain all-reduce's (its grid is derived)
 };
 
 // gfx950 on n11. MI300X has none yet.
@@ -118,9 +116,6 @@ constexpr Calibration kGfx950Calibration = {
     // calibrate.py, dev run 2026-09-30T19-02-08Z: 28 pairs 1274-1383 ns; a repeat
     // (2026-09-30T19-13-36Z) gave 1282, so about 5% run to run.
     .ping_pong_ns = 1334.0,
-    // One-shot won at 56 KiB (7.12 against 7.83 us), two-shot at 112 KiB (7.87 against 8.19),
-    // uncached scratch (2026-09-30T18-00-30Z).
-    .all_reduce_one_shot_max_bytes = 64 * kKiB,
 };
 
 // THE TARGET THE HOST TUNES FOR, and what was measured on it.
