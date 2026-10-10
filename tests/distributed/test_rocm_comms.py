@@ -2240,3 +2240,19 @@ def test_a_capture_warmup_launches_nothing(world: int, ranks: World) -> None:
     got = ranks.run(run_warmup_rank)
     bad = [err for _, err in got if err is not None]
     assert not bad, "; ".join(bad)
+
+
+# BISECT (temporary): which eager shapes fault on the 2-D plain all-reduce, each its own world.
+@pytest.mark.parametrize("shot", SHOTS)
+@pytest.mark.parametrize("rows", [1, 2, 16])
+@pytest.mark.parametrize("hidden", [8, 64, 3584, 7168])
+def test_bisect_eager_all_reduce_shapes(
+    shot: Shot, rows: int, hidden: int, world: int, ranks: World
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(
+        run_strided_all_reduce_rank, shot=shot, rows=rows, hidden=hidden, pad=0, lead=1
+    )
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shot} rows={rows} hidden={hidden}: " + "; ".join(bad)[:300]
