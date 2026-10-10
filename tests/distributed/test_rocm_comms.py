@@ -30,7 +30,6 @@ declines today.
 
 import math
 import multiprocessing as mp
-import os
 import queue
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -2312,8 +2311,9 @@ def test_one_row_wider_than_the_staging_is_refused_by_name(
 # was (2026-10-10). FULL: each example is an eight-process collective.
 # =================================================================================
 
+# 40 calls an op: about a minute of eight-process collectives each, in the full tier.
 PROPERTY = settings(
-    max_examples=int(os.environ.get("ROCM_COMMS_PROP_EXAMPLES", "40")),
+    max_examples=40,
     deadline=None,
     print_blob=True,
 )
