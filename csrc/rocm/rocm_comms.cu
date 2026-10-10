@@ -244,14 +244,14 @@ RocmCommsAllReducePlan rocm_comms_plan_all_reduce(
     std::optional<int64_t> waves_per_eu) {
   const auto alg = algorithm_from(algorithm);
   const auto dir = direction_from(direction);
-  const std::optional<torch::Tensor> rows = as_rows(inp);
-  if (!rows) return all_reduce_plan_of(hip_comms::Error::not_contiguous);
-  const auto d = admitted(*rows);
+  const std::optional<torch::Tensor> m = as_rows(inp);
+  if (!m) return all_reduce_plan_of(hip_comms::Error::not_contiguous);
+  const auto d = admitted(*m);
   if (const auto* e = std::get_if<hip_comms::Error>(&d)) return all_reduce_plan_of(*e);
   // A plan has inp; out is absent: null, its strides 0.
   return all_reduce_plan_of(hip_comms::select_all_reduce(
-      handle_of(handle_ptr), nullptr, 0, 0, nullptr, rows->stride(0), rows->stride(1),
-      rows->size(0), rows->size(1), std::get<hip_comms::DType>(d), alg, dir, narrowed(tile_m),
+      handle_of(handle_ptr), nullptr, 0, 0, nullptr, m->stride(0), m->stride(1),
+      m->size(0), m->size(1), std::get<hip_comms::DType>(d), alg, dir, narrowed(tile_m),
       narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream()));
 }
@@ -358,12 +358,12 @@ RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
     return all_reduce_rms_scale_add_plan_of<L>(*e);
   if (out.dim() != 2)
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::output_not_two_d);
-  const int64_t hidden = out.size(1), latent = inp.size(1) - 2 * hidden;
-  if (latent < 1)
+  const int64_t n = out.size(1), n_latent = inp.size(1) - 2 * n;
+  if (n_latent < 1)
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
   return all_reduce_rms_scale_add_plan_of(hip_comms::select_all_reduce_rms_scale_add(
       handle_of(handle_ptr), nullptr, out.stride(0), out.stride(1), nullptr, inp.stride(0),
-      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), hidden, latent, 0.f, alg, dir, narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
+      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, n_latent, 0.f, alg, dir, narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
       narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream()));
 }
 
@@ -641,11 +641,11 @@ void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
                       int64_t write_idx) {
   check_device({&prefix, &out, &inp, &norm_weight, &qk_weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
-  const int64_t hidden = inp.size(1);
+  const int64_t n = inp.size(1);
   TORCH_CHECK(prefix.sizes() == inp.sizes() && out.sizes() == inp.sizes(),
               "prefix and out must have inp's shape");
   TORCH_CHECK(blocks.is_cuda() && blocks.dim() == 3 && blocks.size(0) == inp.size(0) &&
-                  blocks.size(2) == hidden && blocks.stride(2) == 1,
+                  blocks.size(2) == n && blocks.stride(2) == 1,
               "blocks must be [tokens, sources, hidden] with a unit hidden stride");
   TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1), "num_blocks must be in [0, ",
               blocks.size(1), "]");
@@ -658,10 +658,10 @@ void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
   for (const torch::Tensor* t : same)
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
   for (const torch::Tensor* t : {&norm_weight, &qk_weight})
-    TORCH_CHECK(t->dim() == 1 && t->numel() == hidden, "weights must be 1-D of hidden=", hidden);
+    TORCH_CHECK(t->dim() == 1 && t->numel() == n, "weights must be 1-D of hidden=", n);
   if (out_norm_weight)
-    TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == hidden,
-                "out_norm_weight must be 1-D of hidden=", hidden);
+    TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == n,
+                "out_norm_weight must be 1-D of hidden=", n);
   const int64_t lanes = hip_comms::kBuild.memory.pack_bytes / inp.element_size();
   TORCH_CHECK(blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
                   reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
@@ -708,16 +708,16 @@ void gemm_tensors(const torch::Tensor& out, const torch::Tensor& inp,
                   const torch::Tensor& workspace) {
   check_device({&inp, &norm_weight, &workspace});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D");
-  const int64_t rows = inp.size(0), hidden = inp.size(1);
+  const int64_t m = inp.size(0), n = inp.size(1);
   TORCH_CHECK(workspace.sizes() == inp.sizes() && workspace.scalar_type() == inp.scalar_type(),
               "workspace must be of inp's shape and dtype");
-  TORCH_CHECK(gemm_weight.is_cuda() && gemm_weight.dim() == 2 && gemm_weight.size(1) == hidden,
+  TORCH_CHECK(gemm_weight.is_cuda() && gemm_weight.dim() == 2 && gemm_weight.size(1) == n,
               "gemm_weight must be [N, hidden]");
-  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == rows &&
+  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == m &&
                   out.size(1) == gemm_weight.size(0),
               "out must be [rows, N]");
-  TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == hidden,
-              "norm_weight must be 1-D of hidden=", hidden);
+  TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == n,
+              "norm_weight must be 1-D of hidden=", n);
   for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight})
     TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
 }
@@ -777,14 +777,14 @@ void rocm_comms_all_reduce_rms_scale_add(
   check_device({&out, &inp});
   TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
               "inp and out must be 2-D with the same rows");
-  const int64_t hidden = out.size(1);
-  const int64_t latent = inp.size(1) - 2 * hidden;
-  TORCH_CHECK(latent > 0,
+  const int64_t n = out.size(1);
+  const int64_t n_latent = inp.size(1) - 2 * n;
+  TORCH_CHECK(n_latent > 0,
               "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
   const auto got = hip_comms::all_reduce_rms_scale_add(
       handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), hidden, latent,
+      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), n, n_latent,
       static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());

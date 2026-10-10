@@ -20,7 +20,7 @@ namespace hip_comms {
 //   m = softmax(logits) . sources, online, a tile of sources at a time; out = T(m), or
 //   T(m * rsqrt(mean(m^2) + out_eps) * out_w)
 // `sum` is the tile's rows summed over the ranks; the prefix and out are rows of the tile's width
-// at their Ptrs' strides, `blocks` [rows, sources, hidden] at its row and source strides in
+// at their Ptrs' strides, `blocks` [m, sources, n] at its row and source strides in
 // elements (its columns contiguous, the host checks), and `write_idx` < 0
 // writes no block. A row past M (the last tile's) reads row M - 1 and writes nothing, so every
 // thread still reaches every reduction.

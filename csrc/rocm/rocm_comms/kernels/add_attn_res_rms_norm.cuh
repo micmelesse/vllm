@@ -24,7 +24,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ qk_w_ptr, int64_t qk_w_stride_n,
         const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
-        int write_idx, float eps, float out_eps, int rows, int packs) {
+        int write_idx, float eps, float out_eps, int m, int n) {
   const int rank = 0;  // no peers: the one rank
   const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
   const auto norm_w     = local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank);
@@ -33,10 +33,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
   const auto delta      = local_ptr(delta_ptr, delta_stride_m, delta_stride_n, rank);
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
-  const float inv_hidden = 1.0f / static_cast<float>(cols);
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    Row sum{rows, cols, row, 0};
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  for (int row = blockIdx.x; row < m; row += gridDim.x) {
+    Row sum{m, n, row, 0};
     tile_load(sum, delta);
     block_attn_res_tile<true, TILE_K>(sum, prefix, blocks_ptr, blocks_stride_m, blocks_stride_r,
                                       write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,

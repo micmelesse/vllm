@@ -12,33 +12,33 @@
 
 namespace hip_comms {
 
-// THE SLICE IS COLUMNS, as in aiter's fused two-stage kernel: each rank owns packs
-// [rank * S, rank * S + S) of EVERY row (S = packs / ngpus, rounded up). It sums its columns of a
-// row over the ranks and pushes the sums into every rank's scratch, so after the sync each rank
-// holds the whole all-reduced tensor locally and norms its rows itself: no remote gather, and the
-// norm repeated on every rank instead of sent. Every rank computes the same bytes (the same sums
-// in the same order), so every rank holds the same result. ROW q BELONGS TO BLOCK q % gridDim.x
-// IN BOTH PHASES: after the sync a block may read only what the same block on a peer wrote.
+// THE SLICE IS COLUMNS, as in aiter's fused two-stage kernel: each rank owns columns
+// [rank * S, rank * S + S) of EVERY row (S = n / ngpus, rounded up to whole packs). It sums its
+// columns of a row over the ranks and pushes the sums into every rank's scratch, so after the sync
+// each rank holds the whole all-reduced tensor locally and norms its rows itself: no remote
+// gather, and the norm repeated on every rank instead of sent. Every rank computes the same bytes
+// (the same sums in the same order), so every rank holds the same result. ROW q BELONGS TO BLOCK
+// q % gridDim.x IN BOTH PHASES: after the sync a block may read only what the same block on a peer
+// wrote.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
     PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual,
-    Ptr<const WEIGHT_DTYPE> weight, float eps, int rows, int packs) {
+    Ptr<const WEIGHT_DTYPE> weight, float eps, int m, int n) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int slice        = (packs + WORLD - 1) / WORLD;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  const int slice        = (n / NL + WORLD - 1) / WORLD * NL;  // a rank's columns, in elements
   const int col0         = rank * slice;
-  const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
-  const int my_rows      = rows > static_cast<int>(blockIdx.x)
-                               ? (rows - blockIdx.x + gridDim.x - 1) / gridDim.x
+  const int own_n        = max(0, min(slice, n - col0));  // the last rank's may be short
+  const int my_m         = m > static_cast<int>(blockIdx.x)
+                               ? (m - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
-  const int cols = packs * NL;  // the row, in elements
   // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a TILE_N row (in whole
   // waves), a group a thread, so a row's slice is one round trip (a wave a row took two at 7168,
   // 0.8 us at 16-32 tokens), and as many rows at once as the block holds. A group a thread, not
@@ -60,10 +60,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
   //    to every rank (itself too), at their place in the tensor: tiles of this block's rows (every
   //    gridDim.x-th), A WAVE A ROW, since a rank's columns are a narrow slice.
-  if (own_packs > 0) {
-    for (int q = 0; q < my_rows; q += Slice::kThreadsM)
-    for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
-      const Slice at{rows, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x + q * gridDim.x),
+  if (own_n > 0) {
+    for (int q = 0; q < my_m; q += Slice::kThreadsM)
+    for (int c = col0; c < col0 + own_n; c += Slice::kTileN) {
+      const Slice at{m, col0 + own_n, static_cast<int>(blockIdx.x + q * gridDim.x),
                      c, static_cast<int>(gridDim.x)};
       Slice peers[WORLD];
 #pragma unroll
@@ -85,14 +85,14 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    sync keeps a peer from pushing into this scratch while it is read (a peer's next kernel
   //    starts only once this one has finished).
   const auto own_scratch = rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-    const Row at{rows, cols, row, 0};
+  for (int row = blockIdx.x; row < m; row += gridDim.x) {
+    const Row at{m, n, row, 0};
     // Every load of the row before any store, in flight together: the scratch's, the residual's
     // and the weight's (one-shot's).
     Row own = at, res = at;
     tile_load(own, own_scratch);
     if constexpr (ADD_RESIDUAL) tile_load(res, residual);
-    Weight w{1, cols, 0, 0};
+    Weight w{1, n, 0, 0};
     tile_load(w, weight);
     RowF s = own.template to<float>();
     if constexpr (ADD_RESIDUAL) {
@@ -126,13 +126,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                       int64_t out_stride_n,
                                       const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                      int64_t weight_stride_n, float eps, int rows, int packs) {
+                                      int64_t weight_stride_n, float eps, int m, int n) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
       peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
       peer_signals, self_signal, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
-      eps, rows, packs);
+      eps, m, n);
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
@@ -151,14 +151,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           const DTYPE* __restrict__ residual_ptr,
                                           int64_t residual_stride_m, int64_t residual_stride_n,
                                           const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                          int64_t weight_stride_n, float eps, int rows, int packs) {
+                                          int64_t weight_stride_n, float eps, int m, int n) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
       peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
       peer_signals, self_signal, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
       local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
       local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
-      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, rows, packs);
+      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, m, n);
 }
 
 }  // namespace hip_comms

@@ -24,18 +24,17 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual,
-    Ptr<const WEIGHT_DTYPE> weight, float eps, int rows, int packs) {
+    Ptr<const WEIGHT_DTYPE> weight, float eps, int m, int n) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int slice_rows   = (rows + WORLD - 1) / WORLD;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  const int slice_m      = (m + WORLD - 1) / WORLD;
   // ADD_RESIDUAL: each owned row's RMS scale, a float a row, after the rows in scratch.
-  const int64_t scale_at = int64_t{slice_rows} * scratch_stride_m;  // in elements
+  const int64_t scale_at = int64_t{slice_m} * scratch_stride_m;  // in elements
   const auto scales = [&](DTYPE* scratch) { return reinterpret_cast<float*>(scratch + scale_at); };
-  const int cols = packs * NL;  // the row, in elements
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
@@ -54,24 +53,24 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    PIPELINED: the next row's loads go out before this row's reduction and norm, so a block's
   //    compute runs under its next round trip instead of between them (a block had ~14 rows at
   //    4096 tokens, each 1.24 us of reduction and norm on the critical path: 2026-10-01T00-01-54Z).
-  const int first = rank * slice_rows;
-  const int last  = min(first + slice_rows, rows);
+  const int first = rank * slice_m;
+  const int last  = min(first + slice_m, m);
   // Row `row` from every rank.
   using Peers = Row[WORLD];
   const auto load = [&](int row, Peers& got) {
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) got[r] = Row{rows, cols, row, 0};
+    for (int r = 0; r < WORLD; ++r) got[r] = Row{m, n, row, 0};
     tile_load(got, inputs);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete in issue order, so
   // waiting on one issued after the peers' would wait on the peers' too.
-  Weight w{1, cols, 0, 0};
+  Weight w{1, n, 0, 0};
   tile_load(w, weight);
   // ONE ROW: its residual, then the next row's peer loads into `next`, then this row's sum (its
   // wait covers only its own, older, loads), so the next round trip runs under the reduction and
   // norm. Its rows land in this rank's scratch at row - first.
   const auto one_row = [&](int row, const Peers& cur, Peers& next) {
-    Row res{rows, cols, row, 0};
+    Row res{m, n, row, 0};
     if constexpr (ADD_RESIDUAL) tile_load(res, residual);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform branch costs
     // nothing, where a clamped unconditional load re-read the last row (a block's whole round trip
@@ -126,7 +125,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
   //    first sync keeps a rank from overwriting its scratch while it is read. EVERY OWNER'S PACK
   //    LOADED BEFORE ANY IS STORED, and every load unconditional (each rank's scratch holds
-  //    slice_rows rows, so a slot past the last row is real): a store between two loads, or a
+  //    slice_m rows, so a slot past the last row is real): a store between two loads, or a
   //    load under an `if`, made the eight owners' round trips run one after another.
   //    ADD_RESIDUAL: the owners' rows are the new residual; each is normed here by its owner's
   //    scale (the weight loaded once, before the loop). Every thread loads the 8 scales after the 8
@@ -137,23 +136,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // a thread, as the pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
   using Chunk  = Tile<DTYPE, 1, THREADS_PER_BLOCK * NL, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using ChunkW = TileAs<Chunk, WEIGHT_DTYPE>;
-  for (int l = blockIdx.x; l < slice_rows; l += gridDim.x) {
+  for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
       peers_load_row_scalars<WORLD>([&](int r) { return scales(scratches[r].data); }, l, sc);
-    for (int c = 0; c < cols; c += Chunk::kTileN) {
+    for (int c = 0; c < n; c += Chunk::kTileN) {
       Chunk got[WORLD];
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_rows, cols, l, c};
+      for (int r = 0; r < WORLD; ++r) got[r] = Chunk{slice_m, n, l, c};
       tile_load(got, scratches);
-      ChunkW wc{1, cols, 0, c};
+      ChunkW wc{1, n, 0, c};
       if constexpr (ADD_RESIDUAL) tile_load(wc, weight);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
-        const int row = r * slice_rows + l;
-        if (row >= rows) continue;
+        const int row = r * slice_m + l;
+        if (row >= m) continue;
         Chunk at = got[r];
-        at.M      = rows;
+        at.M      = m;
         at.offs_m = row;
         if constexpr (ADD_RESIDUAL) {
           tile_store(at, residual_out);
@@ -185,13 +184,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                       int64_t out_stride_n,
                                       const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                      int64_t weight_stride_n, float eps, int rows, int packs) {
+                                      int64_t weight_stride_n, float eps, int m, int n) {
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
       peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
       peer_signals, self_signal, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
-      eps, rows, packs);
+      eps, m, n);
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
@@ -210,14 +209,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           const DTYPE* __restrict__ residual_ptr,
                                           int64_t residual_stride_m, int64_t residual_stride_n,
                                           const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                          int64_t weight_stride_n, float eps, int rows, int packs) {
+                                          int64_t weight_stride_n, float eps, int m, int n) {
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
       peer_inputs, inp_stride_m, inp_stride_n, peer_scratch, scratch_stride_m, scratch_stride_n,
       peer_signals, self_signal, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
       local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
       local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
-      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, rows, packs);
+      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, m, n);
 }
 
 }  // namespace hip_comms

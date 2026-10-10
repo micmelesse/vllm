@@ -411,10 +411,10 @@ struct AllReduceLaunch {
   int64_t inp_stride_m, inp_stride_n;
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of a rank's slice a row
   int64_t staging_stride_m, staging_stride_n;  // the staged builds': a band dense
-  int band_rows;                               // the staged builds': the rows a pass
+  int band_m;                               // the staged builds': the rows a pass
   DType dtype;
-  int64_t rows;
-  int64_t cols;
+  int64_t m;
+  int64_t n;
 };
 
 // `weight_dtype`: dtype, or f32.
@@ -438,8 +438,8 @@ struct AllReduceRmsNormLaunch {
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
   DType weight_dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
   float eps;
 };
 
@@ -467,8 +467,8 @@ struct AllReduceAddRmsNormLaunch {
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
   DType weight_dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
   float eps;
 };
 
@@ -504,8 +504,8 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int64_t out_norm_weight_stride_n;
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
   DType dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
   int num_blocks;
   int write_idx;
   float eps;
@@ -541,8 +541,8 @@ struct AllReduceRmsNormGemmLaunch {
   int64_t workspace_stride_m, workspace_stride_n;
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
 };
 
 struct AllReduceRmsNormGemmAddLaunch {
@@ -572,8 +572,8 @@ struct AllReduceRmsNormGemmAddLaunch {
   int64_t workspace_stride_m, workspace_stride_n;
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
 };
 
 // inp's row [shared | projected | latent], widths hidden, hidden, latent; out [rows, hidden].
@@ -594,9 +594,9 @@ struct AllReduceRmsScaleAddLaunch {
   int64_t inp_stride_m, inp_stride_n;
   int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
   DType dtype;
-  int64_t rows;
-  int64_t hidden;
-  int64_t latent;
+  int64_t m;
+  int64_t n;
+  int64_t n_latent;
   float eps;
 };
 
@@ -628,8 +628,8 @@ struct AddAttnResRmsNormLaunch {
   const void* out_norm_weight;
   int64_t out_norm_weight_stride_n;
   DType dtype;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
   int num_blocks;
   int write_idx;
   float eps;

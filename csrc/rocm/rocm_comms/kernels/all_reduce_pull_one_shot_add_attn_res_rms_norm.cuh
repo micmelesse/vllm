@@ -12,7 +12,7 @@
 namespace hip_comms {
 
 // A block owns a row, as the fused norm does: every rank reduces every row, so there is
-// nothing to gather. `blocks` is [rows, num_sources, hidden] at its row, source and column
+// nothing to gather. `blocks` is [m, num_sources, n] at its row, source and column
 // strides in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
@@ -26,11 +26,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ qk_w_ptr, int64_t qk_w_stride_n,
         const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
-        int write_idx, float eps, float out_eps, int rows, int packs) {
+        int write_idx, float eps, float out_eps, int m, int n) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  const int cols         = packs * traits<DTYPE>::N;  // the row, in elements
-  const float inv_hidden = 1.0f / static_cast<float>(cols);
+  const float inv_hidden = 1.0f / static_cast<float>(n);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
@@ -43,10 +42,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+  for (int row = blockIdx.x; row < m; row += gridDim.x) {
     Row peers[WORLD];
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
+    for (int r = 0; r < WORLD; ++r) peers[r] = Row{m, n, row, 0};
     tile_load(peers, inputs);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(peers_reduce(peers), prefix, blocks_ptr,
                                          blocks_stride_m, blocks_stride_r, write_idx, norm_w, qk_w, out_norm_w, out,

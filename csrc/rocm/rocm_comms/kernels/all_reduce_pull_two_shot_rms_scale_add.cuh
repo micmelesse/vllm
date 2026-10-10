@@ -17,6 +17,8 @@ namespace hip_comms {
 // A BLOCK OWNS ONE (ROW, SLICE) OF THIS RANK'S ROWS, `splits` slices a row, as in the one-shot.
 // THE SAME BLOCK AND THREAD INDEX A PACK IN BOTH PHASES: a block gathers exactly the (row, slice)s
 // the same block on each owner finished, which is what a peers barrier makes visible.
+// The input is [m, 2 x n + n_latent] (shared and projected n wide, the latent n_latent), the
+// output [m, n].
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_scale_add(
@@ -24,24 +26,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
         PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, float eps,
-        int rows, int hidden_packs, int latent_packs) {
+        int m, int n, int n_latent) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
-  const int hidden       = hidden_packs * NL;  // in elements
+  const int hidden_packs = n / NL;  // the hidden in packs, as its slices are cut
   // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
-  const float inv_latent = 1.0f / static_cast<float>(latent_packs * NL);
+  const float inv_latent = 1.0f / static_cast<float>(n_latent);
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
-  const int slice_rows   = (rows + WORLD - 1) / WORLD;
+  const int slice_rows   = (m + WORLD - 1) / WORLD;
   // Rank r's rows: [r x slice_rows, its last), the last rank's fewer (or none).
-  const auto rows_of     = [&](int r) { return max(0, min(slice_rows, rows - r * slice_rows)); };
+  const auto rows_of     = [&](int r) { return max(0, min(slice_rows, m - r * slice_rows)); };
   // (Row, slice) w's tile of the hidden at row `row`: one row cut to the slice's columns.
   const auto slice_of    = [&](int w, int row) {
     const int first = (w % splits) * slice;
-    return Row{rows, min(first + slice, hidden_packs) * NL, row, first * NL};
+    return Row{m, min(first + slice, hidden_packs) * NL, row, first * NL};
   };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
@@ -56,8 +58,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   std::array<Ptr<const DTYPE>, WORLD> proj, latent;
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) {
-    proj[r]   = Ptr<const DTYPE>{inputs[r].data + hidden * inp_stride_n, inp_stride_m, inp_stride_n, r};
-    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * hidden * inp_stride_n, inp_stride_m, inp_stride_n, r};
+    proj[r]   = Ptr<const DTYPE>{inputs[r].data + n * inp_stride_n, inp_stride_m, inp_stride_n, r};
+    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * n * inp_stride_n, inp_stride_m, inp_stride_n, r};
   }
 
   // 2. This rank's rows, finished: each (row, slice) from every rank, the latent's sum of squares
@@ -66,7 +68,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int w = blockIdx.x; w < rows_of(rank) * splits; w += gridDim.x) {
     const int row                = first_row + w / splits;
     const Row hid = slice_of(w, row);
-    const Row lat{rows, latent_packs * NL, row, 0};
+    const Row lat{m, n_latent, row, 0};
     Row sh[WORLD], pj[WORLD], lt[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) {

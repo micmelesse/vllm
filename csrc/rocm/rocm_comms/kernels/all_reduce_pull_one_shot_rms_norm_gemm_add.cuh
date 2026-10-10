@@ -11,7 +11,7 @@
 
 namespace hip_comms {
 
-// Every rank reduces and norms every row into `workspace` ([rows, packs] of its own); a
+// Every rank reduces and norms every row into `workspace` ([m, n] of its own); a
 // grid barrier; the GEMM over every row, TILE_M a pass.
 // SLICE_K is the GEMM's lanes a column, TILE_K its K staged in LDS a pass.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
@@ -20,14 +20,12 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
     PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
     Ptr<const DTYPE> norm_w,
-    float eps, Ptr<const DTYPE> gemm_w, int n_cols, Ptr<DTYPE> out, Ptr<DTYPE> workspace, int rows,
-    int packs) {
+    float eps, Ptr<const DTYPE> gemm_w, int n_cols, Ptr<DTYPE> out, Ptr<DTYPE> workspace, int m,
+    int n) {
   Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
-  constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
-  const float inv_hidden = 1.0f / static_cast<float>(packs * NL);
-  const int cols = packs * NL;  // the row, in elements
+  const float inv_hidden = 1.0f / static_cast<float>(n);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
@@ -37,15 +35,15 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum, norm, into the
   //    workspace.
-  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+  for (int row = blockIdx.x; row < m; row += gridDim.x) {
     Row peers[WORLD];
 #pragma unroll
-    for (int r = 0; r < WORLD; ++r) peers[r] = Row{rows, cols, row, 0};
+    for (int r = 0; r < WORLD; ++r) peers[r] = Row{m, n, row, 0};
     tile_load(peers, inputs);
     const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
-    Row wk{1, cols, 0, 0};
+    Row wk{1, n, 0, 0};
     tile_load(wk, norm_w);  // under the reduction
     float ss[1];
     partial_dot(s, s, ss);
@@ -64,9 +62,9 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
   block_stamp(3);
 
   // 4. The GEMM over every row.
-  for (int r0 = 0; r0 < rows; r0 += TILE_M)
+  for (int r0 = 0; r0 < m; r0 += TILE_M)
     grid_gemm<TILE_M, TILE_K, SLICE_K, ADD_RESIDUAL, THREADS_PER_BLOCK>(
-        workspace.data + r0 * workspace.stride_m, workspace.stride_m, min(TILE_M, rows - r0), cols,
+        workspace.data + r0 * workspace.stride_m, workspace.stride_m, min(TILE_M, m - r0), n,
         gemm_w.data, gemm_w.stride_m, n_cols, out.data + r0 * out.stride_m, out.stride_m);
 
   block_stamp(4);
@@ -87,7 +85,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
     int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
     int64_t out_stride_m, int64_t out_stride_n, DTYPE* __restrict__ workspace_ptr,
-    int64_t workspace_stride_m, int64_t workspace_stride_n, int rows, int packs) {
+    int64_t workspace_stride_m, int64_t workspace_stride_n, int m, int n) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, false>(
@@ -95,7 +93,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
         local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
         local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
-        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), rows, packs);
+        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), m, n);
   else
     __builtin_trap();
 }
@@ -110,7 +108,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
     int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
     int64_t out_stride_m, int64_t out_stride_n, DTYPE* __restrict__ workspace_ptr,
-    int64_t workspace_stride_m, int64_t workspace_stride_n, int rows, int packs) {
+    int64_t workspace_stride_m, int64_t workspace_stride_n, int m, int n) {
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, true>(
@@ -118,7 +116,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
         local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
         local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
-        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), rows, packs);
+        local_ptr(workspace_ptr, workspace_stride_m, workspace_stride_n, rank), m, n);
   else
     __builtin_trap();
 }

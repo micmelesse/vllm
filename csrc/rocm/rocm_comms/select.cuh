@@ -509,8 +509,8 @@ inline bool resident(const Handle& h, const void* kernel, int blocks, int thread
 // template `fn` at `config`.
 struct TunedKernel {
   int world;
-  int64_t rows;
-  int64_t hidden;
+  int64_t m;
+  int64_t n;
   Template fn;
   KernelConfig config;
 };
@@ -684,6 +684,12 @@ constexpr bool slices_a_row(Template k) {
   return k == Template::all_reduce_pull_two_shot || slices_columns(k);
 }
 
+// WHETHER EVERY RANK GETS COLUMNS: a template that slices a row needs a load's worth (16 bytes) of
+// the row's `n` for each of the `world` ranks; any other template takes any row.
+constexpr bool every_rank_gets_columns(Template k, int64_t n, DType dtype, int world) {
+  return !slices_a_row(k) || n * elem_bytes(dtype) >= int64_t{world} * kBuild.memory.pack_bytes;
+}
+
 // =================================================================================================
 // 1. THE FORCING: the template the algorithm and direction name (an op with one template needs
 // neither to force a config), and its config from the launch and the op's fields (`config` builds
@@ -788,27 +794,27 @@ constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b;
 // crossover is about bytes); then the last entry whose rows the call reaches, the first when it
 // reaches none. At a width the entry's tile does not cover (`tile_cols`), its tile_n is left to
 // fitting (the smallest built that covers). A KERNEL THAT SLICES A ROW across the ranks is skipped
-// when the row has fewer `packs` than ranks (it would be refused), unless nothing else is tuned
+// when not every rank gets columns of it (it would be refused), unless nothing else is tuned
 // there: a plain call takes a kernel that runs it (2026-10-10, AttnRes at 8 columns).
-constexpr TunedKernel pick(OpType o, int world, int64_t rows, int64_t hidden, int64_t tile_cols,
-                           int64_t packs) {
+constexpr TunedKernel pick(OpType o, int world, int64_t m, int64_t n, int64_t tile_cols,
+                           DType dtype) {
   const std::span<const TunedKernel> kernels = op(o).kernels;
   int w = 0;
   for (const TunedKernel& k : kernels)
     if (w == 0 || distance(k.world, world) < distance(w, world)) w = k.world;
   int64_t h = 0;
   for (const TunedKernel& k : kernels)
-    if (k.world == w && (h == 0 || distance(k.hidden, hidden) < distance(h, hidden)))
-      h = k.hidden;
-  const int64_t as_rows    = rows * hidden / h;
+    if (k.world == w && (h == 0 || distance(k.n, n) < distance(h, n)))
+      h = k.n;
+  const int64_t as_rows    = m * n / h;
   const auto among = [&](bool narrow_ok) {
     const TunedKernel* first = nullptr;
     const TunedKernel* found = nullptr;
     for (const TunedKernel& k : kernels) {
-      if (k.world != w || k.hidden != h) continue;
-      if (!narrow_ok && slices_a_row(k.fn) && packs < world) continue;
-      if (!first || k.rows < first->rows) first = &k;
-      if (k.rows <= as_rows && (!found || k.rows > found->rows)) found = &k;
+      if (k.world != w || k.n != h) continue;
+      if (!narrow_ok && !every_rank_gets_columns(k.fn, n, dtype, world)) continue;
+      if (!first || k.m < first->m) first = &k;
+      if (k.m <= as_rows && (!found || k.m > found->m)) found = &k;
     }
     return found ? found : first;
   };
@@ -830,28 +836,28 @@ constexpr KernelConfig default_config(Template t, int64_t tile_cols) {
   return configs_of(t)[0];
 }
 
-// THE SMALLEST BUILT TILE_N covering `cols` at `c`'s other fields, or 0 when none does (the check
-// refuses it).
-constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t cols) {
-  int n = 0;
+// THE SMALLEST BUILT TILE_N covering `n` columns at `c`'s other fields, or 0 when none does (the
+// check refuses it).
+constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t n) {
+  int best = 0;
   for (const KernelConfig& b : configs_of(t)) {
     KernelConfig same = c;
     set_tile_n(same, tile_n_of(b));
-    if (same_build(same, b) && tile_n_of(b) >= cols && (n == 0 || tile_n_of(b) < n))
-      n = tile_n_of(b);
+    if (same_build(same, b) && tile_n_of(b) >= n && (best == 0 || tile_n_of(b) < best))
+      best = tile_n_of(b);
   }
-  return n;
+  return best;
 }
 
 // THE TILES THERE ARE, one block's work each: this rank's rows (a row two-shot's share, every row
 // otherwise) in TILE_M, by the grid's `grid_cols` columns in TILE_N. A grid wider is idle blocks,
 // each still paying every barrier (the pull norm at 32 tokens ran 36 blocks for 4 rows a rank).
 // The GEMM tail's GEMM strides over column tiles, so it is not cut.
-constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t rows, int64_t grid_cols,
+constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m, int64_t grid_cols,
                            int world) {
   if (gemms(op_of(t))) return launch_of(c).blocks_per_grid;
   const bool row_split = is_two_shot(t) && !slices_columns(t);
-  const int64_t mine   = row_split ? (rows + world - 1) / world : rows;
+  const int64_t mine   = row_split ? (m + world - 1) / world : m;
   const int64_t tm = tile_m_of(c), tn = tile_n_of(c);
   return (mine + tm - 1) / tm * ((grid_cols + tn - 1) / tn);
 }
@@ -859,7 +865,7 @@ constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t rows, int6
 // A TILED KERNEL'S CONFIG FITTED TO THE CALL: a zero field the template's own (another family's
 // config is left for the check to refuse), tile_n the smallest built covering `tile_cols` where
 // none is given, and the grid cut to the tiles there are.
-constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t tile_cols,
+constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t m, int64_t tile_cols,
                               int64_t grid_cols, int world) {
   const KernelConfig own_config = default_config(t, tile_cols);
   if (c.index() != own_config.index()) return c;
@@ -881,7 +887,7 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t 
       c);
   if (tile_n_of(c) == 0) set_tile_n(c, smallest_tile_n(t, c, tile_cols));
   if (tile_n_of(c) == 0) return c;
-  const int64_t tiles = tiles_of(t, c, rows, grid_cols, world);
+  const int64_t tiles = tiles_of(t, c, m, grid_cols, world);
   int& blocks         = launch_of(c).blocks_per_grid;
   if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
   // THE FUSED ATTNRES PULL'S GRID DIVIDES ITS TILES: each block's most tiles kept, the blocks cut
@@ -904,13 +910,13 @@ constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t rows, int64_t 
 // scratch holds): the plain two-shot its slice of every row; a column two-shot the whole reduced tensor
 // (each rank's columns at their place); a row two-shot its rank's rows, twice where it leaves two
 // results (out and the residual). A one-shot reads the inputs and keeps nothing.
-constexpr int64_t scratch_need(Template t, int64_t rows, int64_t packs, int world) {
+constexpr int64_t scratch_need(Template t, int64_t m, int64_t packs, int world) {
   if (!is_two_shot(t)) return 0;
   const OpType o = op_of(t);
-  if (o == OpType::all_reduce) return rows * ((packs + world - 1) / world) * kBuild.memory.pack_bytes;
-  if (slices_columns(t)) return rows * packs * kBuild.memory.pack_bytes;
+  if (o == OpType::all_reduce) return m * ((packs + world - 1) / world) * kBuild.memory.pack_bytes;
+  if (slices_columns(t)) return m * packs * kBuild.memory.pack_bytes;
   const bool two = o == OpType::all_reduce_add_rms_norm;
-  return (rows + world - 1) / world * packs * (two ? 2 : 1) * kBuild.memory.pack_bytes;
+  return (m + world - 1) / world * packs * (two ? 2 : 1) * kBuild.memory.pack_bytes;
 }
 
 // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its rows starting on
@@ -928,14 +934,14 @@ inline std::optional<Error> layout_refused(
 // arguments, checked after the dtype. With no Handle (an experimental op, one rank) the checks
 // that need peers are left out.
 inline std::optional<Error> refused(const Handle* h, Template fn, const KernelConfig& c,
-                                    DType dtype, int64_t rows, int64_t row_elems,
+                                    DType dtype, int64_t m, int64_t n,
                                     int64_t tile_cols, std::optional<Error> own_error,
                                     const void* inp, bool staged, hipStream_t stream) {
   const int world = h ? h->world_size() : 1;
   if (h && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (own_error) return own_error;
-  if (row_elems * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0) return Error::row_not_packs;
+  if (n * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0) return Error::row_not_packs;
   const int threads = launch_of(c).threads_per_block;
   if (c.index() != family_of(fn)) return Error::tile_not_built;
   if (has_builds(fn) && !built_at(fn, threads)) return Error::threads_not_built;
@@ -946,15 +952,15 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (has_tiles(fn) && tile_n_of(c) < tile_cols) return Error::row_too_wide;
   if (!gemm_fits(c)) return Error::block_exceeds_lds;
   if (!h) return std::nullopt;
-  const int64_t packs = packs_of(row_elems, dtype);
+  const int64_t packs = packs_of(n, dtype);
   // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with fewer, the ranks past
   // the row own empty slices, which the kernels do not handle (a GPU memory fault, 2026-10-10, at
   // 8 bf16 columns on 8 ranks). Refused, so the caller takes the one-shot or RCCL.
-  if (slices_a_row(fn) && packs < world) return Error::row_narrower_than_world;
-  if (!staged && scratch_need(fn, rows, packs, world) > h->scratch_bytes())
+  if (!every_rank_gets_columns(fn, n, dtype, world)) return Error::row_narrower_than_world;
+  if (!staged && scratch_need(fn, m, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.
-  const int64_t bytes = rows * row_elems * elem_bytes(dtype);
+  const int64_t bytes = m * n * elem_bytes(dtype);
   if (!staged && !h->reads_in_place(inp, stream) && bytes > h->staging_bytes())
     return Error::staging_too_small;
   return std::nullopt;
@@ -980,12 +986,12 @@ constexpr std::optional<Error> weight_refused(DType dtype, DType weight_dtype) {
 // otherwise its staged kernel, a band of rows a pass.
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, int64_t rows, int64_t cols, DType dtype,
+    int64_t inp_stride_m, int64_t inp_stride_n, int64_t m, int64_t n, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   const int world     = h.world_size();
-  const int64_t bytes = rows * cols * elem_bytes(dtype);
+  const int64_t bytes = m * n * elem_bytes(dtype);
   // 1.
   const std::variant<Forced, Error> forcing =
       forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid,
@@ -1011,14 +1017,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const bool staged = !h.reads_in_place(inp, stream);
   // THE STAGED BAND: the rows a pass, what the staging holds (and the two-shot's scratch, a row of
   // its slice a row).
-  const int64_t row_bytes   = cols * elem_bytes(dtype);
-  const int64_t packs       = cols * elem_bytes(dtype) / kBuild.memory.pack_bytes;
+  const int64_t row_bytes   = n * elem_bytes(dtype);
+  const int64_t packs       = n * elem_bytes(dtype) / kBuild.memory.pack_bytes;
   const int64_t slice_bytes = (packs + world - 1) / world * kBuild.memory.pack_bytes;
   int64_t band              = row_bytes > 0 ? h.staging_bytes() / row_bytes : 0;
   if (is_two_shot(fn) && slice_bytes > 0 && h.scratch_bytes() / slice_bytes < band)
     band = h.scratch_bytes() / slice_bytes;
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, cols, 0, std::nullopt, inp,
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, 0, std::nullopt, inp,
                                              staged, stream))
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
@@ -1080,12 +1086,12 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                           .inp_stride_n      = inp_stride_n,
                           .scratch_stride_m  = slice_bytes / elem_bytes(dtype),
                           .scratch_stride_n  = 1,
-                          .staging_stride_m  = cols,
+                          .staging_stride_m  = n,
                           .staging_stride_n  = 1,
-                          .band_rows         = static_cast<int>(band < rows ? band : rows),
+                          .band_m         = static_cast<int>(band < m ? band : m),
                           .dtype             = dtype,
-                          .rows              = rows,
-                          .cols              = cols};
+                          .m              = m,
+                          .n              = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1096,7 +1102,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
 inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
     const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
     int64_t inp_stride_m, int64_t inp_stride_n, const void* weight, int64_t weight_stride_n,
-    DType dtype, DType weight_dtype, int64_t rows, int64_t hidden, float eps,
+    DType dtype, DType weight_dtype, int64_t m, int64_t n, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
@@ -1111,13 +1117,13 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
                                              weight_refused(dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
@@ -1179,12 +1185,12 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .inp_stride_n      = inp_stride_n,
                                  .weight            = weight,
                                  .weight_stride_n   = weight_stride_n,
-                                 .scratch_stride_m  = hidden,
+                                 .scratch_stride_m  = n,
                                  .scratch_stride_n  = 1,
                                  .dtype             = dtype,
                                  .weight_dtype      = weight_dtype,
-                                 .rows              = rows,
-                                 .hidden            = hidden,
+                                 .m              = m,
+                                 .n            = n,
                                  .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1198,7 +1204,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
     int64_t residual_out_stride_m, int64_t residual_out_stride_n, const void* inp,
     int64_t inp_stride_m, int64_t inp_stride_n, const void* residual, int64_t residual_stride_m,
     int64_t residual_stride_n, const void* weight, int64_t weight_stride_n, DType dtype,
-    DType weight_dtype, int64_t rows, int64_t hidden, float eps,
+    DType weight_dtype, int64_t m, int64_t n, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
@@ -1213,13 +1219,13 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, rows, hidden, hidden,
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
                                              weight_refused(dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
@@ -1287,12 +1293,12 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
                                     .residual_stride_n = residual_stride_n,
                                     .weight            = weight,
                                     .weight_stride_n   = weight_stride_n,
-                                    .scratch_stride_m  = hidden,
+                                    .scratch_stride_m  = n,
                                     .scratch_stride_n  = 1,
                                     .dtype             = dtype,
                                     .weight_dtype      = weight_dtype,
-                                    .rows              = rows,
-                                    .hidden            = hidden,
+                                    .m              = m,
+                                    .n            = n,
                                     .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1311,7 +1317,7 @@ select_all_reduce_add_attn_res_rms_norm(
     int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
     const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
     int64_t out_norm_weight_stride_n,
-    DType dtype, int64_t rows, int64_t hidden,
+    DType dtype, int64_t m, int64_t n,
     int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> tile_k,
@@ -1333,14 +1339,14 @@ select_all_reduce_add_attn_res_rms_norm(
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
     return *e;
   // 3.
   const void* kernel = nullptr;
@@ -1428,11 +1434,11 @@ select_all_reduce_add_attn_res_rms_norm(
                                            .qk_weight_stride_n    = qk_weight_stride_n,
                                            .out_norm_weight       = out_norm_weight,
                                            .out_norm_weight_stride_n = out_norm_weight_stride_n,
-                                           .scratch_stride_m      = hidden,
+                                           .scratch_stride_m      = n,
                                            .scratch_stride_n      = 1,
                                            .dtype                 = dtype,
-                                           .rows                  = rows,
-                                           .hidden                = hidden,
+                                           .m                  = m,
+                                           .n                = n,
                                            .num_blocks            = num_blocks,
                                            .write_idx             = write_idx,
                                            .eps                   = eps,
@@ -1452,7 +1458,7 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
     int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
     int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
     int64_t workspace_stride_n, DType dtype,
-    int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
+    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
@@ -1468,14 +1474,14 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
     return *e;
   // 3. The op's two templates share one config list, so one lookup serves each.
   const void* kernel = nullptr;
@@ -1532,11 +1538,11 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
                                      .workspace         = workspace,
                                      .workspace_stride_m = workspace_stride_m,
                                      .workspace_stride_n = workspace_stride_n,
-                                     .scratch_stride_m = hidden,
+                                     .scratch_stride_m = n,
                                      .scratch_stride_n = 1,
                                      .dtype             = dtype,
-                                     .rows              = rows,
-                                     .hidden            = hidden};
+                                     .m              = m,
+                                     .n            = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1550,7 +1556,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
     int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
     int64_t workspace_stride_n, DType dtype,
-    int64_t rows, int64_t hidden, std::optional<Algorithm> algorithm,
+    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
@@ -1566,14 +1572,14 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, rows, hidden, hidden, std::nullopt, inp, false, stream))
+          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
     return *e;
   // 3. The op's two templates share one config list, so one lookup serves each.
   const void* kernel = nullptr;
@@ -1630,11 +1636,11 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
                                         .workspace         = workspace,
                                         .workspace_stride_m = workspace_stride_m,
                                         .workspace_stride_n = workspace_stride_n,
-                                        .scratch_stride_m = hidden,
+                                        .scratch_stride_m = n,
                                         .scratch_stride_n = 1,
                                         .dtype             = dtype,
-                                        .rows              = rows,
-                                        .hidden            = hidden};
+                                        .m              = m,
+                                        .n            = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1646,8 +1652,8 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
 // needs the row's RMS) beside a TILE_N slice of the hidden, so its grid tiles the hidden.
 inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_scale_add(
     const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t rows, int64_t hidden,
-    int64_t latent, float eps, std::optional<Algorithm> algorithm,
+    int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t m, int64_t n,
+    int64_t n_latent, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     std::optional<int> waves_per_eu,
@@ -1655,7 +1661,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   using K           = Template;
   const OpType op   = OpType::all_reduce_rms_scale_add;
   const int world   = h.world_size();
-  const int64_t row = 2 * hidden + latent;
+  const int64_t row = 2 * n + n_latent;
   // 1.
   const std::variant<Forced, Error> forcing =
       forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_m, tile_n},
@@ -1664,20 +1670,20 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, row, latent, packs_of(row, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, row, n_latent, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, latent,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n_latent,
+             n, world);
   // 2.
   const int e = elem_bytes(dtype);
   const std::optional<Error> widths =
-      hidden * e % kBuild.memory.pack_bytes != 0 || latent * e % kBuild.memory.pack_bytes != 0 ||
-              latent < 1
+      n * e % kBuild.memory.pack_bytes != 0 || n_latent * e % kBuild.memory.pack_bytes != 0 ||
+              n_latent < 1
           ? std::optional<Error>{Error::widths_not_packs}
           : std::nullopt;
   if (const std::optional<Error> err =
-          refused(&h, fn, c, dtype, rows, row, latent, widths, inp, false, stream))
+          refused(&h, fn, c, dtype, m, row, n_latent, widths, inp, false, stream))
     return *err;
   // 3. The one-shot's and the two-shot's builds are one list.
   static_assert(same_builds(K::all_reduce_pull_one_shot_rms_scale_add,
@@ -1723,12 +1729,12 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
                                      .inp               = inp,
                                      .inp_stride_m      = inp_stride_m,
                                      .inp_stride_n      = inp_stride_n,
-                                     .scratch_stride_m  = hidden,
+                                     .scratch_stride_m  = n,
                                      .scratch_stride_n  = 1,
                                      .dtype             = dtype,
-                                     .rows              = rows,
-                                     .hidden            = hidden,
-                                     .latent            = latent,
+                                     .m              = m,
+                                     .n            = n,
+                                     .n_latent            = n_latent,
                                      .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1747,7 +1753,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
     int64_t delta_stride_n, void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
     int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
     const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
-    int64_t out_norm_weight_stride_n, DType dtype, int64_t rows, int64_t hidden, int num_blocks,
+    int64_t out_norm_weight_stride_n, DType dtype, int64_t m, int64_t n, int num_blocks,
     int write_idx, float eps, float out_eps, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> tile_k, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
@@ -1762,13 +1768,13 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
-             hidden, world);
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
+             n, world);
   // 2.
-  if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, rows, hidden, hidden,
+  if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, m, n, n,
                                              std::nullopt, delta, false, stream))
     return *e;
   // 3.
@@ -1815,8 +1821,8 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
                                  .out_norm_weight   = out_norm_weight,
                                  .out_norm_weight_stride_n = out_norm_weight_stride_n,
                                  .dtype             = dtype,
-                                 .rows              = rows,
-                                 .hidden            = hidden,
+                                 .m              = m,
+                                 .n            = n,
                                  .num_blocks        = num_blocks,
                                  .write_idx         = write_idx,
                                  .eps               = eps,
@@ -1903,30 +1909,30 @@ constexpr bool fits(Template fn, const KernelConfig& c) {
   return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
 }
 // The tuned kernel for `rows` rows of `row` elements, fitted.
-constexpr bool tuned_fits(OpType o, int world, int64_t rows, int64_t row, int64_t tile_cols,
+constexpr bool tuned_fits(OpType o, int world, int64_t m, int64_t row, int64_t tile_cols,
                           int64_t grid_cols) {
-  const TunedKernel t = pick(o, world, rows, row, tile_cols, packs_of(row, DType::bf16));
-  return fits(t.fn, fitted(t.fn, t.config, rows, tile_cols, grid_cols, world));
+  const TunedKernel t = pick(o, world, m, row, tile_cols, DType::bf16);
+  return fits(t.fn, fitted(t.fn, t.config, m, tile_cols, grid_cols, world));
 }
 constexpr bool selections_fit() {
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
                                             std::array<int64_t, 3>{kMaxRanks, 4096, 7168}}) {
     const int w = static_cast<int>(call[0]);
-    const int64_t rows = call[1], hidden = call[2], latent = hidden / 2;
+    const int64_t m = call[1], n = call[2], n_latent = n / 2;
     for (const OpType o :
          {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
           OpType::all_reduce_add_attn_res_rms_norm, OpType::all_reduce_rms_norm_gemm,
           OpType::all_reduce_rms_norm_gemm_add})
-      if (!tuned_fits(o, w, rows, hidden, hidden, hidden)) return false;
+      if (!tuned_fits(o, w, m, n, n, n)) return false;
     // The one-all-reduce tail: [shared | projected | latent].
-    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, rows, 2 * hidden + latent, latent,
-                    hidden))
+    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + n_latent, n_latent,
+                    n))
       return false;
-    if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, rows, hidden, hidden, hidden)) return false;
+    if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, m, n, n, n)) return false;
     // The plain all-reduce's derived launch.
     for (const Template t :
          {Template::all_reduce_pull_one_shot, Template::all_reduce_pull_two_shot})
-      if (!fits(t, all_reduce_config(t, rows * hidden * 2, w))) return false;
+      if (!fits(t, all_reduce_config(t, m * n * 2, w))) return false;
   }
   return true;
 }
