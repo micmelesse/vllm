@@ -678,6 +678,12 @@ constexpr bool slices_columns(Template k) {
          k == Template::all_reduce_push_two_shot_add_attn_res_rms_norm;
 }
 
+// A TEMPLATE THAT CUTS EVERY ROW INTO A COLUMN SLICE A RANK: the plain two-shot and the column
+// splits. It needs a 16-byte pack for every rank; with fewer, a rank's slice is empty.
+constexpr bool slices_a_row(Template k) {
+  return k == Template::all_reduce_pull_two_shot || slices_columns(k);
+}
+
 // =================================================================================================
 // 1. THE FORCING: the template the algorithm and direction name (an op with one template needs
 // neither to force a config), and its config from the launch and the op's fields (`config` builds
@@ -781,8 +787,11 @@ constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b;
 // the nearest tuned width, reading the call's rows as that width's rows of the same bytes (a
 // crossover is about bytes); then the last entry whose rows the call reaches, the first when it
 // reaches none. At a width the entry's tile does not cover (`tile_cols`), its tile_n is left to
-// fitting (the smallest built that covers).
-constexpr TunedKernel pick(OpType o, int world, int64_t rows, int64_t hidden, int64_t tile_cols) {
+// fitting (the smallest built that covers). A KERNEL THAT SLICES A ROW across the ranks is skipped
+// when the row has fewer `packs` than ranks (it would be refused), unless nothing else is tuned
+// there: a plain call takes a kernel that runs it (2026-10-10, AttnRes at 8 columns).
+constexpr TunedKernel pick(OpType o, int world, int64_t rows, int64_t hidden, int64_t tile_cols,
+                           int64_t packs) {
   const std::span<const TunedKernel> kernels = op(o).kernels;
   int w = 0;
   for (const TunedKernel& k : kernels)
@@ -792,14 +801,19 @@ constexpr TunedKernel pick(OpType o, int world, int64_t rows, int64_t hidden, in
     if (k.world == w && (h == 0 || distance(k.hidden, hidden) < distance(h, hidden)))
       h = k.hidden;
   const int64_t as_rows    = rows * hidden / h;
-  const TunedKernel* first = nullptr;
-  const TunedKernel* found = nullptr;
-  for (const TunedKernel& k : kernels) {
-    if (k.world != w || k.hidden != h) continue;
-    if (!first || k.rows < first->rows) first = &k;
-    if (k.rows <= as_rows && (!found || k.rows > found->rows)) found = &k;
-  }
-  TunedKernel got = found ? *found : *first;
+  const auto among = [&](bool narrow_ok) {
+    const TunedKernel* first = nullptr;
+    const TunedKernel* found = nullptr;
+    for (const TunedKernel& k : kernels) {
+      if (k.world != w || k.hidden != h) continue;
+      if (!narrow_ok && slices_a_row(k.fn) && packs < world) continue;
+      if (!first || k.rows < first->rows) first = &k;
+      if (k.rows <= as_rows && (!found || k.rows > found->rows)) found = &k;
+    }
+    return found ? found : first;
+  };
+  const TunedKernel* runs = among(false);
+  TunedKernel got         = runs ? *runs : *among(true);
   if (tile_n_of(got.config) < tile_cols) set_tile_n(got.config, 0);
   return got;
 }
@@ -936,8 +950,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with fewer, the ranks past
   // the row own empty slices, which the kernels do not handle (a GPU memory fault, 2026-10-10, at
   // 8 bf16 columns on 8 ranks). Refused, so the caller takes the one-shot or RCCL.
-  const bool column_slices = fn == Template::all_reduce_pull_two_shot || slices_columns(fn);
-  if (column_slices && packs < world) return Error::row_narrower_than_world;
+  if (slices_a_row(fn) && packs < world) return Error::row_narrower_than_world;
   if (!staged && scratch_need(fn, rows, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.
@@ -1098,7 +1111,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1200,7 +1213,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1320,7 +1333,7 @@ select_all_reduce_add_attn_res_rms_norm(
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1455,7 +1468,7 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1553,7 +1566,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1651,7 +1664,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, row, latent);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, row, latent, packs_of(row, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, latent,
@@ -1749,7 +1762,7 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, rows, hidden, hidden, packs_of(hidden, dtype));
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
       fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, rows, hidden,
@@ -1892,7 +1905,7 @@ constexpr bool fits(Template fn, const KernelConfig& c) {
 // The tuned kernel for `rows` rows of `row` elements, fitted.
 constexpr bool tuned_fits(OpType o, int world, int64_t rows, int64_t row, int64_t tile_cols,
                           int64_t grid_cols) {
-  const TunedKernel t = pick(o, world, rows, row, tile_cols);
+  const TunedKernel t = pick(o, world, rows, row, tile_cols, packs_of(row, DType::bf16));
   return fits(t.fn, fitted(t.fn, t.config, rows, tile_cols, grid_cols, world));
 }
 constexpr bool selections_fit() {
