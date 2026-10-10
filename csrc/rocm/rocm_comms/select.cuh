@@ -65,8 +65,8 @@ namespace hip_comms {
 
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
 // Not swept: select cuts it to the rows, so it matters only past 16 rows.
-// The plain one-shot: a tile a row of threads high, a group a thread wide, at each block size a
-// launch may take (64, a wave, its own: all_reduce_config). Not yet tuned: the flat walk's shapes.
+// The plain one-shot: a tile a row high, a group a thread wide, at each block size a launch may
+// take. The grid is the size's (kAllReduceKernels, which picks among these).
 constexpr KernelConfig kAllReduceOneShotConfigs[] = {
     AllReduceConfig{{64, 0, 1}, 1, 512},
     AllReduceConfig{{128, 0, 1}, 1, 1024},
@@ -74,7 +74,7 @@ constexpr KernelConfig kAllReduceOneShotConfigs[] = {
     AllReduceConfig{{512, 0, 1}, 1, 4096},
 };
 // The plain two-shot: a group a thread of a row of threads a rank, at eight ranks (512, a wave per
-// peer, its own). Not yet tuned: the flat walk's shapes.
+// peer). The grid is the size's (kAllReduceKernels).
 constexpr KernelConfig kAllReduceTwoShotConfigs[] = {
     AllReduceConfig{{64, 0, 1}, 1, 64},
     AllReduceConfig{{128, 0, 1}, 1, 128},
@@ -767,43 +767,6 @@ constexpr int own(std::optional<int> v) { return v.value_or(0); }
 // work up to the links' bandwidth-delay product. The one op not yet tuned into a kernel list:
 // it has no tile, and its grid follows the bytes (the tuner will replace it; PLAN 5.3.12.4.5.2).
 //
-// ONE WAVE PER BLOCK. Waves in one block only add a barrier inside it: at 1 token one-shot took
-// 7.8 us at 64 threads, 8.1 at 128, 9.0 at 256 and 10.9 at 512 (bench, 2026-09-29T19-24-48Z).
-// One-shot reads every peer's whole buffer ((N-1)P) in one round trip; two-shot moves less
-// (2(N-1)/N P) in two: one-shot won at 56 KiB (7.12 vs 7.83 us), two-shot at 112 KiB (7.87 vs
-// 8.19), uncached scratch (2026-09-30T18-00-30Z). TWO-SHOT'S BLOCK IS A ROW OF THREADS A RANK
-// (aiter's two-stage, a wave a peer). A GRID THE SIZE OF THE WORK, as aiter sizes its own: every
-// block pays for every sync
-// (at 16 tokens two-shot ran 11.00 us on 16 blocks, 12.31 on 64), capped at what keeps the links
-// busy: their bandwidth-delay product, 7 x 76.8 GB/s x 1334 ns = 717 KB, 88 blocks of 512 threads
-// (the sweep: flat from 80 to 128). Every pass full: 3.7 MB at 88 blocks took 5.09 passes, 23.78
-// us, against 90 blocks in 5 full ones.
-// `loads`: the packs a block has in flight a pass.
-constexpr int link_filling_blocks(const Hardware& hw, const Calibration& cal, int loads) {
-  const double in_flight = hw.xgmi_links * hw.xgmi_gbytes_per_s_a_way * cal.ping_pong_ns;
-  const double per_pass  = static_cast<double>(loads) * kBuild.memory.pack_bytes;
-  const int blocks       = static_cast<int>(in_flight / per_pass + 0.999);
-  return blocks < hw.compute_units ? blocks : hw.compute_units;
-}
-constexpr KernelConfig all_reduce_config(Template t, int64_t bytes, int world) {
-  const Hardware& hw    = kTarget;
-  const bool one_shot   = t == Template::all_reduce_pull_one_shot;
-  const int64_t packs   = (bytes + kBuild.memory.pack_bytes - 1) / kBuild.memory.pack_bytes;
-  const int64_t work    = one_shot ? packs : (packs + world - 1) / world;
-  const int64_t need    = (work + hw.wave_size - 1) / hw.wave_size;
-  // THE TWO-SHOT'S BLOCK IS A ROW OF THREADS A RANK (a wave each at eight), a thread one load: a
-  // tiled two-shot whose thread read every rank put 8x the links' bytes in flight on this grid and
-  // lost 0.8 us at 16-64 tokens however launched (2026-10-04T01-07-11Z).
-  const int threads     = one_shot ? hw.wave_size : hw.wave_size * world;
-  const int fill        = link_filling_blocks(hw, kTargetCalibration, threads);
-  const int64_t passes  = need > fill ? need / fill : 1;
-  const int64_t even    = (need + passes - 1) / passes;
-  // NOT std::min: hipify turns it into HIP's device `min`, which is not constexpr.
-  const int blocks = static_cast<int>(even < hw.compute_units ? even : hw.compute_units);
-  // THE FLAT WALK'S TILE, until tuned: a row of threads, a group (a 16-bit pack) a thread.
-  const int group  = kBuild.memory.pack_bytes / 2;
-  return AllReduceConfig{{threads, blocks, 1}, 1, one_shot ? threads * group : threads / world * group};
-}
 constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b; }
 
 // A TILED OP'S TUNED KERNEL for `rows` rows `hidden` wide at `world` ranks. Among the op's kernels,
@@ -1020,19 +983,22 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f = std::get<Forced>(forcing);
   // The tuned kernel, its tile_n kept narrower than the row: the all-reduce tiles across it.
-  const TunedKernel tuned = f ? TunedKernel{} : pick(OpType::all_reduce, world, m, n, 0, dtype);
+  const TunedKernel tuned = pick(OpType::all_reduce, world, m, n, 0, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   KernelConfig c          = !f ? tuned.config
                             : f->second ? *f->second
                                         : AllReduceConfig{{0, 0, 1}, 0, 0};
-  const KernelConfig derived = all_reduce_config(fn, bytes, world);
-  LaunchConfig& g            = launch_of(c);
-  if (g.threads_per_block == 0) g.threads_per_block = launch_of(derived).threads_per_block;
-  if (g.blocks_per_grid == 0) g.blocks_per_grid = launch_of(derived).blocks_per_grid;
-  if (g.waves_per_eu == 0) g.waves_per_eu = launch_of(derived).waves_per_eu;
+  // A FORCED CALL'S BLANK FIELDS, the template's own (its first listed config), and its grid the
+  // tuned kernel's at this size (the listed configs leave the grid to the size); the tuned config
+  // runs as it was measured.
+  const KernelConfig own = default_config(fn, 0);
+  LaunchConfig& g        = launch_of(c);
+  if (g.threads_per_block == 0) g.threads_per_block = launch_of(own).threads_per_block;
+  if (g.blocks_per_grid == 0) g.blocks_per_grid = launch_of(tuned.config).blocks_per_grid;
+  if (g.waves_per_eu == 0) g.waves_per_eu = launch_of(own).waves_per_eu;
   AllReduceConfig& a = std::get<AllReduceConfig>(c);
-  if (a.tile_m == 0) a.tile_m = 1;
-  if (a.tile_n == 0) a.tile_n = tile_n_of(derived) * g.threads_per_block / launch_of(derived).threads_per_block;
+  if (a.tile_m == 0) a.tile_m = std::get<AllReduceConfig>(own).tile_m;
+  if (a.tile_n == 0) a.tile_n = tile_n_of(own);
   const bool staged = !h.reads_in_place(inp, stream);
   // THE STAGED BAND: the rows a pass, what the staging holds (and the two-shot's scratch, a row of
   // its slice a row).
@@ -1948,10 +1914,9 @@ constexpr bool selections_fit() {
                     n))
       return false;
     if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, m, n, n, n)) return false;
-    // The plain all-reduce's derived launch.
-    for (const Template t :
-         {Template::all_reduce_pull_one_shot, Template::all_reduce_pull_two_shot})
-      if (!fits(t, all_reduce_config(t, m * n * 2, w))) return false;
+    // The plain all-reduce's tuned kernel, as measured (no fitting).
+    const TunedKernel ar = pick(OpType::all_reduce, w, m, n, 0, DType::bf16);
+    if (!fits(ar.fn, ar.config)) return false;
   }
   return true;
 }

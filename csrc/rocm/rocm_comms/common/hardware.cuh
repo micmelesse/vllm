@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE HARDWARE: each target's facts, as the device and AMD's docs report them, and what was
-// measured on it (`Calibration`). No decision lives here: build.cuh derives what a build is from
-// them, select.cuh a launch from them and the input. A new target is one more `Hardware`;
+// THE HARDWARE: each target's facts, as the device and AMD's docs report them. No decision lives
+// here: build.cuh derives what a build is from them, select.cuh a launch from them, the input and
+// each op's tuned kernels (measured, each citing its sweep). A new target is one more `Hardware`;
 // `kTarget` is the one the host tunes for.
 
 #pragma once
@@ -102,25 +102,8 @@ constexpr Hardware kGfx942 = {
 };
 static_assert(kGfx942.compute_units % kGfx942.xcds == 0, "every XCD has the same CUs");
 
-// MEASURED ON THE MACHINE, where `Hardware` is documented: by our probes (calibrate.py) and by our
-// sweeps (the bench's forced launch configs), so it goes stale when the driver, firmware or our own
-// kernels change. Each value cites the run that measured it; one not swept says so and whose it
-// copies. A kernel's launch is not here: it is its template's configs (launch.cuh), and every
-// op's choice, the plain all-reduce's included, is its tuned kernels (select.cuh).
-struct Calibration {
-  double ping_pong_ns;                    // a flag to a peer and back, median of every pair
-};
-
-// gfx950 on n11. MI300X has none yet.
-constexpr Calibration kGfx950Calibration = {
-    // calibrate.py, dev run 2026-09-30T19-02-08Z: 28 pairs 1274-1383 ns; a repeat
-    // (2026-09-30T19-13-36Z) gave 1282, so about 5% run to run.
-    .ping_pong_ns = 1334.0,
-};
-
-// THE TARGET THE HOST TUNES FOR, and what was measured on it.
-constexpr const Hardware& kTarget               = kGfx950;
-constexpr const Calibration& kTargetCalibration = kGfx950Calibration;
+// THE TARGET THE HOST TUNES FOR.
+constexpr const Hardware& kTarget = kGfx950;
 constexpr const char* kTargetArch               = "gfx950";
 
 // THE DEVICE THIS COMPILE PASS IS FOR: a build compiles the device code once per offload arch
