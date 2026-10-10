@@ -972,7 +972,6 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   const int world     = h.world_size();
-  const int64_t bytes = m * n * elem_bytes(dtype);
   // 1.
   const std::variant<Forced, Error> forcing =
       forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid,
