@@ -2058,9 +2058,12 @@ def run_eager_beyond_staging_rank(
     """ONE rank: an eager all-reduce of two and a half stagings, forced at `shot`,
     against RCCL's fp32 sum. Each rank draws its own input on the device: the input is
     too large to rebuild every rank's on the CPU."""
-    n = build_info().staging_bytes * 5 // 2 // 2  # bf16 elements
+    # [rows, 7168] (the model's rows) over two and a half stagings: the staged
+    # builds run in passes of whole rows, so a pass is a band of rows.
+    hidden = 7168
+    rows = build_info().staging_bytes * 5 // 2 // 2 // hidden
     g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
-    x = torch.randn(n, generator=g, device=ctx.device).to(torch.bfloat16)
+    x = torch.randn(rows, hidden, generator=g, device=ctx.device).to(torch.bfloat16)
     want = x.float()
     dist.all_reduce(want, group=ctx.device_group)
     comm = ctx.comm("hip")
@@ -2106,6 +2109,16 @@ def run_strided_all_reduce_rank(
     dist.all_reduce(want, group=ctx.device_group)
     comm = ctx.comm("hip")
     forced = _forced(shot)
+    # A TWO-SHOT ROW NEEDS A PACK A RANK: narrower, it is refused by name, never run.
+    narrow = shot == "all_reduce_pull_two_shot" and hidden * 2 // 16 < ctx.world
+    if narrow:
+        try:
+            comm.all_reduce(x, **forced)
+        except Refused as no:
+            if no.error == Error.row_narrower_than_world:
+                return True, None
+            return False, f"refused for {no.error.name}, not row_narrower_than_world"
+        return False, f"a two-shot row of {hidden} on {ctx.world} ranks was not refused"
     if not comm.should_allreduce(x, **forced):
         return False, f"refused {tuple(x.shape)} at strides {x.stride()}"
     got = comm.all_reduce(x, **forced)[0].float()
@@ -2242,11 +2255,12 @@ def test_a_capture_warmup_launches_nothing(world: int, ranks: World) -> None:
     assert not bad, "; ".join(bad)
 
 
-# BISECT (temporary): which eager shapes fault on the 2-D plain all-reduce, each its own world.
+# THE EDGE A PACK A RANK SITS ON (2026-10-10: two-shot faulted at 8 bf16 columns on 8
+# ranks): below it the two-shot refuses by name, at and above it both shots sum right.
 @pytest.mark.parametrize("shot", SHOTS)
 @pytest.mark.parametrize("rows", [1, 2, 16])
 @pytest.mark.parametrize("hidden", [8, 64, 3584, 7168])
-def test_bisect_eager_all_reduce_shapes(
+def test_an_eager_all_reduce_across_the_pack_a_rank_edge(
     shot: Shot, rows: int, hidden: int, world: int, ranks: World
 ) -> None:
     if world < 2:
@@ -2256,3 +2270,31 @@ def test_bisect_eager_all_reduce_shapes(
     )
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot} rows={rows} hidden={hidden}: " + "; ".join(bad)[:300]
+
+
+def run_row_wider_than_staging_rank(
+    ctx: RankContext, shot: Shot
+) -> tuple[bool, str | None]:
+    """ONE rank: a single row wider than the staging, which no pass of whole rows
+    holds."""
+    x = torch.ones(build_info().staging_bytes, dtype=torch.bfloat16, device=ctx.device)
+    try:
+        ctx.comm("hip").all_reduce(x, **_forced(shot))
+    except Refused as no:
+        if no.error == Error.staging_too_small:
+            return True, None
+        return False, f"refused for {no.error.name}, not staging_too_small"
+    return False, "a row wider than the staging was run"
+
+
+@pytest.mark.parametrize("shot", SHOTS)
+def test_one_row_wider_than_the_staging_is_refused_by_name(
+    shot: Shot, world: int, ranks: World
+) -> None:
+    """The staged builds run in passes of whole rows, so a row wider than the staging
+    is refused (the caller takes RCCL), never run past the staging."""
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_row_wider_than_staging_rank, shot=shot)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shot}: " + "; ".join(bad)

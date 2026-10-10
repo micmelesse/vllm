@@ -933,6 +933,11 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (!gemm_fits(c)) return Error::block_exceeds_lds;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(row_elems, dtype);
+  // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with fewer, the ranks past
+  // the row own empty slices, which the kernels do not handle (a GPU memory fault, 2026-10-10, at
+  // 8 bf16 columns on 8 ranks). Refused, so the caller takes the one-shot or RCCL.
+  const bool column_slices = fn == Template::all_reduce_pull_two_shot || slices_columns(fn);
+  if (column_slices && packs < world) return Error::row_narrower_than_world;
   if (!staged && scratch_need(fn, rows, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.

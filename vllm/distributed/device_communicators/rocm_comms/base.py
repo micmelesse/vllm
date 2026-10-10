@@ -129,6 +129,7 @@ class Error(IntEnum):
     waves_not_built = 34
     inner_stride_not_one = 35
     row_stride_not_packs = 36
+    row_narrower_than_world = 37
 
 
 class Where(IntEnum):

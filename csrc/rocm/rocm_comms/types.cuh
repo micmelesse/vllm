@@ -59,8 +59,9 @@ enum class Error : int {
   waves_not_built = 34,
   inner_stride_not_one = 35,
   row_stride_not_packs = 36,
+  row_narrower_than_world = 37,
 };
-constexpr int kNumErrors = 37;
+constexpr int kNumErrors = 38;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -132,6 +133,9 @@ constexpr const char* to_string(Error e) {
       return "inner_stride_not_one: a buffer's innermost stride is not 1 (the loads are packs)";
     case Error::row_stride_not_packs:
       return "row_stride_not_packs: a buffer's row stride is not whole 16-byte packs";
+    case Error::row_narrower_than_world:
+      return "row_narrower_than_world: a two-shot row has fewer packs than ranks, so a rank's "
+             "slice is empty";
   }
   return "unknown";
 }
