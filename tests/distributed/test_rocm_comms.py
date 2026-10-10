@@ -2172,8 +2172,12 @@ def run_skipped_call_rank(ctx: RankContext) -> tuple[bool, str | None]:
         fault = comm._fault()
         if fault is None:
             return False, "broken with no fault record"
-        if (fault.where, fault.peer, fault.rank) != (Where.start, skipper, ctx.rank):
-            return False, f"the fault names the wrong place: {fault}"
+        # WHO, not which barrier: a kernel that opens with a start barrier gives up
+        # there; one that stages first (the eager one-shot) at its first peers barrier.
+        if (fault.peer, fault.rank) != (skipper, ctx.rank):
+            return False, f"the fault names the wrong ranks: {fault}"
+        if fault.where not in (Where.start, Where.peer_barrier):
+            return False, f"the fault is at a wait a missing peer cannot stop: {fault}"
         return True, None
     finally:
         # The last rank's memory stays mapped until every kernel that wrote to it ended.
