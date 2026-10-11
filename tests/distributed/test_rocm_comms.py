@@ -2069,9 +2069,10 @@ def run_eager_beyond_staging_rank(
     dist.all_reduce(want, group=ctx.device_group)
     comm = ctx.comm("hip")
     forced = _forced(shot)
-    if not comm.should_allreduce(x, **forced):
-        return False, "refused"
-    got = comm.all_reduce(x, **forced)[0].float()
+    try:
+        got = comm.all_reduce(x, **forced)[0].float()
+    except Refused as no:
+        return False, f"refused for {no.error.name}"
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
@@ -2120,9 +2121,10 @@ def run_strided_all_reduce_rank(
                 return True, None
             return False, f"refused for {no.error.name}, not row_narrower_than_world"
         return False, f"a two-shot row of {hidden} on {ctx.world} ranks was not refused"
-    if not comm.should_allreduce(x, **forced):
-        return False, f"refused {tuple(x.shape)} at strides {x.stride()}"
-    got = comm.all_reduce(x, **forced)[0].float()
+    try:
+        got = comm.all_reduce(x, **forced)[0].float()
+    except Refused as no:
+        return False, f"refused {tuple(x.shape)} at strides {x.stride()} for {no.error.name}"
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
