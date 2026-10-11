@@ -12,7 +12,8 @@ namespace hip_comms {
 
 // One thread on each rank of the pair: the lower rank writes and waits, the higher waits and writes
 // back, `kWarm` untimed then `iters` timed, from flag value `base` on. Device wall-clock ticks.
-__global__ void ping_pong(Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
+__global__ void ping_pong(Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr,
+                          int rank,
                           uint64_t timeout_ticks, int peer, uint32_t base, int iters,
                           uint64_t* ticks_ptr) {
   constexpr int kWarm = 16;

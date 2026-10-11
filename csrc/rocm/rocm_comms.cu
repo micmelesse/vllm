@@ -363,7 +363,8 @@ RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
   return all_reduce_rms_scale_add_plan_of(hip_comms::select_all_reduce_rms_scale_add(
       handle_of(handle_ptr), nullptr, out.stride(0), out.stride(1), nullptr, inp.stride(0),
-      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, latent_size_n, 0.f, alg, dir, narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
+      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, latent_size_n, 0.f, alg, dir,
+      narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
       narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream()));
 }
 

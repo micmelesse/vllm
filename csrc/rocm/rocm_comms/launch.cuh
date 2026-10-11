@@ -45,61 +45,64 @@ inline int64_t extent_bytes(int64_t m, int64_t n, int64_t stride_m, DType dtype)
 // STAGED: the kernel copies its own input through its staging a pass at a time, so no peer reads it
 // where it is; in place, the peers read it through its input table.
 inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
-  const int m  = static_cast<int>(l.m);
-  const int n = static_cast<int>(l.n);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const bool one_shot = l.algorithm == Algorithm::one_shot;
   if (l.staged && one_shot)
     Call<AllReduceOneShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.staging_ptrs(),
         l.staging_stride_m, l.staging_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m,
-        l.inp_stride_n, m, n, l.band_m);
+        l.inp_stride_n, inp_size_m, inp_size_n, l.band_m);
   else if (l.staged)
     Call<AllReduceTwoShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.scratch_ptrs(),
         l.scratch_stride_m, l.scratch_stride_n, h.staging_ptrs(), l.staging_stride_m,
         l.staging_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
-        l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m, l.inp_stride_n, m,
-        n, l.band_m);
+        l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m, l.inp_stride_n, inp_size_m,
+        inp_size_n, l.band_m);
   else {
     const void* const* inp_ptrs =
-        h.inp_ptrs(l.inp, extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype), l.stream);
+        h.inp_ptrs(l.inp, extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype),
+                   l.stream);
     if (one_shot)
       Call<AllReduceOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
                                         h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        m, n);
+                                        inp_size_m, inp_size_n);
     else
       Call<AllReduceTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
                                         h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
                                         h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        m, n);
+                                        inp_size_m, inp_size_n);
   }
 }
 
 inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype);
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out,
-        l.out_stride_m, l.out_stride_n, l.weight, l.weight_stride_n, l.eps, m, n);
+        l.out_stride_m, l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
   else
     Call<AllReduceRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
         h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
-        l.out_stride_n, l.weight, l.weight_stride_n, l.eps, m, n);
+        l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
 }
 
 inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype);
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
@@ -107,7 +110,7 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
         l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out,
         l.out_stride_m, l.out_stride_n, l.residual_out, l.residual_out_stride_m,
         l.residual_out_stride_n, l.residual, l.residual_stride_m, l.residual_stride_n, l.weight,
-        l.weight_stride_n, l.eps, m, n);
+        l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
   else
     Call<AllReduceAddRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
@@ -115,14 +118,15 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
         h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
         l.out_stride_n, l.residual_out, l.residual_out_stride_m, l.residual_out_stride_n,
         l.residual, l.residual_stride_m, l.residual_stride_n, l.weight, l.weight_stride_n, l.eps,
-        m, n);
+        inp_size_m, inp_size_n);
 }
 
 // THE PULL TWO-SHOT takes its reduce-scatter blocks last.
 inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
                                                     const AllReduceAddAttnResRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype);
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
@@ -131,7 +135,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, m, n);
+        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n);
   else if (l.direction == Direction::push)
     Call<AllReduceAddAttnResRmsNormPushKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
@@ -140,7 +144,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, m, n);
+        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n);
   else
     Call<AllReduceAddAttnResRmsNormPullKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
@@ -149,12 +153,14 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, m, n, l.reduce_scatter_blocks);
+        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n,
+        l.reduce_scatter_blocks);
 }
 
 inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGemmLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype);
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormGemmOneShotKernel>::run(
@@ -162,7 +168,7 @@ inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGem
         l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
         l.norm_weight, l.norm_weight_stride_n, l.eps, l.gemm_weight, l.gemm_weight_stride_m,
         l.gemm_weight_stride_n, static_cast<int>(l.n_cols), l.out, l.out_stride_m, l.out_stride_n,
-        l.workspace, l.workspace_stride_m, l.workspace_stride_n, m, n);
+        l.workspace, l.workspace_stride_m, l.workspace_stride_n, inp_size_m, inp_size_n);
   else
     Call<AllReduceRmsNormGemmTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
@@ -170,12 +176,13 @@ inline void launch_all_reduce_rms_norm_gemm(Handle& h, const AllReduceRmsNormGem
         h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.norm_weight,
         l.norm_weight_stride_n, l.eps, l.gemm_weight, l.gemm_weight_stride_m,
         l.gemm_weight_stride_n, static_cast<int>(l.n_cols), l.out, l.out_stride_m, l.out_stride_n,
-        l.workspace, l.workspace_stride_m, l.workspace_stride_n, m, n);
+        l.workspace, l.workspace_stride_m, l.workspace_stride_n, inp_size_m, inp_size_n);
 }
 
 inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNormGemmAddLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, l.n, l.inp_stride_m, l.dtype);
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m = static_cast<int>(l.inp_size_m);
+  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormGemmOneShotKernel>::run(
@@ -183,7 +190,7 @@ inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNor
         l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
         l.norm_weight, l.norm_weight_stride_n, l.eps, l.gemm_weight, l.gemm_weight_stride_m,
         l.gemm_weight_stride_n, static_cast<int>(l.n_cols), l.out, l.out_stride_m, l.out_stride_n,
-        l.workspace, l.workspace_stride_m, l.workspace_stride_n, m, n);
+        l.workspace, l.workspace_stride_m, l.workspace_stride_n, inp_size_m, inp_size_n);
   else
     Call<AllReduceRmsNormGemmTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
@@ -191,14 +198,15 @@ inline void launch_all_reduce_rms_norm_gemm_add(Handle& h, const AllReduceRmsNor
         h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.norm_weight,
         l.norm_weight_stride_n, l.eps, l.gemm_weight, l.gemm_weight_stride_m,
         l.gemm_weight_stride_n, static_cast<int>(l.n_cols), l.out, l.out_stride_m, l.out_stride_n,
-        l.workspace, l.workspace_stride_m, l.workspace_stride_n, m, n);
+        l.workspace, l.workspace_stride_m, l.workspace_stride_n, inp_size_m, inp_size_n);
 }
 
 // inp's row is [shared | projected | latent].
 inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAddLaunch& l) {
-  const int64_t bytes = extent_bytes(l.m, 2 * l.n + l.latent_size_n, l.inp_stride_m, l.dtype);
-  const int m        = static_cast<int>(l.m);
-  const int n        = static_cast<int>(l.n);
+  const int64_t bytes =
+      extent_bytes(l.inp_size_m, 2 * l.inp_size_n + l.latent_size_n, l.inp_stride_m, l.dtype);
+  const int inp_size_m    = static_cast<int>(l.inp_size_m);
+  const int inp_size_n    = static_cast<int>(l.inp_size_n);
   const int latent_size_n = static_cast<int>(l.latent_size_n);
   const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
@@ -206,27 +214,28 @@ inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAd
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
                                         h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        l.eps, m, n, latent_size_n);
+                                        l.eps, inp_size_m, inp_size_n, latent_size_n);
   else
     Call<AllReduceRmsScaleAddTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
                                         h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
                                         h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        l.eps, m, n, latent_size_n);
+                                        l.eps, inp_size_m, inp_size_n, latent_size_n);
 }
 
 namespace experimental {
 
 // No peers: its own tensors only.
 inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l) {
-  const int m = static_cast<int>(l.m), n = static_cast<int>(l.n);
+  const int delta_size_m = static_cast<int>(l.delta_size_m);
+  const int delta_size_n = static_cast<int>(l.delta_size_n);
   Call<AddAttnResRmsNormKernel>::run(
       l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.delta, l.delta_stride_m,
       l.delta_stride_n, l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
       l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
       l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-      l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, m, n);
+      l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, delta_size_m, delta_size_n);
 }
 
 // The probe's: a barrier over the signals only; the ping-pong's flags from this pair's next ones

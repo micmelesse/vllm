@@ -300,7 +300,8 @@ class Sync {
   // in its slot for this rank, and wait_flag spins until `peer`'s flag here reaches `v`. Flags
   // only grow, so a caller counts on from the last value it used.
   DINLINE void write_flag(int peer, uint32_t v) const {
-    impl::signals(signal_ptrs_, peer).flag(rank_).template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(v);
+    impl::signals(signal_ptrs_, peer).flag(rank_).template store<__ATOMIC_RELAXED,
+    __MEMORY_SCOPE_SYSTEM>(v);
   }
   DINLINE void wait_flag(int peer, uint32_t v) const {
     impl::wait<false, __MEMORY_SCOPE_DEVICE>(timeout_ticks_, self_signal_ptr_, rank_,

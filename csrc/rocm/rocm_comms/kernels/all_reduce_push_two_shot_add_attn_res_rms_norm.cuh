@@ -25,14 +25,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
         const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
         DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m, int64_t scratch_stride_n,
-        Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
+        Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
+        uint64_t timeout_ticks,
         DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
         DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m, int64_t blocks_stride_r,
         int64_t blocks_stride_n, const DTYPE* __restrict__ norm_w_ptr, int64_t norm_w_stride_n,
         const DTYPE* __restrict__ qk_w_ptr, int64_t qk_w_stride_n,
         const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
-        int write_idx, float eps, float out_eps, int m, int n) {
+        int write_idx, float eps, float out_eps, int inp_size_m, int inp_size_n) {
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
@@ -44,13 +45,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int SLICE_LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
   using Slice = Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
                      THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
-  const float inv_hidden = 1.0f / static_cast<float>(n);
-  const int packs        = n / NL;  // the row, in packs (n is whole packs)
+  const float inv_hidden = 1.0f / static_cast<float>(inp_size_n);
+  const int packs        = inp_size_n / NL;  // the row, in packs (n is whole packs)
   const int slice        = (packs + WORLD - 1) / WORLD;
   const int col0         = rank * slice;
   const int own_packs = max(0, min(slice, packs - col0));  // the last rank's may be short
-  const int my_rows      = m > static_cast<int>(blockIdx.x)
-                               ? (m - blockIdx.x + gridDim.x - 1) / gridDim.x
+  const int my_rows      = inp_size_m > static_cast<int>(blockIdx.x)
+                               ? (inp_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
                                : 0;
 
   // 1. Wait until every peer has launched, so its input is ready.
@@ -68,7 +69,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   if (own_packs > 0) {
     for (int q = 0; q < my_rows; q += Slice::kThreadsM)
     for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
-      const Slice at{m, (col0 + own_packs) * NL, static_cast<int>(blockIdx.x + q * gridDim.x),
+      const Slice at{inp_size_m, (col0 + own_packs) * NL,
+      static_cast<int>(blockIdx.x + q * gridDim.x),
                      c, static_cast<int>(gridDim.x)};
       Slice peers[WORLD];
 #pragma unroll
@@ -88,14 +90,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
   //    one-shot does. The next call's first sync keeps a peer from pushing into this scratch while
   //    it is read (a peer's next kernel starts only once this one has finished).
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n);
+  const auto own_scratch = rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m,
+  scratch_stride_n);
   const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
   const auto norm_w     = local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank);
   const auto qk_w       = local_ptr(qk_w_ptr, 0, qk_w_stride_n, rank);
   const auto out_norm_w = local_ptr(out_norm_w_ptr, 0, out_norm_w_stride_n, rank);
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
-  for (int row = blockIdx.x; row < m; row += gridDim.x) {
-    Row sum{m, n, row, 0};
+  for (int row = blockIdx.x; row < inp_size_m; row += gridDim.x) {
+    Row sum{inp_size_m, inp_size_n, row, 0};
     tile_load(sum, own_scratch);
     block_attn_res_tile<HAS_PREFIX, TILE_K>(sum, prefix, blocks_ptr, blocks_stride_m, blocks_stride_r,
                                          write_idx, norm_w, qk_w, out_norm_w, out, num_blocks, eps,

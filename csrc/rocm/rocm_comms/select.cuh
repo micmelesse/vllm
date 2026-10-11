@@ -1086,8 +1086,8 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                           .staging_stride_n  = 1,
                           .band_m         = static_cast<int>(band < m ? band : m),
                           .dtype             = dtype,
-                          .m              = m,
-                          .n              = n};
+                          .inp_size_m              = m,
+                          .inp_size_n              = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1185,8 +1185,8 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .scratch_stride_n  = 1,
                                  .dtype             = dtype,
                                  .weight_dtype      = weight_dtype,
-                                 .m              = m,
-                                 .n            = n,
+                                 .inp_size_m              = m,
+                                 .inp_size_n            = n,
                                  .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1293,8 +1293,8 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
                                     .scratch_stride_n  = 1,
                                     .dtype             = dtype,
                                     .weight_dtype      = weight_dtype,
-                                    .m              = m,
-                                    .n            = n,
+                                    .inp_size_m              = m,
+                                    .inp_size_n            = n,
                                     .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1433,8 +1433,8 @@ select_all_reduce_add_attn_res_rms_norm(
                                            .scratch_stride_m      = n,
                                            .scratch_stride_n      = 1,
                                            .dtype                 = dtype,
-                                           .m                  = m,
-                                           .n                = n,
+                                           .inp_size_m                  = m,
+                                           .inp_size_n                = n,
                                            .num_blocks            = num_blocks,
                                            .write_idx             = write_idx,
                                            .eps                   = eps,
@@ -1537,8 +1537,8 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
                                      .scratch_stride_m = n,
                                      .scratch_stride_n = 1,
                                      .dtype             = dtype,
-                                     .m              = m,
-                                     .n            = n};
+                                     .inp_size_m              = m,
+                                     .inp_size_n            = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1635,8 +1635,8 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
                                         .scratch_stride_m = n,
                                         .scratch_stride_n = 1,
                                         .dtype             = dtype,
-                                        .m              = m,
-                                        .n            = n};
+                                        .inp_size_m              = m,
+                                        .inp_size_n            = n};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1669,7 +1669,8 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, row, latent_size_n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, latent_size_n,
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m,
+             latent_size_n,
              n, world);
   // 2.
   const int e = elem_bytes(dtype);
@@ -1728,8 +1729,8 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
                                      .scratch_stride_m  = n,
                                      .scratch_stride_n  = 1,
                                      .dtype             = dtype,
-                                     .m              = m,
-                                     .n            = n,
+                                     .inp_size_m              = m,
+                                     .inp_size_n            = n,
                                      .latent_size_n            = latent_size_n,
                                      .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
@@ -1817,8 +1818,8 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
                                  .out_norm_weight   = out_norm_weight,
                                  .out_norm_weight_stride_n = out_norm_weight_stride_n,
                                  .dtype             = dtype,
-                                 .m              = m,
-                                 .n            = n,
+                                 .delta_size_m              = m,
+                                 .delta_size_n            = n,
                                  .num_blocks        = num_blocks,
                                  .write_idx         = write_idx,
                                  .eps               = eps,

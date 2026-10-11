@@ -26,11 +26,12 @@ namespace hip_comms {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
-                             int64_t inp_stride_n, DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
+                             int64_t inp_stride_n, DTYPE* const* __restrict__ scratch_ptrs,
+                             int64_t scratch_stride_m,
                              int64_t scratch_stride_n, Signal* const* __restrict__ signal_ptrs,
                              Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
-                             int64_t out_stride_n, int m, int n) {
+                             int64_t out_stride_n, int inp_size_m, int inp_size_n) {
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
@@ -39,13 +40,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // is right; a wave holding several ranks' rows would read the first lane's rank in every lane.
   static_assert(LANES % kWaveSize == 0, "a rank's row of threads is whole waves");
   using Ranks       = Tile<DTYPE, WORLD, TILE_N, WORLD, LANES, THREADS_PER_BLOCK>;
-  const int slice   = (n / NL + WORLD - 1) / WORLD * NL;  // a rank's columns, in elements
+  const int slice   = (inp_size_n / NL + WORLD - 1) / WORLD * NL;  // a rank's columns, in elements
   const int first   = rank * slice;
-  const int mine    = max(0, min(slice, n - first));      // a late rank's may be short
+  const int mine    = max(0, min(slice, inp_size_n - first));      // a late rank's may be short
   const int chunks  = (slice + TILE_N - 1) / TILE_N;      // a row's, by the full slice
-  const int items   = (m + TILE_M - 1) / TILE_M * chunks;
+  const int items   = (inp_size_m + TILE_M - 1) / TILE_M * chunks;
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
-  const auto slice_n = [&](int w) { return max(0, min(slice, n - rotated(w) * slice)); };
+  const auto slice_n = [&](int w) { return max(0, min(slice, inp_size_n - rotated(w) * slice)); };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   // A ROW'S RANK WHEN IT IS READ: a row is whole waves, so its pointer is one scalar select (every
@@ -69,7 +70,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #pragma unroll
     for (int i = 0; i < TILE_M; ++i) {
       const int row = row0 + i;
-      if (row >= m) break;
+      if (row >= inp_size_m) break;
       Ranks got{WORLD, mine, 0, offs_n};
       reduce_scatter(
           got,
@@ -94,7 +95,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #pragma unroll
     for (int i = 0; i < TILE_M; ++i) {
       const int row = row0 + i;
-      if (row >= m) break;
+      if (row >= inp_size_m) break;
       Ranks got{WORLD, slice, 0, offs_n};
       all_gather(
           got,
@@ -117,14 +118,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // peers barrier makes them visible.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_two_shot_staged(DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
-                                    int64_t scratch_stride_n, DTYPE* const* __restrict__ staging_ptrs,
+    all_reduce_pull_two_shot_staged(DTYPE* const* __restrict__ scratch_ptrs,
+                                    int64_t scratch_stride_m,
+                                    int64_t scratch_stride_n,
+                                    DTYPE* const* __restrict__ staging_ptrs,
                                     int64_t staging_stride_m, int64_t staging_stride_n,
-                                    Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
+                                    Signal* const* __restrict__ signal_ptrs,
+                                    Signal* self_signal_ptr, int rank,
                                     uint64_t timeout_ticks, DTYPE* __restrict__ out_ptr,
                                     int64_t out_stride_m, int64_t out_stride_n,
                                     const DTYPE* __restrict__ inp_ptr, int64_t inp_stride_m,
-                                    int64_t inp_stride_n, int m, int n, int band_m) {
+                                    int64_t inp_stride_n, int inp_size_m, int inp_size_n,
+                                    int band_m) {
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
@@ -133,12 +138,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // is right; a wave holding several ranks' rows would read the first lane's rank in every lane.
   static_assert(LANES % kWaveSize == 0, "a rank's row of threads is whole waves");
   using Ranks       = Tile<DTYPE, WORLD, TILE_N, WORLD, LANES, THREADS_PER_BLOCK>;
-  const int slice   = (n / NL + WORLD - 1) / WORLD * NL;
+  const int slice   = (inp_size_n / NL + WORLD - 1) / WORLD * NL;
   const int first   = rank * slice;
-  const int mine    = max(0, min(slice, n - first));
+  const int mine    = max(0, min(slice, inp_size_n - first));
   const int chunks  = (slice + TILE_N - 1) / TILE_N;
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
-  const auto slice_n = [&](int w) { return max(0, min(slice, n - rotated(w) * slice)); };
+  const auto slice_n = [&](int w) { return max(0, min(slice, inp_size_n - rotated(w) * slice)); };
   const auto own_scratch =
       rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n);
   const auto own_staging =
@@ -150,8 +155,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     return rank_ptr<DTYPE, WORLD>(scratch_ptrs, rotated(w), scratch_stride_m, scratch_stride_n);
   };
 
-  for (int r0 = 0; r0 < m; r0 += band_m) {
-    const int band  = min(band_m, m - r0);  // this pass's rows
+  for (int r0 = 0; r0 < inp_size_m; r0 += band_m) {
+    const int band  = min(band_m, inp_size_m - r0);  // this pass's rows
     const int items = (band + TILE_M - 1) / TILE_M * chunks;
     block_stamp(0);
     // 1. Every rank's slice of this band's rows into this rank's staging, the chunks each rank's
