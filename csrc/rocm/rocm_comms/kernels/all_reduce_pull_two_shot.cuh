@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int first   = rank * slice;
   const int mine    = max(0, min(slice, inp_size_n - first));      // a late rank's may be short
   const int chunks  = (slice + TILE_N - 1) / TILE_N;      // a row's, by the full slice
-  const int items   = (inp_size_m + TILE_M - 1) / TILE_M * chunks;
+  const int tiles_m = (inp_size_m + TILE_M - 1) / TILE_M;
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
   const auto slice_n = [&](int w) { return max(0, min(slice, inp_size_n - rotated(w) * slice)); };
 
@@ -65,8 +65,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Reduce-scatter: this rank's slice of each of the item's rows, summed over every rank, into
   //    its scratch.
-  for (int t = blockIdx.x; t < items; t += gridDim.x) {
-    const int row0 = t / chunks * TILE_M, offs_n = t % chunks * TILE_N;
+  block_for_each_tile(tiles_m, chunks, [&](int tile_row, int chunk) {
+    const int row0 = tile_row * TILE_M, offs_n = chunk * TILE_N;
 #pragma unroll
     for (int i = 0; i < TILE_M; ++i) {
       const int row = row0 + i;
@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           },
           own_scratch.data + row * own_scratch.stride_m);
     }
-  }
+  });
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
@@ -90,8 +90,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. All-gather: every rank's summed chunk of each of the item's rows out of its scratch, at its
   //    place in the output. The next call's first sync keeps a rank from overwriting its scratch
   //    while it is read.
-  for (int t = blockIdx.x; t < items; t += gridDim.x) {
-    const int row0 = t / chunks * TILE_M, offs_n = t % chunks * TILE_N;
+  block_for_each_tile(tiles_m, chunks, [&](int tile_row, int chunk) {
+    const int row0 = tile_row * TILE_M, offs_n = chunk * TILE_N;
 #pragma unroll
     for (int i = 0; i < TILE_M; ++i) {
       const int row = row0 + i;
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           [&](int w) { return out_ptr + row * out_stride_m + rotated(w) * slice * out_stride_n; },
           slice_n);
     }
-  }
+  });
   block_stamp(5);
   sync.finish();
 }
