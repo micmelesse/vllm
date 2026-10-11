@@ -60,20 +60,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
 
-  // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
-  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
   // GPU read rank 0 first, a link at a time carrying the machine's reads, and the reduce-scatter
   // took 1.6x the plain two-shot's cycles for its bytes (thread traces 2026-10-04T21-03-09Z,
   // 21-26-11Z). Each slice is summed by one rank, so the order differing by rank is harmless.
-  // Picked in each lane by select, as scratch_of below: an array indexed at run time is scratch.
-  const auto input = [&](int r) {
-    const int k     = (rank + r) % WORLD;
-    const DTYPE* at = inp[0].data;
-#pragma unroll
-    for (int j = 1; j < WORLD; ++j) at = k == j ? inp[j].data : at;
-    return at;
-  };
+  // A TILE ROW'S RANK DIFFERS ACROSS THE WAVE, so each lane reads its own from the table (an array
+  // of every rank's, indexed at run time, was scratch: 136 B, 520 B as Ptrs).
+  const auto input = [&](int r) { return inp_ptrs[(rank + r) % WORLD]; };
   const auto own_scratch  =
       rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n).data;
   const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
@@ -82,14 +75,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto out_norm_w = local_ptr(out_norm_w_ptr, 0, out_norm_w_stride_n, rank);
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
 
-  // A WAVE'S PACKS MAY HAVE TWO OWNERS, so the owner's scratch is picked in each lane.
-  const auto scratch  = rank_ptrs<DTYPE, WORLD>(scratch_ptrs, scratch_stride_m, scratch_stride_n);
-  const auto scratch_of = [&](int r) {
-    DTYPE* at = scratch[0].data;
-#pragma unroll
-    for (int k = 1; k < WORLD; ++k) at = r == k ? scratch[k].data : at;
-    return at;
-  };
+  // A WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's scratch from the table.
+  const auto scratch_of = [&](int r) { return scratch_ptrs[r]; };
   const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements
   // One tile's reduce-scatter: this rank's columns of its rows summed over the ranks into this
   // rank's scratch, a chunk at a time.
