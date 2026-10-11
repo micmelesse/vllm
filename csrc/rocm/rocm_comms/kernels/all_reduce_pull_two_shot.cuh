@@ -35,6 +35,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+  // A ROW IS WHOLE WAVES, so its rank is the same across each wave and rank_ptr's scalar select
+  // is right; a wave holding several ranks' rows would read the first lane's rank in every lane.
+  static_assert(LANES % kWaveSize == 0, "a rank's row of threads is whole waves");
   using Ranks       = Tile<DTYPE, WORLD, TILE_N, WORLD, LANES, THREADS_PER_BLOCK>;
   const int slice   = (n / NL + WORLD - 1) / WORLD * NL;  // a rank's columns, in elements
   const int first   = rank * slice;
@@ -45,7 +48,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto slice_n = [&](int w) { return max(0, min(slice, n - rotated(w) * slice)); };
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  // A ROW'S RANK WHEN IT IS READ: a row is a wave's, so its pointer is one scalar select (every
+  // A ROW'S RANK WHEN IT IS READ: a row is whole waves, so its pointer is one scalar select (every
   // rank's, rotated, up front was ~20 scalar loads before the first barrier).
   const auto own_scratch =
       rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
@@ -126,6 +129,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+  // A ROW IS WHOLE WAVES, so its rank is the same across each wave and rank_ptr's scalar select
+  // is right; a wave holding several ranks' rows would read the first lane's rank in every lane.
+  static_assert(LANES % kWaveSize == 0, "a rank's row of threads is whole waves");
   using Ranks       = Tile<DTYPE, WORLD, TILE_N, WORLD, LANES, THREADS_PER_BLOCK>;
   const int slice   = (n / NL + WORLD - 1) / WORLD * NL;
   const int first   = rank * slice;

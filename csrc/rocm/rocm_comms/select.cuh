@@ -75,10 +75,8 @@ constexpr KernelConfig kAllReduceOneShotConfigs[] = {
 };
 // The plain two-shot: a group a thread of a row of threads a rank, at eight ranks (512, a wave per
 // peer). The grid is the size's (kAllReduceKernels).
+// 512 threads, 64 a rank's row: a row is whole waves (the kernel's static_assert).
 constexpr KernelConfig kAllReduceTwoShotConfigs[] = {
-    AllReduceConfig{{64, 0, 1}, 1, 64},
-    AllReduceConfig{{128, 0, 1}, 1, 128},
-    AllReduceConfig{{256, 0, 1}, 1, 256},
     AllReduceConfig{{512, 0, 1}, 1, 512},
 };
 constexpr KernelConfig kRmsNormOneShotConfigs[] = {
