@@ -34,8 +34,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
   const float inv_hidden = 1.0f / static_cast<float>(inp_size_n);
-  const int slice        = (inp_size_n / NL + WORLD - 1) / WORLD * NL;  // a rank's columns,
-  in elements
+  const int slice        = (inp_size_n / NL + WORLD - 1) / WORLD * NL;  // a rank's, in elements
   const int col0         = rank * slice;
   const int own_n        = max(0, min(slice, inp_size_n - col0));  // the last rank's may be short
   const int my_m         = inp_size_m > static_cast<int>(blockIdx.x)
