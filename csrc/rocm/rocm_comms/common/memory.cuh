@@ -189,9 +189,8 @@ DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
 }  // namespace impl
 
 // A TILE WHOSE ROWS ARE DIFFERENT TENSORS' (a row a peer): row m's at `row_data(m)`, its first
-// element, the tile's columns counted from it. tile_gather loads every row together, one round trip;
-// tile_scatter stores row m into `row_data(m)` up to its own `row_n(m)` columns (a short last
-// slice).
+// element, the tile's columns counted from it. tile_gather loads every row together, one round trip
+// (the fused AttnRes pull's reduce-scatter; a 3-D tile's ranks are ranks_load's).
 namespace impl {
 template <typename TILE, typename ROW_DATA>
 DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
@@ -207,37 +206,50 @@ DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
 }
 }  // namespace impl
 
-// ...a row only `row_n(m)` columns long (a short last slice): its columns past that read its last
-// group, and an empty row reads nothing.
+
+// A 3-D TILE'S RANKS, each its own memory: rank r's copy of the chunk read through `rank_ptr(r)`, a
+// Ptr at that rank's strides (its data where the chunk's column 0 is), every rank's in one round
+// trip, as tile_load reads one; and stored the same way, rank r's copy to `rank_ptr(r)` up to its
+// own `rank_n(r)` columns (a short last slice). A RANK'S COPY IS WHOLE WAVES: its pointer is one
+// scalar select (rank_ptr reads the wave's first lane's rank), so a group of fewer threads would
+// read the first lane's rank in every lane (the two-shot's small builds summed the wrong peers,
+// 2026-10-10).
 namespace impl {
-template <typename TILE, typename ROW_DATA, typename ROW_N>
-DINLINE void tile_gather(TILE& t, ROW_DATA row_data, ROW_N row_n) {
-  using P = typename TILE::Pack;
-  if (!t.participates()) return;
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    const int r = t.tile_row(m);
-    const int n = row_n(r) / t.kPack;
-    if (n == 0) continue;
-    const P* row = reinterpret_cast<const P*>(row_data(r));
-#pragma unroll
-    for (int k = 0; k < t.K; ++k) {
-      const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
-      impl::held(t, m, k, impl::pack_load(row + (c < n ? c : n - 1)));
-    }
-  }
-  impl::issued();
+template <typename TILE, typename RANK_PTR>
+DINLINE void ranks_load(TILE& t, RANK_PTR rank_ptr) {
+  static_assert(TILE::kThreadsR == TILE::kTileR, "a thread holds one rank's copy");
+  static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
+  const auto p = rank_ptr(t.slice());
+  tile_load(t, p.data, p.stride_m);
+}
+// ...rank r's copy only `rank_n(r)` columns long (a short last slice): its columns past that read
+// its last group, and an empty copy reads nothing.
+template <typename TILE, typename RANK_PTR, typename RANK_N>
+DINLINE void ranks_load(TILE& t, RANK_PTR rank_ptr, RANK_N rank_n) {
+  static_assert(TILE::kThreadsR == TILE::kTileR, "a thread holds one rank's copy");
+  static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
+  const int r = t.slice();
+  const int n = rank_n(r);
+  if (n == 0) return;
+  const auto p    = rank_ptr(r);
+  const int whole = t.N;
+  t.N             = n;  // this thread's copy's end; a thread holds one rank's copy
+  tile_load(t, p.data, p.stride_m);
+  t.N = whole;
 }
 
-template <typename TILE, typename ROW_DATA, typename ROW_N>
-DINLINE void tile_scatter(ROW_DATA row_data, ROW_N row_n, const TILE& t) {
-  using P = typename TILE::Pack;
-  if (!t.participates()) return;
+template <typename TILE, typename RANK_PTR, typename RANK_N>
+DINLINE void ranks_store(RANK_PTR rank_ptr, RANK_N rank_n, const TILE& t) {
+  static_assert(TILE::kThreadsR == TILE::kTileR, "a thread holds one rank's copy");
+  static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
+  using P      = typename TILE::Pack;
+  const int r  = t.slice();
+  const auto p = rank_ptr(r);
+  const int n  = rank_n(r) / t.kPack;
 #pragma unroll
   for (int m = 0; m < TILE::kRows; ++m) {
-    const int r = t.tile_row(m);
-    P* row      = reinterpret_cast<P*>(row_data(r));
-    const int n = row_n(r) / t.kPack;
+    if (!t.live(m)) continue;
+    P* row = reinterpret_cast<P*>(p.data) + int64_t{t.row(m)} * (p.stride_m / t.kPack);
 #pragma unroll
     for (int k = 0; k < t.K; ++k) {
       const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;

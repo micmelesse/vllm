@@ -105,16 +105,22 @@ DINLINE void tile_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREA
   impl::tile_gather(tile, row_data);
 }
 
-// As above, row m only to its own row_n(m) columns (a short last slice).
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, typename ROW_DATA, typename ROW_N>
-DINLINE void tile_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, ROW_DATA row_data, ROW_N row_n) {
-  impl::tile_gather(tile, row_data, row_n);
-}
 
 // Row m of the tile into row_data(m), up to its row_n(m) columns.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, typename ROW_DATA, typename ROW_N>
-DINLINE void tile_scatter(ROW_DATA row_data, ROW_N row_n, const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile) {
-  impl::tile_scatter(row_data, row_n, tile);
+// A 3-D tile's ranks (a copy a rank, whole waves each): rank r's copy loaded through rank_ptr(r), a
+// Ptr at that rank's strides, all in one round trip; and stored to rank_ptr(r) up to rank_n(r)
+// columns.
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR>
+DINLINE void ranks_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile, RANK_PTR rank_ptr) {
+  impl::ranks_load(tile, rank_ptr);
+}
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename RANK_N>
+DINLINE void ranks_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile, RANK_PTR rank_ptr, RANK_N rank_n) {
+  impl::ranks_load(tile, rank_ptr, rank_n);
+}
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename RANK_N>
+DINLINE void ranks_store(RANK_PTR rank_ptr, RANK_N rank_n, const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile) {
+  impl::ranks_store(rank_ptr, rank_n, tile);
 }
 
 // A row's scalar (a norm's scale), stored once a block.
@@ -189,6 +195,16 @@ DINLINE void block_reduce(float (&values)[NUM_VALUES]) {
 template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE>
 DINLINE Tile<DTYPE, 1, TILE_N, 1, THREADS_N, THREADS_PER_BLOCK, float> block_reduce(
     const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile) {
+  return impl::block_reduce<REDUCE_OP, AXIS>(tile);
+}
+
+// A 3-D tile reduced over its ranks (Axis::r): the TILE_M x TILE_N fp32 tile, the first rank's
+// threads'.
+template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R>
+DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, float> block_reduce(
+    const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile)
+  requires(AXIS == Axis::r)
+{
   return impl::block_reduce<REDUCE_OP, AXIS>(tile);
 }
 
@@ -274,12 +290,18 @@ DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, TH
   impl::reduce_scatter(chunk, rank_chunk, sum_out);
 }
 
-// Every rank's summed chunk into the output: rank w's at rank_chunk(w), its rows to out_chunk(m)
-// up to out_len(m) columns.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, typename RANK_CHUNK, typename OUT_CHUNK, typename OUT_LEN>
-DINLINE void all_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& chunk, RANK_CHUNK rank_chunk, OUT_CHUNK out_chunk,
-                        OUT_LEN out_len) {
-  impl::all_gather(chunk, rank_chunk, out_chunk, out_len);
+// ON A 3-D TILE (R x M x N, a copy a rank): this rank's chunk summed over every rank's copy into
+// sum_out, rank r's copy through rank_ptr(r).
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR>
+DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& chunk, RANK_PTR rank_ptr, const Ptr<DTYPE>& sum_out) {
+  impl::reduce_scatter(chunk, rank_ptr, sum_out);
+}
+
+// Every rank's summed chunk into the output: rank r's through rank_ptr(r), to out_ptr(r) up to
+// out_n(r) columns.
+template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename OUT_PTR, typename OUT_N>
+DINLINE void all_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& chunk, RANK_PTR rank_ptr, OUT_PTR out_ptr, OUT_N out_n) {
+  impl::all_gather(chunk, rank_ptr, out_ptr, out_n);
 }
 
 // ===============================================================================================

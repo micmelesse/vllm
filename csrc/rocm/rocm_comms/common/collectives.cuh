@@ -40,17 +40,38 @@ DINLINE void reduce_scatter(TILE& chunk, RANK_CHUNK rank_chunk, typename TILE::D
 }
 }  // namespace impl
 
-// ALL-GATHER: every rank's summed slice into the output, a chunk a call.
-//   rank_chunk(w)  where rank + w's summed copy of the chunk starts (its scratch)
-//   out_chunk(w)   where that chunk goes in the output
-//   out_len(w)     how many of its columns are real there (a late rank's slice is short)
+
+// ON A 3-D TILE, R x M x N, THE RANKS ITS R AXIS: rank r's copy a group of threads (whole waves),
+// read at that rank's strides through `rank_ptr(r)` (a Ptr where the chunk's column 0 is, ROTATED
+// by the caller so the GPUs read different peers at once). A chunk is TILE_M rows of TILE_N
+// columns of a slice, so a rank's slice of several rows fills the tile where one row of it would
+// leave the last chunk part empty.
+
+// REDUCE-SCATTER: this rank's chunk summed over every rank's copy, into `sum_out` (its scratch, a
+// Ptr at the chunk's column 0).
 namespace impl {
-template <typename TILE, typename RANK_CHUNK, typename OUT_CHUNK, typename OUT_LEN>
-DINLINE void all_gather(TILE& chunk, RANK_CHUNK rank_chunk, OUT_CHUNK out_chunk, OUT_LEN out_len) {
-  // 1. Every rank's summed copy of the chunk, a row each, in one round trip.
-  tile_gather(chunk, rank_chunk);
-  // 2. Each row stored where its rank's slice goes.
-  tile_scatter(out_chunk, out_len, chunk);
+template <typename TILE, typename RANK_PTR>
+DINLINE void reduce_scatter(TILE& chunk, RANK_PTR rank_ptr, const Ptr<typename TILE::Dtype>& sum_out) {
+  // 1. Every rank's copy of the chunk, in one round trip.
+  ranks_load(chunk, rank_ptr);
+  // 2. Summed over the ranks, in rank order, through LDS.
+  const auto sum = block_reduce<Sum, Axis::r>(chunk);
+  // 3. Stored as DTYPE in this rank's slice.
+  tile_store(sum_out.data, sum_out.stride_m, sum.template to<typename TILE::Dtype>());
+}
+}  // namespace impl
+
+// ALL-GATHER: every rank's summed chunk into the output, a chunk a call.
+//   rank_ptr(r)  rank r's summed chunk (its scratch)
+//   out_ptr(r)   where that chunk goes in the output
+//   out_n(r)     how many of its columns are real there (a late rank's slice is short)
+namespace impl {
+template <typename TILE, typename RANK_PTR, typename OUT_PTR, typename OUT_N>
+DINLINE void all_gather(TILE& chunk, RANK_PTR rank_ptr, OUT_PTR out_ptr, OUT_N out_n) {
+  // 1. Every rank's summed copy of the chunk, in one round trip.
+  ranks_load(chunk, rank_ptr);
+  // 2. Each rank's copy stored where its slice goes.
+  ranks_store(out_ptr, out_n, chunk);
 }
 }  // namespace impl
 

@@ -142,11 +142,59 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
 //            one-row fp32 result is the first THREADS_N threads' (a Tile of one row of threads)
 //   Axis::n  over the columns, every row's, into `out` (a row's value in every thread of the row):
 //            each thread's groups, then the row's threads (a wave's or the block's)
-enum class Axis { m, n };
+//   Axis::r  over a 3-D tile's ranks, every element's: each rank's copy meets in LDS as it is held,
+//            reduced in fp32 in rank order, and the TILE_M x TILE_N fp32 result is the first
+//            rank's threads' (a 2-D tile of THREADS_M x THREADS_N threads)
+enum class Axis { m, n, r };
 
 namespace impl {
+// OVER THE RANKS: every thread's packs into LDS at its rank's place, a pack a thread side by side
+// (consecutive threads' 16 bytes adjacent), then the first rank's threads sum each pack over the
+// ranks. LDS: TILE_R x TILE_M x TILE_N elements as held.
+template <typename REDUCE_OP, typename TILE>
+DINLINE Tile<typename TILE::Dtype, TILE::kTileM, TILE::kTileN, TILE::kThreadsM, TILE::kThreadsN,
+             TILE::kThreadsPerBlock, float>
+block_reduce_ranks(const TILE& t) {
+  static_assert(TILE::kThreadsR == TILE::kTileR, "a thread holds one rank's copy");
+  using Acc    = typename TILE::Acc;
+  using P      = typename TILE::Pack;
+  constexpr int kPacks = TILE::kRows * TILE::K;  // a thread's
+  __shared__ P part[TILE::kTileR][kPacks][TILE::kSliceThreads];
+  Tile<typename TILE::Dtype, TILE::kTileM, TILE::kTileN, TILE::kThreadsM, TILE::kThreadsN,
+       TILE::kThreadsPerBlock, float>
+      out{t.M, t.N, t.offs_m, t.offs_n, t.row_step};
+  const int mine = static_cast<int>(threadIdx.x) % TILE::kSliceThreads;
+#pragma unroll
+  for (int m = 0; m < TILE::kRows; ++m)
+#pragma unroll
+    for (int k = 0; k < TILE::K; ++k) part[t.slice()][m * TILE::K + k][mine] = pack(t, m, k);
+  __syncthreads();
+  if (out.participates()) {
+#pragma unroll
+    for (int m = 0; m < TILE::kRows; ++m)
+#pragma unroll
+      for (int k = 0; k < TILE::K; ++k) {
+        float x[TILE::kPack];
+        P p = part[0][m * TILE::K + k][mine];
+#pragma unroll
+        for (int j = 0; j < TILE::kPack; ++j) x[j] = static_cast<float>(reinterpret_cast<const Acc*>(&p)[j]);
+#pragma unroll
+        for (int r = 1; r < TILE::kTileR; ++r) {
+          p = part[r][m * TILE::K + k][mine];
+#pragma unroll
+          for (int j = 0; j < TILE::kPack; ++j)
+            x[j] = REDUCE_OP::apply(x[j], static_cast<float>(reinterpret_cast<const Acc*>(&p)[j]));
+        }
+#pragma unroll
+        for (int j = 0; j < TILE::kPack; ++j) out.v[m][k][j] = x[j];
+      }
+  }
+  __syncthreads();  // before the next reduction writes `part`
+  return out;
+}
+
 template <typename REDUCE_OP, Axis AXIS, typename TILE>
-DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kThreadsPerBlock, float> block_reduce(
+DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kThreadsPerBlock, float> block_reduce_rows(
     const TILE& t) {
   static_assert(AXIS == Axis::m, "a row's reduction (Axis::n) writes `out`");
   static_assert(TILE::kRows == 1, "a thread holds one row of the rows reduced");
@@ -176,6 +224,13 @@ DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN, TILE::kT
   }
   __syncthreads();  // before the next reduction writes `part`
   return out;
+}
+
+// A TILE OVER AN AXIS: the ranks' (a 3-D tile's) or the rows' result tile.
+template <typename REDUCE_OP, Axis AXIS, typename TILE>
+DINLINE auto block_reduce(const TILE& t) {
+  if constexpr (AXIS == Axis::r) return block_reduce_ranks<REDUCE_OP>(t);
+  else return block_reduce_rows<REDUCE_OP, AXIS>(t);
 }
 
 template <typename REDUCE_OP, Axis AXIS, typename TILE>
