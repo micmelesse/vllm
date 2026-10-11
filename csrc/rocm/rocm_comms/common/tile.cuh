@@ -138,6 +138,7 @@ struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLO
 // col)` for each, in tiles. The row and column are kept as the walk advances, each step an add, a
 // compare and a carry, where dividing them out of the work item's index cost a 32-bit division a
 // tile (ISA 2026-10-11, the plain all-reduce against the flat walk); the division is once, here.
+namespace impl {
 template <typename BODY>
 DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
   const int step_rows = static_cast<int>(gridDim.x) / tiles_n;
@@ -154,5 +155,6 @@ DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
     }
   }
 }
+}  // namespace impl
 
 }  // namespace hip_comms

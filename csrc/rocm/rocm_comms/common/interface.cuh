@@ -46,6 +46,17 @@
 namespace hip_comms {
 
 // ===============================================================================================
+// TILES: WHICH TILES A BLOCK WORKS ON (tile.cuh)
+// ===============================================================================================
+
+// This block's tiles, grid-strided in row-major order over tiles_m x tiles_n tiles: body(row, col)
+// for each, in tiles, without a division a tile.
+template <typename BODY>
+DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
+  impl::block_for_each_tile(tiles_m, tiles_n, body);
+}
+
+// ===============================================================================================
 // MEMORY: GLOBAL MEMORY ONLY THROUGH TILES (memory.cuh)
 // ===============================================================================================
 
