@@ -13,7 +13,7 @@
 //                   barriers (common/interface.cuh lists it all)
 //   handle.cuh      Handle: the peers' memory, mapped once (run time; kBuild's twin), and
 //                   supported(device, world): whether one can exist there
-//   types.cuh       the vocabulary: Error, Template, each family's KernelConfig, OpType, Algorithm,
+//   types.cuh       the vocabulary: Error, Template, each op's BuildConfig and KernelConfig, OpType, Algorithm,
 //                   Direction, each op's kernel signatures, and each op's launch (the normal
 //                   form select returns)
 // How a call runs:

@@ -2,12 +2,12 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // SELECT, THE ONLY CHOICE, read by each op's select_<op> (interface.cuh): what was tuned (each
-// op's kernels: for each world and row width, the template and KernelConfig that won from a
-// number of rows up, written by the tuner, tune.py, from a sweep; an entry says what ran fastest,
-// the why is the sweep's figure, cited beside it), then the steps every select takes, each on
-// primitives: the forcing made a template and config, or the tuned kernel picked; the config
-// fitted to the call (a zero field the template's own, the tile widened to cover the row, the
-// grid cut to the tiles there are); and the first Error the kernel meets here.
+// op's kernels: for each world and row width, the template and complete KernelConfig, its build
+// and its launch, that won from a number of rows up, written by the tuner, tune.py, from a sweep;
+// an entry says what ran fastest, the why is the sweep's figure, cited beside it), then the steps
+// every select takes, each on primitives: the forced kernel, given whole, or the tuned kernel
+// picked as listed; the grid cut to the tiles there are; and the first Error the kernel meets
+// here. Nothing is filled in: a config is complete wherever it is written.
 
 #pragma once
 
@@ -51,88 +51,87 @@
 namespace hip_comms {
 
 // =================================================================================================
-// THE CATALOG: each template, and the KernelConfigs it is built for.
+// THE CATALOG: each template, and the BuildConfigs it is built for.
 // =================================================================================================
 
-// A TEMPLATE'S CONFIGS, each of its family (types.cuh), in the order select prefers them (its
-// default for a call is the first whose tile covers the call's row). The fields compiled in (the
-// tile, the threads) are what dispatch instantiates, what check accepts and what a tuner
-// searches; the grid (cut to the tiles there are) and reduce_scatter_blocks are each config's
-// launch, and a caller may force others. tile_n counts the elements of a 16-bit dtype, the only
-// ones built. A config that spills shows in its code object (Handle::resources_of) and loses on
-// the clock; none is ruled out by policy. Each grid cites the sweep that set it, at 512 threads
-// (256 was worse for the GEMM tail, 2026-09-28; not swept for the others, which copy it).
+// A TEMPLATE'S BUILDS, each of its op's BuildConfig (types.cuh): what dispatch instantiates, what
+// the check accepts and what a tuner searches. The launch (the grid, reduce_scatter_blocks) is not
+// a build's: each tuned kernel (below) gives its own, and a forced call gives its own. tile_n
+// counts the elements of a 16-bit dtype, the only ones built. A build that spills shows in its code
+// object (Handle::resources_of) and loses on the clock; none is ruled out by policy. The sweeps
+// cited beside a list set its builds and the grids its tuned kernels carry, at 512 threads (256
+// was worse for the GEMM tail, 2026-09-28; not swept for the others, which copy it).
 
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
 // Not swept: select cuts it to the rows, so it matters only past 16 rows.
 // The plain one-shot: a tile a row high, a group a thread wide, at each block size a launch may
 // take. The grid is the size's (kAllReduceKernels, which picks among these).
-constexpr KernelConfig kAllReduceOneShotConfigs[] = {
-    AllReduceConfig{{64, 0, 1}, 1, 512},
-    AllReduceConfig{{128, 0, 1}, 1, 1024},
-    AllReduceConfig{{256, 0, 1}, 1, 2048},
-    AllReduceConfig{{512, 0, 1}, 1, 4096},
+constexpr BuildConfig kAllReduceOneShotConfigs[] = {
+    AllReduceBuildConfig{64, 1, 1, 512},
+    AllReduceBuildConfig{128, 1, 1, 1024},
+    AllReduceBuildConfig{256, 1, 1, 2048},
+    AllReduceBuildConfig{512, 1, 1, 4096},
 };
 // The plain two-shot: a group a thread of a row of threads a rank, at eight ranks (512, a wave per
 // peer). The grid is the size's (kAllReduceKernels).
 // 512 threads, 64 a rank's row: a row is whole waves (the kernel's static_assert).
-constexpr KernelConfig kAllReduceTwoShotConfigs[] = {
-    AllReduceConfig{{512, 0, 1}, 1, 512},
+constexpr BuildConfig kAllReduceTwoShotConfigs[] = {
+    AllReduceBuildConfig{512, 1, 1, 512},
 };
-constexpr KernelConfig kRmsNormOneShotConfigs[] = {
-    AllReduceRmsNormConfig{{512, 16, 1}, 1, 4096},
-    AllReduceRmsNormConfig{{512, 16, 1}, 1, 8192},
-    AllReduceRmsNormConfig{{512, 16, 1}, 1, 16384},
+constexpr BuildConfig kRmsNormOneShotConfigs[] = {
+    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 16384},
 };
 // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55 and 18.11 at 128;
 // 2026-10-01T03-26-44Z); a row a block below that.
-constexpr KernelConfig kRmsNormPushConfigs[] = {
-    AllReduceRmsNormConfig{{512, 256, 1}, 1, 4096},
-    AllReduceRmsNormConfig{{512, 256, 1}, 1, 8192},
-    AllReduceRmsNormConfig{{512, 256, 1}, 1, 16384},
+constexpr BuildConfig kRmsNormPushConfigs[] = {
+    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 16384},
 };
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4 against 81.0 and 147.6 at
 // 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-constexpr KernelConfig kRmsNormPullConfigs[] = {
-    AllReduceRmsNormConfig{{512, 48, 1}, 1, 4096},
-    AllReduceRmsNormConfig{{512, 48, 1}, 1, 8192},
+constexpr BuildConfig kRmsNormPullConfigs[] = {
+    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
 };
 // Not swept: rms_norm's.
-constexpr KernelConfig kAddRmsNormOneShotConfigs[] = {
-    AllReduceAddRmsNormConfig{{512, 16, 1}, 1, 4096},
-    AllReduceAddRmsNormConfig{{512, 16, 1}, 1, 8192},
-    AllReduceAddRmsNormConfig{{512, 16, 1}, 1, 16384},
+constexpr BuildConfig kAddRmsNormOneShotConfigs[] = {
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384},
 };
 // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128; 2026-10-01T03-26-44Z).
-constexpr KernelConfig kAddRmsNormPushConfigs[] = {
-    AllReduceAddRmsNormConfig{{512, 256, 1}, 1, 4096},
-    AllReduceAddRmsNormConfig{{512, 256, 1}, 1, 8192},
-    AllReduceAddRmsNormConfig{{512, 256, 1}, 1, 16384},
+constexpr BuildConfig kAddRmsNormPushConfigs[] = {
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384},
 };
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us at 2048 and 4096
 // against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-constexpr KernelConfig kAddRmsNormPullConfigs[] = {
-    AllReduceAddRmsNormConfig{{512, 48, 1}, 1, 4096},
-    AllReduceAddRmsNormConfig{{512, 48, 1}, 1, 8192},
+constexpr BuildConfig kAddRmsNormPullConfigs[] = {
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
 };
 
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got slower, 6.48 -> 8.16 us a
 // row and 147.5 -> 171.0 at 4096 tokens, with 100 -> 166 VGPRs (stamps 2026-10-01T06-26-55Z
 // against 04-15-48Z). The one-shot's grid not swept: the norms'.
-constexpr KernelConfig kAttnResOneShotConfigs[] = {
-    AllReduceAddAttnResRmsNormConfig{{512, 16, 1}, 1, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{512, 16, 1}, 1, 8192, 1, 0},
+constexpr BuildConfig kAttnResOneShotConfigs[] = {
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
 };
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98 against 39.93, 83.15, 159.33 at
 // 128), a row a block below that (2026-10-01T03-57-23Z).
 // 256 threads a block: Triton's program for AttnRes, and more blocks resident at once (AttnRes
 // from local memory took 192.8 / 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps
 // 2026-10-02T20-36-56Z); its grid not swept yet.
-constexpr KernelConfig kAttnResPushConfigs[] = {
-    AllReduceAddAttnResRmsNormConfig{{512, 256, 1}, 1, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{512, 256, 1}, 1, 8192, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 512, 1}, 1, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 512, 1}, 1, 8192, 1, 0},
+constexpr BuildConfig kAttnResPushConfigs[] = {
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
 };
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192 is within about 5% of
 // the best of 16-256 from 512 to 4096 tokens; 4096 at 447.2 us against 1160.7 at the 36 it had
@@ -144,17 +143,17 @@ constexpr KernelConfig kAttnResPushConfigs[] = {
 // 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4 are no longer
 // built: they lost at every grid, and 4 spilled 25-30 VGPRs.
-constexpr KernelConfig kAttnResPullConfigs[] = {
-    AllReduceAddAttnResRmsNormConfig{{512, 192, 1}, 1, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{512, 192, 1}, 1, 8192, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 384, 1}, 1, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 384, 1}, 1, 8192, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 4096, 2, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 192, 1}, 1, 8192, 2, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 2, 4096, 1, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 192, 1}, 1, 8192, 3, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 4096, 3, 0},
-    AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 4096, 4, 0},
+constexpr BuildConfig kAttnResPullConfigs[] = {
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 2, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 4},
 };
 
 // The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
@@ -162,48 +161,48 @@ constexpr KernelConfig kAttnResPullConfigs[] = {
 // picked at Kimi-K3's shape, 1, 2 and 8 worse at 1 row (2026-09-28); 56 blocks the best at 1 row
 // (2026-09-28, log). Not swept for the rest, which copy it.
 constexpr int kGemmTileK = gemm_tile_k_fit(kTarget, 16);
-constexpr KernelConfig kRmsNormGemmConfigs[] = {
-    AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4},
-    AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4},
-    AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 16384, kGemmTileK, 4},
+constexpr BuildConfig kRmsNormGemmConfigs[] = {
+    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4},
+    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4},
+    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 16384, kGemmTileK, 4},
 };
 // The same builds, the product added into out.
-constexpr KernelConfig kRmsNormGemmAddConfigs[] = {
-    AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4},
-    AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4},
-    AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 16384, kGemmTileK, 4},
+constexpr BuildConfig kRmsNormGemmAddConfigs[] = {
+    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4},
+    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4},
+    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 16384, kGemmTileK, 4},
 };
-// A CONFIG WITH A SLICED K HOLDS ITS GEMM'S BLOCK in the target's LDS (any other: nothing to hold).
-constexpr bool gemm_fits(const KernelConfig& k) {
+// A BUILD WITH A SLICED K HOLDS ITS GEMM'S BLOCK in the target's LDS (any other: nothing to hold).
+constexpr bool gemm_fits(const BuildConfig& b) {
   return std::visit(
       [](const auto& c) {
         if constexpr (requires { c.slice_k; })
-          return gemm_fits(kTarget, c.tile_m, c.tile_k, c.slice_k, c.launch.threads_per_block);
+          return gemm_fits(kTarget, c.tile_m, c.tile_k, c.slice_k, c.threads_per_block);
         else return true;
       },
-      k);
+      b);
 }
 constexpr bool gemm_tail_configs_fit() {
-  for (const KernelConfig& k : kRmsNormGemmConfigs)
-    if (!gemm_fits(k)) return false;
-  for (const KernelConfig& k : kRmsNormGemmAddConfigs)
-    if (!gemm_fits(k)) return false;
+  for (const BuildConfig& b : kRmsNormGemmConfigs)
+    if (!gemm_fits(b)) return false;
+  for (const BuildConfig& b : kRmsNormGemmAddConfigs)
+    if (!gemm_fits(b)) return false;
   return true;
 }
 static_assert(gemm_tail_configs_fit(),
               "every GEMM-tail config holds its block in the target's LDS");
 
 // The one-all-reduce tail. The one-shot: a block a (row, slice) up to one a compute unit.
-constexpr KernelConfig kRmsScaleAddOneShotConfigs[] = {
-    AllReduceRmsScaleAddConfig{{512, 256, 1}, 1, 4096},
-    AllReduceRmsScaleAddConfig{{512, 256, 1}, 1, 8192},
+constexpr BuildConfig kRmsScaleAddOneShotConfigs[] = {
+    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192},
 };
 // About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of the
 // best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4 at 256
 // (2026-10-01T22-07-13Z).
-constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {
-    AllReduceRmsScaleAddConfig{{512, 32, 1}, 1, 4096},
-    AllReduceRmsScaleAddConfig{{512, 32, 1}, 1, 8192},
+constexpr BuildConfig kRmsScaleAddTwoShotConfigs[] = {
+    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192},
 };
 
 // EXPERIMENTAL, AttnRes on a local delta: a row a block, the grid striding over rows. 512 blocks
@@ -211,27 +210,26 @@ constexpr KernelConfig kRmsScaleAddTwoShotConfigs[] = {
 // 2026-10-02T20-36-56Z); not swept. Each build also one wave a EU past its own (72, 102, 104 and
 // 186 VGPRs at 1): 256 threads spilled 8 and 18 there (2026-10-04T15-40-07Z), 512 not tried.
 // 128 threads at 3584 only: twice the loads a wave and the registers (7168's 64 a thread spill).
-constexpr KernelConfig kAddAttnResConfigs[] = {
-    AddAttnResRmsNormConfig{{512, 512, 1}, 1, 4096, 1},
-    AddAttnResRmsNormConfig{{512, 512, 1}, 1, 8192, 1},
-    AddAttnResRmsNormConfig{{256, 512, 1}, 1, 4096, 1},
-    AddAttnResRmsNormConfig{{256, 512, 1}, 1, 8192, 1},
-    AddAttnResRmsNormConfig{{512, 512, 8}, 1, 4096, 1},
-    AddAttnResRmsNormConfig{{512, 512, 5}, 1, 8192, 1},
-    AddAttnResRmsNormConfig{{256, 512, 5}, 1, 4096, 1},
-    AddAttnResRmsNormConfig{{256, 512, 3}, 1, 8192, 1},
-    AddAttnResRmsNormConfig{{128, 512, 1}, 1, 4096, 1},
+constexpr BuildConfig kAddAttnResConfigs[] = {
+    AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
+    AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+    AddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
+    AddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
+    AddAttnResRmsNormBuildConfig{512, 8, 1, 4096, 1},
+    AddAttnResRmsNormBuildConfig{512, 5, 1, 8192, 1},
+    AddAttnResRmsNormBuildConfig{256, 5, 1, 4096, 1},
+    AddAttnResRmsNormBuildConfig{256, 3, 1, 8192, 1},
+    AddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1},
 };
 
-// What each template is, in Template's order: its op, its shot, and its builds (none for the plain
-// all-reduce, which has no tile).
+// What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
   Template fn;
   const char* name;
   OpType op;
   bool two_shot;
   bool push;  // peers push into this rank (else it pulls from them)
-  std::span<const KernelConfig> configs;
+  std::span<const BuildConfig> builds;
 };
 
 // A TEMPLATE AND ITS NAME FROM ONE TOKEN, so the name cannot differ from the enum's.
@@ -289,72 +287,46 @@ constexpr const TemplateInfo& info(Template k) { return kTemplates[static_cast<i
 constexpr const char* to_string(Template k) { return info(k).name; }
 constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
 
-constexpr std::span<const KernelConfig> configs_of(Template k) { return info(k).configs; }
-// Whether a template is built at listed configs (its threads and its tile compiled in).
-constexpr bool has_builds(Template k) { return !configs_of(k).empty(); }
-constexpr bool has_tiles(Template k) { return has_builds(k); }
-
-// Whether two configs are one build: the same family, the same fields compiled in, at the same
-// threads (the grid and reduce_scatter_blocks are a launch's).
-constexpr bool same_build(const KernelConfig& a, const KernelConfig& b) {
-  if (a.index() != b.index()) return false;
-  return std::visit(
-      [&](const auto& x) {
-        const auto& y = std::get<std::decay_t<decltype(x)>>(b);
-        bool same     = x.launch.threads_per_block == y.launch.threads_per_block &&
-                    x.launch.waves_per_eu == y.launch.waves_per_eu;
-        if constexpr (requires { x.tile_m; }) same = same && x.tile_m == y.tile_m;
-        if constexpr (requires { x.tile_n; }) same = same && x.tile_n == y.tile_n;
-        if constexpr (requires { x.tile_k; }) same = same && x.tile_k == y.tile_k;
-        if constexpr (requires { x.slice_k; }) same = same && x.slice_k == y.slice_k;
-        return same;
-      },
-      a);
-}
-// Whether template `k` builds `c`.
-constexpr bool built(Template k, const KernelConfig& c) {
-  for (const KernelConfig& b : configs_of(k))
-    if (same_build(b, c)) return true;
-  return false;
-}
-constexpr bool built_at(Template k, int threads_per_block) {
-  for (const KernelConfig& b : configs_of(k))
-    if (launch_of(b).threads_per_block == threads_per_block) return true;
-  return false;
-}
-// THE BUILD AT `threads_per_block` AND `waves_per_eu`, the first listed, or the template's first
-// build when none is (the check then refuses the threads or the waves by name).
-constexpr KernelConfig build_at(Template k, int threads_per_block, int waves_per_eu) {
-  for (const KernelConfig& b : configs_of(k))
-    if (launch_of(b).threads_per_block == threads_per_block &&
-        launch_of(b).waves_per_eu == waves_per_eu)
-      return b;
-  return configs_of(k)[0];
-}
-constexpr bool built_at(Template k, int threads_per_block, int waves_per_eu) {
-  for (const KernelConfig& b : configs_of(k))
-    if (launch_of(b).threads_per_block == threads_per_block &&
-        launch_of(b).waves_per_eu == waves_per_eu)
-      return true;
-  return false;
-}
-// THE FAMILY A TEMPLATE'S CONFIGS ARE (KernelConfig's index): its list's, and every entry the same
-// (configs_one_family); the plain all-reduce's, which has no list, AllReduceConfig.
-constexpr size_t family_of(Template k) {
-  return configs_of(k).empty() ? 0 : configs_of(k)[0].index();
-}
-constexpr bool configs_one_family() {
+constexpr std::span<const BuildConfig> builds_of(Template k) { return info(k).builds; }
+constexpr bool every_template_built() {
   for (const TemplateInfo& t : kTemplates)
-    for (const KernelConfig& c : t.configs)
-      if (c.index() != family_of(t.fn)) return false;
+    if (t.builds.empty()) return false;
   return true;
 }
-static_assert(configs_one_family(), "a template's configs are not all of one family");
-// Whether two templates are built for the same tiles and threads (one dispatch serves both).
+static_assert(every_template_built(), "a template lists no builds");
+
+// Whether template `k` builds `b`.
+constexpr bool built(Template k, const BuildConfig& b) {
+  for (const BuildConfig& listed : builds_of(k))
+    if (listed == b) return true;
+  return false;
+}
+// Whether any build of `k` runs at `threads_per_block` (and `waves_per_eu`): the check's names for
+// a build that is not listed.
+constexpr bool built_at(Template k, int threads_per_block) {
+  for (const BuildConfig& listed : builds_of(k))
+    if (threads_of(listed) == threads_per_block) return true;
+  return false;
+}
+constexpr bool built_at(Template k, int threads_per_block, int waves_per_eu) {
+  for (const BuildConfig& listed : builds_of(k))
+    if (threads_of(listed) == threads_per_block && waves_of(listed) == waves_per_eu) return true;
+  return false;
+}
+// THE BUILD TYPE A TEMPLATE'S BUILDS ARE (BuildConfig's index): its op's, every entry the same.
+constexpr size_t family_of(Template k) { return builds_of(k)[0].index(); }
+constexpr bool builds_one_family() {
+  for (const TemplateInfo& t : kTemplates)
+    for (const BuildConfig& b : t.builds)
+      if (b.index() != family_of(t.fn)) return false;
+  return true;
+}
+static_assert(builds_one_family(), "a template's builds are not all of one family");
+// Whether two templates list the same builds (one dispatch serves both).
 constexpr bool same_builds(Template a, Template b) {
-  if (configs_of(a).size() != configs_of(b).size()) return false;
-  for (size_t i = 0; i < configs_of(a).size(); ++i)
-    if (!same_build(configs_of(a)[i], configs_of(b)[i])) return false;
+  if (builds_of(a).size() != builds_of(b).size()) return false;
+  for (size_t i = 0; i < builds_of(a).size(); ++i)
+    if (builds_of(a)[i] != builds_of(b)[i]) return false;
   return true;
 }
 
@@ -442,28 +414,30 @@ void by_weight(DType weight, DType dtype, VISITOR&& f) {
   not_built("weight dtype");
 }
 
-// A TEMPLATE'S BUILD, compiled in: the one of template K's configs (the catalog above) `c` names
-// (all but its launch's grid and reduce_scatter_blocks, which are run time), and only those. f is
-// handed it as config_constant<C>, C its family's config, every field a constant expression.
+// A TEMPLATE'S BUILD, compiled in: the one of template K's builds (the catalog above) `b` is, and
+// only those. f is handed it as build_constant<B>, B its op's BuildConfig, every field a constant
+// expression.
 template <Template TEMPLATE>
-using family_t = std::variant_alternative_t<family_of(TEMPLATE), KernelConfig>;
-template <Template TEMPLATE, size_t CONFIG_INDEX>
-constexpr family_t<TEMPLATE> built_config = std::get<family_t<TEMPLATE>>(configs_of(TEMPLATE)[CONFIG_INDEX]);
-template <auto BUILT_CONFIG>
-struct config_constant {
-  static constexpr auto value = BUILT_CONFIG;
+using family_t = std::variant_alternative_t<family_of(TEMPLATE), BuildConfig>;
+template <Template TEMPLATE, size_t BUILD_INDEX>
+constexpr family_t<TEMPLATE> listed_build =
+    std::get<family_t<TEMPLATE>>(builds_of(TEMPLATE)[BUILD_INDEX]);
+template <auto LISTED_BUILD>
+struct build_constant {
+  static constexpr auto value = LISTED_BUILD;
 };
 
 template <Template TEMPLATE, typename VISITOR, size_t... INDICES>
-void by_config_in(const KernelConfig& c, VISITOR& f, std::index_sequence<INDICES...>) {
-  if (!((same_build(c, configs_of(TEMPLATE)[INDICES]) && (f(config_constant<built_config<TEMPLATE, INDICES>>{}), true)) ||
+void by_build_in(const BuildConfig& b, VISITOR& f, std::index_sequence<INDICES...>) {
+  if (!((b == builds_of(TEMPLATE)[INDICES] &&
+         (f(build_constant<listed_build<TEMPLATE, INDICES>>{}), true)) ||
         ...))
-    not_built(std::string("template ") + to_string(TEMPLATE) + " at that tile and threads");
+    not_built(std::string("template ") + to_string(TEMPLATE) + " at that build");
 }
 
 template <Template TEMPLATE, typename VISITOR>
-void by_config(const KernelConfig& c, VISITOR&& f) {
-  by_config_in<TEMPLATE>(c, f, std::make_index_sequence<configs_of(TEMPLATE).size()>{});
+void by_build(const BuildConfig& b, VISITOR&& f) {
+  by_build_in<TEMPLATE>(b, f, std::make_index_sequence<builds_of(TEMPLATE).size()>{});
 }
 
 [[noreturn]] inline void not_this_ops(Template k) {
@@ -526,8 +500,8 @@ inline bool resident(const Handle& h, const void* kernel, int blocks, int thread
   return blocks <= resident_blocks(kTarget, h.resources_of(kernel), threads);
 }
 
-// From `rows` rows up (to the next entry's), at `world` ranks and rows `hidden` elements wide:
-// template `fn` at `config`.
+// From `m` rows up (to the next entry's), at `world` ranks and rows `n` elements wide: template
+// `fn` at `config`, its build and its launch, as measured.
 struct TunedKernel {
   int world;
   int64_t m;
@@ -546,16 +520,16 @@ struct TunedKernel {
 // with the rows. 16 tokens of 3584: 8.0 us against the flat walk's 7.8 (be0e1f4e9c) and the
 // one-shot's 9.6, which the byte threshold this replaces had picked.
 constexpr TunedKernel kAllReduceKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot, AllReduceConfig{{128, 32, 1}, 1, 1024}},
-    {8, 16, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 16, 1}, 1, 512}},
-    {8, 32, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 32, 1}, 1, 512}},
-    {8, 64, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 64, 1}, 1, 512}},
-    {8, 256, 3584, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 128, 1}, 1, 512}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot, AllReduceConfig{{128, 32, 1}, 1, 1024}},
-    {8, 8, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 16, 1}, 1, 512}},
-    {8, 16, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 32, 1}, 1, 512}},
-    {8, 32, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 64, 1}, 1, 512}},
-    {8, 64, 7168, Template::all_reduce_pull_two_shot, AllReduceConfig{{512, 128, 1}, 1, 512}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot, {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8, 16, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
+    {8, 32, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
+    {8, 64, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8, 256, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot, {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8, 8, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
+    {8, 16, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
+    {8, 32, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8, 64, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
 };
 
 // gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps set (each
@@ -564,87 +538,105 @@ constexpr TunedKernel kAllReduceKernels[] = {
 // 2026-09-30T21-06-57Z); the push through 1.75 MiB (256 tokens of 3584: 18.04 against the
 // pull's 18.41), the pull from 2.6 MiB (2026-10-01T03-26-44Z).
 constexpr TunedKernel kRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm, AllReduceRmsNormConfig{{512, 16, 1}, 1, 4096}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm, AllReduceRmsNormConfig{{512, 256, 1}, 1, 4096}},
-    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm, AllReduceRmsNormConfig{{512, 48, 1}, 1, 4096}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm, AllReduceRmsNormConfig{{512, 16, 1}, 1, 8192}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm, AllReduceRmsNormConfig{{512, 256, 1}, 1, 8192}},
-    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm, AllReduceRmsNormConfig{{512, 48, 1}, 1, 8192}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+    // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the 8192's; not swept.
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
 };
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB (192 tokens of
 // 3584: 15.48 against the pull's 16.28), the pull at 1.75 MiB (18.36 against the push's 18.46;
 // 2026-10-01T03-26-44Z).
 constexpr TunedKernel kAddRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 16, 1}, 1, 4096}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 256, 1}, 1, 4096}},
-    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 48, 1}, 1, 4096}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 16, 1}, 1, 8192}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 256, 1}, 1, 8192}},
-    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm, AllReduceAddRmsNormConfig{{512, 48, 1}, 1, 8192}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+    // Past the model's widths, as rms_norm's.
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68 us; 14.03 against
 // 15.18 at 8; 2026-10-01T03-57-23Z); the pull past 256 tokens at 3584 and 192 at 7168, with
 // balanced slices (2026-10-05T03-40-33Z: 3584 x 384 27.7 against the push's 30.4; 7168 x 192
 // 27.3 against 27.7).
+// THE ONE-SHOT BESIDE THE PUSH from 1 token: listed after it, so it runs only where the push does
+// not (a row narrower than a pack a rank); its grid the norms' one-shot's, not swept.
 constexpr TunedKernel kAttnResKernels[] = {
     {8, 1, 3584, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{512, 256, 1}, 1, 4096, 1, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
     {8, 257, 3584, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 4096, 3, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3}, {256, 0}}},
     {8, 1, 7168, Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{512, 256, 1}, 1, 8192, 1, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {16, 0}}},
     {8, 193, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 8192, 3, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3}, {256, 0}}},
     {8, 512, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{256, 256, 1}, 1, 8192, 1, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {256, 0}}},
     {8, 1024, 7168, Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     AllReduceAddAttnResRmsNormConfig{{256, 192, 1}, 1, 8192, 1, 0}},
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
 };
 
 // The GEMM tails: the one-shot through one GEMM pass of rows (16), where the one-shot kernel
 // once had to stop; not swept.
 constexpr TunedKernel kRmsNormGemmKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
     {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
     {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     AllReduceRmsNormGemmConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
+    // Past the model's widths, to the widest build: the one-shot; not swept.
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm_gemm,
+     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 16384, kGemmTileK, 4}, {56, 0}}},
 };
 
 // As rms_norm_gemm's.
 constexpr TunedKernel kRmsNormGemmAddKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
     {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 4096, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
     {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     AllReduceRmsNormGemmAddConfig{{512, 56, 1}, 16, 8192, kGemmTileK, 4}},
+     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
+    // Past the model's widths, to the widest build: the one-shot; not swept.
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
+     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 16384, kGemmTileK, 4}, {56, 0}}},
 };
 
 // The one-all-reduce tail, [T, 17920] (a latent of 3584): the one-shot while there are fewer
 // rows than ranks, the row two-shot from a row a rank (10.8 against 12.3 us at 1 token, 13.2
 // against 14.3 at 8 the other way; 2026-10-01T21-20-57Z).
 constexpr TunedKernel kRmsScaleAddKernels[] = {
-    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add, AllReduceRmsScaleAddConfig{{512, 256, 1}, 1, 4096}},
-    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, AllReduceRmsScaleAddConfig{{512, 32, 1}, 1, 4096}},
+    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {32, 0}}},
+    // A latent of 7168, [T, 21504], on the 8192-wide builds: 17920's crossover and grids; not swept.
+    {8, 1, 21504, Template::all_reduce_pull_one_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 8, 21504, Template::all_reduce_pull_two_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {32, 0}}},
 };
 
 // Experimental, one rank (world 1: there are no peers): not swept.
 constexpr TunedKernel kAddAttnResKernels[] = {
-    {1, 1, 3584, Template::add_attn_res_rms_norm, AddAttnResRmsNormConfig{{512, 512, 1}, 1, 4096, 1}},
-    {1, 1, 7168, Template::add_attn_res_rms_norm, AddAttnResRmsNormConfig{{512, 512, 1}, 1, 8192, 1}},
+    {1, 1, 3584, Template::add_attn_res_rms_norm, {AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {512, 0}}},
+    {1, 1, 7168, Template::add_attn_res_rms_norm, {AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {512, 0}}},
 };
 
 // =================================================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it) and its tuned kernels (none for
-// the plain all-reduce, whose grid is still derived).
+// THE OPS, in OpType's order: each one's name (as Python calls it) and its tuned kernels.
 // =================================================================================================
 
 struct Op {
@@ -679,17 +671,26 @@ constexpr bool ops_in_order() {
 }
 static_assert(ops_in_order(), "kOps must list every OpType in its order");
 
-// EVERY OP BUT THE PLAIN ALL-REDUCE HAS KERNELS, each one of its own templates and built.
+// EVERY OP HAS KERNELS, each one of its own templates, its build listed and its launch one the
+// forcing would accept (a grid of 1 to kMaxBlocks blocks, a split only on the AttnRes pull).
+constexpr bool launch_fits(Template t, const LaunchConfig& l) {
+  if (l.blocks_per_grid < 1 || l.blocks_per_grid > kMaxBlocks) return false;
+  if (l.reduce_scatter_blocks < 0) return false;
+  return l.reduce_scatter_blocks == 0 ||
+         t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
+}
 constexpr bool ops_have_kernels() {
   for (const Op& o : kOps) {
-    if (o.type == OpType::all_reduce) continue;
     if (o.kernels.empty()) return false;
     for (const TunedKernel& k : o.kernels)
-      if (op_of(k.fn) != o.type || !built(k.fn, k.config)) return false;
+      if (op_of(k.fn) != o.type || !built(k.fn, k.config.build) ||
+          !launch_fits(k.fn, k.config.launch))
+        return false;
   }
   return true;
 }
-static_assert(ops_have_kernels(), "an op has no kernels, or one is another op's or not built");
+static_assert(ops_have_kernels(),
+              "an op has no kernels, or one is another op's, not built or not launchable");
 
 // THE OP'S TEMPLATES, in the catalog's order, and how many.
 constexpr int templates_of(OpType o) {
@@ -730,143 +731,125 @@ constexpr bool every_rank_gets_columns(Template k, int64_t n, DType dtype, int w
 }
 
 // =================================================================================================
-// 1. THE FORCING: the template the algorithm and direction name (an op with one template needs
-// neither to force a config), and its config from the launch and the op's fields (`config` builds
-// its family's from them, a zero field the template's own); a mistake in it is its Error. None:
-// select picks.
+// 1. THE FORCING, ALL OR NOTHING: the template (its algorithm and direction, where the op has more
+// than one), every field of its build, and its launch, or none of them. Some but not all is
+// forced_incomplete; a value out of range is its Error; a build the template does not list is the
+// check's to name. None: select picks.
 // =================================================================================================
 
-using Forced = std::optional<std::pair<Template, std::optional<KernelConfig>>>;
+// The kernel a call runs: its template and its complete config.
+struct Chosen {
+  Template fn;
+  KernelConfig config;
+};
 
-template <typename CONFIG_TYPE>
-constexpr std::variant<Forced, Error> forced(OpType o, std::optional<Algorithm> algorithm,
-                                             std::optional<Direction> direction,
-                                             std::optional<int> threads_per_block,
-                                             std::optional<int> blocks_per_grid,
-                                             std::optional<int> waves_per_eu,
-                                             std::initializer_list<std::optional<int>> fields,
-                                             CONFIG_TYPE config) {
-  if (direction && !algorithm) return Error::direction_without_algorithm;
-  if (threads_per_block.has_value() != blocks_per_grid.has_value())
-    return Error::launch_incomplete;
-  const bool launched = blocks_per_grid.has_value();
-  if (launched && (*blocks_per_grid < 1 || *blocks_per_grid > kMaxBlocks ||
-                   *threads_per_block < kWaveSize ||
-                   *threads_per_block > kBuild.kernels.max_threads ||
-                   *threads_per_block % kWaveSize != 0))
-    return Error::launch_out_of_range;
-  if (waves_per_eu && !launched) return Error::field_without_launch;
-  if (waves_per_eu && (*waves_per_eu < 1 ||
-                       *waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu))
-    return Error::launch_out_of_range;
-  for (const std::optional<int>& f : fields) {
-    if (f && !launched) return Error::field_without_launch;
-    if (f && *f < 1) return Error::field_not_positive;
+// `build_fields` are the op's BuildConfig's fields as the call forced them, in its order;
+// `reduce_scatter_blocks` the AttnRes split, which only that op takes (another passes none);
+// `build_of` makes the op's BuildConfig from the fields, called only when every one is given.
+template <typename BUILD_OF>
+constexpr std::variant<std::optional<Chosen>, Error> forced(
+    OpType o, std::optional<Algorithm> algorithm, std::optional<Direction> direction,
+    std::initializer_list<std::optional<int>> build_fields, std::optional<int> blocks_per_grid,
+    std::optional<int> reduce_scatter_blocks, BUILD_OF build_of) {
+  const bool names_template = templates_of(o) > 1;
+  const bool splits         = o == OpType::all_reduce_add_attn_res_rms_norm;
+  int given = 0, needed = 0;
+  const auto count = [&](bool is_given) {
+    ++needed;
+    given += is_given;
+  };
+  if (names_template) {
+    count(algorithm.has_value());
+    count(direction.has_value());
   }
-  std::optional<Template> fn;
-  if (algorithm) {
-    fn = template_of(o, *algorithm, direction.value_or(Direction::pull));
-    if (!fn) return Error::no_such_template;
-  }
-  if (!launched) return fn ? Forced{{*fn, std::nullopt}} : Forced{};
-  if (!fn && templates_of(o) == 1) fn = only_template(o);
-  if (!fn) return Error::config_without_algorithm;
-  const std::variant<KernelConfig, Error> c =
-      config(LaunchConfig{*threads_per_block, *blocks_per_grid, waves_per_eu.value_or(0)}, *fn);
-  if (const Error* e = std::get_if<Error>(&c)) return *e;
-  return Forced{{*fn, std::get<KernelConfig>(c)}};
+  for (const std::optional<int>& f : build_fields) count(f.has_value());
+  count(blocks_per_grid.has_value());
+  if (splits) count(reduce_scatter_blocks.has_value());
+  if (given == 0 && !algorithm && !direction) return std::optional<Chosen>{};
+  if (given != needed) return Error::forced_incomplete;
+  // THE TEMPLATE: the one an op with one template has, else the algorithm and direction's.
+  const std::optional<Template> fn =
+      names_template ? template_of(o, *algorithm, *direction) : std::optional{only_template(o)};
+  if (!fn || (algorithm && algorithm_of(*fn) != *algorithm) ||
+      (direction && direction_of(*fn) != *direction))
+    return Error::no_such_template;
+  // THE RANGES: whole waves up to the build's maximum threads, a grid of 1 to kMaxBlocks blocks,
+  // waves a EU the CU holds, positive tile fields, a split only on the AttnRes pull.
+  const std::span<const std::optional<int>> f(build_fields.begin(), build_fields.size());
+  const int threads = *f[0], waves = *f[1];
+  if (threads < kWaveSize || threads > kBuild.kernels.max_threads || threads % kWaveSize != 0 ||
+      *blocks_per_grid < 1 || *blocks_per_grid > kMaxBlocks || waves < 1 ||
+      waves > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
+    return Error::launch_out_of_range;
+  for (size_t i = 2; i < f.size(); ++i)
+    if (*f[i] < 1) return Error::field_not_positive;
+  const int split = splits ? *reduce_scatter_blocks : 0;
+  if (split < 0) return Error::field_not_positive;
+  if (split > 0 && *fn != Template::all_reduce_pull_two_shot_add_attn_res_rms_norm)
+    return Error::field_not_this_templates;
+  return std::optional<Chosen>{Chosen{*fn, {build_of(), {*blocks_per_grid, split}}}};
 }
 
-// A FORCED FIELD's value, or 0: the template's own.
-constexpr int own(std::optional<int> v) { return v.value_or(0); }
-
 // =================================================================================================
-// 2. THE PICK.
+// 2. THE PICK: an op's tuned kernel for the call, exactly as listed, or the Error that no listed
+// kernel runs it.
 // =================================================================================================
 
-// A PLAIN ALL-REDUCE: pull one-shot up to 64 KiB, pull two-shot past it, the grid the size of the
-// work up to the links' bandwidth-delay product. The one op not yet tuned into a kernel list:
-// it has no tile, and its grid follows the bytes (the tuner will replace it; PLAN 5.3.12.4.5.2).
-//
 constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b; }
 
-// A TILED OP'S TUNED KERNEL for `rows` rows `hidden` wide at `world` ranks. Among the op's kernels,
-// those at the call's world, else at the nearest tuned world; among those, the call's width, else
-// the nearest tuned width, reading the call's rows as that width's rows of the same bytes (a
-// crossover is about bytes); then the last entry whose rows the call reaches, the first when it
-// reaches none. At a width the entry's tile does not cover (`tile_cols`), its tile_n is left to
-// fitting (the smallest built that covers). A KERNEL THAT SLICES A ROW across the ranks is skipped
-// when not every rank gets columns of it (it would be refused), unless nothing else is tuned
-// there: a plain call takes a kernel that runs it (2026-10-10, AttnRes at 8 columns).
-constexpr TunedKernel pick(OpType o, int world, int64_t m, int64_t n, int64_t tile_cols,
-                           DType dtype) {
+// Among the op's kernels at the call's world (else the nearest tuned world), THOSE THAT RUN THE
+// CALL: a kernel that slices a row needs a pack for every rank (every_rank_gets_columns), and a
+// tile that must hold the row (`tile_cols`, the op's) holds it. Among those, the nearest tuned
+// width, reading the call's rows as that width's rows of the same bytes (a crossover is about
+// bytes); then the entry with the most rows the call reaches, the first listed where two tie, the
+// fewest rows where it reaches none. None runs: a row too wide for every tuned tile, or too narrow
+// for every slicing kernel.
+constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m, int64_t n,
+                                                int64_t tile_cols, DType dtype) {
   const std::span<const TunedKernel> kernels = op(o).kernels;
   int w = 0;
   for (const TunedKernel& k : kernels)
     if (w == 0 || distance(k.world, world) < distance(w, world)) w = k.world;
-  // THE NEAREST TUNED WIDTH WITH A KERNEL THAT RUNS HERE: a row too narrow for a width's slicing
-  // kernels takes the nearest width that lists one that is not, so a plain call is not refused
-  // for a kernel some other width would have picked. Any width when none has one.
-  const auto runs_here = [&](const TunedKernel& k) {
+  const auto columns = [&](const TunedKernel& k) {
     return every_rank_gets_columns(k.fn, n, dtype, world);
   };
-  bool any_runs = false;
-  for (const TunedKernel& k : kernels) any_runs = any_runs || (k.world == w && runs_here(k));
-  // NONE DOES (every listed kernel slices the row, and the row is narrower than the world): the
-  // op's own one-shot, which reads whole rows, at its first build.
-  if (!any_runs)
-    for (const TemplateInfo& t : kTemplates)
-      if (t.op == o && !t.two_shot && !t.configs.empty()) {
-        TunedKernel own{world, m, n, t.fn, t.configs[0]};
-        if (tile_n_of(own.config) < tile_cols) set_tile_n(own.config, 0);
-        return own;
-      }
+  const auto runs = [&](const TunedKernel& k) {
+    return k.world == w && columns(k) && tile_n_of(k.config.build) >= tile_cols;
+  };
   int64_t h = 0;
   for (const TunedKernel& k : kernels)
-    if (k.world == w && (!any_runs || runs_here(k)) && (h == 0 || distance(k.n, n) < distance(h, n)))
-      h = k.n;
-  const int64_t as_rows    = m * n / h;
-  const auto among = [&](bool narrow_ok) {
-    const TunedKernel* first = nullptr;
-    const TunedKernel* found = nullptr;
-    for (const TunedKernel& k : kernels) {
-      if (k.world != w || k.n != h) continue;
-      if (!narrow_ok && !runs_here(k)) continue;
-      if (!first || k.m < first->m) first = &k;
-      if (k.m <= as_rows && (!found || k.m > found->m)) found = &k;
-    }
-    return found ? found : first;
-  };
-  const TunedKernel* runs = among(false);
-  TunedKernel got         = runs ? *runs : *among(true);
-  if (tile_n_of(got.config) < tile_cols) set_tile_n(got.config, 0);
-  return got;
-}
-
-// =================================================================================================
-// 3. THE CONFIG FITTED TO THE CALL.
-// =================================================================================================
-
-// THE TEMPLATE'S OWN CONFIG for a tile of `tile_cols` columns: its first listed config whose tile
-// covers them (its first when none does).
-constexpr KernelConfig default_config(Template t, int64_t tile_cols) {
-  for (const KernelConfig& c : configs_of(t))
-    if (tile_n_of(c) >= tile_cols) return c;
-  return configs_of(t)[0];
-}
-
-// THE SMALLEST BUILT TILE_N covering `n` columns at `c`'s other fields, or 0 when none does (the
-// check refuses it).
-constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t n) {
-  int best = 0;
-  for (const KernelConfig& b : configs_of(t)) {
-    KernelConfig same = c;
-    set_tile_n(same, tile_n_of(b));
-    if (same_build(same, b) && tile_n_of(b) >= n && (best == 0 || tile_n_of(b) < best))
-      best = tile_n_of(b);
+    if (runs(k) && (h == 0 || distance(k.n, n) < distance(h, n))) h = k.n;
+  if (h == 0) {
+    for (const TunedKernel& k : kernels)
+      if (k.world == w && columns(k)) return Error::row_too_wide;
+    return Error::row_narrower_than_world;
   }
-  return best;
+  const int64_t as_rows   = m * n / h;
+  const TunedKernel* most  = nullptr;
+  const TunedKernel* least = nullptr;
+  for (const TunedKernel& k : kernels) {
+    if (!runs(k) || k.n != h) continue;
+    if (!least || k.m < least->m) least = &k;
+    if (k.m <= as_rows && (!most || k.m > most->m)) most = &k;
+  }
+  return most ? *most : *least;
 }
+
+// THE KERNEL A CALL RUNS: the forced one, else the tuned one.
+inline std::variant<Chosen, Error> chosen(const std::variant<std::optional<Chosen>, Error>& forcing,
+                                          OpType o, int world, int64_t m, int64_t n,
+                                          int64_t tile_cols, DType dtype) {
+  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
+  if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing)) return *f;
+  const std::variant<TunedKernel, Error> tuned = pick(o, world, m, n, tile_cols, dtype);
+  if (const Error* e = std::get_if<Error>(&tuned)) return *e;
+  const TunedKernel& k = std::get<TunedKernel>(tuned);
+  return Chosen{k.fn, k.config};
+}
+
+// =================================================================================================
+// 3. THE GRID CUT TO THE WORK: a rule on the launch, never a field filled in.
+// =================================================================================================
 
 // THE TILES THERE ARE, one block's work each: this rank's rows (a row two-shot's share, every row
 // otherwise) in TILE_M, by the grid's `grid_cols` columns in TILE_N. A grid wider is idle blocks,
@@ -874,49 +857,27 @@ constexpr int smallest_tile_n(Template t, const KernelConfig& c, int64_t n) {
 // The GEMM tail's GEMM strides over column tiles, so it is not cut.
 constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m, int64_t grid_cols,
                            int world) {
-  if (gemms(op_of(t))) return launch_of(c).blocks_per_grid;
+  if (gemms(op_of(t))) return c.launch.blocks_per_grid;
   const bool row_split = is_two_shot(t) && !slices_columns(t);
   const int64_t mine   = row_split ? (m + world - 1) / world : m;
-  const int64_t tm = tile_m_of(c), tn = tile_n_of(c);
+  const int64_t tm = tile_m_of(c.build), tn = tile_n_of(c.build);
   return (mine + tm - 1) / tm * ((grid_cols + tn - 1) / tn);
 }
 
-// A TILED KERNEL'S CONFIG FITTED TO THE CALL: a zero field the template's own (another family's
-// config is left for the check to refuse), tile_n the smallest built covering `tile_cols` where
-// none is given, and the grid cut to the tiles there are.
-constexpr KernelConfig fitted(Template t, KernelConfig c, int64_t m, int64_t tile_cols,
-                              int64_t grid_cols, int world) {
-  const KernelConfig own_config = default_config(t, tile_cols);
-  if (c.index() != own_config.index()) return c;
-  std::visit(
-      [&](auto& f) {
-        const auto& o     = std::get<std::decay_t<decltype(f)>>(own_config);
-        const auto filled = [](int& field, int its) {
-          if (field == 0) field = its;
-        };
-        filled(f.launch.threads_per_block, o.launch.threads_per_block);
-        filled(f.launch.blocks_per_grid, o.launch.blocks_per_grid);
-        filled(f.launch.waves_per_eu, o.launch.waves_per_eu);
-        if constexpr (requires { f.tile_m; }) filled(f.tile_m, o.tile_m);
-        if constexpr (requires { f.tile_k; }) filled(f.tile_k, o.tile_k);
-        if constexpr (requires { f.slice_k; }) filled(f.slice_k, o.slice_k);
-        if constexpr (requires { f.reduce_scatter_blocks; })
-          filled(f.reduce_scatter_blocks, o.reduce_scatter_blocks);
-      },
-      c);
-  if (tile_n_of(c) == 0) set_tile_n(c, smallest_tile_n(t, c, tile_cols));
-  if (tile_n_of(c) == 0) return c;
-  const int64_t tiles = tiles_of(t, c, m, grid_cols, world);
-  int& blocks         = launch_of(c).blocks_per_grid;
+// A TILED OP'S GRID, at most the tiles there are (at least one block). THE FUSED ATTNRES PULL'S
+// GRID ALSO DIVIDES ITS TILES: each block's most tiles kept, the blocks cut until every block but
+// the last has that many (384 rows on 256 blocks left half the blocks one row: 32.2 against 27.7
+// us on 192, 2026-10-05T03-45-51Z). The other templates' not yet measured. The plain all-reduce
+// runs its grid as given: its tuned grids were measured as they run.
+constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols, int world) {
+  const int64_t tiles = tiles_of(k.fn, k.config, m, grid_cols, world);
+  int& blocks         = k.config.launch.blocks_per_grid;
   if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
-  // THE FUSED ATTNRES PULL'S GRID DIVIDES ITS TILES: each block's most tiles kept, the blocks cut
-  // until every block but the last has that many (384 rows on 256 blocks left half the blocks one
-  // row: 32.2 against 27.7 us on 192, 2026-10-05T03-45-51Z). The other templates' not yet measured.
-  if (t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm && tiles > 0) {
+  if (k.fn == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm && tiles > 0) {
     const int64_t most = (tiles + blocks - 1) / blocks;
     blocks = static_cast<int>((tiles + most - 1) / most);
   }
-  return c;
+  return k;
 }
 
 // =================================================================================================
@@ -961,15 +922,14 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (!dtype_built(dtype)) return Error::dtype_not_built;
   if (own_error) return own_error;
   if (n * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0) return Error::row_not_packs;
-  const int threads = launch_of(c).threads_per_block;
-  if (c.index() != family_of(fn)) return Error::tile_not_built;
-  if (has_builds(fn) && !built_at(fn, threads)) return Error::threads_not_built;
-  if (has_builds(fn) && !built_at(fn, threads, launch_of(c).waves_per_eu))
-    return Error::waves_not_built;
-  if (has_tiles(fn) && tile_n_of(c) == 0) return Error::row_too_wide;
-  if (has_tiles(fn) && !built(fn, c)) return Error::tile_not_built;
-  if (has_tiles(fn) && tile_n_of(c) < tile_cols) return Error::row_too_wide;
-  if (!gemm_fits(c)) return Error::block_exceeds_lds;
+  // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its threads, its waves, its tile.
+  const int threads = threads_of(c.build);
+  if (c.build.index() != family_of(fn)) return Error::tile_not_built;
+  if (!built_at(fn, threads)) return Error::threads_not_built;
+  if (!built_at(fn, threads, waves_of(c.build))) return Error::waves_not_built;
+  if (!built(fn, c.build)) return Error::tile_not_built;
+  if (tile_n_of(c.build) < tile_cols) return Error::row_too_wide;
+  if (!gemm_fits(c.build)) return Error::block_exceeds_lds;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
   // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with fewer, the ranks past
@@ -995,13 +955,12 @@ constexpr std::optional<Error> weight_refused(DType dtype, DType weight_dtype) {
 // =================================================================================================
 // EACH OP'S SELECT: the op's launch, everything decided, from the call's primitives and its
 // forcing, or the first Error the call meets. Each in four steps: 1. the kernel (the forced
-// template and config, a zero field or a config not forced the template's own; else the op's
-// tuned kernel; fitted to the call), 2. the checks, 3. its compiled instance, 4. the launch.
+// template and config, else the op's tuned kernel, its grid cut to the work), 2. the checks, 3. its
+// compiled instance, 4. the launch.
 // =================================================================================================
 
 // all_reduce: the sum of every rank's `inp` ([rows, cols] of `dtype` at its strides) into `out`.
-// Its launch, where not forced, is derived from the bytes, its tile the flat walk's until tuned. In
-// place when the peers can read the input where it is (registered, or captured on this stream),
+// In place when the peers can read the input where it is (registered, or captured on this stream),
 // otherwise its staged kernel, a band of rows a pass.
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
@@ -1009,36 +968,19 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  const int world     = h.world_size();
-  // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(OpType::all_reduce, algorithm, direction, threads_per_block, blocks_per_grid,
-             waves_per_eu, {tile_m, tile_n},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceConfig{l, own(tile_m), own(tile_n)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f = std::get<Forced>(forcing);
-  // The tuned kernel, its tile_n kept narrower than the row: the all-reduce tiles across it.
-  const TunedKernel tuned = pick(OpType::all_reduce, world, m, n, 0, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  KernelConfig c          = !f ? tuned.config
-                            : f->second ? *f->second
-                                        : AllReduceConfig{{0, 0, 1}, 0, 0};
-  // A FORCED CALL'S BLANK FIELDS: its launch the tuned kernel's where that is the forced template,
-  // else the template's first build's, and its grid the tuned kernel's at this size (the listed
-  // configs leave the grid to the size); then its tile the build's AT ITS THREADS AND WAVES, so a
-  // thread's share is the template's (a tile from another thread count is a build that does not
-  // exist). The tuned config runs as it was measured.
-  const KernelConfig first = tuned.fn == fn ? tuned.config : configs_of(fn)[0];
-  LaunchConfig& g          = launch_of(c);
-  if (g.threads_per_block == 0) g.threads_per_block = launch_of(first).threads_per_block;
-  if (g.blocks_per_grid == 0) g.blocks_per_grid = launch_of(tuned.config).blocks_per_grid;
-  if (g.waves_per_eu == 0) g.waves_per_eu = launch_of(first).waves_per_eu;
-  const KernelConfig own = build_at(fn, g.threads_per_block, g.waves_per_eu);
-  AllReduceConfig& a     = std::get<AllReduceConfig>(c);
-  if (a.tile_m == 0) a.tile_m = std::get<AllReduceConfig>(own).tile_m;
-  if (a.tile_n == 0) a.tile_n = tile_n_of(own);
+  const int world = h.world_size();
+  // 1. The tile does not hold the row: the all-reduce tiles across it.
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(OpType::all_reduce, algorithm, direction,
+             {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n};
+             }),
+      OpType::all_reduce, world, m, n, 0, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Template fn        = std::get<Chosen>(picked).fn;
+  const KernelConfig c     = std::get<Chosen>(picked).config;
+  const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
   const bool staged = !h.reads_in_place(inp, stream);
   // THE STAGED BAND: the rows a pass, what the staging holds (and the two-shot's scratch, a row of
   // its slice a row).
@@ -1063,9 +1005,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       constexpr int NL = traits<T>::N;
       switch (fn) {
         case Template::all_reduce_pull_one_shot:
-          by_config<Template::all_reduce_pull_one_shot>(c, [&](auto built) {
-            constexpr AllReduceConfig C = decltype(built)::value;
-            constexpr int THREADS = C.launch.threads_per_block, WAVES = C.launch.waves_per_eu;
+          by_build<Template::all_reduce_pull_one_shot>(c.build, [&](auto built) {
+            constexpr AllReduceBuildConfig C = decltype(built)::value;
+            constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
             if constexpr (THREADS % TM == 0 && TN % (NL * (THREADS / TM)) == 0)
               kernel = staged ? instance<AllReduceOneShotStagedKernel>(
@@ -1075,9 +1017,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
           });
           return;
         case Template::all_reduce_pull_two_shot:
-          by_config<Template::all_reduce_pull_two_shot>(c, [&](auto built) {
-            constexpr AllReduceConfig C = decltype(built)::value;
-            constexpr int THREADS = C.launch.threads_per_block, WAVES = C.launch.waves_per_eu;
+          by_build<Template::all_reduce_pull_two_shot>(c.build, [&](auto built) {
+            constexpr AllReduceBuildConfig C = decltype(built)::value;
+            constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
             if constexpr (THREADS % NG == 0 && TN % (NL * (THREADS / NG)) == 0)
               kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
@@ -1098,9 +1040,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                           .world             = world,
                           .tile_m            = a.tile_m,
                           .tile_n            = a.tile_n,
-                          .threads_per_block = g.threads_per_block,
-                          .blocks_per_grid   = g.blocks_per_grid,
-                          .waves_per_eu      = g.waves_per_eu,
+                          .threads_per_block = a.threads_per_block,
+                          .blocks_per_grid   = c.launch.blocks_per_grid,
+                          .waves_per_eu      = a.waves_per_eu,
                           .staged            = staged,
                           .stream            = stream,
                           .out               = out,
@@ -1135,18 +1077,14 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   const OpType op = OpType::all_reduce_rms_norm;
   const int world = h.world_size();
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_m, tile_n},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceRmsNormConfig{l, own(tile_m), own(tile_n)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
+             std::nullopt, [&] { return AllReduceRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
                                              weight_refused(dtype, weight_dtype), inp, false,
@@ -1162,26 +1100,26 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
         using W = typename decltype(w)::t;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm:
-            return by_config<K::all_reduce_pull_one_shot_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_pull_one_shot_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceRmsNormOneShotKernel>(
                   all_reduce_pull_one_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_pull_two_shot_rms_norm:
-            return by_config<K::all_reduce_pull_two_shot_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_pull_two_shot_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceRmsNormTwoShotKernel>(
                   all_reduce_pull_two_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_push_two_shot_rms_norm:
-            return by_config<K::all_reduce_push_two_shot_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_push_two_shot_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceRmsNormTwoShotKernel>(
                   all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
@@ -1191,16 +1129,16 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
     });
   });
   // 4.
-  const AllReduceRmsNormConfig& r = std::get<AllReduceRmsNormConfig>(c);
+  const AllReduceRmsNormBuildConfig& r = std::get<AllReduceRmsNormBuildConfig>(c.build);
   const AllReduceRmsNormLaunch l{.kernel            = kernel,
                                  .algorithm         = algorithm_of(fn),
                                  .direction         = direction_of(fn),
                                  .world             = world,
                                  .tile_m            = r.tile_m,
                                  .tile_n            = r.tile_n,
-                                 .threads_per_block = r.launch.threads_per_block,
-                                 .blocks_per_grid   = r.launch.blocks_per_grid,
-                                 .waves_per_eu      = r.launch.waves_per_eu,
+                                 .threads_per_block = r.threads_per_block,
+                                 .blocks_per_grid   = c.launch.blocks_per_grid,
+                                 .waves_per_eu      = r.waves_per_eu,
                                  .stream            = stream,
                                  .out               = out,
                                  .out_stride_m      = out_stride_m,
@@ -1237,18 +1175,14 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
   const OpType op = OpType::all_reduce_add_rms_norm;
   const int world = h.world_size();
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_m, tile_n},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceAddRmsNormConfig{l, own(tile_m), own(tile_n)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
+             std::nullopt, [&] { return AllReduceAddRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
                                              weight_refused(dtype, weight_dtype), inp, false,
@@ -1264,26 +1198,26 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
         using W = typename decltype(w)::t;
         switch (fn) {
           case K::all_reduce_pull_one_shot_add_rms_norm:
-            return by_config<K::all_reduce_pull_one_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceAddRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_pull_one_shot_add_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceAddRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormOneShotKernel>(
                   all_reduce_pull_one_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_pull_two_shot_add_rms_norm:
-            return by_config<K::all_reduce_pull_two_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceAddRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_pull_two_shot_add_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceAddRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormTwoShotKernel>(
                   all_reduce_pull_two_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
           case K::all_reduce_push_two_shot_add_rms_norm:
-            return by_config<K::all_reduce_push_two_shot_add_rms_norm>(c, [&](auto cc) {
-              constexpr AllReduceAddRmsNormConfig C = decltype(cc)::value;
-              constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+            return by_build<K::all_reduce_push_two_shot_add_rms_norm>(c.build, [&](auto cc) {
+              constexpr AllReduceAddRmsNormBuildConfig C = decltype(cc)::value;
+              constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
               kernel = instance<AllReduceAddRmsNormTwoShotKernel>(
                   all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB, WPE>);
             });
@@ -1293,16 +1227,16 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
     });
   });
   // 4.
-  const AllReduceAddRmsNormConfig& r = std::get<AllReduceAddRmsNormConfig>(c);
+  const AllReduceAddRmsNormBuildConfig& r = std::get<AllReduceAddRmsNormBuildConfig>(c.build);
   const AllReduceAddRmsNormLaunch l{.kernel            = kernel,
                                     .algorithm         = algorithm_of(fn),
                                     .direction         = direction_of(fn),
                                     .world             = world,
                                     .tile_m            = r.tile_m,
                                     .tile_n            = r.tile_n,
-                                    .threads_per_block = r.launch.threads_per_block,
-                                    .blocks_per_grid   = r.launch.blocks_per_grid,
-                                    .waves_per_eu      = r.launch.waves_per_eu,
+                                    .threads_per_block = r.threads_per_block,
+                                    .blocks_per_grid   = c.launch.blocks_per_grid,
+                                    .waves_per_eu      = r.waves_per_eu,
                                     .stream            = stream,
                                     .out               = out,
                                     .out_stride_m      = out_stride_m,
@@ -1352,23 +1286,14 @@ select_all_reduce_add_attn_res_rms_norm(
   const OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   const int world = h.world_size();
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
-             {tile_m, tile_n, tile_k, reduce_scatter_blocks},
-             [&](LaunchConfig l, Template t) -> std::variant<KernelConfig, Error> {
-               // Not a build's: a template without the field would ignore it.
-               if (reduce_scatter_blocks && t != K::all_reduce_pull_two_shot_add_attn_res_rms_norm)
-                 return Error::field_not_this_templates;
-               return AllReduceAddAttnResRmsNormConfig{l, own(tile_m), own(tile_n), own(tile_k),
-                                                       own(reduce_scatter_blocks)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k}, blocks_per_grid,
+             reduce_scatter_blocks, [&] { return AllReduceAddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
@@ -1381,10 +1306,10 @@ select_all_reduce_add_attn_res_rms_norm(
       using T = typename decltype(t)::t;
       switch (fn) {
         case K::all_reduce_pull_one_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_pull_one_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AllReduceAddAttnResRmsNormConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+          return by_build<K::all_reduce_pull_one_shot_add_attn_res_rms_norm>(c.build, [&](auto cc) {
+            constexpr AllReduceAddAttnResRmsNormBuildConfig C = decltype(cc)::value;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN,
@@ -1394,11 +1319,11 @@ select_all_reduce_add_attn_res_rms_norm(
                                                                               TK, TPB, WPE>);
           });
         case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AllReduceAddAttnResRmsNormConfig C = decltype(cc)::value;
+          return by_build<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(c.build, [&](auto cc) {
+            constexpr AllReduceAddAttnResRmsNormBuildConfig C = decltype(cc)::value;
             constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
-                          TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+                          TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormPullKernel>(
                                all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN,
@@ -1408,10 +1333,10 @@ select_all_reduce_add_attn_res_rms_norm(
                                                                               TN, TK, TPB, WPE>);
           });
         case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
-          return by_config<K::all_reduce_push_two_shot_add_attn_res_rms_norm>(c, [&](auto cc) {
-            constexpr AllReduceAddAttnResRmsNormConfig C = decltype(cc)::value;
-            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+          return by_build<K::all_reduce_push_two_shot_add_attn_res_rms_norm>(c.build, [&](auto cc) {
+            constexpr AllReduceAddAttnResRmsNormBuildConfig C = decltype(cc)::value;
+            constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
             kernel = has_prefix
                          ? instance<AllReduceAddAttnResRmsNormPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN,
@@ -1425,19 +1350,18 @@ select_all_reduce_add_attn_res_rms_norm(
     });
   });
   // 4.
-  const AllReduceAddAttnResRmsNormConfig& a = std::get<AllReduceAddAttnResRmsNormConfig>(c);
-  const LaunchConfig& g                      = launch_of(c);
-  const int tm = a.tile_m, tk = a.tile_k, rs = a.reduce_scatter_blocks;
+  const AllReduceAddAttnResRmsNormBuildConfig& a = std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
+  const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
   const AllReduceAddAttnResRmsNormLaunch l{.kernel                = kernel,
                                            .algorithm             = algorithm_of(fn),
                                            .direction             = direction_of(fn),
                                            .world                 = world,
                                            .tile_m                = tm,
-                                           .tile_n                = tile_n_of(c),
+                                           .tile_n                = a.tile_n,
                                            .tile_k                = tk,
-                                           .threads_per_block     = g.threads_per_block,
-                                           .blocks_per_grid       = g.blocks_per_grid,
-                                           .waves_per_eu          = g.waves_per_eu,
+                                           .threads_per_block     = a.threads_per_block,
+                                           .blocks_per_grid       = c.launch.blocks_per_grid,
+                                           .waves_per_eu          = a.waves_per_eu,
                                            .reduce_scatter_blocks = rs,
                                            .stream                = stream,
                                            .prefix                = prefix,
@@ -1491,19 +1415,14 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
   const OpType op = OpType::all_reduce_rms_norm_gemm;
   const int world = h.world_size();
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
-             {tile_m, tile_n, tile_k, slice_k},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceRmsNormGemmConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k}, blocks_per_grid,
+             std::nullopt, [&] { return AllReduceRmsNormGemmBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k, *slice_k}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
@@ -1514,11 +1433,11 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
     constexpr int NG = decltype(ng)::value;
     by_dtype(dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm>(c, [&](auto cc) {
-        constexpr AllReduceRmsNormGemmConfig C = decltype(cc)::value;
+      by_build<K::all_reduce_pull_one_shot_rms_norm_gemm>(c.build, [&](auto cc) {
+        constexpr AllReduceRmsNormGemmBuildConfig C = decltype(cc)::value;
         constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+                      TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm:
             kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
@@ -1534,7 +1453,7 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
     });
   });
   // 4.
-  const AllReduceRmsNormGemmConfig& g = std::get<AllReduceRmsNormGemmConfig>(c);
+  const AllReduceRmsNormGemmBuildConfig& g = std::get<AllReduceRmsNormGemmBuildConfig>(c.build);
   const AllReduceRmsNormGemmLaunch l{.kernel            = kernel,
                                      .algorithm         = algorithm_of(fn),
                                      .direction         = direction_of(fn),
@@ -1543,9 +1462,9 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
                                      .tile_n            = g.tile_n,
                                      .tile_k            = g.tile_k,
                                      .slice_k           = g.slice_k,
-                                     .threads_per_block = g.launch.threads_per_block,
-                                     .blocks_per_grid   = g.launch.blocks_per_grid,
-                                     .waves_per_eu      = g.launch.waves_per_eu,
+                                     .threads_per_block = g.threads_per_block,
+                                     .blocks_per_grid   = c.launch.blocks_per_grid,
+                                     .waves_per_eu      = g.waves_per_eu,
                                      .stream            = stream,
                                      .out               = out,
                                      .out_stride_m = out_stride_m,
@@ -1589,19 +1508,14 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
   const OpType op = OpType::all_reduce_rms_norm_gemm_add;
   const int world = h.world_size();
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu,
-             {tile_m, tile_n, tile_k, slice_k},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceRmsNormGemmAddConfig{l, own(tile_m), own(tile_n), own(tile_k), own(slice_k)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k}, blocks_per_grid,
+             std::nullopt, [&] { return AllReduceRmsNormGemmAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k, *slice_k}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
@@ -1612,11 +1526,11 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     constexpr int NG = decltype(ng)::value;
     by_dtype(dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      by_config<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c, [&](auto cc) {
-        constexpr AllReduceRmsNormGemmAddConfig C = decltype(cc)::value;
+      by_build<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c.build, [&](auto cc) {
+        constexpr AllReduceRmsNormGemmAddBuildConfig C = decltype(cc)::value;
         constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+                      TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_norm_gemm_add:
             kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
@@ -1632,7 +1546,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     });
   });
   // 4.
-  const AllReduceRmsNormGemmAddConfig& g = std::get<AllReduceRmsNormGemmAddConfig>(c);
+  const AllReduceRmsNormGemmAddBuildConfig& g = std::get<AllReduceRmsNormGemmAddBuildConfig>(c.build);
   const AllReduceRmsNormGemmAddLaunch l{.kernel            = kernel,
                                         .algorithm         = algorithm_of(fn),
                                         .direction         = direction_of(fn),
@@ -1641,9 +1555,9 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
                                         .tile_n            = g.tile_n,
                                         .tile_k            = g.tile_k,
                                         .slice_k           = g.slice_k,
-                                        .threads_per_block = g.launch.threads_per_block,
-                                        .blocks_per_grid   = g.launch.blocks_per_grid,
-                                        .waves_per_eu      = g.launch.waves_per_eu,
+                                        .threads_per_block = g.threads_per_block,
+                                        .blocks_per_grid   = c.launch.blocks_per_grid,
+                                        .waves_per_eu      = g.waves_per_eu,
                                         .stream            = stream,
                                         .out               = out,
                                         .out_stride_m = out_stride_m,
@@ -1688,19 +1602,14 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   const int world   = h.world_size();
   const int64_t row = 2 * n + latent_size_n;
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_m, tile_n},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AllReduceRmsScaleAddConfig{l, own(tile_m), own(tile_n)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, row, latent_size_n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m,
-             latent_size_n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
+             std::nullopt, [&] { return AllReduceRmsScaleAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      op, world, m, row, latent_size_n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   const int e = elem_bytes(dtype);
   const std::optional<Error> widths =
@@ -1719,10 +1628,10 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
     constexpr int NG = decltype(ng)::value;
     by_dtype(dtype, [&](auto t) {
       using T = typename decltype(t)::t;
-      by_config<K::all_reduce_pull_one_shot_rms_scale_add>(c, [&](auto cc) {
-        constexpr AllReduceRmsScaleAddConfig C = decltype(cc)::value;
-        constexpr int TN = C.tile_n, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+      by_build<K::all_reduce_pull_one_shot_rms_scale_add>(c.build, [&](auto cc) {
+        constexpr AllReduceRmsScaleAddBuildConfig C = decltype(cc)::value;
+        constexpr int TN = C.tile_n, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
         switch (fn) {
           case K::all_reduce_pull_one_shot_rms_scale_add:
             kernel = instance<AllReduceRmsScaleAddOneShotKernel>(
@@ -1738,16 +1647,16 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
     });
   });
   // 4.
-  const AllReduceRmsScaleAddConfig& r = std::get<AllReduceRmsScaleAddConfig>(c);
+  const AllReduceRmsScaleAddBuildConfig& r = std::get<AllReduceRmsScaleAddBuildConfig>(c.build);
   const AllReduceRmsScaleAddLaunch l{.kernel            = kernel,
                                      .algorithm         = algorithm_of(fn),
                                      .direction         = direction_of(fn),
                                      .world             = world,
                                      .tile_m            = r.tile_m,
                                      .tile_n            = r.tile_n,
-                                     .threads_per_block = r.launch.threads_per_block,
-                                     .blocks_per_grid   = r.launch.blocks_per_grid,
-                                     .waves_per_eu      = r.launch.waves_per_eu,
+                                     .threads_per_block = r.threads_per_block,
+                                     .blocks_per_grid   = c.launch.blocks_per_grid,
+                                     .waves_per_eu      = r.waves_per_eu,
                                      .stream            = stream,
                                      .out               = out,
                                      .out_stride_m      = out_stride_m,
@@ -1786,19 +1695,14 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
   const OpType op = OpType::add_attn_res_rms_norm;
   const int world = 1;
   // 1.
-  const std::variant<Forced, Error> forcing =
-      forced(op, std::nullopt, std::nullopt, threads_per_block, blocks_per_grid, waves_per_eu,
-             {tile_m, tile_n, tile_k},
-             [&](LaunchConfig l, Template) -> std::variant<KernelConfig, Error> {
-               return AddAttnResRmsNormConfig{l, own(tile_m), own(tile_n), own(tile_k)};
-             });
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, n, n, dtype);
-  const Template fn       = f ? f->first : tuned.fn;
-  const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n,
-             n, world);
+  const std::variant<Chosen, Error> picked = chosen(
+      forced(op, std::nullopt, std::nullopt, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k}, blocks_per_grid,
+             std::nullopt, [&] { return AddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k}; }),
+      op, world, m, n, n, dtype);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Template fn     = k.fn;
+  const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, m, n, n,
                                              std::nullopt, delta, false, stream))
@@ -1807,15 +1711,15 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
   const void* kernel = nullptr;
   by_dtype(dtype, [&](auto t) {
     using T = typename decltype(t)::t;
-    by_config<Template::add_attn_res_rms_norm>(c, [&](auto cc) {
-      constexpr AddAttnResRmsNormConfig C = decltype(cc)::value;
-      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.launch.threads_per_block,
-                WPE = C.launch.waves_per_eu;
+    by_build<Template::add_attn_res_rms_norm>(c.build, [&](auto cc) {
+      constexpr AddAttnResRmsNormBuildConfig C = decltype(cc)::value;
+      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
+                WPE = C.waves_per_eu;
       kernel = instance<AddAttnResRmsNormKernel>(add_attn_res_rms_norm<T, TN, TK, TPB, WPE>);
     });
   });
   // 4.
-  const AddAttnResRmsNormConfig& a = std::get<AddAttnResRmsNormConfig>(c);
+  const AddAttnResRmsNormBuildConfig& a = std::get<AddAttnResRmsNormBuildConfig>(c.build);
   return AddAttnResRmsNormLaunch{.kernel            = kernel,
                                  .algorithm         = algorithm_of(fn),
                                  .direction         = direction_of(fn),
@@ -1823,9 +1727,9 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
                                  .tile_m            = a.tile_m,
                                  .tile_n            = a.tile_n,
                                  .tile_k            = a.tile_k,
-                                 .threads_per_block = a.launch.threads_per_block,
-                                 .blocks_per_grid   = a.launch.blocks_per_grid,
-                                 .waves_per_eu      = a.launch.waves_per_eu,
+                                 .threads_per_block = a.threads_per_block,
+                                 .blocks_per_grid   = c.launch.blocks_per_grid,
+                                 .waves_per_eu      = a.waves_per_eu,
                                  .stream            = stream,
                                  .prefix            = prefix,
                                  .prefix_stride_m   = prefix_stride_m,
@@ -1922,23 +1826,20 @@ inline std::variant<LinkTrafficLaunch, Error> select_link_traffic(
 }  // namespace experimental
 
 // =================================================================================================
-// EVERY TUNED SELECTION FITS, for every tiled op at the smallest call and a large one: an op never
-// declines (a fusion that is on runs its fused op), and a kernel past a capability is a compile
-// error, not one that overruns its signal slots or register arrays.
+// EVERY TUNED SELECTION FITS, for every op at the smallest call (8 columns on 2 ranks: narrower than
+// any slicing kernel takes) and a large one: an op never declines (a fusion that is on runs its
+// fused op), and a kernel past a capability is a compile error, not one that overruns its signal
+// slots.
 // =================================================================================================
 
-constexpr bool fits(Template fn, const KernelConfig& c) {
-  const LaunchConfig& l = launch_of(c);
-  if (l.blocks_per_grid < 1 || l.blocks_per_grid > kMaxBlocks) return false;
-  if (has_tiles(fn) && tile_n_of(c) == 0) return false;
-  const int t = l.threads_per_block;
-  return t >= kWaveSize && t <= kBuild.kernels.max_threads && t % kWaveSize == 0;
-}
-// The tuned kernel for `rows` rows of `row` elements, fitted.
+// The tuned kernel for `m` rows of `row` elements, cut to the work: picked, and launchable.
 constexpr bool tuned_fits(OpType o, int world, int64_t m, int64_t row, int64_t tile_cols,
                           int64_t grid_cols) {
-  const TunedKernel t = pick(o, world, m, row, tile_cols, DType::bf16);
-  return fits(t.fn, fitted(t.fn, t.config, m, tile_cols, grid_cols, world));
+  const std::variant<TunedKernel, Error> t = pick(o, world, m, row, tile_cols, DType::bf16);
+  if (std::holds_alternative<Error>(t)) return false;
+  const TunedKernel& k = std::get<TunedKernel>(t);
+  const Chosen cut     = cut_to_the_work(Chosen{k.fn, k.config}, m, grid_cols, world);
+  return launch_fits(cut.fn, cut.config.launch);
 }
 constexpr bool selections_fit() {
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
@@ -1955,9 +1856,9 @@ constexpr bool selections_fit() {
                     n))
       return false;
     if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, m, n, n, n)) return false;
-    // The plain all-reduce's tuned kernel, as measured (no fitting).
-    const TunedKernel ar = pick(OpType::all_reduce, w, m, n, 0, DType::bf16);
-    if (!fits(ar.fn, ar.config)) return false;
+    // The plain all-reduce's tuned kernel, as measured (its grid not cut).
+    if (std::holds_alternative<Error>(pick(OpType::all_reduce, w, m, n, 0, DType::bf16)))
+      return false;
   }
   return true;
 }

@@ -48,20 +48,17 @@ enum class Error : int {
   groups_disagree = 23,
   threads_not_built = 24,
   tile_not_built = 25,
-  direction_without_algorithm = 26,
-  config_without_algorithm = 27,
-  launch_incomplete = 28,
-  launch_out_of_range = 29,
-  field_without_launch = 30,
-  field_not_positive = 31,
-  field_not_this_templates = 32,
-  probe_out_of_range = 33,
-  waves_not_built = 34,
-  inner_stride_not_one = 35,
-  row_stride_not_packs = 36,
-  row_narrower_than_world = 37,
+  launch_out_of_range = 26,
+  field_not_positive = 27,
+  field_not_this_templates = 28,
+  probe_out_of_range = 29,
+  waves_not_built = 30,
+  inner_stride_not_one = 31,
+  row_stride_not_packs = 32,
+  row_narrower_than_world = 33,
+  forced_incomplete = 34,
 };
-constexpr int kNumErrors = 38;
+constexpr int kNumErrors = 35;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -110,19 +107,9 @@ constexpr const char* to_string(Error e) {
       return "waves_not_built: no build of the template at that block size has those waves a EU";
     case Error::tile_not_built:
       return "tile_not_built: no build of the template has that TILE_M or TILE_N";
-    case Error::direction_without_algorithm:
-      return "direction_without_algorithm: a forced direction needs its algorithm";
-    case Error::config_without_algorithm:
-      return "config_without_algorithm: a forced config needs its algorithm where the op has "
-             "more than one template";
-    case Error::launch_incomplete:
-      return "launch_incomplete: a forced launch gives threads_per_block and blocks_per_grid "
-             "together";
     case Error::launch_out_of_range:
       return "launch_out_of_range: threads_per_block is whole waves up to the build's maximum, "
              "blocks_per_grid at least 1 and at most the resident maximum";
-    case Error::field_without_launch:
-      return "field_without_launch: a forced config field needs its launch";
     case Error::field_not_positive:
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
@@ -136,6 +123,9 @@ constexpr const char* to_string(Error e) {
     case Error::row_narrower_than_world:
       return "row_narrower_than_world: a two-shot row has fewer packs than ranks, so a rank's "
              "slice is empty";
+    case Error::forced_incomplete:
+      return "forced_incomplete: a forced call gives every field of its config (the template, "
+             "its build and its launch) or none";
   }
   return "unknown";
 }
@@ -186,108 +176,120 @@ enum class OpType : int {
   add_attn_res_rms_norm            = 7,  // experimental: no all-reduce
 };
 
-// HOW A KERNEL IS LAUNCHED: its block's threads (Triton's num_warps x 64), its grid, and the waves
-// a SIMD (an EU) the compiler fits its registers to (__launch_bounds__'s second value, Triton's
-// waves_per_eu; 1 asks nothing). Every kernel has one; the grid is the launch's alone, never
-// compiled in.
-struct LaunchConfig {
-  int threads_per_block;
-  int blocks_per_grid;
-  int waves_per_eu;
-};
-
-// EACH API'S CONFIG, Triton's autotune config: one a public op (interface.cuh), shared by every
-// template of that op, its launch and its own fields. Every config has the tile, TILE_M rows x
-// TILE_N columns in elements (tile_n 0 when no build holds the call's row, which check refuses; a
-// template building only TILE_M 1 refuses another, as any tile it does not build); TILE_K is the
-// reduced dimension a step (the GEMM's K a pass, AttnRes's sources a step); SLICE_K lanes
-// splitting one output's K (CUTLASS's sliced-K). Every field is compiled in except the launch's
-// grid and reduce_scatter_blocks.
+// A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what is compiled in (one
+// of the builds its template lists, select.cuh), and its LAUNCH, what is chosen at each call. A
+// tuned kernel holds both, a forced call gives both, and select hands both to the launch; no
+// field is ever 0 for "left to someone else".
+//
+// EACH OP'S BUILD, Triton's autotune config less the grid: the block's threads (Triton's num_warps
+// x 64), the waves a SIMD (an EU) the compiler fits its registers to (__launch_bounds__'s second
+// value, Triton's waves_per_eu; 1 asks nothing), and the tile, TILE_M rows x TILE_N columns in
+// elements; TILE_K is the reduced dimension a step (the GEMM's K a pass, AttnRes's sources a
+// step) and SLICE_K the lanes splitting one output's K (CUTLASS's sliced-K). One type an op, so a
+// config cannot cross ops, though three hold the same fields.
 // all_reduce: a tile a work item, the grid striding over the buffer's.
-struct AllReduceConfig {
-  LaunchConfig launch;
+struct AllReduceBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
+  bool operator==(const AllReduceBuildConfig&) const = default;
 };
 // all_reduce_rms_norm.
-struct AllReduceRmsNormConfig {
-  LaunchConfig launch;
+struct AllReduceRmsNormBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
+  bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_rms_norm.
-struct AllReduceAddRmsNormConfig {
-  LaunchConfig launch;
+struct AllReduceAddRmsNormBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
+  bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
 };
-// all_reduce_add_attn_res_rms_norm: TILE_K sources a step; the pull two-shot's reduce-scatter on
-// the grid's first `reduce_scatter_blocks` blocks (its reads queue behind the links past a few
-// dozen; AttnRes after it on every block), 0 on the one-shot and push.
-struct AllReduceAddAttnResRmsNormConfig {
-  LaunchConfig launch;
+// all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
+struct AllReduceAddAttnResRmsNormBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
   int tile_k;
-  int reduce_scatter_blocks;
+  bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 // all_reduce_rms_norm_gemm.
-struct AllReduceRmsNormGemmConfig {
-  LaunchConfig launch;
+struct AllReduceRmsNormGemmBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
   int tile_k;
   int slice_k;
+  bool operator==(const AllReduceRmsNormGemmBuildConfig&) const = default;
 };
 // all_reduce_rms_norm_gemm_add.
-struct AllReduceRmsNormGemmAddConfig {
-  LaunchConfig launch;
+struct AllReduceRmsNormGemmAddBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
   int tile_k;
   int slice_k;
+  bool operator==(const AllReduceRmsNormGemmAddBuildConfig&) const = default;
 };
 // all_reduce_rms_scale_add.
-struct AllReduceRmsScaleAddConfig {
-  LaunchConfig launch;
+struct AllReduceRmsScaleAddBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
+  bool operator==(const AllReduceRmsScaleAddBuildConfig&) const = default;
 };
 // add_attn_res_rms_norm (experimental): TILE_K sources a step.
-struct AddAttnResRmsNormConfig {
-  LaunchConfig launch;
+struct AddAttnResRmsNormBuildConfig {
+  int threads_per_block;
+  int waves_per_eu;
   int tile_m;
   int tile_n;
   int tile_k;
+  bool operator==(const AddAttnResRmsNormBuildConfig&) const = default;
 };
-using KernelConfig =
-    std::variant<AllReduceConfig, AllReduceRmsNormConfig, AllReduceAddRmsNormConfig,
-                 AllReduceAddAttnResRmsNormConfig, AllReduceRmsNormGemmConfig,
-                 AllReduceRmsNormGemmAddConfig, AllReduceRmsScaleAddConfig,
-                 AddAttnResRmsNormConfig>;
+using BuildConfig =
+    std::variant<AllReduceBuildConfig, AllReduceRmsNormBuildConfig, AllReduceAddRmsNormBuildConfig,
+                 AllReduceAddAttnResRmsNormBuildConfig, AllReduceRmsNormGemmBuildConfig,
+                 AllReduceRmsNormGemmAddBuildConfig, AllReduceRmsScaleAddBuildConfig,
+                 AddAttnResRmsNormBuildConfig>;
 
-// THE FIELDS EVERY CONFIG SHARES: its launch and its tile.
-constexpr const LaunchConfig& launch_of(const KernelConfig& c) {
-  return std::visit([](const auto& f) -> const LaunchConfig& { return f.launch; }, c);
+// A KERNEL'S LAUNCH: its grid, never compiled in, and the blocks of it the fused AttnRes pull
+// two-shot gives its reduce-scatter (its reads queue behind the links past a few dozen; AttnRes
+// after it on every block). reduce_scatter_blocks 0 is no split, every block both: the only value
+// any other kernel takes.
+struct LaunchConfig {
+  int blocks_per_grid;
+  int reduce_scatter_blocks;
+};
+
+// THE COMPLETE CONFIG: the build and the launch.
+struct KernelConfig {
+  BuildConfig build;
+  LaunchConfig launch;
+};
+
+// THE FIELDS EVERY BUILD HAS.
+constexpr int threads_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.threads_per_block; }, b);
 }
-constexpr LaunchConfig& launch_of(KernelConfig& c) {
-  return std::visit([](auto& f) -> LaunchConfig& { return f.launch; }, c);
+constexpr int waves_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.waves_per_eu; }, b);
 }
-constexpr int tile_m_of(const KernelConfig& c) {
-  return std::visit([](const auto& f) { return f.tile_m; }, c);
+constexpr int tile_m_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.tile_m; }, b);
 }
-constexpr int tile_n_of(const KernelConfig& c) {
-  return std::visit([](const auto& f) { return f.tile_n; }, c);
-}
-constexpr void set_tile_n(KernelConfig& c, int n) {
-  std::visit([&](auto& f) { f.tile_n = n; }, c);
-}
-// FAMILY `i`'S CONFIG WITH EVERY FIELD 0: a forced template's own, all left to it.
-template <size_t FAMILY_INDEX = 0>
-constexpr KernelConfig zero_config(size_t family) {
-  if constexpr (FAMILY_INDEX + 1 < std::variant_size_v<KernelConfig>)
-    if (family != FAMILY_INDEX) return zero_config<FAMILY_INDEX + 1>(family);
-  return KernelConfig{std::in_place_index<FAMILY_INDEX>};
+constexpr int tile_n_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.tile_n; }, b);
 }
 
 

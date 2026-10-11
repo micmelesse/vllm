@@ -118,18 +118,15 @@ class Error(IntEnum):
     groups_disagree = 23
     threads_not_built = 24
     tile_not_built = 25
-    direction_without_algorithm = 26
-    config_without_algorithm = 27
-    launch_incomplete = 28
-    launch_out_of_range = 29
-    field_without_launch = 30
-    field_not_positive = 31
-    field_not_this_templates = 32
-    probe_out_of_range = 33
-    waves_not_built = 34
-    inner_stride_not_one = 35
-    row_stride_not_packs = 36
-    row_narrower_than_world = 37
+    launch_out_of_range = 26
+    field_not_positive = 27
+    field_not_this_templates = 28
+    probe_out_of_range = 29
+    waves_not_built = 30
+    inner_stride_not_one = 31
+    row_stride_not_packs = 32
+    row_narrower_than_world = 33
+    forced_incomplete = 34
 
 
 class Where(IntEnum):

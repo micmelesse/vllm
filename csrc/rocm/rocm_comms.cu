@@ -412,30 +412,27 @@ BuildInfoWire rocm_comms_build_info() {
     errors.push_back(s.substr(0, s.find(':')));
   }
   for (int i = 1; i <= kNumWheres; ++i) wheres.push_back(to_string(static_cast<Where>(i)));
-  // Each template's op, and its configs (what dispatch instantiates: the
-  // tuner's search space), flat: a config's fields in `fields`' order, 0 where its family has
-  // none.
-  const Names fields = {"tile_m",  "tile_n", "tile_k", "slice_k", "reduce_scatter_blocks",
-                        "threads_per_block", "blocks_per_grid", "waves_per_eu"};
+  // Each template's op, and its builds (what dispatch instantiates: the tuner's search space),
+  // flat: a build's fields in `fields`' order, 0 where its op's BuildConfig has none (every field
+  // it has is set). The launch is not a build's: a forced call gives its own grid.
+  const Names fields = {"tile_m", "tile_n", "tile_k", "slice_k", "threads_per_block",
+                        "waves_per_eu"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
     templates.push_back(t.name);
     template_ops.push_back(to_string(op_of(t.fn)));
-    counts.push_back(static_cast<int64_t>(t.configs.size()));
-    for (const KernelConfig& c : t.configs)
+    counts.push_back(static_cast<int64_t>(t.builds.size()));
+    for (const BuildConfig& b : t.builds)
       std::visit(
           [&](const auto& f) {
-            int64_t m = 0, n = 0, k = 0, sk = 0, rs = 0;
-            if constexpr (requires { f.tile_m; }) m = f.tile_m;
-            if constexpr (requires { f.tile_n; }) n = f.tile_n;
+            int64_t k = 0, sk = 0;
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
             if constexpr (requires { f.slice_k; }) sk = f.slice_k;
-            if constexpr (requires { f.reduce_scatter_blocks; }) rs = f.reduce_scatter_blocks;
-            configs.insert(configs.end(), {m, n, k, sk, rs, f.launch.threads_per_block,
-                                           f.launch.blocks_per_grid, f.launch.waves_per_eu});
+            configs.insert(configs.end(),
+                           {f.tile_m, f.tile_n, k, sk, f.threads_per_block, f.waves_per_eu});
           },
-          c);
+          b);
   }
   return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
           wheres, templates, template_ops, fields, configs, counts};
