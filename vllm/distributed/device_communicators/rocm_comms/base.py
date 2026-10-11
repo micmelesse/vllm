@@ -202,12 +202,12 @@ _DTYPES: Mapping[str, torch.dtype] = {
 
 @dataclass(frozen=True)
 class TemplateBuild:
-    """One C++ template as built: its op, and the configs dispatch instantiates (its
-    catalog list; none for the plain all-reduce), each its fields by name at its listed
-    grid: what an op takes as keyword arguments to force it."""
+    """One C++ template as built: its op, and the builds dispatch instantiates (its
+    catalog list), each its fields by name (threads_per_block, waves_per_eu and its
+    tile; never the launch, which a forced call gives itself)."""
 
     op: str
-    configs: tuple[dict[str, int], ...]
+    builds: tuple[dict[str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -249,12 +249,12 @@ def build_info() -> BuildInfo:
     templates: dict[str, TemplateBuild] = {}
     at, width = 0, len(fields)
     for name, op, count in zip(names, template_ops, counts):
-        configs = []
+        builds = []
         for _ in range(count):
             values = flat[at : at + width]
-            configs.append({f: v for f, v in zip(fields, values) if v != 0})
+            builds.append({f: v for f, v in zip(fields, values) if v != 0})
             at += width
-        templates[name] = TemplateBuild(op, tuple(configs))
+        templates[name] = TemplateBuild(op, tuple(builds))
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
@@ -373,9 +373,12 @@ class Communicator(ABC):
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
     # Each op and its `should_` take the same arguments: the op's own tensors and
-    # values, then, keyword-only, what the sweep and the tests force (the algorithm,
-    # `one_shot` or `two_shot`, the direction, `pull` or `push`, and that op's own
-    # config fields, each None for the backend's choice); the model forces none.
+    # values, then, keyword-only, what the sweep and the tests force: ALL OR NOTHING,
+    # the algorithm (`one_shot` or `two_shot`) and the direction (`pull` or `push`)
+    # where the op has more than one template, every field of one of its builds
+    # (`build_info().templates`), and the launch (blocks_per_grid, and the AttnRes
+    # op's reduce_scatter_blocks); some but not all is `forced_incomplete`. All None
+    # is the backend's choice; the model forces none.
     # `should_` is the op's check; the op runs its check, raises Refused on an Error,
     # and returns what ran.
 

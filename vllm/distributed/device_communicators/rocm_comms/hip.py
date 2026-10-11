@@ -5,9 +5,10 @@
 memory they run over.
 
 The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
-keyword arguments an op takes after its own (the algorithm, the direction, that op's
-config fields) are the one way to force one, for the sweep and the tests. Every one is
-passed through as it came: C++ builds the config, checks it, and answers.
+keyword arguments an op takes after its own (the algorithm, the direction, every field
+of one build and the launch, all or none) are the one way to force one, for the sweep
+and the tests. Every one is passed through as it came: C++ builds the config, checks
+it, and answers.
 
 TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
 is held by vLLM for the graph's life, so it is registered once at capture exit and read

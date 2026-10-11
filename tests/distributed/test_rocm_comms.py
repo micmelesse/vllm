@@ -738,15 +738,21 @@ def _chunks(
 Forced = dict[str, str | int]
 
 
-def _forced(kernel: str) -> Forced:
-    """The kernel a case names (`all_reduce_push_two_shot...`) forced, by its algorithm
-    and direction, at a launch every template admits (16 blocks of 512 threads), its
-    own tile, for a case that forces one only to check it."""
+def _forced(kernel: str, cols: int = 0) -> Forced:
+    """The template a case names (`all_reduce_push_two_shot...`) forced WHOLE, as a
+    forced call must be: its algorithm and direction, its first build whose tile holds
+    `cols` columns (the row a norm reduces; 0 where the tile tiles across the row), and
+    a launch every template admits (16 blocks, no reduce-scatter split), for a case that
+    forces one only to check it."""
+    builds = build_info().templates[kernel].builds
+    build = next(b for b in builds if b["tile_n"] >= cols)
+    split = {"reduce_scatter_blocks": 0} if "attn_res" in kernel else {}
     return {
         "algorithm": "two_shot" if "two_shot" in kernel else "one_shot",
         "direction": "push" if "_push_" in kernel else "pull",
-        "threads_per_block": 512,
+        **build,
         "blocks_per_grid": 16,
+        **split,
     }
 
 
@@ -1486,7 +1492,7 @@ def run_fused_rank(
     inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
     residual = _one_input(world, 1, shape, dtype)
     weight = _one_input(world + 1, 2, (shape[1],), dtype).to(weight_dtype or dtype)
-    forced = _forced(f"{shot}_{form}")
+    forced = _forced(f"{shot}_{form}", shape[1])
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if form == "rms_norm":
@@ -1751,7 +1757,7 @@ def run_add_attn_res_rms_norm_rank(
     )
     torch.cuda.synchronize()
 
-    forced = _forced(f"{shot}_add_attn_res_rms_norm")
+    forced = _forced(f"{shot}_add_attn_res_rms_norm", hidden)
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     if not comm.should_allreduce_add_attn_res_rms_norm(mine, **forced):
@@ -1861,7 +1867,7 @@ def run_rms_norm_gemm_rank(
     torch.cuda.synchronize()
 
     op = "rms_norm_gemm_add" if add else "rms_norm_gemm"
-    forced = _forced(f"{shot}_{op}")
+    forced = _forced(f"{shot}_{op}", latent)
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     admits = (
@@ -1956,7 +1962,7 @@ def run_rms_scale_add_rank(
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     got = torch.empty(rows, hidden, dtype=dtype, device=device)
-    forced = _forced(shot)
+    forced = _forced(shot, latent)
     if not comm.should_allreduce_rms_scale_add(mine, got, **forced):
         return False, NO_FUSED_KERNEL
     comm.all_reduce_rms_scale_add(mine, got, FUSED_EPS, **forced)
@@ -2011,10 +2017,10 @@ def test_python_names_cpps_errors_and_ops() -> None:
     assert set(get_args(Op)) | set(get_args(ExperimentalOp)) == set(built.op_names)
 
 
-def test_build_info_lists_every_template_with_its_configs() -> None:
-    """Every template the build holds names one of its ops and lists at least one config
-    at a legal block size, each with a tile; every op's but the plain all-reduce's has a
-    grid (its grid is the call's)."""
+def test_build_info_lists_every_template_with_its_builds() -> None:
+    """Every template the build holds names one of its ops and lists at least one build
+    at a legal block size, each with a tile, and none with a launch (a forced call gives
+    its own)."""
     # example-based: one fixed catalog
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
@@ -2022,11 +2028,12 @@ def test_build_info_lists_every_template_with_its_configs() -> None:
     assert built.templates
     for name, t in built.templates.items():
         assert t.op in built.op_names, name
-        assert t.configs, name
-        for c in t.configs:
-            assert c["threads_per_block"] > 0 and c["waves_per_eu"] >= 1, (name, c)
-            assert c["tile_m"] >= 1 and c["tile_n"] > 0, (name, c)
-            assert t.op == "all_reduce" or c["blocks_per_grid"] > 0, (name, c)
+        assert t.builds, name
+        for b in t.builds:
+            assert b["threads_per_block"] > 0 and b["waves_per_eu"] >= 1, (name, b)
+            assert b["tile_m"] >= 1 and b["tile_n"] > 0, (name, b)
+            launched = {"blocks_per_grid", "reduce_scatter_blocks"} & b.keys()
+            assert not launched, (name, b)
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
@@ -2124,7 +2131,8 @@ def run_strided_all_reduce_rank(
     try:
         got = comm.all_reduce(x, **forced)[0].float()
     except Refused as no:
-        return False, f"refused {tuple(x.shape)} at strides {x.stride()} for {no.error.name}"
+        where = f"{tuple(x.shape)} at strides {x.stride()}"
+        return False, f"refused {where} for {no.error.name}"
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
@@ -2347,33 +2355,43 @@ FORCED_DRAWN = st.fixed_dictionaries(
         "waves_per_eu": st.sampled_from([None, None, 1, 2, 4]),
     }
 )
+GRIDS_DRAWN = st.sampled_from([1, 16, 80, 256])
 FORCED_DRAWN_FIELDS = (
-    "algorithm", "direction", "tile_m", "tile_n", "threads_per_block", "blocks_per_grid",
+    "algorithm",
+    "direction",
+    "tile_m",
+    "tile_n",
+    "threads_per_block",
+    "blocks_per_grid",
     "waves_per_eu",
 )
 
 
-
 def _forced_drawn(op: str) -> st.SearchStrategy[dict]:
-    """FORCED_DRAWN, or a config the build holds for one of `op`'s templates: forced
-    fields drawn one by one rarely land on a built config, so the builds the tuned
-    lists do not pick would otherwise never run."""
+    """FORCED_DRAWN (mostly partial, so refused as forced_incomplete), or a whole
+    forcing of a build one of `op`'s templates lists, on a drawn grid: forced fields
+    drawn one by one rarely land on a built config, so the builds the tuned lists do
+    not pick would otherwise never run."""
 
     def built() -> st.SearchStrategy[dict]:
-        configs = []
+        forcings = []
         for name, template in build_info().templates.items():
             if template.op != op:
                 continue
             shot = re.search(r"(pull|push)_(one_shot|two_shot)", name)
             assert shot, f"{name} names no direction and algorithm"
             direction, algorithm = shot.groups()
-            configs += [
+            split = {"reduce_scatter_blocks": 0} if "attn_res" in name else {}
+            forcings += [
                 dict.fromkeys(FORCED_DRAWN_FIELDS)
                 | {"algorithm": algorithm, "direction": direction}
-                | {k: v for k, v in c.items() if k in FORCED_DRAWN_FIELDS}
-                for c in template.configs
+                | b
+                | split
+                for b in template.builds
             ]
-        return st.sampled_from(configs)
+        return st.tuples(st.sampled_from(forcings), GRIDS_DRAWN).map(
+            lambda forcing_grid: forcing_grid[0] | {"blocks_per_grid": forcing_grid[1]}
+        )
 
     return st.one_of(FORCED_DRAWN, st.deferred(built))
 
@@ -2401,13 +2419,26 @@ def _forcing(forced: dict) -> dict:
     return {k: v for k, v in forced.items() if v is not None}
 
 
-def _plain(forced: dict, rows: int, hidden: int, pad: int) -> bool:
-    """A call nothing about which is unusual, which must run."""
+def _plain(op: str, forced: dict, rows: int, hidden: int, pad: int) -> bool:
+    """A call nothing about which is unusual, which must run: nothing forced, whole
+    packs, a contiguous row the staging holds, and, for an op whose tile holds the row,
+    a row some build of it holds (a wider one is row_too_wide, a capability)."""
     return (
         not _forcing(forced)
         and pad == 0
         and hidden % 8 == 0
         and rows * hidden * 2 <= build_info().staging_bytes
+        and (op == "all_reduce" or hidden <= _widest_build(op))
+    )
+
+
+def _widest_build(op: str) -> int:
+    """The widest row a build of `op` holds in its tile."""
+    return max(
+        b["tile_n"]
+        for t in build_info().templates.values()
+        if t.op == op
+        for b in t.builds
     )
 
 
@@ -2512,7 +2543,9 @@ def test_all_reduce_api(
         seed=seed,
         forced=forced,
     )
-    _refused_or_right(answers, plain=lead == 1 and _plain(forced, rows, hidden, pad))
+    _refused_or_right(
+        answers, plain=lead == 1 and _plain("all_reduce", forced, rows, hidden, pad)
+    )
 
 
 # -- all_reduce_rms_norm --------------------------------------------------------------
@@ -2583,7 +2616,9 @@ def test_all_reduce_rms_norm_api(
         forced=forced,
     )
     _refused_or_right(
-        answers, plain=not fp32_weight and _plain(forced, rows, hidden, pad)
+        answers,
+        plain=not fp32_weight
+        and _plain("all_reduce_rms_norm", forced, rows, hidden, pad),
     )
 
 
@@ -2668,7 +2703,9 @@ def test_all_reduce_add_rms_norm_api(
         forced=forced,
     )
     _refused_or_right(
-        answers, plain=not fp32_weight and _plain(forced, rows, hidden, pad)
+        answers,
+        plain=not fp32_weight
+        and _plain("all_reduce_add_rms_norm", forced, rows, hidden, pad),
     )
 
 
@@ -2788,4 +2825,7 @@ def test_all_reduce_add_attn_res_rms_norm_api(
         seed=seed,
         forced=forced,
     )
-    _refused_or_right(answers, plain=_plain(forced, rows, hidden, pad))
+    _refused_or_right(
+        answers,
+        plain=_plain("all_reduce_add_attn_res_rms_norm", forced, rows, hidden, pad),
+    )
