@@ -219,33 +219,9 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& softmax, const float (&logit)[N
 }
 
 // ===============================================================================================
-// PEERS: THE RANKS' BUFFERS, RANK R THE SAME ACROSS THE WAVE (peers.cuh)
+// POINTERS: A KERNEL'S ARGUMENTS AS Ptrs (ptr.cuh)
 // ===============================================================================================
 
-template <typename DTYPE, int WORLD>
-DINLINE const DTYPE* rank_input(const PeerPtrs& peer_ptrs, int rank) {
-  return impl::rank_input<DTYPE, WORLD>(peer_ptrs, rank);
-}
-template <typename DTYPE, int WORLD>
-DINLINE DTYPE* rank_staging(const PeerPtrs& peer_ptrs, int rank) {
-  return impl::rank_staging<DTYPE, WORLD>(peer_ptrs, rank);
-}
-template <typename DTYPE, int WORLD>
-DINLINE DTYPE* rank_scratch(const PeerPtrs& peer_ptrs, int rank) {
-  return impl::rank_scratch<DTYPE, WORLD>(peer_ptrs, rank);
-}
-template <typename DTYPE, int WORLD>
-DINLINE std::array<const DTYPE*, WORLD> rank_inputs(const PeerPtrs& peer_ptrs) {
-  return impl::rank_inputs<DTYPE, WORLD>(peer_ptrs);
-}
-template <typename DTYPE, int WORLD>
-DINLINE std::array<DTYPE*, WORLD> rank_stagings(const PeerPtrs& peer_ptrs) {
-  return impl::rank_stagings<DTYPE, WORLD>(peer_ptrs);
-}
-template <typename DTYPE, int WORLD>
-DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& peer_ptrs) {
-  return impl::rank_scratches<DTYPE, WORLD>(peer_ptrs);
-}
 // THE BOUNDARY, a kernel's first lines (ptr.cuh): every rank's buffer as a Ptr (rank r's at r),
 // and a local tensor as one.
 template <typename T, int WORLD>

@@ -105,10 +105,10 @@ struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
 struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
 
-// RANK r'S BUFFER, its first element. `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave
-// rank): read from the first lane, the compiler knows it, and the pointer loads are scalar rather
-// than one per lane. `rank_<kind>s` every rank's, how a kernel begins (before its start barrier);
-// an input is read only.
+// RANK r'S BUFFER, its first element, which rank_ptr and rank_ptrs (ptr.cuh) make a Ptr of: a
+// kernel's arguments carry every rank's address of a buffer (PeerPtrs) and this picks one. `r` IS
+// THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane, the compiler
+// knows it, and the pointer loads are scalar rather than one per lane.
 namespace impl {
 template <typename DTYPE, int WORLD>
 DINLINE DTYPE* rank_of(const PeerPtrs& ptrs, int r) {
@@ -119,36 +119,6 @@ DINLINE DTYPE* rank_of(const PeerPtrs& ptrs, int r) {
     if (r == k) at = ptrs.p[k];
   return static_cast<DTYPE*>(at);
 }
-template <typename DTYPE, int WORLD>
-DINLINE std::array<DTYPE*, WORLD> every(const PeerPtrs& p) {
-  std::array<DTYPE*, WORLD> all;
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) all[r] = rank_of<DTYPE, WORLD>(p, r);
-  return all;
-}
-
-template <typename DTYPE, int WORLD>
-DINLINE const DTYPE* rank_input(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
-
-template <typename DTYPE, int WORLD>
-DINLINE DTYPE* rank_staging(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
-
-template <typename DTYPE, int WORLD>
-DINLINE DTYPE* rank_scratch(const PeerPtrs& p, int r) { return impl::rank_of<DTYPE, WORLD>(p, r); }
-
-template <typename DTYPE, int WORLD>
-DINLINE std::array<const DTYPE*, WORLD> rank_inputs(const PeerPtrs& p) {
-  std::array<const DTYPE*, WORLD> all;
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) all[r] = impl::rank_of<DTYPE, WORLD>(p, r);
-  return all;
-}
-
-template <typename DTYPE, int WORLD>
-DINLINE std::array<DTYPE*, WORLD> rank_stagings(const PeerPtrs& p) { return impl::every<DTYPE, WORLD>(p); }
-
-template <typename DTYPE, int WORLD>
-DINLINE std::array<DTYPE*, WORLD> rank_scratches(const PeerPtrs& p) { return impl::every<DTYPE, WORLD>(p); }
 }  // namespace impl
 
 }  // namespace hip_comms

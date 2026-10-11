@@ -59,13 +59,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
-  const auto inputs = rank_inputs<DTYPE, WORLD>(*peer_inputs);
+  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
   // GPU read rank 0 first, a link at a time carrying the machine's reads, and the reduce-scatter
   // took 1.6x the plain two-shot's cycles for its bytes (thread traces 2026-10-04T21-03-09Z,
   // 21-26-11Z). Each slice is summed by one rank, so the order differing by rank is harmless.
-  const auto input = [&](int r) { return inputs[(rank + r) % WORLD]; };
-  const auto own_scratch  = rank_scratch<DTYPE, WORLD>(peer_scratch, rank);
+  const auto input = [&](int r) { return inputs[(rank + r) % WORLD].data; };
+  const auto own_scratch  =
+      rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n).data;
   const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
   const auto norm_w     = local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank);
   const auto qk_w       = local_ptr(qk_w_ptr, 0, qk_w_stride_n, rank);
@@ -73,11 +74,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
 
   // A WAVE'S PACKS MAY HAVE TWO OWNERS, so the owner's scratch is picked in each lane.
-  const auto scratches  = rank_scratches<DTYPE, WORLD>(peer_scratch);
+  const auto scratches  = rank_ptrs<DTYPE, WORLD>(peer_scratch, scratch_stride_m, scratch_stride_n);
   const auto scratch_of = [&](int r) {
-    DTYPE* at = scratches[0];
+    DTYPE* at = scratches[0].data;
 #pragma unroll
-    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k] : at;
+    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k].data : at;
     return at;
   };
   const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements
