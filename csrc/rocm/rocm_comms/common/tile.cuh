@@ -134,4 +134,25 @@ template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
 struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>>
     : std::true_type {};
 
+// THIS BLOCK'S TILES, grid-strided in row-major order over `tiles_m` x `tiles_n` tiles: `body(row,
+// col)` for each, in tiles. The row and column are kept as the walk advances, each step an add, a
+// compare and a carry, where dividing them out of the work item's index cost a 32-bit division a
+// tile (ISA 2026-10-11, the plain all-reduce against the flat walk); the division is once, here.
+template <typename BODY>
+DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
+  const int step_rows = static_cast<int>(gridDim.x) / tiles_n;
+  const int step_cols = static_cast<int>(gridDim.x) % tiles_n;
+  int row             = static_cast<int>(blockIdx.x) / tiles_n;
+  int col             = static_cast<int>(blockIdx.x) % tiles_n;
+  while (row < tiles_m) {
+    body(row, col);
+    row += step_rows;
+    col += step_cols;
+    if (col >= tiles_n) {
+      col -= tiles_n;
+      ++row;
+    }
+  }
+}
+
 }  // namespace hip_comms

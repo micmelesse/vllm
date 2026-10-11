@@ -25,7 +25,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (inp_size_n + TILE_N - 1) / TILE_N;
-  const int tiles   = (inp_size_m + TILE_M - 1) / TILE_M * tiles_n;
+  const int tiles_m = (inp_size_m + TILE_M - 1) / TILE_M;
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
@@ -35,14 +35,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // 2. Read every rank's input, in rank order, and sum.
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-    const Block at{inp_size_m, inp_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N};
+  block_for_each_tile(tiles_m, tiles_n, [&](int row, int col) {
+    const Block at{inp_size_m, inp_size_n, row * TILE_M, col * TILE_N};
     Block peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
     tile_load(peers, inp);
     tile_store(peers_reduce(peers), out);
-  }
+  });
   block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
