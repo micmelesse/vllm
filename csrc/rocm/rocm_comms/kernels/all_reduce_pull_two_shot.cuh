@@ -17,7 +17,7 @@ namespace hip_comms {
 // scratch), sync, all-gather (every rank's summed share out to the output). The kernel states the
 // problem; collectives.cuh walks it as [R, 1, M*N], each rank's share one contiguous range of the
 // elements, for long reads from each peer (its comment says why and what it serves badly). A rank's
-// copy of a chunk is a wave (LANES threads); the Ranks tile is that [R, 1, TILE_N] chunk.
+// copy of a chunk is a wave (LANES threads); the Chunk tile is that [R, 1, TILE_N] chunk.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
@@ -30,8 +30,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;  // a rank's copy's threads
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-  static_assert(TILE_M == 1, "the walk's chunk is one row of the flat range");
-  using Ranks = Tile<DTYPE, TILE_M, TILE_N, TILE_M, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
+  // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's
+  // two_shot_lays_out): R ranks' copies of TILE_N elements.
+  using Chunk = Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inp = [&](int r) {
@@ -46,7 +47,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks, into its scratch.
-  reduce_scatter<Ranks>(rank, inp, inp_size_m, inp_size_n, scratch(rank));
+  reduce_scatter<Chunk>(rank, inp, inp_size_m, inp_size_n, scratch(rank));
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
@@ -55,7 +56,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 4. All-gather: every rank's summed share out of its scratch, at its place in the output. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
-  all_gather<Ranks>(rank, scratch, out, inp_size_m, inp_size_n);
+  all_gather<Chunk>(rank, scratch, out, inp_size_m, inp_size_n);
   block_stamp(5);
   sync.finish();
 }
@@ -80,8 +81,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-  static_assert(TILE_M == 1, "the walk's chunk is one row of the flat range");
-  using Ranks = Tile<DTYPE, TILE_M, TILE_N, TILE_M, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
+  // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's
+  // two_shot_lays_out): R ranks' copies of TILE_N elements.
+  using Chunk = Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
   const auto staging = [&](int r) {
     return rank_ptr<DTYPE, WORLD>(staging_ptrs, r, staging_stride_m, staging_stride_n);
   };
@@ -98,12 +100,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 1. This band, every rank's share of it, into this rank's staging (the chunks each rank's same
     //    block reads), then visible (and, past the first pass, every peer has read this rank's
     //    scratch).
-    stage<Ranks>(rank, inp, staging(rank), band, inp_size_n);
+    stage<Chunk>(rank, inp, staging(rank), band, inp_size_n);
     barrier<Group::peers, Until::visible>(sync);
     block_stamp(1);
 
     // 2. Reduce-scatter: this rank's share of the band from every rank's staging, into its scratch.
-    reduce_scatter<Ranks>(rank, staging, band, inp_size_n, scratch(rank));
+    reduce_scatter<Chunk>(rank, staging, band, inp_size_n, scratch(rank));
 
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
@@ -112,7 +114,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     block_stamp(3);
 
     // 4. All-gather: every rank's summed share out of its scratch, at its place in the output.
-    all_gather<Ranks>(rank, scratch, out, band, inp_size_n);
+    all_gather<Chunk>(rank, scratch, out, band, inp_size_n);
     block_stamp(5);
   }
   sync.finish();
