@@ -150,7 +150,12 @@ DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data,
     if (impl::skipped(t[0], m)) continue;
 #pragma unroll
     for (int k = 0; k < t[0].K; ++k) {
-      const int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
+      // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the row's uniform part was
+      // added to every rank's base in scalar registers, an add and a carry a rank (16 instructions
+      // a tile at eight ranks, the plain all-reduce against the flat walk: ISA 2026-10-11); held
+      // in a VGPR, each rank's address is one shift-and-add of it.
+      int64_t i = int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
+      asm volatile("" : "+v"(i));
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
         impl::held(t[r], m, k, impl::pack_load(reinterpret_cast<const P*>(data(r)) + i));
