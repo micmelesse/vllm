@@ -1038,7 +1038,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups for every thread of
-  //    a tile row (the two-shot's rows are the ranks).
+  //    a tile row (the two-shot's tile a copy a rank, R x M x N, its rows a rank's threads').
   const void* kernel = nullptr;
   by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
@@ -1063,7 +1063,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            if constexpr (THREADS % NG == 0 && TN % (NL * (THREADS / NG)) == 0)
+            // A rank's THREADS / NG threads laid TM x THREADS / NG / TM over its TM x TN chunk.
+            if constexpr (THREADS % NG == 0 && (THREADS / NG) % TM == 0 &&
+                          TN % (NL * (THREADS / NG / TM)) == 0)
               kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
                                     all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS, WAVES>)
                               : instance<AllReduceTwoShotKernel>(
