@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;  // a rank's copy's threads
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   static_assert(TILE_M == 1, "the walk's chunk is one row of the flat range");
-  using Ranks = Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
+  using Ranks = Tile<DTYPE, TILE_M, TILE_N, TILE_M, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inp = [&](int r) {
@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   static_assert(TILE_M == 1, "the walk's chunk is one row of the flat range");
-  using Ranks = Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
+  using Ranks = Tile<DTYPE, TILE_M, TILE_N, TILE_M, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
   const auto staging = [&](int r) {
     return rank_ptr<DTYPE, WORLD>(staging_ptrs, r, staging_stride_m, staging_stride_n);
   };
