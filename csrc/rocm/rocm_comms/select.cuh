@@ -804,9 +804,26 @@ constexpr TunedKernel pick(OpType o, int world, int64_t m, int64_t n, int64_t ti
   int w = 0;
   for (const TunedKernel& k : kernels)
     if (w == 0 || distance(k.world, world) < distance(w, world)) w = k.world;
+  // THE NEAREST TUNED WIDTH WITH A KERNEL THAT RUNS HERE: a row too narrow for a width's slicing
+  // kernels takes the nearest width that lists one that is not, so a plain call is not refused
+  // for a kernel some other width would have picked. Any width when none has one.
+  const auto runs_here = [&](const TunedKernel& k) {
+    return every_rank_gets_columns(k.fn, n, dtype, world);
+  };
+  bool any_runs = false;
+  for (const TunedKernel& k : kernels) any_runs = any_runs || (k.world == w && runs_here(k));
+  // NONE DOES (every listed kernel slices the row, and the row is narrower than the world): the
+  // op's own one-shot, which reads whole rows, at its first build.
+  if (!any_runs)
+    for (const TemplateInfo& t : kTemplates)
+      if (t.op == o && !t.two_shot && !t.configs.empty()) {
+        TunedKernel own{world, m, n, t.fn, t.configs[0]};
+        if (tile_n_of(own.config) < tile_cols) set_tile_n(own.config, 0);
+        return own;
+      }
   int64_t h = 0;
   for (const TunedKernel& k : kernels)
-    if (k.world == w && (h == 0 || distance(k.n, n) < distance(h, n)))
+    if (k.world == w && (!any_runs || runs_here(k)) && (h == 0 || distance(k.n, n) < distance(h, n)))
       h = k.n;
   const int64_t as_rows    = m * n / h;
   const auto among = [&](bool narrow_ok) {
@@ -814,7 +831,7 @@ constexpr TunedKernel pick(OpType o, int world, int64_t m, int64_t n, int64_t ti
     const TunedKernel* found = nullptr;
     for (const TunedKernel& k : kernels) {
       if (k.world != w || k.n != h) continue;
-      if (!narrow_ok && !every_rank_gets_columns(k.fn, n, dtype, world)) continue;
+      if (!narrow_ok && !runs_here(k)) continue;
       if (!first || k.m < first->m) first = &k;
       if (k.m <= as_rows && (!found || k.m > found->m)) found = &k;
     }
