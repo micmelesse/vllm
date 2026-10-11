@@ -31,6 +31,7 @@ declines today.
 import math
 import multiprocessing as mp
 import queue
+import re
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -2344,6 +2345,35 @@ FORCED_DRAWN = st.fixed_dictionaries(
         "waves_per_eu": st.sampled_from([None, None, 1, 2, 4]),
     }
 )
+FORCED_DRAWN_FIELDS = (
+    "algorithm", "direction", "tile_m", "tile_n", "threads_per_block", "blocks_per_grid",
+    "waves_per_eu",
+)
+
+
+
+def _forced_drawn(op: str) -> st.SearchStrategy[dict]:
+    """FORCED_DRAWN, or a config the build holds for one of `op`'s templates: forced
+    fields drawn one by one rarely land on a built config, so the builds the tuned
+    lists do not pick would otherwise never run."""
+
+    def built() -> st.SearchStrategy[dict]:
+        configs = []
+        for name, template in build_info().templates.items():
+            if template.op != op:
+                continue
+            shot = re.search(r"(pull|push)_(one_shot|two_shot)", name)
+            assert shot, f"{name} names no direction and algorithm"
+            direction, algorithm = shot.groups()
+            configs += [
+                dict.fromkeys(FORCED_DRAWN_FIELDS)
+                | {"algorithm": algorithm, "direction": direction}
+                | {k: v for k, v in c.items() if k in FORCED_DRAWN_FIELDS}
+                for c in template.configs
+            ]
+        return st.sampled_from(configs)
+
+    return st.one_of(FORCED_DRAWN, st.deferred(built))
 
 
 def _seeded(ctx: RankContext, seed: int, shape: tuple[int, ...], dtype) -> torch.Tensor:
@@ -2454,7 +2484,7 @@ def run_all_reduce_api_rank(
     pad=PAD_DRAWN,
     lead=st.sampled_from([1, 1, 2]),
     seed=SEED_DRAWN,
-    forced=FORCED_DRAWN,
+    forced=_forced_drawn("all_reduce"),
 )
 def test_all_reduce_api(
     dtype: str,
@@ -2525,7 +2555,7 @@ def run_all_reduce_rms_norm_api_rank(
     pad=PAD_DRAWN,
     fp32_weight=st.booleans(),
     seed=SEED_DRAWN,
-    forced=FORCED_DRAWN,
+    forced=_forced_drawn("all_reduce_rms_norm"),
 )
 def test_all_reduce_rms_norm_api(
     dtype: str,
@@ -2610,7 +2640,7 @@ def run_all_reduce_add_rms_norm_api_rank(
     pad=PAD_DRAWN,
     fp32_weight=st.booleans(),
     seed=SEED_DRAWN,
-    forced=FORCED_DRAWN,
+    forced=_forced_drawn("all_reduce_add_rms_norm"),
 )
 def test_all_reduce_add_rms_norm_api(
     dtype: str,
@@ -2729,7 +2759,7 @@ def run_all_reduce_add_attn_res_rms_norm_api_rank(
     num_blocks=st.integers(0, ATTN_RES_SOURCES - 1),
     output_norm=st.booleans(),
     seed=SEED_DRAWN,
-    forced=FORCED_DRAWN,
+    forced=_forced_drawn("all_reduce_add_attn_res_rms_norm"),
 )
 def test_all_reduce_add_attn_res_rms_norm_api(
     rows: int,
