@@ -322,6 +322,15 @@ constexpr bool built_at(Template k, int threads_per_block) {
     if (launch_of(b).threads_per_block == threads_per_block) return true;
   return false;
 }
+// THE BUILD AT `threads_per_block` AND `waves_per_eu`, the first listed, or the template's first
+// build when none is (the check then refuses the threads or the waves by name).
+constexpr KernelConfig build_at(Template k, int threads_per_block, int waves_per_eu) {
+  for (const KernelConfig& b : configs_of(k))
+    if (launch_of(b).threads_per_block == threads_per_block &&
+        launch_of(b).waves_per_eu == waves_per_eu)
+      return b;
+  return configs_of(k)[0];
+}
 constexpr bool built_at(Template k, int threads_per_block, int waves_per_eu) {
   for (const KernelConfig& b : configs_of(k))
     if (launch_of(b).threads_per_block == threads_per_block &&
@@ -999,15 +1008,18 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   KernelConfig c          = !f ? tuned.config
                             : f->second ? *f->second
                                         : AllReduceConfig{{0, 0, 1}, 0, 0};
-  // A FORCED CALL'S BLANK FIELDS, the template's own (its first listed config), and its grid the
-  // tuned kernel's at this size (the listed configs leave the grid to the size); the tuned config
-  // runs as it was measured.
-  const KernelConfig own = default_config(fn, 0);
-  LaunchConfig& g        = launch_of(c);
-  if (g.threads_per_block == 0) g.threads_per_block = launch_of(own).threads_per_block;
+  // A FORCED CALL'S BLANK FIELDS: its launch the tuned kernel's where that is the forced template,
+  // else the template's first build's, and its grid the tuned kernel's at this size (the listed
+  // configs leave the grid to the size); then its tile the build's AT ITS THREADS AND WAVES, so a
+  // thread's share is the template's (a tile from another thread count is a build that does not
+  // exist). The tuned config runs as it was measured.
+  const KernelConfig first = tuned.fn == fn ? tuned.config : configs_of(fn)[0];
+  LaunchConfig& g          = launch_of(c);
+  if (g.threads_per_block == 0) g.threads_per_block = launch_of(first).threads_per_block;
   if (g.blocks_per_grid == 0) g.blocks_per_grid = launch_of(tuned.config).blocks_per_grid;
-  if (g.waves_per_eu == 0) g.waves_per_eu = launch_of(own).waves_per_eu;
-  AllReduceConfig& a = std::get<AllReduceConfig>(c);
+  if (g.waves_per_eu == 0) g.waves_per_eu = launch_of(first).waves_per_eu;
+  const KernelConfig own = build_at(fn, g.threads_per_block, g.waves_per_eu);
+  AllReduceConfig& a     = std::get<AllReduceConfig>(c);
   if (a.tile_m == 0) a.tile_m = std::get<AllReduceConfig>(own).tile_m;
   if (a.tile_n == 0) a.tile_n = tile_n_of(own);
   const bool staged = !h.reads_in_place(inp, stream);
