@@ -215,7 +215,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> all_reduce_rms_norm_ge
 inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
     Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
     int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t m, int64_t n,
-    int64_t n_latent, float eps, std::optional<Algorithm> algorithm,
+    int64_t latent_size_n, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     std::optional<int> waves_per_eu,
@@ -225,7 +225,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
     return *e;
   std::variant<AllReduceRmsScaleAddLaunch, Error> l = select_all_reduce_rms_scale_add(
       h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, dtype, m, n,
-      n_latent, eps, algorithm, direction, tile_m, tile_n,
+      latent_size_n, eps, algorithm, direction, tile_m, tile_n,
       threads_per_block, blocks_per_grid, waves_per_eu, stream);
   if (const AllReduceRmsScaleAddLaunch* got = std::get_if<AllReduceRmsScaleAddLaunch>(&l))
     launch_all_reduce_rms_scale_add(h, *got);

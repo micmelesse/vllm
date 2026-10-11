@@ -482,6 +482,20 @@ template <typename PARAM>
 struct erase<const PARAM*> {
   using t = const void*;
 };
+// A peer table, every rank's address of a buffer: its elements erased, the table kept. The signal
+// table is not an element pointer and keeps its type.
+template <typename PARAM>
+struct erase<PARAM* const*> {
+  using t = void* const*;
+};
+template <typename PARAM>
+struct erase<const PARAM* const*> {
+  using t = const void* const*;
+};
+template <>
+struct erase<Signal* const*> {
+  using t = Signal* const*;
+};
 template <typename KERNEL_PTR>
 struct erased;
 template <typename... PARAMS>
@@ -1635,7 +1649,7 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
 inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_scale_add(
     const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
     int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t m, int64_t n,
-    int64_t n_latent, float eps, std::optional<Algorithm> algorithm,
+    int64_t latent_size_n, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
     std::optional<int> waves_per_eu,
@@ -1643,7 +1657,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   using K           = Template;
   const OpType op   = OpType::all_reduce_rms_scale_add;
   const int world   = h.world_size();
-  const int64_t row = 2 * n + n_latent;
+  const int64_t row = 2 * n + latent_size_n;
   // 1.
   const std::variant<Forced, Error> forcing =
       forced(op, algorithm, direction, threads_per_block, blocks_per_grid, waves_per_eu, {tile_m, tile_n},
@@ -1652,20 +1666,20 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
              });
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   const Forced& f         = std::get<Forced>(forcing);
-  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, row, n_latent, dtype);
+  const TunedKernel tuned = f ? TunedKernel{} : pick(op, world, m, row, latent_size_n, dtype);
   const Template fn       = f ? f->first : tuned.fn;
   const KernelConfig c =
-      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, n_latent,
+      fitted(fn, f ? f->second.value_or(zero_config(family_of(fn))) : tuned.config, m, latent_size_n,
              n, world);
   // 2.
   const int e = elem_bytes(dtype);
   const std::optional<Error> widths =
-      n * e % kBuild.memory.pack_bytes != 0 || n_latent * e % kBuild.memory.pack_bytes != 0 ||
-              n_latent < 1
+      n * e % kBuild.memory.pack_bytes != 0 || latent_size_n * e % kBuild.memory.pack_bytes != 0 ||
+              latent_size_n < 1
           ? std::optional<Error>{Error::widths_not_packs}
           : std::nullopt;
   if (const std::optional<Error> err =
-          refused(&h, fn, c, dtype, m, row, n_latent, widths, inp, false, stream))
+          refused(&h, fn, c, dtype, m, row, latent_size_n, widths, inp, false, stream))
     return *err;
   // 3. The one-shot's and the two-shot's builds are one list.
   static_assert(same_builds(K::all_reduce_pull_one_shot_rms_scale_add,
@@ -1716,7 +1730,7 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
                                      .dtype             = dtype,
                                      .m              = m,
                                      .n            = n,
-                                     .n_latent            = n_latent,
+                                     .latent_size_n            = latent_size_n,
                                      .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1900,14 +1914,14 @@ constexpr bool selections_fit() {
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
                                             std::array<int64_t, 3>{kMaxRanks, 4096, 7168}}) {
     const int w = static_cast<int>(call[0]);
-    const int64_t m = call[1], n = call[2], n_latent = n / 2;
+    const int64_t m = call[1], n = call[2], latent_size_n = n / 2;
     for (const OpType o :
          {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
           OpType::all_reduce_add_attn_res_rms_norm, OpType::all_reduce_rms_norm_gemm,
           OpType::all_reduce_rms_norm_gemm_add})
       if (!tuned_fits(o, w, m, n, n, n)) return false;
     // The one-all-reduce tail: [shared | projected | latent].
-    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + n_latent, n_latent,
+    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + latent_size_n, latent_size_n,
                     n))
       return false;
     if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, m, n, n, n)) return false;

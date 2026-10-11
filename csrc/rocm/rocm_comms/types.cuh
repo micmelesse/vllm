@@ -299,44 +299,46 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 }
 
 // =================================================================================================
-// EACH KERNEL'S SIGNATURE, element pointers as void*: every compiled instance has one of these
+// EACH KERNEL'S SIGNATURE, element pointers as void* (a peer table's as void* const*): every
+// compiled instance has one of these
 // (select asserts it when it picks the instance), so a launch calls the kernel select chose
 // through it, with the kernel's own arguments. A kernel's arguments are its buffers and values,
 // in this order: every rank's input (a device table: a captured launch's are filled after the
 // capture), scratch or staging, each only where the kernel uses it; the synchronization state
 // (every rank's signal block, this rank's, its rank, the wait limit); then its own. EVERY BUFFER
 // IS FOLLOWED BY ITS STRIDES, in elements, every dimension's (STANDARDS, *One file is the
-// interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone.
+// interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone. A peer
+// buffer is a device table of every rank's address (vLLM's RankData), its strides every rank's.
 // =================================================================================================
 
 // The plain all-reduce: out, rows, packs (a row's); staged, the staging first (and the two-shot's
 // scratch before it), its own input after out, and the rows a band.
 using AllReduceOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
              int64_t, int, int);
 using AllReduceTwoShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, void*, int64_t, int64_t, int, int);
 using AllReduceOneShotStagedKernel =
-    void (*)(PeerPtrs, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+    void (*)(void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
              int64_t, const void*, int64_t, int64_t, int, int, int);
 using AllReduceTwoShotStagedKernel =
-    void (*)(PeerPtrs, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, int, int, int);
 // out, weight, eps, rows, packs; the two-shots (pull and push) with every rank's scratch.
 using AllReduceRmsNormOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
              int64_t, const void*, int64_t, float, int, int);
 using AllReduceRmsNormTwoShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, void*, int64_t, int64_t, const void*, int64_t, float, int, int);
 // out, residual_out, residual, weight, eps, rows, packs.
 using AllReduceAddRmsNormOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
              int64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, const void*,
              int64_t, float, int, int);
 using AllReduceAddRmsNormTwoShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, void*, int64_t, int64_t, void*, int64_t, int64_t, const void*, int64_t,
              int64_t, const void*, int64_t, float, int, int);
 // prefix, blocks (m, r, n), norm_w, qk_w, out_norm_w, out, num_blocks, write_idx, eps, out_eps,
@@ -346,40 +348,40 @@ using AllReduceAddRmsNormTwoShotKernel =
   void*, int64_t, int64_t, void*, int64_t, int64_t, int64_t, const void*, int64_t, const void*, \
       int64_t, const void*, int64_t, void*, int64_t, int64_t, int, int, float, float, int, int
 using AllReduceAddAttnResRmsNormOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t,
              HIP_COMMS_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPushKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, HIP_COMMS_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPullKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, HIP_COMMS_ATTN_RES_ARGS, int);
 // norm_w, eps, gemm_w, n_cols, out, workspace, rows, packs: written or added
 // (all_reduce_rms_norm_gemm and _gemm_add), one shape.
 using AllReduceRmsNormGemmOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, const void*,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, const void*,
              int64_t, float, const void*, int64_t, int64_t, int, void*, int64_t, int64_t, void*,
              int64_t, int64_t, int, int);
 using AllReduceRmsNormGemmTwoShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, const void*, int64_t, float, const void*, int64_t, int64_t, int, void*,
              int64_t, int64_t, void*, int64_t, int64_t, int, int);
 // out, eps, rows, hidden_packs, latent_packs.
 using AllReduceRmsScaleAddOneShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerSignals, void*, int, uint64_t, void*, int64_t,
+    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
              int64_t, float, int, int, int);
 using AllReduceRmsScaleAddTwoShotKernel =
-    void (*)(const void*, int64_t, int64_t, PeerPtrs, int64_t, int64_t, PeerSignals, void*, int,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*, int,
              uint64_t, void*, int64_t, int64_t, float, int, int, int);
 // Experimental, no peers: delta, then the AttnRes arguments.
 using AddAttnResRmsNormKernel = void (*)(const void*, int64_t, int64_t, HIP_COMMS_ATTN_RES_ARGS);
 #undef HIP_COMMS_ATTN_RES_ARGS
 // The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the
 // streamed buffer's) and staging, then mode, peer, pullers, packs, sink.
-using ProbeBarrierKernel = void (*)(PeerSignals, void*, int, uint64_t);
-using PingPongKernel = void (*)(PeerSignals, void*, int, uint64_t, int, uint32_t, int, void*);
+using ProbeBarrierKernel = void (*)(Signal* const*, void*, int, uint64_t);
+using PingPongKernel = void (*)(Signal* const*, void*, int, uint64_t, int, uint32_t, int, void*);
 using LinkTrafficKernel =
-    void (*)(const void*, PeerPtrs, PeerSignals, void*, int, uint64_t, int, int, int,
+    void (*)(const void* const*, void* const*, Signal* const*, void*, int, uint64_t, int, int, int,
              int64_t, void*);
 
 
@@ -596,7 +598,7 @@ struct AllReduceRmsScaleAddLaunch {
   DType dtype;
   int64_t m;
   int64_t n;
-  int64_t n_latent;
+  int64_t latent_size_n;
   float eps;
 };
 

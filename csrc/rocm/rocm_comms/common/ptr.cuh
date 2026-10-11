@@ -36,17 +36,17 @@ namespace impl {
 // EVERY RANK'S BUFFER AS A Ptr, rank r's data at r (rank r the same across the wave, as rank_of
 // makes it), each with the buffer's row stride.
 template <typename T, int WORLD>
-DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& p, int64_t stride_m, int64_t stride_n) {
+DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(T* const* p, int64_t stride_m, int64_t stride_n) {
   std::array<Ptr<T>, WORLD> all;
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
-    all[r] = Ptr<T>{impl::rank_of<std::remove_const_t<T>, WORLD>(p, r), stride_m, stride_n, r};
+    all[r] = Ptr<T>{impl::rank_of(p, r), stride_m, stride_n, r};
   return all;
 }
 // ONE RANK'S BUFFER AS A Ptr (this rank's own, most often), by the same rank_of.
 template <typename T, int WORLD>
-DINLINE Ptr<T> rank_ptr(const PeerPtrs& p, int rank, int64_t stride_m, int64_t stride_n) {
-  return Ptr<T>{impl::rank_of<std::remove_const_t<T>, WORLD>(p, rank), stride_m, stride_n, rank};
+DINLINE Ptr<T> rank_ptr(T* const* p, int rank, int64_t stride_m, int64_t stride_n) {
+  return Ptr<T>{impl::rank_of(p, rank), stride_m, stride_n, rank};
 }
 template <typename T>
 DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n, int rank) {

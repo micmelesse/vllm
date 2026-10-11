@@ -16,16 +16,16 @@ namespace hip_comms {
 // latent for the row's RMS (its 1/rms is the same in every slice). Rounds as the reference does:
 // each span's sum lands as T, the all-reduce output, then out = T(float(shared) +
 // float(projected) * scale).
-// The input is [m, 2 x n + n_latent] (shared and projected n wide, the latent n_latent), the
+// The input is [m, 2 x n + latent_size_n] (shared and projected n wide, the latent latent_size_n), the
 // output [m, n].
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_scale_add(
-        const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
-        PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+        const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
+        Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, float eps,
-        int m, int n, int n_latent) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+        int m, int n, int latent_size_n) {
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -33,21 +33,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // A ROW'S COLUMN TILES: its hidden in TILE_N slices, spread evenly over as many.
   const int splits       = (hidden_packs + TILE_N / NL - 1) / (TILE_N / NL);
   const int slice        = (hidden_packs + splits - 1) / splits;
-  const float inv_latent = 1.0f / static_cast<float>(n_latent);
+  const float inv_latent = 1.0f / static_cast<float>(latent_size_n);
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
   // EACH RANK'S THREE SPANS, the shared, the projected and the latent, as Ptrs into its input.
-  const auto& shared = inputs;
+  const auto& shared = inp;
   std::array<Ptr<const DTYPE>, WORLD> proj, latent;
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) {
-    proj[r]   = Ptr<const DTYPE>{inputs[r].data + n * inp_stride_n, inp_stride_m, inp_stride_n, r};
-    latent[r] = Ptr<const DTYPE>{inputs[r].data + 2 * n * inp_stride_n, inp_stride_m, inp_stride_n, r};
+    proj[r]   = Ptr<const DTYPE>{inp[r].data + n * inp_stride_n, inp_stride_m, inp_stride_n, r};
+    latent[r] = Ptr<const DTYPE>{inp[r].data + 2 * n * inp_stride_n, inp_stride_m, inp_stride_n, r};
   }
 
   // 2. Each of this block's (row, slice): the slice's shared and projected packs and the row's
@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int first = (w % splits) * slice;
     const int len   = min(slice, hidden_packs - first);
     const Row hid{m, (first + len) * NL, row, first * NL};
-    const Row lat{m, n_latent, row, 0};
+    const Row lat{m, latent_size_n, row, 0};
     Row sh[WORLD], pj[WORLD], lt[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) {

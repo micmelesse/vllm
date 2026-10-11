@@ -358,12 +358,12 @@ RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
     return all_reduce_rms_scale_add_plan_of<L>(*e);
   if (out.dim() != 2)
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::output_not_two_d);
-  const int64_t n = out.size(1), n_latent = inp.size(1) - 2 * n;
-  if (n_latent < 1)
+  const int64_t n = out.size(1), latent_size_n = inp.size(1) - 2 * n;
+  if (latent_size_n < 1)
     return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
   return all_reduce_rms_scale_add_plan_of(hip_comms::select_all_reduce_rms_scale_add(
       handle_of(handle_ptr), nullptr, out.stride(0), out.stride(1), nullptr, inp.stride(0),
-      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, n_latent, 0.f, alg, dir, narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
+      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, latent_size_n, 0.f, alg, dir, narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
       narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream()));
 }
 
@@ -778,13 +778,13 @@ void rocm_comms_all_reduce_rms_scale_add(
   TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
               "inp and out must be 2-D with the same rows");
   const int64_t n = out.size(1);
-  const int64_t n_latent = inp.size(1) - 2 * n;
-  TORCH_CHECK(n_latent > 0,
+  const int64_t latent_size_n = inp.size(1) - 2 * n;
+  TORCH_CHECK(latent_size_n > 0,
               "inp's row must be wider than twice out's: [shared | projected | latent]");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
   const auto got = hip_comms::all_reduce_rms_scale_add(
       handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), n, n_latent,
+      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), n, latent_size_n,
       static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());

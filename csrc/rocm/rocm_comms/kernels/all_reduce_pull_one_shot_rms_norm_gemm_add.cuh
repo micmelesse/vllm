@@ -17,18 +17,18 @@ namespace hip_comms {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLICE_K,
           int THREADS_PER_BLOCK, bool ADD_RESIDUAL>
 DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
-    const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
-    PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+    const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
+    Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
     Ptr<const DTYPE> norm_w,
     float eps, Ptr<const DTYPE> gemm_w, int n_cols, Ptr<DTYPE> out, Ptr<DTYPE> workspace, int m,
     int n) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   const float inv_hidden = 1.0f / static_cast<float>(n);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
   block_stamp(1);
@@ -39,7 +39,7 @@ DINLINE void all_reduce_pull_one_shot_rms_norm_gemm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = Row{m, n, row, 0};
-    tile_load(peers, inputs);
+    tile_load(peers, inp);
     const RowF s = peers_reduce(peers).template to<float>();
     // The norm, rounding as vLLM's reference rms_norm does (weight in DTYPE):
     //   out = DTYPE(DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)), s = float(DTYPE(sum over ranks))
@@ -79,8 +79,8 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLI
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm_gemm(
-    const PeerPtrs* __restrict__ peer_inputs,
-    int64_t inp_stride_m, int64_t inp_stride_n, PeerSignals peer_signals, Signal* self_signal,
+    const DTYPE* const* __restrict__ inp_ptrs,
+    int64_t inp_stride_m, int64_t inp_stride_n, Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr,
     int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w_ptr,
     int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
     int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, false>(
-        peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+        inp_ptrs, inp_stride_m, inp_stride_n, signal_ptrs, self_signal_ptr, rank, timeout_ticks,
         local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
         local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
         local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
@@ -102,8 +102,8 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int SLI
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm_gemm_add(
-    const PeerPtrs* __restrict__ peer_inputs,
-    int64_t inp_stride_m, int64_t inp_stride_n, PeerSignals peer_signals, Signal* self_signal,
+    const DTYPE* const* __restrict__ inp_ptrs,
+    int64_t inp_stride_m, int64_t inp_stride_n, Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr,
     int rank, uint64_t timeout_ticks, const DTYPE* __restrict__ norm_w_ptr,
     int64_t norm_w_stride_n, float eps, const DTYPE* __restrict__ gemm_w_ptr,
     int64_t gemm_w_stride_m, int64_t gemm_w_stride_n, int n_cols, DTYPE* __restrict__ out_ptr,
@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   if constexpr (gemm_fits(kDevice, TILE_M, TILE_K, SLICE_K, THREADS_PER_BLOCK))
     all_reduce_pull_one_shot_rms_norm_gemm_body<DTYPE, WORLD, TILE_M, TILE_N, TILE_K, SLICE_K,
                                                 THREADS_PER_BLOCK, true>(
-        peer_inputs, inp_stride_m, inp_stride_n, peer_signals, self_signal, rank, timeout_ticks,
+        inp_ptrs, inp_stride_m, inp_stride_n, signal_ptrs, self_signal_ptr, rank, timeout_ticks,
         local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank), eps,
         local_ptr(gemm_w_ptr, gemm_w_stride_m, gemm_w_stride_n, rank), n_cols,
         local_ptr(out_ptr, out_stride_m, out_stride_n, rank),

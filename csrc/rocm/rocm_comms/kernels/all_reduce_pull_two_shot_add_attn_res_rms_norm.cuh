@@ -26,9 +26,9 @@ template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_M, int TILE_N, in
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
-        const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m, int64_t inp_stride_n,
-        PeerPtrs peer_scratch, int64_t scratch_stride_m, int64_t scratch_stride_n,
-        PeerSignals peer_signals, Signal* self_signal, int rank, uint64_t timeout_ticks,
+        const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
+        DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m, int64_t scratch_stride_n,
+        Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
         DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
         DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m, int64_t blocks_stride_r,
         int64_t blocks_stride_n, const DTYPE* __restrict__ norm_w_ptr, int64_t norm_w_stride_n,
@@ -36,7 +36,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
         int write_idx, float eps, float out_eps, int m, int n, int reduce_scatter_blocks) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   constexpr int NL = traits<DTYPE>::N;
   const int packs        = n / NL;  // the row, in packs (n is whole packs)
@@ -59,14 +59,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the other two-shots (held across it they spilled).
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
   // GPU read rank 0 first, a link at a time carrying the machine's reads, and the reduce-scatter
   // took 1.6x the plain two-shot's cycles for its bytes (thread traces 2026-10-04T21-03-09Z,
   // 21-26-11Z). Each slice is summed by one rank, so the order differing by rank is harmless.
-  const auto input = [&](int r) { return inputs[(rank + r) % WORLD].data; };
+  const auto input = [&](int r) { return inp[(rank + r) % WORLD].data; };
   const auto own_scratch  =
-      rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n).data;
+      rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n).data;
   const auto prefix     = local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
   const auto norm_w     = local_ptr(norm_w_ptr, 0, norm_w_stride_n, rank);
   const auto qk_w       = local_ptr(qk_w_ptr, 0, qk_w_stride_n, rank);
@@ -74,11 +74,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
 
   // A WAVE'S PACKS MAY HAVE TWO OWNERS, so the owner's scratch is picked in each lane.
-  const auto scratches  = rank_ptrs<DTYPE, WORLD>(peer_scratch, scratch_stride_m, scratch_stride_n);
+  const auto scratch  = rank_ptrs<DTYPE, WORLD>(scratch_ptrs, scratch_stride_m, scratch_stride_n);
   const auto scratch_of = [&](int r) {
-    DTYPE* at = scratches[0].data;
+    DTYPE* at = scratch[0].data;
 #pragma unroll
-    for (int k = 1; k < WORLD; ++k) at = r == k ? scratches[k].data : at;
+    for (int k = 1; k < WORLD; ++k) at = r == k ? scratch[k].data : at;
     return at;
   };
   const int end = (col0 + own_packs) * NL;  // this rank's columns end, in elements

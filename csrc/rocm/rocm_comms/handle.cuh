@@ -52,7 +52,7 @@ class Handle {
         world_size_(world_size),
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
-    self_signal_ = static_cast<Signal*>(alloc_symmetric());
+    self_signal_ptr_ = static_cast<Signal*>(alloc_symmetric());
     // THE FAULT RECORD, host-mapped and coherent: a wait that gives up writes it with system-scope
     // atomics while the host polls it, and the host sets its `abort` (barrier.cuh). The kernels
     // find it through this rank's signal block.
@@ -61,23 +61,33 @@ class Handle {
     std::memset(fault_, 0, sizeof(Fault));
     Fault* device_fault = nullptr;
     HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_fault), fault_, 0));
-    HIP_CHECK(hipMemcpy(&self_signal_->fault, &device_fault, sizeof(device_fault),
+    HIP_CHECK(hipMemcpy(&self_signal_ptr_->fault, &device_fault, sizeof(device_fault),
                         hipMemcpyHostToDevice));
-    // THE SLAB the launches' peer-pointer tables live in: read by this rank's kernels only.
+    // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table: read by this
+    // rank's kernels only.
     const int64_t slots = build.memory.peer_ptr_slots;
-    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * sizeof(PeerPtrs)));
-    slab_end_         = slab_ + slots;
+    HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
+    slab_end_         = slab_ + slots * kMaxRanks;
     cursor_           = slab_;
-    const auto opened = open_peers(gather(ipc_bytes(self_signal_)), self_signal_);
-    for (int i = 0; i < world_size_; ++i)
-      signals_.s[i] = static_cast<Signal*>(opened[i]);
-    // THE STAGING IS REGISTERED HERE: every rank's lies at the same offset in its allocation.
-    std::vector<void*> staging(world_size_);
-    for (int i = 0; i < world_size_; ++i)
+    const auto opened = open_peers(gather(ipc_bytes(self_signal_ptr_)), self_signal_ptr_);
+    // EVERY RANK'S SIGNAL BLOCK, SCRATCH AND STAGING, a table each, written once: each rank's
+    // symmetric memory is [ Signal | scratch | staging ], at the same offsets on every rank. The
+    // staging is registered here too, so an eager input's launch reads its table.
+    HIP_CHECK(hipMalloc(&signal_ptrs_, kMaxRanks * sizeof(Signal*)));
+    std::vector<Signal*> signals(kMaxRanks, nullptr);
+    std::vector<void*> scratch(world_size_), staging(world_size_);
+    for (int i = 0; i < world_size_; ++i) {
+      signals[i] = static_cast<Signal*>(opened[i]);
+      scratch[i] = static_cast<char*>(opened[i]) + sizeof(Signal);
       staging[i] = static_cast<char*>(opened[i]) + sizeof(Signal) + scratch_bytes_;
-    PeerPtrs* slot = next_slot();
-    write_slot(slot, staging);
-    registered_[staging[rank_]] = slot;
+    }
+    HIP_CHECK(hipMemcpy(signal_ptrs_, signals.data(), kMaxRanks * sizeof(Signal*),
+                        hipMemcpyHostToDevice));
+    scratch_ptrs_ = next_slot();
+    write_slot(scratch_ptrs_, scratch);
+    staging_ptrs_ = next_slot();
+    write_slot(staging_ptrs_, staging);
+    registered_[staging[rank_]] = staging_ptrs_;
     // The device wall clock is fixed-rate, in kHz; the kernels count the timeout in it.
     int device = 0, khz = 0;
     HIP_CHECK(hipGetDevice(&device));
@@ -88,7 +98,8 @@ class Handle {
   ~Handle() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
-    hipFree(self_signal_);
+    hipFree(signal_ptrs_);
+    hipFree(self_signal_ptr_);
     hipHostFree(fault_);
   }
 
@@ -100,12 +111,12 @@ class Handle {
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it holds.
   void* staging() const {
-    return reinterpret_cast<char*>(self_signal_) + sizeof(Signal) + scratch_bytes_;
+    return reinterpret_cast<char*>(self_signal_ptr_) + sizeof(Signal) + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
 
   // THE BUFFERS A CAPTURE RECORDED, registered, every rank together. During capture an input's
-  // address is not registered yet, so `peer_inputs` reserves a slot and remembers the pointer; this
+  // address is not registered yet, so `inp_ptrs` reserves a slot and remembers the pointer; this
   // gathers every rank's handle for each and fills the slots in. Sound because a captured address
   // is fixed for the graph's life: the kernel reads a slot filled AFTER the capture that recorded
   // the launch. False, with nothing registered, when the ranks captured different numbers (every
@@ -140,7 +151,7 @@ class Handle {
   // allocation at the same address would read the dead buffer's peers.
   void register_buffer(void* self, const Gather& gather) {
     const std::vector<std::string> theirs = gather(ipc_bytes(self));
-    PeerPtrs* slot                   = next_slot();
+    void** slot = next_slot();
     write_slot(slot, open_peers(theirs, self));
     registered_[self]     = slot;
     buffer_handles_[self] = theirs;
@@ -160,30 +171,20 @@ class Handle {
     buffer_handles_.erase(it);
   }
 
-  // WHAT A KERNEL IS HANDED, each its own argument. Every rank's input for a launch over `input`
-  // (`bytes` long) on `stream`: a device table, filled after the capture for a captured launch
-  // (an eager input is copied into the staging, and the table is the staging's).
-  const PeerPtrs* peer_inputs(const void* input, int64_t bytes, hipStream_t stream) {
+  // WHAT A KERNEL IS HANDED, each its own argument, a peer buffer as a device table of every
+  // rank's address. Every rank's input for a launch over `input` (`bytes` long) on `stream`:
+  // filled after the capture for a captured launch (an eager input is copied into the staging,
+  // and the table is the staging's).
+  const void* const* inp_ptrs(const void* input, int64_t bytes, hipStream_t stream) {
     return slot_for(const_cast<void*>(input), bytes, stream);
   }
-  // Every rank's scratch and staging, fixed for the handle's life: each rank's symmetric memory is
-  // [ Signal | scratch | staging ].
-  PeerPtrs peer_scratch() const {
-    PeerPtrs p{};
-    for (int r = 0; r < world_size_; ++r)
-      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(Signal);
-    return p;
-  }
-  PeerPtrs peer_staging() const {
-    PeerPtrs p{};
-    for (int r = 0; r < world_size_; ++r)
-      p.p[r] = reinterpret_cast<char*>(signals_.s[r]) + sizeof(Signal) + scratch_bytes_;
-    return p;
-  }
+  // Every rank's scratch and staging, fixed for the handle's life.
+  void* const* scratch_ptrs() const { return scratch_ptrs_; }
+  void* const* staging_ptrs() const { return staging_ptrs_; }
   // The synchronization state: every rank's signal block, this rank's, and how long a wait may
   // last before it gives up.
-  PeerSignals peer_signals() const { return signals_; }
-  Signal* self_signal() const { return self_signal_; }
+  Signal* const* signal_ptrs() const { return signal_ptrs_; }
+  Signal* self_signal_ptr() const { return self_signal_ptr_; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
   // THE FAULT RECORD, read while kernels run: whole once a wait has written it, else nothing.
@@ -279,7 +280,7 @@ class Handle {
 
   // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's
   // with the input copied in.
-  PeerPtrs* slot_for(void* input, int64_t bytes, hipStream_t stream) {
+  void** slot_for(void* input, int64_t bytes, hipStream_t stream) {
     hipStreamCaptureStatus status;
     HIP_CHECK(hipStreamIsCapturing(stream, &status));
     if (status == hipStreamCaptureStatusActive) {
@@ -287,7 +288,7 @@ class Handle {
       // buffers are freed with the graph and the allocator hands the same address back.
       // Skipping the record would make the recorded COUNT depend on that luck, and the
       // exchange after capture is COLLECTIVE, so ranks would exchange different counts.
-      PeerPtrs* slot = next_slot();
+      void** slot = next_slot();
       pending_.push_back(input);
       pending_slots_.push_back(slot);
       return slot;
@@ -306,34 +307,39 @@ class Handle {
     return registered_.at(staging());
   }
 
-  PeerPtrs* next_slot() {
+  // A TABLE, kMaxRanks addresses of the slab.
+  void** next_slot() {
     if (cursor_ >= slab_end_)
       throw std::runtime_error("hip_comms: peer-pointer slab is full; allocate a larger one");
-    return cursor_++;
+    void** slot = cursor_;
+    cursor_ += kMaxRanks;
+    return slot;
   }
 
-  void write_slot(PeerPtrs* slot, const std::vector<void*>& ptrs) {
-    PeerPtrs host{};
-    for (int i = 0; i < world_size_; ++i) host.p[i] = ptrs[i];
-    HIP_CHECK(hipMemcpy(slot, &host, sizeof(PeerPtrs), hipMemcpyHostToDevice));
+  void write_slot(void** slot, const std::vector<void*>& ptrs) {
+    std::vector<void*> host(kMaxRanks, nullptr);
+    for (int i = 0; i < world_size_; ++i) host[i] = ptrs[i];
+    HIP_CHECK(hipMemcpy(slot, host.data(), kMaxRanks * sizeof(void*), hipMemcpyHostToDevice));
   }
 
   int rank_;
   int world_size_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
-  Signal* self_signal_ = nullptr;
+  Signal* self_signal_ptr_ = nullptr;
   Fault* fault_        = nullptr;
   uint64_t timeout_ticks_   = 0;
-  PeerSignals signals_{};
-  PeerPtrs* slab_     = nullptr;
-  PeerPtrs* slab_end_ = nullptr;
-  PeerPtrs* cursor_   = nullptr;
-  std::unordered_map<void*, PeerPtrs*> registered_;
+  Signal** signal_ptrs_ = nullptr;
+  void** scratch_ptrs_  = nullptr;
+  void** staging_ptrs_  = nullptr;
+  void** slab_           = nullptr;
+  void** slab_end_       = nullptr;
+  void** cursor_         = nullptr;
+  std::unordered_map<void*, void**> registered_;
   std::unordered_map<void*, std::vector<std::string>> buffer_handles_;
   mutable std::unordered_map<const void*, Resources> resources_;
   std::vector<void*> pending_;
-  std::vector<PeerPtrs*> pending_slots_;
+  std::vector<void**> pending_slots_;
   std::unordered_map<std::string, void*> opened_;
   uint32_t flags_used_[kMaxRanks] = {};
 };

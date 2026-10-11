@@ -16,17 +16,17 @@ namespace hip_comms {
 // a tile row), the grid striding over the tiles row-major. Both tile sides are tuned (select.cuh).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot(const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m,
-                             int64_t inp_stride_n, PeerSignals peer_signals, Signal* self_signal,
+    all_reduce_pull_one_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
+                             int64_t inp_stride_n, Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr,
                              int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out_ptr,
                              int64_t out_stride_m, int64_t out_stride_n, int m, int n) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (n + TILE_N - 1) / TILE_N;
   const int tiles   = (m + TILE_M - 1) / TILE_M * tiles_n;
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inputs = rank_ptrs<const DTYPE, WORLD>(*peer_inputs, inp_stride_m, inp_stride_n);
+  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   const auto out    = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     Block peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
-    tile_load(peers, inputs);
+    tile_load(peers, inp);
     tile_store(peers_reduce(peers), out);
   }
   block_stamp(2);
@@ -55,18 +55,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // peers barrier makes visible.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_staged(PeerPtrs peer_staging, int64_t staging_stride_m,
-                                    int64_t staging_stride_n, PeerSignals peer_signals,
-                                    Signal* self_signal, int rank, uint64_t timeout_ticks,
+    all_reduce_pull_one_shot_staged(DTYPE* const* __restrict__ staging_ptrs, int64_t staging_stride_m,
+                                    int64_t staging_stride_n, Signal* const* __restrict__ signal_ptrs,
+                                    Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                     int64_t out_stride_n, const DTYPE* __restrict__ inp_ptr,
                                     int64_t inp_stride_m, int64_t inp_stride_n, int m, int n,
                                     int band_m) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (n + TILE_N - 1) / TILE_N;
-  const auto staged      = rank_ptrs<DTYPE, WORLD>(peer_staging, staging_stride_m, staging_stride_n);
-  const auto own_staging = rank_ptr<DTYPE, WORLD>(peer_staging, rank, staging_stride_m, staging_stride_n);
+  const auto staging      = rank_ptrs<DTYPE, WORLD>(staging_ptrs, staging_stride_m, staging_stride_n);
+  const auto own_staging = rank_ptr<DTYPE, WORLD>(staging_ptrs, rank, staging_stride_m, staging_stride_n);
 
   for (int r0 = 0; r0 < m; r0 += band_m) {
     const int band  = min(band_m, m - r0);  // this pass's rows
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       Block peers[WORLD];
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) peers[r] = at;
-      tile_load(peers, staged);
+      tile_load(peers, staging);
       tile_store(peers_reduce(peers), out);
     }
     block_stamp(2);

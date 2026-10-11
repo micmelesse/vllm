@@ -25,13 +25,13 @@ namespace hip_comms {
 // THE FIRST: both count a row's chunks by the full slice and stride over the work items alike.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_two_shot(const PeerPtrs* __restrict__ peer_inputs, int64_t inp_stride_m,
-                             int64_t inp_stride_n, PeerPtrs peer_scratch, int64_t scratch_stride_m,
-                             int64_t scratch_stride_n, PeerSignals peer_signals,
-                             Signal* self_signal, int rank, uint64_t timeout_ticks,
+    all_reduce_pull_two_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
+                             int64_t inp_stride_n, DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
+                             int64_t scratch_stride_n, Signal* const* __restrict__ signal_ptrs,
+                             Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
                              DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                              int64_t out_stride_n, int m, int n) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
@@ -51,12 +51,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // A ROW'S RANK WHEN IT IS READ: a row is whole waves, so its pointer is one scalar select (every
   // rank's, rotated, up front was ~20 scalar loads before the first barrier).
   const auto own_scratch =
-      rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
+      rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n);
   const auto input = [&](int w) {
-    return rank_ptr<const DTYPE, WORLD>(*peer_inputs, rotated(w), inp_stride_m, inp_stride_n);
+    return rank_ptr<const DTYPE, WORLD>(inp_ptrs, rotated(w), inp_stride_m, inp_stride_n);
   };
   const auto scratch = [&](int w) {
-    return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), scratch_stride_m, scratch_stride_n);
+    return rank_ptr<DTYPE, WORLD>(scratch_ptrs, rotated(w), scratch_stride_m, scratch_stride_n);
   };
   block_stamp(0);
   barrier<Group::peers, Until::launched>(sync);
@@ -117,15 +117,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // peers barrier makes them visible.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_two_shot_staged(PeerPtrs peer_scratch, int64_t scratch_stride_m,
-                                    int64_t scratch_stride_n, PeerPtrs peer_staging,
+    all_reduce_pull_two_shot_staged(DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
+                                    int64_t scratch_stride_n, DTYPE* const* __restrict__ staging_ptrs,
                                     int64_t staging_stride_m, int64_t staging_stride_n,
-                                    PeerSignals peer_signals, Signal* self_signal, int rank,
+                                    Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
                                     uint64_t timeout_ticks, DTYPE* __restrict__ out_ptr,
                                     int64_t out_stride_m, int64_t out_stride_n,
                                     const DTYPE* __restrict__ inp_ptr, int64_t inp_stride_m,
                                     int64_t inp_stride_n, int m, int n, int band_m) {
-  Sync<WORLD> sync{peer_signals, self_signal, rank, timeout_ticks};
+  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
   constexpr int NL    = traits<DTYPE>::N;
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
@@ -140,14 +140,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto rotated = [&](int w) { return (rank + w) % WORLD; };
   const auto slice_n = [&](int w) { return max(0, min(slice, n - rotated(w) * slice)); };
   const auto own_scratch =
-      rank_ptr<DTYPE, WORLD>(peer_scratch, rank, scratch_stride_m, scratch_stride_n);
+      rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m, scratch_stride_n);
   const auto own_staging =
-      rank_ptr<DTYPE, WORLD>(peer_staging, rank, staging_stride_m, staging_stride_n);
+      rank_ptr<DTYPE, WORLD>(staging_ptrs, rank, staging_stride_m, staging_stride_n);
   const auto staging = [&](int w) {
-    return rank_ptr<DTYPE, WORLD>(peer_staging, rotated(w), staging_stride_m, staging_stride_n);
+    return rank_ptr<DTYPE, WORLD>(staging_ptrs, rotated(w), staging_stride_m, staging_stride_n);
   };
   const auto scratch = [&](int w) {
-    return rank_ptr<DTYPE, WORLD>(peer_scratch, rotated(w), scratch_stride_m, scratch_stride_n);
+    return rank_ptr<DTYPE, WORLD>(scratch_ptrs, rotated(w), scratch_stride_m, scratch_stride_n);
   };
 
   for (int r0 = 0; r0 < m; r0 += band_m) {

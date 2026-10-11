@@ -13,7 +13,7 @@
 
 namespace hip_comms {
 
-// EVERY BLOCK STREAMING CHUNKS: pulled from the buffer `peer_inputs` names on `peer` (a pull
+// EVERY BLOCK STREAMING CHUNKS: pulled from the buffer `inp_ptrs` names on `peer` (a pull
 // only) or every other rank (the staging, or a registered buffer), all of them in flight together,
 // pushed into every other rank's staging, both at once with the blocks `split` (the first
 // `pullers` pull, the rest push) or with `each` block doing both, chunk by chunk. The pulled chunks
@@ -21,10 +21,10 @@ namespace hip_comms {
 // which keeps the loads without a store per load.
 template <typename DTYPE, int WORLD>
 __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
-    link_traffic(const PeerPtrs* __restrict__ peer_inputs, PeerPtrs peer_staging,
-                 PeerSignals peer_signals, Signal* self_signal, int rank,
+    link_traffic(const DTYPE* const* __restrict__ inp_ptrs, DTYPE* const* __restrict__ staging_ptrs,
+                 Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
                  uint64_t timeout_ticks, int mode, int peer, int pullers, int64_t packs,
-                 uint32_t* sink) {
+                 uint32_t* sink_ptr) {
   constexpr int THREADS = kBuild.kernels.max_threads;
   using Chunk           = Tile<DTYPE, 1, THREADS * traits<DTYPE>::N, 1, THREADS, THREADS>;
   const auto traffic    = static_cast<Traffic>(mode);
@@ -41,10 +41,10 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
   std::array<Ptr<const DTYPE>, WORLD - 1> others;
 #pragma unroll
   for (int i = 0; i < WORLD - 1; ++i)
-    others[i] = rank_ptr<const DTYPE, WORLD>(*peer_inputs, (rank + 1 + i) % WORLD, len, 1);
+    others[i] = rank_ptr<const DTYPE, WORLD>(inp_ptrs, (rank + 1 + i) % WORLD, len, 1);
   const Ptr<const DTYPE> one = peer < 0 ? Ptr<const DTYPE>{nullptr, len, 1, peer}
-                                        : rank_ptr<const DTYPE, WORLD>(*peer_inputs, peer, len, 1);
-  const auto stagings   = rank_ptrs<DTYPE, WORLD>(peer_staging, len, 1);
+                                        : rank_ptr<const DTYPE, WORLD>(inp_ptrs, peer, len, 1);
+  const auto staging   = rank_ptrs<DTYPE, WORLD>(staging_ptrs, len, 1);
   auto sum              = Chunk{1, len, 0, 0}.template zeros<float>();
   for (int offs_n = index * Chunk::kTileN; offs_n < len; offs_n += blocks * Chunk::kTileN) {
     const Chunk at{1, len, 0, offs_n};
@@ -63,12 +63,12 @@ __global__ void __launch_bounds__(kBuild.kernels.max_threads, 1)
     if (pushes) {
 #pragma unroll
       for (int r = 0; r < WORLD; ++r)
-        if (r != rank) tile_store(at, stagings[r]);
+        if (r != rank) tile_store(at, staging[r]);
     }
   }
   float d[1];
   partial_dot(sum, sum, d);
-  if (d[0] < 0.0f) *sink = 1u;
+  if (d[0] < 0.0f) *sink_ptr = 1u;
 }
 
 }  // namespace hip_comms

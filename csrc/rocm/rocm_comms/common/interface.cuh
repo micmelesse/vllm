@@ -23,8 +23,8 @@
 //                  to<U>(), like<U>(), zeros<U>()
 //   reduce.cuh     Sum, Max (a reduction's operation), Axis::m | n
 //   softmax.cuh    OnlineSoftmax
-//   peers.cuh      PeerPtrs, PeerSignals, Signal, kMaxRanks, kMaxBlocks
-//   barrier.cuh    Sync<WORLD>{peer_signals, self_signal, rank, timeout}: write_flag(peer, v),
+//   peers.cuh      Signal, kMaxRanks, kMaxBlocks
+//   barrier.cuh    Sync<WORLD>{signal_ptrs, self_signal_ptr, rank, timeout}: write_flag(peer, v),
 //                  wait_flag(peer, v), finish() (the kernel's last statement); Group, Until
 
 #pragma once
@@ -222,15 +222,18 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& softmax, const float (&logit)[N
 // POINTERS: A KERNEL'S ARGUMENTS AS Ptrs (ptr.cuh)
 // ===============================================================================================
 
-// THE BOUNDARY, a kernel's first lines (ptr.cuh): every rank's buffer as a Ptr (rank r's at r),
-// and a local tensor as one.
+// ONE FORMAT (STANDARDS 3.2): a kernel's arguments are raw pointers, strides, sizes and scalars;
+// a peer buffer is a device table of every rank's address (`x_ptrs`, as vLLM's RankData). Its
+// first lines make them Ptrs, named for the buffer (`inp`, `scratch`, `out`), and its body
+// touches memory only through them.
+// THE BOUNDARY (ptr.cuh): every rank's buffer as a Ptr (rank r's at r), and a local one as one.
 template <typename T, int WORLD>
-DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(const PeerPtrs& peer_ptrs, int64_t stride_m, int64_t stride_n) {
-  return impl::rank_ptrs<T, WORLD>(peer_ptrs, stride_m, stride_n);
+DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(T* const* ptrs, int64_t stride_m, int64_t stride_n) {
+  return impl::rank_ptrs<T, WORLD>(ptrs, stride_m, stride_n);
 }
 template <typename T, int WORLD>
-DINLINE Ptr<T> rank_ptr(const PeerPtrs& peer_ptrs, int rank, int64_t stride_m, int64_t stride_n) {
-  return impl::rank_ptr<T, WORLD>(peer_ptrs, rank, stride_m, stride_n);
+DINLINE Ptr<T> rank_ptr(T* const* ptrs, int rank, int64_t stride_m, int64_t stride_n) {
+  return impl::rank_ptr<T, WORLD>(ptrs, rank, stride_m, stride_n);
 }
 template <typename T>
 DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n, int rank) {

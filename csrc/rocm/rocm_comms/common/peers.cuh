@@ -5,11 +5,11 @@
 // a kernel takes them in. A RANK'S MEMORY, two places:
 //   ours, one allocation (Handle's symmetric memory), mapped by every peer at startup:
 //     [ Signal | scratch | staging ]
-//   each handed to a kernel as its own argument: every rank's signal block, scratch and
-//   staging (PeerPtrs by value);
+//   each handed to a kernel as its own argument, a device table of every rank's address (its
+//   signal block, scratch and staging), written once when the handle opens;
 //   the caller's, one tensor a call:
 //     [ input ]   read in place only when registered or captured, its peers' addresses a device
-//                 table (`const PeerPtrs*`: a captured launch's are filled after the capture);
+//                 table (a captured launch's are filled after the capture);
 //                 otherwise a staged kernel copies it into the staging
 // A buffer is read or written by tile_load / tile_store / peers_load, ordered only by
 // barrier.cuh's `barrier`. The Signal block is barrier.cuh's, never read as data.
@@ -101,23 +101,16 @@ struct Signal {
   alignas(128) Fault* fault;
 };
 
-struct __align__(16) PeerPtrs { void* p[kMaxRanks]; };
-struct __align__(16) PeerSignals { Signal* s[kMaxRanks]; };
 
 
 // RANK r'S BUFFER, its first element, which rank_ptr and rank_ptrs (ptr.cuh) make a Ptr of: a
-// kernel's arguments carry every rank's address of a buffer (PeerPtrs) and this picks one. `r` IS
-// THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first lane, the compiler
-// knows it, and the pointer loads are scalar rather than one per lane.
+// kernel's arguments carry every rank's address of a buffer (a device table, `ptrs`) and this
+// reads one. `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read from the first
+// lane, the compiler knows it, and the load is scalar rather than one per lane.
 namespace impl {
-template <typename DTYPE, int WORLD>
-DINLINE DTYPE* rank_of(const PeerPtrs& ptrs, int r) {
-  r = __builtin_amdgcn_readfirstlane(r);
-  void* at = ptrs.p[0];
-#pragma unroll
-  for (int k = 1; k < WORLD; ++k)
-    if (r == k) at = ptrs.p[k];
-  return static_cast<DTYPE*>(at);
+template <typename T>
+DINLINE T* rank_of(T* const* ptrs, int r) {
+  return ptrs[__builtin_amdgcn_readfirstlane(r)];
 }
 }  // namespace impl
 
