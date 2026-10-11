@@ -18,7 +18,9 @@ namespace hip_comms {
 
 // A TILE, in Triton's terms, and THE ONE TYPE A KERNEL WORKS IN: a chunk of an M x N tensor, the
 // block's work at once (TILE_M rows from offs_m, every row_step-th, and TILE_N columns from offs_n),
-// and the elements of it this thread holds. Rows and columns count elements, as the tensor does. A
+// and the elements of it this thread holds. A 3-D TILE IS R x M x N: TILE_R copies of the chunk,
+// one a rank (R the ranks, the axis a collective reduces over; K stays the GEMM's), each read from
+// its own rank's memory at that rank's strides. Rows and columns count elements, as the tensor does. A
 // row is real when it is below M and a column when it is below N (the last tile may be short; a
 // slice is a tile whose N is the slice's end).
 //   DTYPE              the tensor's dtype in memory: a thread holds kPack-element groups, one
@@ -31,15 +33,23 @@ namespace hip_comms {
 //                      Compile-time, since it sizes the registers
 //   THREADS_PER_BLOCK  the kernel's block: a layout of all of it holds a place in every thread, so
 //                      nothing compares threadIdx (the launch bounds do not tell the compiler)
+//   TILE_R, THREADS_R  the rank axis and its layout: THREADS_R groups of THREADS_M x THREADS_N
+//                      threads, group r holding rank r's copy (THREADS_R == TILE_R: a thread holds
+//                      one rank's elements, the collectives meeting in LDS). 1 x 1 for a 2-D tile
 //   ACC_DTYPE          what the elements are held as: DTYPE as loaded, float for the math
 //                      (`to<float>()` keeps every element where it is), or a weight's own dtype
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE = DTYPE>
+          int THREADS_PER_BLOCK, typename ACC_DTYPE = DTYPE, int TILE_R = 1, int THREADS_R = 1>
 struct Tile {
   static constexpr int kPack     = traits<DTYPE>::N;                  // elements in a group
-  static constexpr int kTileM   = TILE_M;  // the chunk, rows x columns in elements
+  static constexpr int kTileR   = TILE_R;  // the chunk, ranks x rows x columns in elements
+  static constexpr int kTileM   = TILE_M;
   static constexpr int kTileN   = TILE_N;
-  static constexpr int kThreads = THREADS_M * THREADS_N;  // the layout's
+  static constexpr int kThreadsR = THREADS_R;
+  static constexpr int kSliceThreads = THREADS_M * THREADS_N;  // a rank's copy's
+  static constexpr int kThreads = THREADS_R * kSliceThreads;   // the layout's
+  static_assert(THREADS_R == TILE_R || TILE_R == 1,
+                "a thread holds one rank's copy (THREADS_R == TILE_R) or the tile is 2-D");
   static constexpr int kThreadsPerBlock = THREADS_PER_BLOCK;
   static_assert(kThreads <= THREADS_PER_BLOCK, "a layout is the block's threads or fewer");
   static constexpr int kThreadsM = THREADS_M;
@@ -76,6 +86,11 @@ struct Tile {
     else return static_cast<int>(threadIdx.x) < kThreads;
   }
   DINLINE int lane() const { return static_cast<int>(threadIdx.x) % THREADS_N; }
+  // THIS THREAD'S RANK COPY, r of R: its group of THREADS_M x THREADS_N threads.
+  DINLINE int slice() const {
+    if constexpr (THREADS_R == 1) return 0;
+    else return static_cast<int>(threadIdx.x) / kSliceThreads;
+  }
   DINLINE int col(int k) const {
     const int n = offs_n / kPack + lane() + k * THREADS_N;
     return n < N / kPack ? n : N / kPack - 1;
@@ -87,14 +102,17 @@ struct Tile {
   DINLINE int tile_row(int m) const {
     // One row of threads: the row is the block's, so its address stays scalar.
     if constexpr (THREADS_M == 1) return m;
-    return static_cast<int>(threadIdx.x) / THREADS_N + m * THREADS_M;
+    else if constexpr (THREADS_R == 1)
+      return static_cast<int>(threadIdx.x) / THREADS_N + m * THREADS_M;
+    else return static_cast<int>(threadIdx.x) % kSliceThreads / THREADS_N + m * THREADS_M;
   }
   DINLINE bool live(int m) const { return offs_m + tile_row(m) * row_step < M; }
   DINLINE int row(int m) const { return live(m) ? offs_m + tile_row(m) * row_step : M - 1; }
 
   // The same place held as AS_DTYPE, its elements converted (rounded once), unset, or zero.
   template <typename AS_DTYPE>
-  using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, AS_DTYPE>;
+  using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, AS_DTYPE, TILE_R,
+                  THREADS_R>;
   template <typename AS_DTYPE>
   DINLINE As<AS_DTYPE> like() const {
     return As<AS_DTYPE>(M, N, offs_m, offs_n, row_step);
@@ -130,9 +148,9 @@ using TileAs = typename TILE::template As<AS_DTYPE>;
 template <typename X>
 struct is_tile : std::false_type {};
 template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE>
-struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>>
-    : std::true_type {};
+          int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R>
+struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE,
+                    TILE_R, THREADS_R>> : std::true_type {};
 
 // THIS BLOCK'S TILES, grid-strided in row-major order over `tiles_m` x `tiles_n` tiles: `body(row,
 // col)` for each, in tiles. The row and column are kept as the walk advances, each step an add, a

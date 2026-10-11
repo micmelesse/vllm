@@ -17,10 +17,11 @@
 // THE TYPES a kernel names, defined in their files (a type cannot be passed on):
 //   hardware.cuh   Hardware, kTarget, kWaveSize: the device's documented facts
 //   build.cuh      kBuild: what is compiled for the device
-//   tile.cuh       Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>
-//                  {M, N, offs_m, offs_n, row_step}: a chunk of an M x N tensor, the block's
-//                  threads over it THREADS_M x THREADS_N, this thread's elements held as ACC_DTYPE;
-//                  to<U>(), like<U>(), zeros<U>()
+//   tile.cuh       Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE,
+//                  TILE_R, THREADS_R> {M, N, offs_m, offs_n, row_step}: a chunk of an M x N
+//                  tensor, the block's threads over it THREADS_M x THREADS_N, this thread's elements
+//                  held as ACC_DTYPE; R x M x N with a copy a rank when TILE_R > 1 (a group of
+//                  threads a rank, slice() this thread's); to<U>(), like<U>(), zeros<U>()
 //   reduce.cuh     Sum, Max (a reduction's operation), Axis::m | n
 //   softmax.cuh    OnlineSoftmax
 //   peers.cuh      Signal, kMaxRanks, kMaxBlocks
