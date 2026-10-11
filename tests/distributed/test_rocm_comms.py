@@ -2311,6 +2311,55 @@ def test_one_row_wider_than_the_staging_is_refused_by_name(
     assert not bad, f"{shot}: " + "; ".join(bad)
 
 
+def run_forcing_rank(
+    ctx: RankContext, shot: Shot, drop: str | None, tile_n: int | None
+) -> tuple[str | None, str | None]:
+    """ONE rank: an all-reduce forced at `shot`'s whole config less `drop`, or with its
+    tile_n replaced by `tile_n`: the name of the Error it is refused for, None when it
+    ran (an answer, not a failure: the second element stays None)."""
+    forced = _forced(shot)
+    if drop is not None:
+        del forced[drop]
+    if tile_n is not None:
+        forced["tile_n"] = tile_n
+    x = torch.ones(2, 3584, dtype=torch.bfloat16, device=ctx.device)
+    try:
+        ctx.comm("hip").all_reduce(x, **forced)
+    except Refused as no:
+        return no.error.name, None
+    return None, None
+
+
+@pytest.mark.parametrize("shot", SHOTS)
+@pytest.mark.parametrize(
+    ("drop", "tile_n", "want"),
+    [
+        (None, None, None),
+        ("algorithm", None, "forced_incomplete"),
+        ("tile_n", None, "forced_incomplete"),
+        ("waves_per_eu", None, "forced_incomplete"),
+        ("blocks_per_grid", None, "forced_incomplete"),
+        (None, 100, "tile_not_built"),
+    ],
+)
+def test_a_forcing_is_whole_or_refused_by_name(
+    shot: Shot,
+    drop: str | None,
+    tile_n: int | None,
+    want: str | None,
+    world: int,
+    ranks: World,
+) -> None:
+    """A forced call gives every field of its config or none: one field short is
+    forced_incomplete, never filled in; a whole forcing of a build the template does not
+    list is refused for what differs; a whole listed one runs."""
+    # example-based: one shape, each way a forcing can be short
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    got = ranks.run(run_forcing_rank, shot=shot, drop=drop, tile_n=tile_n)
+    assert {refused for refused, _ in got} == {want}, got
+
+
 # =================================================================================
 # EVERY OP, PROPERTY-TESTED: REFUSED BY NAME, OR RIGHT. One test per op. Hypothesis
 # draws a call -- dtype, rows, width, row padding, a seed, and any forcing (algorithm,
