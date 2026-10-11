@@ -520,16 +520,26 @@ struct TunedKernel {
 // with the rows. 16 tokens of 3584: 8.0 us against the flat walk's 7.8 (be0e1f4e9c) and the
 // one-shot's 9.6, which the byte threshold this replaces had picked.
 constexpr TunedKernel kAllReduceKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot, {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8, 16, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
-    {8, 32, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
-    {8, 64, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
-    {8, 256, 3584, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot, {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8, 8, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
-    {8, 16, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
-    {8, 32, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
-    {8, 64, 7168, Template::all_reduce_pull_two_shot, {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8, 16, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
+    {8, 32, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
+    {8, 64, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8, 256, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8, 8, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
+    {8, 16, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
+    {8, 32, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8, 64, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
 };
 
 // gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps set (each
@@ -538,28 +548,42 @@ constexpr TunedKernel kAllReduceKernels[] = {
 // 2026-09-30T21-06-57Z); the push through 1.75 MiB (256 tokens of 3584: 18.04 against the
 // pull's 18.41), the pull from 2.6 MiB (2026-10-01T03-26-44Z).
 constexpr TunedKernel kRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 257, 3584, Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 129, 7168, Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
     // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the 8192's; not swept.
-    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm, {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
 };
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB (192 tokens of
 // 3584: 15.48 against the pull's 16.28), the pull at 1.75 MiB (18.36 against the push's 18.46;
 // 2026-10-01T03-26-44Z).
 constexpr TunedKernel kAddRmsNormKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+    {8, 1, 3584, Template::all_reduce_pull_one_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
+    {8, 19, 3584, Template::all_reduce_push_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 193, 3584, Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    {8, 1, 7168, Template::all_reduce_pull_one_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
+    {8, 10, 7168, Template::all_reduce_push_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 97, 7168, Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
     // Past the model's widths, as rms_norm's.
-    {8, 1, 16384, Template::all_reduce_pull_one_shot_add_rms_norm, {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
+    {8, 1, 16384, Template::all_reduce_pull_one_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68 us; 14.03 against
@@ -622,17 +646,24 @@ constexpr TunedKernel kRmsNormGemmAddKernels[] = {
 // rows than ranks, the row two-shot from a row a rank (10.8 against 12.3 us at 1 token, 13.2
 // against 14.3 at 8 the other way; 2026-10-01T21-20-57Z).
 constexpr TunedKernel kRmsScaleAddKernels[] = {
-    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {32, 0}}},
-    // A latent of 7168, [T, 21504], on the 8192-wide builds: 17920's crossover and grids; not swept.
-    {8, 1, 21504, Template::all_reduce_pull_one_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8, 8, 21504, Template::all_reduce_pull_two_shot_rms_scale_add, {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {32, 0}}},
+    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add,
+     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {256, 0}}},
+    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add,
+     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {32, 0}}},
+    // A latent of 7168, [T, 21504], on the 8192-wide builds: 17920's crossover and grids; not
+    // swept.
+    {8, 1, 21504, Template::all_reduce_pull_one_shot_rms_scale_add,
+     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    {8, 8, 21504, Template::all_reduce_pull_two_shot_rms_scale_add,
+     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {32, 0}}},
 };
 
 // Experimental, one rank (world 1: there are no peers): not swept.
 constexpr TunedKernel kAddAttnResKernels[] = {
-    {1, 1, 3584, Template::add_attn_res_rms_norm, {AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {512, 0}}},
-    {1, 1, 7168, Template::add_attn_res_rms_norm, {AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {512, 0}}},
+    {1, 1, 3584, Template::add_attn_res_rms_norm,
+     {AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {512, 0}}},
+    {1, 1, 7168, Template::add_attn_res_rms_norm,
+     {AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {512, 0}}},
 };
 
 // =================================================================================================
@@ -1078,8 +1109,12 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
-             std::nullopt, [&] { return AllReduceRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                  *tile_n};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1176,8 +1211,12 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
-             std::nullopt, [&] { return AllReduceAddRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceAddRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                     *tile_n};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1287,8 +1326,12 @@ select_all_reduce_add_attn_res_rms_norm(
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k}, blocks_per_grid,
-             reduce_scatter_blocks, [&] { return AllReduceAddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k}; }),
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k},
+             blocks_per_grid, reduce_scatter_blocks,
+             [&] {
+               return AllReduceAddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu,
+                                                            *tile_m, *tile_n, *tile_k};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1350,7 +1393,8 @@ select_all_reduce_add_attn_res_rms_norm(
     });
   });
   // 4.
-  const AllReduceAddAttnResRmsNormBuildConfig& a = std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
+  const AllReduceAddAttnResRmsNormBuildConfig& a =
+      std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
   const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
   const AllReduceAddAttnResRmsNormLaunch l{.kernel                = kernel,
                                            .algorithm             = algorithm_of(fn),
@@ -1416,8 +1460,13 @@ inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_nor
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k}, blocks_per_grid,
-             std::nullopt, [&] { return AllReduceRmsNormGemmBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k, *slice_k}; }),
+      forced(op, algorithm, direction,
+             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceRmsNormGemmBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                      *tile_n, *tile_k, *slice_k};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1509,8 +1558,13 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k}, blocks_per_grid,
-             std::nullopt, [&] { return AllReduceRmsNormGemmAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k, *slice_k}; }),
+      forced(op, algorithm, direction,
+             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceRmsNormGemmAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                         *tile_n, *tile_k, *slice_k};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1546,7 +1600,8 @@ inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_
     });
   });
   // 4.
-  const AllReduceRmsNormGemmAddBuildConfig& g = std::get<AllReduceRmsNormGemmAddBuildConfig>(c.build);
+  const AllReduceRmsNormGemmAddBuildConfig& g =
+      std::get<AllReduceRmsNormGemmAddBuildConfig>(c.build);
   const AllReduceRmsNormGemmAddLaunch l{.kernel            = kernel,
                                         .algorithm         = algorithm_of(fn),
                                         .direction         = direction_of(fn),
@@ -1603,8 +1658,12 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
   const int64_t row = 2 * n + latent_size_n;
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
-             std::nullopt, [&] { return AllReduceRmsScaleAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n}; }),
+      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AllReduceRmsScaleAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                      *tile_n};
+             }),
       op, world, m, row, latent_size_n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1696,8 +1755,13 @@ inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm
   const int world = 1;
   // 1.
   const std::variant<Chosen, Error> picked = chosen(
-      forced(op, std::nullopt, std::nullopt, {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k}, blocks_per_grid,
-             std::nullopt, [&] { return AddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n, *tile_k}; }),
+      forced(op, std::nullopt, std::nullopt,
+             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k},
+             blocks_per_grid, std::nullopt,
+             [&] {
+               return AddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
+                                                   *tile_n, *tile_k};
+             }),
       op, world, m, n, n, dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
@@ -1826,10 +1890,10 @@ inline std::variant<LinkTrafficLaunch, Error> select_link_traffic(
 }  // namespace experimental
 
 // =================================================================================================
-// EVERY TUNED SELECTION FITS, for every op at the smallest call (8 columns on 2 ranks: narrower than
-// any slicing kernel takes) and a large one: an op never declines (a fusion that is on runs its
-// fused op), and a kernel past a capability is a compile error, not one that overruns its signal
-// slots.
+// EVERY TUNED SELECTION FITS, for every op at the smallest call (8 columns on 2 ranks: narrower
+// than any slicing kernel takes) and a large one: an op never declines (a fusion that is on runs
+// its fused op), and a kernel past a capability is a compile error, not one that overruns its
+// signal slots.
 // =================================================================================================
 
 // The tuned kernel for `m` rows of `row` elements, cut to the work: picked, and launchable.

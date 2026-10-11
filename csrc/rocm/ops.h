@@ -80,8 +80,8 @@ void rocm_comms_dispose(fptr_t handle_ptr);
 std::vector<int64_t> rocm_comms_fault(fptr_t handle_ptr);
 void rocm_comms_abort(fptr_t handle_ptr);
 
-// Each op takes its own forcing last: a template by name, and only the config
-// fields its kernels have (none: select's, or the template's own).
+// Each op takes its own forcing last: the template by name, every field of one of
+// its builds, and the launch, all or none (none: select's).
 
 // A PLANNER'S ANSWER: the template's name and the op's config fields as its
 // kernel has them, or the Error's number.
