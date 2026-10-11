@@ -41,37 +41,122 @@ DINLINE void reduce_scatter(TILE& chunk, RANK_CHUNK rank_chunk, typename TILE::D
 }  // namespace impl
 
 
-// ON A 3-D TILE, R x M x N, THE RANKS ITS R AXIS: rank r's copy a group of threads (whole waves),
-// read at that rank's strides through `rank_ptr(r)` (a Ptr where the chunk's column 0 is, ROTATED
-// by the caller so the GPUs read different peers at once). A chunk is TILE_M rows of TILE_N
-// columns of a slice, so a rank's slice of several rows fills the tile where one row of it would
-// leave the last chunk part empty.
-
-// REDUCE-SCATTER: this rank's chunk summed over every rank's copy, into `sum_out` (its scratch, a
-// Ptr at the chunk's column 0).
+// AN ELEMENTWISE [R, M, N] PROBLEM -- R ranks' copies of an [M, N] buffer, each at its own strides --
+// WALKED AS [R, 1, M*N]: the rows are only the buffer's layout, so the elements are numbered
+// row-major (e = row * N + col, flat_at) and each rank's SHARE is one contiguous range of them, a
+// rank's tile copy TILE_N of it. WHY: the links and HBM reward long reads from each peer. Cut a row
+// at a time, a rank's share was its slice of every row -- 1.8 KB runs at N = 7168, the plain
+// all-reduce +2% against the flat walk; 128-column tiles, 256 B runs, +3-7% (2026-10-11) -- while a
+// contiguous buffer's range is one run of the whole share. IT SERVES BADLY a strided buffer: its
+// runs are its rows wherever it has them, and each pack's row and column are divided out.
+// The walk is the same for every step and every rank, so a block reads in the all-gather what the
+// same block on each rank wrote in the reduce-scatter. A copy is whole waves (its rank's pointer one
+// scalar select); copy w is rank + w's, ROTATED, so at any moment the GPUs read different peers.
 namespace impl {
-template <typename TILE, typename RANK_PTR>
-DINLINE void reduce_scatter(TILE& chunk, RANK_PTR rank_ptr, const Ptr<typename TILE::Dtype>& sum_out) {
-  // 1. Every rank's copy of the chunk, in one round trip.
-  ranks_load(chunk, rank_ptr);
-  // 2. Summed over the ranks, in rank order, through LDS.
-  const auto sum = block_reduce<Sum, Axis::r>(chunk);
-  // 3. Stored as DTYPE in this rank's slice.
-  tile_store(sum_out.data, sum_out.stride_m, sum.template to<typename TILE::Dtype>());
+// THE SHARES of m x n elements over WORLD ranks, in whole packs (the last rank's short), and the
+// chunks of TILE_N a share takes.
+struct Shares {
+  int64_t total;
+  int slice;
+  int chunks;
+  DINLINE int64_t first(int r) const { return int64_t{r} * slice; }
+  DINLINE int len(int r) const {
+    return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - first(r))));
+  }
+};
+template <typename TILE>
+DINLINE Shares shares_of(int m, int n) {
+  constexpr int WORLD = TILE::kTileR;
+  const int64_t total = int64_t{m} * n;
+  const int slice = static_cast<int>((total / TILE::kPack + WORLD - 1) / WORLD * TILE::kPack);
+  return {total, slice, (slice + TILE::kTileN - 1) / TILE::kTileN};
 }
-}  // namespace impl
+// THIS THREAD'S COPY OF THE CHUNK, from the range starting at element `first` of an [*, n] buffer:
+// one run when its rows are back to back (the address a uniform base and a lane's offset, as
+// tile_load builds it), else each pack's own row and column.
+template <typename TILE, typename T>
+DINLINE void range_load(TILE& t, const Ptr<T>& p, int n, int64_t first) {
+  using P = typename TILE::Pack;
+  if (p.stride_m == int64_t{n} * p.stride_n) {
+    tile_load(t, p.data + first * p.stride_n, 0);
+    return;
+  }
+#pragma unroll
+  for (int k = 0; k < t.K; ++k)
+    held(t, 0, k,
+         pack_load(reinterpret_cast<const P*>(flat_at(p, first + int64_t{t.col(k)} * t.kPack, n))));
+  issued();
+}
+// ...and stored, its first `len` elements.
+template <typename TILE, typename T>
+DINLINE void range_store(const TILE& t, const Ptr<T>& p, int n, int64_t first, int len) {
+  using P = typename TILE::Pack;
+  const bool run = p.stride_m == int64_t{n} * p.stride_n;
+#pragma unroll
+  for (int k = 0; k < t.K; ++k) {
+    const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
+    if (c >= len / t.kPack) continue;
+    const int64_t e = first + int64_t{c} * t.kPack;
+    P* at = reinterpret_cast<P*>(run ? p.data + e * p.stride_n : flat_at(p, e, n));
+    if constexpr (sizeof(P) == 16)
+      global_store(at, pack(t, 0, k));
+    else
+      *at = pack(t, 0, k);
+  }
+}
 
-// ALL-GATHER: every rank's summed chunk into the output, a chunk a call.
-//   rank_ptr(r)  rank r's summed chunk (its scratch)
-//   out_ptr(r)   where that chunk goes in the output
-//   out_n(r)     how many of its columns are real there (a late rank's slice is short)
-namespace impl {
-template <typename TILE, typename RANK_PTR, typename OUT_PTR, typename OUT_N>
-DINLINE void all_gather(TILE& chunk, RANK_PTR rank_ptr, OUT_PTR out_ptr, OUT_N out_n) {
-  // 1. Every rank's summed copy of the chunk, in one round trip.
-  ranks_load(chunk, rank_ptr);
-  // 2. Each rank's copy stored where its slice goes.
-  ranks_store(out_ptr, out_n, chunk);
+// REDUCE-SCATTER: this rank's share of the inputs, summed over the ranks, into its scratch (one
+// contiguous run from scratch.data). inp(r) is rank r's input at its strides.
+template <typename TILE, typename RANK_PTR, typename T>
+DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& scratch) {
+  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
+  static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
+  constexpr int WORLD = TILE::kTileR;
+  const Shares s      = shares_of<TILE>(m, n);
+  if (s.len(rank) == 0) return;  // a late rank's share is empty at few packs (every block alike)
+  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
+    TILE got{1, s.len(rank), 0, chunk * TILE::kTileN};
+    // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
+    range_load(got, inp((rank + got.slice()) % WORLD), n, s.first(rank));
+    // 2. Summed over the ranks, in rank order, through LDS.
+    const auto sum = block_reduce<Sum, Axis::r>(got);
+    // 3. Stored as T in this rank's scratch.
+    tile_store(scratch.data, 0, sum.template to<T>());
+  });
+}
+
+// ALL-GATHER: every rank's summed share out of its scratch, at its place in the output.
+template <typename TILE, typename RANK_PTR, typename T>
+DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, int n) {
+  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
+  static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
+  constexpr int WORLD = TILE::kTileR;
+  const Shares s      = shares_of<TILE>(m, n);
+  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
+    TILE got{1, s.slice, 0, chunk * TILE::kTileN};
+    const int r = (rank + got.slice()) % WORLD;
+    // 1. Rank r's summed chunk, in one round trip.
+    tile_load(got, scratch(r).data, 0);
+    // 2. Stored where rank r's share goes.
+    range_store(got, out, n, s.first(r), s.len(r));
+  });
+}
+
+// STAGED, BEFORE THE REDUCE-SCATTER: this rank's input, every rank's share of it, into its staging
+// (an [m, n] buffer, ours), each block the chunks that rank's same block reads.
+template <typename TILE, typename T>
+DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int m, int n) {
+  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
+  constexpr int WORLD = TILE::kTileR;
+  const Shares s      = shares_of<TILE>(m, n);
+  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
+    const int r   = (rank + TILE{}.slice()) % WORLD;
+    const int len = s.len(r);
+    if (len == 0) return;
+    TILE part{1, len, 0, chunk * TILE::kTileN};
+    range_load(part, inp, n, s.first(r));
+    range_store(part, staging, n, s.first(r), len);
+  });
 }
 }  // namespace impl
 

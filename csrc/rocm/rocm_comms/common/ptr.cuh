@@ -48,6 +48,16 @@ template <typename T, int WORLD>
 DINLINE Ptr<T> rank_ptr(T* const* p, int rank, int64_t stride_m, int64_t stride_n) {
   return Ptr<T>{impl::rank_of(p, rank), stride_m, stride_n, rank};
 }
+// ELEMENT e OF A BUFFER OF `n`-ELEMENT ROWS, COUNTED ROW-MAJOR (e = row * n + col), at the Ptr's
+// strides: one multiply-add when the rows are back to back (stride_m == n * stride_n, a contiguous
+// tensor), else e's row and column divided out. `e` a pack's first element and `n` whole packs (the
+// host's row_not_packs), so a pack never spans two rows.
+template <typename T>
+DINLINE T* flat_at(const Ptr<T>& p, int64_t e, int n) {
+  if (p.stride_m == int64_t{n} * p.stride_n) return p.data + e * p.stride_n;
+  const int64_t row = e / n;
+  return p.data + row * p.stride_m + (e - row * n) * p.stride_n;
+}
 template <typename T>
 DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n, int rank) {
   return Ptr<T>{data, stride_m, stride_n, rank};

@@ -106,23 +106,6 @@ DINLINE void tile_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREA
 }
 
 
-// Row m of the tile into row_data(m), up to its row_n(m) columns.
-// A 3-D tile's ranks (a copy a rank, whole waves each): rank r's copy loaded through rank_ptr(r), a
-// Ptr at that rank's strides, all in one round trip; and stored to rank_ptr(r) up to rank_n(r)
-// columns.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR>
-DINLINE void ranks_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile, RANK_PTR rank_ptr) {
-  impl::ranks_load(tile, rank_ptr);
-}
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename RANK_N>
-DINLINE void ranks_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile, RANK_PTR rank_ptr, RANK_N rank_n) {
-  impl::ranks_load(tile, rank_ptr, rank_n);
-}
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename RANK_N>
-DINLINE void ranks_store(RANK_PTR rank_ptr, RANK_N rank_n, const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile) {
-  impl::ranks_store(rank_ptr, rank_n, tile);
-}
-
 // A row's scalar (a norm's scale), stored once a block.
 DINLINE void block_store_row_scalar(float* scalars, int row, float value) {
   impl::block_store_row_scalar(scalars, row, value);
@@ -290,18 +273,23 @@ DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, TH
   impl::reduce_scatter(chunk, rank_chunk, sum_out);
 }
 
-// ON A 3-D TILE (R x M x N, a copy a rank): this rank's chunk summed over every rank's copy into
-// sum_out, rank r's copy through rank_ptr(r).
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR>
-DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& chunk, RANK_PTR rank_ptr, const Ptr<DTYPE>& sum_out) {
-  impl::reduce_scatter(chunk, rank_ptr, sum_out);
+// AN ELEMENTWISE [R, M, N] PROBLEM: R ranks' copies of an [m, n] buffer, rank r's at inp(r) (a Ptr
+// at its strides). TILE is the [R, 1, TILE_N] chunk the walk moves (collectives.cuh: walked as
+// [R, 1, m*n], each rank's share one contiguous range of the elements, for long runs).
+// Reduce-scatter: this rank's share, summed over the ranks, into its scratch.
+template <typename TILE, typename RANK_PTR, typename T>
+DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& scratch) {
+  impl::reduce_scatter<TILE>(rank, inp, m, n, scratch);
 }
-
-// Every rank's summed chunk into the output: rank r's through rank_ptr(r), to out_ptr(r) up to
-// out_n(r) columns.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R, typename RANK_PTR, typename OUT_PTR, typename OUT_N>
-DINLINE void all_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& chunk, RANK_PTR rank_ptr, OUT_PTR out_ptr, OUT_N out_n) {
-  impl::all_gather(chunk, rank_ptr, out_ptr, out_n);
+// All-gather: every rank's summed share, rank r's at scratch(r), at its place in `out`.
+template <typename TILE, typename RANK_PTR, typename T>
+DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, int n) {
+  impl::all_gather<TILE>(rank, scratch, out, m, n);
+}
+// Staged, first: this rank's input, every rank's share of it, into its staging.
+template <typename TILE, typename T>
+DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int m, int n) {
+  impl::stage<TILE>(rank, inp, staging, m, n);
 }
 
 // ===============================================================================================

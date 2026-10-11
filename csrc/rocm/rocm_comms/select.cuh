@@ -72,19 +72,11 @@ constexpr BuildConfig kAllReduceOneShotConfigs[] = {
     AllReduceBuildConfig{256, 1, 1, 2048},
     AllReduceBuildConfig{512, 1, 1, 4096},
 };
-// The plain two-shot: a 3-D tile, a wave a rank (512 threads at eight ranks), its 64 threads laid
-// TILE_M x 64 / TILE_M over a rank's TILE_M x TILE_N chunk. The grid is the size's
-// (kAllReduceKernels). TILE_M x TILE_N fitted to a rank's slice so every thread is busy: 4 x 128
-// and 4 x 896 divide 7168's 896 columns, 8 x 64 and 8 x 448 divide 3584's 448 (the first of each a
-// group a thread, today's tile size, so the grid's work items stay as many; the second the whole
-// slice, 7 groups a thread, fewer and longer runs); 1 x 512 any width, a row's last chunk part
-// empty where the slice is not whole chunks.
+// The plain two-shot: a group a thread of a row of threads a rank, at eight ranks (512, a wave per
+// peer). The grid is the size's (kAllReduceKernels).
+// 512 threads, 64 a rank's row: a row is whole waves (the kernel's static_assert).
 constexpr BuildConfig kAllReduceTwoShotConfigs[] = {
     AllReduceBuildConfig{512, 1, 1, 512},
-    AllReduceBuildConfig{512, 1, 4, 128},
-    AllReduceBuildConfig{512, 1, 4, 896},
-    AllReduceBuildConfig{512, 1, 8, 64},
-    AllReduceBuildConfig{512, 1, 8, 448},
 };
 constexpr BuildConfig kRmsNormOneShotConfigs[] = {
     AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
@@ -526,32 +518,54 @@ struct TunedKernel {
 // 23-28-34Z prefill; every built config at 8-512 blocks): the one-shot while a row's tiles are few
 // (through 8 tokens of 3584, 4 of 7168), then the two-shot on 512-wide tiles, its grid growing
 // with the rows. 16 tokens of 3584: 8.0 us against the flat walk's 7.8 (be0e1f4e9c) and the
-// one-shot's 9.6, which the byte threshold this replaces had picked. THE TWO-SHOT'S TILES ARE NOT
-// YET SWEPT: 8 x 64 at 3584 and 4 x 128 at 7168 (a rank's slice in whole chunks, every thread busy,
-// as many work items as the 512-wide tile's, so its grids carry over), chosen by the slice, not a
-// run (2026-10-11).
+// one-shot's 9.6, which the byte threshold this replaces had picked.
 constexpr TunedKernel kAllReduceKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8, 16, 3584, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 8, 64}, {16, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
     {8, 32, 3584, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 8, 64}, {32, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
     {8, 64, 3584, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 8, 64}, {64, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
     {8, 256, 3584, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 8, 64}, {128, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8, 8, 7168, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 4, 128}, {16, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
     {8, 16, 7168, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 4, 128}, {32, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
     {8, 32, 7168, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 4, 128}, {64, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
     {8, 64, 7168, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 4, 128}, {128, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
 };
+
+// THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT WHOLE at `world` ranks and `nl` elements a pack, which
+// its dispatch instantiates and nothing else: the one-shot's TILE_M rows a THREADS / TILE_M-thread
+// row each across TILE_N; the two-shot's [R, 1, TILE_N] chunk, a rank's THREADS / world threads a
+// group each across it (collectives.cuh's flat walk). Every tuned entry must lay out, or select
+// would refuse it at run time (tile_not_built): checked here, at compile time.
+constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
+  return c.threads_per_block % c.tile_m == 0 &&
+         c.tile_n % (nl * (c.threads_per_block / c.tile_m)) == 0;
+}
+constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world, int nl) {
+  return c.tile_m == 1 && c.threads_per_block % world == 0 &&
+         c.tile_n % (nl * (c.threads_per_block / world)) == 0;
+}
+constexpr bool all_reduce_kernels_lay_out() {
+  const int nl = kBuild.memory.pack_bytes / 2;  // the tuned dtypes', bf16 and fp16
+  for (const TunedKernel& k : kAllReduceKernels) {
+    const auto& c = std::get<AllReduceBuildConfig>(k.config.build);
+    if (k.fn == Template::all_reduce_pull_one_shot && !one_shot_lays_out(c, nl)) return false;
+    if (k.fn == Template::all_reduce_pull_two_shot && !two_shot_lays_out(c, k.world, nl))
+      return false;
+  }
+  return true;
+}
+static_assert(all_reduce_kernels_lay_out(), "a tuned all-reduce build its dispatch never instantiates");
 
 // gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps set (each
 // crossover cites its run) at the widths we run, until the tuner writes them.
@@ -1038,7 +1052,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups for every thread of
-  //    a tile row (the two-shot's tile a copy a rank, R x M x N, its rows a rank's threads').
+  //    a tile row (the two-shot's rows are the ranks).
   const void* kernel = nullptr;
   by_world(world, [&](auto ng) {
     constexpr int NG = decltype(ng)::value;
@@ -1051,7 +1065,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            if constexpr (THREADS % TM == 0 && TN % (NL * (THREADS / TM)) == 0)
+            if constexpr (one_shot_lays_out(C, NL))
               kernel = staged ? instance<AllReduceOneShotStagedKernel>(
                                     all_reduce_pull_one_shot_staged<T, NG, TM, TN, THREADS, WAVES>)
                               : instance<AllReduceOneShotKernel>(
@@ -1063,9 +1077,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            // A rank's THREADS / NG threads laid TM x THREADS / NG / TM over its TM x TN chunk.
-            if constexpr (THREADS % NG == 0 && (THREADS / NG) % TM == 0 &&
-                          TN % (NL * (THREADS / NG / TM)) == 0)
+            if constexpr (two_shot_lays_out(C, NG, NL))
               kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
                                     all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS, WAVES>)
                               : instance<AllReduceTwoShotKernel>(
