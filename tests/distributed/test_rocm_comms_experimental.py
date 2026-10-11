@@ -25,7 +25,7 @@ def _randn(seed: int, shape: tuple[int, ...]) -> torch.Tensor:
     return torch.randn(shape, generator=g).to(torch.bfloat16).cuda()
 
 
-# (rows, hidden, num_blocks, write_idx, output norm, a forced config or none)
+# (rows, hidden, num_blocks, write_idx, output norm, a whole forced config or none)
 AttnResCall = tuple[int, int, int, int, bool, dict[str, int]]
 
 
@@ -35,12 +35,12 @@ def _attn_res_calls(draw: st.DrawFn) -> AttnResCall:
     rows = draw(st.integers(1, 600))
     num_blocks = draw(st.integers(0, SOURCES - 1))
     write_idx = draw(st.sampled_from((-1, num_blocks)))
-    configs = [
-        c
-        for c in build_info().templates["add_attn_res_rms_norm"].configs
-        if c["tile_n"] >= hidden
+    builds = [
+        b
+        for b in build_info().templates["add_attn_res_rms_norm"].builds
+        if b["tile_n"] >= hidden
     ]
-    forced = draw(st.sampled_from([{}, *configs]))
+    forced = draw(st.sampled_from([{}, *builds]))
     if forced:
         forced = {**forced, "blocks_per_grid": draw(st.integers(1, 1024))}
     return rows, hidden, num_blocks, write_idx, draw(st.booleans()), forced
