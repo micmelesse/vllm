@@ -52,10 +52,14 @@ DINLINE Ptr<T> rank_ptr(T* const* p, int rank, int64_t stride_m, int64_t stride_
 // strides: one multiply-add when the rows are back to back (stride_m == n * stride_n, a contiguous
 // tensor), else e's row and column divided out. `e` a pack's first element and `n` whole packs (the
 // host's row_not_packs), so a pack never spans two rows.
+// The division in 32 bits below 2^31 elements (a few instructions, where a 64-bit one is a
+// hundred).
 template <typename T>
 DINLINE T* flat_at(const Ptr<T>& p, int64_t e, int n) {
   if (p.stride_m == int64_t{n} * p.stride_n) return p.data + e * p.stride_n;
-  const int64_t row = e / n;
+  const int64_t row = e < (int64_t{1} << 31)
+                          ? int64_t{static_cast<uint32_t>(e) / static_cast<uint32_t>(n)}
+                          : e / n;
   return p.data + row * p.stride_m + (e - row * n) * p.stride_n;
 }
 template <typename T>

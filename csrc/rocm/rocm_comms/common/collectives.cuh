@@ -87,21 +87,27 @@ DINLINE void range_load(TILE& t, const Ptr<T>& p, int n, int64_t first) {
          pack_load(reinterpret_cast<const P*>(flat_at(p, first + int64_t{t.col(k)} * t.kPack, n))));
   issued();
 }
-// ...and stored, its first `len` elements.
+// ...and stored, its first `len` elements: one run when the rows are back to back, the address a
+// uniform base and a lane's offset (as tile_store builds it), else each pack's own row and column.
 template <typename TILE, typename T>
 DINLINE void range_store(const TILE& t, const Ptr<T>& p, int n, int64_t first, int len) {
   using P = typename TILE::Pack;
-  const bool run = p.stride_m == int64_t{n} * p.stride_n;
-#pragma unroll
-  for (int k = 0; k < t.K; ++k) {
-    const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
-    if (c >= len / t.kPack) continue;
-    const int64_t e = first + int64_t{c} * t.kPack;
-    P* at = reinterpret_cast<P*>(run ? p.data + e * p.stride_n : flat_at(p, e, n));
+  const auto put = [&](P* at, int k) {
     if constexpr (sizeof(P) == 16)
       global_store(at, pack(t, 0, k));
     else
       *at = pack(t, 0, k);
+  };
+  P* run = reinterpret_cast<P*>(p.data + first * p.stride_n);
+  const bool contiguous = p.stride_m == int64_t{n} * p.stride_n;
+#pragma unroll
+  for (int k = 0; k < t.K; ++k) {
+    const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
+    if (c >= len / t.kPack) continue;
+    if (contiguous)
+      put(at_col(run, t, k), k);
+    else
+      put(reinterpret_cast<P*>(flat_at(p, first + int64_t{c} * t.kPack, n)), k);
   }
 }
 
