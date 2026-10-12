@@ -514,11 +514,12 @@ struct TunedKernel {
 // EACH OP'S KERNELS.
 // =================================================================================================
 
-// all_reduce, gfx950 on n11, bf16, 8 ranks, swept on the 2-D kernels (2026-10-10T23-22-13Z decode,
-// 23-28-34Z prefill; every built config at 8-512 blocks): the one-shot while a row's tiles are few
-// (through 8 tokens of 3584, 4 of 7168), then the two-shot on 512-wide tiles, its grid growing
-// with the rows. 16 tokens of 3584: 8.0 us against the flat walk's 7.8 (be0e1f4e9c) and the
-// one-shot's 9.6, which the byte threshold this replaces had picked.
+// all_reduce, gfx950 on n11, bf16, 8 ranks: the one-shot while a row's tiles are few (through 8
+// tokens of 3584, 4 of 7168; swept 2026-10-10T23-22-13Z), then the two-shot. From 64 tokens of 7168
+// (128 of 3584) the two-shot's grid is the flat walk's measured best, swept uniformly at 40-256
+// blocks (2026-10-12T01-27-40Z, 01-45-53Z; one run a point): 80-120 blocks at mid sizes, 72 from
+// 1 MB-ish shares up, where the flat walk beats be0e1f4e9c (7168 x 4096: 262.4 against 263.9 us).
+// Equal bytes measure alike (the walk is over the flat range), so the two widths share grids.
 constexpr TunedKernel kAllReduceKernels[] = {
     {8, 1, 3584, Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
@@ -529,7 +530,13 @@ constexpr TunedKernel kAllReduceKernels[] = {
     {8, 64, 3584, Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
     {8, 256, 3584, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {80, 0}}},
+    {8, 512, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {120, 0}}},
+    {8, 1024, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {104, 0}}},
+    {8, 2048, 3584, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {72, 0}}},
     {8, 1, 7168, Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8, 8, 7168, Template::all_reduce_pull_two_shot,
@@ -539,7 +546,15 @@ constexpr TunedKernel kAllReduceKernels[] = {
     {8, 32, 7168, Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
     {8, 64, 7168, Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {128, 0}}},
+     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8, 128, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {80, 0}}},
+    {8, 256, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {120, 0}}},
+    {8, 512, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {104, 0}}},
+    {8, 1024, 7168, Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {72, 0}}},
 };
 
 // THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT WHOLE at `world` ranks and `nl` elements a pack, which
