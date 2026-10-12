@@ -224,16 +224,6 @@ RocmCommsAllReduceAddAttnResRmsNormPlan all_reduce_add_attn_res_rms_norm_plan_of
           l.waves_per_eu,
           std::nullopt};
 }
-template <typename LAUNCH>
-RocmCommsAllReduceRmsNormGemmPlan all_reduce_rms_norm_gemm_plan_of(
-    const std::variant<LAUNCH, hip_comms::Error>& p) {
-  if (const auto* e = std::get_if<hip_comms::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
-  const LAUNCH& l = std::get<LAUNCH>(p);
-  return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.tile_k, l.slice_k,
-          l.threads_per_block, l.blocks_per_grid, l.waves_per_eu, std::nullopt};
-}
 }  // namespace
 
 RocmCommsAllReducePlan rocm_comms_plan_all_reduce(
@@ -309,39 +299,6 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
       current_stream()));
 }
 
-// `add`: the GEMM added into the output's; otherwise written. `gemm_weight` is [N, hidden].
-RocmCommsAllReduceRmsNormGemmPlan rocm_comms_plan_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& gemm_weight, bool add,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  const auto alg = algorithm_from(algorithm);
-  const auto dir = direction_from(direction);
-  const auto d = admitted(inp);
-  if (const auto* e = std::get_if<hip_comms::Error>(&d))
-    return all_reduce_rms_norm_gemm_plan_of<hip_comms::AllReduceRmsNormGemmLaunch>(*e);
-  if (gemm_weight.dim() != 2)
-    return all_reduce_rms_norm_gemm_plan_of<hip_comms::AllReduceRmsNormGemmLaunch>(
-        hip_comms::Error::output_not_two_d);
-  auto& h = handle_of(handle_ptr);
-  const hip_comms::DType dt = std::get<hip_comms::DType>(d);
-  const auto tm = narrowed(tile_m), tn = narrowed(tile_n), tk = narrowed(tile_k);
-  const auto sk = narrowed(slice_k), tpb = narrowed(threads_per_block);
-  const auto bpg = narrowed(blocks_per_grid), wpe = narrowed(waves_per_eu);
-  // A plan has inp and the gemm weight; every other buffer is absent: null, its strides 0.
-  const int64_t im = inp.stride(0), in = inp.stride(1), n = gemm_weight.size(0);
-  const int64_t gm = gemm_weight.stride(0), gn = gemm_weight.stride(1);
-  if (add)
-    return all_reduce_rms_norm_gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm_add(
-        h, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0.f, nullptr, gm, gn, n, nullptr, 0, 0, dt,
-        inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, wpe, current_stream()));
-  return all_reduce_rms_norm_gemm_plan_of(hip_comms::select_all_reduce_rms_norm_gemm(
-      h, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0.f, nullptr, gm, gn, n, nullptr, 0, 0, dt,
-      inp.size(0), inp.size(1), alg, dir, tm, tn, tk, sk, tpb, bpg, wpe, current_stream()));
-}
-
 // `inp`'s row is [shared | projected | latent] and `out` [rows, hidden]: the latent is what is
 // left.
 RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
@@ -415,8 +372,7 @@ BuildInfoWire rocm_comms_build_info() {
   // Each template's op, and its builds (what dispatch instantiates: the tuner's search space),
   // flat: a build's fields in `fields`' order, 0 where its op's BuildConfig has none (every field
   // it has is set). The launch is not a build's: a forced call gives its own grid.
-  const Names fields = {"tile_m", "tile_n", "tile_k", "slice_k", "threads_per_block",
-                        "waves_per_eu"};
+  const Names fields = {"tile_m", "tile_n", "tile_k", "threads_per_block", "waves_per_eu"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
@@ -426,11 +382,10 @@ BuildInfoWire rocm_comms_build_info() {
     for (const BuildConfig& b : t.builds)
       std::visit(
           [&](const auto& f) {
-            int64_t k = 0, sk = 0;
+            int64_t k = 0;
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
-            if constexpr (requires { f.slice_k; }) sk = f.slice_k;
-            configs.insert(configs.end(),
-                           {f.tile_m, f.tile_n, k, sk, f.threads_per_block, f.waves_per_eu});
+            configs.insert(configs.end(), {f.tile_m, f.tile_n, k, f.threads_per_block,
+                                           f.waves_per_eu});
           },
           b);
   }
@@ -697,71 +652,6 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
-namespace {
-// A GEMM-TAIL CALL'S TENSORS: inp [rows, hidden]; workspace its shape and dtype; gemm_weight
-// [N, hidden] with contiguous rows; out [rows, N] with a unit column stride (a column slice of a
-// wider buffer allowed); every one inp's dtype.
-void gemm_tensors(const torch::Tensor& out, const torch::Tensor& inp,
-                  const torch::Tensor& norm_weight, const torch::Tensor& gemm_weight,
-                  const torch::Tensor& workspace) {
-  check_device({&inp, &norm_weight, &workspace});
-  TORCH_CHECK(inp.dim() == 2, "inp must be 2-D");
-  const int64_t m = inp.size(0), n = inp.size(1);
-  TORCH_CHECK(workspace.sizes() == inp.sizes() && workspace.scalar_type() == inp.scalar_type(),
-              "workspace must be of inp's shape and dtype");
-  TORCH_CHECK(gemm_weight.is_cuda() && gemm_weight.dim() == 2 && gemm_weight.size(1) == n,
-              "gemm_weight must be [N, hidden]");
-  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == m &&
-                  out.size(1) == gemm_weight.size(0),
-              "out must be [rows, N]");
-  TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == n,
-              "norm_weight must be 1-D of hidden=", n);
-  for (const torch::Tensor* t : {&out, &norm_weight, &gemm_weight})
-    TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
-}
-}  // namespace
-
-void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
-  const auto got = hip_comms::all_reduce_rms_norm_gemm(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), norm_weight.data_ptr(), norm_weight.stride(0),
-      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.stride(0),
-      gemm_weight.stride(1), gemm_weight.size(0), workspace.data_ptr(), workspace.stride(0),
-      workspace.stride(1), dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
-      current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
-
-void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, torch::Tensor& norm_weight,
-    double eps, torch::Tensor& gemm_weight, torch::Tensor& workspace,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  gemm_tensors(out, inp, norm_weight, gemm_weight, workspace);
-  const auto got = hip_comms::all_reduce_rms_norm_gemm_add(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), norm_weight.data_ptr(), norm_weight.stride(0),
-      static_cast<float>(eps), gemm_weight.data_ptr(), gemm_weight.stride(0),
-      gemm_weight.stride(1), gemm_weight.size(0), workspace.data_ptr(), workspace.stride(0),
-      workspace.stride(1), dtype_of(inp), inp.size(0), inp.size(1), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(slice_k),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
-      current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
 
 // out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
 // projected | latent] summed over the ranks first: the widths are out's, out's again, and the

@@ -207,17 +207,6 @@ DINLINE void partial_dot(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_
   impl::partial_dot(a, b, d);
 }
 
-// The skinny GEMM, out (or out +=, ACCUMULATE) = x[rows, cols] . w[n_cols, cols]^T, the grid
-// striding over tiles of columns.
-template <int TILE_M, int TILE_K, int SLICE_K, bool ACCUMULATE, int THREADS_PER_BLOCK,
-          typename DTYPE>
-DINLINE void grid_gemm(const DTYPE* x, int64_t x_stride, int rows, int cols,
-                       const DTYPE* __restrict__ gemm_w, int64_t gemm_w_stride, int n_cols,
-                       DTYPE* __restrict__ out, int64_t out_stride) {
-  impl::grid_gemm<TILE_M, TILE_K, SLICE_K, ACCUMULATE, THREADS_PER_BLOCK, DTYPE>(
-      x, x_stride, rows, cols, gemm_w, gemm_w_stride, n_cols, out, out_stride);
-}
-
 // ===============================================================================================
 // SOFTMAX (softmax.cuh)
 // ===============================================================================================

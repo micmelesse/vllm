@@ -35,30 +35,29 @@ enum class Error : int {
   template_not_this_ops = 10,
   row_too_wide = 11,
   block_not_a_wave_per_peer = 12,
-  block_exceeds_lds = 13,
-  scratch_too_small = 14,
-  grid_not_resident = 15,
-  staging_too_small = 16,
-  device_not_built = 17,
-  device_not_tuned = 18,
-  weight_not_built = 19,
-  no_such_template = 20,
-  no_such_group = 21,
-  ranks_disagree = 22,
-  groups_disagree = 23,
-  threads_not_built = 24,
-  tile_not_built = 25,
-  launch_out_of_range = 26,
-  field_not_positive = 27,
-  field_not_this_templates = 28,
-  probe_out_of_range = 29,
-  waves_not_built = 30,
-  inner_stride_not_one = 31,
-  row_stride_not_packs = 32,
-  row_narrower_than_world = 33,
-  forced_incomplete = 34,
+  scratch_too_small = 13,
+  grid_not_resident = 14,
+  staging_too_small = 15,
+  device_not_built = 16,
+  device_not_tuned = 17,
+  weight_not_built = 18,
+  no_such_template = 19,
+  no_such_group = 20,
+  ranks_disagree = 21,
+  groups_disagree = 22,
+  threads_not_built = 23,
+  tile_not_built = 24,
+  launch_out_of_range = 25,
+  field_not_positive = 26,
+  field_not_this_templates = 27,
+  probe_out_of_range = 28,
+  waves_not_built = 29,
+  inner_stride_not_one = 30,
+  row_stride_not_packs = 31,
+  row_narrower_than_world = 32,
+  forced_incomplete = 33,
 };
-constexpr int kNumErrors = 35;
+constexpr int kNumErrors = 34;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -80,8 +79,6 @@ constexpr const char* to_string(Error e) {
       return "row_too_wide: the row is wider than the template's widest build holds";
     case Error::block_not_a_wave_per_peer:
       return "block_not_a_wave_per_peer: a two-shot block must be one wave per peer";
-    case Error::block_exceeds_lds:
-      return "block_exceeds_lds: the GEMM tail's block exceeds what its LDS holds";
     case Error::scratch_too_small:
       return "scratch_too_small: the two-shot scratch exceeds the scratch";
     case Error::grid_not_resident:
@@ -141,15 +138,11 @@ enum class Template : int {
   all_reduce_pull_two_shot_add_rms_norm          = 5,
   all_reduce_pull_one_shot_add_attn_res_rms_norm = 6,
   all_reduce_pull_two_shot_add_attn_res_rms_norm = 7,
-  all_reduce_pull_one_shot_rms_norm_gemm_add     = 8,
-  all_reduce_pull_two_shot_rms_norm_gemm_add     = 9,
-  all_reduce_push_two_shot_rms_norm              = 10,
-  all_reduce_push_two_shot_add_rms_norm          = 11,
-  all_reduce_push_two_shot_add_attn_res_rms_norm = 12,
-  all_reduce_pull_one_shot_rms_norm_gemm         = 13,
-  all_reduce_pull_two_shot_rms_norm_gemm         = 14,
-  all_reduce_pull_one_shot_rms_scale_add         = 15,
-  all_reduce_pull_two_shot_rms_scale_add         = 16,
+  all_reduce_push_two_shot_rms_norm              = 8,
+  all_reduce_push_two_shot_add_rms_norm          = 9,
+  all_reduce_push_two_shot_add_attn_res_rms_norm = 10,
+  all_reduce_pull_one_shot_rms_scale_add         = 11,
+  all_reduce_pull_two_shot_rms_scale_add         = 12,
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's whole input; two-shot
@@ -168,9 +161,7 @@ enum class OpType : int {
   all_reduce_rms_norm              = 1,
   all_reduce_add_rms_norm          = 2,
   all_reduce_add_attn_res_rms_norm = 3,
-  all_reduce_rms_norm_gemm_add     = 4,
-  all_reduce_rms_norm_gemm         = 5,
-  all_reduce_rms_scale_add         = 6,
+  all_reduce_rms_scale_add         = 4,
 };
 
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what is compiled in (one
@@ -181,9 +172,8 @@ enum class OpType : int {
 // EACH OP'S BUILD, Triton's autotune config less the grid: the block's threads (Triton's num_warps
 // x 64), the waves a SIMD (an EU) the compiler fits its registers to (__launch_bounds__'s second
 // value, Triton's waves_per_eu; 1 asks nothing), and the tile, TILE_M rows x TILE_N columns in
-// elements; TILE_K is the reduced dimension a step (the GEMM's K a pass, AttnRes's sources a
-// step) and SLICE_K the lanes splitting one output's K (CUTLASS's sliced-K). One type an op, so a
-// config cannot cross ops, though three hold the same fields.
+// elements; TILE_K is the reduced dimension a step (AttnRes's sources a step). One type an op,
+// so a config cannot cross ops, though four hold the same fields.
 // all_reduce: a tile a work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
   int threads_per_block;
@@ -217,26 +207,6 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_k;
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
-// all_reduce_rms_norm_gemm.
-struct AllReduceRmsNormGemmBuildConfig {
-  int threads_per_block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int slice_k;
-  bool operator==(const AllReduceRmsNormGemmBuildConfig&) const = default;
-};
-// all_reduce_rms_norm_gemm_add.
-struct AllReduceRmsNormGemmAddBuildConfig {
-  int threads_per_block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int slice_k;
-  bool operator==(const AllReduceRmsNormGemmAddBuildConfig&) const = default;
-};
 // all_reduce_rms_scale_add.
 struct AllReduceRmsScaleAddBuildConfig {
   int threads_per_block;
@@ -247,8 +217,7 @@ struct AllReduceRmsScaleAddBuildConfig {
 };
 using BuildConfig =
     std::variant<AllReduceBuildConfig, AllReduceRmsNormBuildConfig, AllReduceAddRmsNormBuildConfig,
-                 AllReduceAddAttnResRmsNormBuildConfig, AllReduceRmsNormGemmBuildConfig,
-                 AllReduceRmsNormGemmAddBuildConfig, AllReduceRmsScaleAddBuildConfig>;
+                 AllReduceAddAttnResRmsNormBuildConfig, AllReduceRmsScaleAddBuildConfig>;
 
 // A KERNEL'S LAUNCH: its grid, never compiled in, and the blocks of it the fused AttnRes pull
 // two-shot gives its reduce-scatter (its reads queue behind the links past a few dozen; AttnRes
@@ -355,18 +324,6 @@ using AllReduceAddAttnResRmsNormPullKernel =
     void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
           void*, int,
              uint64_t, HIP_COMMS_ATTN_RES_ARGS, int);
-// norm_w, eps, gemm_w, n_cols, out, workspace, inp_size_m, inp_size_n: written or added
-// (all_reduce_rms_norm_gemm and _gemm_add), one shape.
-using AllReduceRmsNormGemmOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t,
-          const void*,
-             int64_t, float, const void*, int64_t, int64_t, int, void*, int64_t, int64_t, void*,
-             int64_t, int64_t, int, int);
-using AllReduceRmsNormGemmTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
-          void*, int,
-             uint64_t, const void*, int64_t, float, const void*, int64_t, int64_t, int, void*,
-             int64_t, int64_t, void*, int64_t, int64_t, int, int);
 // out, eps, inp_size_m, inp_size_n, latent_size_n.
 using AllReduceRmsScaleAddOneShotKernel =
     void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*,
@@ -514,69 +471,6 @@ struct AllReduceAddAttnResRmsNormLaunch {
   float eps;
   float out_eps;
   bool has_prefix;
-};
-
-// out [rows, n_cols] at `out_stride`; gemm_weight [n_cols, hidden]; `workspace` inp's shape.
-struct AllReduceRmsNormGemmLaunch {
-  const void* kernel;
-  Algorithm algorithm;
-  Direction direction;
-  int world;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int slice_k;
-  int threads_per_block;
-  int blocks_per_grid;
-  int waves_per_eu;
-  hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
-  const void* norm_weight;
-  int64_t norm_weight_stride_n;
-  float eps;
-  const void* gemm_weight;
-  int64_t gemm_weight_stride_m, gemm_weight_stride_n;
-  int64_t n_cols;
-  void* workspace;
-  int64_t workspace_stride_m, workspace_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
-  DType dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
-};
-
-struct AllReduceRmsNormGemmAddLaunch {
-  const void* kernel;
-  Algorithm algorithm;
-  Direction direction;
-  int world;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int slice_k;
-  int threads_per_block;
-  int blocks_per_grid;
-  int waves_per_eu;
-  hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
-  const void* norm_weight;
-  int64_t norm_weight_stride_n;
-  float eps;
-  const void* gemm_weight;
-  int64_t gemm_weight_stride_m, gemm_weight_stride_n;
-  int64_t n_cols;
-  void* workspace;
-  int64_t workspace_stride_m, workspace_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
-  DType dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
 };
 
 // inp's row [shared | projected | latent], widths hidden, hidden, latent; out [rows, hidden].

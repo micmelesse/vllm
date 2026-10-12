@@ -41,8 +41,6 @@ Op = Literal[
     "all_reduce_rms_norm",
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
-    "all_reduce_rms_norm_gemm_add",
-    "all_reduce_rms_norm_gemm",
     "all_reduce_rms_scale_add",
 ]
 
@@ -105,28 +103,28 @@ class Error(IntEnum):
     template_not_this_ops = 10
     row_too_wide = 11
     block_not_a_wave_per_peer = 12
-    block_exceeds_lds = 13
-    scratch_too_small = 14
-    grid_not_resident = 15
-    staging_too_small = 16
-    device_not_built = 17
-    device_not_tuned = 18
-    weight_not_built = 19
-    no_such_template = 20
-    no_such_group = 21
-    ranks_disagree = 22
-    groups_disagree = 23
-    threads_not_built = 24
-    tile_not_built = 25
-    launch_out_of_range = 26
-    field_not_positive = 27
-    field_not_this_templates = 28
-    probe_out_of_range = 29
-    waves_not_built = 30
-    inner_stride_not_one = 31
-    row_stride_not_packs = 32
-    row_narrower_than_world = 33
-    forced_incomplete = 34
+    scratch_too_small = 13
+    grid_not_resident = 14
+    staging_too_small = 15
+    device_not_built = 16
+    device_not_tuned = 17
+    weight_not_built = 18
+    no_such_template = 19
+    no_such_group = 20
+    ranks_disagree = 21
+    groups_disagree = 22
+    threads_not_built = 23
+    tile_not_built = 24
+    launch_out_of_range = 25
+    field_not_positive = 26
+    field_not_this_templates = 27
+    probe_out_of_range = 28
+    waves_not_built = 29
+    inner_stride_not_one = 30
+    row_stride_not_packs = 31
+    row_narrower_than_world = 32
+    forced_incomplete = 33
+
 
 
 class Where(IntEnum):
@@ -714,191 +712,9 @@ class Communicator(ABC):
         )
         return prefix_out, out, ran
 
-    @final
-    def should_allreduce_rms_norm_gemm(
-        self,
-        inp: torch.Tensor,
-        gemm_weight: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        slice_k: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> bool:
-        """Whether `all_reduce_rms_norm_gemm(inp, ..., gemm_weight, ...)` runs here;
-        `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        ran = self._check_all_reduce_rms_norm_gemm(
-            inp,
-            gemm_weight,
-            False,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            slice_k,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
 
-    @final
-    def all_reduce_rms_norm_gemm(
-        self,
-        inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        slice_k: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> Ran:
-        """`out = rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
-        kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
-        wider buffer is fine). Returns what ran."""
-        ran = self._check_all_reduce_rms_norm_gemm(
-            inp,
-            gemm_weight,
-            False,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            slice_k,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        if not self._warming_up():
-            self._record("all_reduce_rms_norm_gemm", inp, ran)
-            self._all_reduce_rms_norm_gemm(
-                False,
-                inp,
-                norm_weight,
-                eps,
-                gemm_weight,
-                out,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return ran
 
-    @final
-    def should_allreduce_rms_norm_gemm_add(
-        self,
-        inp: torch.Tensor,
-        gemm_weight: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        slice_k: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> bool:
-        """Whether `all_reduce_rms_norm_gemm_add(inp, ..., gemm_weight, ...)` runs here;
-        `gemm_weight` is [N, hidden], and its N shapes the launch."""
-        ran = self._check_all_reduce_rms_norm_gemm(
-            inp,
-            gemm_weight,
-            True,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            slice_k,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
 
-    @final
-    def all_reduce_rms_norm_gemm_add(
-        self,
-        inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        slice_k: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> Ran:
-        """`out += rms_norm(all_reduce(inp), norm_weight, eps) @ gemm_weight.T` in one
-        kernel, `gemm_weight` being [N, hidden] and `out` [rows, N] (a column slice of a
-        wider buffer is fine). Returns what ran."""
-        ran = self._check_all_reduce_rms_norm_gemm(
-            inp,
-            gemm_weight,
-            True,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            slice_k,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        if not self._warming_up():
-            self._record("all_reduce_rms_norm_gemm_add", inp, ran)
-            self._all_reduce_rms_norm_gemm(
-                True,
-                inp,
-                norm_weight,
-                eps,
-                gemm_weight,
-                out,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                slice_k,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return ran
 
     @final
     def should_allreduce_rms_scale_add(
@@ -1265,42 +1081,7 @@ class Communicator(ABC):
             f"{type(self).__name__} has no fused all-reduce + AttnRes"
         )
 
-    def _check_all_reduce_rms_norm_gemm(
-        self,
-        inp: torch.Tensor,
-        gemm_weight: torch.Tensor,
-        add: bool,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        tile_k: int | None,
-        slice_k: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        return Error.no_such_op
 
-    def _all_reduce_rms_norm_gemm(
-        self,
-        add: bool,
-        inp: torch.Tensor,
-        norm_weight: torch.Tensor,
-        eps: float,
-        gemm_weight: torch.Tensor,
-        out: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        tile_k: int | None,
-        slice_k: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> None:
-        raise NotImplementedError(f"{type(self).__name__} has no fused GEMM tail")
 
     def _check_all_reduce_rms_scale_add(
         self,

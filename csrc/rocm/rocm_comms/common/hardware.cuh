@@ -171,14 +171,6 @@ constexpr int resident_blocks(const Hardware& hw, Resources r, int threads) {
   return static_cast<int>(per_cu * hw.compute_units);
 }
 
-// Waves a block may have when its LDS is `fixed` bytes plus `per_wave` for each wave: what the
-// device's LDS holds, and no more than the block limit.
-constexpr int lds_max_waves(const Hardware& hw, int64_t fixed, int64_t per_wave) {
-  const int64_t fit = (hw.lds_bytes - fixed) / per_wave;
-  const int64_t cap = hw.max_workgroup / hw.wave_size;
-  return static_cast<int>(fit < cap ? fit : cap);
-}
-
 // THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles are wrong.
 #if defined(__AMDGCN_WAVEFRONT_SIZE)
 static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize,

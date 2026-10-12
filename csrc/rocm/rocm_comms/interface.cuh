@@ -145,67 +145,6 @@ inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error> all_reduce_add_attn
 }
 
 // =================================================================================================
-// THE GEMM TAILS: out = rms_norm(all_reduce(inp), norm_weight) @ gemm_weight^T, written
-// (all_reduce_rms_norm_gemm) or added (_gemm_add, the latent MoE tail). out [rows, n_cols] at
-// its strides (a column slice of a wider buffer); gemm_weight [n_cols, hidden]; `workspace` holds
-// the normed rows, inp's shape.
-// =================================================================================================
-
-inline std::variant<AllReduceRmsNormGemmLaunch, Error> all_reduce_rms_norm_gemm(
-    Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* norm_weight,
-    int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
-    int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
-    int64_t workspace_stride_n, DType dtype,
-    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  if (const std::optional<Error> e = layout_refused(
-          dtype, {{out_stride_m, out_stride_n},
-                  {inp_stride_m, inp_stride_n},
-                  {0, norm_weight_stride_n},
-                  {gemm_weight_stride_m, gemm_weight_stride_n},
-                  {workspace_stride_m, workspace_stride_n}}))
-    return *e;
-  std::variant<AllReduceRmsNormGemmLaunch, Error> l = select_all_reduce_rms_norm_gemm(
-      h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, norm_weight,
-      norm_weight_stride_n, eps, gemm_weight, gemm_weight_stride_m, gemm_weight_stride_n, n_cols,
-      workspace, workspace_stride_m, workspace_stride_n, dtype, m, n, algorithm, direction, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-      blocks_per_grid, waves_per_eu, stream);
-  if (const AllReduceRmsNormGemmLaunch* got = std::get_if<AllReduceRmsNormGemmLaunch>(&l))
-    launch_all_reduce_rms_norm_gemm(h, *got);
-  return l;
-}
-
-inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> all_reduce_rms_norm_gemm_add(
-    Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* norm_weight,
-    int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
-    int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
-    int64_t workspace_stride_n, DType dtype,
-    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  if (const std::optional<Error> e = layout_refused(
-          dtype, {{out_stride_m, out_stride_n},
-                  {inp_stride_m, inp_stride_n},
-                  {0, norm_weight_stride_n},
-                  {gemm_weight_stride_m, gemm_weight_stride_n},
-                  {workspace_stride_m, workspace_stride_n}}))
-    return *e;
-  std::variant<AllReduceRmsNormGemmAddLaunch, Error> l = select_all_reduce_rms_norm_gemm_add(
-      h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, norm_weight,
-      norm_weight_stride_n, eps, gemm_weight, gemm_weight_stride_m, gemm_weight_stride_n, n_cols,
-      workspace, workspace_stride_m, workspace_stride_n, dtype, m, n, algorithm, direction, tile_m, tile_n, tile_k, slice_k, threads_per_block,
-      blocks_per_grid, waves_per_eu, stream);
-  if (const AllReduceRmsNormGemmAddLaunch* got = std::get_if<AllReduceRmsNormGemmAddLaunch>(&l))
-    launch_all_reduce_rms_norm_gemm_add(h, *got);
-  return l;
-}
-
-// =================================================================================================
 // all_reduce_rms_scale_add: Kimi-K3's latent MoE tail with one all-reduce. inp's row is [shared |
 // projected | latent], widths hidden, hidden and latent, summed over the ranks; out [rows, hidden]
 // = shared + projected * rsqrt(mean(latent^2) + eps). Its tile holds the latent whole (each tile

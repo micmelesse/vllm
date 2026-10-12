@@ -100,10 +100,6 @@ using RocmCommsAllReduceAddAttnResRmsNormPlan =
     RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
                   RocmCommsField, RocmCommsField, RocmCommsField,
                   RocmCommsField>;
-using RocmCommsAllReduceRmsNormGemmPlan =
-    RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField>;
 using RocmCommsAllReduceRmsScaleAddPlan =
     RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField, RocmCommsField,
                   RocmCommsField>;
@@ -128,15 +124,6 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-RocmCommsAllReduceRmsNormGemmPlan rocm_comms_plan_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, const torch::Tensor& inp,
-    const torch::Tensor& gemm_weight, bool add,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> tile_k, std::optional<int64_t> slice_k,
     std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
@@ -189,30 +176,10 @@ void rocm_comms_all_reduce_add_rms_norm(
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void rocm_comms_all_reduce_rms_norm_gemm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
-    torch::Tensor& workspace, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
 void rocm_comms_all_reduce_rms_scale_add(
     fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, double eps,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
-void rocm_comms_all_reduce_rms_norm_gemm_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-    torch::Tensor& norm_weight, double eps, torch::Tensor& gemm_weight,
-    torch::Tensor& workspace, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> slice_k, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 

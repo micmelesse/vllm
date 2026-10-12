@@ -34,12 +34,10 @@
 #include "kernels/all_reduce_pull_one_shot.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_pull_one_shot_rms_norm_gemm_add.cuh"
 #include "kernels/all_reduce_pull_one_shot_rms_scale_add.cuh"
 #include "kernels/all_reduce_pull_two_shot.cuh"
 #include "kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_pull_two_shot_rms_norm_gemm_add.cuh"
 #include "kernels/all_reduce_pull_two_shot_rms_scale_add.cuh"
 #include "kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
@@ -58,8 +56,7 @@ namespace hip_comms {
 // a build's: each tuned kernel (below) gives its own, and a forced call gives its own. tile_n
 // counts the elements of a 16-bit dtype, the only ones built. A build that spills shows in its code
 // object (Handle::resources_of) and loses on the clock; none is ruled out by policy. The sweeps
-// cited beside a list set its builds and the grids its tuned kernels carry, at 512 threads (256
-// was worse for the GEMM tail, 2026-09-28; not swept for the others, which copy it).
+// cited beside a list set its builds and the grids its tuned kernels carry.
 
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a row split).
 // Not swept: select cuts it to the rows, so it matters only past 16 rows.
@@ -155,42 +152,6 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 4},
 };
 
-// The GEMM tails, both ops and both shots: 16 rows a GEMM pass (one fp32 accumulator a row in each
-// lane); TILE_K what gfx950's LDS stages at 16 rows beside the widest block's partials; SLICE_K 4,
-// picked at Kimi-K3's shape, 1, 2 and 8 worse at 1 row (2026-09-28); 56 blocks the best at 1 row
-// (2026-09-28, log). Not swept for the rest, which copy it.
-constexpr int kGemmTileK = gemm_tile_k_fit(kTarget, 16);
-constexpr BuildConfig kRmsNormGemmConfigs[] = {
-    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4},
-    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4},
-    AllReduceRmsNormGemmBuildConfig{512, 1, 16, 16384, kGemmTileK, 4},
-};
-// The same builds, the product added into out.
-constexpr BuildConfig kRmsNormGemmAddConfigs[] = {
-    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4},
-    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4},
-    AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 16384, kGemmTileK, 4},
-};
-// A BUILD WITH A SLICED K HOLDS ITS GEMM'S BLOCK in the target's LDS (any other: nothing to hold).
-constexpr bool gemm_fits(const BuildConfig& b) {
-  return std::visit(
-      [](const auto& c) {
-        if constexpr (requires { c.slice_k; })
-          return gemm_fits(kTarget, c.tile_m, c.tile_k, c.slice_k, c.threads_per_block);
-        else return true;
-      },
-      b);
-}
-constexpr bool gemm_tail_configs_fit() {
-  for (const BuildConfig& b : kRmsNormGemmConfigs)
-    if (!gemm_fits(b)) return false;
-  for (const BuildConfig& b : kRmsNormGemmAddConfigs)
-    if (!gemm_fits(b)) return false;
-  return true;
-}
-static_assert(gemm_tail_configs_fit(),
-              "every GEMM-tail config holds its block in the target's LDS");
-
 // The one-all-reduce tail. The one-shot: a block a (row, slice) up to one a compute unit.
 constexpr BuildConfig kRmsScaleAddOneShotConfigs[] = {
     AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096},
@@ -234,20 +195,12 @@ constexpr TemplateInfo kTemplates[] = {
      OpType::all_reduce_add_attn_res_rms_norm, false, false, kAttnResOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, true, false, kAttnResPullConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm_add),
-     OpType::all_reduce_rms_norm_gemm_add, false, false, kRmsNormGemmAddConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm_add),
-     OpType::all_reduce_rms_norm_gemm_add, true, false, kRmsNormGemmAddConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_rms_norm), OpType::all_reduce_rms_norm,
      true, true, kRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_rms_norm), OpType::all_reduce_add_rms_norm,
      true, true, kAddRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, true, true, kAttnResPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_norm_gemm), OpType::all_reduce_rms_norm_gemm,
-     false, false, kRmsNormGemmConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_norm_gemm), OpType::all_reduce_rms_norm_gemm,
-     true, false, kRmsNormGemmConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), OpType::all_reduce_rms_scale_add,
      false, false, kRmsScaleAddOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), OpType::all_reduce_rms_scale_add,
@@ -631,37 +584,6 @@ constexpr TunedKernel kAttnResKernels[] = {
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
 };
 
-// The GEMM tails: the one-shot through one GEMM pass of rows (16), where the one-shot kernel
-// once had to stop; not swept.
-constexpr TunedKernel kRmsNormGemmKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
-    {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
-    {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm,
-     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
-    // Past the model's widths, to the widest build: the one-shot; not swept.
-    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm_gemm,
-     {AllReduceRmsNormGemmBuildConfig{512, 1, 16, 16384, kGemmTileK, 4}, {56, 0}}},
-};
-
-// As rms_norm_gemm's.
-constexpr TunedKernel kRmsNormGemmAddKernels[] = {
-    {8, 1, 3584, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
-    {8, 17, 3584, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 4096, kGemmTileK, 4}, {56, 0}}},
-    {8, 1, 7168, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
-    {8, 17, 7168, Template::all_reduce_pull_two_shot_rms_norm_gemm_add,
-     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 8192, kGemmTileK, 4}, {56, 0}}},
-    // Past the model's widths, to the widest build: the one-shot; not swept.
-    {8, 1, 16384, Template::all_reduce_pull_one_shot_rms_norm_gemm_add,
-     {AllReduceRmsNormGemmAddBuildConfig{512, 1, 16, 16384, kGemmTileK, 4}, {56, 0}}},
-};
-
 // The one-all-reduce tail, [T, 17920] (a latent of 3584): the one-shot while there are fewer
 // rows than ranks, the row two-shot from a row a rank (10.8 against 12.3 us at 1 token, 13.2
 // against 14.3 at 8 the other way; 2026-10-01T21-20-57Z).
@@ -696,8 +618,6 @@ constexpr Op kOps[] = {
     {HIP_COMMS_NAMED(all_reduce_rms_norm), kRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_attn_res_rms_norm), kAttnResKernels},
-    {HIP_COMMS_NAMED(all_reduce_rms_norm_gemm_add), kRmsNormGemmAddKernels},
-    {HIP_COMMS_NAMED(all_reduce_rms_norm_gemm), kRmsNormGemmKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_scale_add), kRmsScaleAddKernels},
 };
 #undef HIP_COMMS_NAMED
@@ -744,11 +664,6 @@ constexpr Template only_template(OpType o) {
   for (const TemplateInfo& t : kTemplates)
     if (t.op == o) return t.fn;
   return Template::all_reduce_pull_one_shot;  // never: every op has a template
-}
-
-// A norm then a GEMM, written or added: their GEMM phase strides over column tiles.
-constexpr bool gemms(OpType op) {
-  return op == OpType::all_reduce_rms_norm_gemm || op == OpType::all_reduce_rms_norm_gemm_add;
 }
 
 // A COLUMN TWO-SHOT reduce-scatters by columns, so every block keeps every row; a row two-shot
@@ -896,10 +811,8 @@ inline std::variant<Chosen, Error> chosen(const std::variant<std::optional<Chose
 // THE TILES THERE ARE, one block's work each: this rank's rows (a row two-shot's share, every row
 // otherwise) in TILE_M, by the grid's `grid_cols` columns in TILE_N. A grid wider is idle blocks,
 // each still paying every barrier (the pull norm at 32 tokens ran 36 blocks for 4 rows a rank).
-// The GEMM tail's GEMM strides over column tiles, so it is not cut.
 constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m, int64_t grid_cols,
                            int world) {
-  if (gemms(op_of(t))) return c.launch.blocks_per_grid;
   const bool row_split = is_two_shot(t) && !slices_columns(t);
   const int64_t mine   = row_split ? (m + world - 1) / world : m;
   const int64_t tm = tile_m_of(c.build), tn = tile_n_of(c.build);
@@ -971,7 +884,6 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
   if (!built_at(fn, threads, waves_of(c.build))) return Error::waves_not_built;
   if (!built(fn, c.build)) return Error::tile_not_built;
   if (tile_n_of(c.build) < tile_cols) return Error::row_too_wide;
-  if (!gemm_fits(c.build)) return Error::block_exceeds_lds;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
   // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with fewer, the ranks past
@@ -1461,204 +1373,6 @@ select_all_reduce_add_attn_res_rms_norm(
   return l;
 }
 
-// all_reduce_rms_norm_gemm: out = rms_norm(all_reduce(inp), norm_weight) @ gemm_weight^T, out
-// [rows, n_cols] at `out_stride` (a column slice of a wider buffer); gemm_weight [n_cols, hidden];
-// `workspace` holds the normed rows, inp's shape.
-inline std::variant<AllReduceRmsNormGemmLaunch, Error> select_all_reduce_rms_norm_gemm(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* norm_weight,
-    int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
-    int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
-    int64_t workspace_stride_n, DType dtype,
-    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  using K         = Template;
-  const OpType op = OpType::all_reduce_rms_norm_gemm;
-  const int world = h.world_size();
-  // 1.
-  const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction,
-             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k},
-             blocks_per_grid, std::nullopt,
-             [&] {
-               return AllReduceRmsNormGemmBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
-                                                      *tile_n, *tile_k, *slice_k};
-             }),
-      op, world, m, n, n, dtype);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
-  const Template fn     = k.fn;
-  const KernelConfig& c = k.config;
-  // 2.
-  if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
-    return *e;
-  // 3. The op's two templates share one config list, so one lookup serves each.
-  const void* kernel = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      by_build<K::all_reduce_pull_one_shot_rms_norm_gemm>(c.build, [&](auto cc) {
-        constexpr AllReduceRmsNormGemmBuildConfig C = decltype(cc)::value;
-        constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.threads_per_block,
-                WPE = C.waves_per_eu;
-        switch (fn) {
-          case K::all_reduce_pull_one_shot_rms_norm_gemm:
-            kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB, WPE>);
-            return;
-          case K::all_reduce_pull_two_shot_rms_norm_gemm:
-            kernel = instance<AllReduceRmsNormGemmTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm<T, NG, TM, TN, TK, SK, TPB, WPE>);
-            return;
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  // 4.
-  const AllReduceRmsNormGemmBuildConfig& g = std::get<AllReduceRmsNormGemmBuildConfig>(c.build);
-  const AllReduceRmsNormGemmLaunch l{.kernel            = kernel,
-                                     .algorithm         = algorithm_of(fn),
-                                     .direction         = direction_of(fn),
-                                     .world             = world,
-                                     .tile_m            = g.tile_m,
-                                     .tile_n            = g.tile_n,
-                                     .tile_k            = g.tile_k,
-                                     .slice_k           = g.slice_k,
-                                     .threads_per_block = g.threads_per_block,
-                                     .blocks_per_grid   = c.launch.blocks_per_grid,
-                                     .waves_per_eu      = g.waves_per_eu,
-                                     .stream            = stream,
-                                     .out               = out,
-                                     .out_stride_m = out_stride_m,
-                                     .out_stride_n = out_stride_n,
-                                     .inp               = inp,
-                                     .inp_stride_m = inp_stride_m,
-                                     .inp_stride_n = inp_stride_n,
-                                     .norm_weight       = norm_weight,
-                                     .norm_weight_stride_n = norm_weight_stride_n,
-                                     .eps               = eps,
-                                     .gemm_weight       = gemm_weight,
-                                     .gemm_weight_stride_m = gemm_weight_stride_m,
-                                     .gemm_weight_stride_n = gemm_weight_stride_n,
-                                     .n_cols            = n_cols,
-                                     .workspace         = workspace,
-                                     .workspace_stride_m = workspace_stride_m,
-                                     .workspace_stride_n = workspace_stride_n,
-                                     .scratch_stride_m = n,
-                                     .scratch_stride_n = 1,
-                                     .dtype             = dtype,
-                                     .inp_size_m              = m,
-                                     .inp_size_n            = n};
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
-    return Error::grid_not_resident;
-  return l;
-}
-
-// all_reduce_rms_norm_gemm_add: the latent MoE tail: as all_reduce_rms_norm_gemm, the
-// product added into out.
-inline std::variant<AllReduceRmsNormGemmAddLaunch, Error> select_all_reduce_rms_norm_gemm_add(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* norm_weight,
-    int64_t norm_weight_stride_n, float eps, const void* gemm_weight, int64_t gemm_weight_stride_m,
-    int64_t gemm_weight_stride_n, int64_t n_cols, void* workspace, int64_t workspace_stride_m,
-    int64_t workspace_stride_n, DType dtype,
-    int64_t m, int64_t n, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> slice_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  using K         = Template;
-  const OpType op = OpType::all_reduce_rms_norm_gemm_add;
-  const int world = h.world_size();
-  // 1.
-  const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction,
-             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, slice_k},
-             blocks_per_grid, std::nullopt,
-             [&] {
-               return AllReduceRmsNormGemmAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
-                                                         *tile_n, *tile_k, *slice_k};
-             }),
-      op, world, m, n, n, dtype);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
-  const Template fn     = k.fn;
-  const KernelConfig& c = k.config;
-  // 2.
-  if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
-    return *e;
-  // 3. The op's two templates share one config list, so one lookup serves each.
-  const void* kernel = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      by_build<K::all_reduce_pull_one_shot_rms_norm_gemm_add>(c.build, [&](auto cc) {
-        constexpr AllReduceRmsNormGemmAddBuildConfig C = decltype(cc)::value;
-        constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k, SK = C.slice_k,
-                      TPB = C.threads_per_block,
-                WPE = C.waves_per_eu;
-        switch (fn) {
-          case K::all_reduce_pull_one_shot_rms_norm_gemm_add:
-            kernel = instance<AllReduceRmsNormGemmOneShotKernel>(
-                all_reduce_pull_one_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB, WPE>);
-            return;
-          case K::all_reduce_pull_two_shot_rms_norm_gemm_add:
-            kernel = instance<AllReduceRmsNormGemmTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_norm_gemm_add<T, NG, TM, TN, TK, SK, TPB, WPE>);
-            return;
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  // 4.
-  const AllReduceRmsNormGemmAddBuildConfig& g =
-      std::get<AllReduceRmsNormGemmAddBuildConfig>(c.build);
-  const AllReduceRmsNormGemmAddLaunch l{.kernel            = kernel,
-                                        .algorithm         = algorithm_of(fn),
-                                        .direction         = direction_of(fn),
-                                        .world             = world,
-                                        .tile_m            = g.tile_m,
-                                        .tile_n            = g.tile_n,
-                                        .tile_k            = g.tile_k,
-                                        .slice_k           = g.slice_k,
-                                        .threads_per_block = g.threads_per_block,
-                                        .blocks_per_grid   = c.launch.blocks_per_grid,
-                                        .waves_per_eu      = g.waves_per_eu,
-                                        .stream            = stream,
-                                        .out               = out,
-                                        .out_stride_m = out_stride_m,
-                                        .out_stride_n = out_stride_n,
-                                        .inp               = inp,
-                                        .inp_stride_m = inp_stride_m,
-                                        .inp_stride_n = inp_stride_n,
-                                        .norm_weight       = norm_weight,
-                                        .norm_weight_stride_n = norm_weight_stride_n,
-                                        .eps               = eps,
-                                        .gemm_weight       = gemm_weight,
-                                        .gemm_weight_stride_m = gemm_weight_stride_m,
-                                        .gemm_weight_stride_n = gemm_weight_stride_n,
-                                        .n_cols            = n_cols,
-                                        .workspace         = workspace,
-                                        .workspace_stride_m = workspace_stride_m,
-                                        .workspace_stride_n = workspace_stride_n,
-                                        .scratch_stride_m = n,
-                                        .scratch_stride_n = 1,
-                                        .dtype             = dtype,
-                                        .inp_size_m              = m,
-                                        .inp_size_n            = n};
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
-    return Error::grid_not_resident;
-  return l;
-}
-
 // all_reduce_rms_scale_add: Kimi-K3's latent MoE tail with one all-reduce. inp's row is [shared |
 // projected | latent], widths hidden, hidden and latent, summed over the ranks; out [rows, hidden]
 // = shared + projected * rsqrt(mean(latent^2) + eps). Its tile holds the latent whole (each tile
@@ -1845,8 +1559,7 @@ constexpr bool selections_fit() {
     const int64_t m = call[1], n = call[2], latent_size_n = n / 2;
     for (const OpType o :
          {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
-          OpType::all_reduce_add_attn_res_rms_norm, OpType::all_reduce_rms_norm_gemm,
-          OpType::all_reduce_rms_norm_gemm_add})
+          OpType::all_reduce_add_attn_res_rms_norm})
       if (!tuned_fits(o, w, m, n, n, n)) return false;
     // The one-all-reduce tail: [shared | projected | latent].
     if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + latent_size_n, latent_size_n,
