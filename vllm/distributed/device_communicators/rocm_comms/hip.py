@@ -328,8 +328,6 @@ class HipCommunicator(Communicator):
             waves_per_eu,
         )
 
-
-
     def _on_close(self) -> None:
         """Release the peer memory now. Idempotent. Dropping the object does not close
         the IPC handles the C++ side opened; this does."""

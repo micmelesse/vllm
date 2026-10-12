@@ -121,7 +121,6 @@ class Error(IntEnum):
     forced_incomplete = 29
 
 
-
 class Where(IntEnum):
     """WHERE A KERNEL'S WAIT GAVE UP: C++'s `hip_comms::Where`, number for number (a
     test holds them equal)."""
@@ -707,10 +706,6 @@ class Communicator(ABC):
         )
         return prefix_out, out, ran
 
-
-
-
-
     @final
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
@@ -1000,8 +995,6 @@ class Communicator(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} has no fused all-reduce + AttnRes"
         )
-
-
 
     @abstractmethod
     def _open(self) -> str | None:
