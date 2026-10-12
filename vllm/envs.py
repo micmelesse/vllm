@@ -150,7 +150,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
-    VLLM_ROCM_COMMS_BACKEND: Literal["hip", "torch"] | None = None
+    VLLM_ROCM_COMMS_BACKEND: Literal["hip"] | None = None
     VLLM_KIMI_K3_FUSED_DECODER: Literal[
         "none",
         "all_reduce_rms_norm",

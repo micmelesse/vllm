@@ -24,7 +24,7 @@ case starts a fresh one: a failed collective can leave peer state inconsistent.
 
 TWO TIERS. The default (`-m "not full"`) is what vLLM runs, at Kimi-K3's shapes, plus
 the boundaries that decide which path is taken. `full` is everything else: fp16, the
-other backends, eager, the remaining shapes and the kernels tune
+torch control, eager, the remaining shapes and the kernels tune
 declines today.
 """
 
@@ -73,7 +73,6 @@ from vllm.distributed.device_communicators.rocm_comms.base import (
     supported,
 )
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
-from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -172,9 +171,36 @@ def _atol(op_name: str, dtype: torch.dtype) -> float:
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
-# The interface, all three impls and the `make_communicator` selector live in vLLM's
-# `communicator.py` -- exactly what the serving path runs, so this drives that selector
-# directly.
+# hip comes from `make_communicator`, the selector the serving path runs; the control
+# is the test's own.
+
+
+class TorchCommunicator(Communicator):
+    """torch.distributed over `device_group`: the known-good control hip is checked
+    against, the same interface and admission, an implementation nobody doubts. The gloo
+    `cpu_group` is accepted for interface parity and unused. It supplies no
+    `_on_capture`: there is nothing to do around a capture."""
+
+    def _open(self) -> str | None:
+        """Nothing to bring up, but gated on the device and world like hip: a control
+        is only wanted where hip runs."""
+        got = supported(self.device, dist.get_world_size(self.device_group))
+        return got.name if isinstance(got, Error) else None
+
+    def _all_reduce(
+        self,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        algorithm: str | None,
+        direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+        waves_per_eu: int | None,
+    ) -> None:
+        out.copy_(inp)
+        dist.all_reduce(out, group=self.device_group)  # SUM
 
 
 # What each name MUST construct, stated independently of the factory's if-chain: a
@@ -188,9 +214,9 @@ _BACKEND_CLASS = {
 
 # Control FIRST in `COMMUNICATOR_CASES`, because it is the first case to run: if torch
 # is red, nothing after it means anything.
-# hip as C++ picks, and each all_reduce kernel forced; the other backends have one
-# kernel each. A SHOT names every op's kernel, `f"{shot}_{op}"` (the plain
-# all_reduce's is the shot itself).
+# hip as C++ picks, and each all_reduce kernel forced; the control has one kernel. A
+# SHOT names every op's kernel, `f"{shot}_{op}"` (the plain all_reduce's is the shot
+# itself).
 Shot = Literal["all_reduce_pull_one_shot", "all_reduce_pull_two_shot"]
 SHOTS: tuple[Shot, ...] = get_args(Shot)
 # The fast tier forces each, whatever tune would pick.
@@ -344,7 +370,11 @@ def _build_communicator(
     device_group: ProcessGroup,
     device: torch.device,
 ) -> Communicator:
-    comm = make_communicator(cpu_group, device_group, device, backend=backend)
+    comm = (
+        TorchCommunicator(cpu_group, device_group, device)
+        if backend == "torch"
+        else make_communicator(cpu_group, device_group, device, backend=backend)
+    )
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
     # remember to extend when a backend is added.

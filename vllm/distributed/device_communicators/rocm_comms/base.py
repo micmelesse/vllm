@@ -4,7 +4,7 @@
 """The interface every ROCm TP collective backend implements, and the two rules it
 enforces once.
 
-One file per backend beside this one: `hip`, `torch`. This holds only what they
+One file per backend beside this one: `hip`. This holds only what they
 share -- the abstract surface `CudaCommunicator` calls, and the admission checks that
 decide whether a tensor is one of ours at all.
 """
@@ -1013,10 +1013,8 @@ class Communicator(ABC):
         return nullcontext()
 
     def _on_close(self) -> None:  # noqa: B027 -- an optional hook, not an abstract one
-        """What this backend has to release. Nothing, by default -- torch.distributed
-        holds nothing
-        of ours, and a backend that does drops it here so its destructor runs at a known
-        moment."""
+        """What this backend has to release. Nothing, by default; a backend that holds
+        something of ours drops it here so its destructor runs at a known moment."""
 
     # Whether this backend has a fault record for the watchdog to read (`_fault`).
     _faults: ClassVar[bool] = False

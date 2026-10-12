@@ -137,8 +137,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 make_communicator,
             )
 
-            # Both groups (mirrors DeviceCommunicatorBase): the torch reference backend
-            # runs torch.dist over the device group.
+            # Both groups (mirrors DeviceCommunicatorBase); hip exchanges its IPC
+            # handles over the cpu group.
             self.rocm_comm = make_communicator(
                 cpu_group=self.cpu_group,
                 device_group=self.device_group,

@@ -5,7 +5,6 @@
 
     base      the Communicator interface, and the admission rules every backend shares
     hip       our own kernel, built into `_rocm_C` (csrc/rocm/rocm_comms.cu)
-    torch     torch.distributed, the oracle the others are measured against
 
 WHICH ONE IS A CHOICE THE CALLER MAKES AND PASSES IN: this package takes process groups,
 a device and a backend name, and reads no environment variable and no vLLM config.
@@ -25,7 +24,7 @@ logger = init_logger(__name__)
 # THE BACKENDS THERE ARE, one file each beside this one. `vllm.envs` states the same set
 # for the env var it reads; the two meet where the value is passed in, so a name vLLM
 # admits and this package does not is a type error at that call rather than a surprise.
-Backend = Literal["hip", "torch"]
+Backend = Literal["hip"]
 
 __all__ = ["Backend", "Communicator", "Error", "make_communicator"]
 
@@ -44,8 +43,8 @@ def make_communicator(
 
     Unavailability does NOT raise -- the caller checks `.disabled`. A config error does.
 
-    IMPORTED ONE AT A TIME: `hip` compiles a kernel on first use, so naming another
-    backend must not cost it.
+    IMPORTED ON USE: `hip` compiles a kernel on first use, so importing this package
+    must not cost it.
     """
     if backend not in get_args(Backend):
         raise ValueError(
@@ -53,10 +52,6 @@ def make_communicator(
             f"{', '.join(get_args(Backend))}"
         )
     logger.info("rocm_comms make_communicator: backend=%s", backend)
-    if backend == "torch":
-        from .torch import TorchCommunicator
-
-        return TorchCommunicator(cpu_group, device_group, device)
     if backend == "hip":
         from .hip import HipCommunicator
 
