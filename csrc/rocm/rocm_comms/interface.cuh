@@ -6,8 +6,8 @@
 // which decides nothing), and returns the launch it ran or the Error. Every argument is a
 // primitive: pointers, sizes, a DType, and the op's own forcing (an Algorithm and a Direction,
 // then its config fields, each none for select's). Python's plan_<op> is select_<op>. The
-// experimental ops (no stability promise: promoted out or deleted): AttnRes on one rank with no
-// Handle, and the probe's, which measure the machine.
+// experimental ops (no stability promise: promoted out or deleted): the probe's, which measure
+// the machine.
 
 #pragma once
 
@@ -233,46 +233,6 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
 }
 
 namespace experimental {
-
-// =================================================================================================
-// add_attn_res_rms_norm: AttnRes and its RMSNorm on a local `delta`, no all-reduce: prefix +=
-// delta (rounded once), then Triton's attn_res over the blocks and the new prefix. Its one
-// template needs no algorithm to force a config.
-// =================================================================================================
-
-inline std::variant<AddAttnResRmsNormLaunch, Error> add_attn_res_rms_norm(
-    void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, void* out,
-    int64_t out_stride_m, int64_t out_stride_n, const void* delta, int64_t delta_stride_m,
-    int64_t delta_stride_n, void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
-    int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
-    const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
-    int64_t out_norm_weight_stride_n, DType dtype, int64_t m, int64_t n, int num_blocks,
-    int write_idx, float eps, float out_eps, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  if (const std::optional<Error> e = layout_refused(
-          dtype, {{prefix_stride_m, prefix_stride_n},
-                  {out_stride_m, out_stride_n},
-                  {delta_stride_m, delta_stride_n},
-                  {blocks_stride_m, blocks_stride_n},
-                  {blocks_stride_r, blocks_stride_n},
-                  {0, norm_weight_stride_n},
-                  {0, qk_weight_stride_n}}))
-    return *e;
-  if (out_norm_weight != nullptr)
-    if (const std::optional<Error> e = layout_refused(dtype, {{0, out_norm_weight_stride_n}}))
-      return *e;
-  std::variant<AddAttnResRmsNormLaunch, Error> l = select_add_attn_res_rms_norm(
-      prefix, prefix_stride_m, prefix_stride_n, out, out_stride_m, out_stride_n, delta,
-      delta_stride_m, delta_stride_n, blocks, blocks_stride_m, blocks_stride_r, blocks_stride_n,
-      norm_weight, norm_weight_stride_n, qk_weight, qk_weight_stride_n, out_norm_weight,
-      out_norm_weight_stride_n, dtype, m, n, num_blocks, write_idx, eps, out_eps, tile_m, tile_n, tile_k,
-      threads_per_block, blocks_per_grid, waves_per_eu, stream);
-  if (const AddAttnResRmsNormLaunch* got = std::get_if<AddAttnResRmsNormLaunch>(&l))
-    launch_add_attn_res_rms_norm(*got);
-  return l;
-}
-
 
 // THE PROBE'S OPS: the machine as the peers layer (common/peers.cuh, barrier.cuh) sees it, one measurement at a time (calibrate.py
 // times them).

@@ -72,7 +72,6 @@ from vllm.distributed.device_communicators.rocm_comms.base import (
     build_info,
     supported,
 )
-from vllm.distributed.device_communicators.rocm_comms.experimental import ExperimentalOp
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.parallel_state import (
@@ -1985,7 +1984,7 @@ def test_python_names_cpps_errors_and_ops() -> None:
     assert tuple(e.name for e in Error) == built.error_names
     assert tuple(w.name for w in Where) == built.where_names
     assert [w.value for w in Where] == list(range(1, len(built.where_names) + 1))
-    assert set(get_args(Op)) | set(get_args(ExperimentalOp)) == set(built.op_names)
+    assert set(get_args(Op)) == set(built.op_names)
 
 
 def test_build_info_lists_every_template_with_its_builds() -> None:

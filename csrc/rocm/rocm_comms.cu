@@ -789,27 +789,3 @@ void rocm_comms_all_reduce_rms_scale_add(
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
-// EXPERIMENTAL: AttnRes on a local `delta` (no all-reduce), prefix updated in place to
-// prefix + delta.
-void rocm_comms_add_attn_res_rms_norm(
-    torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& delta, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
-    double eps, double out_eps, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  attn_res_tensors(prefix, out, delta, blocks, norm_weight, qk_weight, out_norm_weight,
-                   num_blocks, write_idx);
-  const auto got = hip_comms::experimental::add_attn_res_rms_norm(
-      prefix.data_ptr(), prefix.stride(0), prefix.stride(1), out.data_ptr(), out.stride(0),
-      out.stride(1), delta.data_ptr(), delta.stride(0), delta.stride(1), blocks.data_ptr(),
-      blocks.stride(0), blocks.stride(1), blocks.stride(2), norm_weight.data_ptr(),
-      norm_weight.stride(0), qk_weight.data_ptr(), qk_weight.stride(0),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr,
-      out_norm_weight ? out_norm_weight->stride(0) : 0, dtype_of(delta), delta.size(0),
-      delta.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
-      static_cast<float>(eps), static_cast<float>(out_eps), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
-      current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}

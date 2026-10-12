@@ -31,7 +31,6 @@
 #include <utility>
 #include <variant>
 
-#include "kernels/add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_one_shot.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
@@ -205,23 +204,6 @@ constexpr BuildConfig kRmsScaleAddTwoShotConfigs[] = {
     AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192},
 };
 
-// EXPERIMENTAL, AttnRes on a local delta: a row a block, the grid striding over rows. 512 blocks
-// took the AttnRes phase from local scratch to 86.0 us at 4096 x 7168 (192: 192.8; stamps
-// 2026-10-02T20-36-56Z); not swept. Each build also one wave a EU past its own (72, 102, 104 and
-// 186 VGPRs at 1): 256 threads spilled 8 and 18 there (2026-10-04T15-40-07Z), 512 not tried.
-// 128 threads at 3584 only: twice the loads a wave and the registers (7168's 64 a thread spill).
-constexpr BuildConfig kAddAttnResConfigs[] = {
-    AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
-    AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
-    AddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
-    AddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
-    AddAttnResRmsNormBuildConfig{512, 8, 1, 4096, 1},
-    AddAttnResRmsNormBuildConfig{512, 5, 1, 8192, 1},
-    AddAttnResRmsNormBuildConfig{256, 5, 1, 4096, 1},
-    AddAttnResRmsNormBuildConfig{256, 3, 1, 8192, 1},
-    AddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1},
-};
-
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
   Template fn;
@@ -270,8 +252,6 @@ constexpr TemplateInfo kTemplates[] = {
      false, false, kRmsScaleAddOneShotConfigs},
     {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), OpType::all_reduce_rms_scale_add,
      true, false, kRmsScaleAddTwoShotConfigs},
-    {HIP_COMMS_NAMED(add_attn_res_rms_norm), OpType::add_attn_res_rms_norm,
-     false, false, kAddAttnResConfigs},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -698,14 +678,6 @@ constexpr TunedKernel kRmsScaleAddKernels[] = {
      {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {32, 0}}},
 };
 
-// Experimental, one rank (world 1: there are no peers): not swept.
-constexpr TunedKernel kAddAttnResKernels[] = {
-    {1, 1, 3584, Template::add_attn_res_rms_norm,
-     {AddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {512, 0}}},
-    {1, 1, 7168, Template::add_attn_res_rms_norm,
-     {AddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {512, 0}}},
-};
-
 // =================================================================================================
 // THE OPS, in OpType's order: each one's name (as Python calls it) and its tuned kernels.
 // =================================================================================================
@@ -727,7 +699,6 @@ constexpr Op kOps[] = {
     {HIP_COMMS_NAMED(all_reduce_rms_norm_gemm_add), kRmsNormGemmAddKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_norm_gemm), kRmsNormGemmKernels},
     {HIP_COMMS_NAMED(all_reduce_rms_scale_add), kRmsScaleAddKernels},
-    {HIP_COMMS_NAMED(add_attn_res_rms_norm), kAddAttnResKernels},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
@@ -982,8 +953,8 @@ inline std::optional<Error> layout_refused(
 }
 
 // `row_elems`: the row the kernel reduces, in elements; `own`: the op's own Error on its own
-// arguments, checked after the dtype. With no Handle (an experimental op, one rank) the checks
-// that need peers are left out.
+// arguments, checked after the dtype. With no Handle the checks that need
+// peers are left out.
 inline std::optional<Error> refused(const Handle* h, Template fn, const KernelConfig& c,
                                     DType dtype, int64_t m, int64_t n,
                                     int64_t tile_cols, std::optional<Error> own_error,
@@ -1785,92 +1756,6 @@ inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_sca
 
 namespace experimental {
 
-// add_attn_res_rms_norm: AttnRes and its RMSNorm on a local `delta`, no all-reduce: prefix +=
-// delta (rounded once), then Triton's attn_res over the blocks and the new prefix. One rank, no
-// Handle: its one template needs no algorithm to force a config, and the checks that need peers
-// are left out.
-inline std::variant<AddAttnResRmsNormLaunch, Error> select_add_attn_res_rms_norm(
-    void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, void* out,
-    int64_t out_stride_m, int64_t out_stride_n, const void* delta, int64_t delta_stride_m,
-    int64_t delta_stride_n, void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
-    int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
-    const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
-    int64_t out_norm_weight_stride_n, DType dtype, int64_t m, int64_t n, int num_blocks,
-    int write_idx, float eps, float out_eps, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> tile_k, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
-  const OpType op = OpType::add_attn_res_rms_norm;
-  const int world = 1;
-  // 1.
-  const std::variant<Chosen, Error> picked = chosen(
-      forced(op, std::nullopt, std::nullopt,
-             {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k},
-             blocks_per_grid, std::nullopt,
-             [&] {
-               return AddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
-                                                   *tile_n, *tile_k};
-             }),
-      op, world, m, n, n, dtype);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
-  const Template fn     = k.fn;
-  const KernelConfig& c = k.config;
-  // 2.
-  if (const std::optional<Error> e = refused(nullptr, fn, c, dtype, m, n, n,
-                                             std::nullopt, delta, false, stream))
-    return *e;
-  // 3.
-  const void* kernel = nullptr;
-  by_dtype(dtype, [&](auto t) {
-    using T = typename decltype(t)::t;
-    by_build<Template::add_attn_res_rms_norm>(c.build, [&](auto cc) {
-      constexpr AddAttnResRmsNormBuildConfig C = decltype(cc)::value;
-      constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
-                WPE = C.waves_per_eu;
-      kernel = instance<AddAttnResRmsNormKernel>(add_attn_res_rms_norm<T, TN, TK, TPB, WPE>);
-    });
-  });
-  // 4.
-  const AddAttnResRmsNormBuildConfig& a = std::get<AddAttnResRmsNormBuildConfig>(c.build);
-  return AddAttnResRmsNormLaunch{.kernel            = kernel,
-                                 .algorithm         = algorithm_of(fn),
-                                 .direction         = direction_of(fn),
-                                 .world             = world,
-                                 .tile_m            = a.tile_m,
-                                 .tile_n            = a.tile_n,
-                                 .tile_k            = a.tile_k,
-                                 .threads_per_block = a.threads_per_block,
-                                 .blocks_per_grid   = c.launch.blocks_per_grid,
-                                 .waves_per_eu      = a.waves_per_eu,
-                                 .stream            = stream,
-                                 .prefix            = prefix,
-                                 .prefix_stride_m   = prefix_stride_m,
-                                 .prefix_stride_n   = prefix_stride_n,
-                                 .out               = out,
-                                 .out_stride_m      = out_stride_m,
-                                 .out_stride_n      = out_stride_n,
-                                 .delta             = delta,
-                                 .delta_stride_m    = delta_stride_m,
-                                 .delta_stride_n    = delta_stride_n,
-                                 .blocks            = blocks,
-                                 .blocks_stride_m   = blocks_stride_m,
-                                 .blocks_stride_r   = blocks_stride_r,
-                                 .blocks_stride_n   = blocks_stride_n,
-                                 .norm_weight       = norm_weight,
-                                 .norm_weight_stride_n = norm_weight_stride_n,
-                                 .qk_weight         = qk_weight,
-                                 .qk_weight_stride_n = qk_weight_stride_n,
-                                 .out_norm_weight   = out_norm_weight,
-                                 .out_norm_weight_stride_n = out_norm_weight_stride_n,
-                                 .dtype             = dtype,
-                                 .delta_size_m              = m,
-                                 .delta_size_n            = n,
-                                 .num_blocks        = num_blocks,
-                                 .write_idx         = write_idx,
-                                 .eps               = eps,
-                                 .out_eps           = out_eps};
-}
-
 // THE PROBE'S: one block of 64 threads, its twin on every rank.
 inline std::variant<ProbeBarrierLaunch, Error> select_probe_barrier(const Handle& h,
                                                                     hipStream_t stream) {
@@ -1967,7 +1852,6 @@ constexpr bool selections_fit() {
     if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + latent_size_n, latent_size_n,
                     n))
       return false;
-    if (!tuned_fits(OpType::add_attn_res_rms_norm, 1, m, n, n, n)) return false;
     // The plain all-reduce's tuned kernel, as measured (its grid not cut).
     if (std::holds_alternative<Error>(pick(OpType::all_reduce, w, m, n, 0, DType::bf16)))
       return false;

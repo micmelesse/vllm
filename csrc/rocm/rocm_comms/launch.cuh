@@ -226,18 +226,6 @@ inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAd
 
 namespace experimental {
 
-// No peers: its own tensors only.
-inline void launch_add_attn_res_rms_norm(const AddAttnResRmsNormLaunch& l) {
-  const int delta_size_m = static_cast<int>(l.delta_size_m);
-  const int delta_size_n = static_cast<int>(l.delta_size_n);
-  Call<AddAttnResRmsNormKernel>::run(
-      l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.delta, l.delta_stride_m,
-      l.delta_stride_n, l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
-      l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
-      l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-      l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, delta_size_m, delta_size_n);
-}
-
 // The probe's: a barrier over the signals only; the ping-pong's flags from this pair's next ones
 // (flags only grow); the link traffic over every rank's copy of its buffer and staging.
 inline void launch_probe_barrier(Handle& h, const ProbeBarrierLaunch& l) {

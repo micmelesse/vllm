@@ -216,15 +216,6 @@ void rocm_comms_all_reduce_rms_norm_gemm_add(
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-// Experimental: AttnRes on a local delta, no all-reduce.
-void rocm_comms_add_attn_res_rms_norm(
-    torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& delta, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
-    double eps, double out_eps, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
 void rocm_comms_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
     torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,

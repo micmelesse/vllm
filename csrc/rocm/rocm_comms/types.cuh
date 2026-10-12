@@ -150,7 +150,6 @@ enum class Template : int {
   all_reduce_pull_two_shot_rms_norm_gemm         = 14,
   all_reduce_pull_one_shot_rms_scale_add         = 15,
   all_reduce_pull_two_shot_rms_scale_add         = 16,
-  add_attn_res_rms_norm                          = 17,  // experimental: no all-reduce
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's whole input; two-shot
@@ -163,8 +162,7 @@ enum class Direction : int { pull = 0, push = 1 };
 // the blocks split between the two, or both from every block.
 enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
-// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses, and the experimental
-// ops (no all-reduce).
+// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses.
 enum class OpType : int {
   all_reduce                       = 0,
   all_reduce_rms_norm              = 1,
@@ -173,7 +171,6 @@ enum class OpType : int {
   all_reduce_rms_norm_gemm_add     = 4,
   all_reduce_rms_norm_gemm         = 5,
   all_reduce_rms_scale_add         = 6,
-  add_attn_res_rms_norm            = 7,  // experimental: no all-reduce
 };
 
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what is compiled in (one
@@ -248,20 +245,10 @@ struct AllReduceRmsScaleAddBuildConfig {
   int tile_n;
   bool operator==(const AllReduceRmsScaleAddBuildConfig&) const = default;
 };
-// add_attn_res_rms_norm (experimental): TILE_K sources a step.
-struct AddAttnResRmsNormBuildConfig {
-  int threads_per_block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  bool operator==(const AddAttnResRmsNormBuildConfig&) const = default;
-};
 using BuildConfig =
     std::variant<AllReduceBuildConfig, AllReduceRmsNormBuildConfig, AllReduceAddRmsNormBuildConfig,
                  AllReduceAddAttnResRmsNormBuildConfig, AllReduceRmsNormGemmBuildConfig,
-                 AllReduceRmsNormGemmAddBuildConfig, AllReduceRmsScaleAddBuildConfig,
-                 AddAttnResRmsNormBuildConfig>;
+                 AllReduceRmsNormGemmAddBuildConfig, AllReduceRmsScaleAddBuildConfig>;
 
 // A KERNEL'S LAUNCH: its grid, never compiled in, and the blocks of it the fused AttnRes pull
 // two-shot gives its reduce-scatter (its reads queue behind the links past a few dozen; AttnRes
@@ -389,8 +376,6 @@ using AllReduceRmsScaleAddTwoShotKernel =
     void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
           void*, int,
              uint64_t, void*, int64_t, int64_t, float, int, int, int);
-// Experimental, no peers: delta, then the AttnRes arguments.
-using AddAttnResRmsNormKernel = void (*)(const void*, int64_t, int64_t, HIP_COMMS_ATTN_RES_ARGS);
 #undef HIP_COMMS_ATTN_RES_ARGS
 // The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the
 // streamed buffer's) and staging, then mode, peer, pullers, packs, sink.
@@ -616,42 +601,6 @@ struct AllReduceRmsScaleAddLaunch {
   int64_t inp_size_n;
   int64_t latent_size_n;
   float eps;
-};
-
-// Experimental, one rank: its one template is the pull one-shot by name only (it reads no peer).
-struct AddAttnResRmsNormLaunch {
-  const void* kernel;
-  Algorithm algorithm;
-  Direction direction;
-  int world;
-  int tile_m;
-  int tile_n;
-  int tile_k;
-  int threads_per_block;
-  int blocks_per_grid;
-  int waves_per_eu;
-  hipStream_t stream;
-  void* prefix;
-  int64_t prefix_stride_m, prefix_stride_n;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* delta;
-  int64_t delta_stride_m, delta_stride_n;
-  void* blocks;
-  int64_t blocks_stride_m, blocks_stride_r, blocks_stride_n;
-  const void* norm_weight;
-  int64_t norm_weight_stride_n;
-  const void* qk_weight;
-  int64_t qk_weight_stride_n;
-  const void* out_norm_weight;
-  int64_t out_norm_weight_stride_n;
-  DType dtype;
-  int64_t delta_size_m;
-  int64_t delta_size_n;
-  int num_blocks;
-  int write_idx;
-  float eps;
-  float out_eps;
 };
 
 // THE PROBE'S, experimental: one block a rank, so the next measurement starts on every rank
