@@ -150,7 +150,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
-    VLLM_ROCM_USE_HIP_CUSTOM_COMMS: bool = False
+    VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR: bool = False
     VLLM_KIMI_K3_FUSED_DECODER: Literal[
         "none",
         "all_reduce_rms_norm",
@@ -1360,13 +1360,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter allreduce for collective ops.
     # By default is disabled.
-    # Whether HipCustomComms (device_communicators/hip_custom_comms) owns the TP
-    # all-reduce and its fused ops. By default is disabled.
-    "VLLM_ROCM_USE_HIP_CUSTOM_COMMS": lambda: (
-        os.getenv("VLLM_ROCM_USE_HIP_CUSTOM_COMMS", "False").lower() in ("true", "1")
+    # Whether HipCustomCommunicator (device_communicators/hip_custom_communicator.py)
+    # owns the TP all-reduce and its fused ops. By default is disabled.
+    "VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR": lambda: (
+        os.getenv("VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR", "False").lower()
+        in ("true", "1")
     ),
     # Which fused decoder layer Kimi-K3 runs, named for the ops it fuses in order
-    # (HipCustomComms only): none, all_reduce_rms_norm (the MoE latent
+    # (HipCustomCommunicator only): none, all_reduce_rms_norm (the MoE latent
     # all-reduce and its RMSNorm), all_reduce_add_attn_res_rms_norm (each hidden
     # all-reduce with the AttnRes and RMSNorm after it) or
     # all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm (both). By default none.

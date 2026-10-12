@@ -88,79 +88,79 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // unreachable and the call raises "no fallback function is registered". So they are
   // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
   rocm_ops.def(
-      "hip_custom_comms_open(str cpu_group, str device_group, int device) -> (int?, int?)",
-      &hip_custom_comms_open);
+      "hip_custom_communicator_open(str cpu_group, str device_group, int device) -> (int?, int?)",
+      &hip_custom_communicator_open);
   rocm_ops.def(
-      "hip_custom_comms_stamps", &hip_custom_comms_stamps);
+      "hip_custom_communicator_stamps", &hip_custom_communicator_stamps);
   rocm_ops.def(
-      "hip_custom_comms_dispose", &hip_custom_comms_dispose);
+      "hip_custom_communicator_dispose", &hip_custom_communicator_dispose);
   // The fault record the watchdog polls, and the abort it sets (barrier.cuh).
-  rocm_ops.def("hip_custom_comms_fault(int handle_ptr) -> int[]", &hip_custom_comms_fault);
-  rocm_ops.def("hip_custom_comms_abort(int handle_ptr) -> ()", &hip_custom_comms_abort);
-  rocm_ops.def("hip_custom_comms_register_buffer(int handle_ptr, Tensor buffer, str group) -> ()",
-               &hip_custom_comms_register_buffer);
-  rocm_ops.def("hip_custom_comms_forget_buffer(int handle_ptr, Tensor buffer) -> ()",
-               &hip_custom_comms_forget_buffer);
-  rocm_ops.def("hip_custom_comms_wall_clock_khz(int device) -> int", &hip_custom_comms_wall_clock_khz);
+  rocm_ops.def("hip_custom_communicator_fault(int handle_ptr) -> int[]", &hip_custom_communicator_fault);
+  rocm_ops.def("hip_custom_communicator_abort(int handle_ptr) -> ()", &hip_custom_communicator_abort);
+  rocm_ops.def("hip_custom_communicator_register_buffer(int handle_ptr, Tensor buffer, str group) -> ()",
+               &hip_custom_communicator_register_buffer);
+  rocm_ops.def("hip_custom_communicator_forget_buffer(int handle_ptr, Tensor buffer) -> ()",
+               &hip_custom_communicator_forget_buffer);
+  rocm_ops.def("hip_custom_communicator_wall_clock_khz(int device) -> int", &hip_custom_communicator_wall_clock_khz);
   // The planners: what runs a call, or the Error it meets.
   rocm_ops.def(
-      "hip_custom_comms_plan_all_reduce(int handle_ptr, Tensor inp, str? algorithm, str? direction, "
+      "hip_custom_communicator_plan_all_reduce(int handle_ptr, Tensor inp, str? algorithm, str? direction, "
       "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> (str?, str?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_comms_plan_all_reduce);
+      &hip_custom_communicator_plan_all_reduce);
   rocm_ops.def(
-      "hip_custom_comms_plan_all_reduce_rms_norm(int handle_ptr, Tensor inp, Tensor weight, "
+      "hip_custom_communicator_plan_all_reduce_rms_norm(int handle_ptr, Tensor inp, Tensor weight, "
       "bool add, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
       "int? blocks_per_grid, int? waves_per_eu) -> (str?, str?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_comms_plan_all_reduce_rms_norm);
+      &hip_custom_communicator_plan_all_reduce_rms_norm);
   rocm_ops.def(
-      "hip_custom_comms_plan_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor inp, "
+      "hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor inp, "
       "str? algorithm, str? direction, int? tile_m, int? tile_n, int? tile_k, "
       "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> (str?, "
       "str?, int?, int?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_comms_plan_all_reduce_add_attn_res_rms_norm);
+      &hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm);
   rocm_ops.def(
-      "hip_custom_comms_supported(int device, int world) -> (str?, int?)",
-               &hip_custom_comms_supported);
+      "hip_custom_communicator_supported(int device, int world) -> (str?, int?)",
+               &hip_custom_communicator_supported);
   rocm_ops.def(
-      "hip_custom_comms_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
+      "hip_custom_communicator_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
       "str[], int[], int[])",
-      &hip_custom_comms_build_info);
+      &hip_custom_communicator_build_info);
   rocm_ops.def(
-      "hip_custom_comms_register_captured", &hip_custom_comms_register_captured);
+      "hip_custom_communicator_register_captured", &hip_custom_communicator_register_captured);
 
   rocm_ops.def(
-      "hip_custom_comms_all_reduce(int handle_ptr, Tensor! out, Tensor inp, str? algorithm, "
+      "hip_custom_communicator_all_reduce(int handle_ptr, Tensor! out, Tensor inp, str? algorithm, "
       "str? direction, int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> ()");
-  rocm_ops.impl("hip_custom_comms_all_reduce", torch::kCUDA, &hip_custom_comms_all_reduce);
+  rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA, &hip_custom_communicator_all_reduce);
 
   // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
   // (which also returns the sum plus residual). `eps` is a float in the schema because
   // torch has no `double` there; the kernel narrows it.
   rocm_ops.def(
-      "hip_custom_comms_all_reduce_rms_norm(int handle_ptr, Tensor! out, Tensor inp, Tensor weight, "
+      "hip_custom_communicator_all_reduce_rms_norm(int handle_ptr, Tensor! out, Tensor inp, Tensor weight, "
       "float eps, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
       "int? blocks_per_grid, int? waves_per_eu) -> ()");
-  rocm_ops.impl("hip_custom_comms_all_reduce_rms_norm", torch::kCUDA,
-                &hip_custom_comms_all_reduce_rms_norm);
+  rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_rms_norm);
   rocm_ops.def(
-      "hip_custom_comms_all_reduce_add_rms_norm(int handle_ptr, Tensor! out, Tensor! residual_out, "
+      "hip_custom_communicator_all_reduce_add_rms_norm(int handle_ptr, Tensor! out, Tensor! residual_out, "
       "Tensor inp, Tensor residual, Tensor weight, float eps, str? algorithm, str? direction, "
       "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, int? waves_per_eu) -> ()");
-  rocm_ops.impl("hip_custom_comms_all_reduce_add_rms_norm", torch::kCUDA,
-                &hip_custom_comms_all_reduce_add_rms_norm);
+  rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_add_rms_norm);
 
   rocm_ops.def(
-      "hip_custom_comms_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor! prefix, "
+      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor! prefix, "
       "Tensor! out, Tensor inp, Tensor! blocks, Tensor norm_weight, Tensor qk_weight, "
       "Tensor? out_norm_weight, int num_blocks, int write_idx, float eps, float out_eps, "
       "bool has_prefix, str? algorithm, str? direction, int? tile_m, int? tile_n, int? tile_k, "
       "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> ()");
-  rocm_ops.impl("hip_custom_comms_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
-                &hip_custom_comms_all_reduce_add_attn_res_rms_norm);
+  rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

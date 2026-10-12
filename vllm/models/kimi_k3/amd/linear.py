@@ -473,13 +473,13 @@ def pick_layer(fusion: str) -> type[nn.Module]:
     file, a copy of decoder.py's layer with that fusion's change. It runs its
     fused ops or raises, never the unfused ops."""
     backend = (
-        getattr(get_tp_group().device_communicator, "hip_custom_comms", None)
+        getattr(get_tp_group().device_communicator, "hip_custom_communicator", None)
         if get_tensor_model_parallel_world_size() > 1
         else None
     )
     if backend is None or backend.disabled:
         raise RuntimeError(
-            f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs HipCustomComms "
+            f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs HipCustomCommunicator "
             "live with TP above one"
         )
     if fusion == "all_reduce_rms_norm":
