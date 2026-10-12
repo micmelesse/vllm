@@ -56,8 +56,8 @@ Op = Literal[
 
 
 class Error(IntEnum):
-    """WHY A CALL CANNOT RUN: C++'s `hip_comms::Error`, number for number (a test
-    holds them equal). Every backend answers with these; ours from its C++."""
+    """WHY A CALL CANNOT RUN: C++'s `hip_custom_communicator::Error`, number for
+    number (a test holds them equal)."""
 
     disabled = 0
     no_such_op = 1
@@ -92,8 +92,8 @@ class Error(IntEnum):
 
 
 class Where(IntEnum):
-    """WHERE A KERNEL'S WAIT GAVE UP: C++'s `hip_comms::Where`, number for number (a
-    test holds them equal)."""
+    """WHERE A KERNEL'S WAIT GAVE UP: C++'s `hip_custom_communicator::Where`, number
+    for number (a test holds them equal)."""
 
     start = 1  # a launch's first barrier: the peer had not launched
     peer_barrier = 2  # a later peers barrier
@@ -225,7 +225,7 @@ class Supported:
 
 def supported(device: torch.device, world: int) -> Supported | Error:
     """Whether our kernels run on `device` in a world of `world`, as the C++ build
-    answers it (`hip_comms::supported`): the Supported, or the Error."""
+    answers it (`hip_custom_communicator::supported`): the Supported, or the Error."""
     arch, err = torch.ops._rocm_C.hip_custom_communicator_supported(device.index, world)
     return Error(err) if err is not None else Supported(arch)
 
