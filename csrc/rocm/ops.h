@@ -52,65 +52,65 @@ void paged_attention(
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
 
-// ROCm TP collectives (vllm/distributed/device_communicators/rocm_comms). The context is a
+// ROCm TP collectives (vllm/distributed/device_communicators/hip_custom_comms). The context is a
 // stateful object, so it crosses as an opaque handle the way custom all-reduce's does.
 using fptr_t = int64_t;
 
 // Opened on `device` over the process groups named `cpu_group` and `device_group`, a collective:
 // the handle or the Error's number. The IPC handles go round in C++.
-std::tuple<std::optional<int64_t>, std::optional<int64_t>> rocm_comms_open(
+std::tuple<std::optional<int64_t>, std::optional<int64_t>> hip_custom_comms_open(
     const std::string& cpu_group, const std::string& device_group, int64_t device);
 // The buffers a capture recorded, registered over `group`, a collective.
-void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group);
-void rocm_comms_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
+void hip_custom_comms_register_captured(fptr_t handle_ptr, const std::string& group);
+void hip_custom_comms_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
                                 const std::string& group);
-void rocm_comms_forget_buffer(fptr_t handle_ptr, torch::Tensor& buffer);
-int64_t rocm_comms_wall_clock_khz(int64_t device);
-torch::Tensor rocm_comms_stamps();
+void hip_custom_comms_forget_buffer(fptr_t handle_ptr, torch::Tensor& buffer);
+int64_t hip_custom_comms_wall_clock_khz(int64_t device);
+torch::Tensor hip_custom_comms_stamps();
 
-void rocm_comms_dispose(fptr_t handle_ptr);
+void hip_custom_comms_dispose(fptr_t handle_ptr);
 // The rank's fault record, [where, rank, block, peer, count, want, elapsed_ticks], or empty while
 // no wait has given up; and the abort every wait on the rank then leaves at.
-std::vector<int64_t> rocm_comms_fault(fptr_t handle_ptr);
-void rocm_comms_abort(fptr_t handle_ptr);
+std::vector<int64_t> hip_custom_comms_fault(fptr_t handle_ptr);
+void hip_custom_comms_abort(fptr_t handle_ptr);
 
 // Each op takes its own forcing last: the template by name, every field of one of
 // its builds, and the launch, all or none (none: select's).
 
 // A PLANNER'S ANSWER: the template's name and the op's config fields as its
 // kernel has them, or the Error's number.
-using RocmCommsField = std::optional<int64_t>;
+using HipCustomCommsField = std::optional<int64_t>;
 template <typename... Fields>
-using RocmCommsPlan =
+using HipCustomCommsPlan =
     std::tuple<std::optional<std::string>, std::optional<std::string>, Fields...,
                std::optional<int64_t>>;
-using RocmCommsAllReducePlan =
-    RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField>;
-using RocmCommsAllReduceRmsNormPlan =
-    RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField>;
-using RocmCommsAllReduceAddAttnResRmsNormPlan =
-    RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField>;
+using HipCustomCommsAllReducePlan =
+    HipCustomCommsPlan<HipCustomCommsField, HipCustomCommsField, HipCustomCommsField, HipCustomCommsField,
+                  HipCustomCommsField>;
+using HipCustomCommsAllReduceRmsNormPlan =
+    HipCustomCommsPlan<HipCustomCommsField, HipCustomCommsField, HipCustomCommsField, HipCustomCommsField,
+                  HipCustomCommsField>;
+using HipCustomCommsAllReduceAddAttnResRmsNormPlan =
+    HipCustomCommsPlan<HipCustomCommsField, HipCustomCommsField, HipCustomCommsField,
+                  HipCustomCommsField, HipCustomCommsField, HipCustomCommsField,
+                  HipCustomCommsField>;
 
 // The planners, one per op family, each given the call's own tensors.
-RocmCommsAllReducePlan rocm_comms_plan_all_reduce(
+HipCustomCommsAllReducePlan hip_custom_comms_plan_all_reduce(
     fptr_t handle_ptr, const torch::Tensor& inp,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
-RocmCommsAllReduceRmsNormPlan rocm_comms_plan_all_reduce_rms_norm(
+HipCustomCommsAllReduceRmsNormPlan hip_custom_comms_plan_all_reduce_rms_norm(
     fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight,
     bool add, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
-RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
+HipCustomCommsAllReduceAddAttnResRmsNormPlan hip_custom_comms_plan_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, const torch::Tensor& inp,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
@@ -121,7 +121,7 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
 // A variant at the torch boundary: the arch or the Error's number, exactly one
 // set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>>
-rocm_comms_supported(int64_t device, int64_t world);
+hip_custom_comms_supported(int64_t device, int64_t world);
 // The build's dtypes by name, its worlds, a pack's bytes and a staging's, its
 // ops', errors' and fault places' names in their enums' order, and each template's name, op
 // and BuildConfigs (flat, a build's fields in the names' order, 0 where its op's
@@ -131,9 +131,9 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<int64_t>, std::vector<int64_t>>
-rocm_comms_build_info();
+hip_custom_comms_build_info();
 
-void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
+void hip_custom_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
                            torch::Tensor& inp,
                            std::optional<std::string> algorithm,
                            std::optional<std::string> direction,
@@ -142,7 +142,7 @@ void rocm_comms_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
                            std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
+void hip_custom_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                     torch::Tensor& inp, torch::Tensor& weight,
                                     double eps,
                                     std::optional<std::string> algorithm,
@@ -152,7 +152,7 @@ void rocm_comms_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void rocm_comms_all_reduce_add_rms_norm(
+void hip_custom_comms_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out,
     torch::Tensor& inp, torch::Tensor& residual, torch::Tensor& weight,
     double eps, std::optional<std::string> algorithm,
@@ -161,7 +161,7 @@ void rocm_comms_all_reduce_add_rms_norm(
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void rocm_comms_all_reduce_add_attn_res_rms_norm(
+void hip_custom_comms_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
     torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
     torch::Tensor& qk_weight,

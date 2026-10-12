@@ -75,13 +75,13 @@ class HipCommunicator(Communicator):
         """
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
-        handle, err = torch.ops._rocm_C.rocm_comms_open(
+        handle, err = torch.ops._rocm_C.hip_custom_comms_open(
             self.cpu_group.group_name, self.device_group.group_name, self.device.index
         )
         if err is not None:
             return Error(err).name
         self._handle = handle
-        self._khz = torch.ops._rocm_C.rocm_comms_wall_clock_khz(self.device.index)
+        self._khz = torch.ops._rocm_C.hip_custom_comms_wall_clock_khz(self.device.index)
         logger.info("HipCommunicator ready")
         return None
 
@@ -94,7 +94,7 @@ class HipCommunicator(Communicator):
             yield
         finally:
             # Even on error: unfilled slots fault later on a null peer pointer.
-            torch.ops._rocm_C.rocm_comms_register_captured(
+            torch.ops._rocm_C.hip_custom_comms_register_captured(
                 self._handle, self.cpu_group.group_name
             )
 
@@ -113,7 +113,7 @@ class HipCommunicator(Communicator):
             return Error.disabled
         _require_capture(self.state)
         return _answer(
-            torch.ops._rocm_C.rocm_comms_plan_all_reduce(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce(
                 self._handle,
                 inp,
                 algorithm,
@@ -139,7 +139,7 @@ class HipCommunicator(Communicator):
         waves_per_eu: int | None,
     ) -> None:
         """Sum `inp` across the TP ranks into `out`."""
-        torch.ops._rocm_C.rocm_comms_all_reduce(
+        torch.ops._rocm_C.hip_custom_comms_all_reduce(
             self._handle,
             out,
             inp,
@@ -169,7 +169,7 @@ class HipCommunicator(Communicator):
             return Error.disabled
         _require_capture(self.state)
         return _answer(
-            torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_norm(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce_rms_norm(
                 self._handle,
                 inp,
                 weight,
@@ -198,7 +198,7 @@ class HipCommunicator(Communicator):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_rms_norm(
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_rms_norm(
             self._handle,
             out,
             inp,
@@ -230,7 +230,7 @@ class HipCommunicator(Communicator):
         waves_per_eu: int | None,
     ) -> None:
         """The normed result into `out`, the sum plus residual into `residual_out`."""
-        torch.ops._rocm_C.rocm_comms_all_reduce_add_rms_norm(
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_add_rms_norm(
             self._handle,
             out,
             residual_out,
@@ -264,7 +264,7 @@ class HipCommunicator(Communicator):
             return Error.disabled
         _require_capture(self.state)
         return _answer(
-            torch.ops._rocm_C.rocm_comms_plan_all_reduce_add_attn_res_rms_norm(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce_add_attn_res_rms_norm(
                 self._handle,
                 inp,
                 algorithm,
@@ -303,7 +303,7 @@ class HipCommunicator(Communicator):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_add_attn_res_rms_norm(
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_add_attn_res_rms_norm(
             self._handle,
             prefix_out,
             out,
@@ -333,7 +333,7 @@ class HipCommunicator(Communicator):
         the IPC handles the C++ side opened; this does."""
         if self._handle is None:
             return
-        torch.ops._rocm_C.rocm_comms_dispose(self._handle)
+        torch.ops._rocm_C.hip_custom_comms_dispose(self._handle)
         self._handle = None
 
     def _fault(self) -> Fault | None:
@@ -341,7 +341,7 @@ class HipCommunicator(Communicator):
         device)."""
         if self._handle is None:
             return None
-        got = torch.ops._rocm_C.rocm_comms_fault(self._handle)
+        got = torch.ops._rocm_C.hip_custom_comms_fault(self._handle)
         if not got:
             return None
         where, rank, block, peer, count, want, ticks = got
@@ -357,4 +357,4 @@ class HipCommunicator(Communicator):
 
     def _abort(self) -> None:
         if self._handle is not None:
-            torch.ops._rocm_C.rocm_comms_abort(self._handle)
+            torch.ops._rocm_C.hip_custom_comms_abort(self._handle)

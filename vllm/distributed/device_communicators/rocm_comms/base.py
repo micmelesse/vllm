@@ -237,7 +237,7 @@ def build_info() -> BuildInfo:
         fields,
         flat,
         counts,
-    ) = torch.ops._rocm_C.rocm_comms_build_info()
+    ) = torch.ops._rocm_C.hip_custom_comms_build_info()
     templates: dict[str, TemplateBuild] = {}
     at, width = 0, len(fields)
     for name, op, count in zip(names, template_ops, counts):
@@ -284,7 +284,7 @@ class Supported:
 def supported(device: torch.device, world: int) -> Supported | Error:
     """Whether our kernels run on `device` in a world of `world`, as the C++ build
     answers it (`hip_comms::supported`): the Supported, or the Error."""
-    arch, err = torch.ops._rocm_C.rocm_comms_supported(device.index, world)
+    arch, err = torch.ops._rocm_C.hip_custom_comms_supported(device.index, world)
     return Error(err) if err is not None else Supported(arch)
 
 
