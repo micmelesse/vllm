@@ -1,47 +1,43 @@
-# SPDX-License-Identifier: MIT Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All
+# SPDX-License-Identifier: MIT Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All
 # rights reserved.
 
-"""The interface every ROCm TP collective backend implements, and the two rules it
-enforces once.
+"""HipCustomComms: vLLM's custom all-reduce (`custom_all_reduce.py`'s CustomAllreduce)
+extended to every collective Kimi-K3 needs -- the all-reduce and the all-reduces fused
+with the ops after them -- over our HIP kernels in `_rocm_C`
+(`csrc/rocm/hip_custom_comms.cu`).
 
-One file per backend beside this one: `hip`. This holds only what they
-share -- the abstract surface `CudaCommunicator` calls, and the admission checks that
-decide whether a tensor is one of ours at all.
+The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
+keyword arguments an op takes after its own (the algorithm, the direction, every field
+of one build and the launch, all or none) are the one way to force one, for the sweep
+and the tests. Every one is passed through as it came: C++ builds the config, checks
+it, and answers.
+
+TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
+is held by vLLM for the graph's life, so it is registered once at capture exit and read
+in place. An eager input is the caching allocator's, borrowed for the call, so C++
+copies it into a staging buffer it owns.
+
+The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
+`close()` has to run.
 """
 
-import functools
 import threading
 import time
 import warnings
-from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import IntEnum
-from typing import ClassVar, Literal, final
+from typing import ClassVar, final
 
 import torch
 from torch.distributed import ProcessGroup
 
 from vllm.logger import init_logger
 
+from .build import Error, Fault, Op, Ran, Refused, Where
+
 logger = init_logger(__name__)
-
-# ---- THE CAPABILITIES EVERY BACKEND HERE IS BOUND BY. Not tunables: a tunable is a
-# number you may change with the code still correct, and changing one of these means
-# changing a kernel. They are declared ONCE, here, for the same reason the admission
-# envelope is: torch is the control, and a control that serves a superset is answering a
-# different question than the backends it is a control for. ----
-
-# EVERY OP, as C++ names them (`enum class Op`; a test holds them equal) and as its
-# method is named: the all-reduce, then each all-reduce and the ops it fuses, in order.
-Op = Literal[
-    "all_reduce",
-    "all_reduce_rms_norm",
-    "all_reduce_add_rms_norm",
-    "all_reduce_add_attn_res_rms_norm",
-]
 
 
 def _as_device(device: int | str | torch.device) -> torch.device:
@@ -56,7 +52,7 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 # A COMMUNICATOR'S LIFE, each state holding what is true in it alone: `__init__` -> Open
 # | Disabled(why); Open <-> Capturing; Capturing -> Broken(cause) when a capture raises,
 # and Open or Capturing -> Broken(cause) when the watchdog finds a fault; any -> Closed.
-# Only `Communicator` moves it, under its lock (the watchdog is another thread).
+# Only `HipCustomComms` moves it, under its lock (the watchdog is another thread).
 @dataclass(frozen=True)
 class Disabled:
     why: str  # the backend's reason it cannot run here (not an error)
@@ -83,77 +79,6 @@ class Closed:
 
 
 State = Disabled | Open | Capturing | Broken | Closed
-
-
-class Error(IntEnum):
-    """WHY A CALL CANNOT RUN: C++'s `hip_comms::Error`, number for number (a test
-    holds them equal). Every backend answers with these; ours from its C++."""
-
-    disabled = 0
-    no_such_op = 1
-    not_contiguous = 2
-    not_two_d = 3
-    dtype_not_built = 4
-    world_not_built = 5
-    row_not_packs = 6
-    template_not_this_ops = 7
-    row_too_wide = 8
-    block_not_a_wave_per_peer = 9
-    scratch_too_small = 10
-    grid_not_resident = 11
-    staging_too_small = 12
-    device_not_built = 13
-    device_not_tuned = 14
-    weight_not_built = 15
-    no_such_template = 16
-    no_such_group = 17
-    ranks_disagree = 18
-    groups_disagree = 19
-    threads_not_built = 20
-    tile_not_built = 21
-    launch_out_of_range = 22
-    field_not_positive = 23
-    field_not_this_templates = 24
-    waves_not_built = 25
-    inner_stride_not_one = 26
-    row_stride_not_packs = 27
-    row_narrower_than_world = 28
-    forced_incomplete = 29
-
-
-class Where(IntEnum):
-    """WHERE A KERNEL'S WAIT GAVE UP: C++'s `hip_comms::Where`, number for number (a
-    test holds them equal)."""
-
-    start = 1  # a launch's first barrier: the peer had not launched
-    peer_barrier = 2  # a later peers barrier
-    world_peer = 3  # a world barrier's exchange: the peer had not posted
-    world = 4  # a world barrier on this device
-    grid = 5  # a grid barrier on this device
-    flag = 6  # a flag the peer had not written
-
-
-@dataclass(frozen=True)
-class Fault:
-    """A RANK'S FAULT RECORD: the first of its kernels' waits to outlive the timeout,
-    which then left the kernel (its output garbage) and made every other wait on the
-    rank leave."""
-
-    where: Where
-    rank: int
-    block: int
-    peer: int  # the rank it waited for, -1 for none (a wait on this device)
-    count: int  # the counter it read last
-    want: int  # the value it waited for
-    waited_s: float
-
-    def __str__(self) -> str:
-        waited_for = "" if self.peer < 0 else f" for rank {self.peer}"
-        return (
-            f"rank {self.rank} block {self.block} gave up in {self.where.name}"
-            f"{waited_for} after {self.waited_s:.1f} s: count {self.count}, "
-            f"want {self.want}"
-        )
 
 
 @dataclass(frozen=True)
@@ -184,123 +109,36 @@ _RECORDED = 64
 _WATCH_S = 0.1
 
 
-# C++'s `DType` names, as torch's dtypes.
-_DTYPES: Mapping[str, torch.dtype] = {
-    "f16": torch.float16,
-    "bf16": torch.bfloat16,
-    "f32": torch.float32,
-}
+def _require_capture(state: State) -> None:
+    """Raise on a launch being recorded into a cudagraph outside `capture()`: peers are
+    registered when that context exits, and a graph captured without it replays against
+    addresses that were never registered."""
+    if torch.cuda.is_current_stream_capturing() and not isinstance(state, Capturing):
+        raise RuntimeError(
+            "HipCustomComms is being captured into a cudagraph without `capture()`. "
+            "Use `with comm.capture(), torch.cuda.graph(g): ...`"
+        )
 
 
-@dataclass(frozen=True)
-class TemplateBuild:
-    """One C++ template as built: its op, and the builds dispatch instantiates (its
-    catalog list), each its fields by name (threads_per_block, waves_per_eu and its
-    tile; never the launch, which a forced call gives itself)."""
-
-    op: str
-    builds: tuple[dict[str, int], ...]
-
-
-@dataclass(frozen=True)
-class BuildInfo:
-    """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack and staging bytes, its ops', errors' and fault places' names, and its
-    templates."""
-
-    dtypes: frozenset[torch.dtype]
-    worlds: frozenset[int]
-    pack_bytes: int
-    staging_bytes: int
-    # C++'s `Op`, `Error` and `Where` members by name, each in its enum's order: an op
-    # crosses by name, an Error and a Where by number.
-    op_names: tuple[str, ...]
-    error_names: tuple[str, ...]
-    where_names: tuple[str, ...]
-    # Each template by name, in C++'s `Template` order: what a tuner searches.
-    templates: dict[str, TemplateBuild]
+def _answer(got: tuple[str | int | None, ...]) -> Ran | Error:
+    """A C++ planner's answer: what would run (the algorithm, the direction and the op's
+    config fields), or its last value, the Error's number."""
+    err = got[-1]
+    if err is not None:
+        assert isinstance(err, int)
+        return Error(err)
+    return tuple(got[:-1])
 
 
-@functools.cache
-def build_info() -> BuildInfo:
-    """The build's facts, read once: they are fixed when it is compiled."""
-    (
-        dtypes,
-        worlds,
-        pack,
-        staging,
-        ops,
-        errors,
-        wheres,
-        names,
-        template_ops,
-        fields,
-        flat,
-        counts,
-    ) = torch.ops._rocm_C.hip_custom_comms_build_info()
-    templates: dict[str, TemplateBuild] = {}
-    at, width = 0, len(fields)
-    for name, op, count in zip(names, template_ops, counts):
-        builds = []
-        for _ in range(count):
-            values = flat[at : at + width]
-            builds.append({f: v for f, v in zip(fields, values) if v != 0})
-            at += width
-        templates[name] = TemplateBuild(op, tuple(builds))
-    return BuildInfo(
-        frozenset(_DTYPES[d] for d in dtypes),
-        frozenset(worlds),
-        pack,
-        staging,
-        tuple(ops),
-        tuple(errors),
-        tuple(wheres),
-        templates,
-    )
+class HipCustomComms:
+    """vLLM's TP all-reduce and its fused ops over our HIP kernels, behind
+    CudaCommunicator. One per process group, because peer pointers are group-scoped.
 
-
-# WHAT RAN: the algorithm and direction, then the op's config fields as its kernel had
-# them, in the op's argument order; all None from a backend with no kernels to choose
-# (torch).
-Ran = tuple[str | int | None, ...]
-
-
-class Refused(RuntimeError):
-    """A call this backend does not take, raised by the op (its `should_` said so
-    first): the Error, and the input it was asked to run on."""
-
-    def __init__(self, error: Error, inp: torch.Tensor) -> None:
-        super().__init__(f"{error.name}: shape={tuple(inp.shape)} dtype={inp.dtype}")
-        self.error = error
-
-
-@dataclass(frozen=True)
-class Supported:
-    """What the library runs on, once `supported` finds it can: the device's arch."""
-
-    arch: str
-
-
-def supported(device: torch.device, world: int) -> Supported | Error:
-    """Whether our kernels run on `device` in a world of `world`, as the C++ build
-    answers it (`hip_comms::supported`): the Supported, or the Error."""
-    arch, err = torch.ops._rocm_C.hip_custom_comms_supported(device.index, world)
-    return Error(err) if err is not None else Supported(arch)
-
-
-def _is_weak_contiguous(inp: torch.Tensor) -> bool:
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
-
-
-class Communicator(ABC):
-    """A TP all-reduce / all-gather backend behind vLLM's CudaCommunicator.
-
-    This class owns the call SEQUENCE -- the admission gate, the capture invariant, and
-    delegation -- and a backend supplies only the hooks at the bottom. Collectives are
-    out-of-place.
+    The public ops own the call SEQUENCE -- the admission gate, the capture invariant
+    and the flight recorder -- and the private hooks at the bottom are the kernels. The
+    IPC handle exchange is done over the gloo `cpu_group`; C++ only opens the handles it
+    is handed. Missing ops are an error, not a disable: falling back quietly would let
+    vLLM run its own all-reduce and report the arm ready. Collectives are out-of-place.
     """
 
     state: State = Disabled("not opened")
@@ -740,7 +578,7 @@ class Communicator(ABC):
         self._on_close()
 
     @final
-    def __enter__(self) -> "Communicator":
+    def __enter__(self) -> "HipCustomComms":
         return self
 
     @final
@@ -843,11 +681,46 @@ class Communicator(ABC):
             and not torch.cuda.is_current_stream_capturing()
         )
 
-    # ---- What a BACKEND supplies: for each op it runs, its check (what would run, or
-    # the Error; disabled when it is) and its launch, both taking the op's own
-    # arguments. Every op's outputs are the base's, so a capture's warmup returns them
-    # without calling here. The fused ops are not abstract: a backend without one keeps
-    # its check, no_such_op. ----
+    # ---- THE KERNELS: each op's check (what C++ would run, or the Error) and launch,
+    # and the peer memory's life. ----
+
+    # Declared here so a disabled communicator is still safe to hold and close.
+    _handle: int | None = None
+    # The device wall clock's rate, which the fault record counts its wait in.
+    _khz: int = 0
+    # Whether there is a fault record for the watchdog to read (`_fault`).
+    _faults: ClassVar[bool] = True
+
+    def _open(self) -> str | None:
+        """Open the peer memory. A collective, so every rank must reach it.
+
+        Eager, and before any capture: doing this inside a cudagraph capture is not
+        recoverable.
+        """
+        # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
+        # device and gathers every rank's IPC handle over the CPU group (a collective).
+        handle, err = torch.ops._rocm_C.hip_custom_comms_open(
+            self.cpu_group.group_name, self.device_group.group_name, self.device.index
+        )
+        if err is not None:
+            return Error(err).name
+        self._handle = handle
+        self._khz = torch.ops._rocm_C.hip_custom_comms_wall_clock_khz(self.device.index)
+        logger.info("HipCustomComms ready")
+        return None
+
+    @contextmanager
+    def _on_capture(self) -> Iterator[None]:
+        """Wrap a cudagraph capture; the buffers its launches recorded are registered
+        on exit, by C++, a collective over the CPU group. A captured address is fixed
+        for the graph's life, so filling the slots after capture is sound."""
+        try:
+            yield
+        finally:
+            # Even on error: unfilled slots fault later on a null peer pointer.
+            torch.ops._rocm_C.hip_custom_comms_register_captured(
+                self._handle, self.cpu_group.group_name
+            )
 
     def _check_all_reduce(
         self,
@@ -860,31 +733,23 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> Ran | Error:
-        """By default (torch) the build's envelope, so a control admits what our
-        kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
-        having no template to force. Ours overrides it with its C++'s answer."""
         if self.disabled:
             return Error.disabled
-        if (
-            algorithm is not None
-            or direction is not None
-            or tile_m is not None
-            or tile_n is not None
-            or threads_per_block is not None
-            or blocks_per_grid is not None
-            or waves_per_eu is not None
-        ):
-            return Error.no_such_template
-        if not _is_weak_contiguous(inp):
-            return Error.not_contiguous
-        built = build_info()
-        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
-            return Error.row_not_packs
-        if inp.dtype not in built.dtypes:
-            return Error.dtype_not_built
-        return (None, None, None, None, None, None, None)
+        _require_capture(self.state)
+        return _answer(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce(
+                self._handle,
+                inp,
+                algorithm,
+                direction,
+                tile_m,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
+                waves_per_eu,
+            )
+        )
 
-    @abstractmethod
     def _all_reduce(
         self,
         out: torch.Tensor,
@@ -897,8 +762,19 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        """SUM across ranks into `out`, which the base allocated: input untouched.
-        Assume `inp` is admitted -- the base checked."""
+        """Sum `inp` across the TP ranks into `out`."""
+        torch.ops._rocm_C.hip_custom_comms_all_reduce(
+            self._handle,
+            out,
+            inp,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
+        )
 
     def _check_all_reduce_rms_norm(
         self,
@@ -913,7 +789,24 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> Ran | Error:
-        return Error.no_such_op
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
+        return _answer(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce_rms_norm(
+                self._handle,
+                inp,
+                weight,
+                add,
+                algorithm,
+                direction,
+                tile_m,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
+                waves_per_eu,
+            )
+        )
 
     def _all_reduce_rms_norm(
         self,
@@ -929,8 +822,19 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms_norm"
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_rms_norm(
+            self._handle,
+            out,
+            inp,
+            weight,
+            eps,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
         )
 
     def _all_reduce_add_rms_norm(
@@ -949,8 +853,22 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + fused_add_rms_norm"
+        """The normed result into `out`, the sum plus residual into `residual_out`."""
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_add_rms_norm(
+            self._handle,
+            out,
+            residual_out,
+            inp,
+            residual,
+            weight,
+            eps,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
         )
 
     def _check_all_reduce_add_attn_res_rms_norm(
@@ -966,7 +884,24 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> Ran | Error:
-        return Error.no_such_op
+        if self.disabled:
+            return Error.disabled
+        _require_capture(self.state)
+        return _answer(
+            torch.ops._rocm_C.hip_custom_comms_plan_all_reduce_add_attn_res_rms_norm(
+                self._handle,
+                inp,
+                algorithm,
+                direction,
+                tile_m,
+                tile_n,
+                tile_k,
+                reduce_scatter_blocks,
+                threads_per_block,
+                blocks_per_grid,
+                waves_per_eu,
+            )
+        )
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
@@ -992,30 +927,58 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + AttnRes"
+        torch.ops._rocm_C.hip_custom_comms_all_reduce_add_attn_res_rms_norm(
+            self._handle,
+            prefix_out,
+            out,
+            inp,
+            blocks,
+            norm_weight,
+            qk_weight,
+            out_norm_weight,
+            num_blocks,
+            write_idx,
+            eps,
+            out_eps,
+            has_prefix,
+            algorithm,
+            direction,
+            tile_m,
+            tile_n,
+            tile_k,
+            reduce_scatter_blocks,
+            threads_per_block,
+            blocks_per_grid,
+            waves_per_eu,
         )
 
-    @abstractmethod
-    def _open(self) -> str | None:
-        """Bring this backend up, its availability checks included. None when it is
-        usable; otherwise why not, which leaves it disabled and is not an error."""
-
-    def _on_capture(self) -> AbstractContextManager[None]:
-        """What this backend needs around a capture. Nothing, by default."""
-        return nullcontext()
-
-    def _on_close(self) -> None:  # noqa: B027 -- an optional hook, not an abstract one
-        """What this backend has to release. Nothing, by default; a backend that holds
-        something of ours drops it here so its destructor runs at a known moment."""
-
-    # Whether this backend has a fault record for the watchdog to read (`_fault`).
-    _faults: ClassVar[bool] = False
+    def _on_close(self) -> None:
+        """Release the peer memory now. Idempotent. Dropping the object does not close
+        the IPC handles the C++ side opened; this does."""
+        if self._handle is None:
+            return
+        torch.ops._rocm_C.hip_custom_comms_dispose(self._handle)
+        self._handle = None
 
     def _fault(self) -> Fault | None:
-        """This backend's fault record, read without waiting on the device: a Fault once
-        one of its kernels' waits has given up, else None. None, by default."""
-        return None
+        """The C++ handle's fault record (host-mapped, so this never waits on the
+        device)."""
+        if self._handle is None:
+            return None
+        got = torch.ops._rocm_C.hip_custom_comms_fault(self._handle)
+        if not got:
+            return None
+        where, rank, block, peer, count, want, ticks = got
+        return Fault(
+            where=Where(where),
+            rank=rank,
+            block=block,
+            peer=peer,
+            count=count,
+            want=want,
+            waited_s=ticks / (self._khz * 1000.0),
+        )
 
-    def _abort(self) -> None:  # noqa: B027 -- an optional hook, not an abstract one
-        """Make every wait this backend's kernels are in leave. Nothing, by default."""
+    def _abort(self) -> None:
+        if self._handle is not None:
+            torch.ops._rocm_C.hip_custom_comms_abort(self._handle)

@@ -280,7 +280,7 @@ def _fused_attn_res(
     raises, naming why, for an input it cannot run."""
     backend = _comm()
     assert backend is not None, (
-        "the all_reduce_add_attn_res_rms_norm path runs only with rocm_comms live"
+        "the all_reduce_add_attn_res_rms_norm path runs only with HipCustomComms live"
     )
     prefix, out, _ = backend.all_reduce_add_attn_res_rms_norm(
         delta,
@@ -298,8 +298,8 @@ def _fused_attn_res(
 
 
 def _comm() -> Any | None:
-    """The rocm_comms backend, when live with TP above one; None otherwise."""
+    """HipCustomComms, when live with TP above one; None otherwise."""
     if get_tensor_model_parallel_world_size() <= 1:
         return None
-    backend = getattr(get_tp_group().device_communicator, "rocm_comm", None)
+    backend = getattr(get_tp_group().device_communicator, "hip_custom_comms", None)
     return None if backend is None or backend.disabled else backend

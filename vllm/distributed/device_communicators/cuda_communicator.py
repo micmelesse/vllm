@@ -105,7 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
-        self.rocm_comm = None
+        self.hip_custom_comms = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
@@ -127,23 +127,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             self.world_size > 1
             and current_platform.is_rocm()
-            and envs.VLLM_ROCM_COMMS_BACKEND
+            and envs.VLLM_ROCM_USE_HIP_CUSTOM_COMMS
         ):
-            # OUR BACKEND OWNS THE ALL-REDUCE, all of it. When one is named, none of
+            # HIP CUSTOM COMMS OWNS THE ALL-REDUCE, all of it. When on, none of
             # upstream's TP all-reduce paths are built -- not AITER's, not
-            # CustomAllreduce, not QuickReduce -- so an arm named for a backend is not a
-            # mixture of two. When none is named, upstream's code below runs untouched.
-            from vllm.distributed.device_communicators.rocm_comms import (
-                make_communicator,
+            # CustomAllreduce, not QuickReduce -- so an arm is not a mixture of two.
+            # When off, upstream's code below runs untouched.
+            from vllm.distributed.device_communicators.hip_custom_comms import (
+                HipCustomComms,
             )
 
-            # Both groups (mirrors DeviceCommunicatorBase); hip exchanges its IPC
+            # Both groups (mirrors DeviceCommunicatorBase); it exchanges its IPC
             # handles over the cpu group.
-            self.rocm_comm = make_communicator(
+            self.hip_custom_comms = HipCustomComms(
                 cpu_group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
-                backend=envs.VLLM_ROCM_COMMS_BACKEND,
             )
         else:
             if (
@@ -198,7 +197,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_custom_allreduce
             and self.world_size > 1
             and current_platform.is_rocm()
-            and self.rocm_comm is None
+            and self.hip_custom_comms is None
         ):
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
@@ -303,7 +302,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
-            "ROCM_COMMS",
+            "HIP_CUSTOM_COMMS",
             "QUICK_REDUCE",
             "AITER_CUSTOM",
             "CUSTOM",
@@ -342,9 +341,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
-        # Named with its backend, so a step log states which collective an arm ran.
-        if self.rocm_comm is not None and not self.rocm_comm.disabled:
-            enabled_ar_backends.append(f"ROCM_COMMS:{envs.VLLM_ROCM_COMMS_BACKEND}")
+        if self.hip_custom_comms is not None and not self.hip_custom_comms.disabled:
+            enabled_ar_backends.append("HIP_CUSTOM_COMMS")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if (
@@ -387,13 +385,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        rocm_comm = self.rocm_comm
+        hip_custom_comms = self.hip_custom_comms
         if (
-            rocm_comm is not None
-            and not rocm_comm.disabled
-            and rocm_comm.should_allreduce(input_)
+            hip_custom_comms is not None
+            and not hip_custom_comms.disabled
+            and hip_custom_comms.should_allreduce(input_)
         ):
-            out, _ = rocm_comm.all_reduce(input_)  # the sum, and what ran
+            out, _ = hip_custom_comms.all_reduce(input_)  # the sum, and what ran
             return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -709,9 +707,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.rocm_comm is not None:
-            self.rocm_comm.close()
-            self.rocm_comm = None
+        if self.hip_custom_comms is not None:
+            self.hip_custom_comms.close()
+            self.hip_custom_comms = None
         if self.qr_comm is not None:
             self.qr_comm = None
         if self.ca_comm is not None:

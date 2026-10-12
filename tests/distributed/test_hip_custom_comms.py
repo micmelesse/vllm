@@ -34,6 +34,7 @@ import queue
 import re
 import time
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import product
@@ -51,28 +52,30 @@ from hypothesis import strategies as st
 from torch.distributed import ProcessGroup
 
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.device_communicators.rocm_comms import (
-    Communicator,
-    Error,
-    make_communicator,
+from vllm.distributed.device_communicators.hip_custom_comms import HipCustomComms
+from vllm.distributed.device_communicators.hip_custom_comms import (
+    hip_custom_comms as comms_module,
 )
-from vllm.distributed.device_communicators.rocm_comms import base as base_module
-from vllm.distributed.device_communicators.rocm_comms.base import (
+from vllm.distributed.device_communicators.hip_custom_comms.build import (
+    Error,
+    Fault,
+    Op,
+    Ran,
+    Refused,
+    Supported,
+    Where,
+    build_info,
+    is_weak_contiguous,
+    supported,
+)
+from vllm.distributed.device_communicators.hip_custom_comms.hip_custom_comms import (
     Broken,
     Capturing,
     Closed,
     Disabled,
-    Fault,
-    Op,
     Open,
-    Refused,
     State,
-    Supported,
-    Where,
-    build_info,
-    supported,
 )
-from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -171,15 +174,18 @@ def _atol(op_name: str, dtype: torch.dtype) -> float:
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
-# hip comes from `make_communicator`, the selector the serving path runs; the control
-# is the test's own.
+# hip is HipCustomComms, as the serving path builds it; the control is the test's own.
 
 
-class TorchCommunicator(Communicator):
+class TorchCommunicator(HipCustomComms):
     """torch.distributed over `device_group`: the known-good control hip is checked
-    against, the same interface and admission, an implementation nobody doubts. The gloo
-    `cpu_group` is accepted for interface parity and unused. It supplies no
-    `_on_capture`: there is nothing to do around a capture."""
+    against, HipCustomComms' own call sequence and admission with its kernels replaced
+    by torch's, an implementation nobody doubts. The gloo `cpu_group` is accepted for
+    interface parity and unused. Its hooks are the control's: the build's envelope as
+    the check, no fused ops, nothing around a capture or at close, and no fault
+    record."""
+
+    _faults = False
 
     def _open(self) -> str | None:
         """Nothing to bring up, but gated on the device and world like hip: a control
@@ -202,6 +208,83 @@ class TorchCommunicator(Communicator):
         out.copy_(inp)
         dist.all_reduce(out, group=self.device_group)  # SUM
 
+    def _check_all_reduce(
+        self,
+        inp: torch.Tensor,
+        algorithm: str | None,
+        direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+        waves_per_eu: int | None,
+    ) -> Ran | Error:
+        """The build's envelope, so the control admits what our kernels do:
+        weak-contiguous, whole packs, a dtype built; and nothing forced, having no
+        template to force."""
+        if self.disabled:
+            return Error.disabled
+        if (
+            algorithm is not None
+            or direction is not None
+            or tile_m is not None
+            or tile_n is not None
+            or threads_per_block is not None
+            or blocks_per_grid is not None
+            or waves_per_eu is not None
+        ):
+            return Error.no_such_template
+        if not is_weak_contiguous(inp):
+            return Error.not_contiguous
+        built = build_info()
+        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
+            return Error.row_not_packs
+        if inp.dtype not in built.dtypes:
+            return Error.dtype_not_built
+        return (None, None, None, None, None, None, None)
+
+    def _check_all_reduce_rms_norm(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        add: bool,
+        algorithm: str | None,
+        direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+        waves_per_eu: int | None,
+    ) -> Ran | Error:
+        return Error.no_such_op
+
+    def _check_all_reduce_add_attn_res_rms_norm(
+        self,
+        inp: torch.Tensor,
+        algorithm: str | None,
+        direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        tile_k: int | None,
+        reduce_scatter_blocks: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+        waves_per_eu: int | None,
+    ) -> Ran | Error:
+        return Error.no_such_op
+
+    def _on_capture(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def _on_close(self) -> None:
+        pass
+
+    def _fault(self) -> Fault | None:
+        return None
+
+    def _abort(self) -> None:
+        pass
+
 
 # What each name MUST construct, stated independently of the factory's if-chain: a
 # branch wired to the wrong class is silent -- you ask for hip, get something else, and
@@ -209,7 +292,7 @@ class TorchCommunicator(Communicator):
 # derive from this one list.
 _BACKEND_CLASS = {
     "torch": TorchCommunicator,  # the known-good reference
-    "hip": HipCommunicator,
+    "hip": HipCustomComms,
 }
 
 # Control FIRST in `COMMUNICATOR_CASES`, because it is the first case to run: if torch
@@ -369,11 +452,11 @@ def _build_communicator(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
     device: torch.device,
-) -> Communicator:
+) -> HipCustomComms:
     comm = (
         TorchCommunicator(cpu_group, device_group, device)
         if backend == "torch"
-        else make_communicator(cpu_group, device_group, device, backend=backend)
+        else HipCustomComms(cpu_group, device_group, device)
     )
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
@@ -421,9 +504,9 @@ class RankContext:
     cpu_group: ProcessGroup
     device_group: ProcessGroup
     # A dict in a frozen dataclass: the fields cannot be rebound, the cache still fills.
-    _comms: dict[str, Communicator] = field(default_factory=dict, init=False)
+    _comms: dict[str, HipCustomComms] = field(default_factory=dict, init=False)
 
-    def comm(self, backend: str) -> Communicator:
+    def comm(self, backend: str) -> HipCustomComms:
         """The world's communicator for `backend`, built the first time a case asks and
         kept for the world's life, as vLLM keeps one.
 
@@ -760,7 +843,7 @@ def _forced(kernel: str, cols: int = 0) -> Forced:
 
 
 def declined(
-    comm: Communicator,
+    comm: HipCustomComms,
     op_name: str,
     shape: tuple[int, ...],
     dtype: torch.dtype,
@@ -824,7 +907,7 @@ def precheck(
 
 
 def run_collective(
-    comm: Communicator,
+    comm: HipCustomComms,
     op_name: str,
     mine: Sequence[Sequence[torch.Tensor]],
     sched: Schedule,
@@ -1254,12 +1337,12 @@ def test_the_watchdog_breaks_on_a_fault_and_logs_the_last_launches(
     for i in range(launches):
         comm._record("all_reduce", torch.empty(i + 1, 8), (None,) * 7)
     logged: list[str] = []
-    real = base_module.logger.error
-    base_module.logger.error = lambda msg, *args: logged.append(msg % args)  # type: ignore[method-assign]
+    real = comms_module.logger.error
+    comms_module.logger.error = lambda msg, *args: logged.append(msg % args)  # type: ignore[method-assign]
     try:
         comm._watch()
     finally:
-        base_module.logger.error = real  # type: ignore[method-assign]
+        comms_module.logger.error = real  # type: ignore[method-assign]
     assert comm.reads == after
     assert comm.state == Broken(f"a kernel's wait gave up: {fault}")
     assert comm.aborts == 1
@@ -1267,7 +1350,7 @@ def test_the_watchdog_breaks_on_a_fault_and_logs_the_last_launches(
         _ = comm.disabled
     (message,) = logged
     assert str(fault) in message
-    kept = min(launches, base_module._RECORDED)
+    kept = min(launches, comms_module._RECORDED)
     seqs = [int(line.split()[0][1:]) for line in message.splitlines()[1:] if kept]
     assert seqs == list(range(launches - 1, launches - 1 - kept, -1))
 
@@ -1295,8 +1378,8 @@ def test_admission_matches_the_baseline() -> None:
     """Every backend admits exactly what vLLM's CustomAllreduce does -- the precondition
     for the matrix
     meaning anything, since arms that route different work compare routing rather than
-    kernels. Needs no GPU. fp32 is excluded: `hip_comms.cu` has fp16/bf16 instantiations
-    only, so closing it needs a kernel.
+    kernels. Needs no GPU. fp32 is excluded: `hip_custom_comms.cu` has fp16/bf16
+    instantiations only, so closing it needs a kernel.
     """
     ours = _bare(Open())
     # Every power of two across the range PLUS the bound and one element either side.
@@ -2328,7 +2411,7 @@ def _refused_or_right(answers: list[tuple[bool, str | None]], plain: bool) -> No
         assert not plain, f"a plain call was refused: {refusal}"
 
 
-def _broken_stops_the_world(comm: Communicator) -> None:
+def _broken_stops_the_world(comm: HipCustomComms) -> None:
     """A call that broke the communicator ends the world, so the next case starts
     clean instead of inheriting the break."""
     if isinstance(comm.state, Broken):

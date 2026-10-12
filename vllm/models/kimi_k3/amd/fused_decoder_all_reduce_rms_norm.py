@@ -251,7 +251,7 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
     ) -> torch.Tensor:
         backend = _comm()
         assert backend is not None, (
-            "the all_reduce_rms_norm path runs only with rocm_comms live"
+            "the all_reduce_rms_norm path runs only with HipCustomComms live"
         )
         transform = self.routed_output_transform
         assert transform is not None
@@ -277,8 +277,8 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
 
 
 def _comm() -> Any | None:
-    """The rocm_comms backend, when live with TP above one; None otherwise."""
+    """HipCustomComms, when live with TP above one; None otherwise."""
     if get_tensor_model_parallel_world_size() <= 1:
         return None
-    backend = getattr(get_tp_group().device_communicator, "rocm_comm", None)
+    backend = getattr(get_tp_group().device_communicator, "hip_custom_comms", None)
     return None if backend is None or backend.disabled else backend
