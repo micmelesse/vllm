@@ -4,7 +4,7 @@
 """The interface every ROCm TP collective backend implements, and the two rules it
 enforces once.
 
-One file per backend beside this one: `hip`, `iris`, `torch`. This holds only what they
+One file per backend beside this one: `hip`, `torch`. This holds only what they
 share -- the abstract surface `CudaCommunicator` calls, and the admission checks that
 decide whether a tensor is one of ours at all.
 """
@@ -269,7 +269,7 @@ def build_info() -> BuildInfo:
 
 # WHAT RAN: the algorithm and direction, then the op's config fields as its kernel had
 # them, in the op's argument order; all None from a backend with no kernels to choose
-# (torch, iris).
+# (torch).
 Ran = tuple[str | int | None, ...]
 
 
@@ -1129,7 +1129,7 @@ class Communicator(ABC):
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> Ran | Error:
-        """By default (torch, iris) the build's envelope, so a control admits what our
+        """By default (torch) the build's envelope, so a control admits what our
         kernels do: weak-contiguous, whole packs, a dtype built; and nothing forced,
         having no template to force. Ours overrides it with its C++'s answer."""
         if self.disabled:

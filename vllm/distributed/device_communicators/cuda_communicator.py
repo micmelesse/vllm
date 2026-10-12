@@ -138,7 +138,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             # Both groups (mirrors DeviceCommunicatorBase): the torch reference backend
-            # runs torch.dist over the device group; iris uses its own shmem.
+            # runs torch.dist over the device group.
             self.rocm_comm = make_communicator(
                 cpu_group=self.cpu_group,
                 device_group=self.device_group,

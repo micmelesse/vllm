@@ -74,9 +74,6 @@ from vllm.distributed.device_communicators.rocm_comms.base import (
 )
 from vllm.distributed.device_communicators.rocm_comms.experimental import ExperimentalOp
 from vllm.distributed.device_communicators.rocm_comms.hip import HipCommunicator
-from vllm.distributed.device_communicators.rocm_comms.iris import (
-    IrisCommunicator,
-)
 from vllm.distributed.device_communicators.rocm_comms.torch import TorchCommunicator
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -182,35 +179,12 @@ def _atol(op_name: str, dtype: torch.dtype) -> float:
 
 
 # What each name MUST construct, stated independently of the factory's if-chain: a
-# branch wired to the wrong class is silent -- you ask for iris, get something else, and
+# branch wired to the wrong class is silent -- you ask for hip, get something else, and
 # the number looks plausible. CONTROL FIRST, since the run order and the control both
 # derive from this one list.
 _BACKEND_CLASS = {
     "torch": TorchCommunicator,  # the known-good reference
     "hip": HipCommunicator,
-    "iris": IrisCommunicator,  # someone else's kernel; expected to fail, see below
-}
-
-# WHAT WE ALREADY KNOW IS BROKEN, and why it stays in the matrix anyway. A backend left
-# out of the list is a backend nobody measures; one left in and red is a suite nobody
-# trusts. Naming it here is the third option: the case appears in the report, with the
-# reason, and nothing is spent running it.
-#
-# iris serves and computes WRONG ANSWERS -- gsm8k 0.000 against baseline's 0.805 on
-# 2026-09-14 -- and on 2026-09-17 it stopped serving at all, raising inside all_gather.
-# It is not ours; we measure against it.
-#
-# SKIP AND NOT XFAIL, which is what this was. `xfail` RUNS the case: it spawns eight
-# ranks, initialises NCCL and waits for the failure it already expects -- a third of
-# this suite's wall clock spent confirming a dated line above. The suite gates every
-# run, so that time is charged to every run.
-#
-# WHAT IS GIVEN UP: the day iris starts working, `xfail` would have said XPASS and skip
-# says nothing. That is the trade, and it is the right way round while the thing is
-# known broken. Turn it back into an xfail when there is a reason to think it passes.
-DISABLED = {
-    "iris": "iris computes wrong answers (gsm8k 0.000, 2026-09-14) and has since "
-    "stopped serving (all_gather raises, 2026-09-17)",
 }
 
 # Control FIRST in `COMMUNICATOR_CASES`, because it is the first case to run: if torch
@@ -1327,12 +1301,9 @@ def _communicator_param(
     groups: tuple[str, ...],
     full: bool,
 ) -> ParameterSet:
-    """One `test_communicator` case, marked with its tier and, for a backend known to
-    be broken, the reason it is skipped."""
+    """One `test_communicator` case, marked with its tier."""
     name = backend if kernel is None else f"{backend}-{kernel}"
     marks = [pytest.mark.full] if full else []
-    if backend in DISABLED:
-        marks.append(pytest.mark.skip(reason=DISABLED[backend]))
     return pytest.param(
         backend,
         kernel,
@@ -1347,7 +1318,7 @@ def _communicator_param(
 # CHOSEN, not gridded. FAST is what vLLM runs: hip with no forced launch (select
 # picks), captured the way vLLM captures, at Kimi-K3's widths in bf16; and each PULL
 # kernel forced at a small and a large shape, so both code paths run whatever tune
-# picks. FULL is the rest: the control and iris, every forced kernel and every mode on
+# picks. FULL is the rest: the control, every forced kernel and every mode on
 # the 8192 sweep with its admission boundaries, and hip's own choice in fp16 and eager
 # at Kimi-K3's widths. Control FIRST: the list's order is the run order, and if torch
 # is red, nothing after it means anything.
