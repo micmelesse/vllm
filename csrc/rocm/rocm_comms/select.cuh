@@ -1077,11 +1077,19 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            if constexpr (two_shot_lays_out(C, NG, NL))
-              kernel = staged ? instance<AllReduceTwoShotStagedKernel>(
-                                    all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS, WAVES>)
+            // THE INSTANCE FOR THE LAYOUT AS GIVEN: rows back to back read each peer's share as one
+            // run, other strides the strided walk (collectives.cuh); the input is not reshaped.
+            const bool contiguous = inp_stride_m == n * inp_stride_n && out_stride_m == n * out_stride_n;
+            if constexpr (two_shot_lays_out(C, NG, NL)) {
+              const auto at = [&](auto layout) {
+                constexpr bool CONTIGUOUS = decltype(layout)::value;
+                return staged ? instance<AllReduceTwoShotStagedKernel>(
+                                    all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS, WAVES, CONTIGUOUS>)
                               : instance<AllReduceTwoShotKernel>(
-                                    all_reduce_pull_two_shot<T, NG, TM, TN, THREADS, WAVES>);
+                                    all_reduce_pull_two_shot<T, NG, TM, TN, THREADS, WAVES, CONTIGUOUS>);
+              };
+              kernel = contiguous ? at(std::true_type{}) : at(std::false_type{});
+            }
           });
           return;
         default: not_this_ops(fn);

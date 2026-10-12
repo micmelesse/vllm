@@ -277,19 +277,19 @@ DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, TH
 // at its strides). TILE is the [R, 1, TILE_N] chunk the walk moves (collectives.cuh: walked as
 // [R, 1, m*n], each rank's share one contiguous range of the elements, for long runs).
 // Reduce-scatter: this rank's share, summed over the ranks, into its scratch.
-template <typename TILE, typename RANK_PTR, typename T>
+template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
 DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& scratch) {
-  impl::reduce_scatter<TILE>(rank, inp, m, n, scratch);
+  impl::reduce_scatter<TILE, CONTIGUOUS>(rank, inp, m, n, scratch);
 }
 // All-gather: every rank's summed share, rank r's at scratch(r), at its place in `out`.
-template <typename TILE, typename RANK_PTR, typename T>
+template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
 DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, int n) {
-  impl::all_gather<TILE>(rank, scratch, out, m, n);
+  impl::all_gather<TILE, CONTIGUOUS>(rank, scratch, out, m, n);
 }
 // Staged, first: this rank's input, every rank's share of it, into its staging.
-template <typename TILE, typename T>
+template <typename TILE, bool CONTIGUOUS, typename T>
 DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int m, int n) {
-  impl::stage<TILE>(rank, inp, staging, m, n);
+  impl::stage<TILE, CONTIGUOUS>(rank, inp, staging, m, n);
 }
 
 // ===============================================================================================

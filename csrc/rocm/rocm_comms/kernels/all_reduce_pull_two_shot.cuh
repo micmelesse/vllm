@@ -17,8 +17,10 @@ namespace hip_comms {
 // scratch), sync, all-gather (every rank's summed share out to the output). The kernel states the
 // problem; collectives.cuh walks it as [R, 1, M*N], each rank's share one contiguous range of the
 // elements, for long reads from each peer (its comment says why and what it serves badly). A rank's
-// copy of a chunk is a wave (LANES threads); the Chunk tile is that [R, 1, TILE_N] chunk.
-template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+// copy of a chunk is a wave (LANES threads); the Chunk tile is that [R, 1, TILE_N] chunk. CONTIGUOUS:
+// the input's and the output's rows are back to back, the instance the host picks from their strides.
+template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU,
+          bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
                              int64_t inp_stride_n, DTYPE* const* __restrict__ scratch_ptrs,
@@ -47,7 +49,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(1);
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks, into its scratch.
-  reduce_scatter<Chunk>(rank, inp, inp_size_m, inp_size_n, scratch(rank));
+  reduce_scatter<Chunk, CONTIGUOUS>(rank, inp, inp_size_m, inp_size_n, scratch(rank));
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
@@ -56,7 +58,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 4. All-gather: every rank's summed share out of its scratch, at its place in the output. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
-  all_gather<Chunk>(rank, scratch, out, inp_size_m, inp_size_n);
+  all_gather<Chunk, CONTIGUOUS>(rank, scratch, out, inp_size_m, inp_size_n);
   block_stamp(5);
   sync.finish();
 }
@@ -66,7 +68,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // [r0, r0 + band) at their strides, the staging ([band, n], ours) and the scratch (a share of it)
 // at most what each holds (the host's). EACH BLOCK STAGES, OF EVERY RANK'S SHARE, THE CHUNKS THAT
 // RANK'S SAME BLOCK READS, so a peers barrier makes them visible.
-template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
+template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU,
+          bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_staged(DTYPE* const* __restrict__ scratch_ptrs,
                                     int64_t scratch_stride_m, int64_t scratch_stride_n,
@@ -100,12 +103,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 1. This band, every rank's share of it, into this rank's staging (the chunks each rank's same
     //    block reads), then visible (and, past the first pass, every peer has read this rank's
     //    scratch).
-    stage<Chunk>(rank, inp, staging(rank), band, inp_size_n);
+    stage<Chunk, CONTIGUOUS>(rank, inp, staging(rank), band, inp_size_n);
     barrier<Group::peers, Until::visible>(sync);
     block_stamp(1);
 
     // 2. Reduce-scatter: this rank's share of the band from every rank's staging, into its scratch.
-    reduce_scatter<Chunk>(rank, staging, band, inp_size_n, scratch(rank));
+    reduce_scatter<Chunk, true>(rank, staging, band, inp_size_n, scratch(rank));  // ours, rows back to back
 
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
@@ -114,7 +117,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     block_stamp(3);
 
     // 4. All-gather: every rank's summed share out of its scratch, at its place in the output.
-    all_gather<Chunk>(rank, scratch, out, band, inp_size_n);
+    all_gather<Chunk, CONTIGUOUS>(rank, scratch, out, band, inp_size_n);
     block_stamp(5);
   }
   sync.finish();
