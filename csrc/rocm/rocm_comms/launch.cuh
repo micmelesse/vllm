@@ -157,30 +157,4 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.reduce_scatter_blocks);
 }
 
-namespace experimental {
-
-// The probe's: a barrier over the signals only; the ping-pong's flags from this pair's next ones
-// (flags only grow); the link traffic over every rank's copy of its buffer and staging.
-inline void launch_probe_barrier(Handle& h, const ProbeBarrierLaunch& l) {
-  Call<ProbeBarrierKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                                h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks());
-}
-
-inline void launch_ping_pong(Handle& h, const PingPongLaunch& l) {
-  const uint32_t base = h.take_flags(l.peer, ping_pong_flags(l.iters));
-  Call<PingPongKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                            h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
-                            l.peer, base, l.iters, l.ticks);
-}
-
-inline void launch_link_traffic(Handle& h, const LinkTrafficLaunch& l) {
-  Call<LinkTrafficKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream,
-                               h.inp_ptrs(l.buffer, l.bytes, l.stream), h.staging_ptrs(),
-                               h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
-                               static_cast<int>(l.mode), l.peer, l.pullers,
-                               l.bytes / kBuild.memory.pack_bytes, l.sink);
-}
-
-}  // namespace experimental
-
 }  // namespace hip_comms

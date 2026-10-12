@@ -5,9 +5,7 @@
 // launch, everything decided, or the first Error the call meets) then launch_<op> (launch.cuh,
 // which decides nothing), and returns the launch it ran or the Error. Every argument is a
 // primitive: pointers, sizes, a DType, and the op's own forcing (an Algorithm and a Direction,
-// then its config fields, each none for select's). Python's plan_<op> is select_<op>. The
-// experimental ops (no stability promise: promoted out or deleted): the probe's, which measure
-// the machine.
+// then its config fields, each none for select's). Python's plan_<op> is select_<op>.
 
 #pragma once
 
@@ -143,36 +141,5 @@ inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error> all_reduce_add_attn
     launch_all_reduce_add_attn_res_rms_norm(h, *got);
   return l;
 }
-
-namespace experimental {
-
-// THE PROBE'S OPS: the machine as the peers layer (common/peers.cuh, barrier.cuh) sees it, one measurement at a time (calibrate.py
-// times them).
-inline std::variant<ProbeBarrierLaunch, Error> probe_barrier(Handle& h, hipStream_t stream) {
-  std::variant<ProbeBarrierLaunch, Error> l = select_probe_barrier(h, stream);
-  if (const ProbeBarrierLaunch* got = std::get_if<ProbeBarrierLaunch>(&l))
-    launch_probe_barrier(h, *got);
-  return l;
-}
-
-inline std::variant<PingPongLaunch, Error> ping_pong(Handle& h, int peer, int iters, void* ticks,
-                                                     hipStream_t stream) {
-  std::variant<PingPongLaunch, Error> l = select_ping_pong(h, peer, iters, ticks, stream);
-  if (const PingPongLaunch* got = std::get_if<PingPongLaunch>(&l)) launch_ping_pong(h, *got);
-  return l;
-}
-
-inline std::variant<LinkTrafficLaunch, Error> link_traffic(Handle& h, const void* buffer,
-                                                           int64_t bytes, Traffic mode, int peer,
-                                                           int blocks, int pullers, void* sink,
-                                                           hipStream_t stream) {
-  std::variant<LinkTrafficLaunch, Error> l =
-      select_link_traffic(h, buffer, bytes, mode, peer, blocks, pullers, sink, stream);
-  if (const LinkTrafficLaunch* got = std::get_if<LinkTrafficLaunch>(&l))
-    launch_link_traffic(h, *got);
-  return l;
-}
-
-}  // namespace experimental
 
 }  // namespace hip_comms

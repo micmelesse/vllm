@@ -213,14 +213,6 @@ class Handle {
     return resources_[kernel] = {attrs.numRegs, static_cast<int64_t>(attrs.sharedSizeBytes)};
   }
 
-  // The first of `n` flag values for `peer`, the rest reserved: flags only grow, so each use starts
-  // past the last (write_flag).
-  uint32_t take_flags(int peer, uint32_t n) {
-    const uint32_t base = flags_used_[peer];
-    flags_used_[peer] += n;
-    return base;
-  }
-
  private:
   // THIS RANK'S SYMMETRIC MEMORY, one allocation, zeroed: the signal block, the scratch, then the
   // staging. UNCACHED, as aiter and vLLM's custom all-reduce allocate theirs: peers read what this
@@ -341,7 +333,6 @@ class Handle {
   std::vector<void*> pending_;
   std::vector<void**> pending_slots_;
   std::unordered_map<std::string, void*> opened_;
-  uint32_t flags_used_[kMaxRanks] = {};
 };
 
 // =================================================================================================

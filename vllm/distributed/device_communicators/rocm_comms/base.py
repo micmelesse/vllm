@@ -114,12 +114,11 @@ class Error(IntEnum):
     launch_out_of_range = 22
     field_not_positive = 23
     field_not_this_templates = 24
-    probe_out_of_range = 25
-    waves_not_built = 26
-    inner_stride_not_one = 27
-    row_stride_not_packs = 28
-    row_narrower_than_world = 29
-    forced_incomplete = 30
+    waves_not_built = 25
+    inner_stride_not_one = 26
+    row_stride_not_packs = 27
+    row_narrower_than_world = 28
+    forced_incomplete = 29
 
 
 

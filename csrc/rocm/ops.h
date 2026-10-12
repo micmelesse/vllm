@@ -62,12 +62,6 @@ std::tuple<std::optional<int64_t>, std::optional<int64_t>> rocm_comms_open(
     const std::string& cpu_group, const std::string& device_group, int64_t device);
 // The buffers a capture recorded, registered over `group`, a collective.
 void rocm_comms_register_captured(fptr_t handle_ptr, const std::string& group);
-// The probe's ops (experimental): calibrate.py times them, every rank together.
-void rocm_comms_probe_barrier(fptr_t handle_ptr);
-void rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters, torch::Tensor& ticks);
-void rocm_comms_link_traffic(fptr_t handle_ptr, const std::optional<torch::Tensor>& buffer,
-                             int64_t bytes, const std::string& mode, int64_t peer,
-                             int64_t blocks, int64_t pullers, torch::Tensor& sink);
 void rocm_comms_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
                                 const std::string& group);
 void rocm_comms_forget_buffer(fptr_t handle_ptr, torch::Tensor& buffer);

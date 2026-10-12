@@ -47,14 +47,13 @@ enum class Error : int {
   launch_out_of_range = 22,
   field_not_positive = 23,
   field_not_this_templates = 24,
-  probe_out_of_range = 25,
-  waves_not_built = 26,
-  inner_stride_not_one = 27,
-  row_stride_not_packs = 28,
-  row_narrower_than_world = 29,
-  forced_incomplete = 30,
+  waves_not_built = 25,
+  inner_stride_not_one = 26,
+  row_stride_not_packs = 27,
+  row_narrower_than_world = 28,
+  forced_incomplete = 29,
 };
-constexpr int kNumErrors = 31;
+constexpr int kNumErrors = 30;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -103,8 +102,6 @@ constexpr const char* to_string(Error e) {
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
       return "field_not_this_templates: the forced template has no such config field";
-    case Error::probe_out_of_range:
-      return "probe_out_of_range: a probe's peer, iterations, bytes or grid is out of range";
     case Error::inner_stride_not_one:
       return "inner_stride_not_one: a buffer's innermost stride is not 1 (the loads are packs)";
     case Error::row_stride_not_packs:
@@ -140,10 +137,6 @@ enum class Template : int {
 // write into it).
 enum class Algorithm : int { one_shot = 0, two_shot = 1 };
 enum class Direction : int { pull = 0, push = 1 };
-
-// WHAT THE PROBE'S LINK TRAFFIC MOVES: pulled from the peers, pushed into them, both at once with
-// the blocks split between the two, or both from every block.
-enum class Traffic : int { pull = 0, push = 1, split = 2, each = 3 };
 
 // WHICH OP the caller asked for: an all-reduce, alone or with what it fuses.
 enum class OpType : int {
@@ -306,14 +299,6 @@ using AllReduceAddAttnResRmsNormPullKernel =
           void*, int,
              uint64_t, HIP_COMMS_ATTN_RES_ARGS, int);
 #undef HIP_COMMS_ATTN_RES_ARGS
-// The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the
-// streamed buffer's) and staging, then mode, peer, pullers, packs, sink.
-using ProbeBarrierKernel = void (*)(Signal* const*, void*, int, uint64_t);
-using PingPongKernel = void (*)(Signal* const*, void*, int, uint64_t, int, uint32_t, int, void*);
-using LinkTrafficKernel =
-    void (*)(const void* const*, void* const*, Signal* const*, void*, int, uint64_t, int, int, int,
-             int64_t, void*);
-
 
 // =================================================================================================
 // EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel (the
@@ -443,43 +428,6 @@ struct AllReduceAddAttnResRmsNormLaunch {
   float eps;
   float out_eps;
   bool has_prefix;
-};
-
-// THE PROBE'S, experimental: one block a rank, so the next measurement starts on every rank
-// together; a flag to `peer` and back `iters` times, the device clock ticks written to `ticks`;
-// every thread streaming `bytes` of `buffer` (null: the staging) by `mode`, the first `pullers`
-// blocks pulling where the mode is split, the pulled packs folded into `sink`.
-struct ProbeBarrierLaunch {
-  const void* kernel;
-  int world;
-  int threads_per_block;
-  int blocks_per_grid;
-  hipStream_t stream;
-};
-
-struct PingPongLaunch {
-  const void* kernel;
-  int world;
-  int threads_per_block;
-  int blocks_per_grid;
-  hipStream_t stream;
-  int peer;
-  int iters;
-  void* ticks;
-};
-
-struct LinkTrafficLaunch {
-  const void* kernel;
-  int world;
-  int threads_per_block;
-  int blocks_per_grid;
-  hipStream_t stream;
-  const void* buffer;
-  int64_t bytes;
-  Traffic mode;
-  int peer;
-  int pullers;
-  void* sink;
 };
 
 }  // namespace hip_comms

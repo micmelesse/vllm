@@ -392,46 +392,6 @@ torch::Tensor rocm_comms_stamps() {
   return out;
 }
 
-// THE PROBE'S OPS (experimental): calibrate.py times them, every rank together.
-void rocm_comms_probe_barrier(fptr_t handle_ptr) {
-  const auto got = hip_comms::experimental::probe_barrier(handle_of(handle_ptr), current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
-
-// `ticks` an int64 [1] on device: the device clock ticks of `iters` round trips to `peer`.
-void rocm_comms_ping_pong(fptr_t handle_ptr, int64_t peer, int64_t iters, torch::Tensor& ticks) {
-  check_device_contiguous({&ticks});
-  TORCH_CHECK(ticks.scalar_type() == at::ScalarType::Long && ticks.numel() == 1,
-              "ticks must be one int64");
-  const auto got = hip_comms::experimental::ping_pong(
-      handle_of(handle_ptr), *narrowed(peer), *narrowed(iters), ticks.data_ptr(), current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
-
-// `buffer` registered with the peers, or none for the staging; `mode` pull, push, split or each;
-// `peer` -1 for every peer; `sink` an int32 [1] on device.
-void rocm_comms_link_traffic(fptr_t handle_ptr, const std::optional<torch::Tensor>& buffer,
-                             int64_t bytes, const std::string& mode, int64_t peer,
-                             int64_t blocks, int64_t pullers, torch::Tensor& sink) {
-  if (buffer) check_device_contiguous({&*buffer});
-  check_device_contiguous({&sink});
-  TORCH_CHECK(sink.scalar_type() == at::ScalarType::Int && sink.numel() == 1,
-              "sink must be one int32");
-  TORCH_CHECK(!buffer || buffer->numel() * buffer->element_size() >= bytes,
-              "buffer must hold `bytes`");
-  using hip_comms::Traffic;
-  TORCH_CHECK(mode == "pull" || mode == "push" || mode == "split" || mode == "each",
-              "hip_comms: mode is pull, push, split or each");
-  const Traffic m = mode == "pull"   ? Traffic::pull
-                    : mode == "push" ? Traffic::push
-                    : mode == "split" ? Traffic::split
-                                      : Traffic::each;
-  const auto got = hip_comms::experimental::link_traffic(
-      handle_of(handle_ptr), buffer ? buffer->data_ptr() : nullptr, bytes, m, *narrowed(peer),
-      *narrowed(blocks), *narrowed(pullers), sink.data_ptr(), current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
-
 // `buffer` registered with every rank's over the process group named `group`, a collective: the
 // peers read it where it is until it is forgotten, which must come before it is freed.
 void rocm_comms_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
