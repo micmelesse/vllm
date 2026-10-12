@@ -34,11 +34,9 @@
 #include "kernels/all_reduce_pull_one_shot.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_pull_one_shot_rms_scale_add.cuh"
 #include "kernels/all_reduce_pull_two_shot.cuh"
 #include "kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_pull_two_shot_rms_scale_add.cuh"
 #include "kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
 #include "kernels/probe_barrier.cuh"
@@ -152,19 +150,6 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 4},
 };
 
-// The one-all-reduce tail. The one-shot: a block a (row, slice) up to one a compute unit.
-constexpr BuildConfig kRmsScaleAddOneShotConfigs[] = {
-    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192},
-};
-// About 32 blocks keeps the links fed; more queue behind them: at [T, 17920] bf16, within 1% of the
-// best of 8-48 blocks from 8 to 4096 tokens, and 1024 tokens 146.9 us at 32 against 258.4 at 256
-// (2026-10-01T22-07-13Z).
-constexpr BuildConfig kRmsScaleAddTwoShotConfigs[] = {
-    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192},
-};
-
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
   Template fn;
@@ -201,10 +186,6 @@ constexpr TemplateInfo kTemplates[] = {
      true, true, kAddRmsNormPushConfigs},
     {HIP_COMMS_NAMED(all_reduce_push_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, true, true, kAttnResPushConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_one_shot_rms_scale_add), OpType::all_reduce_rms_scale_add,
-     false, false, kRmsScaleAddOneShotConfigs},
-    {HIP_COMMS_NAMED(all_reduce_pull_two_shot_rms_scale_add), OpType::all_reduce_rms_scale_add,
-     true, false, kRmsScaleAddTwoShotConfigs},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -584,22 +565,6 @@ constexpr TunedKernel kAttnResKernels[] = {
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
 };
 
-// The one-all-reduce tail, [T, 17920] (a latent of 3584): the one-shot while there are fewer
-// rows than ranks, the row two-shot from a row a rank (10.8 against 12.3 us at 1 token, 13.2
-// against 14.3 at 8 the other way; 2026-10-01T21-20-57Z).
-constexpr TunedKernel kRmsScaleAddKernels[] = {
-    {8, 1, 17920, Template::all_reduce_pull_one_shot_rms_scale_add,
-     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8, 8, 17920, Template::all_reduce_pull_two_shot_rms_scale_add,
-     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 4096}, {32, 0}}},
-    // A latent of 7168, [T, 21504], on the 8192-wide builds: 17920's crossover and grids; not
-    // swept.
-    {8, 1, 21504, Template::all_reduce_pull_one_shot_rms_scale_add,
-     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8, 8, 21504, Template::all_reduce_pull_two_shot_rms_scale_add,
-     {AllReduceRmsScaleAddBuildConfig{512, 1, 1, 8192}, {32, 0}}},
-};
-
 // =================================================================================================
 // THE OPS, in OpType's order: each one's name (as Python calls it) and its tuned kernels.
 // =================================================================================================
@@ -618,7 +583,6 @@ constexpr Op kOps[] = {
     {HIP_COMMS_NAMED(all_reduce_rms_norm), kRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels},
     {HIP_COMMS_NAMED(all_reduce_add_attn_res_rms_norm), kAttnResKernels},
-    {HIP_COMMS_NAMED(all_reduce_rms_scale_add), kRmsScaleAddKernels},
 };
 #undef HIP_COMMS_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
@@ -1373,101 +1337,6 @@ select_all_reduce_add_attn_res_rms_norm(
   return l;
 }
 
-// all_reduce_rms_scale_add: Kimi-K3's latent MoE tail with one all-reduce. inp's row is [shared |
-// projected | latent], widths hidden, hidden and latent, summed over the ranks; out [rows, hidden]
-// = shared + projected * rsqrt(mean(latent^2) + eps). Its tile holds the latent whole (each tile
-// needs the row's RMS) beside a TILE_N slice of the hidden, so its grid tiles the hidden.
-inline std::variant<AllReduceRmsScaleAddLaunch, Error> select_all_reduce_rms_scale_add(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t m, int64_t n,
-    int64_t latent_size_n, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu,
-    hipStream_t stream) {
-  using K           = Template;
-  const OpType op   = OpType::all_reduce_rms_scale_add;
-  const int world   = h.world_size();
-  const int64_t row = 2 * n + latent_size_n;
-  // 1.
-  const std::variant<Chosen, Error> picked = chosen(
-      forced(op, algorithm, direction, {threads_per_block, waves_per_eu, tile_m, tile_n},
-             blocks_per_grid, std::nullopt,
-             [&] {
-               return AllReduceRmsScaleAddBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
-                                                      *tile_n};
-             }),
-      op, world, m, row, latent_size_n, dtype);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
-  const Template fn     = k.fn;
-  const KernelConfig& c = k.config;
-  // 2.
-  const int e = elem_bytes(dtype);
-  const std::optional<Error> widths =
-      n * e % kBuild.memory.pack_bytes != 0 || latent_size_n * e % kBuild.memory.pack_bytes != 0 ||
-              latent_size_n < 1
-          ? std::optional<Error>{Error::widths_not_packs}
-          : std::nullopt;
-  if (const std::optional<Error> err =
-          refused(&h, fn, c, dtype, m, row, latent_size_n, widths, inp, false, stream))
-    return *err;
-  // 3. The one-shot's and the two-shot's builds are one list.
-  static_assert(same_builds(K::all_reduce_pull_one_shot_rms_scale_add,
-                            K::all_reduce_pull_two_shot_rms_scale_add));
-  const void* kernel = nullptr;
-  by_world(world, [&](auto ng) {
-    constexpr int NG = decltype(ng)::value;
-    by_dtype(dtype, [&](auto t) {
-      using T = typename decltype(t)::t;
-      by_build<K::all_reduce_pull_one_shot_rms_scale_add>(c.build, [&](auto cc) {
-        constexpr AllReduceRmsScaleAddBuildConfig C = decltype(cc)::value;
-        constexpr int TN = C.tile_n, TPB = C.threads_per_block,
-                WPE = C.waves_per_eu;
-        switch (fn) {
-          case K::all_reduce_pull_one_shot_rms_scale_add:
-            kernel = instance<AllReduceRmsScaleAddOneShotKernel>(
-                all_reduce_pull_one_shot_rms_scale_add<T, NG, TN, TPB, WPE>);
-            return;
-          case K::all_reduce_pull_two_shot_rms_scale_add:
-            kernel = instance<AllReduceRmsScaleAddTwoShotKernel>(
-                all_reduce_pull_two_shot_rms_scale_add<T, NG, TN, TPB, WPE>);
-            return;
-          default: not_this_ops(fn);
-        }
-      });
-    });
-  });
-  // 4.
-  const AllReduceRmsScaleAddBuildConfig& r = std::get<AllReduceRmsScaleAddBuildConfig>(c.build);
-  const AllReduceRmsScaleAddLaunch l{.kernel            = kernel,
-                                     .algorithm         = algorithm_of(fn),
-                                     .direction         = direction_of(fn),
-                                     .world             = world,
-                                     .tile_m            = r.tile_m,
-                                     .tile_n            = r.tile_n,
-                                     .threads_per_block = r.threads_per_block,
-                                     .blocks_per_grid   = c.launch.blocks_per_grid,
-                                     .waves_per_eu      = r.waves_per_eu,
-                                     .stream            = stream,
-                                     .out               = out,
-                                     .out_stride_m      = out_stride_m,
-                                     .out_stride_n      = out_stride_n,
-                                     .inp               = inp,
-                                     .inp_stride_m      = inp_stride_m,
-                                     .inp_stride_n      = inp_stride_n,
-                                     .scratch_stride_m  = n,
-                                     .scratch_stride_n  = 1,
-                                     .dtype             = dtype,
-                                     .inp_size_m              = m,
-                                     .inp_size_n            = n,
-                                     .latent_size_n            = latent_size_n,
-                                     .eps               = eps};
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
-    return Error::grid_not_resident;
-  return l;
-}
-
 namespace experimental {
 
 // THE PROBE'S: one block of 64 threads, its twin on every rank.
@@ -1556,15 +1425,11 @@ constexpr bool selections_fit() {
   for (const std::array<int64_t, 3> call : {std::array<int64_t, 3>{2, 1, 8},
                                             std::array<int64_t, 3>{kMaxRanks, 4096, 7168}}) {
     const int w = static_cast<int>(call[0]);
-    const int64_t m = call[1], n = call[2], latent_size_n = n / 2;
+    const int64_t m = call[1], n = call[2];
     for (const OpType o :
          {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
           OpType::all_reduce_add_attn_res_rms_norm})
       if (!tuned_fits(o, w, m, n, n, n)) return false;
-    // The one-all-reduce tail: [shared | projected | latent].
-    if (!tuned_fits(OpType::all_reduce_rms_scale_add, w, m, 2 * n + latent_size_n, latent_size_n,
-                    n))
-      return false;
     // The plain all-reduce's tuned kernel, as measured (its grid not cut).
     if (std::holds_alternative<Error>(pick(OpType::all_reduce, w, m, n, 0, DType::bf16)))
       return false;

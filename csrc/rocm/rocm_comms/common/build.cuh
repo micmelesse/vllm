@@ -62,7 +62,7 @@ constexpr BuildInfo derive(const Hardware& hw) {
   m.pack_bytes = hw.max_load_bytes;
   // THE STAGING an eager input is copied into for its peers: policy. A staged build takes any
   // size through it a pass at a time; an in-place build on an eager input (the fused ops) needs it
-  // whole, up to Kimi-K3's widest row (the one-all-reduce tail's 4096 x 17920 bf16, 147 MB).
+  // whole, up to Kimi-K3's widest row (its 4096 x 7168 bf16 prefill, 59 MB).
   m.staging_bytes = 256 * kMiB;
   // THE TWO-SHOT SCRATCH, per rank, after the signal block: policy. It holds one rank's slice, so
   // it caps a two-shot buffer at scratch_bytes x ngpus (1 GiB at 8 ranks); a quantized two-shot
@@ -76,8 +76,8 @@ constexpr BuildInfo derive(const Hardware& hw) {
   BuildInfo::Kernels& b = info.kernels;
 
   // THE WIDEST BLOCK WHOSE THREADS KEEP EVERY ARCHITECTURAL REGISTER. A bound is a register trade:
-  // at 1024 threads a gfx950 thread gets 128 and the row kernels spill (AttnRes at 2 packs, the
-  // GEMM tail at any; ISA 2026-09-29T23-48-40Z).
+  // at 1024 threads a gfx950 thread gets 128 and the row kernels spill (AttnRes at 2 packs;
+  // ISA 2026-09-29T23-48-40Z).
   b.max_threads = hw.wave_size;
   for (int t = hw.wave_size; t <= hw.max_workgroup; t += hw.wave_size)
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;

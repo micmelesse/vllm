@@ -157,29 +157,6 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.reduce_scatter_blocks);
 }
 
-// inp's row is [shared | projected | latent].
-inline void launch_all_reduce_rms_scale_add(Handle& h, const AllReduceRmsScaleAddLaunch& l) {
-  const int64_t bytes =
-      extent_bytes(l.inp_size_m, 2 * l.inp_size_n + l.latent_size_n, l.inp_stride_m, l.dtype);
-  const int inp_size_m    = static_cast<int>(l.inp_size_m);
-  const int inp_size_n    = static_cast<int>(l.inp_size_n);
-  const int latent_size_n = static_cast<int>(l.latent_size_n);
-  const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
-  if (l.algorithm == Algorithm::one_shot)
-    Call<AllReduceRmsScaleAddOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
-                                        l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
-                                        h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
-                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        l.eps, inp_size_m, inp_size_n, latent_size_n);
-  else
-    Call<AllReduceRmsScaleAddTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
-                                        l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
-                                        h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-                                        h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
-                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        l.eps, inp_size_m, inp_size_n, latent_size_n);
-}
-
 namespace experimental {
 
 // The probe's: a barrier over the signals only; the ping-pong's flags from this pair's next ones

@@ -26,38 +26,35 @@ enum class Error : int {
   no_such_op = 1,
   not_contiguous = 2,
   not_two_d = 3,
-  output_not_two_d = 4,
-  dtype_not_built = 5,
-  world_not_built = 6,
-  row_not_packs = 7,
-  widths_not_packs = 8,
-  row_not_wider_than_output = 9,
-  template_not_this_ops = 10,
-  row_too_wide = 11,
-  block_not_a_wave_per_peer = 12,
-  scratch_too_small = 13,
-  grid_not_resident = 14,
-  staging_too_small = 15,
-  device_not_built = 16,
-  device_not_tuned = 17,
-  weight_not_built = 18,
-  no_such_template = 19,
-  no_such_group = 20,
-  ranks_disagree = 21,
-  groups_disagree = 22,
-  threads_not_built = 23,
-  tile_not_built = 24,
-  launch_out_of_range = 25,
-  field_not_positive = 26,
-  field_not_this_templates = 27,
-  probe_out_of_range = 28,
-  waves_not_built = 29,
-  inner_stride_not_one = 30,
-  row_stride_not_packs = 31,
-  row_narrower_than_world = 32,
-  forced_incomplete = 33,
+  dtype_not_built = 4,
+  world_not_built = 5,
+  row_not_packs = 6,
+  template_not_this_ops = 7,
+  row_too_wide = 8,
+  block_not_a_wave_per_peer = 9,
+  scratch_too_small = 10,
+  grid_not_resident = 11,
+  staging_too_small = 12,
+  device_not_built = 13,
+  device_not_tuned = 14,
+  weight_not_built = 15,
+  no_such_template = 16,
+  no_such_group = 17,
+  ranks_disagree = 18,
+  groups_disagree = 19,
+  threads_not_built = 20,
+  tile_not_built = 21,
+  launch_out_of_range = 22,
+  field_not_positive = 23,
+  field_not_this_templates = 24,
+  probe_out_of_range = 25,
+  waves_not_built = 26,
+  inner_stride_not_one = 27,
+  row_stride_not_packs = 28,
+  row_narrower_than_world = 29,
+  forced_incomplete = 30,
 };
-constexpr int kNumErrors = 34;
+constexpr int kNumErrors = 31;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -65,14 +62,9 @@ constexpr const char* to_string(Error e) {
     case Error::no_such_op: return "no_such_op: the backend has no such op";
     case Error::not_contiguous: return "not_contiguous: the input is not contiguous";
     case Error::not_two_d: return "not_two_d: a fused op takes a 2-D input";
-    case Error::output_not_two_d: return "output_not_two_d: the output is not 2-D";
     case Error::dtype_not_built: return "dtype_not_built: only float16 and bfloat16 are built";
     case Error::world_not_built: return "world_not_built: the world size is not 2, 4 or 8";
     case Error::row_not_packs: return "row_not_packs: the row is not whole 16-byte packs";
-    case Error::widths_not_packs:
-      return "widths_not_packs: the output's and the latent's widths are not whole packs";
-    case Error::row_not_wider_than_output:
-      return "row_not_wider_than_output: the input's row is not wider than twice the output's";
     case Error::template_not_this_ops:
       return "template_not_this_ops: the forced template is not this op's";
     case Error::row_too_wide:
@@ -141,8 +133,6 @@ enum class Template : int {
   all_reduce_push_two_shot_rms_norm              = 8,
   all_reduce_push_two_shot_add_rms_norm          = 9,
   all_reduce_push_two_shot_add_attn_res_rms_norm = 10,
-  all_reduce_pull_one_shot_rms_scale_add         = 11,
-  all_reduce_pull_two_shot_rms_scale_add         = 12,
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's whole input; two-shot
@@ -161,7 +151,6 @@ enum class OpType : int {
   all_reduce_rms_norm              = 1,
   all_reduce_add_rms_norm          = 2,
   all_reduce_add_attn_res_rms_norm = 3,
-  all_reduce_rms_scale_add         = 4,
 };
 
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what is compiled in (one
@@ -173,7 +162,7 @@ enum class OpType : int {
 // x 64), the waves a SIMD (an EU) the compiler fits its registers to (__launch_bounds__'s second
 // value, Triton's waves_per_eu; 1 asks nothing), and the tile, TILE_M rows x TILE_N columns in
 // elements; TILE_K is the reduced dimension a step (AttnRes's sources a step). One type an op,
-// so a config cannot cross ops, though four hold the same fields.
+// so a config cannot cross ops, though three hold the same fields.
 // all_reduce: a tile a work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
   int threads_per_block;
@@ -207,17 +196,9 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_k;
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
-// all_reduce_rms_scale_add.
-struct AllReduceRmsScaleAddBuildConfig {
-  int threads_per_block;
-  int waves_per_eu;
-  int tile_m;
-  int tile_n;
-  bool operator==(const AllReduceRmsScaleAddBuildConfig&) const = default;
-};
 using BuildConfig =
     std::variant<AllReduceBuildConfig, AllReduceRmsNormBuildConfig, AllReduceAddRmsNormBuildConfig,
-                 AllReduceAddAttnResRmsNormBuildConfig, AllReduceRmsScaleAddBuildConfig>;
+                 AllReduceAddAttnResRmsNormBuildConfig>;
 
 // A KERNEL'S LAUNCH: its grid, never compiled in, and the blocks of it the fused AttnRes pull
 // two-shot gives its reduce-scatter (its reads queue behind the links past a few dozen; AttnRes
@@ -324,15 +305,6 @@ using AllReduceAddAttnResRmsNormPullKernel =
     void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
           void*, int,
              uint64_t, HIP_COMMS_ATTN_RES_ARGS, int);
-// out, eps, inp_size_m, inp_size_n, latent_size_n.
-using AllReduceRmsScaleAddOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*,
-          int64_t,
-             int64_t, float, int, int, int);
-using AllReduceRmsScaleAddTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
-          void*, int,
-             uint64_t, void*, int64_t, int64_t, float, int, int, int);
 #undef HIP_COMMS_ATTN_RES_ARGS
 // The probe's: nothing of its own; peer, flag base, iterations, ticks; every rank's input (the
 // streamed buffer's) and staging, then mode, peer, pullers, packs, sink.
@@ -471,30 +443,6 @@ struct AllReduceAddAttnResRmsNormLaunch {
   float eps;
   float out_eps;
   bool has_prefix;
-};
-
-// inp's row [shared | projected | latent], widths hidden, hidden, latent; out [rows, hidden].
-struct AllReduceRmsScaleAddLaunch {
-  const void* kernel;
-  Algorithm algorithm;
-  Direction direction;
-  int world;
-  int tile_m;
-  int tile_n;
-  int threads_per_block;
-  int blocks_per_grid;
-  int waves_per_eu;
-  hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of hidden a row
-  DType dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
-  int64_t latent_size_n;
-  float eps;
 };
 
 // THE PROBE'S, experimental: one block a rank, so the next measurement starts on every rank

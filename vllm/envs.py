@@ -156,7 +156,6 @@ if TYPE_CHECKING:
         "all_reduce_rms_norm",
         "all_reduce_add_attn_res_rms_norm",
         "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm",
-        "rms_weight_gemm_all_reduce_rms_scale_add",
     ] = "none"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1368,8 +1367,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (rocm_comms backend only): none, all_reduce_rms_norm (the MoE latent
     # all-reduce and its RMSNorm), all_reduce_add_attn_res_rms_norm (each hidden
     # all-reduce with the AttnRes and RMSNorm after it) or
-    # rms_weight_gemm_all_reduce_rms_scale_add (the MoE tail's two all-reduces as
-    # one). By default none.
+    # all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm (both). By default none.
     "VLLM_KIMI_K3_FUSED_DECODER": env_with_choices(
         "VLLM_KIMI_K3_FUSED_DECODER",
         "none",
@@ -1378,7 +1376,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "all_reduce_rms_norm",
             "all_reduce_add_attn_res_rms_norm",
             "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm",
-            "rms_weight_gemm_all_reduce_rms_scale_add",
         ],
     ),
     # Whether to use aiter triton kernels for gemm ops.

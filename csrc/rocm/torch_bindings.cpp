@@ -129,11 +129,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "str?, int?, int?, int?, int?, int?, int?, int?, int?)",
       &rocm_comms_plan_all_reduce_add_attn_res_rms_norm);
   rocm_ops.def(
-      "rocm_comms_plan_all_reduce_rms_scale_add(int handle_ptr, Tensor inp, Tensor out, "
-      "str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
-      "int? blocks_per_grid, int? waves_per_eu) -> (str?, str?, int?, int?, int?, int?, int?, int?)",
-      &rocm_comms_plan_all_reduce_rms_scale_add);
-  rocm_ops.def(
       "rocm_comms_supported(int device, int world) -> (str?, int?)",
                &rocm_comms_supported);
   rocm_ops.def(
@@ -174,13 +169,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int? waves_per_eu) -> ()");
   rocm_ops.impl("rocm_comms_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &rocm_comms_all_reduce_add_attn_res_rms_norm);
-
-  rocm_ops.def(
-      "rocm_comms_all_reduce_rms_scale_add(int handle_ptr, Tensor! out, Tensor inp, float eps, "
-      "str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
-      "int? blocks_per_grid, int? waves_per_eu) -> ()");
-  rocm_ops.impl("rocm_comms_all_reduce_rms_scale_add", torch::kCUDA,
-                &rocm_comms_all_reduce_rms_scale_add);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

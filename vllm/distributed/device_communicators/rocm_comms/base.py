@@ -41,7 +41,6 @@ Op = Literal[
     "all_reduce_rms_norm",
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
-    "all_reduce_rms_scale_add",
 ]
 
 
@@ -94,36 +93,33 @@ class Error(IntEnum):
     no_such_op = 1
     not_contiguous = 2
     not_two_d = 3
-    output_not_two_d = 4
-    dtype_not_built = 5
-    world_not_built = 6
-    row_not_packs = 7
-    widths_not_packs = 8
-    row_not_wider_than_output = 9
-    template_not_this_ops = 10
-    row_too_wide = 11
-    block_not_a_wave_per_peer = 12
-    scratch_too_small = 13
-    grid_not_resident = 14
-    staging_too_small = 15
-    device_not_built = 16
-    device_not_tuned = 17
-    weight_not_built = 18
-    no_such_template = 19
-    no_such_group = 20
-    ranks_disagree = 21
-    groups_disagree = 22
-    threads_not_built = 23
-    tile_not_built = 24
-    launch_out_of_range = 25
-    field_not_positive = 26
-    field_not_this_templates = 27
-    probe_out_of_range = 28
-    waves_not_built = 29
-    inner_stride_not_one = 30
-    row_stride_not_packs = 31
-    row_narrower_than_world = 32
-    forced_incomplete = 33
+    dtype_not_built = 4
+    world_not_built = 5
+    row_not_packs = 6
+    template_not_this_ops = 7
+    row_too_wide = 8
+    block_not_a_wave_per_peer = 9
+    scratch_too_small = 10
+    grid_not_resident = 11
+    staging_too_small = 12
+    device_not_built = 13
+    device_not_tuned = 14
+    weight_not_built = 15
+    no_such_template = 16
+    no_such_group = 17
+    ranks_disagree = 18
+    groups_disagree = 19
+    threads_not_built = 20
+    tile_not_built = 21
+    launch_out_of_range = 22
+    field_not_positive = 23
+    field_not_this_templates = 24
+    probe_out_of_range = 25
+    waves_not_built = 26
+    inner_stride_not_one = 27
+    row_stride_not_packs = 28
+    row_narrower_than_world = 29
+    forced_incomplete = 30
 
 
 
@@ -717,81 +713,6 @@ class Communicator(ABC):
 
 
     @final
-    def should_allreduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> bool:
-        """Whether `all_reduce_rms_scale_add(inp, out, ...)` runs here: `out` [rows,
-        hidden] from `inp`'s row [shared | projected | latent]."""
-        ran = self._check_all_reduce_rms_scale_add(
-            inp,
-            out,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
-
-    @final
-    def all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        eps: float,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> Ran:
-        """`s = all_reduce(inp)` split [shared | projected | latent], then `out = shared
-        + projected * rsqrt(mean(latent^2) + eps)` in one kernel. Returns what ran."""
-        ran = self._check_all_reduce_rms_scale_add(
-            inp,
-            out,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        if not self._warming_up():
-            self._record("all_reduce_rms_scale_add", inp, ran)
-            self._all_reduce_rms_scale_add(
-                inp,
-                out,
-                eps,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return ran
-
-    @final
     def close(self) -> None:
         """Release what this communicator holds, NOW. Idempotent, and safe to call on a
         disabled one.
@@ -1082,37 +1003,6 @@ class Communicator(ABC):
         )
 
 
-
-    def _check_all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        return Error.no_such_op
-
-    def _all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        eps: float,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} has no fused all-reduce + rms scale + add"
-        )
 
     @abstractmethod
     def _open(self) -> str | None:

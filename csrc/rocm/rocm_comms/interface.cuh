@@ -144,33 +144,6 @@ inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error> all_reduce_add_attn
   return l;
 }
 
-// =================================================================================================
-// all_reduce_rms_scale_add: Kimi-K3's latent MoE tail with one all-reduce. inp's row is [shared |
-// projected | latent], widths hidden, hidden and latent, summed over the ranks; out [rows, hidden]
-// = shared + projected * rsqrt(mean(latent^2) + eps). Its tile holds the latent whole (each tile
-// needs the row's RMS) beside a TILE_N slice of the hidden, so its grid tiles the hidden.
-// =================================================================================================
-
-inline std::variant<AllReduceRmsScaleAddLaunch, Error> all_reduce_rms_scale_add(
-    Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, DType dtype, int64_t m, int64_t n,
-    int64_t latent_size_n, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu,
-    hipStream_t stream) {
-  if (const std::optional<Error> e = layout_refused(
-          dtype, {{out_stride_m, out_stride_n}, {inp_stride_m, inp_stride_n}}))
-    return *e;
-  std::variant<AllReduceRmsScaleAddLaunch, Error> l = select_all_reduce_rms_scale_add(
-      h, out, out_stride_m, out_stride_n, inp, inp_stride_m, inp_stride_n, dtype, m, n,
-      latent_size_n, eps, algorithm, direction, tile_m, tile_n,
-      threads_per_block, blocks_per_grid, waves_per_eu, stream);
-  if (const AllReduceRmsScaleAddLaunch* got = std::get_if<AllReduceRmsScaleAddLaunch>(&l))
-    launch_all_reduce_rms_scale_add(h, *got);
-  return l;
-}
-
 namespace experimental {
 
 // THE PROBE'S OPS: the machine as the peers layer (common/peers.cuh, barrier.cuh) sees it, one measurement at a time (calibrate.py

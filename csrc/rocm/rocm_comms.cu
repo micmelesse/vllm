@@ -202,11 +202,6 @@ RocmCommsAllReduceRmsNormPlan all_reduce_rms_norm_plan_of(
   return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.threads_per_block,
           l.blocks_per_grid, l.waves_per_eu, std::nullopt};
 }
-template <typename LAUNCH>
-RocmCommsAllReduceRmsScaleAddPlan all_reduce_rms_scale_add_plan_of(
-    const std::variant<LAUNCH, hip_comms::Error>& p) {
-  return all_reduce_rms_norm_plan_of(p);
-}
 RocmCommsAllReduceAddAttnResRmsNormPlan all_reduce_add_attn_res_rms_norm_plan_of(
     const std::variant<hip_comms::AllReduceAddAttnResRmsNormLaunch, hip_comms::Error>& p) {
   if (const auto* e = std::get_if<hip_comms::Error>(&p))
@@ -297,32 +292,6 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
       narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream()));
-}
-
-// `inp`'s row is [shared | projected | latent] and `out` [rows, hidden]: the latent is what is
-// left.
-RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& out,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  const auto alg = algorithm_from(algorithm);
-  const auto dir = direction_from(direction);
-  const auto d = admitted(inp);
-  using L = hip_comms::AllReduceRmsScaleAddLaunch;
-  if (const auto* e = std::get_if<hip_comms::Error>(&d))
-    return all_reduce_rms_scale_add_plan_of<L>(*e);
-  if (out.dim() != 2)
-    return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::output_not_two_d);
-  const int64_t n = out.size(1), latent_size_n = inp.size(1) - 2 * n;
-  if (latent_size_n < 1)
-    return all_reduce_rms_scale_add_plan_of<L>(hip_comms::Error::row_not_wider_than_output);
-  return all_reduce_rms_scale_add_plan_of(hip_comms::select_all_reduce_rms_scale_add(
-      handle_of(handle_ptr), nullptr, out.stride(0), out.stride(1), nullptr, inp.stride(0),
-      inp.stride(1), std::get<hip_comms::DType>(d), inp.size(0), n, latent_size_n, 0.f, alg, dir,
-      narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
-      narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream()));
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
@@ -652,30 +621,4 @@ void rocm_comms_all_reduce_add_attn_res_rms_norm(
   if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
 }
 
-
-// out [rows, hidden] = shared + projected * rsqrt(mean(latent^2) + eps), inp's row [shared |
-// projected | latent] summed over the ranks first: the widths are out's, out's again, and the
-// rest.
-void rocm_comms_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, double eps,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  check_device({&out, &inp});
-  TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && out.size(0) == inp.size(0),
-              "inp and out must be 2-D with the same rows");
-  const int64_t n = out.size(1);
-  const int64_t latent_size_n = inp.size(1) - 2 * n;
-  TORCH_CHECK(latent_size_n > 0,
-              "inp's row must be wider than twice out's: [shared | projected | latent]");
-  TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  const auto got = hip_comms::all_reduce_rms_scale_add(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), dtype_of(inp), inp.size(0), n, latent_size_n,
-      static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_comms::Error>(&got)) raise(*e);
-}
 

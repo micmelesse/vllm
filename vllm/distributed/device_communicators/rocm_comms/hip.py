@@ -330,63 +330,6 @@ class HipCommunicator(Communicator):
 
 
 
-    def _check_all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        if self.disabled:
-            return Error.disabled
-        _require_capture(self.state)
-        return _answer(
-            torch.ops._rocm_C.rocm_comms_plan_all_reduce_rms_scale_add(
-                self._handle,
-                inp,
-                out,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        )
-
-    def _all_reduce_rms_scale_add(
-        self,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        eps: float,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> None:
-        torch.ops._rocm_C.rocm_comms_all_reduce_rms_scale_add(
-            self._handle,
-            out,
-            inp,
-            eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-
     def _on_close(self) -> None:
         """Release the peer memory now. Idempotent. Dropping the object does not close
         the IPC handles the C++ side opened; this does."""

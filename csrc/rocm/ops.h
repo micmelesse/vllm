@@ -100,9 +100,6 @@ using RocmCommsAllReduceAddAttnResRmsNormPlan =
     RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField,
                   RocmCommsField, RocmCommsField, RocmCommsField,
                   RocmCommsField>;
-using RocmCommsAllReduceRmsScaleAddPlan =
-    RocmCommsPlan<RocmCommsField, RocmCommsField, RocmCommsField, RocmCommsField,
-                  RocmCommsField>;
 
 // The planners, one per op family, each given the call's own tensors.
 RocmCommsAllReducePlan rocm_comms_plan_all_reduce(
@@ -125,12 +122,6 @@ RocmCommsAllReduceAddAttnResRmsNormPlan rocm_comms_plan_all_reduce_add_attn_res_
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-RocmCommsAllReduceRmsScaleAddPlan rocm_comms_plan_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& out,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 // A variant at the torch boundary: the arch or the Error's number, exactly one
@@ -173,13 +164,6 @@ void rocm_comms_all_reduce_add_rms_norm(
     double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
-void rocm_comms_all_reduce_rms_scale_add(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp, double eps,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
