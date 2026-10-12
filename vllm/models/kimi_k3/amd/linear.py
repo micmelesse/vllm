@@ -7,12 +7,11 @@ from typing import Any
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -29,6 +28,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention as KimiLinearGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -60,6 +62,8 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.kimi_k3.amd import hip_custom_communicator_fusions as fusions
+from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
@@ -463,51 +467,291 @@ class KimiMLAAttention(nn.Module):
         return self.mla_attn(positions, hidden_states)
 
 
-# THE DECODER LAYER LIVES IN decoder.py, beside its fused variants; imported here,
-# after the classes it builds, and re-exported.
-from vllm.models.kimi_k3.amd.decoder import KimiDecoderLayer  # noqa: E402
+class KimiDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        fuse_all_reduces: bool = False,
+    ) -> None:
+        super().__init__()
+        # With fuse_all_reduces (hip_custom_communicator_fusions), attention and the
+        # MLP leave their outputs unreduced and each AttnRes reduces its delta.
+        self.fuse_all_reduces = fuse_all_reduces
+        self.hidden_size = config.hidden_size
+        self.layer_idx = int(prefix.rsplit(".", 1)[1])
 
+        self.is_moe = config.is_moe
+        layer_idx = self.layer_idx
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
 
-def pick_layer(fusion: str) -> type[nn.Module]:
-    """The fused decoder layer VLLM_KIMI_K3_FUSED_DECODER names: each its own
-    file, a copy of decoder.py's layer with that fusion's change. It runs its
-    fused ops or raises, never the unfused ops."""
-    backend = (
-        getattr(get_tp_group().device_communicator, "hip_custom_communicator", None)
-        if get_tensor_model_parallel_world_size() > 1
-        else None
-    )
-    if backend is None or backend.disabled:
-        raise RuntimeError(
-            f"VLLM_KIMI_K3_FUSED_DECODER={fusion} needs HipCustomCommunicator "
-            "live with TP above one"
+        if config.is_kda_layer(layer_idx):
+            # Kimi-K3 sets use_full_rank_gate and uses the ROCm-specific K3 KDA
+            # layer; Kimi-Linear keeps the shared low-rank-gate implementation.
+            kda_config = config.linear_attn_config
+            assert kda_config is not None
+            if kda_config.get("use_full_rank_gate", False):
+                self.self_attn = KimiK3DeltaAttention(
+                    config,
+                    vllm_config,
+                    prefix=f"{prefix}.self_attn",
+                    reduce_results=not fuse_all_reduces,
+                )
+            else:
+                self.self_attn = KimiLinearGatedDeltaNetAttention(
+                    config,
+                    vllm_config,
+                    prefix=f"{prefix}.self_attn",
+                )
+        else:
+            qk_nope_head_dim = config.qk_nope_head_dim
+            qk_rope_head_dim = config.qk_rope_head_dim
+            v_head_dim = config.v_head_dim
+            kv_lora_rank = config.kv_lora_rank
+            mla_use_nope = config.mla_use_nope
+            assert qk_nope_head_dim is not None
+            assert qk_rope_head_dim is not None
+            assert v_head_dim is not None
+            assert kv_lora_rank is not None
+            assert mla_use_nope is not None
+            self.self_attn = KimiMLAAttention(
+                layer_idx=layer_idx,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                quant_config=quant_config,
+                cache_config=cache_config,
+                model_config=model_config,
+                prefix=f"{prefix}.self_attn",
+                config=config,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                v_head_dim=v_head_dim,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                use_nope=mla_use_nope,
+                reduce_results=not fuse_all_reduces,
+            )
+
+        if (
+            self.is_moe
+            and config.num_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            self.block_sparse_moe = KimiMoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.block_sparse_moe",
+                layer_idx=layer_idx,
+                reduce_results=not fuse_all_reduces,
+                latent_runner_cls=(
+                    fusions.ROCmLatentMoERunnerAllReduceRmsNorm
+                    if fuse_all_reduces
+                    else ROCmLatentMoERunner
+                ),
+            )
+            self.mlp = self.block_sparse_moe
+            assert not fuse_all_reduces or (
+                self.mlp.experts.moe_config.skip_final_all_reduce
+            ), "the MoE ignored reduce_results=False; it would reduce twice"
+        else:
+            self.mlp = KimiMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+                activation_situ_beta=config.activation_situ_beta,
+                activation_situ_linear_beta=config.activation_situ_linear_beta,
+                reduce_results=not fuse_all_reduces,
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
         )
-    if fusion == "all_reduce_rms_norm":
-        from vllm.models.kimi_k3.amd.fused_decoder_all_reduce_rms_norm import (
-            KimiDecoderLayerAllReduceRmsNorm,
+
+        attn_res_block_size = config.attn_res_block_size
+        self.use_attn_residuals = attn_res_block_size is not None
+        if attn_res_block_size is not None:
+            self.attn_res_block_size = attn_res_block_size
+            self.is_block_write_layer = layer_idx % self.attn_res_block_size == 0
+            self.block_write_idx = layer_idx // self.attn_res_block_size
+            self.prev_valid_blocks = cdiv(layer_idx, self.attn_res_block_size)
+            self.self_attention_res_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.self_attention_res_proj = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.self_attention_res_proj",
+            )
+            self.mlp_res_proj = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.mlp_res_proj",
+            )
+        # The model's final AttnRes is unfused, so the last layer reduces its output.
+        self.is_last_layer = layer_idx == config.num_hidden_layers - 1
+
+    def _run_self_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
         )
 
-        return KimiDecoderLayerAllReduceRmsNorm
-    if fusion == "all_reduce_add_attn_res_rms_norm":
-        from vllm.models.kimi_k3.amd import (
-            fused_decoder_all_reduce_add_attn_res_rms_norm as fused,
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        prefix_delta: torch.Tensor | None = None,
+        **kwargs,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
+        if self.use_attn_residuals:
+            assert residual is not None
+            forward_attn_residual = (
+                self.forward_attn_residual_fused
+                if self.fuse_all_reduces
+                else self.forward_attn_residual
+            )
+            return forward_attn_residual(
+                positions, hidden_states, residual, prefix_delta
+            )
+
+        assert prefix_delta is None
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self._run_self_attn(positions, hidden_states)
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def forward_attn_residual(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        prefix_delta: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        prefix_sum = hidden_states
+        hidden_states = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.prev_valid_blocks,
+            delta=prefix_delta,
+            output_norm=self.input_layernorm,
+            block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
         )
 
-        return fused.KimiDecoderLayerAllReduceAddAttnResRmsNorm
-    if fusion == "all_reduce_rms_norm+all_reduce_add_attn_res_rms_norm":
-        from vllm.models.kimi_k3.amd import (
-            fused_decoder_all_reduce_rms_norm_all_reduce_add_attn_res_rms_norm as both,
+        if self.is_block_write_layer:
+            prefix_sum = None
+
+        hidden_states = self._run_self_attn(positions, hidden_states)
+
+        if prefix_sum is None:
+            prefix_sum = hidden_states
+            prefix_delta = None
+        else:
+            prefix_delta = hidden_states
+
+        mlp_valid_blocks = self.prev_valid_blocks + (
+            1 if self.is_block_write_layer else 0
+        )
+        hidden_states = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            mlp_valid_blocks,
+            delta=prefix_delta,
+            output_norm=self.post_attention_layernorm,
         )
 
-        return both.KimiDecoderLayerAllReduceRmsNormAllReduceAddAttnResRmsNorm
-    raise ValueError(f"VLLM_KIMI_K3_FUSED_DECODER={fusion} names no layer")
+        hidden_states = self.mlp(hidden_states)
+        return prefix_sum, block_residual, hidden_states
+
+    def forward_attn_residual_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        prefix_delta: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # `prefix_delta` is the previous layer's MLP output, unreduced; the first
+        # layer has none, and its input (the embedding) is already whole.
+        prefix_sum: torch.Tensor | None = hidden_states
+        block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
+        if prefix_delta is None:
+            hidden_states = _apply_attn_res(
+                hidden_states,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.prev_valid_blocks,
+                output_norm=self.input_layernorm,
+                block_write_idx=block_write_idx,
+            )
+        else:
+            prefix_sum, hidden_states = fusions.fused_attn_res(
+                prefix_sum,
+                prefix_delta,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                self.prev_valid_blocks,
+                block_write_idx,
+            )
+
+        if self.is_block_write_layer:
+            prefix_sum = None
+
+        attn_out = self._run_self_attn(positions, hidden_states)
+
+        mlp_valid_blocks = self.prev_valid_blocks + (
+            1 if self.is_block_write_layer else 0
+        )
+        prefix, hidden_states = fusions.fused_attn_res(
+            prefix_sum,
+            attn_out,
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+            mlp_valid_blocks,
+        )
+
+        hidden_states = self.mlp(hidden_states)
+        if self.is_last_layer:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return prefix, block_residual, hidden_states
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin):
-    # The standard decoder layer, or with VLLM_KIMI_K3_FUSED_DECODER a variant whose
-    # all-reduces are fused into the ops that consume them.
-    layer_cls: type[nn.Module] = KimiDecoderLayer
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -525,11 +769,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        if envs.VLLM_KIMI_K3_FUSED_DECODER != "none":
-            self.layer_cls = pick_layer(envs.VLLM_KIMI_K3_FUSED_DECODER)
+        fuse_all_reduces = fusions.fuse_all_reduces(config, vllm_config)
 
         def get_layer(prefix: str):
-            return self.layer_cls(config, vllm_config, prefix)
+            return KimiDecoderLayer(
+                config,
+                vllm_config,
+                prefix,
+                fuse_all_reduces=fuse_all_reduces,
+            )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
