@@ -318,6 +318,22 @@ def is_weak_contiguous(input: torch.Tensor) -> bool:
     )
 
 
+# TORCH'S DEFAULT for a collective on a GPU process group (`default_pg_nccl_timeout`): how long a
+# kernel waits on a peer before it reports a fault, where the group does not say its own.
+TORCH_COLLECTIVE_TIMEOUT_SECONDS = 600.0
+
+
+def collective_timeout_seconds(group: ProcessGroup, device: torch.device) -> float:
+    """The group's own timeout, so a wait in our kernels gives up when every other
+    collective on the group would: torch's 10 minutes unless the group was made with
+    another. Read through torch's backend options, which are private, so where they
+    are not there it is torch's default."""
+    try:
+        return group._get_backend(device).options._timeout.total_seconds()
+    except (AttributeError, RuntimeError):
+        return TORCH_COLLECTIVE_TIMEOUT_SECONDS
+
+
 # ---- THE COMMUNICATOR. ----
 
 
@@ -438,12 +454,21 @@ class HipCustomCommunicator:
         cpu_group: ProcessGroup,
         device_group: ProcessGroup,
         device: int | str | torch.device,
+        *,
+        timeout_seconds: float | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
-        availability. Unavailability is not an error: the caller checks `.disabled`."""
+        availability. Unavailability is not an error: the caller checks `.disabled`.
+        `timeout_seconds`: how long a kernel waits on a peer before it reports a
+        fault; None is the device group's own (`collective_timeout_seconds`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
+        self.timeout_seconds = (
+            collective_timeout_seconds(device_group, self.device)
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         self._own_fields()
         why = self._open()
         if why is None:
@@ -855,7 +880,10 @@ class HipCustomCommunicator:
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
         handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
-            self.cpu_group.group_name, self.device_group.group_name, self.device.index
+            self.cpu_group.group_name,
+            self.device_group.group_name,
+            self.device.index,
+            self.timeout_seconds,
         )
         if err is not None:
             return Error(err).name

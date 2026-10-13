@@ -154,10 +154,11 @@ using Refusal = std::optional<int64_t>;
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
 // handles) and `device_group`, a collective: this rank's symmetric memory, made and owned here, its
-// handle gathered with every rank's, and the peers' opened. A torch op cannot return a variant, so
-// it is two optionals and exactly one is set, the handle or the Error's number.
+// handle gathered with every rank's, and the peers' opened. `timeout_seconds`: how long a kernel
+// waits on a peer before it reports a fault. A torch op cannot return a variant, so it is two
+// optionals and exactly one is set, the handle or the Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group, const std::string& device_group,
-                         int64_t device) {
+                                      int64_t device, double timeout_seconds) {
   const auto refused = [](hip_custom_communicator::Error e) {
     return OpenWire{std::nullopt, static_cast<int64_t>(e)};
   };
@@ -168,7 +169,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group, const std::s
   const int world = (*pg)->getSize();
   const auto ok   = hip_custom_communicator::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&ok)) return refused(*e);
-  auto* handle = new hip_custom_communicator::Handle((*pg)->getRank(), world, gather_over(*pg));
+  auto* handle = new hip_custom_communicator::Handle((*pg)->getRank(), world, gather_over(*pg),
+                                                     timeout_seconds);
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 

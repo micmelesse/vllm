@@ -457,6 +457,14 @@ class Measurement:
         )
 
 
+# THE TESTS' TIMEOUT, short and explicit: the fault tests skip a call on one rank and
+# wait for the others to report it, which at serving's 10 minutes would be 10 minutes a
+# case. Safe because the ranks are aligned before every cell (`exercise`), so what it
+# measures is our kernels' waits, not the test's own host work, which differs by rank
+# (one rank issued the same call 10.7 s after the others, 2026-10-13T18-20-21Z).
+TEST_TIMEOUT_SECONDS = 10.0
+
+
 def _build_communicator(
     backend: str,
     cpu_group: ProcessGroup,
@@ -464,9 +472,13 @@ def _build_communicator(
     device: torch.device,
 ) -> HipCustomCommunicator:
     comm = (
-        TorchCommunicator(cpu_group, device_group, device)
+        TorchCommunicator(
+            cpu_group, device_group, device, timeout_seconds=TEST_TIMEOUT_SECONDS
+        )
         if backend == "torch"
-        else HipCustomCommunicator(cpu_group, device_group, device)
+        else HipCustomCommunicator(
+            cpu_group, device_group, device, timeout_seconds=TEST_TIMEOUT_SECONDS
+        )
     )
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
@@ -1152,6 +1164,11 @@ def exercise(
                     return None, err
                 slots = sched.slots(len(shapes))
                 inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
+                # ALIGNED BEFORE THE CALLS: each rank made its inputs on its own, and a
+                # rank that finishes late reaches the first collective late, which the
+                # others' waits would count against TEST_TIMEOUT_SECONDS.
+                torch.cuda.synchronize()
+                dist.barrier(group=comm.cpu_group)
                 got = run_collective(
                     comm, op_name, [i[rank] for i in inputs], sched, forced
                 )
@@ -1956,7 +1973,7 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
-        "no-such", "no-such", 0
+        "no-such", "no-such", 0, TEST_TIMEOUT_SECONDS
     )
     assert handle is None and Error(err) is Error.no_such_group
 

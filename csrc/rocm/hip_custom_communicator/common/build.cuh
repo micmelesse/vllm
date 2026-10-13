@@ -45,7 +45,6 @@ struct BuildInfo {
   struct Kernels {
     int max_threads;              // the widest block, and every kernel's __launch_bounds__
     int max_waves;                // its waves
-    double sync_timeout_seconds;  // how long a kernel waits on a peer before it gives up
   };
   Supports supports;
   Memory memory;
@@ -83,8 +82,6 @@ constexpr BuildInfo derive(const Hardware& hw) {
     if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
   b.max_waves = b.max_threads / hw.wave_size;
 
-  // HOW LONG A KERNEL WAITS ON A PEER before it records a fault and leaves (barrier.cuh).
-  b.sync_timeout_seconds = 10.0;
   return info;
 }
 

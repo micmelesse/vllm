@@ -53,8 +53,11 @@ class Handle {
   // OPENED on every rank together: this rank's symmetric memory allocated, two allocations, the
   // signals and the exchange (the scratch, then the staging), each one's IPC handle gathered with
   // every rank's, and the peers' opened.
-  // `world_size` is one the build holds (the opener checks it).
-  Handle(int rank, int world_size, const Gather& gather, const BuildInfo& build = kBuild)
+  // `world_size` is one the build holds (the opener checks it). `timeout_seconds`: how long a
+  // kernel waits on a peer before it records a fault and leaves (barrier.cuh), the caller's: the
+  // process group's own timeout, as every other collective on it has.
+  Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
+         const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
         scratch_bytes_(build.memory.scratch_bytes),
@@ -101,7 +104,7 @@ class Handle {
     int device = 0, khz = 0;
     HIP_CHECK(hipGetDevice(&device));
     HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
-    timeout_ticks_ = static_cast<uint64_t>(build.kernels.sync_timeout_seconds * khz * 1000.0);
+    timeout_ticks_ = static_cast<uint64_t>(timeout_seconds * khz * 1000.0);
   }
 
   ~Handle() {

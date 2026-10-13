@@ -59,7 +59,8 @@ using fptr_t = int64_t;
 // Opened on `device` over the process groups named `cpu_group` and `device_group`, a collective:
 // the handle or the Error's number. The IPC handles go round in C++.
 std::tuple<std::optional<int64_t>, std::optional<int64_t>> hip_custom_communicator_open(
-    const std::string& cpu_group, const std::string& device_group, int64_t device);
+    const std::string& cpu_group, const std::string& device_group, int64_t device,
+    double timeout_seconds);
 // The buffers a capture recorded, registered over `group`, a collective.
 void hip_custom_communicator_register_captured(fptr_t handle_ptr, const std::string& group);
 void hip_custom_communicator_register_buffer(fptr_t handle_ptr, torch::Tensor& buffer,
