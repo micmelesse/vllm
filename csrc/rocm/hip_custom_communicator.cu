@@ -312,22 +312,54 @@ void hip_custom_communicator_register_captured(fptr_t handle_ptr, const std::str
 
 namespace {
 // NO INPUT OVERLAPS AN OUTPUT (STANDARDS): the kernels take each as its own `__restrict__` pointer,
-// so two that share bytes would be undefined behavior. A view's bytes are its first to its last
-// element at its strides; a missing tensor (null) overlaps nothing.
-std::pair<uintptr_t, uintptr_t> span_of(const torch::Tensor& t) {
+// so two that share bytes would be undefined behavior. A missing tensor (null) overlaps nothing.
+//
+// EXACT FOR VIEWS OF ONE STACK, conservative otherwise. AttnRes reads `blocks[:, :num_blocks]` and
+// writes `blocks[:, write_index]`: interleaved, every row the sources then the slot, so their
+// first-to-last spans overlap though no element does (the span check refused Kimi's own append,
+// 2026-10-13). A view whose dimensions after the first are one contiguous run is ROWS: a run of
+// `width` bytes every `stride` bytes. Two rows views with the same stride are disjoint exactly when
+// their runs do not meet within one period; anything else is compared by its span.
+struct Span {
+  uintptr_t first, last;     // the first byte and one past the last
+  bool rows;                 // whether it is rows (below)
+  uintptr_t stride, width;   // a row's period and its run, in bytes
+};
+Span span_of(const torch::Tensor& t) {
   const uintptr_t first = reinterpret_cast<uintptr_t>(t.data_ptr());
+  const int64_t elem    = t.element_size();
   int64_t last = 0;
   for (int64_t d = 0; d < t.dim(); ++d) last += (t.size(d) - 1) * t.stride(d);
-  return {first, first + static_cast<uintptr_t>((last + 1) * t.element_size())};
+  Span s{first, first + static_cast<uintptr_t>((last + 1) * elem), false, 0, 0};
+  if (t.dim() < 2 || t.stride(t.dim() - 1) != 1) return s;
+  int64_t run = 1;
+  for (int64_t d = t.dim() - 1; d >= 1; --d) {
+    if (t.stride(d) != run) return s;
+    run *= t.size(d);
+  }
+  if (t.stride(0) < run) return s;
+  s.rows   = true;
+  s.stride = static_cast<uintptr_t>(t.stride(0) * elem);
+  s.width  = static_cast<uintptr_t>(run * elem);
+  return s;
+}
+bool overlap(const Span& a, const Span& b) {
+  if (a.last <= b.first || b.last <= a.first) return false;
+  if (!(a.rows && b.rows && a.stride == b.stride)) return true;
+  // Within one period: a's run at offset `at`, b's at `bt`, on a circle of `stride` bytes.
+  const uintptr_t at = a.first % a.stride, bt = b.first % b.stride;
+  const auto meets = [&](uintptr_t x, uintptr_t xw, uintptr_t y) {
+    return (y + a.stride - x) % a.stride < xw;  // y lands inside [x, x + xw) on the circle
+  };
+  return meets(at, a.width, bt) || meets(bt, b.width, at);
 }
 void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
                     std::initializer_list<const torch::Tensor*> outputs) {
   for (const torch::Tensor* i : inputs)
     for (const torch::Tensor* o : outputs) {
       if (i == nullptr || o == nullptr || i->numel() == 0 || o->numel() == 0) continue;
-      const auto [i0, i1] = span_of(*i);
-      const auto [o0, o1] = span_of(*o);
-      TORCH_CHECK(i1 <= o0 || o1 <= i0, "an input and an output share memory; pass a separate output");
+      TORCH_CHECK(!overlap(span_of(*i), span_of(*o)),
+                  "an input and an output share memory; pass a separate output");
     }
 }
 }  // namespace
