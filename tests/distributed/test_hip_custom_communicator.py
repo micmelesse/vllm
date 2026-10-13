@@ -65,13 +65,12 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     HipCustomCommunicator,
     Op,
     Open,
-    Ran,
     Refused,
     State,
     Supported,
     Where,
     build_info,
-    is_weak_contiguous,
+    should,
     supported,
 )
 from vllm.distributed.parallel_state import (
@@ -180,8 +179,9 @@ class TorchCommunicator(HipCustomCommunicator):
     """torch.distributed over `device_group`: the known-good control hip is checked
     against, HipCustomCommunicator's own call sequence and admission with its kernels
     replaced by torch's, an implementation nobody doubts. The gloo `cpu_group` is
-    accepted for interface parity and unused. Its hooks are the control's: the build's
-    envelope as the check, no fused ops, nothing around a capture or at close, and no
+    accepted for interface parity and unused. Its admission is hip's (`should`, the
+    build's record); its hooks are the control's: torch's sum with nothing forced, no
+    fused ops (each refused, no_such_op), nothing around a capture or at close, and no
     fault record."""
 
     _faults = False
@@ -203,50 +203,31 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> None:
-        out.copy_(inp)
-        dist.all_reduce(out, group=self.device_group)  # SUM
-
-    def _check_all_reduce(
-        self,
-        inp: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        """The build's envelope, so the control admits what our kernels do:
-        weak-contiguous, whole packs, a dtype built; and nothing forced, having no
-        template to force."""
-        if self.disabled:
-            return Error.disabled
-        if (
-            algorithm is not None
-            or direction is not None
-            or tile_m is not None
-            or tile_n is not None
-            or threads_per_block is not None
-            or blocks_per_grid is not None
-            or waves_per_eu is not None
+    ) -> int | None:
+        """The sum, torch's; nothing forced, having no template to force."""
+        if any(
+            f is not None
+            for f in (
+                algorithm,
+                direction,
+                tile_m,
+                tile_n,
+                threads_per_block,
+                blocks_per_grid,
+                waves_per_eu,
+            )
         ):
             return Error.no_such_template
-        if not is_weak_contiguous(inp):
-            return Error.not_contiguous
-        built = build_info()
-        if inp.numel() * inp.element_size() % built.pack_bytes != 0:
-            return Error.row_not_packs
-        if inp.dtype not in built.dtypes:
-            return Error.dtype_not_built
-        return (None, None, None, None, None, None, None)
+        out.copy_(inp)
+        dist.all_reduce(out, group=self.device_group)  # SUM
+        return None
 
-    def _check_all_reduce_rms_norm(
+    def _all_reduce_rms_norm(
         self,
+        out: torch.Tensor,
         inp: torch.Tensor,
         weight: torch.Tensor,
-        add: bool,
+        eps: float,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
@@ -254,12 +235,41 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> Ran | Error:
+    ) -> int | None:
         return Error.no_such_op
 
-    def _check_all_reduce_add_attn_res_rms_norm(
+    def _all_reduce_add_rms_norm(
         self,
+        out: torch.Tensor,
+        residual_out: torch.Tensor,
         inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        algorithm: str | None,
+        direction: str | None,
+        tile_m: int | None,
+        tile_n: int | None,
+        threads_per_block: int | None,
+        blocks_per_grid: int | None,
+        waves_per_eu: int | None,
+    ) -> int | None:
+        return Error.no_such_op
+
+    def _all_reduce_add_attn_res_rms_norm(
+        self,
+        prefix_out: torch.Tensor,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        has_prefix: bool,
+        blocks: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qk_weight: torch.Tensor,
+        out_norm_weight: torch.Tensor | None,
+        num_blocks: int,
+        write_idx: int,
+        eps: float,
+        out_eps: float,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
@@ -269,7 +279,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> Ran | Error:
+    ) -> int | None:
         return Error.no_such_op
 
     def _on_capture(self) -> AbstractContextManager[None]:
@@ -856,8 +866,9 @@ def declined(
     could not; this one was asked a question.
     """
     one = torch.empty(shape, dtype=dtype)
-    should = getattr(comm, f"should_{op_name.replace('_', '')}")
-    if not should(one, **(forced or {})):
+    # A forced call asks no `should_`: the plain rule drops what no plain call runs,
+    # and a forced kernel C++ then refuses raises, by name.
+    if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
         return "declined by the communicator"
     return None
 
@@ -955,8 +966,7 @@ def run_collective(
     ]
 
     def body(s: int) -> list[torch.Tensor]:
-        # Each op returns its output and what ran.
-        return [op()[0] for op in ops[s]]
+        return [op() for op in ops[s]]
 
     def feed(s: int, replay: int) -> None:
         for m, static in enumerate(statics):
@@ -1334,7 +1344,7 @@ def test_the_watchdog_breaks_on_a_fault_and_logs_the_last_launches(
     cause and the flight recorder's launches, the last first, at most its length."""
     comm = _faulting(Open(), fault, after)
     for i in range(launches):
-        comm._record("all_reduce", torch.empty(i + 1, 8), (None,) * 7)
+        comm._record("all_reduce", torch.empty(i + 1, 8))
     logged: list[str] = []
     real = comms_module.logger.error
     comms_module.logger.error = lambda msg, *args: logged.append(msg % args)  # type: ignore[method-assign]
@@ -1394,8 +1404,9 @@ def test_admission_matches_the_baseline() -> None:
             t = torch.empty(nbytes // es, dtype=dtype)
             where = f"{dtype} {nbytes}B"
             aligned = nbytes % BASELINE_ALIGNMENT == 0
-            # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. Size refuses nothing,
-            # and the dtype grid here is fp16/bf16, so what `should_*` still refuses is
+            # THE ONE TERM LEFT IN THE ENVELOPE IS ALIGNMENT. Size refuses nothing up
+            # to the op's max_bytes (the grid's top, a scratch's worth), and the dtype
+            # grid here is fp16/bf16, so what `should_*` still refuses is
             # a tensor the kernel cannot vectorise: `vec` is 16 bytes wide. The grid
             # REACHES those on purpose: an edge +/- one element is 14 and 18 bytes off
             # the 16-byte edge.
@@ -1577,21 +1588,21 @@ def run_fused_rank(
     forced = _forced(f"{shot}_{form}", shape[1])
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
-    if form == "rms_norm":
-        if not comm.should_allreduce_rms_norm(mine, weight, **forced):
-            return False, NO_FUSED_KERNEL
-        got, _ = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS, **forced)
-        got_residual = None
-    else:
-        if not comm.should_allreduce_add_rms_norm(mine, weight, **forced):
-            return False, NO_FUSED_KERNEL
-        got, got_residual, _ = comm.all_reduce_add_rms_norm(
-            mine,
-            residual.to(device),
-            weight.to(device),
-            FUSED_EPS,
-            **forced,
-        )
+    # A forced call asks no `should_`: C++ refusing the shot is its having no kernel.
+    try:
+        if form == "rms_norm":
+            got = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS, **forced)
+            got_residual = None
+        else:
+            got, got_residual = comm.all_reduce_add_rms_norm(
+                mine,
+                residual.to(device),
+                weight.to(device),
+                FUSED_EPS,
+                **forced,
+            )
+    except Refused:
+        return False, NO_FUSED_KERNEL
     want, want_residual = _fused_reference(form, inputs, residual, weight)
     atol, rtol = _fused_tolerance(dtype)
     checks = [("out", got.cpu(), want, atol)]
@@ -1697,7 +1708,7 @@ def test_all_reduce_rms_norm_takes_an_fp32_weight(
     _fused_case(form, shape, dtype_name, shot, torch.float32, world, ranks)
 
 
-def run_weight_plan_rank(ctx: RankContext) -> tuple[bool, str | None]:
+def run_weight_rank(ctx: RankContext) -> tuple[bool, str | None]:
     """ONE rank: a norm's weight in neither the call's dtype nor fp32 is C++'s refusal,
     `weight_not_built`; in either, the op runs."""
     comm = ctx.comm("hip")
@@ -1723,12 +1734,12 @@ def run_weight_plan_rank(ctx: RankContext) -> tuple[bool, str | None]:
 
 
 def test_a_norm_weight_c_does_not_build_is_refused(world: int, ranks: World) -> None:
-    """The weight's dtype is part of the call C++ plans: the rule that a norm's weight
-    is the call's dtype or fp32 is C++'s alone."""
+    """The weight's dtype is part of the call C++ selects for: the rule that a norm's
+    weight is the call's dtype or fp32 is C++'s (kOps), which `should` reads."""
     # example-based: the three weight dtypes against one input dtype are the whole rule
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    bad = [err for _, err in ranks.run(run_weight_plan_rank) if err is not None]
+    bad = [err for _, err in ranks.run(run_weight_rank) if err is not None]
     assert not bad, "; ".join(bad)
 
 
@@ -1842,22 +1853,24 @@ def run_add_attn_res_rms_norm_rank(
     forced = _forced(f"{shot}_add_attn_res_rms_norm", hidden)
     comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
-    if not comm.should_allreduce_add_attn_res_rms_norm(mine, **forced):
-        return False, NO_FUSED_KERNEL
     got_blocks = blocks.to(device).clone()
-    got_prefix, got, _ = comm.all_reduce_add_attn_res_rms_norm(
-        mine,
-        prefix.to(device).clone() if has_prefix else None,
-        got_blocks,
-        norm_w.to(device),
-        qk_w.to(device),
-        None if out_w is None else out_w.to(device),
-        num_blocks,
-        write_idx,
-        1e-6,
-        1e-5,
-        **forced,
-    )
+    # A forced call asks no `should_`: C++ refusing the shot is its having no kernel.
+    try:
+        got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
+            mine,
+            prefix.to(device).clone() if has_prefix else None,
+            got_blocks,
+            norm_w.to(device),
+            qk_w.to(device),
+            None if out_w is None else out_w.to(device),
+            num_blocks,
+            write_idx,
+            1e-6,
+            1e-5,
+            **forced,
+        )
+    except Refused:
+        return False, NO_FUSED_KERNEL
     torch.cuda.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     sum_tol = _atol("all_reduce", dtype)
@@ -1969,7 +1982,7 @@ def run_eager_beyond_staging_rank(
     comm = ctx.comm("hip")
     forced = _forced(shot)
     try:
-        got = comm.all_reduce(x, **forced)[0].float()
+        got = comm.all_reduce(x, **forced).float()
     except Refused as no:
         return False, f"refused for {no.error.name}"
     torch.cuda.synchronize()
@@ -2021,7 +2034,7 @@ def run_strided_all_reduce_rank(
             return False, f"refused for {no.error.name}, not row_narrower_than_world"
         return False, f"a two-shot row of {hidden} on {ctx.world} ranks was not refused"
     try:
-        got = comm.all_reduce(x, **forced)[0].float()
+        got = comm.all_reduce(x, **forced).float()
     except Refused as no:
         where = f"{tuple(x.shape)} at strides {x.stride()}"
         return False, f"refused {where} for {no.error.name}"
@@ -2126,11 +2139,10 @@ def run_warmup_rank(ctx: RankContext) -> tuple[bool, str | None]:
     done = torch.cuda.Event()
     with comm.capture(), torch.cuda.stream(torch.cuda.Stream()):
         if ctx.rank == 0:
-            # Each op's outputs, without what ran.
             outs = [
-                comm.all_reduce(x)[0],
-                comm.all_reduce_rms_norm(x, weight, 1e-6)[0],
-                *comm.all_reduce_add_rms_norm(x, x, weight, 1e-6)[:2],
+                comm.all_reduce(x),
+                comm.all_reduce_rms_norm(x, weight, 1e-6),
+                *comm.all_reduce_add_rms_norm(x, x, weight, 1e-6),
             ]
             done.record()
     if ctx.rank == 0:
@@ -2258,9 +2270,10 @@ def test_a_forcing_is_whole_or_refused_by_name(
 # direction, tile, launch; built or not) -- and every rank makes it. The call is either
 # refused with a named Error, the same on every rank, or its outputs match the
 # reference: the exact sum, then the op the fusion replaces. It never faults or hangs,
-# and a plain call (nothing forced, contiguous, whole packs, fits the staging) always
-# runs. A failing call is shrunk to the smallest, as the two-shot's empty-slice fault
-# was (2026-10-10). FULL: each example is an eight-process collective.
+# and a plain call (nothing forced, and the module's `should` admits it, as each
+# `should_` asks) always runs. A failing call is shrunk to the smallest, as the
+# two-shot's empty-slice fault was (2026-10-10). FULL: each example is an
+# eight-process collective.
 # =================================================================================
 
 # 40 calls an op: about a minute of eight-process collectives each, in the full tier.
@@ -2360,27 +2373,22 @@ def _forcing(forced: dict) -> dict:
     return {k: v for k, v in forced.items() if v is not None}
 
 
-def _plain(op: str, forced: dict, rows: int, hidden: int, pad: int) -> bool:
-    """A call nothing about which is unusual, which must run: nothing forced, whole
-    packs, a contiguous row the staging holds, and, for an op whose tile holds the row,
-    a row some build of it holds (a wider one is row_too_wide, a capability)."""
-    return (
-        not _forcing(forced)
-        and pad == 0
-        and hidden % 8 == 0
-        and rows * hidden * 2 <= build_info().staging_bytes
-        and (op == "all_reduce" or hidden <= _widest_build(op))
-    )
+def _plain(
+    op: Op, forced: dict, x: torch.Tensor, weight: torch.Tensor | None = None
+) -> bool:
+    """A PLAIN CALL, which must run: nothing forced, and the module's `should` admits
+    it -- the rule every `should_` asks, not a copy of it."""
+    return not _forcing(forced) and should(op, x, weight)
 
 
-def _widest_build(op: str) -> int:
-    """The widest row a build of `op` holds in its tile."""
-    return max(
-        b["tile_n"]
-        for t in build_info().templates.values()
-        if t.op == op
-        for b in t.builds
-    )
+def _drawn(
+    dtype: torch.dtype, rows: int, hidden: int, pad: int, lead: int = 1
+) -> torch.Tensor:
+    """A drawn call's input as its ranks make it -- `rows` x `hidden` read out of rows
+    `pad` wider, over `lead` leading dimensions -- on the CPU, unwritten: what
+    `should` reads."""
+    x = torch.empty(rows, hidden + pad, dtype=dtype)[:, :hidden]
+    return x.unflatten(0, (2, rows // 2)) if lead == 2 else x
 
 
 def _differences(
@@ -2440,7 +2448,7 @@ def run_all_reduce_api_rank(
         x, summed = x.unflatten(0, (2, rows // 2)), summed.unflatten(0, (2, rows // 2))
     comm = ctx.comm("hip")
     try:
-        out, _ = comm.all_reduce(x, **_forcing(forced))
+        out = comm.all_reduce(x, **_forcing(forced))
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
@@ -2484,9 +2492,8 @@ def test_all_reduce_api(
         seed=seed,
         forced=forced,
     )
-    _refused_or_right(
-        answers, plain=lead == 1 and _plain("all_reduce", forced, rows, hidden, pad)
-    )
+    x = _drawn(D_DTYPES[dtype], rows, hidden, pad, lead)
+    _refused_or_right(answers, plain=_plain("all_reduce", forced, x))
 
 
 # -- all_reduce_rms_norm --------------------------------------------------------------
@@ -2512,7 +2519,7 @@ def run_all_reduce_rms_norm_api_rank(
         weight = weight.float()
     comm = ctx.comm("hip")
     try:
-        out, _ = comm.all_reduce_rms_norm(x, weight, FUSED_EPS, **_forcing(forced))
+        out = comm.all_reduce_rms_norm(x, weight, FUSED_EPS, **_forcing(forced))
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
@@ -2556,11 +2563,10 @@ def test_all_reduce_rms_norm_api(
         seed=seed,
         forced=forced,
     )
-    _refused_or_right(
-        answers,
-        plain=not fp32_weight
-        and _plain("all_reduce_rms_norm", forced, rows, hidden, pad),
-    )
+    dt = D_DTYPES[dtype]
+    weight = torch.empty(hidden, dtype=torch.float32 if fp32_weight else dt)
+    x = _drawn(dt, rows, hidden, pad)
+    _refused_or_right(answers, plain=_plain("all_reduce_rms_norm", forced, x, weight))
 
 
 # -- all_reduce_add_rms_norm ----------------------------------------------------------
@@ -2588,7 +2594,7 @@ def run_all_reduce_add_rms_norm_api_rank(
     residual = _seeded(ctx, seed * 1009 + 2, (rows, hidden), dt)
     comm = ctx.comm("hip")
     try:
-        out, out_residual, _ = comm.all_reduce_add_rms_norm(
+        out, out_residual = comm.all_reduce_add_rms_norm(
             x, residual.clone(), weight, FUSED_EPS, **_forcing(forced)
         )
         torch.cuda.synchronize()
@@ -2643,10 +2649,11 @@ def test_all_reduce_add_rms_norm_api(
         seed=seed,
         forced=forced,
     )
+    dt = D_DTYPES[dtype]
+    weight = torch.empty(hidden, dtype=torch.float32 if fp32_weight else dt)
+    x = _drawn(dt, rows, hidden, pad)
     _refused_or_right(
-        answers,
-        plain=not fp32_weight
-        and _plain("all_reduce_add_rms_norm", forced, rows, hidden, pad),
+        answers, plain=_plain("all_reduce_add_rms_norm", forced, x, weight)
     )
 
 
@@ -2685,7 +2692,7 @@ def run_all_reduce_add_attn_res_rms_norm_api_rank(
     comm = ctx.comm("hip")
     got_blocks = blocks.clone()
     try:
-        got_prefix, out, _ = comm.all_reduce_add_attn_res_rms_norm(
+        got_prefix, out = comm.all_reduce_add_attn_res_rms_norm(
             x,
             prefix.clone() if has_prefix else None,
             got_blocks,
@@ -2766,7 +2773,7 @@ def test_all_reduce_add_attn_res_rms_norm_api(
         seed=seed,
         forced=forced,
     )
+    x = _drawn(torch.bfloat16, rows, hidden, pad)
     _refused_or_right(
-        answers,
-        plain=_plain("all_reduce_add_attn_res_rms_norm", forced, rows, hidden, pad),
+        answers, plain=_plain("all_reduce_add_attn_res_rms_norm", forced, x)
     )
