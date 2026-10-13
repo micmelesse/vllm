@@ -17,7 +17,7 @@
 //
 // A WAIT NEVER HANGS AND NEVER TRAPS: past the timeout it writes the rank's fault record (where,
 // which peer, the count against the one wanted) and leaves the kernel, and every wait leaves once
-// the record's `abort` is set; the host reads the record (peers.cuh's `Fault`). HIP_CUSTOM_COMMUNICATOR_DEBUG=1
+// the status's `abort` is set; the host reads the status (peers.cuh's `StatusField`). HIP_CUSTOM_COMMUNICATOR_DEBUG=1
 // skews every wait by a random per-block delay, so a race shows on every run.
 
 #pragma once
@@ -88,47 +88,56 @@ DINLINE void fence() {
   }
 }
 
+// One word of this rank's status, by its field, at the buffer's stride.
+DINLINE uint64_t* status_word(uint64_t* status_ptr, int64_t status_stride_field, StatusField f) {
+  return status_ptr + static_cast<int64_t>(f) * status_stride_field;
+}
+
 // THE FAULT, written once by the first wait on this rank to give up: `state` claimed 0 -> 1, the
 // fields, then 2 released, so the host reads them only whole. Then `abort`, so every other wait on
 // this rank leaves at its next check rather than spinning out its own timeout.
-DINLINE void record_fault(Fault* f, Where where, int rank, int peer, uint32_t count,
-                          uint32_t want, uint64_t elapsed) {
-  uint32_t clear = 0;
-  if (__scoped_atomic_compare_exchange_n(&f->state, &clear, 1u, false, __ATOMIC_RELAXED,
-                                         __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
-    f->where         = static_cast<uint32_t>(where);
-    f->rank          = rank;
-    f->block         = static_cast<int32_t>(blockIdx.x);
-    f->peer          = peer;
-    f->count         = count;
-    f->want          = want;
-    f->elapsed_ticks = elapsed;
-    __scoped_atomic_store_n(&f->state, 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+DINLINE void record_fault(uint64_t* status_ptr, int64_t status_stride_field, Where where, int rank,
+                          int peer, uint32_t count, uint32_t want, uint64_t elapsed) {
+  const auto word = [&](StatusField f) { return status_word(status_ptr, status_stride_field, f); };
+  uint64_t clear  = 0;
+  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &clear, uint64_t{1}, false,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
+    *word(StatusField::where)         = static_cast<uint64_t>(where);
+    *word(StatusField::rank)          = static_cast<uint64_t>(rank);
+    *word(StatusField::block)         = blockIdx.x;
+    *word(StatusField::peer)          = static_cast<uint64_t>(peer);
+    *word(StatusField::count)         = count;
+    *word(StatusField::want)          = want;
+    *word(StatusField::elapsed_ticks) = elapsed;
+    __scoped_atomic_store_n(word(StatusField::state), uint64_t{2}, __ATOMIC_RELEASE,
+                            __MEMORY_SCOPE_SYSTEM);
   }
-  __scoped_atomic_store_n(&f->abort, 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  __scoped_atomic_store_n(word(StatusField::abort), uint64_t{1}, __ATOMIC_RELAXED,
+                          __MEMORY_SCOPE_SYSTEM);
 }
 
 // Spins relaxed and acquires once, after: an acquire per poll would invalidate the caches on every
 // iteration of every spinning block. A sleep a poll (64 cycles) keeps a spinning block from
-// hammering the link. EVERY 256 POLLS, the slow path: the clock, and the fault record's `abort`
+// hammering the link. EVERY 256 POLLS, the slow path: the clock, and the status's `abort`
 // (host-mapped, so only here, never in the fast path). Past the timeout the wait records the fault;
 // timed out or aborted, the WAVE ENDS (s_endpgm): an ended wave no longer counts at the block's
 // s_barrier, so the block's other waves run on to their own next wait, see `abort`, and end too.
 // The kernel's output is then garbage and the communicator broken (the host's watchdog).
 template <bool ACQUIRE, int MEMORY_SCOPE>
-DINLINE void wait(uint64_t timeout_ticks, Fault* fault_ptr, int rank, const Counter& flag,
-                  uint32_t want, Where where, int peer) {
+DINLINE void wait(uint64_t timeout_ticks, uint64_t* status_ptr, int64_t status_stride_field,
+                  int rank, const Counter& flag, uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
   for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want; ++n) {
     __builtin_amdgcn_s_sleep(1);
     if ((n & 255u) != 0) continue;
     const uint64_t waited = wall_clock64() - t0;
     const bool aborted =
-        __scoped_atomic_load_n(&fault_ptr->abort, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+        __scoped_atomic_load_n(status_word(status_ptr, status_stride_field, StatusField::abort),
+                               __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
     if (!aborted && waited <= timeout_ticks) continue;
     if (!aborted)
-      record_fault(fault_ptr, where, rank, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want,
-                   waited);
+      record_fault(status_ptr, status_stride_field, where, rank, peer,
+                   flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want, waited);
     __builtin_amdgcn_endpgm();
   }
   if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
@@ -148,7 +157,7 @@ DINLINE void wait(uint64_t timeout_ticks, Fault* fault_ptr, int rank, const Coun
 enum class Until { launched, visible, read };
 
 // A KERNEL'S SYNCHRONIZATION, one per kernel: the signals buffer (every rank's address and the
-// strides), the fault record, this rank, how long a wait may last before it gives up, and the
+// strides), the status buffer, this rank, how long a wait may last before it gives up, and the
 // launch's barriers so far, which pick each barrier's flag set (its parity). Nothing in it outlives
 // the launch.
 // A read after a barrier may see only what the SAME BLOCK on the peer wrote before it, so both
@@ -166,7 +175,8 @@ class Sync {
   int64_t signals_stride_parity_;
   int64_t signals_stride_block_;
   int64_t signals_stride_writer_;
-  Fault* fault_ptr_;
+  uint64_t* status_ptr_;
+  int64_t status_stride_field_;
   int rank_;
   uint64_t timeout_ticks_;
   uint32_t barriers_ = 0;
@@ -185,13 +195,14 @@ class Sync {
 
  public:
   DINLINE Sync(uint32_t* const* signals_ptrs, int64_t signals_stride_parity,
-               int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr,
-               int rank, uint64_t timeout_ticks)
+               int64_t signals_stride_block, int64_t signals_stride_writer, uint64_t* status_ptr,
+               int64_t status_stride_field, int rank, uint64_t timeout_ticks)
       : signals_ptrs_(signals_ptrs),
         signals_stride_parity_(signals_stride_parity),
         signals_stride_block_(signals_stride_block),
         signals_stride_writer_(signals_stride_writer),
-        fault_ptr_(fault_ptr),
+        status_ptr_(status_ptr),
+        status_stride_field_(status_stride_field),
         rank_(rank),
         timeout_ticks_(timeout_ticks) {}
 };
@@ -227,7 +238,8 @@ DINLINE void barrier(Sync<WORLD>& sync) {
     const Counter theirs = sync.flag(threadIdx.x, parity, blockIdx.x, sync.rank_);
     const Counter mine   = sync.flag(sync.rank_, parity, blockIdx.x, threadIdx.x);
     theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(1u);
-    wait<kOrdered, __MEMORY_SCOPE_DEVICE>(sync.timeout_ticks_, sync.fault_ptr_, sync.rank_, mine, 1u,
+    wait<kOrdered, __MEMORY_SCOPE_DEVICE>(sync.timeout_ticks_, sync.status_ptr_,
+                                          sync.status_stride_field_, sync.rank_, mine, 1u,
                                           kFirst ? Where::start : Where::peer_barrier,
                                           static_cast<int>(threadIdx.x));
     mine.template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(0u);

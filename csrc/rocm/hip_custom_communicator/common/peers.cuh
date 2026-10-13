@@ -50,23 +50,25 @@ constexpr const char* to_string(Where w) {
   return "?";
 }
 
-// A RANK'S FAULT RECORD, in HOST-MAPPED memory (the handle's), so the host reads it and sets
-// `abort` while a kernel still runs, and a graph replay, which runs none of our host code, still
-// reports. A wait that outlives the timeout writes it once (the first block to claim `state` wins)
-// and sets `abort`; every wait checks `abort` with its clock and leaves, so one fault ends the
-// rank's kernel instead of each block spinning out its own timeout. The host sets `abort` to end
-// a kernel it has given up on.
-struct Fault {
-  uint32_t abort;          // nonzero: every wait on this rank leaves
-  uint32_t state;          // 0 clear, 1 being written, 2 written (read the rest only at 2)
-  uint32_t where;          // Where
-  int32_t rank;            // this rank
-  int32_t block;           // the block that gave up
-  int32_t peer;            // the rank it waited for
-  uint32_t count;          // the counter it read last
-  uint32_t want;           // the value it waited for
-  uint64_t elapsed_ticks;  // how long it waited, in the device wall clock's ticks
+// A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it and sets `abort` while
+// a kernel still runs, and a graph replay, which runs none of our host code, still reports: a
+// buffer of 64-bit words, one a field, `status[field]` at its stride (`status_stride_field`), the
+// field a StatusField. A wait that outlives the timeout writes the fault once (the first block to
+// claim `state` wins) and sets `abort`; every wait checks `abort` with its clock and leaves, so one
+// fault ends the rank's kernel instead of each block spinning out its own timeout. The host sets
+// `abort` to end a kernel it has given up on.
+enum class StatusField : int {
+  abort,          // nonzero: every wait on this rank leaves
+  state,          // 0 clear, 1 being written, 2 written (read the rest only at 2)
+  where,          // Where
+  rank,           // this rank
+  block,          // the block that gave up
+  peer,           // the rank it waited for
+  count,          // the flag it read last
+  want,           // the value it waited for
+  elapsed_ticks,  // how long it waited, in the device wall clock's ticks
 };
+constexpr int kStatusFields = 9;
 
 
 

@@ -235,7 +235,7 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // compiled instance has one of these
 // (select asserts it when it picks the instance), so a launch calls the kernel select chose
 // through it, with the kernel's own arguments. A kernel's arguments, in STANDARDS' one order: the
-// inputs, the outputs, the exchange (scratch, staging), the signals, the fault record, then the
+// inputs, the outputs, the exchange (scratch, staging), the signals, the status, then the
 // scalars; each buffer its pointer, then its strides, then its sizes, every dimension's, in
 // elements (STANDARDS, *A kernel's arguments have one format*). A peer
 // buffer is a device table of every rank's address (vLLM's RankData), its strides every rank's.
@@ -250,8 +250,9 @@ using AllReduceOneShotKernel =
              int /*output_size_m*/, int /*output_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -261,8 +262,9 @@ using AllReduceTwoShotKernel =
              int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/);
 using AllReduceOneShotStagedKernel =
     void (*)(const void* /*input_ptr*/, int64_t /*input_stride_m*/, int64_t /*input_stride_n*/,
              int /*input_size_m*/, int /*input_size_n*/, void* /*output_ptr*/,
@@ -272,7 +274,8 @@ using AllReduceOneShotStagedKernel =
              void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
              int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
              int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
-             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/);
+             void* /*status_ptr*/, int64_t /*status_stride_field*/, int /*status_size_field*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotStagedKernel =
     void (*)(const void* /*input_ptr*/, int64_t /*input_stride_m*/, int64_t /*input_stride_n*/,
              int /*input_size_m*/, int /*input_size_n*/, void* /*output_ptr*/,
@@ -284,7 +287,8 @@ using AllReduceTwoShotStagedKernel =
              void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
              int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
              int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
-             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/);
+             void* /*status_ptr*/, int64_t /*status_stride_field*/, int /*status_size_field*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceRmsNormOneShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -293,8 +297,9 @@ using AllReduceRmsNormOneShotKernel =
              int /*output_size_m*/, int /*output_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceRmsNormTwoShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -305,8 +310,9 @@ using AllReduceRmsNormTwoShotKernel =
              int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddRmsNormOneShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -320,7 +326,8 @@ using AllReduceAddRmsNormOneShotKernel =
              void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
              int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
              int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
-             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
+             void* /*status_ptr*/, int64_t /*status_stride_field*/, int /*status_size_field*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddRmsNormTwoShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -336,7 +343,8 @@ using AllReduceAddRmsNormTwoShotKernel =
              void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
              int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
              int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
-             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
+             void* /*status_ptr*/, int64_t /*status_stride_field*/, int /*status_size_field*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddAttnResRmsNormOneShotKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -357,9 +365,9 @@ using AllReduceAddAttnResRmsNormOneShotKernel =
              int /*block_output_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
-             float /*output_eps*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/, float /*output_eps*/);
 using AllReduceAddAttnResRmsNormPushKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -382,9 +390,9 @@ using AllReduceAddAttnResRmsNormPushKernel =
              int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
-             float /*output_eps*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/, float /*output_eps*/);
 using AllReduceAddAttnResRmsNormPullKernel =
     void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
              int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -407,9 +415,10 @@ using AllReduceAddAttnResRmsNormPullKernel =
              int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
              int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
              int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
-             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
-             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
-             float /*output_eps*/, int /*reduce_scatter_blocks*/);
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*status_ptr*/,
+             int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
+             uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/, float /*output_eps*/,
+             int /*reduce_scatter_blocks*/);
 
 // =================================================================================================
 // EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel (the

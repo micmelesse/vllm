@@ -44,11 +44,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                              int signals_size_parity,
                              int signals_size_block,
                              int signals_size_writer,
-                             Fault* fault_ptr,
+                             uint64_t* __restrict__ status_ptr,
+                             int64_t status_stride_field,
+                             int status_size_field,
                              int rank,
                              uint64_t timeout_ticks) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;  // a rank's copy's threads
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's
@@ -116,11 +119,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     int signals_size_parity,
                                     int signals_size_block,
                                     int signals_size_writer,
-                                    Fault* fault_ptr,
+                                    uint64_t* __restrict__ status_ptr,
+                                    int64_t status_stride_field,
+                                    int status_size_field,
                                     int rank,
                                     uint64_t timeout_ticks) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's

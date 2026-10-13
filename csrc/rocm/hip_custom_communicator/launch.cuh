@@ -55,7 +55,8 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         l.staging_stride_n, static_cast<int>(l.staging_size_m), static_cast<int>(l.staging_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks());
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks());
   else if (l.staged)
     Call<AllReduceTwoShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input, l.input_stride_m,
@@ -66,8 +67,8 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         h.staging_ptrs(), l.staging_stride_m, l.staging_stride_n,
         static_cast<int>(l.staging_size_m), static_cast<int>(l.staging_size_n), h.signals_ptrs(),
         h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
-        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(),
-        h.rank(), h.timeout_ticks());
+        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
+        h.status_stride_field(), h.status_size_field(), h.rank(), h.timeout_ticks());
   else {
     const void* const* input_ptrs =
         h.input_ptrs(l.input, extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype),
@@ -79,8 +80,8 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         l.output, l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
         static_cast<int>(l.output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
-        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
-        h.timeout_ticks());
+        h.signals_size_block(), h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+        h.status_size_field(), h.rank(), h.timeout_ticks());
     else
       Call<AllReduceTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
@@ -90,7 +91,8 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks());
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks());
   }
 }
 
@@ -105,8 +107,8 @@ inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& 
         l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
         static_cast<int>(l.output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
-        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
-        h.timeout_ticks(), l.eps);
+        h.signals_size_block(), h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+        h.status_size_field(), h.rank(), h.timeout_ticks(), l.eps);
   else
     Call<AllReduceRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
@@ -117,7 +119,8 @@ inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& 
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.eps);
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks(), l.eps);
 }
 
 inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
@@ -135,7 +138,8 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
         static_cast<int>(l.residual_output_size_m), static_cast<int>(l.residual_output_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.eps);
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks(), l.eps);
   else
     Call<AllReduceAddRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
@@ -149,8 +153,8 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
         h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n), h.signals_ptrs(),
         h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
-        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(),
-        h.rank(), h.timeout_ticks(), l.eps);
+        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
+        h.status_stride_field(), h.status_size_field(), h.rank(), h.timeout_ticks(), l.eps);
 }
 
 // THE PULL TWO-SHOT takes its reduce-scatter blocks last.
@@ -175,8 +179,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.block_output_stride_m, l.block_output_stride_n, static_cast<int>(l.block_output_size_m),
         static_cast<int>(l.block_output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
-        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
-        h.timeout_ticks(), l.num_blocks, l.eps, l.output_eps);
+        h.signals_size_block(), h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+        h.status_size_field(), h.rank(), h.timeout_ticks(), l.num_blocks, l.eps, l.output_eps);
   else if (l.direction == Direction::push)
     Call<AllReduceAddAttnResRmsNormPushKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
@@ -196,8 +200,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.num_blocks, l.eps,
-        l.output_eps);
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks(), l.num_blocks, l.eps, l.output_eps);
   else
     Call<AllReduceAddAttnResRmsNormPullKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
@@ -217,8 +221,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.num_blocks, l.eps,
-        l.output_eps, l.reduce_scatter_blocks);
+        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(), h.status_size_field(),
+        h.rank(), h.timeout_ticks(), l.num_blocks, l.eps, l.output_eps, l.reduce_scatter_blocks);
 }
 
 }  // namespace hip_custom_communicator

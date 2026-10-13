@@ -65,14 +65,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    int signals_size_parity,
                                                    int signals_size_block,
                                                    int signals_size_writer,
-                                                   Fault* fault_ptr,
+                                                   uint64_t* __restrict__ status_ptr,
+                                                   int64_t status_stride_field,
+                                                   int status_size_field,
                                                    int rank,
                                                    uint64_t timeout_ticks,
                                                    int num_blocks,
                                                    float eps,
                                                    float output_eps) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 

@@ -12,6 +12,7 @@
 #include <c10/util/BFloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -58,13 +59,13 @@ class Handle {
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
     symmetric_ = alloc_symmetric();
-    // THE FAULT RECORD, host-mapped and coherent: a wait that gives up writes it with system-scope
+    // THE STATUS, host-mapped and coherent: a wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort` (barrier.cuh). The kernels
-    // take its device address as their own argument.
-    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&fault_), sizeof(Fault),
+    // take its device address as their own argument, a buffer of kStatusFields words.
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&status_), kStatusFields * sizeof(uint64_t),
                             hipHostMallocMapped | hipHostMallocCoherent));
-    std::memset(fault_, 0, sizeof(Fault));
-    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_fault_), fault_, 0));
+    std::memset(status_, 0, kStatusFields * sizeof(uint64_t));
+    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_status_), status_, 0));
     // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table: read by this
     // rank's kernels only.
     const int64_t slots = build.memory.peer_ptr_slots;
@@ -102,7 +103,7 @@ class Handle {
     hipFree(slab_);
     hipFree(signals_ptrs_);
     hipFree(symmetric_);
-    hipHostFree(fault_);
+    hipHostFree(status_);
   }
 
   Handle(const Handle&)            = delete;
@@ -194,17 +195,25 @@ class Handle {
   static constexpr int64_t signals_size_parity() { return 2; }
   static constexpr int64_t signals_size_block() { return kMaxBlocks; }
   static constexpr int64_t signals_size_writer() { return kMaxRanks; }
-  // This rank's fault record, at its device address.
-  Fault* fault_ptr() const { return device_fault_; }
+  // This rank's status, at its device address: one word a StatusField.
+  uint64_t* status_ptr() const { return device_status_; }
+  static constexpr int64_t status_stride_field() { return 1; }
+  static constexpr int64_t status_size_field() { return kStatusFields; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
-  // THE FAULT RECORD, read while kernels run: whole once a wait has written it, else nothing.
-  std::optional<Fault> fault() const {
-    if (__atomic_load_n(&fault_->state, __ATOMIC_ACQUIRE) != 2) return std::nullopt;
-    return *fault_;
+  // THE FAULT, read from the status while kernels run: every field's word once a wait has written it
+  // whole (`state` 2), else nothing.
+  std::optional<std::array<uint64_t, kStatusFields>> fault() const {
+    if (__atomic_load_n(&status_[static_cast<int>(StatusField::state)], __ATOMIC_ACQUIRE) != 2)
+      return std::nullopt;
+    std::array<uint64_t, kStatusFields> words{};
+    for (int f = 0; f < kStatusFields; ++f) words[f] = status_[f];
+    return words;
   }
   // Every wait on this rank leaves at its next check: for a communicator the host has given up on.
-  void abort() { __atomic_store_n(&fault_->abort, 1u, __ATOMIC_RELEASE); }
+  void abort() {
+    __atomic_store_n(&status_[static_cast<int>(StatusField::abort)], uint64_t{1}, __ATOMIC_RELEASE);
+  }
 
   // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is
   // registered at capture exit, before any replay). Otherwise it goes through the staging.
@@ -330,8 +339,8 @@ class Handle {
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
   void* symmetric_      = nullptr;
-  Fault* fault_         = nullptr;
-  Fault* device_fault_  = nullptr;
+  uint64_t* status_        = nullptr;
+  uint64_t* device_status_ = nullptr;
   uint64_t timeout_ticks_   = 0;
   void** signals_ptrs_  = nullptr;
   void** scratch_ptrs_  = nullptr;

@@ -33,11 +33,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                              int signals_size_parity,
                              int signals_size_block,
                              int signals_size_writer,
-                             Fault* fault_ptr,
+                             uint64_t* __restrict__ status_ptr,
+                             int64_t status_stride_field,
+                             int status_size_field,
                              int rank,
                              uint64_t timeout_ticks) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles_m = (input_size_m + TILE_M - 1) / TILE_M;
@@ -93,11 +96,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     int signals_size_parity,
                                     int signals_size_block,
                                     int signals_size_writer,
-                                    Fault* fault_ptr,
+                                    uint64_t* __restrict__ status_ptr,
+                                    int64_t status_stride_field,
+                                    int status_size_field,
                                     int rank,
                                     uint64_t timeout_ticks) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const auto staging      = rank_ptrs<DTYPE, WORLD>(staging_ptrs, staging_stride_m,

@@ -78,7 +78,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    int signals_size_parity,
                                                    int signals_size_block,
                                                    int signals_size_writer,
-                                                   Fault* fault_ptr,
+                                                   uint64_t* __restrict__ status_ptr,
+                                                   int64_t status_stride_field,
+                                                   int status_size_field,
                                                    int rank,
                                                    uint64_t timeout_ticks,
                                                    int num_blocks,
@@ -86,7 +88,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    float output_eps,
                                                    int reduce_scatter_blocks) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   using Rows             = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   constexpr int NL = traits<DTYPE>::N;
   const int packs        = input_size_n / NL;  // the row, in packs (n is whole packs)

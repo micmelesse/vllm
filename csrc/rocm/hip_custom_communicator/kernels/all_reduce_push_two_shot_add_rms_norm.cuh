@@ -24,12 +24,15 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, i
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m, int64_t scratch_stride_n,
-    uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr, int rank,
+    uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer, uint64_t* __restrict__ status_ptr,
+    int64_t status_stride_field, int rank,
     uint64_t timeout_ticks,
     Ptr<DTYPE> output, Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual,
     Ptr<const WEIGHT_DTYPE> weight, float eps, int input_size_m, int input_size_n) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
-                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
+                   signals_stride_writer, status_ptr, status_stride_field, rank,
+                   timeout_ticks};
   constexpr int NL       = traits<DTYPE>::N;
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -145,13 +148,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       int signals_size_parity,
                                       int signals_size_block,
                                       int signals_size_writer,
-                                      Fault* fault_ptr,
+                                      uint64_t* __restrict__ status_ptr,
+                                      int64_t status_stride_field,
+                                      int status_size_field,
                                       int rank,
                                       uint64_t timeout_ticks,
                                       float eps) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs, scratch_stride_m, scratch_stride_n,
-      signals_ptrs, signals_stride_parity, signals_stride_block, signals_stride_writer, fault_ptr,
+      signals_ptrs, signals_stride_parity, signals_stride_block, signals_stride_writer, status_ptr, status_stride_field,
       rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
@@ -196,13 +201,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           int signals_size_parity,
                                           int signals_size_block,
                                           int signals_size_writer,
-                                          Fault* fault_ptr,
+                                          uint64_t* __restrict__ status_ptr,
+                                          int64_t status_stride_field,
+                                          int status_size_field,
                                           int rank,
                                           uint64_t timeout_ticks,
                                           float eps) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs, scratch_stride_m, scratch_stride_n,
-      signals_ptrs, signals_stride_parity, signals_stride_block, signals_stride_writer, fault_ptr,
+      signals_ptrs, signals_stride_parity, signals_stride_block, signals_stride_writer, status_ptr, status_stride_field,
       rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       local_ptr(residual_output_ptr, residual_output_stride_m, residual_output_stride_n, rank),

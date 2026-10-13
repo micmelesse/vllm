@@ -239,9 +239,11 @@ void hip_custom_communicator_dispose(fptr_t handle_ptr) { delete &handle_of(hand
 std::vector<int64_t> hip_custom_communicator_fault(fptr_t handle_ptr) {
   const auto f = handle_of(handle_ptr).fault();
   if (!f) return {};
-  return {static_cast<int64_t>(f->where), f->rank,  f->block, f->peer,
-          static_cast<int64_t>(f->count), static_cast<int64_t>(f->want),
-          static_cast<int64_t>(f->elapsed_ticks)};
+  using hip_custom_communicator::StatusField;
+  const auto word = [&](StatusField s) { return static_cast<int64_t>((*f)[static_cast<int>(s)]); };
+  return {word(StatusField::where), word(StatusField::rank),  word(StatusField::block),
+          word(StatusField::peer),  word(StatusField::count), word(StatusField::want),
+          word(StatusField::elapsed_ticks)};
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) { handle_of(handle_ptr).abort(); }
 
