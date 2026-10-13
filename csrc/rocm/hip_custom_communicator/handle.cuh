@@ -209,7 +209,8 @@ class Handle {
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
   // THE STATUS, every field's word, read while kernels run (host-mapped: it never waits on the
-  // device). The fault's fields are whole only once `state` is 2; the reader checks.
+  // device). The fault's fields are whole only once `state` is FaultState::written; the reader
+  // checks.
   std::array<uint32_t, kStatusFields> status() const {
     std::array<uint32_t, kStatusFields> words{};
     words[static_cast<int>(StatusField::state)] =
@@ -218,8 +219,8 @@ class Handle {
       if (f != static_cast<int>(StatusField::state)) words[f] = status_[f];
     return words;
   }
-  // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value). Between launches every value
-  // is zero (barrier.cuh); read only once the launches have finished, as this copies device memory
+  // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value), the value a FlagState unless
+  // the memory is corrupt. Between launches every one is `clear` (barrier.cuh); read only once the launches have finished, as this copies device memory
   // that a running kernel is changing.
   std::vector<std::array<int64_t, 4>> signals() const {
     std::vector<uint32_t> flags(static_cast<size_t>(kSignalsBytes / sizeof(uint32_t)));
@@ -236,7 +237,7 @@ class Handle {
   }
   // Every wait on this rank leaves at its next check: for a communicator the host has given up on.
   void abort() {
-    __atomic_store_n(&status_[static_cast<int>(StatusField::abort)], 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&status_[static_cast<int>(StatusField::abort)], uint32_t{1}, __ATOMIC_RELEASE);
   }
 
   // Whether the peers can read `input` where it is, on `stream`: registered, or captured (it is

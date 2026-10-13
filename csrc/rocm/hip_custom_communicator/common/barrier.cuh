@@ -99,8 +99,9 @@ DINLINE uint32_t* status_word(uint32_t* status_ptr, int64_t status_stride_field,
 DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field, Where where, int rank,
                           int peer, uint32_t count, uint32_t want, uint64_t elapsed) {
   const auto word = [&](StatusField f) { return status_word(status_ptr, status_stride_field, f); };
-  uint32_t clear  = 0;
-  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &clear, 1u, false,
+  uint32_t none   = static_cast<uint32_t>(FaultState::none);
+  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &none,
+                                         static_cast<uint32_t>(FaultState::writing), false,
                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
     *word(StatusField::where)        = static_cast<uint32_t>(where);
     *word(StatusField::rank)         = static_cast<uint32_t>(rank);
@@ -110,7 +111,8 @@ DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field, Whe
     *word(StatusField::want)         = want;
     *word(StatusField::elapsed_low)  = static_cast<uint32_t>(elapsed);
     *word(StatusField::elapsed_high) = static_cast<uint32_t>(elapsed >> 32);
-    __scoped_atomic_store_n(word(StatusField::state), 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(word(StatusField::state), static_cast<uint32_t>(FaultState::written),
+                            __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
   }
   __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
 }
@@ -236,12 +238,14 @@ DINLINE void barrier(Sync<WORLD>& sync) {
     if constexpr (!kOrdered) wait_stores();
     const Counter theirs = sync.flag(threadIdx.x, parity, blockIdx.x, sync.rank_);
     const Counter mine   = sync.flag(sync.rank_, parity, blockIdx.x, threadIdx.x);
-    theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(1u);
+    theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
+        static_cast<uint32_t>(FlagState::arrived));
     wait<kOrdered, __MEMORY_SCOPE_DEVICE>(sync.timeout_ticks_, sync.status_ptr_,
-                                          sync.status_stride_field_, sync.rank_, mine, 1u,
+                                          sync.status_stride_field_, sync.rank_, mine,
+                                          static_cast<uint32_t>(FlagState::arrived),
                                           kFirst ? Where::start : Where::peer_barrier,
                                           static_cast<int>(threadIdx.x));
-    mine.template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(0u);
+    mine.template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(static_cast<uint32_t>(FlagState::clear));
   }
   __syncthreads();
   ++sync.barriers_;

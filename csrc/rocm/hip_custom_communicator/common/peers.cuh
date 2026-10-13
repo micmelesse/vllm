@@ -58,9 +58,25 @@ constexpr const char* to_string(Where w) {
 // claim `state` wins) and sets `abort`; every wait checks `abort` with its clock and leaves, so one
 // fault ends the rank's kernel instead of each block spinning out its own timeout. The host sets
 // `abort` to end a kernel it has given up on.
+// A FLAG'S STATES, the only values a barrier writes: `arrived` into a peer's slot for it, `clear`
+// into its own once it has seen it. Between launches every flag is `clear`; any other value is not
+// a state the protocol has, so the memory is corrupt.
+enum class FlagState : uint32_t {
+  clear   = 0,  // the writer has not reached this barrier, or the owner has seen it
+  arrived = 1,  // the writer reached this barrier; the owner has not yet seen it
+};
+
+// THE FAULT'S STATES, the status's `state` word: claimed by the first wait to give up, then written
+// whole; the host reads the fault's fields only once `written`.
+enum class FaultState : uint32_t {
+  none    = 0,
+  writing = 1,
+  written = 2,
+};
+
 enum class StatusField : int {
-  abort,          // nonzero: every wait on this rank leaves
-  state,          // 0 clear, 1 being written, 2 written (read the rest only at 2)
+  abort,          // 1: every wait on this rank leaves; 0: they wait
+  state,          // a FaultState
   where,          // Where
   rank,           // this rank
   block,          // the block that gave up

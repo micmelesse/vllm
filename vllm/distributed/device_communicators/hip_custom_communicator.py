@@ -99,16 +99,33 @@ class Where(IntEnum):
     peer_barrier = 2  # a later barrier
 
 
+class FlagState(IntEnum):
+    """A FLAG'S STATES: C++'s `hip_custom_communicator::FlagState`, value for value,
+    the only values a barrier writes. Any other value is corrupt memory, and decoding
+    it raises."""
+
+    clear = 0  # the writer has not reached this barrier, or the owner has seen it
+    arrived = 1  # the writer reached it; the owner has not yet seen it
+
+
+class FaultState(IntEnum):
+    """THE FAULT'S STATES, the status's `state`: C++'s `FaultState`, value for value."""
+
+    none = 0
+    writing = 1
+    written = 2  # the fault's fields are whole
+
+
 @dataclass(frozen=True)
 class Flag:
     """ONE FLAG of this rank's signals: the slot block `block` on rank `writer` sets
-    at a barrier of `parity`, and its value. Every value is zero between launches; one
-    that is not is state a launch left behind."""
+    at a barrier of `parity`, and its state. Every one is `clear` between launches; one
+    `arrived` is state a launch left behind."""
 
     parity: int
     block: int
     writer: int
-    value: int
+    state: FlagState
 
 
 @dataclass(frozen=True)
@@ -1021,7 +1038,7 @@ class HipCustomCommunicator:
             torch.ops._rocm_C.hip_custom_communicator_status(self._handle)
         )
         fault = None
-        if state == 2:  # written whole
+        if FaultState(state) is FaultState.written:
             fault = Fault(
                 where=Where(where),
                 rank=rank,
@@ -1034,13 +1051,16 @@ class HipCustomCommunicator:
         return Status(abort=abort != 0, fault=fault)
 
     def signals(self) -> list[Flag]:
-        """Every flag of this rank's signals, each value zero between launches. It
+        """Every flag of this rank's signals, each `clear` between launches. It
         reads device memory, so call it only once the launches have finished
         (`torch.cuda.synchronize()`)."""
         if self._handle is None:
             return []
         flat = torch.ops._rocm_C.hip_custom_communicator_signals(self._handle)
-        return [Flag(*flat[i : i + 4]) for i in range(0, len(flat), 4)]
+        return [
+            Flag(flat[i], flat[i + 1], flat[i + 2], FlagState(flat[i + 3]))
+            for i in range(0, len(flat), 4)
+        ]
 
     def _fault(self) -> Fault | None:
         """The fault this rank's status records, for the watchdog."""
