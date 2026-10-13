@@ -18,6 +18,17 @@
 
 #define DINLINE __device__ __forceinline__
 
+// THE TARGETS OUR KERNELS ARE WRITTEN FOR: MI300 (gfx942) and MI355 (gfx950). vLLM's ROCm build
+// compiles every file for more (gfx90a and the Radeon gfx11xx/gfx12xx), where our kernels use what
+// does not exist (DPP row broadcasts, gfx9's cache bits), so on those every kernel's body is left out
+// and traps. Nothing launches one there: `supported` refuses the device first. The host pass, which
+// generates no device code, sees the whole body.
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx942__) || defined(__gfx950__)
+#define HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED 1
+#else
+#define HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED 0
+#endif
+
 namespace hip_custom_communicator {
 
 template <typename DTYPE, int VEC_SIZE>

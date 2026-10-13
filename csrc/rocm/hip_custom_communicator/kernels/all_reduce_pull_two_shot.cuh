@@ -49,6 +49,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                              int status_size_field,
                              int rank,
                              uint64_t timeout_ticks) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
                    signals_stride_writer, status_ptr, status_stride_field, rank,
                    timeout_ticks};
@@ -82,6 +83,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
   all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, input_size_m, input_size_n);
   block_stamp(5);
+#else
+  __builtin_trap();
+#endif
 }
 
 // STAGED: each rank copies its input into its staging a band of `staging_size_m` rows at a time and each
@@ -124,6 +128,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     int status_size_field,
                                     int rank,
                                     uint64_t timeout_ticks) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
                    signals_stride_writer, status_ptr, status_stride_field, rank,
                    timeout_ticks};
@@ -165,6 +170,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, band, input_size_n);
     block_stamp(5);
   }
+#else
+  __builtin_trap();
+#endif
 }
 
 }  // namespace hip_custom_communicator

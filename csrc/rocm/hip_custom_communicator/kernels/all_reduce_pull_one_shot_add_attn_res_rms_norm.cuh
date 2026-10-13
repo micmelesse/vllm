@@ -73,6 +73,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    int num_blocks,
                                                    float eps,
                                                    float output_eps) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
                    signals_stride_writer, status_ptr, status_stride_field, rank,
                    timeout_ticks};
@@ -107,6 +108,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read>(sync);
+#else
+  __builtin_trap();
+#endif
 }
 
 }  // namespace hip_custom_communicator

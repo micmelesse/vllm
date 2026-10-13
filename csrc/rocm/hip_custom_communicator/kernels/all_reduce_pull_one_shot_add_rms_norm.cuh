@@ -114,12 +114,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       int rank,
                                       uint64_t timeout_ticks,
                                       float eps) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, signals_ptrs, signals_stride_parity,
       signals_stride_block, signals_stride_writer, status_ptr, status_stride_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
       eps, input_size_m, input_size_n);
+#else
+  __builtin_trap();
+#endif
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
@@ -161,6 +165,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           int rank,
                                           uint64_t timeout_ticks,
                                           float eps) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, signals_ptrs, signals_stride_parity,
       signals_stride_block, signals_stride_writer, status_ptr, status_stride_field, rank, timeout_ticks,
@@ -168,6 +173,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       local_ptr(residual_output_ptr, residual_output_stride_m, residual_output_stride_n, rank),
       local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
       local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, input_size_m, input_size_n);
+#else
+  __builtin_trap();
+#endif
 }
 
 }  // namespace hip_custom_communicator

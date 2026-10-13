@@ -87,6 +87,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    float eps,
                                                    float output_eps,
                                                    int reduce_scatter_blocks) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
                    signals_stride_writer, status_ptr, status_stride_field, rank,
                    timeout_ticks};
@@ -161,6 +162,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(3);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
   block_stamp(4);
+#else
+  __builtin_trap();
+#endif
 }
 
 }  // namespace hip_custom_communicator
