@@ -4,15 +4,15 @@
 // THE RANKS' MEMORY: every rank's buffers as plain tensors a tile loads and stores, and the types
 // a kernel takes them in. A RANK'S MEMORY, two places:
 //   ours, one allocation (Handle's symmetric memory), mapped by every peer at startup:
-//     [ Signal | scratch | staging ]
+//     [ signals | scratch | staging ]
 //   each handed to a kernel as its own argument, a device table of every rank's address (its
-//   signal block, scratch and staging), written once when the handle opens;
+//   signals, scratch and staging) and the buffer's strides, written once when the handle opens;
 //   the caller's, one tensor a call:
 //     [ input ]   read in place only when registered or captured, its peers' addresses a device
 //                 table (a captured launch's are filled after the capture);
 //                 otherwise a staged kernel copies it into the staging
 // A buffer is read or written by tile_load / tile_store / peers_load, ordered only by
-// barrier.cuh's `barrier`. The Signal block is barrier.cuh's, never read as data.
+// barrier.cuh's `barrier`. The signals are barrier.cuh's, never read as data.
 
 #pragma once
 
@@ -68,16 +68,6 @@ struct Fault {
   uint64_t elapsed_ticks;  // how long it waited, in the device wall clock's ticks
 };
 
-// A RANK'S SIGNAL BLOCK, the first bytes of its one IPC allocation (the scratch and staging follow):
-// `flags[parity][block][writer]`, the slot block `block` on rank `writer` sets here. Two sets, so a
-// launch's consecutive barriers never share a slot (barrier.cuh), and every flag is 0 between
-// launches: nothing in it is state.
-struct Signal {
-  alignas(128) uint32_t flags[2][kMaxBlocks][kMaxRanks];
-  // This rank's fault record (the handle's, host-mapped), written once when the handle opens.
-  // A peer's block holds that peer's, which this rank never reads.
-  alignas(128) Fault* fault;
-};
 
 
 

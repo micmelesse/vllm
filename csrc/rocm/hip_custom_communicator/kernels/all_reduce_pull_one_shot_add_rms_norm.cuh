@@ -19,11 +19,12 @@ namespace hip_custom_communicator {
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
-    Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
+    uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr, int rank,
     uint64_t timeout_ticks,
     Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight,
     float eps, int inp_size_m, int inp_size_n) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
@@ -86,8 +87,9 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(const DTYPE* const* __restrict__ inp_ptrs,
                                       int64_t inp_stride_m, int64_t inp_stride_n,
-                                      Signal* const* __restrict__ signal_ptrs,
-                                      Signal* self_signal_ptr,
+                                      uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+                                      int64_t signals_stride_block, int64_t signals_stride_writer,
+                                      Fault* fault_ptr,
                                       int rank, uint64_t timeout_ticks,
                                       DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                       int64_t out_stride_n,
@@ -95,7 +97,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       int64_t weight_stride_n, float eps, int inp_size_m,
                                       int inp_size_n) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
-      inp_ptrs, inp_stride_m, inp_stride_n, signal_ptrs, self_signal_ptr, rank, timeout_ticks,
+      inp_ptrs, inp_stride_m, inp_stride_n, signals_ptrs, signals_stride_parity,
+      signals_stride_block, signals_stride_writer, fault_ptr, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
       eps, inp_size_m, inp_size_n);
@@ -106,8 +109,9 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(const DTYPE* const* __restrict__ inp_ptrs,
                                           int64_t inp_stride_m, int64_t inp_stride_n,
-                                          Signal* const* __restrict__ signal_ptrs,
-                                          Signal* self_signal_ptr,
+                                          uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+                                          int64_t signals_stride_block, int64_t signals_stride_writer,
+                                          Fault* fault_ptr,
                                           int rank, uint64_t timeout_ticks,
                                           DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                           int64_t out_stride_n,
@@ -120,7 +124,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                           int64_t weight_stride_n, float eps, int inp_size_m,
                                           int inp_size_n) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
-      inp_ptrs, inp_stride_m, inp_stride_n, signal_ptrs, self_signal_ptr, rank, timeout_ticks,
+      inp_ptrs, inp_stride_m, inp_stride_n, signals_ptrs, signals_stride_parity,
+      signals_stride_block, signals_stride_writer, fault_ptr, rank, timeout_ticks,
       local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
       local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
       local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),

@@ -376,8 +376,7 @@ template <typename PARAM>
 struct erase<const PARAM*> {
   using t = const void*;
 };
-// A peer table, every rank's address of a buffer: its elements erased, the table kept. The signal
-// table is not an element pointer and keeps its type.
+// A peer table, every rank's address of a buffer: its elements erased, the table kept.
 template <typename PARAM>
 struct erase<PARAM* const*> {
   using t = void* const*;
@@ -385,10 +384,6 @@ struct erase<PARAM* const*> {
 template <typename PARAM>
 struct erase<const PARAM* const*> {
   using t = const void* const*;
-};
-template <>
-struct erase<Signal* const*> {
-  using t = Signal* const*;
 };
 template <typename KERNEL_PTR>
 struct erased;

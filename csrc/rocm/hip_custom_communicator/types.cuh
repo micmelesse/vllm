@@ -237,7 +237,8 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // through it, with the kernel's own arguments. A kernel's arguments are its buffers and values,
 // in this order: every rank's input (a device table: a captured launch's are filled after the
 // capture), scratch or staging, each only where the kernel uses it; the synchronization state
-// (every rank's signal block, this rank's, its rank, the wait limit); then its own. EVERY BUFFER
+// (every rank's signals and their strides, the fault record, its rank, the wait limit); then its
+// own. EVERY BUFFER
 // IS FOLLOWED BY ITS STRIDES, in elements, every dimension's (STANDARDS, *One file is the
 // interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone. A peer
 // buffer is a device table of every rank's address (vLLM's RankData), its strides every rank's.
@@ -246,38 +247,38 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // The plain all-reduce: out, inp_size_m, inp_size_n; staged, the staging first (and the two-shot's
 // scratch before it), its own input after out, and the rows a band.
 using AllReduceOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
           int64_t,
              int64_t, int, int);
 using AllReduceTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
           void*, int,
              uint64_t, void*, int64_t, int64_t, int, int);
 using AllReduceOneShotStagedKernel =
-    void (*)(void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*, int64_t,
+    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*, int64_t,
              int64_t, const void*, int64_t, int64_t, int, int, int);
 using AllReduceTwoShotStagedKernel =
-    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*, void*,
+    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*,
           int,
              uint64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, int, int, int);
 // out, weight, eps, inp_size_m, inp_size_n; the two-shots (pull and push) with every rank's
 // scratch.
 using AllReduceRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
           int64_t,
              int64_t, const void*, int64_t, float, int, int);
 using AllReduceRmsNormTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
           void*, int,
              uint64_t, void*, int64_t, int64_t, const void*, int64_t, float, int, int);
 // out, residual_out, residual, weight, eps, inp_size_m, inp_size_n.
 using AllReduceAddRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t, void*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
           int64_t,
              int64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, const void*,
              int64_t, float, int, int);
 using AllReduceAddRmsNormTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
           void*, int,
              uint64_t, void*, int64_t, int64_t, void*, int64_t, int64_t, const void*, int64_t,
              int64_t, const void*, int64_t, float, int, int);
@@ -288,14 +289,14 @@ using AllReduceAddRmsNormTwoShotKernel =
   void*, int64_t, int64_t, void*, int64_t, int64_t, int64_t, const void*, int64_t, const void*, \
       int64_t, const void*, int64_t, void*, int64_t, int64_t, int, int, float, float, int, int
 using AllReduceAddAttnResRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, Signal* const*, void*, int, uint64_t,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t,
              HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPushKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
           void*, int,
              uint64_t, HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS);
 using AllReduceAddAttnResRmsNormPullKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, Signal* const*,
+    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
           void*, int,
              uint64_t, HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS, int);
 #undef HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS

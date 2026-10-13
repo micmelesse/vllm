@@ -24,8 +24,8 @@
 //                  threads a rank, slice() this thread's); to<U>(), like<U>(), zeros<U>()
 //   reduce.cuh     Sum, Max (a reduction's operation), Axis::m | n
 //   softmax.cuh    OnlineSoftmax
-//   peers.cuh      Signal, kMaxRanks, kMaxBlocks
-//   barrier.cuh    Sync<WORLD>{signal_ptrs, self_signal_ptr, rank, timeout}, Until
+//   peers.cuh      Fault, kMaxRanks, kMaxBlocks
+//   barrier.cuh    Sync<WORLD>{signals_ptrs, its three strides, fault_ptr, rank, timeout}, Until
 
 #pragma once
 

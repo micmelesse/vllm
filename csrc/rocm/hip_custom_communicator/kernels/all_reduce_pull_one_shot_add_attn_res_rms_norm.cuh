@@ -19,7 +19,7 @@ template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
-        Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr, int rank,
+        uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr, int rank,
         uint64_t timeout_ticks,
         DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m, int64_t prefix_stride_n,
         DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m, int64_t blocks_stride_r,
@@ -28,7 +28,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ out_norm_w_ptr, int64_t out_norm_w_stride_n,
         DTYPE* __restrict__ out_ptr, int64_t out_stride_m, int64_t out_stride_n, int num_blocks,
         int write_idx, float eps, float out_eps, int inp_size_m, int inp_size_n) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(inp_size_n);
 

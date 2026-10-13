@@ -42,6 +42,11 @@ namespace hip_custom_communicator {
 // rank calls it together.
 using Gather = std::function<std::vector<std::string>(const std::string&)>;
 
+// THE SIGNALS' BYTES, the first of a rank's symmetric memory: two flag sets of kMaxBlocks blocks by
+// kMaxRanks writers, rounded to 128 bytes so the scratch after them starts aligned.
+constexpr int64_t kSignalsBytes = (2 * int64_t{kMaxBlocks} * kMaxRanks * int64_t{sizeof(uint32_t)} + 127) /
+                                  128 * 128;
+
 class Handle {
  public:
   // OPENED on every rank together: this rank's symmetric memory (the signal block, the scratch,
@@ -52,36 +57,33 @@ class Handle {
         world_size_(world_size),
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
-    self_signal_ptr_ = static_cast<Signal*>(alloc_symmetric());
+    symmetric_ = alloc_symmetric();
     // THE FAULT RECORD, host-mapped and coherent: a wait that gives up writes it with system-scope
     // atomics while the host polls it, and the host sets its `abort` (barrier.cuh). The kernels
-    // find it through this rank's signal block.
+    // take its device address as their own argument.
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&fault_), sizeof(Fault),
                             hipHostMallocMapped | hipHostMallocCoherent));
     std::memset(fault_, 0, sizeof(Fault));
-    Fault* device_fault = nullptr;
-    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_fault), fault_, 0));
-    HIP_CHECK(hipMemcpy(&self_signal_ptr_->fault, &device_fault, sizeof(device_fault),
-                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_fault_), fault_, 0));
     // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table: read by this
     // rank's kernels only.
     const int64_t slots = build.memory.peer_ptr_slots;
     HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
     slab_end_         = slab_ + slots * kMaxRanks;
     cursor_           = slab_;
-    const auto opened = open_peers(gather(ipc_bytes(self_signal_ptr_)), self_signal_ptr_);
-    // EVERY RANK'S SIGNAL BLOCK, SCRATCH AND STAGING, a table each, written once: each rank's
-    // symmetric memory is [ Signal | scratch | staging ], at the same offsets on every rank. The
-    // staging is registered here too, so an eager input's launch reads its table.
-    HIP_CHECK(hipMalloc(&signal_ptrs_, kMaxRanks * sizeof(Signal*)));
-    std::vector<Signal*> signals(kMaxRanks, nullptr);
+    const auto opened = open_peers(gather(ipc_bytes(symmetric_)), symmetric_);
+    // EVERY RANK'S SIGNALS, SCRATCH AND STAGING, a table each, written once: each rank's symmetric
+    // memory is [ signals | scratch | staging ], at the same offsets on every rank. The staging is
+    // registered here too, so an eager input's launch reads its table.
+    HIP_CHECK(hipMalloc(&signals_ptrs_, kMaxRanks * sizeof(void*)));
+    std::vector<void*> signals(kMaxRanks, nullptr);
     std::vector<void*> scratch(world_size_), staging(world_size_);
     for (int i = 0; i < world_size_; ++i) {
-      signals[i] = static_cast<Signal*>(opened[i]);
-      scratch[i] = static_cast<char*>(opened[i]) + sizeof(Signal);
-      staging[i] = static_cast<char*>(opened[i]) + sizeof(Signal) + scratch_bytes_;
+      signals[i] = opened[i];
+      scratch[i] = static_cast<char*>(opened[i]) + kSignalsBytes;
+      staging[i] = static_cast<char*>(opened[i]) + kSignalsBytes + scratch_bytes_;
     }
-    HIP_CHECK(hipMemcpy(signal_ptrs_, signals.data(), kMaxRanks * sizeof(Signal*),
+    HIP_CHECK(hipMemcpy(signals_ptrs_, signals.data(), kMaxRanks * sizeof(void*),
                         hipMemcpyHostToDevice));
     scratch_ptrs_ = next_slot();
     write_slot(scratch_ptrs_, scratch);
@@ -98,8 +100,8 @@ class Handle {
   ~Handle() {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
-    hipFree(signal_ptrs_);
-    hipFree(self_signal_ptr_);
+    hipFree(signals_ptrs_);
+    hipFree(symmetric_);
     hipHostFree(fault_);
   }
 
@@ -111,7 +113,7 @@ class Handle {
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it holds.
   void* staging() const {
-    return reinterpret_cast<char*>(self_signal_ptr_) + sizeof(Signal) + scratch_bytes_;
+    return static_cast<char*>(symmetric_) + kSignalsBytes + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
 
@@ -183,8 +185,14 @@ class Handle {
   void* const* staging_ptrs() const { return staging_ptrs_; }
   // The synchronization state: every rank's signal block, this rank's, and how long a wait may
   // last before it gives up.
-  Signal* const* signal_ptrs() const { return signal_ptrs_; }
-  Signal* self_signal_ptr() const { return self_signal_ptr_; }
+  // Every rank's signals, [R, 2, kMaxBlocks, kMaxRanks] (owner, parity, block, writer): the table,
+  // then the inner strides, in elements.
+  void* const* signals_ptrs() const { return signals_ptrs_; }
+  static constexpr int64_t signals_stride_parity() { return int64_t{kMaxBlocks} * kMaxRanks; }
+  static constexpr int64_t signals_stride_block() { return kMaxRanks; }
+  static constexpr int64_t signals_stride_writer() { return 1; }
+  // This rank's fault record, at its device address.
+  Fault* fault_ptr() const { return device_fault_; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
   // THE FAULT RECORD, read while kernels run: whole once a wait has written it, else nothing.
@@ -219,7 +227,7 @@ class Handle {
   // rank wrote, and cached, those writes sit dirty in L2 for the barrier's writeback to flush.
   void* alloc_symmetric() const {
     void* p            = nullptr;
-    const size_t bytes = sizeof(Signal) + static_cast<size_t>(scratch_bytes_ + staging_bytes_);
+    const size_t bytes = kSignalsBytes + static_cast<size_t>(scratch_bytes_ + staging_bytes_);
     HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
     HIP_CHECK(hipMemset(p, 0, bytes));
     HIP_CHECK(hipDeviceSynchronize());
@@ -318,10 +326,11 @@ class Handle {
   int world_size_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
-  Signal* self_signal_ptr_ = nullptr;
-  Fault* fault_        = nullptr;
+  void* symmetric_      = nullptr;
+  Fault* fault_         = nullptr;
+  Fault* device_fault_  = nullptr;
   uint64_t timeout_ticks_   = 0;
-  Signal** signal_ptrs_ = nullptr;
+  void** signals_ptrs_  = nullptr;
   void** scratch_ptrs_  = nullptr;
   void** staging_ptrs_  = nullptr;
   void** slab_           = nullptr;

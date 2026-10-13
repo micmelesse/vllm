@@ -25,11 +25,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
                              int64_t inp_stride_n, DTYPE* const* __restrict__ scratch_ptrs,
                              int64_t scratch_stride_m, int64_t scratch_stride_n,
-                             Signal* const* __restrict__ signal_ptrs, Signal* self_signal_ptr,
+                             uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr,
                              int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out_ptr,
                              int64_t out_stride_m, int64_t out_stride_n, int inp_size_m,
                              int inp_size_n) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;  // a rank's copy's threads
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's
@@ -74,13 +75,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     int64_t scratch_stride_m, int64_t scratch_stride_n,
                                     DTYPE* const* __restrict__ staging_ptrs,
                                     int64_t staging_stride_m, int64_t staging_stride_n,
-                                    Signal* const* __restrict__ signal_ptrs,
-                                    Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
+                                    uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+                                    int64_t signals_stride_block, int64_t signals_stride_writer,
+                                    Fault* fault_ptr, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                     int64_t out_stride_n, const DTYPE* __restrict__ inp_ptr,
                                     int64_t inp_stride_m, int64_t inp_stride_n, int inp_size_m,
                                     int inp_size_n, int band_m) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   constexpr int LANES = THREADS_PER_BLOCK / WORLD;
   static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
   // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the build's, 1: select's

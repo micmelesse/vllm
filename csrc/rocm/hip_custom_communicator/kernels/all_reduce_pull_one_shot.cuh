@@ -17,12 +17,14 @@ namespace hip_custom_communicator {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m,
-                             int64_t inp_stride_n, Signal* const* __restrict__ signal_ptrs,
-                             Signal* self_signal_ptr,
+                             int64_t inp_stride_n, uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+                             int64_t signals_stride_block, int64_t signals_stride_writer,
+                             Fault* fault_ptr,
                              int rank, uint64_t timeout_ticks, DTYPE* __restrict__ out_ptr,
                              int64_t out_stride_m, int64_t out_stride_n, int inp_size_m,
                              int inp_size_n) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (inp_size_n + TILE_N - 1) / TILE_N;
   const int tiles_m = (inp_size_m + TILE_M - 1) / TILE_M;
@@ -59,14 +61,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_staged(DTYPE* const* __restrict__ staging_ptrs,
                                     int64_t staging_stride_m,
                                     int64_t staging_stride_n,
-                                    Signal* const* __restrict__ signal_ptrs,
-                                    Signal* self_signal_ptr, int rank, uint64_t timeout_ticks,
+                                    uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
+                                    int64_t signals_stride_block, int64_t signals_stride_writer,
+                                    Fault* fault_ptr, int rank, uint64_t timeout_ticks,
                                     DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
                                     int64_t out_stride_n, const DTYPE* __restrict__ inp_ptr,
                                     int64_t inp_stride_m, int64_t inp_stride_n, int inp_size_m,
                                     int inp_size_n,
                                     int band_m) {
-  Sync<WORLD> sync{signal_ptrs, self_signal_ptr, rank, timeout_ticks};
+  Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
+                   signals_stride_writer, fault_ptr, rank, timeout_ticks};
   using Block       = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M, THREADS_PER_BLOCK>;
   const int tiles_n = (inp_size_n + TILE_N - 1) / TILE_N;
   const auto staging      = rank_ptrs<DTYPE, WORLD>(staging_ptrs, staging_stride_m,

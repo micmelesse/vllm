@@ -51,14 +51,16 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
   if (l.staged && one_shot)
     Call<AllReduceOneShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.staging_ptrs(),
-        l.staging_stride_m, l.staging_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
+        l.staging_stride_m, l.staging_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m,
         l.inp_stride_n, inp_size_m, inp_size_n, l.band_m);
   else if (l.staged)
     Call<AllReduceTwoShotStagedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.scratch_ptrs(),
         l.scratch_stride_m, l.scratch_stride_n, h.staging_ptrs(), l.staging_stride_m,
-        l.staging_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
+        l.staging_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
         l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m, l.inp_stride_n, inp_size_m,
         inp_size_n, l.band_m);
   else {
@@ -68,14 +70,16 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
     if (one_shot)
       Call<AllReduceOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
-                                        h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
+                                        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+                                        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
                                         inp_size_m, inp_size_n);
     else
       Call<AllReduceTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
                                         l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
                                         h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-                                        h.signal_ptrs(), h.self_signal_ptr(), h.rank(),
+                                        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+                                        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
                                         h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
                                         inp_size_m, inp_size_n);
   }
@@ -89,13 +93,15 @@ inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& 
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out,
+        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out,
         l.out_stride_m, l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
   else
     Call<AllReduceRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-        h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
         l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
 }
 
@@ -107,7 +113,8 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out,
+        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out,
         l.out_stride_m, l.out_stride_n, l.residual_out, l.residual_out_stride_m,
         l.residual_out_stride_n, l.residual, l.residual_stride_m, l.residual_stride_n, l.weight,
         l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
@@ -115,7 +122,8 @@ inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormL
     Call<AllReduceAddRmsNormTwoShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-        h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
         l.out_stride_n, l.residual_out, l.residual_out_stride_m, l.residual_out_stride_n,
         l.residual, l.residual_stride_m, l.residual_stride_n, l.weight, l.weight_stride_n, l.eps,
         inp_size_m, inp_size_n);
@@ -131,7 +139,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
+        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
@@ -140,7 +149,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
     Call<AllReduceAddAttnResRmsNormPushKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-        h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
@@ -149,7 +159,8 @@ inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
     Call<AllReduceAddAttnResRmsNormPullKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
         l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-        h.signal_ptrs(), h.self_signal_ptr(), h.rank(), h.timeout_ticks(),
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
         l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
         l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
         l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
