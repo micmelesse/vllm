@@ -134,16 +134,25 @@ inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error> all_reduce_add_attn
     std::optional<int> reduce_scatter_blocks, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
-          dtype, {{prefix_stride_m, prefix_stride_n},
-                  {output_stride_m, output_stride_n},
-                  {input_stride_m, input_stride_n},
+          dtype, {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
                   {blocks_stride_r, blocks_stride_n},
                   {0, norm_weight_stride_n},
-                  {0, qk_weight_stride_n}}))
+                  {0, qk_weight_stride_n},
+                  {prefix_output_stride_m, prefix_output_stride_n},
+                  {output_stride_m, output_stride_n}}))
     return *e;
+  // THE OPTIONAL BUFFERS, checked only when given: a missing one is a null pointer with zero strides,
+  // which is no layout at all (a prefix-less call was refused as `inner_stride_not_one`, 2026-10-13).
+  if (prefix != nullptr)
+    if (const std::optional<Error> e = layout_refused(dtype, {{prefix_stride_m, prefix_stride_n}}))
+      return *e;
   if (output_norm_weight != nullptr)
     if (const std::optional<Error> e = layout_refused(dtype, {{0, output_norm_weight_stride_n}}))
+      return *e;
+  if (block_output != nullptr)
+    if (const std::optional<Error> e =
+            layout_refused(dtype, {{block_output_stride_m, block_output_stride_n}}))
       return *e;
   std::variant<AllReduceAddAttnResRmsNormLaunch, Error> l =
       select_all_reduce_add_attn_res_rms_norm(

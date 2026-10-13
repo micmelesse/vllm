@@ -2452,6 +2452,18 @@ def _refused_or_right(answers: list[tuple[bool, str | None]], plain: bool) -> No
         assert not plain, f"a plain call was refused: {refusal}"
 
 
+def _refusal(forced: dict, admitted: bool, no: Refused) -> tuple[bool, str | None]:
+    """A REFUSAL IS AN ANSWER only where nothing promised the call would run: a forced
+    call (C++ decides those) or one `should_` declined. A plain call `should_` admitted
+    and the op then refused breaks the contract every caller relies on, the Kimi path
+    first: it calls the fused op whenever the communicator is live (a prefix-less
+    AttnRes call was refused on its null prefix's strides and passed here as REFUSED,
+    2026-10-13)."""
+    if not forced and admitted:
+        return False, f"should_ admitted the call and the op refused it: {no.error.name}"
+    return True, f"REFUSED {no.error.name}"
+
+
 def _the_call_left_nothing(comm: HipCustomCommunicator) -> None:
     """After a call has finished: it did not break the communicator (a break ends the
     world, so the next case starts clean instead of inheriting it), and it left no
@@ -2487,7 +2499,7 @@ def run_all_reduce_api_rank(
         out = comm.all_reduce(x, **_forcing(forced))
         torch.cuda.synchronize()
     except Refused as no:
-        return True, f"REFUSED {no.error.name}"
+        return _refusal(forced, comm.should_allreduce(x), no)
     _the_call_left_nothing(comm)
     atol, rtol = _fused_tolerance(dt)
     return (why := _differences([("out", out, summed, atol)], rtol)) is None, why
@@ -2558,7 +2570,7 @@ def run_all_reduce_rms_norm_api_rank(
         out = comm.all_reduce_rms_norm(x, weight, FUSED_EPS, **_forcing(forced))
         torch.cuda.synchronize()
     except Refused as no:
-        return True, f"REFUSED {no.error.name}"
+        return _refusal(forced, comm.should_allreduce_rms_norm(x, weight), no)
     _the_call_left_nothing(comm)
     want = vllm.ir.ops.rms_norm(summed, weight, FUSED_EPS)
     atol, rtol = _fused_tolerance(dt)
@@ -2635,7 +2647,7 @@ def run_all_reduce_add_rms_norm_api_rank(
         )
         torch.cuda.synchronize()
     except Refused as no:
-        return True, f"REFUSED {no.error.name}"
+        return _refusal(forced, comm.should_allreduce_add_rms_norm(x, weight), no)
     _the_call_left_nothing(comm)
     want, want_residual = vllm.ir.ops.fused_add_rms_norm(
         summed, residual.clone(), weight, FUSED_EPS
@@ -2743,7 +2755,7 @@ def run_all_reduce_add_attn_res_rms_norm_api_rank(
         )
         torch.cuda.synchronize()
     except Refused as no:
-        return True, f"REFUSED {no.error.name}"
+        return _refusal(forced, comm.should_allreduce_add_attn_res_rms_norm(x), no)
     _the_call_left_nothing(comm)
     want_prefix = prefix.clone() if has_prefix else summed.clone()
     want_blocks = blocks.clone()
