@@ -1166,7 +1166,11 @@ def exercise(
                 inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
                 # ALIGNED BEFORE THE CALLS: each rank made its inputs on its own, and a
                 # rank that finishes late reaches the first collective late, which the
-                # others' waits would count against TEST_TIMEOUT_SECONDS.
+                # others' waits would count against TEST_TIMEOUT_SECONDS. Every rank
+                # reaches this barrier or none does, because `precheck` answers the same
+                # on every rank: its budget is a share of the device's TOTAL memory. Made
+                # from free memory, which differs by rank, one rank could skip the cell
+                # while the others wait here for it.
                 torch.cuda.synchronize()
                 dist.barrier(group=comm.cpu_group)
                 got = run_collective(
