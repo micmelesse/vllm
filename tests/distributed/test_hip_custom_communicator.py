@@ -195,8 +195,8 @@ class TorchCommunicator(HipCustomCommunicator):
 
     def _all_reduce(
         self,
-        out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
+        output: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
@@ -219,15 +219,15 @@ class TorchCommunicator(HipCustomCommunicator):
             )
         ):
             return Error.no_such_template
-        out.copy_(inp)
-        dist.all_reduce(out, group=self.device_group)  # SUM
+        output.copy_(input)
+        dist.all_reduce(output, group=self.device_group)  # SUM
         return None
 
     def _all_reduce_rms_norm(
         self,
-        out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         weight: torch.Tensor,
+        output: torch.Tensor,
         eps: float,
         algorithm: str | None,
         direction: str | None,
@@ -241,11 +241,11 @@ class TorchCommunicator(HipCustomCommunicator):
 
     def _all_reduce_add_rms_norm(
         self,
-        out: torch.Tensor,
-        residual_out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
+        output: torch.Tensor,
+        residual_output: torch.Tensor,
         eps: float,
         algorithm: str | None,
         direction: str | None,
@@ -259,18 +259,18 @@ class TorchCommunicator(HipCustomCommunicator):
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
-        prefix_out: torch.Tensor,
-        out: torch.Tensor,
-        inp: torch.Tensor,
-        has_prefix: bool,
+        input: torch.Tensor,
+        prefix: torch.Tensor | None,
         blocks: torch.Tensor,
         norm_weight: torch.Tensor,
         qk_weight: torch.Tensor,
-        out_norm_weight: torch.Tensor | None,
+        output_norm_weight: torch.Tensor | None,
+        prefix_output: torch.Tensor,
+        output: torch.Tensor,
+        block_output: torch.Tensor | None,
         num_blocks: int,
-        write_idx: int,
         eps: float,
-        out_eps: float,
+        output_eps: float,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
