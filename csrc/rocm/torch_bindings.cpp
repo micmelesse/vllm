@@ -20,35 +20,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 #ifndef VLLM_SKIP_SKINNY_GEMMS
   // Custom gemm op for matrix-vector multiplication
   rocm_ops.def(
-      "LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> "
-      "Tensor");
+      "LLMM1(Tensor in_a, Tensor in_b, int rows_per_block) -> Tensor");
   rocm_ops.impl("LLMM1", torch::kCUDA, &LLMM1);
 
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
-      "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
-      "Tensor");
+      "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> Tensor");
   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
 
   // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales,
   // optional zero points [M/8, K/group_size] int32 for asymmetric
   // quantization
   rocm_ops.def(
-      "wvSplitK_int4_g(Tensor in_a, Tensor in_b, Tensor in_scale, "
-      "Tensor? in_zero_points, Tensor? in_bias, int CuCount, "
-      "int group_size) -> Tensor");
+      "wvSplitK_int4_g(Tensor in_a, Tensor in_b, Tensor in_scale, Tensor? in_zero_points, "
+      "Tensor? in_bias, int CuCount, int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
-      "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
-      "Tensor");
+      "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> Tensor");
   rocm_ops.impl("wvSplitKrc", torch::kCUDA, &wvSplitKrc);
 
   // wvSplitK for fp8
   rocm_ops.def(
-      "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor? in_bias, Tensor! out_c, "
-      "Tensor scale_a, "
+      "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor? in_bias, Tensor! out_c, Tensor scale_a, "
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
@@ -56,21 +51,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
-      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, bool use_v2_format) -> Tensor");
+      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, Tensor b_scales, "
+      "bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
 
   rocm_ops.def(
-      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
-      "Tensor b_scales, bool use_v2_format) -> Tensor");
+      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, Tensor b_scales, "
+      "bool use_v2_format) -> Tensor");
   rocm_ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
 
   rocm_ops.def(
-      "moe_gptq_gemm_rdna3(Tensor a, Tensor! c, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor b_qzeros, Tensor topk_weights, "
-      "Tensor sorted_token_ids, Tensor expert_ids, "
-      "Tensor num_tokens_post_padded, "
-      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "moe_gptq_gemm_rdna3(Tensor a, Tensor! c, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor b_qzeros, Tensor topk_weights, Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, int top_k, int block_size_m, bool mul_topk_weight, "
       "int output_topk) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
@@ -79,21 +72,80 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
   rocm_ops.def(
-      "paged_attention(Tensor! out, Tensor exp_sums,"
-      "                Tensor max_logits, Tensor tmp_out,"
-      "                Tensor query, Tensor key_cache,"
-      "                Tensor value_cache, int num_kv_heads,"
-      "                float scale, Tensor block_tables,"
-      "                Tensor seq_lens,"
-      "                Tensor? query_start_loc,"
-      "                int block_size,"
-      "                int max_seq_len,"
-      "                Tensor? alibi_slopes,"
-      "                str kv_cache_dtype,"
-      "                Tensor k_scale, Tensor v_scale,"
-      "                Tensor? fp8_out_scale,"
-      "                str mfma_type) -> ()");
+      "paged_attention(Tensor! out, Tensor exp_sums,                Tensor max_logits, "
+      "Tensor tmp_out,                Tensor query, Tensor key_cache, "
+      "               Tensor value_cache, int num_kv_heads,                float scale, "
+      "Tensor block_tables,                Tensor seq_lens, "
+      "               Tensor? query_start_loc,                int block_size, "
+      "               int max_seq_len,                Tensor? alibi_slopes, "
+      "               str kv_cache_dtype,                Tensor k_scale, Tensor v_scale, "
+      "               Tensor? fp8_out_scale,                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // ROCm TP collectives. Only the two collectives take tensors, so only they get a
+  // schema plus a device impl. THE REST TAKE NONE, and an op with no tensor argument
+  // has nothing for the dispatcher to select a backend from -- a `kCPU` impl is then
+  // unreachable and the call raises "no fallback function is registered". So they are
+  // bound directly, which is what vLLM's quick-reduce does with its own handle ops.
+  rocm_ops.def(
+      "hip_custom_communicator_open(str cpu_group, str device_group, int device, "
+      "float timeout_seconds) -> (int?, int?)",
+      &hip_custom_communicator_open);
+  rocm_ops.def(
+      "hip_custom_communicator_stamps", &hip_custom_communicator_stamps);
+  rocm_ops.def(
+      "hip_custom_communicator_dispose", &hip_custom_communicator_dispose);
+  // The fault record the watchdog polls, and the abort it sets (barrier.cuh).
+  rocm_ops.def("hip_custom_communicator_status(int handle_ptr) -> int[]", &hip_custom_communicator_status);
+  rocm_ops.def("hip_custom_communicator_signals(int handle_ptr) -> int[]", &hip_custom_communicator_signals);
+  rocm_ops.def("hip_custom_communicator_abort(int handle_ptr) -> ()", &hip_custom_communicator_abort);
+  rocm_ops.def("hip_custom_communicator_register_buffer(int handle_ptr, Tensor buffer, str group) -> ()",
+               &hip_custom_communicator_register_buffer);
+  rocm_ops.def("hip_custom_communicator_forget_buffer(int handle_ptr, Tensor buffer) -> ()",
+               &hip_custom_communicator_forget_buffer);
+  rocm_ops.def("hip_custom_communicator_wall_clock_khz(int device) -> int", &hip_custom_communicator_wall_clock_khz);
+  rocm_ops.def(
+      "hip_custom_communicator_supported(int device, int world) -> (str?, int?)",
+               &hip_custom_communicator_supported);
+  rocm_ops.def(
+      "hip_custom_communicator_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
+      "str[], int[], int[], str[], str[], int[])",
+      &hip_custom_communicator_build_info);
+  rocm_ops.def(
+      "hip_custom_communicator_register_captured", &hip_custom_communicator_register_captured);
+
+  rocm_ops.def(
+      "hip_custom_communicator_all_reduce(int handle_ptr, Tensor input, Tensor! output, str? algorithm, "
+      "str? direction, int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
+      "int? waves_per_eu) -> int?");
+  rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA, &hip_custom_communicator_all_reduce);
+
+  // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
+  // (which also returns the sum plus residual). `eps` is a float in the schema because
+  // torch has no `double` there; the kernel narrows it.
+  rocm_ops.def(
+      "hip_custom_communicator_all_reduce_rms_norm(int handle_ptr, Tensor input, Tensor weight, Tensor! output, "
+      "float eps, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
+      "int? blocks_per_grid, int? waves_per_eu) -> int?");
+  rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_rms_norm);
+  rocm_ops.def(
+      "hip_custom_communicator_all_reduce_add_rms_norm(int handle_ptr, Tensor input, Tensor residual, "
+      "Tensor weight, Tensor! output, Tensor! residual_output, float eps, str? algorithm, str? direction, "
+      "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, int? waves_per_eu) -> int?");
+  rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_add_rms_norm);
+
+  rocm_ops.def(
+      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor input, "
+      "Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, "
+      "Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, "
+      "int num_blocks, float eps, float output_eps, str? algorithm, str? direction, int? tile_m, "
+      "int? tile_n, int? tile_k, "
+      "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
+      "int? waves_per_eu) -> int?");
+  rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
+                &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
