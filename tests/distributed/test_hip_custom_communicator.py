@@ -1154,6 +1154,12 @@ def exercise(
                 got = run_collective(
                     comm, op_name, [i[rank] for i in inputs], sched, forced
                 )
+                # NOTHING LEFT BEHIND, after every call of the schedule (run_collective
+                # synchronized): ours returns its signals to zero.
+                if isinstance(comm, HipCustomCommunicator) and (left := comm.signals()):
+                    raise RuntimeError(
+                        f"{op_name} left {len(left)} signals set: {left[:4]}"
+                    )
                 expected = [expected_outputs(op_name, i, slots) for i in inputs]
                 return [compare(g, e, atol, RTOL) for g, e in zip(got, expected)], None
 
@@ -2420,11 +2426,15 @@ def _refused_or_right(answers: list[tuple[bool, str | None]], plain: bool) -> No
         assert not plain, f"a plain call was refused: {refusal}"
 
 
-def _broken_stops_the_world(comm: HipCustomCommunicator) -> None:
-    """A call that broke the communicator ends the world, so the next case starts
-    clean instead of inheriting the break."""
+def _the_call_left_nothing(comm: HipCustomCommunicator) -> None:
+    """After a call has finished: it did not break the communicator (a break ends the
+    world, so the next case starts clean instead of inheriting it), and it left no
+    signal set (every launch returns its signals to zero; one that does not leaves
+    state the next launch pairs against)."""
     if isinstance(comm.state, Broken):
         raise RuntimeError(f"the call broke the communicator: {comm.state}")
+    if left := comm.signals():
+        raise RuntimeError(f"the call left {len(left)} signals set: {left[:4]}")
 
 
 # -- all_reduce ---------------------------------------------------------------------
@@ -2452,7 +2462,7 @@ def run_all_reduce_api_rank(
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
-    _broken_stops_the_world(comm)
+    _the_call_left_nothing(comm)
     atol, rtol = _fused_tolerance(dt)
     return (why := _differences([("out", out, summed, atol)], rtol)) is None, why
 
@@ -2523,7 +2533,7 @@ def run_all_reduce_rms_norm_api_rank(
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
-    _broken_stops_the_world(comm)
+    _the_call_left_nothing(comm)
     want = vllm.ir.ops.rms_norm(summed, weight, FUSED_EPS)
     atol, rtol = _fused_tolerance(dt)
     return (why := _differences([("out", out, want, atol)], rtol)) is None, why
@@ -2600,7 +2610,7 @@ def run_all_reduce_add_rms_norm_api_rank(
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
-    _broken_stops_the_world(comm)
+    _the_call_left_nothing(comm)
     want, want_residual = vllm.ir.ops.fused_add_rms_norm(
         summed, residual.clone(), weight, FUSED_EPS
     )
@@ -2708,7 +2718,7 @@ def run_all_reduce_add_attn_res_rms_norm_api_rank(
         torch.cuda.synchronize()
     except Refused as no:
         return True, f"REFUSED {no.error.name}"
-    _broken_stops_the_world(comm)
+    _the_call_left_nothing(comm)
     want_prefix = prefix.clone() if has_prefix else summed.clone()
     want_blocks = blocks.clone()
     want = attn_res(

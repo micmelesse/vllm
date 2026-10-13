@@ -100,6 +100,18 @@ class Where(IntEnum):
 
 
 @dataclass(frozen=True)
+class Flag:
+    """A SIGNAL THAT IS SET, in this rank's signals: the slot block `block` on rank
+    `writer` sets at a barrier of `parity`. None is set between launches; one that is
+    is state a launch left behind."""
+
+    parity: int
+    block: int
+    writer: int
+    value: int
+
+
+@dataclass(frozen=True)
 class Fault:
     """A RANK'S FAULT RECORD: the first of its kernels' waits to outlive the timeout,
     which then left the kernel (its output garbage) and made every other wait on the
@@ -108,18 +120,26 @@ class Fault:
     where: Where
     rank: int
     block: int
-    peer: int  # the rank it waited for, -1 for none (a wait on this device)
-    count: int  # the counter it read last
+    peer: int  # the rank it waited for
+    count: int  # the flag it read last
     want: int  # the value it waited for
     waited_s: float
 
     def __str__(self) -> str:
-        waited_for = "" if self.peer < 0 else f" for rank {self.peer}"
         return (
             f"rank {self.rank} block {self.block} gave up in {self.where.name}"
-            f"{waited_for} after {self.waited_s:.1f} s: count {self.count}, "
+            f" for rank {self.peer} after {self.waited_s:.1f} s: count {self.count}, "
             f"want {self.want}"
         )
+
+
+@dataclass(frozen=True)
+class Status:
+    """A RANK'S STATUS, as C++ reads it: whether its waits were told to leave, and
+    the fault its first wait to give up recorded (None when none has)."""
+
+    abort: bool
+    fault: Fault | None
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -992,24 +1012,39 @@ class HipCustomCommunicator:
         torch.ops._rocm_C.hip_custom_communicator_dispose(self._handle)
         self._handle = None
 
-    def _fault(self) -> Fault | None:
-        """The C++ handle's fault record (host-mapped, so this never waits on the
-        device)."""
+    def status(self) -> Status:
+        """This rank's status, read from host-mapped memory, so it never waits on the
+        device: valid even while a kernel is hung."""
         if self._handle is None:
-            return None
-        got = torch.ops._rocm_C.hip_custom_communicator_fault(self._handle)
-        if not got:
-            return None
-        where, rank, block, peer, count, want, ticks = got
-        return Fault(
-            where=Where(where),
-            rank=rank,
-            block=block,
-            peer=peer,
-            count=count,
-            want=want,
-            waited_s=ticks / (self._khz * 1000.0),
+            return Status(abort=False, fault=None)
+        abort, state, where, rank, block, peer, count, want, ticks = (
+            torch.ops._rocm_C.hip_custom_communicator_status(self._handle)
         )
+        fault = None
+        if state == 2:  # written whole
+            fault = Fault(
+                where=Where(where),
+                rank=rank,
+                block=block,
+                peer=peer,
+                count=count,
+                want=want,
+                waited_s=ticks / (self._khz * 1000.0),
+            )
+        return Status(abort=abort != 0, fault=fault)
+
+    def signals(self) -> list[Flag]:
+        """This rank's signals that are set; empty between launches. It reads device
+        memory, so call it only once the launches have finished
+        (`torch.cuda.synchronize()`)."""
+        if self._handle is None:
+            return []
+        flat = torch.ops._rocm_C.hip_custom_communicator_signals(self._handle)
+        return [Flag(*flat[i : i + 4]) for i in range(0, len(flat), 4)]
+
+    def _fault(self) -> Fault | None:
+        """The fault this rank's status records, for the watchdog."""
+        return self.status().fault
 
     def _abort(self) -> None:
         if self._handle is not None:

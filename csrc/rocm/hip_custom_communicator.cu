@@ -234,20 +234,30 @@ BuildInfoWire hip_custom_communicator_build_info() {
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
 
-// THE FAULT RECORD AS PYTHON READS IT: polled by the communicator's watchdog, so it never waits on
-// the device.
-std::vector<int64_t> hip_custom_communicator_fault(fptr_t handle_ptr) {
-  const auto f = handle_of(handle_ptr).fault();
-  if (!f) return {};
+// THE STATUS AS PYTHON READS IT, every field in StatusField's order, `elapsed` its two words joined:
+// polled by the communicator's watchdog, so it never waits on the device.
+std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr) {
   using hip_custom_communicator::StatusField;
-  const auto word = [&](StatusField s) { return (*f)[static_cast<int>(s)]; };
+  const auto words = handle_of(handle_ptr).status();
+  const auto word  = [&](StatusField s) { return words[static_cast<int>(s)]; };
   const auto as_int = [](uint32_t w) { return static_cast<int64_t>(static_cast<int32_t>(w)); };
-  const int64_t elapsed = static_cast<int64_t>(uint64_t{word(StatusField::elapsed_high)} << 32 |
-                                               word(StatusField::elapsed_low));
-  return {static_cast<int64_t>(word(StatusField::where)), as_int(word(StatusField::rank)),
-          as_int(word(StatusField::block)), as_int(word(StatusField::peer)),
-          static_cast<int64_t>(word(StatusField::count)), static_cast<int64_t>(word(StatusField::want)),
-          elapsed};
+  return {word(StatusField::abort),
+          word(StatusField::state),
+          word(StatusField::where),
+          as_int(word(StatusField::rank)),
+          as_int(word(StatusField::block)),
+          as_int(word(StatusField::peer)),
+          word(StatusField::count),
+          word(StatusField::want),
+          static_cast<int64_t>(uint64_t{word(StatusField::elapsed_high)} << 32 |
+                               word(StatusField::elapsed_low))};
+}
+// THE SIGNALS THAT ARE SET, this rank's, flattened four a flag: parity, block, writer, value. Empty
+// between launches; read once they have finished.
+std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr) {
+  std::vector<int64_t> flat;
+  for (const auto& f : handle_of(handle_ptr).signals_set()) flat.insert(flat.end(), f.begin(), f.end());
+  return flat;
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) { handle_of(handle_ptr).abort(); }
 

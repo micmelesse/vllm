@@ -208,14 +208,32 @@ class Handle {
   static constexpr int64_t status_size_field() { return kStatusFields; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
 
-  // THE FAULT, read from the status while kernels run: every field's word once a wait has written it
-  // whole (`state` 2), else nothing.
-  std::optional<std::array<uint32_t, kStatusFields>> fault() const {
-    if (__atomic_load_n(&status_[static_cast<int>(StatusField::state)], __ATOMIC_ACQUIRE) != 2)
-      return std::nullopt;
+  // THE STATUS, every field's word, read while kernels run (host-mapped: it never waits on the
+  // device). The fault's fields are whole only once `state` is 2; the reader checks.
+  std::array<uint32_t, kStatusFields> status() const {
     std::array<uint32_t, kStatusFields> words{};
-    for (int f = 0; f < kStatusFields; ++f) words[f] = status_[f];
+    words[static_cast<int>(StatusField::state)] =
+        __atomic_load_n(&status_[static_cast<int>(StatusField::state)], __ATOMIC_ACQUIRE);
+    for (int f = 0; f < kStatusFields; ++f)
+      if (f != static_cast<int>(StatusField::state)) words[f] = status_[f];
     return words;
+  }
+  // THE SIGNALS THAT ARE SET, this rank's: each flag not zero, as (parity, block, writer, value).
+  // Between launches there are none (barrier.cuh); read only once the launches have finished, as
+  // this copies device memory that a running kernel is changing.
+  std::vector<std::array<int64_t, 4>> signals_set() const {
+    std::vector<uint32_t> flags(static_cast<size_t>(kSignalsBytes / sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(flags.data(), signals_, static_cast<size_t>(kSignalsBytes),
+                        hipMemcpyDeviceToHost));
+    std::vector<std::array<int64_t, 4>> set;
+    for (int64_t p = 0; p < signals_size_parity(); ++p)
+      for (int64_t b = 0; b < signals_size_block(); ++b)
+        for (int64_t w = 0; w < signals_size_writer(); ++w) {
+          const uint32_t v = flags[p * signals_stride_parity() + b * signals_stride_block() +
+                                   w * signals_stride_writer()];
+          if (v != 0) set.push_back({p, b, w, v});
+        }
+    return set;
   }
   // Every wait on this rank leaves at its next check: for a communicator the host has given up on.
   void abort() {

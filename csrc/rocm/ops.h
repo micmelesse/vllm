@@ -71,7 +71,8 @@ torch::Tensor hip_custom_communicator_stamps();
 void hip_custom_communicator_dispose(fptr_t handle_ptr);
 // The rank's fault record, [where, rank, block, peer, count, want, elapsed_ticks], or empty while
 // no wait has given up; and the abort every wait on the rank then leaves at.
-std::vector<int64_t> hip_custom_communicator_fault(fptr_t handle_ptr);
+std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr);
+std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr);
 void hip_custom_communicator_abort(fptr_t handle_ptr);
 
 // A variant at the torch boundary: the arch or the Error's number, exactly one
