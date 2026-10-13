@@ -32,7 +32,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
   const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // 2. Each of this block's rows: read it from every rank in rank order and sum, then (ADD_RESIDUAL) add
@@ -76,9 +76,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Group::peers, Until::read>(sync);
+  barrier<Until::read>(sync);
   block_stamp(5);
-  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

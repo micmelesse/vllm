@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read this rank's input.
-  barrier<Group::peers, Until::visible>(sync);
+  barrier<Until::visible>(sync);
   block_stamp(3);
 
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then AttnRes, as the
@@ -105,7 +105,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                          out_eps, inv_hidden);
   }
   block_stamp(4);
-  sync.finish();
 }
 
 }  // namespace hip_custom_communicator

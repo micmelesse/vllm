@@ -38,22 +38,14 @@ constexpr int kMaxBlocks = kMaxResidentBlocks;
 // WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's `Where`, number for
 // number. 0 is no fault.
 enum class Where : uint32_t {
-  start = 1,          // a peers barrier at the launch's start: the peer had not launched
-  peer_barrier,       // a peers barrier after it
-  world_peer,         // a world barrier's exchange: the peer had not posted its epoch
-  world,              // a world barrier on this device: the last block never released the grid
-  grid,               // a grid barrier on this device
-  flag,               // wait_flag: the peer had not written its flag
+  start = 1,     // a launch's first barrier: the peer had not launched
+  peer_barrier,  // a later barrier
 };
-constexpr int kNumWheres = 6;  // numbered from 1
+constexpr int kNumWheres = 2;  // numbered from 1
 constexpr const char* to_string(Where w) {
   switch (w) {
     case Where::start: return "start";
     case Where::peer_barrier: return "peer_barrier";
-    case Where::world_peer: return "world_peer";
-    case Where::world: return "world";
-    case Where::grid: return "grid";
-    case Where::flag: return "flag";
   }
   return "?";
 }
@@ -70,32 +62,18 @@ struct Fault {
   uint32_t where;          // Where
   int32_t rank;            // this rank
   int32_t block;           // the block that gave up
-  int32_t peer;            // the rank it waited for, -1 for none (a grid wait)
+  int32_t peer;            // the rank it waited for
   uint32_t count;          // the counter it read last
   uint32_t want;           // the value it waited for
   uint64_t elapsed_ticks;  // how long it waited, in the device wall clock's ticks
 };
 
-// One IPC allocation per rank holds the signal block AND the scratch: scratch is simply
-// the bytes after the struct.
-//
-// TWO counter arrays, not one. A peer block can reach the second barrier while this one
-// is still at the first, and with a single array the peer would write counter+1 while we
-// busy-wait on counter. `seq` is the per-block monotonic sequence number.
-//
-// The barriers use the rest: `peer[r]` is the last world barrier rank r posted here,
-// `arrive` and `gen` the grid barrier on this device, `epoch` the syncs this rank has
-// completed.
+// A RANK'S SIGNAL BLOCK, the first bytes of its one IPC allocation (the scratch and staging follow):
+// `flags[parity][block][writer]`, the slot block `block` on rank `writer` sets here. Two sets, so a
+// launch's consecutive barriers never share a slot (barrier.cuh), and every flag is 0 between
+// launches: nothing in it is state.
 struct Signal {
-  alignas(128) uint32_t start[kMaxBlocks][kMaxRanks];
-  alignas(128) uint32_t end[kMaxBlocks][kMaxRanks];
-  alignas(128) uint32_t seq[kMaxBlocks];
-  alignas(128) uint32_t peer[kMaxRanks];
-  // `flag[r]`: the last flag rank r wrote here (write_flag).
-  alignas(128) uint32_t flag[kMaxRanks];
-  alignas(128) uint32_t arrive;
-  alignas(128) uint32_t gen;
-  alignas(128) uint32_t epoch;
+  alignas(128) uint32_t flags[2][kMaxBlocks][kMaxRanks];
   // This rank's fault record (the handle's, host-mapped), written once when the handle opens.
   // A peer's block holds that peer's, which this rank never reads.
   alignas(128) Fault* fault;

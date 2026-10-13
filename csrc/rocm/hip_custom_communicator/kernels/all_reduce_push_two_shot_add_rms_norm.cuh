@@ -51,7 +51,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across it they spilled).
@@ -78,7 +78,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch.
-  barrier<Group::peers, Until::visible>(sync);
+  barrier<Until::visible>(sync);
   block_stamp(3);
 
   // 4. This block's rows out of this rank's scratch: (ADD_RESIDUAL) add the residual, then RMSNorm,
@@ -113,7 +113,6 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     tile_store(normed, out);
   }
   block_stamp(4);
-  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

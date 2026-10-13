@@ -39,7 +39,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto qk_w       = local_ptr(qk_w_ptr, 0, qk_w_stride_n, rank);
   const auto out_norm_w = local_ptr(out_norm_w_ptr, 0, out_norm_w_stride_n, rank);
   const auto out        = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every rank in rank order,
   //    sum, AttnRes.
@@ -54,8 +54,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Group::peers, Until::read>(sync);
-  sync.finish();
+  barrier<Until::read>(sync);
 }
 
 }  // namespace hip_custom_communicator

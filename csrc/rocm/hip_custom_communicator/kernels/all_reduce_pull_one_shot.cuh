@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
   const auto out    = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // 2. Read every rank's input, in rank order, and sum.
@@ -46,9 +46,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Group::peers, Until::read>(sync);
+  barrier<Until::read>(sync);
   block_stamp(5);
-  sync.finish();
 }
 
 // STAGED: each rank copies its input into its staging `band_m` rows at a time and every rank
@@ -88,7 +87,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       tile_load(mine, inp);
       tile_store(mine, own_staging);
     }
-    barrier<Group::peers, Until::visible>(sync);
+    barrier<Until::visible>(sync);
     block_stamp(1);
     // 2. Read every rank's staged band, in rank order, and sum.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
@@ -101,10 +100,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     block_stamp(2);
     // 3. No rank may stage its next band until every peer has read this one.
-    barrier<Group::peers, Until::read>(sync);
+    barrier<Until::read>(sync);
     block_stamp(5);
   }
-  sync.finish();
 }
 
 }  // namespace hip_custom_communicator

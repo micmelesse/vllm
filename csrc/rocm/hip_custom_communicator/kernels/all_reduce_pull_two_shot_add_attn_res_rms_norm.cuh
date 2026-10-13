@@ -57,7 +57,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them: in rank order every
@@ -101,11 +101,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (inp_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
   block_stamp(2);
-  barrier<Group::peers, Until::visible>(sync);
+  barrier<Until::visible>(sync);
   block_stamp(3);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
   block_stamp(4);
-  sync.finish();
 }
 
 }  // namespace hip_custom_communicator

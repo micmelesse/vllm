@@ -96,11 +96,7 @@ class Where(IntEnum):
     for number (a test holds them equal)."""
 
     start = 1  # a launch's first barrier: the peer had not launched
-    peer_barrier = 2  # a later peers barrier
-    world_peer = 3  # a world barrier's exchange: the peer had not posted
-    world = 4  # a world barrier on this device
-    grid = 5  # a grid barrier on this device
-    flag = 6  # a flag the peer had not written
+    peer_barrier = 2  # a later barrier
 
 
 @dataclass(frozen=True)

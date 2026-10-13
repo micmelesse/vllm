@@ -39,7 +39,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // 1. Wait until every peer has launched, so its input is ready.
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack build keeps 68 B of
@@ -121,7 +121,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
-  barrier<Group::peers, Until::visible>(sync);
+  barrier<Until::visible>(sync);
   block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The next call's
@@ -171,7 +171,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     }
   }
   block_stamp(6);
-  sync.finish();
 }
 
 // THE KERNELS, one per op, both the body above.

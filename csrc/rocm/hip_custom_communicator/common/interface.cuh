@@ -25,8 +25,7 @@
 //   reduce.cuh     Sum, Max (a reduction's operation), Axis::m | n
 //   softmax.cuh    OnlineSoftmax
 //   peers.cuh      Signal, kMaxRanks, kMaxBlocks
-//   barrier.cuh    Sync<WORLD>{signal_ptrs, self_signal_ptr, rank, timeout}: write_flag(peer, v),
-//                  wait_flag(peer, v), finish() (the kernel's last statement); Group, Until
+//   barrier.cuh    Sync<WORLD>{signal_ptrs, self_signal_ptr, rank, timeout}, Until
 
 #pragma once
 
@@ -244,12 +243,12 @@ DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n, int rank) 
 // BARRIER: THE RANKS' SYNCHRONIZATION (barrier.cuh)
 // ===============================================================================================
 
-// GROUP peers (this block and the same block on every rank), grid (every block of this rank) or
-// world; UNTIL launched (every peer's input is ready), visible (what was written before is seen
-// after) or read (every peer is done reading this rank).
-template <Group GROUP, Until UNTIL, int WORLD>
+// This block and the same block on every rank, UNTIL launched (every peer's input is ready; a
+// launch's first barrier), visible (what was written before is seen after) or read (every peer is
+// done reading this rank). A kernel's barriers are even in number, so its flags end where they began.
+template <Until UNTIL, int WORLD>
 DINLINE void barrier(Sync<WORLD>& sync) {
-  impl::barrier<GROUP, UNTIL, WORLD>(sync);
+  impl::barrier<UNTIL, WORLD>(sync);
 }
 
 // ===============================================================================================

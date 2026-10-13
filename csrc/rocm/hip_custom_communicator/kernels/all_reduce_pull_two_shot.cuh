@@ -45,7 +45,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   };
   const auto out = local_ptr(out_ptr, out_stride_m, out_stride_n, rank);
   block_stamp(0);
-  barrier<Group::peers, Until::launched>(sync);
+  barrier<Until::launched>(sync);
   block_stamp(1);
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks, into its scratch.
@@ -53,14 +53,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
-  barrier<Group::peers, Until::visible>(sync);
+  barrier<Until::visible>(sync);
   block_stamp(3);
 
   // 4. All-gather: every rank's summed share out of its scratch, at its place in the output. The
   //    next call's first sync keeps a rank from overwriting its scratch while it is read.
   all_gather<Chunk, CONTIGUOUS>(rank, scratch, out, inp_size_m, inp_size_n);
   block_stamp(5);
-  sync.finish();
 }
 
 // STAGED: each rank copies its input into its staging a band of `band_m` rows at a time and each
@@ -104,7 +103,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    block reads), then visible (and, past the first pass, every peer has read this rank's
     //    scratch).
     stage<Chunk, CONTIGUOUS>(rank, inp, staging(rank), band, inp_size_n);
-    barrier<Group::peers, Until::visible>(sync);
+    barrier<Until::visible>(sync);
     block_stamp(1);
 
     // 2. Reduce-scatter: this rank's share of the band from every rank's staging, into its scratch.
@@ -113,14 +112,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read this rank's staged
     //    band, so the next one may overwrite it.
-    barrier<Group::peers, Until::visible>(sync);
+    barrier<Until::visible>(sync);
     block_stamp(3);
 
     // 4. All-gather: every rank's summed share out of its scratch, at its place in the output.
     all_gather<Chunk, CONTIGUOUS>(rank, scratch, out, band, inp_size_n);
     block_stamp(5);
   }
-  sync.finish();
 }
 
 }  // namespace hip_custom_communicator
