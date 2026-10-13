@@ -115,7 +115,7 @@ DINLINE void range_store(const TILE& t, const Ptr<T>& p, int n, int64_t first, i
 // REDUCE-SCATTER: this rank's share of the inputs, summed over the ranks, into its scratch (one
 // contiguous run from scratch.data). inp(r) is rank r's input at its strides, every rank's alike.
 template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& scratch) {
+DINLINE void reduce_scatter(int rank, RANK_PTR input, int m, int n, const Ptr<T>& scratch) {
   static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
   static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
   constexpr int WORLD = TILE::kTileR;
@@ -124,7 +124,7 @@ DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& 
   block_for_each_tile(1, s.chunks, [&](int, int chunk) {
     TILE got{1, s.len(rank), 0, chunk * TILE::kTileN};
     // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
-    range_load<CONTIGUOUS>(got, inp((rank + got.slice()) % WORLD), n, s.first(rank));
+    range_load<CONTIGUOUS>(got, input((rank + got.slice()) % WORLD), n, s.first(rank));
     // 2. Summed over the ranks, in rank order, through LDS.
     const auto sum = block_reduce<Sum, Axis::r>(got);
     // 3. Stored as T in this rank's scratch.
@@ -134,7 +134,7 @@ DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& 
 
 // ALL-GATHER: every rank's summed share out of its scratch, at its place in the output.
 template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, int n) {
+DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& output, int m, int n) {
   static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
   static_assert(TILE::kSliceThreads % kWaveSize == 0, "a rank's copy is whole waves");
   constexpr int WORLD = TILE::kTileR;
@@ -145,7 +145,7 @@ DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, in
     // 1. Rank r's summed chunk, in one round trip.
     tile_load(got, scratch(r).data, 0);
     // 2. Stored where rank r's share goes.
-    range_store<CONTIGUOUS>(got, out, n, s.first(r), s.len(r));
+    range_store<CONTIGUOUS>(got, output, n, s.first(r), s.len(r));
   });
 }
 
@@ -153,7 +153,7 @@ DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, in
 // (an [m, n] buffer, ours, its rows back to back: the host's staging_stride_m = n), each block the
 // chunks that rank's same block reads.
 template <typename TILE, bool CONTIGUOUS, typename T>
-DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int m, int n) {
+DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging, int m, int n) {
   static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR, "an [R, 1, TILE_N] chunk");
   constexpr int WORLD = TILE::kTileR;
   const Shares s      = shares_of<TILE>(m, n);
@@ -162,7 +162,7 @@ DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int
     const int len = s.len(r);
     if (len == 0) return;
     TILE part{1, len, 0, chunk * TILE::kTileN};
-    range_load<CONTIGUOUS>(part, inp, n, s.first(r));
+    range_load<CONTIGUOUS>(part, input, n, s.first(r));
     range_store<true>(part, staging, n, s.first(r), len);
   });
 }

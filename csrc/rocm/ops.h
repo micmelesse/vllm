@@ -95,43 +95,29 @@ hip_custom_communicator_build_info();
 // its builds, and the launch, all or none (none: select's). It returns the Error's
 // number it was refused for, or none when it ran.
 
-std::optional<int64_t> hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
-                           torch::Tensor& inp,
-                           std::optional<std::string> algorithm,
-                           std::optional<std::string> direction,
-                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                           std::optional<int64_t> threads_per_block,
-                           std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
-std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
-                                    torch::Tensor& inp, torch::Tensor& weight,
-                                    double eps,
-                                    std::optional<std::string> algorithm,
-                                    std::optional<std::string> direction,
-                                    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                                    std::optional<int64_t> threads_per_block,
-                                    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out,
-    torch::Tensor& inp, torch::Tensor& residual, torch::Tensor& weight,
-    double eps, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
-    torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
-    torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
-    int64_t write_idx, double eps, double out_eps, bool has_prefix,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
+std::optional<int64_t> hip_custom_communicator_all_reduce(
+    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
+    std::optional<std::string> algorithm, std::optional<std::string> direction, std::optional<int64_t> tile_m,
+    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu);
+std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output,
+    double eps, std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
+    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
+    torch::Tensor& output, torch::Tensor& residual_output, double eps,
+    std::optional<std::string> algorithm, std::optional<std::string> direction, std::optional<int64_t> tile_m,
+    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu);
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
+    torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
+    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps, std::optional<std::string> algorithm, std::optional<std::string> direction,
+    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
+    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu);

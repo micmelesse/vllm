@@ -45,127 +45,180 @@ inline int64_t extent_bytes(int64_t m, int64_t n, int64_t stride_m, DType dtype)
 // STAGED: the kernel copies its own input through its staging a pass at a time, so no peer reads it
 // where it is; in place, the peers read it through its input table.
 inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
-  const int inp_size_m = static_cast<int>(l.inp_size_m);
-  const int inp_size_n = static_cast<int>(l.inp_size_n);
   const bool one_shot = l.algorithm == Algorithm::one_shot;
   if (l.staged && one_shot)
     Call<AllReduceOneShotStagedKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.staging_ptrs(),
-        l.staging_stride_m, l.staging_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
-        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m,
-        l.inp_stride_n, inp_size_m, inp_size_n, l.band_m);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.output, l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.staging_ptrs(), l.staging_stride_m,
+        l.staging_stride_n, static_cast<int>(l.staging_size_m), static_cast<int>(l.staging_size_n),
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks());
   else if (l.staged)
     Call<AllReduceTwoShotStagedKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, h.scratch_ptrs(),
-        l.scratch_stride_m, l.scratch_stride_n, h.staging_ptrs(), l.staging_stride_m,
-        l.staging_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
-        l.out, l.out_stride_m, l.out_stride_n, l.inp, l.inp_stride_m, l.inp_stride_n, inp_size_m,
-        inp_size_n, l.band_m);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.output, l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
+        h.staging_ptrs(), l.staging_stride_m, l.staging_stride_n,
+        static_cast<int>(l.staging_size_m), static_cast<int>(l.staging_size_n), h.signals_ptrs(),
+        h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
+        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(),
+        h.rank(), h.timeout_ticks());
   else {
-    const void* const* inp_ptrs =
-        h.inp_ptrs(l.inp, extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype),
+    const void* const* input_ptrs =
+        h.input_ptrs(l.input, extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype),
                    l.stream);
     if (one_shot)
-      Call<AllReduceOneShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
-                                        l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
-                                        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-                                        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
-                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        inp_size_m, inp_size_n);
+      Call<AllReduceOneShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.output, l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
+        h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
+        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
+        h.timeout_ticks());
     else
-      Call<AllReduceTwoShotKernel>::run(l.kernel, l.blocks_per_grid, l.threads_per_block,
-                                        l.stream, inp_ptrs, l.inp_stride_m, l.inp_stride_n,
-                                        h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-                                        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-                                        h.signals_stride_writer(), h.fault_ptr(), h.rank(),
-                                        h.timeout_ticks(), l.out, l.out_stride_m, l.out_stride_n,
-                                        inp_size_m, inp_size_n);
+      Call<AllReduceTwoShotKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.output, l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks());
   }
 }
 
 inline void launch_all_reduce_rms_norm(Handle& h, const AllReduceRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
-  const int inp_size_m = static_cast<int>(l.inp_size_m);
-  const int inp_size_n = static_cast<int>(l.inp_size_n);
-  const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
+  const int64_t bytes = extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out,
-        l.out_stride_m, l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.weight, l.weight_stride_n, static_cast<int>(l.weight_size_n), l.output,
+        l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
+        h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
+        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
+        h.timeout_ticks(), l.eps);
   else
     Call<AllReduceRmsNormTwoShotKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.weight, l.weight_stride_n, static_cast<int>(l.weight_size_n), l.output,
+        l.output_stride_m, l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
-        l.out_stride_n, l.weight, l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.eps);
 }
 
 inline void launch_all_reduce_add_rms_norm(Handle& h, const AllReduceAddRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
-  const int inp_size_m = static_cast<int>(l.inp_size_m);
-  const int inp_size_n = static_cast<int>(l.inp_size_n);
-  const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
+  const int64_t bytes = extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out,
-        l.out_stride_m, l.out_stride_n, l.residual_out, l.residual_out_stride_m,
-        l.residual_out_stride_n, l.residual, l.residual_stride_m, l.residual_stride_n, l.weight,
-        l.weight_stride_n, l.eps, inp_size_m, inp_size_n);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.residual, l.residual_stride_m, l.residual_stride_n, static_cast<int>(l.residual_size_m),
+        static_cast<int>(l.residual_size_n), l.weight, l.weight_stride_n,
+        static_cast<int>(l.weight_size_n), l.output, l.output_stride_m, l.output_stride_n,
+        static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n), l.residual_output,
+        l.residual_output_stride_m, l.residual_output_stride_n,
+        static_cast<int>(l.residual_output_size_m), static_cast<int>(l.residual_output_size_n),
+        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.eps);
   else
     Call<AllReduceAddRmsNormTwoShotKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
-        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.out, l.out_stride_m,
-        l.out_stride_n, l.residual_out, l.residual_out_stride_m, l.residual_out_stride_n,
-        l.residual, l.residual_stride_m, l.residual_stride_n, l.weight, l.weight_stride_n, l.eps,
-        inp_size_m, inp_size_n);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.residual, l.residual_stride_m, l.residual_stride_n, static_cast<int>(l.residual_size_m),
+        static_cast<int>(l.residual_size_n), l.weight, l.weight_stride_n,
+        static_cast<int>(l.weight_size_n), l.output, l.output_stride_m, l.output_stride_n,
+        static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n), l.residual_output,
+        l.residual_output_stride_m, l.residual_output_stride_n,
+        static_cast<int>(l.residual_output_size_m), static_cast<int>(l.residual_output_size_n),
+        h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
+        static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n), h.signals_ptrs(),
+        h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
+        h.signals_size_parity(), h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(),
+        h.rank(), h.timeout_ticks(), l.eps);
 }
 
 // THE PULL TWO-SHOT takes its reduce-scatter blocks last.
 inline void launch_all_reduce_add_attn_res_rms_norm(Handle& h,
                                                     const AllReduceAddAttnResRmsNormLaunch& l) {
-  const int64_t bytes = extent_bytes(l.inp_size_m, l.inp_size_n, l.inp_stride_m, l.dtype);
-  const int inp_size_m = static_cast<int>(l.inp_size_m);
-  const int inp_size_n = static_cast<int>(l.inp_size_n);
-  const void* const* inp_ptrs = h.inp_ptrs(l.inp, bytes, l.stream);
+  const int64_t bytes = extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
-        l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
-        l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
-        l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n);
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.prefix, l.prefix_stride_m, l.prefix_stride_n, static_cast<int>(l.prefix_size_m),
+        static_cast<int>(l.prefix_size_n), l.blocks, l.blocks_stride_m, l.blocks_stride_r,
+        l.blocks_stride_n, static_cast<int>(l.blocks_size_m), static_cast<int>(l.blocks_size_r),
+        static_cast<int>(l.blocks_size_n), l.norm_weight, l.norm_weight_stride_n,
+        static_cast<int>(l.norm_weight_size_n), l.qk_weight, l.qk_weight_stride_n,
+        static_cast<int>(l.qk_weight_size_n), l.output_norm_weight, l.output_norm_weight_stride_n,
+        static_cast<int>(l.output_norm_weight_size_n), l.prefix_output, l.prefix_output_stride_m,
+        l.prefix_output_stride_n, static_cast<int>(l.prefix_output_size_m),
+        static_cast<int>(l.prefix_output_size_n), l.output, l.output_stride_m, l.output_stride_n,
+        static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n), l.block_output,
+        l.block_output_stride_m, l.block_output_stride_n, static_cast<int>(l.block_output_size_m),
+        static_cast<int>(l.block_output_size_n), h.signals_ptrs(), h.signals_stride_parity(),
+        h.signals_stride_block(), h.signals_stride_writer(), h.signals_size_parity(),
+        h.signals_size_block(), h.signals_size_writer(), h.fault_ptr(), h.rank(),
+        h.timeout_ticks(), l.num_blocks, l.eps, l.output_eps);
   else if (l.direction == Direction::push)
     Call<AllReduceAddAttnResRmsNormPushKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.prefix, l.prefix_stride_m, l.prefix_stride_n, static_cast<int>(l.prefix_size_m),
+        static_cast<int>(l.prefix_size_n), l.blocks, l.blocks_stride_m, l.blocks_stride_r,
+        l.blocks_stride_n, static_cast<int>(l.blocks_size_m), static_cast<int>(l.blocks_size_r),
+        static_cast<int>(l.blocks_size_n), l.norm_weight, l.norm_weight_stride_n,
+        static_cast<int>(l.norm_weight_size_n), l.qk_weight, l.qk_weight_stride_n,
+        static_cast<int>(l.qk_weight_size_n), l.output_norm_weight, l.output_norm_weight_stride_n,
+        static_cast<int>(l.output_norm_weight_size_n), l.prefix_output, l.prefix_output_stride_m,
+        l.prefix_output_stride_n, static_cast<int>(l.prefix_output_size_m),
+        static_cast<int>(l.prefix_output_size_n), l.output, l.output_stride_m, l.output_stride_n,
+        static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n), l.block_output,
+        l.block_output_stride_m, l.block_output_stride_n, static_cast<int>(l.block_output_size_m),
+        static_cast<int>(l.block_output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
-        l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
-        l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
-        l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n);
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.num_blocks, l.eps,
+        l.output_eps);
   else
     Call<AllReduceAddAttnResRmsNormPullKernel>::run(
-        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, inp_ptrs, l.inp_stride_m,
-        l.inp_stride_n, h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, input_ptrs, l.input_stride_m,
+        l.input_stride_n, static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
+        l.prefix, l.prefix_stride_m, l.prefix_stride_n, static_cast<int>(l.prefix_size_m),
+        static_cast<int>(l.prefix_size_n), l.blocks, l.blocks_stride_m, l.blocks_stride_r,
+        l.blocks_stride_n, static_cast<int>(l.blocks_size_m), static_cast<int>(l.blocks_size_r),
+        static_cast<int>(l.blocks_size_n), l.norm_weight, l.norm_weight_stride_n,
+        static_cast<int>(l.norm_weight_size_n), l.qk_weight, l.qk_weight_stride_n,
+        static_cast<int>(l.qk_weight_size_n), l.output_norm_weight, l.output_norm_weight_stride_n,
+        static_cast<int>(l.output_norm_weight_size_n), l.prefix_output, l.prefix_output_stride_m,
+        l.prefix_output_stride_n, static_cast<int>(l.prefix_output_size_m),
+        static_cast<int>(l.prefix_output_size_n), l.output, l.output_stride_m, l.output_stride_n,
+        static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n), l.block_output,
+        l.block_output_stride_m, l.block_output_stride_n, static_cast<int>(l.block_output_size_m),
+        static_cast<int>(l.block_output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        l.scratch_stride_n, static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(),
-        l.prefix, l.prefix_stride_m, l.prefix_stride_n, l.blocks, l.blocks_stride_m,
-        l.blocks_stride_r, l.blocks_stride_n, l.norm_weight, l.norm_weight_stride_n, l.qk_weight,
-        l.qk_weight_stride_n, l.out_norm_weight, l.out_norm_weight_stride_n, l.out, l.out_stride_m,
-        l.out_stride_n, l.num_blocks, l.write_idx, l.eps, l.out_eps, inp_size_m, inp_size_n,
-        l.reduce_scatter_blocks);
+        h.signals_stride_writer(), h.signals_size_parity(), h.signals_size_block(),
+        h.signals_size_writer(), h.fault_ptr(), h.rank(), h.timeout_ticks(), l.num_blocks, l.eps,
+        l.output_eps, l.reduce_scatter_blocks);
 }
 
 }  // namespace hip_custom_communicator

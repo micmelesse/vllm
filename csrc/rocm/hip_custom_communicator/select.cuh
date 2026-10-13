@@ -851,7 +851,7 @@ inline std::optional<Error> layout_refused(
 inline std::optional<Error> refused(const Handle* h, Template fn, const KernelConfig& c,
                                     DType dtype, int64_t m, int64_t n,
                                     int64_t tile_cols, std::optional<Error> own_error,
-                                    const void* inp, bool staged, hipStream_t stream) {
+                                    const void* input, bool staged, hipStream_t stream) {
   const int world = h ? h->world_size() : 1;
   if (h && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
@@ -874,7 +874,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in whole first.
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!staged && !h->reads_in_place(inp, stream) && bytes > h->staging_bytes())
+  if (!staged && !h->reads_in_place(input, stream) && bytes > h->staging_bytes())
     return Error::staging_too_small;
   return std::nullopt;
 }
@@ -902,11 +902,13 @@ constexpr int64_t tile_cols(OpType o, int64_t n) { return op(o).tile_holds_row ?
 // In place when the peers can read the input where it is (registered, or captured on this stream),
 // otherwise its staged kernel, a band of rows a pass.
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, int64_t m, int64_t n, DType dtype,
+    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
+    int64_t input_size_n, void* output, int64_t output_stride_m, int64_t output_stride_n,
+    int64_t output_size_m, int64_t output_size_n, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   const int world = h.world_size();
   // 1. The tile does not hold the row: the all-reduce tiles across it.
   const std::variant<Chosen, Error> picked = chosen(
@@ -920,7 +922,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const Template fn        = std::get<Chosen>(picked).fn;
   const KernelConfig c     = std::get<Chosen>(picked).config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  const bool staged = !h.reads_in_place(inp, stream);
+  const bool staged = !h.reads_in_place(input, stream);
   // THE STAGED BAND: the rows a pass, what the staging holds (and the two-shot's scratch, a row of
   // its slice a row).
   const int64_t row_bytes   = n * elem_bytes(dtype);
@@ -932,7 +934,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n,
                                              tile_cols(OpType::all_reduce, n), std::nullopt,
-                                             inp, staged, stream))
+                                             input, staged, stream))
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups for every thread of
@@ -963,7 +965,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr int TM = C.tile_m, TN = C.tile_n;
             // THE INSTANCE FOR THE LAYOUT AS GIVEN: rows back to back read each peer's share as one
             // run, other strides the strided walk (collectives.cuh); the input is not reshaped.
-            const bool contiguous = inp_stride_m == n * inp_stride_n && out_stride_m == n * out_stride_n;
+            const bool contiguous = input_stride_m == n * input_stride_n && output_stride_m == n * output_stride_n;
             if constexpr (two_shot_lays_out(C, NG, NL)) {
               const auto at = [&](auto layout) {
                 constexpr bool CONTIGUOUS = decltype(layout)::value;
@@ -993,20 +995,25 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                           .waves_per_eu      = a.waves_per_eu,
                           .staged            = staged,
                           .stream            = stream,
-                          .out               = out,
-                          .out_stride_m      = out_stride_m,
-                          .out_stride_n      = out_stride_n,
-                          .inp               = inp,
-                          .inp_stride_m      = inp_stride_m,
-                          .inp_stride_n      = inp_stride_n,
+                          .input             = input,
+                          .input_stride_m    = input_stride_m,
+                          .input_stride_n    = input_stride_n,
+                          .input_size_m      = m,
+                          .input_size_n      = n,
+                          .output            = output,
+                          .output_stride_m   = output_stride_m,
+                          .output_stride_n   = output_stride_n,
+                          .output_size_m     = output_size_m,
+                          .output_size_n     = output_size_n,
                           .scratch_stride_m  = slice_bytes / elem_bytes(dtype),
                           .scratch_stride_n  = 1,
+                          .scratch_size_m    = staged ? (band < m ? band : m) : m,
+                          .scratch_size_n    = slice_bytes / elem_bytes(dtype),
                           .staging_stride_m  = n,
                           .staging_stride_n  = 1,
-                          .band_m         = static_cast<int>(band < m ? band : m),
-                          .dtype             = dtype,
-                          .inp_size_m              = m,
-                          .inp_size_n              = n};
+                          .staging_size_m    = static_cast<int>(band < m ? band : m),
+                          .staging_size_n    = n,
+                          .dtype             = dtype};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
@@ -1015,12 +1022,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
 // all_reduce_rms_norm: out = rms_norm(all_reduce(inp), weight), vLLM's roundings exactly. inp
 // [rows, hidden]; the weight `weight_dtype`, dtype or f32.
 inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* weight, int64_t weight_stride_n,
-    DType dtype, DType weight_dtype, int64_t m, int64_t n, float eps,
+    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
+    int64_t input_size_n, const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    int64_t output_size_n, DType dtype, DType weight_dtype, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   using K         = Template;
   const OpType op = OpType::all_reduce_rms_norm;
   const int world = h.world_size();
@@ -1039,7 +1048,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, tile_cols(op, n),
-                                             weight_refused(op, dtype, weight_dtype), inp, false,
+                                             weight_refused(op, dtype, weight_dtype), input, false,
                                              stream))
     return *e;
   // 3.
@@ -1082,6 +1091,11 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   });
   // 4.
   const AllReduceRmsNormBuildConfig& r = std::get<AllReduceRmsNormBuildConfig>(c.build);
+  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
+  const int64_t scratch_rows =
+      n > 0 ? scratch_need(fn, m, n * elem_bytes(dtype) / kBuild.memory.pack_bytes, world) /
+                  (n * elem_bytes(dtype))
+            : 0;
   const AllReduceRmsNormLaunch l{.kernel            = kernel,
                                  .algorithm         = algorithm_of(fn),
                                  .direction         = direction_of(fn),
@@ -1092,20 +1106,25 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .blocks_per_grid   = c.launch.blocks_per_grid,
                                  .waves_per_eu      = r.waves_per_eu,
                                  .stream            = stream,
-                                 .out               = out,
-                                 .out_stride_m      = out_stride_m,
-                                 .out_stride_n      = out_stride_n,
-                                 .inp               = inp,
-                                 .inp_stride_m      = inp_stride_m,
-                                 .inp_stride_n      = inp_stride_n,
+                                 .input             = input,
+                                 .input_stride_m    = input_stride_m,
+                                 .input_stride_n    = input_stride_n,
+                                 .input_size_m      = m,
+                                 .input_size_n      = n,
                                  .weight            = weight,
                                  .weight_stride_n   = weight_stride_n,
+                                 .weight_size_n     = weight_size_n,
+                                 .output            = output,
+                                 .output_stride_m   = output_stride_m,
+                                 .output_stride_n   = output_stride_n,
+                                 .output_size_m     = output_size_m,
+                                 .output_size_n     = output_size_n,
                                  .scratch_stride_m  = n,
                                  .scratch_stride_n  = 1,
+                                 .scratch_size_m    = scratch_rows,
+                                 .scratch_size_n    = n,
                                  .dtype             = dtype,
                                  .weight_dtype      = weight_dtype,
-                                 .inp_size_m              = m,
-                                 .inp_size_n            = n,
                                  .eps               = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1115,14 +1134,18 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
 // all_reduce_add_rms_norm: out, residual_out = fused_add_rms_norm(all_reduce(inp), residual,
 // weight), vLLM's roundings exactly.
 inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_norm(
-    const Handle& h, void* out, int64_t out_stride_m, int64_t out_stride_n, void* residual_out,
-    int64_t residual_out_stride_m, int64_t residual_out_stride_n, const void* inp,
-    int64_t inp_stride_m, int64_t inp_stride_n, const void* residual, int64_t residual_stride_m,
-    int64_t residual_stride_n, const void* weight, int64_t weight_stride_n, DType dtype,
-    DType weight_dtype, int64_t m, int64_t n, float eps,
+    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
+    int64_t input_size_n, const void* residual, int64_t residual_stride_m,
+    int64_t residual_stride_n, int64_t residual_size_m, int64_t residual_size_n,
+    const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
+    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m, int64_t output_size_n,
+    void* residual_output, int64_t residual_output_stride_m, int64_t residual_output_stride_n,
+    int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
+    DType weight_dtype, float eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   using K         = Template;
   const OpType op = OpType::all_reduce_add_rms_norm;
   const int world = h.world_size();
@@ -1141,7 +1164,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
   const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, tile_cols(op, n),
-                                             weight_refused(op, dtype, weight_dtype), inp, false,
+                                             weight_refused(op, dtype, weight_dtype), input, false,
                                              stream))
     return *e;
   // 3.
@@ -1184,60 +1207,80 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
   });
   // 4.
   const AllReduceAddRmsNormBuildConfig& r = std::get<AllReduceAddRmsNormBuildConfig>(c.build);
-  const AllReduceAddRmsNormLaunch l{.kernel            = kernel,
-                                    .algorithm         = algorithm_of(fn),
-                                    .direction         = direction_of(fn),
-                                    .world             = world,
-                                    .tile_m            = r.tile_m,
-                                    .tile_n            = r.tile_n,
-                                    .threads_per_block = r.threads_per_block,
-                                    .blocks_per_grid   = c.launch.blocks_per_grid,
-                                    .waves_per_eu      = r.waves_per_eu,
-                                    .stream            = stream,
-                                    .out               = out,
-                                    .out_stride_m      = out_stride_m,
-                                    .out_stride_n      = out_stride_n,
-                                    .residual_out      = residual_out,
-                                    .residual_out_stride_m = residual_out_stride_m,
-                                    .residual_out_stride_n = residual_out_stride_n,
-                                    .inp               = inp,
-                                    .inp_stride_m      = inp_stride_m,
-                                    .inp_stride_n      = inp_stride_n,
-                                    .residual          = residual,
-                                    .residual_stride_m = residual_stride_m,
-                                    .residual_stride_n = residual_stride_n,
-                                    .weight            = weight,
-                                    .weight_stride_n   = weight_stride_n,
-                                    .scratch_stride_m  = n,
-                                    .scratch_stride_n  = 1,
-                                    .dtype             = dtype,
-                                    .weight_dtype      = weight_dtype,
-                                    .inp_size_m              = m,
-                                    .inp_size_n            = n,
-                                    .eps               = eps};
+  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
+  const int64_t scratch_rows =
+      n > 0 ? scratch_need(fn, m, n * elem_bytes(dtype) / kBuild.memory.pack_bytes, world) /
+                  (n * elem_bytes(dtype))
+            : 0;
+  const AllReduceAddRmsNormLaunch l{.kernel                   = kernel,
+                                    .algorithm                = algorithm_of(fn),
+                                    .direction                = direction_of(fn),
+                                    .world                    = world,
+                                    .tile_m                   = r.tile_m,
+                                    .tile_n                   = r.tile_n,
+                                    .threads_per_block        = r.threads_per_block,
+                                    .blocks_per_grid          = c.launch.blocks_per_grid,
+                                    .waves_per_eu             = r.waves_per_eu,
+                                    .stream                   = stream,
+                                    .input                    = input,
+                                    .input_stride_m           = input_stride_m,
+                                    .input_stride_n           = input_stride_n,
+                                    .input_size_m             = m,
+                                    .input_size_n             = n,
+                                    .residual                 = residual,
+                                    .residual_stride_m        = residual_stride_m,
+                                    .residual_stride_n        = residual_stride_n,
+                                    .residual_size_m          = residual_size_m,
+                                    .residual_size_n          = residual_size_n,
+                                    .weight                   = weight,
+                                    .weight_stride_n          = weight_stride_n,
+                                    .weight_size_n            = weight_size_n,
+                                    .output                   = output,
+                                    .output_stride_m          = output_stride_m,
+                                    .output_stride_n          = output_stride_n,
+                                    .output_size_m            = output_size_m,
+                                    .output_size_n            = output_size_n,
+                                    .residual_output          = residual_output,
+                                    .residual_output_stride_m = residual_output_stride_m,
+                                    .residual_output_stride_n = residual_output_stride_n,
+                                    .residual_output_size_m   = residual_output_size_m,
+                                    .residual_output_size_n   = residual_output_size_n,
+                                    .scratch_stride_m         = n,
+                                    .scratch_stride_n         = 1,
+                                    .scratch_size_m           = scratch_rows,
+                                    .scratch_size_n           = n,
+                                    .dtype                    = dtype,
+                                    .weight_dtype             = weight_dtype,
+                                    .eps                      = eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
 
 // all_reduce_add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each row of the
-// all-reduced sum of `inp`. With `has_prefix` the sum is added to `prefix` in place; without, the
-// sum IS the new prefix. The pull two-shot's config family has TILE_M and its reduce-scatter
+// all-reduced sum of `input`. With a `prefix` the sum is added to it, into `prefix_output`; without
+// (null), the sum IS the new prefix. `block_output`, when not null, gets the new prefix too. The pull two-shot's config family has TILE_M and its reduce-scatter
 // blocks; the one-shot's and push's (a row a tile) have neither.
 inline std::variant<AllReduceAddAttnResRmsNormLaunch, Error>
 select_all_reduce_add_attn_res_rms_norm(
-    const Handle& h, void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n, void* out,
-    int64_t out_stride_m, int64_t out_stride_n, const void* inp, int64_t inp_stride_m,
-    int64_t inp_stride_n, void* blocks, int64_t blocks_stride_m, int64_t blocks_stride_r,
-    int64_t blocks_stride_n, const void* norm_weight, int64_t norm_weight_stride_n,
-    const void* qk_weight, int64_t qk_weight_stride_n, const void* out_norm_weight,
-    int64_t out_norm_weight_stride_n,
-    DType dtype, int64_t m, int64_t n,
-    int num_blocks, int write_idx, float eps, float out_eps, bool has_prefix,
+    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n, int64_t input_size_m,
+    int64_t input_size_n, const void* prefix, int64_t prefix_stride_m, int64_t prefix_stride_n,
+    int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n, int64_t blocks_size_m, int64_t blocks_size_r,
+    int64_t blocks_size_n, const void* norm_weight, int64_t norm_weight_stride_n,
+    int64_t norm_weight_size_n, const void* qk_weight, int64_t qk_weight_stride_n,
+    int64_t qk_weight_size_n, const void* output_norm_weight, int64_t output_norm_weight_stride_n,
+    int64_t output_norm_weight_size_n, void* prefix_output, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, int64_t prefix_output_size_m, int64_t prefix_output_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
+    int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
+    DType dtype, int num_blocks, float eps, float output_eps,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu, hipStream_t stream) {
+  const int64_t m = input_size_m, n = input_size_n;  // the problem's shape: the input's
   using K         = Template;
   const OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   const int world = h.world_size();
@@ -1256,7 +1299,7 @@ select_all_reduce_add_attn_res_rms_norm(
   const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt, inp, false, stream))
+          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt, input, false, stream))
     return *e;
   // 3.
   const void* kernel = nullptr;
@@ -1270,7 +1313,7 @@ select_all_reduce_add_attn_res_rms_norm(
             constexpr AllReduceAddAttnResRmsNormBuildConfig C = decltype(cc)::value;
             constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
                 WPE = C.waves_per_eu;
-            kernel = has_prefix
+            kernel = prefix != nullptr
                          ? instance<AllReduceAddAttnResRmsNormOneShotKernel>(
                                all_reduce_pull_one_shot_add_attn_res_rms_norm<T, NG, true, TN,
                                                                               TK, TPB, WPE>)
@@ -1284,7 +1327,7 @@ select_all_reduce_add_attn_res_rms_norm(
             constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
                           TPB = C.threads_per_block,
                 WPE = C.waves_per_eu;
-            kernel = has_prefix
+            kernel = prefix != nullptr
                          ? instance<AllReduceAddAttnResRmsNormPullKernel>(
                                all_reduce_pull_two_shot_add_attn_res_rms_norm<T, NG, true, TM, TN,
                                                                               TK, TPB, WPE>)
@@ -1297,7 +1340,7 @@ select_all_reduce_add_attn_res_rms_norm(
             constexpr AllReduceAddAttnResRmsNormBuildConfig C = decltype(cc)::value;
             constexpr int TN = C.tile_n, TK = C.tile_k, TPB = C.threads_per_block,
                 WPE = C.waves_per_eu;
-            kernel = has_prefix
+            kernel = prefix != nullptr
                          ? instance<AllReduceAddAttnResRmsNormPushKernel>(
                                all_reduce_push_two_shot_add_attn_res_rms_norm<T, NG, true, TN,
                                                                               TK, TPB, WPE>)
@@ -1313,47 +1356,72 @@ select_all_reduce_add_attn_res_rms_norm(
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
   const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
-  const AllReduceAddAttnResRmsNormLaunch l{.kernel                = kernel,
-                                           .algorithm             = algorithm_of(fn),
-                                           .direction             = direction_of(fn),
-                                           .world                 = world,
-                                           .tile_m                = tm,
-                                           .tile_n                = a.tile_n,
-                                           .tile_k                = tk,
-                                           .threads_per_block     = a.threads_per_block,
-                                           .blocks_per_grid       = c.launch.blocks_per_grid,
-                                           .waves_per_eu          = a.waves_per_eu,
-                                           .reduce_scatter_blocks = rs,
-                                           .stream                = stream,
-                                           .prefix                = prefix,
-                                           .prefix_stride_m       = prefix_stride_m,
-                                           .prefix_stride_n       = prefix_stride_n,
-                                           .out                   = out,
-                                           .out_stride_m          = out_stride_m,
-                                           .out_stride_n          = out_stride_n,
-                                           .inp                   = inp,
-                                           .inp_stride_m          = inp_stride_m,
-                                           .inp_stride_n          = inp_stride_n,
-                                           .blocks                = blocks,
-                                           .blocks_stride_m       = blocks_stride_m,
-                                           .blocks_stride_r       = blocks_stride_r,
-                                           .blocks_stride_n       = blocks_stride_n,
-                                           .norm_weight           = norm_weight,
-                                           .norm_weight_stride_n  = norm_weight_stride_n,
-                                           .qk_weight             = qk_weight,
-                                           .qk_weight_stride_n    = qk_weight_stride_n,
-                                           .out_norm_weight       = out_norm_weight,
-                                           .out_norm_weight_stride_n = out_norm_weight_stride_n,
-                                           .scratch_stride_m      = n,
-                                           .scratch_stride_n      = 1,
-                                           .dtype                 = dtype,
-                                           .inp_size_m                  = m,
-                                           .inp_size_n                = n,
-                                           .num_blocks            = num_blocks,
-                                           .write_idx             = write_idx,
-                                           .eps                   = eps,
-                                           .out_eps               = out_eps,
-                                           .has_prefix            = has_prefix};
+  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
+  const int64_t scratch_rows =
+      n > 0 ? scratch_need(fn, m, n * elem_bytes(dtype) / kBuild.memory.pack_bytes, world) /
+                  (n * elem_bytes(dtype))
+            : 0;
+  const AllReduceAddAttnResRmsNormLaunch l{.kernel                      = kernel,
+                                           .algorithm                   = algorithm_of(fn),
+                                           .direction                   = direction_of(fn),
+                                           .world                       = world,
+                                           .tile_m                      = tm,
+                                           .tile_n                      = a.tile_n,
+                                           .tile_k                      = tk,
+                                           .threads_per_block           = a.threads_per_block,
+                                           .blocks_per_grid             = c.launch.blocks_per_grid,
+                                           .waves_per_eu                = a.waves_per_eu,
+                                           .reduce_scatter_blocks       = rs,
+                                           .stream                      = stream,
+                                           .input                       = input,
+                                           .input_stride_m              = input_stride_m,
+                                           .input_stride_n              = input_stride_n,
+                                           .input_size_m                = m,
+                                           .input_size_n                = n,
+                                           .prefix                      = prefix,
+                                           .prefix_stride_m             = prefix_stride_m,
+                                           .prefix_stride_n             = prefix_stride_n,
+                                           .prefix_size_m               = prefix_size_m,
+                                           .prefix_size_n               = prefix_size_n,
+                                           .blocks                      = blocks,
+                                           .blocks_stride_m             = blocks_stride_m,
+                                           .blocks_stride_r             = blocks_stride_r,
+                                           .blocks_stride_n             = blocks_stride_n,
+                                           .blocks_size_m               = blocks_size_m,
+                                           .blocks_size_r               = blocks_size_r,
+                                           .blocks_size_n               = blocks_size_n,
+                                           .norm_weight                 = norm_weight,
+                                           .norm_weight_stride_n        = norm_weight_stride_n,
+                                           .norm_weight_size_n          = norm_weight_size_n,
+                                           .qk_weight                   = qk_weight,
+                                           .qk_weight_stride_n          = qk_weight_stride_n,
+                                           .qk_weight_size_n            = qk_weight_size_n,
+                                           .output_norm_weight          = output_norm_weight,
+                                           .output_norm_weight_stride_n = output_norm_weight_stride_n,
+                                           .output_norm_weight_size_n   = output_norm_weight_size_n,
+                                           .prefix_output               = prefix_output,
+                                           .prefix_output_stride_m      = prefix_output_stride_m,
+                                           .prefix_output_stride_n      = prefix_output_stride_n,
+                                           .prefix_output_size_m        = prefix_output_size_m,
+                                           .prefix_output_size_n        = prefix_output_size_n,
+                                           .output                      = output,
+                                           .output_stride_m             = output_stride_m,
+                                           .output_stride_n             = output_stride_n,
+                                           .output_size_m               = output_size_m,
+                                           .output_size_n               = output_size_n,
+                                           .block_output                = block_output,
+                                           .block_output_stride_m       = block_output_stride_m,
+                                           .block_output_stride_n       = block_output_stride_n,
+                                           .block_output_size_m         = block_output_size_m,
+                                           .block_output_size_n         = block_output_size_n,
+                                           .scratch_stride_m            = n,
+                                           .scratch_stride_n            = 1,
+                                           .scratch_size_m              = scratch_rows,
+                                           .scratch_size_n              = n,
+                                           .dtype                       = dtype,
+                                           .num_blocks                  = num_blocks,
+                                           .eps                         = eps,
+                                           .output_eps                  = output_eps};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;

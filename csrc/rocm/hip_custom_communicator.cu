@@ -61,11 +61,11 @@ std::vector<std::string> all_gathered(const ProcessGroupPtr& pg, const std::stri
   const auto as_bytes = torch::TensorOptions().dtype(torch::kUInt8);
   std::vector<at::Tensor> in{torch::empty({static_cast<int64_t>(mine.size())}, as_bytes)};
   std::memcpy(in[0].data_ptr(), mine.data(), mine.size());
-  std::vector<std::vector<at::Tensor>> out(1);
-  for (int r = 0; r < pg->getSize(); ++r) out[0].push_back(torch::empty_like(in[0]));
-  pg->allgather(out, in)->wait();
+  std::vector<std::vector<at::Tensor>> output(1);
+  for (int r = 0; r < pg->getSize(); ++r) output[0].push_back(torch::empty_like(in[0]));
+  pg->allgather(output, in)->wait();
   std::vector<std::string> got;
-  for (const auto& t : out[0])
+  for (const auto& t : output[0])
     got.emplace_back(static_cast<const char*>(t.data_ptr()), static_cast<size_t>(t.numel()));
   return got;
 }
@@ -250,16 +250,16 @@ void hip_custom_communicator_abort(fptr_t handle_ptr) { handle_of(handle_ptr).ab
 // THE PER-PHASE STAMPS SINCE THE LAST READ, [block][phase] device clock ticks (100 MHz), zero where
 // no block stamped, then zeroed. Only a HIP_CUSTOM_COMMUNICATOR_STAMPS build writes them (block_stamp).
 torch::Tensor hip_custom_communicator_stamps() {
-  auto out = torch::zeros({hip_custom_communicator::kStampBlocks, hip_custom_communicator::kStampPhases},
+  auto output = torch::zeros({hip_custom_communicator::kStampBlocks, hip_custom_communicator::kStampPhases},
                           torch::TensorOptions().dtype(torch::kInt64));
   HIP_CHECK(hipDeviceSynchronize());
-  HIP_CHECK(hipMemcpyFromSymbol(out.data_ptr<int64_t>(), HIP_SYMBOL(hip_custom_communicator::g_stamps),
+  HIP_CHECK(hipMemcpyFromSymbol(output.data_ptr<int64_t>(), HIP_SYMBOL(hip_custom_communicator::g_stamps),
                                 sizeof(hip_custom_communicator::g_stamps)));
   // Zeroed after reading, so the next launch's table holds only its own blocks.
   void* table = nullptr;
   HIP_CHECK(hipGetSymbolAddress(&table, HIP_SYMBOL(hip_custom_communicator::g_stamps)));
   HIP_CHECK(hipMemset(table, 0, sizeof(hip_custom_communicator::g_stamps)));
-  return out;
+  return output;
 }
 
 // `buffer` registered with every rank's over the process group named `group`, a collective: the
@@ -292,68 +292,47 @@ void hip_custom_communicator_register_captured(fptr_t handle_ptr, const std::str
     raise(hip_custom_communicator::Error::ranks_disagree);
 }
 
-Refusal hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-                           std::optional<std::string> algorithm,
-                           std::optional<std::string> direction,
-                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                           std::optional<int64_t> threads_per_block,
-                           std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  check_device({&out, &inp});
-  TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
-  TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
-  const std::optional<torch::Tensor> in_rows = as_rows(inp), out_rows = as_rows(out);
-  if (!in_rows || !out_rows) return static_cast<int64_t>(hip_custom_communicator::Error::not_contiguous);
-  const auto got = hip_custom_communicator::all_reduce(
-      handle_of(handle_ptr), out_rows->data_ptr(), out_rows->stride(0), out_rows->stride(1),
-      in_rows->data_ptr(), in_rows->stride(0), in_rows->stride(1), in_rows->size(0),
-      in_rows->size(1), dtype_of(inp), algorithm_from(algorithm), direction_from(direction),
-      narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
-  return std::nullopt;
-}
-
 namespace {
-// A NORM CALL'S TENSORS: inp [tokens, hidden], out (and with a residual, residual and
-// residual_out) its shape and dtype, the weight 1-D of hidden (its dtype is select's to refuse).
-void norm_tensors(const torch::Tensor& out, const torch::Tensor& inp, const torch::Tensor& weight,
-                  const torch::Tensor* residual, const torch::Tensor* residual_out) {
-  check_device({&out, &inp, &weight});
-  TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
-  TORCH_CHECK(out.sizes() == inp.sizes(), "out must have inp's shape");
-  TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  TORCH_CHECK(weight.dim() == 1 && weight.numel() == inp.size(1),
-              "weight must be 1-D of hidden=", inp.size(1));
-  // The weight is read a pack at a time, a pack's worth of inp's elements per load.
-  const int64_t weight_pack =
-      hip_custom_communicator::kBuild.memory.pack_bytes / inp.element_size() * weight.element_size();
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack == 0,
-              "weight must be aligned to ", weight_pack, " bytes");
-  if (residual != nullptr) {
-    check_device({residual, residual_out});
-    TORCH_CHECK(residual->sizes() == inp.sizes() && residual_out->sizes() == inp.sizes(),
-                "residual and residual_out must have inp's shape");
-    TORCH_CHECK(residual->scalar_type() == inp.scalar_type() &&
-                    residual_out->scalar_type() == inp.scalar_type(),
-                "every tensor must share inp's dtype");
-  }
+// NO INPUT OVERLAPS AN OUTPUT (STANDARDS): the kernels take each as its own `__restrict__` pointer,
+// so two that share bytes would be undefined behavior. A view's bytes are its first to its last
+// element at its strides; a missing tensor (null) overlaps nothing.
+std::pair<uintptr_t, uintptr_t> span_of(const torch::Tensor& t) {
+  const uintptr_t first = reinterpret_cast<uintptr_t>(t.data_ptr());
+  int64_t last = 0;
+  for (int64_t d = 0; d < t.dim(); ++d) last += (t.size(d) - 1) * t.stride(d);
+  return {first, first + static_cast<uintptr_t>((last + 1) * t.element_size())};
+}
+void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
+                    std::initializer_list<const torch::Tensor*> outputs) {
+  for (const torch::Tensor* i : inputs)
+    for (const torch::Tensor* o : outputs) {
+      if (i == nullptr || o == nullptr || i->numel() == 0 || o->numel() == 0) continue;
+      const auto [i0, i1] = span_of(*i);
+      const auto [o0, o1] = span_of(*o);
+      TORCH_CHECK(i1 <= o0 || o1 <= i0, "an input and an output share memory; pass a separate output");
+    }
 }
 }  // namespace
 
-Refusal hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
-                                    torch::Tensor& weight, double eps,
-                                    std::optional<std::string> algorithm,
-                                    std::optional<std::string> direction,
-                                    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-                                    std::optional<int64_t> threads_per_block,
-                                    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  norm_tensors(out, inp, weight, nullptr, nullptr);
-  const auto got = hip_custom_communicator::all_reduce_rms_norm(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), weight.data_ptr(), weight.stride(0), dtype_of(inp),
-      dtype_of(weight), inp.size(0), inp.size(1), static_cast<float>(eps),
+Refusal hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& input,
+                                           torch::Tensor& output,
+                                           std::optional<std::string> algorithm,
+                                           std::optional<std::string> direction,
+                                           std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
+                                           std::optional<int64_t> threads_per_block,
+                                           std::optional<int64_t> blocks_per_grid,
+                                           std::optional<int64_t> waves_per_eu) {
+  check_device({&input, &output});
+  TORCH_CHECK(output.sizes() == input.sizes(), "output and input must have the same shape");
+  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output and input must share a dtype");
+  refuse_overlap({&input}, {&output});
+  const std::optional<torch::Tensor> input_rows = as_rows(input), output_rows = as_rows(output);
+  if (!input_rows || !output_rows)
+    return static_cast<int64_t>(hip_custom_communicator::Error::not_contiguous);
+  const auto got = hip_custom_communicator::all_reduce(
+      handle_of(handle_ptr), input_rows->data_ptr(), input_rows->stride(0), input_rows->stride(1),
+      input_rows->size(0), input_rows->size(1), output_rows->data_ptr(), output_rows->stride(0),
+      output_rows->stride(1), output_rows->size(0), output_rows->size(1), dtype_of(input),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream());
@@ -361,20 +340,69 @@ Refusal hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Te
   return std::nullopt;
 }
 
-Refusal hip_custom_communicator_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out, torch::Tensor& inp,
-    torch::Tensor& residual, torch::Tensor& weight, double eps,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
+namespace {
+// A NORM CALL'S TENSORS: input [tokens, hidden], output (and with a residual, residual and
+// residual_output) its shape and dtype, the weight 1-D of hidden (its dtype is select's to refuse).
+void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
+                  const torch::Tensor& weight, const torch::Tensor& output,
+                  const torch::Tensor* residual_output) {
+  check_device({&input, &weight, &output});
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]; got ", input.dim(), "-D");
+  TORCH_CHECK(output.sizes() == input.sizes(), "output must have input's shape");
+  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output must share input's dtype");
+  TORCH_CHECK(weight.dim() == 1 && weight.numel() == input.size(1),
+              "weight must be 1-D of hidden=", input.size(1));
+  // The weight is read a pack at a time, a pack's worth of input's elements per load.
+  const int64_t weight_pack =
+      hip_custom_communicator::kBuild.memory.pack_bytes / input.element_size() * weight.element_size();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % weight_pack == 0,
+              "weight must be aligned to ", weight_pack, " bytes");
+  if (residual != nullptr) {
+    check_device({residual, residual_output});
+    TORCH_CHECK(residual->sizes() == input.sizes() && residual_output->sizes() == input.sizes(),
+                "residual and residual_output must have input's shape");
+    TORCH_CHECK(residual->scalar_type() == input.scalar_type() &&
+                    residual_output->scalar_type() == input.scalar_type(),
+                "every tensor must share input's dtype");
+  }
+  refuse_overlap({&input, residual, &weight}, {&output, residual_output});
+}
+}  // namespace
+
+Refusal hip_custom_communicator_all_reduce_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight, torch::Tensor& output,
+    double eps, std::optional<std::string> algorithm, std::optional<std::string> direction,
+    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
+    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu) {
-  norm_tensors(out, inp, weight, &residual, &residual_out);
+  norm_tensors(input, nullptr, weight, output, nullptr);
+  const auto got = hip_custom_communicator::all_reduce_rms_norm(
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1), input.size(0),
+      input.size(1), weight.data_ptr(), weight.stride(0), weight.size(0), output.data_ptr(),
+      output.stride(0), output.stride(1), output.size(0), output.size(1), dtype_of(input),
+      dtype_of(weight), static_cast<float>(eps), algorithm_from(algorithm),
+      direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block),
+      narrowed(blocks_per_grid), narrowed(waves_per_eu), current_stream());
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
+  return std::nullopt;
+}
+
+Refusal hip_custom_communicator_all_reduce_add_rms_norm(
+    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
+    torch::Tensor& output, torch::Tensor& residual_output, double eps,
+    std::optional<std::string> algorithm, std::optional<std::string> direction,
+    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
+    std::optional<int64_t> threads_per_block, std::optional<int64_t> blocks_per_grid,
+    std::optional<int64_t> waves_per_eu) {
+  norm_tensors(input, &residual, weight, output, &residual_output);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
-      handle_of(handle_ptr), out.data_ptr(), out.stride(0), out.stride(1),
-      residual_out.data_ptr(), residual_out.stride(0), residual_out.stride(1), inp.data_ptr(),
-      inp.stride(0), inp.stride(1), residual.data_ptr(), residual.stride(0), residual.stride(1),
-      weight.data_ptr(), weight.stride(0), dtype_of(inp), dtype_of(weight), inp.size(0),
-      inp.size(1), static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1), input.size(0),
+      input.size(1), residual.data_ptr(), residual.stride(0), residual.stride(1), residual.size(0),
+      residual.size(1), weight.data_ptr(), weight.stride(0), weight.size(0), output.data_ptr(),
+      output.stride(0), output.stride(1), output.size(0), output.size(1),
+      residual_output.data_ptr(), residual_output.stride(0), residual_output.stride(1),
+      residual_output.size(0), residual_output.size(1), dtype_of(input), dtype_of(weight),
+      static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
@@ -382,69 +410,97 @@ Refusal hip_custom_communicator_all_reduce_add_rms_norm(
 }
 
 namespace {
-// AN ATTNRES CALL'S TENSORS, as every AttnRes op takes them: `inp` (the partial sum, or the delta)
-// [tokens, hidden], prefix and out its shape, blocks [tokens, sources, hidden], every one its
-// dtype.
-void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
-                      const torch::Tensor& inp, const torch::Tensor& blocks,
-                      const torch::Tensor& norm_weight, const torch::Tensor& qk_weight,
-                      const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks,
-                      int64_t write_idx) {
-  check_device({&prefix, &out, &inp, &norm_weight, &qk_weight});
-  TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
-  const int64_t n = inp.size(1);
-  TORCH_CHECK(prefix.sizes() == inp.sizes() && out.sizes() == inp.sizes(),
-              "prefix and out must have inp's shape");
-  TORCH_CHECK(blocks.is_cuda() && blocks.dim() == 3 && blocks.size(0) == inp.size(0) &&
+// AN ATTNRES CALL'S TENSORS, as every AttnRes op takes them: `input` (the partial sum, or the delta)
+// [tokens, hidden]; `prefix` (none: the sum starts it), `prefix_output` and `output` its shape;
+// `blocks` [tokens, sources, hidden], its first `num_blocks` the sources read; `block_output` (none:
+// no block written) a [tokens, hidden] slot, by the standard not one of the sources; every one
+// input's dtype.
+void attn_res_tensors(const torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
+                      const torch::Tensor& blocks, const torch::Tensor& norm_weight,
+                      const torch::Tensor& qk_weight,
+                      const std::optional<torch::Tensor>& output_norm_weight,
+                      const torch::Tensor& prefix_output, const torch::Tensor& output,
+                      const std::optional<torch::Tensor>& block_output, int64_t num_blocks) {
+  check_device({&input, &norm_weight, &qk_weight, &prefix_output, &output});
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]; got ", input.dim(), "-D");
+  const int64_t n = input.size(1);
+  TORCH_CHECK(prefix_output.sizes() == input.sizes() && output.sizes() == input.sizes(),
+              "prefix_output and output must have input's shape");
+  TORCH_CHECK(blocks.is_cuda() && blocks.dim() == 3 && blocks.size(0) == input.size(0) &&
                   blocks.size(2) == n && blocks.stride(2) == 1,
               "blocks must be [tokens, sources, hidden] with a unit hidden stride");
   TORCH_CHECK(num_blocks >= 0 && num_blocks <= blocks.size(1), "num_blocks must be in [0, ",
               blocks.size(1), "]");
-  TORCH_CHECK(write_idx < blocks.size(1), "write_idx must be < ", blocks.size(1));
-  std::vector<const torch::Tensor*> same = {&prefix, &out, &blocks, &norm_weight, &qk_weight};
-  if (out_norm_weight) {
-    check_device({&*out_norm_weight});
-    same.push_back(&*out_norm_weight);
-  }
+  std::vector<const torch::Tensor*> same = {&blocks, &norm_weight, &qk_weight, &prefix_output,
+                                            &output};
+  for (const std::optional<torch::Tensor>* o : {&prefix, &output_norm_weight, &block_output})
+    if (*o) {
+      check_device({&**o});
+      same.push_back(&**o);
+    }
   for (const torch::Tensor* t : same)
-    TORCH_CHECK(t->scalar_type() == inp.scalar_type(), "every tensor must share inp's dtype");
+    TORCH_CHECK(t->scalar_type() == input.scalar_type(), "every tensor must share input's dtype");
+  if (prefix) TORCH_CHECK(prefix->sizes() == input.sizes(), "prefix must have input's shape");
+  if (block_output)
+    TORCH_CHECK(block_output->sizes() == input.sizes() && block_output->stride(1) == 1,
+                "block_output must be [tokens, hidden] with a unit hidden stride");
   for (const torch::Tensor* t : {&norm_weight, &qk_weight})
     TORCH_CHECK(t->dim() == 1 && t->numel() == n, "weights must be 1-D of hidden=", n);
-  if (out_norm_weight)
-    TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == n,
-                "out_norm_weight must be 1-D of hidden=", n);
+  if (output_norm_weight)
+    TORCH_CHECK(output_norm_weight->dim() == 1 && output_norm_weight->numel() == n,
+                "output_norm_weight must be 1-D of hidden=", n);
   // Its rows' and sources' strides are the interface's to refuse (whole packs); its start is here.
   TORCH_CHECK(reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
                       hip_custom_communicator::kBuild.memory.pack_bytes ==
                   0,
               "blocks must start 16-byte aligned");
+  // The sources read are the first num_blocks; block_output may be a later slot of the same stack.
+  const torch::Tensor sources = blocks.narrow(1, 0, num_blocks);
+  refuse_overlap({&input, prefix ? &*prefix : nullptr, &sources, &norm_weight, &qk_weight,
+                  output_norm_weight ? &*output_norm_weight : nullptr},
+                 {&prefix_output, &output, block_output ? &*block_output : nullptr});
+}
+
+// A [rows, cols] TENSOR'S ARGUMENTS, none's a null pointer and zeros.
+struct Rows {
+  void* ptr;
+  int64_t stride_m, stride_n, size_m, size_n;
+};
+Rows rows_of(const std::optional<torch::Tensor>& t) {
+  if (!t) return {nullptr, 0, 0, 0, 0};
+  return {t->data_ptr(), t->stride(0), t->stride(1), t->size(0), t->size(1)};
 }
 }  // namespace
 
 Refusal hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
+    fptr_t handle_ptr, torch::Tensor& input, const std::optional<torch::Tensor>& prefix,
     torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
-    double eps, double out_eps, bool has_prefix, std::optional<std::string> algorithm,
+    const std::optional<torch::Tensor>& output_norm_weight, torch::Tensor& prefix_output,
+    torch::Tensor& output, const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
     std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  attn_res_tensors(prefix, out, inp, blocks, norm_weight, qk_weight, out_norm_weight,
-                   num_blocks, write_idx);
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu) {
+  attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight, output_norm_weight,
+                   prefix_output, output, block_output, num_blocks);
+  const Rows old = rows_of(prefix), block = rows_of(block_output);
   const auto got = hip_custom_communicator::all_reduce_add_attn_res_rms_norm(
-      handle_of(handle_ptr), prefix.data_ptr(), prefix.stride(0), prefix.stride(1), out.data_ptr(),
-      out.stride(0), out.stride(1), inp.data_ptr(), inp.stride(0), inp.stride(1),
-      blocks.data_ptr(), blocks.stride(0), blocks.stride(1), blocks.stride(2),
-      norm_weight.data_ptr(), norm_weight.stride(0), qk_weight.data_ptr(), qk_weight.stride(0),
-      out_norm_weight ? out_norm_weight->data_ptr() : nullptr,
-      out_norm_weight ? out_norm_weight->stride(0) : 0, dtype_of(inp), inp.size(0),
-      inp.size(1), static_cast<int>(num_blocks), static_cast<int>(write_idx),
-      static_cast<float>(eps), static_cast<float>(out_eps), has_prefix, algorithm_from(algorithm),
-      direction_from(direction), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
-      narrowed(reduce_scatter_blocks), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu),
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1), input.size(0),
+      input.size(1), old.ptr, old.stride_m, old.stride_n, old.size_m, old.size_n,
+      blocks.data_ptr(), blocks.stride(0), blocks.stride(1), blocks.stride(2), blocks.size(0),
+      blocks.size(1), blocks.size(2), norm_weight.data_ptr(), norm_weight.stride(0),
+      norm_weight.size(0), qk_weight.data_ptr(), qk_weight.stride(0), qk_weight.size(0),
+      output_norm_weight ? output_norm_weight->data_ptr() : nullptr,
+      output_norm_weight ? output_norm_weight->stride(0) : 0,
+      output_norm_weight ? output_norm_weight->size(0) : 0, prefix_output.data_ptr(),
+      prefix_output.stride(0), prefix_output.stride(1), prefix_output.size(0),
+      prefix_output.size(1), output.data_ptr(), output.stride(0), output.stride(1),
+      output.size(0), output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
+      block.size_n, dtype_of(input), static_cast<int>(num_blocks), static_cast<float>(eps),
+      static_cast<float>(output_eps), algorithm_from(algorithm), direction_from(direction),
+      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
+      narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream());
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
   return std::nullopt;

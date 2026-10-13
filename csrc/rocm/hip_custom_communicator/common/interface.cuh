@@ -112,8 +112,8 @@ DINLINE void block_store_row_scalar(float* scalars, int row, float value) {
 
 // Every rank's scalar for `row`.
 template <int WORLD, typename RANK_DATA>
-DINLINE void peers_load_row_scalars(RANK_DATA rank_data, int row, float (&out)[WORLD]) {
-  impl::peers_load_row_scalars<WORLD>(rank_data, row, out);
+DINLINE void peers_load_row_scalars(RANK_DATA rank_data, int row, float (&output)[WORLD]) {
+  impl::peers_load_row_scalars<WORLD>(rank_data, row, output);
 }
 
 // ===============================================================================================
@@ -192,8 +192,8 @@ DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, flo
 
 // Each row of a tile reduced over its columns (Axis::n), into out[row].
 template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE>
-DINLINE void block_reduce(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, float (&out)[TILE_M / THREADS_M]) {
-  impl::block_reduce<REDUCE_OP, AXIS>(tile, out);
+DINLINE void block_reduce(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK, ACC_DTYPE>& tile, float (&output)[TILE_M / THREADS_M]) {
+  impl::block_reduce<REDUCE_OP, AXIS>(tile, output);
 }
 
 // ===============================================================================================
@@ -266,18 +266,18 @@ DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, TH
 // [R, 1, m*n], each rank's share one contiguous range of the elements, for long runs).
 // Reduce-scatter: this rank's share, summed over the ranks, into its scratch.
 template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void reduce_scatter(int rank, RANK_PTR inp, int m, int n, const Ptr<T>& scratch) {
-  impl::reduce_scatter<TILE, CONTIGUOUS>(rank, inp, m, n, scratch);
+DINLINE void reduce_scatter(int rank, RANK_PTR input, int m, int n, const Ptr<T>& scratch) {
+  impl::reduce_scatter<TILE, CONTIGUOUS>(rank, input, m, n, scratch);
 }
 // All-gather: every rank's summed share, rank r's at scratch(r), at its place in `out`.
 template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& out, int m, int n) {
-  impl::all_gather<TILE, CONTIGUOUS>(rank, scratch, out, m, n);
+DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& output, int m, int n) {
+  impl::all_gather<TILE, CONTIGUOUS>(rank, scratch, output, m, n);
 }
 // Staged, first: this rank's input, every rank's share of it, into its staging.
 template <typename TILE, bool CONTIGUOUS, typename T>
-DINLINE void stage(int rank, const Ptr<const T>& inp, const Ptr<T>& staging, int m, int n) {
-  impl::stage<TILE, CONTIGUOUS>(rank, inp, staging, m, n);
+DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging, int m, int n) {
+  impl::stage<TILE, CONTIGUOUS>(rank, input, staging, m, n);
 }
 
 // ===============================================================================================

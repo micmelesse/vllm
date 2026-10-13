@@ -113,7 +113,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hip_custom_communicator_register_captured", &hip_custom_communicator_register_captured);
 
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce(int handle_ptr, Tensor! out, Tensor inp, str? algorithm, "
+      "hip_custom_communicator_all_reduce(int handle_ptr, Tensor input, Tensor! output, str? algorithm, "
       "str? direction, int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA, &hip_custom_communicator_all_reduce);
@@ -122,23 +122,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // (which also returns the sum plus residual). `eps` is a float in the schema because
   // torch has no `double` there; the kernel narrows it.
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_rms_norm(int handle_ptr, Tensor! out, Tensor inp, Tensor weight, "
+      "hip_custom_communicator_all_reduce_rms_norm(int handle_ptr, Tensor input, Tensor weight, Tensor! output, "
       "float eps, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
       "int? blocks_per_grid, int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_rms_norm);
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_add_rms_norm(int handle_ptr, Tensor! out, Tensor! residual_out, "
-      "Tensor inp, Tensor residual, Tensor weight, float eps, str? algorithm, str? direction, "
+      "hip_custom_communicator_all_reduce_add_rms_norm(int handle_ptr, Tensor input, Tensor residual, "
+      "Tensor weight, Tensor! output, Tensor! residual_output, float eps, str? algorithm, str? direction, "
       "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
 
   rocm_ops.def(
-      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor! prefix, "
-      "Tensor! out, Tensor inp, Tensor! blocks, Tensor norm_weight, Tensor qk_weight, "
-      "Tensor? out_norm_weight, int num_blocks, int write_idx, float eps, float out_eps, "
-      "bool has_prefix, str? algorithm, str? direction, int? tile_m, int? tile_n, int? tile_k, "
+      "hip_custom_communicator_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor input, "
+      "Tensor? prefix, Tensor blocks, Tensor norm_weight, Tensor qk_weight, "
+      "Tensor? output_norm_weight, Tensor! prefix_output, Tensor! output, Tensor!? block_output, "
+      "int num_blocks, float eps, float output_eps, str? algorithm, str? direction, int? tile_m, "
+      "int? tile_n, int? tile_k, "
       "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
       "int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm", torch::kCUDA,

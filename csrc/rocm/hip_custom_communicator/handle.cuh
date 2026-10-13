@@ -44,8 +44,8 @@ using Gather = std::function<std::vector<std::string>(const std::string&)>;
 
 // THE SIGNALS' BYTES, the first of a rank's symmetric memory: two flag sets of kMaxBlocks blocks by
 // kMaxRanks writers, rounded to 128 bytes so the scratch after them starts aligned.
-constexpr int64_t kSignalsBytes = (2 * int64_t{kMaxBlocks} * kMaxRanks * int64_t{sizeof(uint32_t)} + 127) /
-                                  128 * 128;
+constexpr int64_t kSignalsBytes = (2 * int64_t{kMaxBlocks} * kMaxRanks * int64_t{sizeof(uint32_t)} +
+                                   127) / 128 * 128;
 
 class Handle {
  public:
@@ -177,7 +177,7 @@ class Handle {
   // rank's address. Every rank's input for a launch over `input` (`bytes` long) on `stream`:
   // filled after the capture for a captured launch (an eager input is copied into the staging,
   // and the table is the staging's).
-  const void* const* inp_ptrs(const void* input, int64_t bytes, hipStream_t stream) {
+  const void* const* input_ptrs(const void* input, int64_t bytes, hipStream_t stream) {
     return slot_for(const_cast<void*>(input), bytes, stream);
   }
   // Every rank's scratch and staging, fixed for the handle's life.
@@ -186,11 +186,14 @@ class Handle {
   // The synchronization state: every rank's signal block, this rank's, and how long a wait may
   // last before it gives up.
   // Every rank's signals, [R, 2, kMaxBlocks, kMaxRanks] (owner, parity, block, writer): the table,
-  // then the inner strides, in elements.
+  // then the inner strides and sizes, in elements.
   void* const* signals_ptrs() const { return signals_ptrs_; }
   static constexpr int64_t signals_stride_parity() { return int64_t{kMaxBlocks} * kMaxRanks; }
   static constexpr int64_t signals_stride_block() { return kMaxRanks; }
   static constexpr int64_t signals_stride_writer() { return 1; }
+  static constexpr int64_t signals_size_parity() { return 2; }
+  static constexpr int64_t signals_size_block() { return kMaxBlocks; }
+  static constexpr int64_t signals_size_writer() { return kMaxRanks; }
   // This rank's fault record, at its device address.
   Fault* fault_ptr() const { return device_fault_; }
   uint64_t timeout_ticks() const { return timeout_ticks_; }
@@ -254,10 +257,10 @@ class Handle {
   // the same cache, keyed the same way.
   std::vector<void*> open_peers(const std::vector<std::string>& theirs, void* self) {
     constexpr size_t kIpc = sizeof(hipIpcMemHandle_t);
-    std::vector<void*> out(world_size_, nullptr);
+    std::vector<void*> output(world_size_, nullptr);
     for (int i = 0; i < world_size_; ++i) {
       if (i == rank_) {
-        out[i] = self;
+        output[i] = self;
         continue;
       }
       if (theirs[i].size() != kIpc + sizeof(int64_t))
@@ -273,9 +276,9 @@ class Handle {
         HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
         it = opened_.emplace(handle, base).first;
       }
-      out[i] = static_cast<char*>(it->second) + offset;
+      output[i] = static_cast<char*>(it->second) + offset;
     }
-    return out;
+    return output;
   }
 
   // The peers' view of `input`: a capture's deferred slot, a registered buffer's, or the staging's

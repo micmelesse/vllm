@@ -234,72 +234,182 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // EACH KERNEL'S SIGNATURE, element pointers as void* (a peer table's as void* const*): every
 // compiled instance has one of these
 // (select asserts it when it picks the instance), so a launch calls the kernel select chose
-// through it, with the kernel's own arguments. A kernel's arguments are its buffers and values,
-// in this order: every rank's input (a device table: a captured launch's are filled after the
-// capture), scratch or staging, each only where the kernel uses it; the synchronization state
-// (every rank's signals and their strides, the fault record, its rank, the wait limit); then its
-// own. EVERY BUFFER
-// IS FOLLOWED BY ITS STRIDES, in elements, every dimension's (STANDARDS, *One file is the
-// interface*): a [rows, cols] buffer's stride_m and stride_n, a vector's stride_n alone. A peer
+// through it, with the kernel's own arguments. A kernel's arguments, in STANDARDS' one order: the
+// inputs, the outputs, the exchange (scratch, staging), the signals, the fault record, then the
+// scalars; each buffer its pointer, then its strides, then its sizes, every dimension's, in
+// elements (STANDARDS, *A kernel's arguments have one format*). A peer
 // buffer is a device table of every rank's address (vLLM's RankData), its strides every rank's.
 // =================================================================================================
 
-// The plain all-reduce: out, inp_size_m, inp_size_n; staged, the staging first (and the two-shot's
-// scratch before it), its own input after out, and the rows a band.
+// Generated from the kernels' signatures (one alias a signature; the two-shots' pull and push share
+// theirs), each parameter's name beside its type, so a launch's arguments read against it.
 using AllReduceOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
-          int64_t,
-             int64_t, int, int);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
-          void*, int,
-             uint64_t, void*, int64_t, int64_t, int, int);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* const* /*scratch_ptrs*/,
+             int64_t /*scratch_stride_m*/, int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
+             int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceOneShotStagedKernel =
-    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*, int64_t,
-             int64_t, const void*, int64_t, int64_t, int, int, int);
+    void (*)(const void* /*input_ptr*/, int64_t /*input_stride_m*/, int64_t /*input_stride_n*/,
+             int /*input_size_m*/, int /*input_size_n*/, void* /*output_ptr*/,
+             int64_t /*output_stride_m*/, int64_t /*output_stride_n*/, int /*output_size_m*/,
+             int /*output_size_n*/, void* const* /*staging_ptrs*/, int64_t /*staging_stride_m*/,
+             int64_t /*staging_stride_n*/, int /*staging_size_m*/, int /*staging_size_n*/,
+             void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
+             int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
+             int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
+             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotStagedKernel =
-    void (*)(void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*,
-          int,
-             uint64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, int, int, int);
-// out, weight, eps, inp_size_m, inp_size_n; the two-shots (pull and push) with every rank's
-// scratch.
+    void (*)(const void* /*input_ptr*/, int64_t /*input_stride_m*/, int64_t /*input_stride_n*/,
+             int /*input_size_m*/, int /*input_size_n*/, void* /*output_ptr*/,
+             int64_t /*output_stride_m*/, int64_t /*output_stride_n*/, int /*output_size_m*/,
+             int /*output_size_n*/, void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
+             int64_t /*scratch_stride_n*/, int /*scratch_size_m*/, int /*scratch_size_n*/,
+             void* const* /*staging_ptrs*/, int64_t /*staging_stride_m*/,
+             int64_t /*staging_stride_n*/, int /*staging_size_m*/, int /*staging_size_n*/,
+             void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
+             int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
+             int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
+             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
-          int64_t,
-             int64_t, const void*, int64_t, float, int, int);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*weight_ptr*/, int64_t /*weight_stride_n*/, int /*weight_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceRmsNormTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
-          void*, int,
-             uint64_t, void*, int64_t, int64_t, const void*, int64_t, float, int, int);
-// out, residual_out, residual, weight, eps, inp_size_m, inp_size_n.
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*weight_ptr*/, int64_t /*weight_stride_n*/, int /*weight_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* const* /*scratch_ptrs*/,
+             int64_t /*scratch_stride_m*/, int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
+             int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t, void*,
-          int64_t,
-             int64_t, void*, int64_t, int64_t, const void*, int64_t, int64_t, const void*,
-             int64_t, float, int, int);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
+             int64_t /*residual_stride_n*/, int /*residual_size_m*/, int /*residual_size_n*/,
+             const void* /*weight_ptr*/, int64_t /*weight_stride_n*/, int /*weight_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
+             int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
+             int /*residual_output_size_m*/, int /*residual_output_size_n*/,
+             void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
+             int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
+             int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
+             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddRmsNormTwoShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
-          void*, int,
-             uint64_t, void*, int64_t, int64_t, void*, int64_t, int64_t, const void*, int64_t,
-             int64_t, const void*, int64_t, float, int, int);
-// prefix, blocks (m, r, n), norm_w, qk_w, out_norm_w, out, num_blocks, write_idx, eps, out_eps,
-// inp_size_m, inp_size_n; the push with every rank's scratch; the pull with it and its
-// reduce_scatter_blocks last.
-#define HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS                                                                  \
-  void*, int64_t, int64_t, void*, int64_t, int64_t, int64_t, const void*, int64_t, const void*, \
-      int64_t, const void*, int64_t, void*, int64_t, int64_t, int, int, float, float, int, int
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
+             int64_t /*residual_stride_n*/, int /*residual_size_m*/, int /*residual_size_n*/,
+             const void* /*weight_ptr*/, int64_t /*weight_stride_n*/, int /*weight_size_n*/,
+             void* /*output_ptr*/, int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+             int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
+             int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
+             int /*residual_output_size_m*/, int /*residual_output_size_n*/,
+             void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
+             int64_t /*scratch_stride_n*/, int /*scratch_size_m*/, int /*scratch_size_n*/,
+             void* const* /*signals_ptrs*/, int64_t /*signals_stride_parity*/,
+             int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
+             int /*signals_size_parity*/, int /*signals_size_block*/, int /*signals_size_writer*/,
+             void* /*fault_ptr*/, int /*rank*/, uint64_t /*timeout_ticks*/, float /*eps*/);
 using AllReduceAddAttnResRmsNormOneShotKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t, void*, int, uint64_t,
-             HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/, int64_t /*prefix_stride_n*/,
+             int /*prefix_size_m*/, int /*prefix_size_n*/, const void* /*blocks_ptr*/,
+             int64_t /*blocks_stride_m*/, int64_t /*blocks_stride_r*/, int64_t /*blocks_stride_n*/,
+             int /*blocks_size_m*/, int /*blocks_size_r*/, int /*blocks_size_n*/,
+             const void* /*norm_weight_ptr*/, int64_t /*norm_weight_stride_n*/,
+             int /*norm_weight_size_n*/, const void* /*qk_weight_ptr*/,
+             int64_t /*qk_weight_stride_n*/, int /*qk_weight_size_n*/,
+             const void* /*output_norm_weight_ptr*/, int64_t /*output_norm_weight_stride_n*/,
+             int /*output_norm_weight_size_n*/, void* /*prefix_output_ptr*/,
+             int64_t /*prefix_output_stride_m*/, int64_t /*prefix_output_stride_n*/,
+             int /*prefix_output_size_m*/, int /*prefix_output_size_n*/, void* /*output_ptr*/,
+             int64_t /*output_stride_m*/, int64_t /*output_stride_n*/, int /*output_size_m*/,
+             int /*output_size_n*/, void* /*block_output_ptr*/, int64_t /*block_output_stride_m*/,
+             int64_t /*block_output_stride_n*/, int /*block_output_size_m*/,
+             int /*block_output_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
+             float /*output_eps*/);
 using AllReduceAddAttnResRmsNormPushKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
-          void*, int,
-             uint64_t, HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS);
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/, int64_t /*prefix_stride_n*/,
+             int /*prefix_size_m*/, int /*prefix_size_n*/, const void* /*blocks_ptr*/,
+             int64_t /*blocks_stride_m*/, int64_t /*blocks_stride_r*/, int64_t /*blocks_stride_n*/,
+             int /*blocks_size_m*/, int /*blocks_size_r*/, int /*blocks_size_n*/,
+             const void* /*norm_weight_ptr*/, int64_t /*norm_weight_stride_n*/,
+             int /*norm_weight_size_n*/, const void* /*qk_weight_ptr*/,
+             int64_t /*qk_weight_stride_n*/, int /*qk_weight_size_n*/,
+             const void* /*output_norm_weight_ptr*/, int64_t /*output_norm_weight_stride_n*/,
+             int /*output_norm_weight_size_n*/, void* /*prefix_output_ptr*/,
+             int64_t /*prefix_output_stride_m*/, int64_t /*prefix_output_stride_n*/,
+             int /*prefix_output_size_m*/, int /*prefix_output_size_n*/, void* /*output_ptr*/,
+             int64_t /*output_stride_m*/, int64_t /*output_stride_n*/, int /*output_size_m*/,
+             int /*output_size_n*/, void* /*block_output_ptr*/, int64_t /*block_output_stride_m*/,
+             int64_t /*block_output_stride_n*/, int /*block_output_size_m*/,
+             int /*block_output_size_n*/, void* const* /*scratch_ptrs*/,
+             int64_t /*scratch_stride_m*/, int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
+             int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
+             float /*output_eps*/);
 using AllReduceAddAttnResRmsNormPullKernel =
-    void (*)(const void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, void* const*, int64_t, int64_t, int64_t,
-          void*, int,
-             uint64_t, HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS, int);
-#undef HIP_CUSTOM_COMMUNICATOR_ATTN_RES_ARGS
+    void (*)(const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
+             int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+             const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/, int64_t /*prefix_stride_n*/,
+             int /*prefix_size_m*/, int /*prefix_size_n*/, const void* /*blocks_ptr*/,
+             int64_t /*blocks_stride_m*/, int64_t /*blocks_stride_r*/, int64_t /*blocks_stride_n*/,
+             int /*blocks_size_m*/, int /*blocks_size_r*/, int /*blocks_size_n*/,
+             const void* /*norm_weight_ptr*/, int64_t /*norm_weight_stride_n*/,
+             int /*norm_weight_size_n*/, const void* /*qk_weight_ptr*/,
+             int64_t /*qk_weight_stride_n*/, int /*qk_weight_size_n*/,
+             const void* /*output_norm_weight_ptr*/, int64_t /*output_norm_weight_stride_n*/,
+             int /*output_norm_weight_size_n*/, void* /*prefix_output_ptr*/,
+             int64_t /*prefix_output_stride_m*/, int64_t /*prefix_output_stride_n*/,
+             int /*prefix_output_size_m*/, int /*prefix_output_size_n*/, void* /*output_ptr*/,
+             int64_t /*output_stride_m*/, int64_t /*output_stride_n*/, int /*output_size_m*/,
+             int /*output_size_n*/, void* /*block_output_ptr*/, int64_t /*block_output_stride_m*/,
+             int64_t /*block_output_stride_n*/, int /*block_output_size_m*/,
+             int /*block_output_size_n*/, void* const* /*scratch_ptrs*/,
+             int64_t /*scratch_stride_m*/, int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
+             int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+             int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+             int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+             int /*signals_size_block*/, int /*signals_size_writer*/, void* /*fault_ptr*/,
+             int /*rank*/, uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
+             float /*output_eps*/, int /*reduce_scatter_blocks*/);
 
 // =================================================================================================
 // EACH OP'S LAUNCH: the kernel select decided, and every argument it runs with. Which kernel (the
@@ -310,7 +420,8 @@ using AllReduceAddAttnResRmsNormPullKernel =
 // =================================================================================================
 
 // `staged`: the build that copies an eager input through the staging a pass at a time, not the
-// one that reads a registered or captured input in place.
+// one that reads a registered or captured input in place. Exchange (scratch, staging) is the
+// handle's, so a launch holds only its strides and sizes.
 struct AllReduceLaunch {
   const void* kernel;
   Algorithm algorithm;
@@ -323,16 +434,17 @@ struct AllReduceLaunch {
   int waves_per_eu;
   bool staged;
   hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shot's: a row of a rank's slice a row
-  int64_t staging_stride_m, staging_stride_n;  // the staged builds': a band dense
-  int band_m;                               // the staged builds': the rows a pass
+  const void* input;
+  int64_t input_stride_m, input_stride_n;
+  int64_t input_size_m, input_size_n;
+  void* output;
+  int64_t output_stride_m, output_stride_n;
+  int64_t output_size_m, output_size_n;
+  int64_t scratch_stride_m, scratch_stride_n;
+  int64_t scratch_size_m, scratch_size_n;
+  int64_t staging_stride_m, staging_stride_n;
+  int64_t staging_size_m, staging_size_n;
   DType dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
 };
 
 // `weight_dtype`: dtype, or f32.
@@ -347,17 +459,19 @@ struct AllReduceRmsNormLaunch {
   int blocks_per_grid;
   int waves_per_eu;
   hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
+  const void* input;
+  int64_t input_stride_m, input_stride_n;
+  int64_t input_size_m, input_size_n;
   const void* weight;
   int64_t weight_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
+  int64_t weight_size_n;
+  void* output;
+  int64_t output_stride_m, output_stride_n;
+  int64_t output_size_m, output_size_n;
+  int64_t scratch_stride_m, scratch_stride_n;
+  int64_t scratch_size_m, scratch_size_n;
   DType dtype;
   DType weight_dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
   float eps;
 };
 
@@ -372,27 +486,32 @@ struct AllReduceAddRmsNormLaunch {
   int blocks_per_grid;
   int waves_per_eu;
   hipStream_t stream;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  void* residual_out;
-  int64_t residual_out_stride_m, residual_out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
+  const void* input;
+  int64_t input_stride_m, input_stride_n;
+  int64_t input_size_m, input_size_n;
   const void* residual;
   int64_t residual_stride_m, residual_stride_n;
+  int64_t residual_size_m, residual_size_n;
   const void* weight;
   int64_t weight_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
+  int64_t weight_size_n;
+  void* output;
+  int64_t output_stride_m, output_stride_n;
+  int64_t output_size_m, output_size_n;
+  void* residual_output;
+  int64_t residual_output_stride_m, residual_output_stride_n;
+  int64_t residual_output_size_m, residual_output_size_n;
+  int64_t scratch_stride_m, scratch_stride_n;
+  int64_t scratch_size_m, scratch_size_n;
   DType dtype;
   DType weight_dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
   float eps;
 };
 
 // tile_m 1 on the one-shot and push (a row a tile); reduce_scatter_blocks the pull two-shot's, 0
-// on the others. `blocks` is [rows, sources, hidden] at its strides in elements; `write_idx` < 0
-// writes no block; `out_norm_weight` null: no output norm.
+// on the others. `blocks` is [rows, sources, hidden] at its strides in elements; `prefix` null: no
+// prefix (the sum starts it); `block_output` null: no block written; `output_norm_weight` null: no
+// output norm.
 struct AllReduceAddAttnResRmsNormLaunch {
   const void* kernel;
   Algorithm algorithm;
@@ -406,29 +525,39 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int waves_per_eu;
   int reduce_scatter_blocks;
   hipStream_t stream;
-  void* prefix;
+  const void* input;
+  int64_t input_stride_m, input_stride_n;
+  int64_t input_size_m, input_size_n;
+  const void* prefix;
   int64_t prefix_stride_m, prefix_stride_n;
-  void* out;
-  int64_t out_stride_m, out_stride_n;
-  const void* inp;
-  int64_t inp_stride_m, inp_stride_n;
-  void* blocks;
+  int64_t prefix_size_m, prefix_size_n;
+  const void* blocks;
   int64_t blocks_stride_m, blocks_stride_r, blocks_stride_n;
+  int64_t blocks_size_m, blocks_size_r, blocks_size_n;
   const void* norm_weight;
   int64_t norm_weight_stride_n;
+  int64_t norm_weight_size_n;
   const void* qk_weight;
   int64_t qk_weight_stride_n;
-  const void* out_norm_weight;
-  int64_t out_norm_weight_stride_n;
-  int64_t scratch_stride_m, scratch_stride_n;  // the two-shots': a row of hidden a row
+  int64_t qk_weight_size_n;
+  const void* output_norm_weight;
+  int64_t output_norm_weight_stride_n;
+  int64_t output_norm_weight_size_n;
+  void* prefix_output;
+  int64_t prefix_output_stride_m, prefix_output_stride_n;
+  int64_t prefix_output_size_m, prefix_output_size_n;
+  void* output;
+  int64_t output_stride_m, output_stride_n;
+  int64_t output_size_m, output_size_n;
+  void* block_output;
+  int64_t block_output_stride_m, block_output_stride_n;
+  int64_t block_output_size_m, block_output_size_n;
+  int64_t scratch_stride_m, scratch_stride_n;
+  int64_t scratch_size_m, scratch_size_n;
   DType dtype;
-  int64_t inp_size_m;
-  int64_t inp_size_n;
   int num_blocks;
-  int write_idx;
   float eps;
-  float out_eps;
-  bool has_prefix;
+  float output_eps;
 };
 
 }  // namespace hip_custom_communicator

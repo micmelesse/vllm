@@ -18,20 +18,20 @@ namespace hip_custom_communicator {
 // their arguments into Ptrs; the peers' inputs become theirs after the first barrier.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL, int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
-    const DTYPE* const* __restrict__ inp_ptrs, int64_t inp_stride_m, int64_t inp_stride_n,
+    const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer, Fault* fault_ptr, int rank,
     uint64_t timeout_ticks,
-    Ptr<DTYPE> out, Ptr<DTYPE> residual_out, Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight,
-    float eps, int inp_size_m, int inp_size_n) {
+    Ptr<DTYPE> output, Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight,
+    float eps, int input_size_m, int input_size_n) {
   Sync<WORLD> sync{signals_ptrs, signals_stride_parity, signals_stride_block,
                    signals_stride_writer, fault_ptr, rank, timeout_ticks};
   using Row              = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF             = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
   using Weight           = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, WEIGHT_DTYPE>;
-  const float inv_hidden = 1.0f / static_cast<float>(inp_size_n);
+  const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
   // 1. Every rank's buffers, then wait until every peer has launched, so its input is ready.
-  const auto inp = rank_ptrs<const DTYPE, WORLD>(inp_ptrs, inp_stride_m, inp_stride_n);
+  const auto input = rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
   block_stamp(0);
   barrier<Until::launched>(sync);
   block_stamp(1);
@@ -42,8 +42,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   //      s  += float(residual); residual_out = DTYPE(s) ADD_RESIDUAL only (fused_add_rms_norm)
   //      out = DTYPE(WEIGHT_DTYPE(WEIGHT_DTYPE(s * rsqrt(mean(s^2) + eps)) * float(w)))
   //    The variance is of `s` before any further rounding, kept in registers between the passes.
-  for (int row = blockIdx.x; row < inp_size_m; row += gridDim.x) {
-    const Row at{inp_size_m, inp_size_n, row, 0};
+  for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
+    const Row at{input_size_m, input_size_n, row, 0};
     // Every load of the row before any store, in flight together: the peers', the residual's and
     // the weight's. A load issues where it is written (an address is built at its load), and the
     // weight after the peers' sum was a round trip of its own (+0.34 us at 16 x 3584,
@@ -51,16 +51,16 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     Row peers[WORLD];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r) peers[r] = at;
-    tile_load(peers, inp);
+    tile_load(peers, input);
     Row res = at;
     if constexpr (ADD_RESIDUAL) tile_load(res, residual);
-    Weight w{1, inp_size_n, 0, 0};
+    Weight w{1, input_size_n, 0, 0};
     tile_load(w, weight);
     RowF s = peers_reduce(peers).template to<float>();
     block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
-      tile_store(s.template to<DTYPE>(), residual_out);
+      tile_store(s.template to<DTYPE>(), residual_output);
     }
     float ss[1];
     partial_dot(s, s, ss);
@@ -72,7 +72,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
                             w.template to<float>())
                      .template to<WEIGHT_DTYPE>()
                      .template to<DTYPE>();
-    tile_store(normed, out);
+    tile_store(normed, output);
   }
 
   block_stamp(4);
@@ -85,51 +85,82 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_rms_norm(const DTYPE* const* __restrict__ inp_ptrs,
-                                      int64_t inp_stride_m, int64_t inp_stride_n,
-                                      uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
-                                      int64_t signals_stride_block, int64_t signals_stride_writer,
-                                      Fault* fault_ptr,
-                                      int rank, uint64_t timeout_ticks,
-                                      DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
-                                      int64_t out_stride_n,
+    all_reduce_pull_one_shot_rms_norm(const DTYPE* const* __restrict__ input_ptrs,
+                                      int64_t input_stride_m,
+                                      int64_t input_stride_n,
+                                      int input_size_m,
+                                      int input_size_n,
                                       const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                      int64_t weight_stride_n, float eps, int inp_size_m,
-                                      int inp_size_n) {
+                                      int64_t weight_stride_n,
+                                      int weight_size_n,
+                                      DTYPE* __restrict__ output_ptr,
+                                      int64_t output_stride_m,
+                                      int64_t output_stride_n,
+                                      int output_size_m,
+                                      int output_size_n,
+                                      uint32_t* const* __restrict__ signals_ptrs,
+                                      int64_t signals_stride_parity,
+                                      int64_t signals_stride_block,
+                                      int64_t signals_stride_writer,
+                                      int signals_size_parity,
+                                      int signals_size_block,
+                                      int signals_size_writer,
+                                      Fault* fault_ptr,
+                                      int rank,
+                                      uint64_t timeout_ticks,
+                                      float eps) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false, TILE_N, THREADS_PER_BLOCK>(
-      inp_ptrs, inp_stride_m, inp_stride_n, signals_ptrs, signals_stride_parity,
+      input_ptrs, input_stride_m, input_stride_n, signals_ptrs, signals_stride_parity,
       signals_stride_block, signals_stride_writer, fault_ptr, rank, timeout_ticks,
-      local_ptr(out_ptr, out_stride_m, out_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
+      local_ptr(output_ptr, output_stride_m, output_stride_n, rank), Ptr<DTYPE>{nullptr, 0, 0, rank},
       Ptr<const DTYPE>{nullptr, 0, 0, rank}, local_ptr(weight_ptr, 0, weight_stride_n, rank),
-      eps, inp_size_m, inp_size_n);
+      eps, input_size_m, input_size_n);
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_add_rms_norm(const DTYPE* const* __restrict__ inp_ptrs,
-                                          int64_t inp_stride_m, int64_t inp_stride_n,
-                                          uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
-                                          int64_t signals_stride_block, int64_t signals_stride_writer,
-                                          Fault* fault_ptr,
-                                          int rank, uint64_t timeout_ticks,
-                                          DTYPE* __restrict__ out_ptr, int64_t out_stride_m,
-                                          int64_t out_stride_n,
-                                          DTYPE* __restrict__ residual_out_ptr,
-                                          int64_t residual_out_stride_m,
-                                          int64_t residual_out_stride_n,
+    all_reduce_pull_one_shot_add_rms_norm(const DTYPE* const* __restrict__ input_ptrs,
+                                          int64_t input_stride_m,
+                                          int64_t input_stride_n,
+                                          int input_size_m,
+                                          int input_size_n,
                                           const DTYPE* __restrict__ residual_ptr,
-                                          int64_t residual_stride_m, int64_t residual_stride_n,
+                                          int64_t residual_stride_m,
+                                          int64_t residual_stride_n,
+                                          int residual_size_m,
+                                          int residual_size_n,
                                           const WEIGHT_DTYPE* __restrict__ weight_ptr,
-                                          int64_t weight_stride_n, float eps, int inp_size_m,
-                                          int inp_size_n) {
+                                          int64_t weight_stride_n,
+                                          int weight_size_n,
+                                          DTYPE* __restrict__ output_ptr,
+                                          int64_t output_stride_m,
+                                          int64_t output_stride_n,
+                                          int output_size_m,
+                                          int output_size_n,
+                                          DTYPE* __restrict__ residual_output_ptr,
+                                          int64_t residual_output_stride_m,
+                                          int64_t residual_output_stride_n,
+                                          int residual_output_size_m,
+                                          int residual_output_size_n,
+                                          uint32_t* const* __restrict__ signals_ptrs,
+                                          int64_t signals_stride_parity,
+                                          int64_t signals_stride_block,
+                                          int64_t signals_stride_writer,
+                                          int signals_size_parity,
+                                          int signals_size_block,
+                                          int signals_size_writer,
+                                          Fault* fault_ptr,
+                                          int rank,
+                                          uint64_t timeout_ticks,
+                                          float eps) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true, TILE_N, THREADS_PER_BLOCK>(
-      inp_ptrs, inp_stride_m, inp_stride_n, signals_ptrs, signals_stride_parity,
+      input_ptrs, input_stride_m, input_stride_n, signals_ptrs, signals_stride_parity,
       signals_stride_block, signals_stride_writer, fault_ptr, rank, timeout_ticks,
-      local_ptr(out_ptr, out_stride_m, out_stride_n, rank),
-      local_ptr(residual_out_ptr, residual_out_stride_m, residual_out_stride_n, rank),
+      local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
+      local_ptr(residual_output_ptr, residual_output_stride_m, residual_output_stride_n, rank),
       local_ptr(residual_ptr, residual_stride_m, residual_stride_n, rank),
-      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, inp_size_m, inp_size_n);
+      local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, input_size_m, input_size_n);
 }
 
 }  // namespace hip_custom_communicator

@@ -217,10 +217,10 @@ DINLINE void block_store_row_scalar(float* scalars, int row, float v) {
 }
 
 template <int WORLD, typename RANK_DATA>
-DINLINE void peers_load_row_scalars(RANK_DATA data, int row, float (&out)[WORLD]) {
+DINLINE void peers_load_row_scalars(RANK_DATA data, int row, float (&output)[WORLD]) {
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
-    out[r] = *(const __attribute__((address_space(1))) float*)(data(r) + row);
+    output[r] = *(const __attribute__((address_space(1))) float*)(data(r) + row);
   impl::issued();
 }
 }  // namespace impl

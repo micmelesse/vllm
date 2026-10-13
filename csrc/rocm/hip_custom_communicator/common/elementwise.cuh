@@ -25,15 +25,15 @@ DINLINE A zip(const A& a, const B& b, OP op) {
                 "tile math is on float tiles; to<float>() first");
   static_assert(B::kRows == A::kRows || B::kRows == 1, "b is a's shape or one row");
   static_assert(B::K == A::K && B::kPack == A::kPack, "b holds a's columns");
-  A out = a;
+  A output = a;
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < A::K; ++k)
 #pragma unroll
       for (int j = 0; j < A::kPack; ++j)
-        out.v[m][k][j] = op(a.v[m][k][j], b.v[B::kRows == 1 ? 0 : m][k][j]);
-  return out;
+        output.v[m][k][j] = op(a.v[m][k][j], b.v[B::kRows == 1 ? 0 : m][k][j]);
+  return output;
 }
 
 template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
@@ -49,14 +49,14 @@ DINLINE A tile_mul(const A& a, const B& b) {
 template <typename A>
 DINLINE A tile_mul(const A& a, const float (&row_scale)[A::kRows]) {
   static_assert(std::is_same_v<typename A::Acc, float>, "tile math is on float tiles");
-  A out = a;
+  A output = a;
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < A::K; ++k)
 #pragma unroll
-      for (int j = 0; j < A::kPack; ++j) out.v[m][k][j] = a.v[m][k][j] * row_scale[m];
-  return out;
+      for (int j = 0; j < A::kPack; ++j) output.v[m][k][j] = a.v[m][k][j] * row_scale[m];
+  return output;
 }
 
 template <typename A>
@@ -76,15 +76,15 @@ template <typename A, typename B>
 DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
                    const float (&b_row_scale)[A::kRows]) {
   static_assert(std::is_same_v<typename A::Acc, float>, "the sum is a float tile");
-  A out = a;
+  A output = a;
 #pragma unroll
   for (int m = 0; m < A::kRows; ++m)
 #pragma unroll
     for (int k = 0; k < A::K; ++k)
 #pragma unroll
       for (int j = 0; j < A::kPack; ++j)
-        out.v[m][k][j] = fmaf(static_cast<float>(b.v[m][k][j]), b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
-  return out;
+        output.v[m][k][j] = fmaf(static_cast<float>(b.v[m][k][j]), b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
+  return output;
 }
 }  // namespace impl
 

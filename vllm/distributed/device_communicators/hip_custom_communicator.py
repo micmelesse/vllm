@@ -230,24 +230,24 @@ def build_info() -> BuildInfo:
     )
 
 
-def should(op: Op, inp: torch.Tensor, weight: torch.Tensor | None = None) -> bool:
-    """Whether a PLAIN call of `op` (nothing forced) on `inp`, and a norm's `weight`,
+def should(op: Op, input: torch.Tensor, weight: torch.Tensor | None = None) -> bool:
+    """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
     runs: inside the op's record (`build_info().ops`) and whole packs a row. Python
     alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
     admits."""
     built = build_info()
     record = built.ops[op]
-    if inp.dtype not in record.dtypes or not inp.is_contiguous() or inp.numel() == 0:
+    if input.dtype not in record.dtypes or not input.is_contiguous() or input.numel() == 0:
         return False
-    if inp.dim() == 0 or (record.two_d and inp.dim() != 2):
+    if input.dim() == 0 or (record.two_d and input.dim() != 2):
         return False
-    row = inp.shape[-1]
-    if weight is not None and weight.dtype not in record.weight_dtypes | {inp.dtype}:
+    row = input.shape[-1]
+    if weight is not None and weight.dtype not in record.weight_dtypes | {input.dtype}:
         return False
     return (
-        row * inp.element_size() % built.pack_bytes == 0
+        row * input.element_size() % built.pack_bytes == 0
         and (record.widest_row == 0 or row <= record.widest_row)
-        and inp.numel() * inp.element_size() <= record.max_bytes
+        and input.numel() * input.element_size() <= record.max_bytes
     )
 
 
@@ -255,8 +255,8 @@ class Refused(RuntimeError):
     """A call this backend does not take, raised by the op with the Error C++ refused
     it for, and the input it was asked to run on. A call `should` admits never is."""
 
-    def __init__(self, error: Error, inp: torch.Tensor) -> None:
-        super().__init__(f"{error.name}: shape={tuple(inp.shape)} dtype={inp.dtype}")
+    def __init__(self, error: Error, input: torch.Tensor) -> None:
+        super().__init__(f"{error.name}: shape={tuple(input.shape)} dtype={input.dtype}")
         self.error = error
 
 
@@ -274,10 +274,10 @@ def supported(device: torch.device, world: int) -> Supported | Error:
     return Error(err) if err is not None else Supported(arch)
 
 
-def is_weak_contiguous(inp: torch.Tensor) -> bool:
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
+def is_weak_contiguous(input: torch.Tensor) -> bool:
+    return input.is_contiguous() or (
+        input.storage().nbytes() - input.storage_offset() * input.element_size()
+        == input.numel() * input.element_size()
     )
 
 
@@ -450,14 +450,14 @@ class HipCustomCommunicator:
     # Error C++ refused it for; a call its `should_` admitted is never refused.
 
     @final
-    def should_allreduce(self, inp: torch.Tensor) -> bool:
-        """Whether `all_reduce(inp)` runs here."""
-        return not self.disabled and should("all_reduce", inp)
+    def should_allreduce(self, input: torch.Tensor) -> bool:
+        """Whether `all_reduce(input)` runs here."""
+        return not self.disabled and should("all_reduce", input)
 
     @final
     def all_reduce(
         self,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         *,
         algorithm: str | None = None,
         direction: str | None = None,
@@ -470,13 +470,13 @@ class HipCustomCommunicator:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
         picks among a backend's own paths (hip's in C++), never whether it is ours.
         Returns the sum."""
-        self._admit(inp)
-        out = torch.empty_like(inp)
+        self._admit(input)
+        output = torch.empty_like(input)
         if self._warming_up():
-            return out
+            return output
         refused = self._all_reduce(
-            out,
-            inp,
+            input,
+            output,
             algorithm,
             direction,
             tile_m,
@@ -485,20 +485,20 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce", inp, refused)
-        return out
+        self._launched("all_reduce", input, refused)
+        return output
 
     @final
     def should_allreduce_rms_norm(
-        self, inp: torch.Tensor, weight: torch.Tensor
+        self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
-        """Whether `all_reduce_rms_norm(inp, weight, ...)` runs here."""
-        return not self.disabled and should("all_reduce_rms_norm", inp, weight)
+        """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
+        return not self.disabled and should("all_reduce_rms_norm", input, weight)
 
     @final
     def all_reduce_rms_norm(
         self,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         *,
@@ -510,16 +510,16 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
     ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel. Returns
+        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)` in one kernel. Returns
         the normed sum."""
-        self._admit(inp)
-        out = torch.empty_like(inp)
+        self._admit(input)
+        output = torch.empty_like(input)
         if self._warming_up():
-            return out
+            return output
         refused = self._all_reduce_rms_norm(
-            out,
-            inp,
+            input,
             weight,
+            output,
             eps,
             algorithm,
             direction,
@@ -529,20 +529,20 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_rms_norm", inp, refused)
-        return out
+        self._launched("all_reduce_rms_norm", input, refused)
+        return output
 
     @final
     def should_allreduce_add_rms_norm(
-        self, inp: torch.Tensor, weight: torch.Tensor
+        self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
-        """Whether `all_reduce_add_rms_norm(inp, ..., weight, ...)` runs here."""
-        return not self.disabled and should("all_reduce_add_rms_norm", inp, weight)
+        """Whether `all_reduce_add_rms_norm(input, ..., weight, ...)` runs here."""
+        return not self.disabled and should("all_reduce_add_rms_norm", input, weight)
 
     @final
     def all_reduce_add_rms_norm(
         self,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
@@ -555,18 +555,18 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
+        """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)` in
         one kernel. Returns the normed result and the sum plus residual."""
-        self._admit(inp)
-        out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
+        self._admit(input)
+        output, residual_output = torch.empty_like(input), torch.empty_like(input)
         if self._warming_up():
-            return out, residual_out
+            return output, residual_output
         refused = self._all_reduce_add_rms_norm(
-            out,
-            residual_out,
-            inp,
+            input,
             residual,
             weight,
+            output,
+            residual_output,
             eps,
             algorithm,
             direction,
@@ -576,27 +576,27 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_add_rms_norm", inp, refused)
-        return out, residual_out
+        self._launched("all_reduce_add_rms_norm", input, refused)
+        return output, residual_output
 
     @final
-    def should_allreduce_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
-        """Whether `all_reduce_add_attn_res_rms_norm(inp, ...)` runs here."""
-        return not self.disabled and should("all_reduce_add_attn_res_rms_norm", inp)
+    def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
+        """Whether `all_reduce_add_attn_res_rms_norm(input, ...)` runs here."""
+        return not self.disabled and should("all_reduce_add_attn_res_rms_norm", input)
 
     @final
     def all_reduce_add_attn_res_rms_norm(
         self,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         prefix: torch.Tensor | None,
         blocks: torch.Tensor,
         norm_weight: torch.Tensor,
         qk_weight: torch.Tensor,
-        out_norm_weight: torch.Tensor | None,
+        output_norm_weight: torch.Tensor | None,
         num_blocks: int,
-        write_idx: int,
+        write_index: int,
         eps: float,
-        out_eps: float,
+        output_eps: float,
         *,
         algorithm: str | None = None,
         direction: str | None = None,
@@ -608,29 +608,32 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
-        `prefix` the sum starting one. Returns the prefix (updated in place when given)
-        and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
-        block."""
-        self._admit(inp)
-        # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
-        prefix_out = torch.empty_like(inp) if prefix is None else prefix
-        out = torch.empty_like(inp)
+        """`attn_res(prefix, all_reduce(input), blocks, ...)` in one kernel, or with no
+        `prefix` the sum starting one. Returns the new prefix and the AttnRes output,
+        each a new tensor: `prefix` is only read. `write_index` >= 0 also stores the new
+        prefix as that block of `blocks`, which must not be one of the `num_blocks`
+        sources the call reads."""
+        self._admit(input)
+        prefix_output = torch.empty_like(input)
+        output = torch.empty_like(input)
         if self._warming_up():
-            return prefix_out, out
+            return prefix_output, output
+        # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
+        # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
+        block_output = blocks[:, write_index] if write_index >= 0 else None
         refused = self._all_reduce_add_attn_res_rms_norm(
-            prefix_out,
-            out,
-            inp,
-            prefix is not None,
+            input,
+            prefix,
             blocks,
             norm_weight,
             qk_weight,
-            out_norm_weight,
+            output_norm_weight,
+            prefix_output,
+            output,
+            block_output,
             num_blocks,
-            write_idx,
             eps,
-            out_eps,
+            output_eps,
             algorithm,
             direction,
             tile_m,
@@ -641,8 +644,8 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_add_attn_res_rms_norm", inp, refused)
-        return prefix_out, out
+        self._launched("all_reduce_add_attn_res_rms_norm", input, refused)
+        return prefix_output, output
 
     @final
     def close(self) -> None:
@@ -755,30 +758,30 @@ class HipCustomCommunicator:
         )
 
     @final
-    def _admit(self, inp: torch.Tensor) -> None:
+    def _admit(self, input: torch.Tensor) -> None:
         """Before an op: refused when no call may run (`disabled`), and raise on a
         capture outside `capture()`."""
         if self.disabled:
-            raise Refused(Error.disabled, inp)
+            raise Refused(Error.disabled, input)
         _require_capture(self.state)
 
     @final
-    def _launched(self, op: Op, inp: torch.Tensor, refused: int | None) -> None:
+    def _launched(self, op: Op, input: torch.Tensor, refused: int | None) -> None:
         """After an op's kernel hook: Refused with the Error's number it answered, or
         the launch into the flight recorder."""
         if refused is not None:
-            raise Refused(Error(refused), inp)
-        self._record(op, inp)
+            raise Refused(Error(refused), input)
+        self._record(op, input)
 
     @final
-    def _record(self, op: Op, inp: torch.Tensor) -> None:
+    def _record(self, op: Op, input: torch.Tensor) -> None:
         """Into the flight recorder, as a launch goes out."""
         self._calls.append(
             Call(
                 seq=self._launches,
                 op=op,
-                shape=tuple(inp.shape),
-                dtype=inp.dtype,
+                shape=tuple(input.shape),
+                dtype=input.dtype,
                 captured=torch.cuda.is_current_stream_capturing(),
                 at_s=time.monotonic(),
             )
@@ -841,8 +844,8 @@ class HipCustomCommunicator:
 
     def _all_reduce(
         self,
-        out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
+        output: torch.Tensor,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
@@ -851,12 +854,12 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> int | None:
-        """Sum `inp` across the TP ranks into `out`; the Error's number C++ refused
+        """Sum `input` across the TP ranks into `output`; the Error's number C++ refused
         the call for, or None when it ran (as every kernel hook answers)."""
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
             self._handle,
-            out,
-            inp,
+            input,
+            output,
             algorithm,
             direction,
             tile_m,
@@ -868,9 +871,9 @@ class HipCustomCommunicator:
 
     def _all_reduce_rms_norm(
         self,
-        out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         weight: torch.Tensor,
+        output: torch.Tensor,
         eps: float,
         algorithm: str | None,
         direction: str | None,
@@ -882,9 +885,9 @@ class HipCustomCommunicator:
     ) -> int | None:
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
             self._handle,
-            out,
-            inp,
+            input,
             weight,
+            output,
             eps,
             algorithm,
             direction,
@@ -897,11 +900,11 @@ class HipCustomCommunicator:
 
     def _all_reduce_add_rms_norm(
         self,
-        out: torch.Tensor,
-        residual_out: torch.Tensor,
-        inp: torch.Tensor,
+        input: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
+        output: torch.Tensor,
+        residual_output: torch.Tensor,
         eps: float,
         algorithm: str | None,
         direction: str | None,
@@ -911,14 +914,14 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> int | None:
-        """The normed result into `out`, the sum plus residual into `residual_out`."""
+        """The normed result into `output`, the sum plus residual into `residual_output`."""
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             self._handle,
-            out,
-            residual_out,
-            inp,
+            input,
             residual,
             weight,
+            output,
+            residual_output,
             eps,
             algorithm,
             direction,
@@ -931,18 +934,18 @@ class HipCustomCommunicator:
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
-        prefix_out: torch.Tensor,
-        out: torch.Tensor,
-        inp: torch.Tensor,
-        has_prefix: bool,
+        input: torch.Tensor,
+        prefix: torch.Tensor | None,
         blocks: torch.Tensor,
         norm_weight: torch.Tensor,
         qk_weight: torch.Tensor,
-        out_norm_weight: torch.Tensor | None,
+        output_norm_weight: torch.Tensor | None,
+        prefix_output: torch.Tensor,
+        output: torch.Tensor,
+        block_output: torch.Tensor | None,
         num_blocks: int,
-        write_idx: int,
         eps: float,
-        out_eps: float,
+        output_eps: float,
         algorithm: str | None,
         direction: str | None,
         tile_m: int | None,
@@ -958,18 +961,18 @@ class HipCustomCommunicator:
         )
         return launch(
             self._handle,
-            prefix_out,
-            out,
-            inp,
+            input,
+            prefix,
             blocks,
             norm_weight,
             qk_weight,
-            out_norm_weight,
+            output_norm_weight,
+            prefix_output,
+            output,
+            block_output,
             num_blocks,
-            write_idx,
             eps,
-            out_eps,
-            has_prefix,
+            output_eps,
             algorithm,
             direction,
             tile_m,
