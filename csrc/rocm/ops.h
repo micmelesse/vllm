@@ -74,50 +74,6 @@ void hip_custom_communicator_dispose(fptr_t handle_ptr);
 std::vector<int64_t> hip_custom_communicator_fault(fptr_t handle_ptr);
 void hip_custom_communicator_abort(fptr_t handle_ptr);
 
-// Each op takes its own forcing last: the template by name, every field of one of
-// its builds, and the launch, all or none (none: select's).
-
-// A PLANNER'S ANSWER: the template's name and the op's config fields as its
-// kernel has them, or the Error's number.
-using HipCustomCommunicatorField = std::optional<int64_t>;
-template <typename... Fields>
-using HipCustomCommunicatorPlan =
-    std::tuple<std::optional<std::string>, std::optional<std::string>, Fields...,
-               std::optional<int64_t>>;
-using HipCustomCommunicatorAllReducePlan =
-    HipCustomCommunicatorPlan<HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField,
-                  HipCustomCommunicatorField>;
-using HipCustomCommunicatorAllReduceRmsNormPlan =
-    HipCustomCommunicatorPlan<HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField,
-                  HipCustomCommunicatorField>;
-using HipCustomCommunicatorAllReduceAddAttnResRmsNormPlan =
-    HipCustomCommunicatorPlan<HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField,
-                  HipCustomCommunicatorField, HipCustomCommunicatorField, HipCustomCommunicatorField,
-                  HipCustomCommunicatorField>;
-
-// The planners, one per op family, each given the call's own tensors.
-HipCustomCommunicatorAllReducePlan hip_custom_communicator_plan_all_reduce(
-    fptr_t handle_ptr, const torch::Tensor& inp,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-HipCustomCommunicatorAllReduceRmsNormPlan hip_custom_communicator_plan_all_reduce_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight,
-    bool add, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
-HipCustomCommunicatorAllReduceAddAttnResRmsNormPlan hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> tile_k, std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
 // A variant at the torch boundary: the arch or the Error's number, exactly one
 // set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>>
@@ -125,15 +81,21 @@ hip_custom_communicator_supported(int64_t device, int64_t world);
 // The build's dtypes by name, its worlds, a pack's bytes and a staging's, its
 // ops', errors' and fault places' names in their enums' order, and each template's name, op
 // and BuildConfigs (flat, a build's fields in the names' order, 0 where its op's
-// BuildConfig has none, with each template's count).
+// BuildConfig has none, with each template's count), and each op's plain call (its
+// dtypes and its weight's besides its input's, flat, and five ints an op).
 std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
-           std::vector<int64_t>, std::vector<int64_t>>
+           std::vector<int64_t>, std::vector<int64_t>, std::vector<std::string>,
+           std::vector<std::string>, std::vector<int64_t>>
 hip_custom_communicator_build_info();
 
-void hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
+// Each op takes its own forcing last: the template by name, every field of one of
+// its builds, and the launch, all or none (none: select's). It returns the Error's
+// number it was refused for, or none when it ran.
+
+std::optional<int64_t> hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
                            torch::Tensor& inp,
                            std::optional<std::string> algorithm,
                            std::optional<std::string> direction,
@@ -142,7 +104,7 @@ void hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out,
                            std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
+std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out,
                                     torch::Tensor& inp, torch::Tensor& weight,
                                     double eps,
                                     std::optional<std::string> algorithm,
@@ -152,7 +114,7 @@ void hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tenso
                                     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void hip_custom_communicator_all_reduce_add_rms_norm(
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out,
     torch::Tensor& inp, torch::Tensor& residual, torch::Tensor& weight,
     double eps, std::optional<std::string> algorithm,
@@ -161,7 +123,7 @@ void hip_custom_communicator_all_reduce_add_rms_norm(
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
 
-void hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out,
     torch::Tensor& inp, torch::Tensor& blocks, torch::Tensor& norm_weight,
     torch::Tensor& qk_weight,

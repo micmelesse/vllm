@@ -4,7 +4,7 @@
 // Our HIP collectives as torch ops, built into `_rocm_C`: this file only strips torch. Each op
 // checks its tensors and passes their pointers, shapes and dtypes, its names as enums and its
 // numbers as ints, to its function in hip_custom_communicator/interface.cuh (the API, torch-free), and turns
-// the answer back: an Error raised, or a plan's kernel as its schema's tuple.
+// the answer back: an op returns the Error's number it was refused for, or none when it ran.
 // Self-contained: torch and the HIP runtime, nothing from aiter.
 
 #include <ATen/cuda/CUDAContext.h>
@@ -146,153 +146,11 @@ std::optional<torch::Tensor> as_rows(const torch::Tensor& t) {
 using Names         = std::vector<std::string>;
 using SupportedWire = std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire      = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
-using BuildInfoWire = std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names,
-                                 Names, Names, Names, std::vector<int64_t>, std::vector<int64_t>>;
-
-// A torch dtype as ours, or none for one ours has no name for.
-std::optional<hip_custom_communicator::DType> dtype_from(at::ScalarType s) {
-  if (s == at::ScalarType::Half) return hip_custom_communicator::DType::f16;
-  if (s == at::ScalarType::BFloat16) return hip_custom_communicator::DType::bf16;
-  if (s == at::ScalarType::Float) return hip_custom_communicator::DType::f32;
-  return std::nullopt;
-}
-
-// WHAT RUNS A CALL, or the first Error it meets: `hip_custom_communicator::plan`, one planner
-// per op family, each handed the call's own tensors and reading their facts
-// here, with the op's own forcing. A torch op cannot return a variant, so each
-// returns the kernel's template (by name) and its config as that op's own
-// fields, or the Error's number: those or the one. The arguments a call's
-// kernel reads are not, so they are null.
-namespace {
-// AN INPUT AS OURS: its dtype, or the Error it meets first (not 2-D, a dtype ours has no name
-// for, a layout the packed loads cannot read: the interface's own check, on its strides).
-std::variant<hip_custom_communicator::DType, hip_custom_communicator::Error> admitted(const torch::Tensor& inp) {
-  if (inp.dim() != 2) return hip_custom_communicator::Error::not_two_d;
-  const std::optional<hip_custom_communicator::DType> d = dtype_from(inp.scalar_type());
-  if (!d) return hip_custom_communicator::Error::dtype_not_built;
-  if (const auto e = hip_custom_communicator::layout_refused(*d, {{inp.stride(0), inp.stride(1)}})) return *e;
-  return *d;
-}
-
-std::optional<std::string> name_of(hip_custom_communicator::Algorithm a) {
-  return std::string(a == hip_custom_communicator::Algorithm::two_shot ? "two_shot" : "one_shot");
-}
-std::optional<std::string> name_of(hip_custom_communicator::Direction d) {
-  return std::string(d == hip_custom_communicator::Direction::push ? "push" : "pull");
-}
-std::optional<int64_t> number_of(hip_custom_communicator::Error e) { return static_cast<int64_t>(e); }
-
-// EACH OP'S ANSWER, as its schema returns it: the launch's fields, or the Error's number.
-HipCustomCommunicatorAllReducePlan all_reduce_plan_of(
-    const std::variant<hip_custom_communicator::AllReduceLaunch, hip_custom_communicator::Error>& p) {
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, number_of(*e)};
-  const auto& l = std::get<hip_custom_communicator::AllReduceLaunch>(p);
-  return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.threads_per_block,
-          l.blocks_per_grid, l.waves_per_eu, std::nullopt};
-}
-template <typename LAUNCH>
-HipCustomCommunicatorAllReduceRmsNormPlan all_reduce_rms_norm_plan_of(
-    const std::variant<LAUNCH, hip_custom_communicator::Error>& p) {
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, number_of(*e)};
-  const LAUNCH& l = std::get<LAUNCH>(p);
-  return {name_of(l.algorithm), name_of(l.direction), l.tile_m, l.tile_n, l.threads_per_block,
-          l.blocks_per_grid, l.waves_per_eu, std::nullopt};
-}
-HipCustomCommunicatorAllReduceAddAttnResRmsNormPlan all_reduce_add_attn_res_rms_norm_plan_of(
-    const std::variant<hip_custom_communicator::AllReduceAddAttnResRmsNormLaunch, hip_custom_communicator::Error>& p) {
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&p))
-    return {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, number_of(*e)};
-  const auto& l   = std::get<hip_custom_communicator::AllReduceAddAttnResRmsNormLaunch>(p);
-  return {name_of(l.algorithm),
-          name_of(l.direction),
-          l.tile_m,
-          l.tile_n,
-          l.tile_k,
-          l.reduce_scatter_blocks,
-          l.threads_per_block,
-          l.blocks_per_grid,
-          l.waves_per_eu,
-          std::nullopt};
-}
-}  // namespace
-
-HipCustomCommunicatorAllReducePlan hip_custom_communicator_plan_all_reduce(
-    fptr_t handle_ptr, const torch::Tensor& inp, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  const auto alg = algorithm_from(algorithm);
-  const auto dir = direction_from(direction);
-  const std::optional<torch::Tensor> m = as_rows(inp);
-  if (!m) return all_reduce_plan_of(hip_custom_communicator::Error::not_contiguous);
-  const auto d = admitted(*m);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&d)) return all_reduce_plan_of(*e);
-  // A plan has inp; out is absent: null, its strides 0.
-  return all_reduce_plan_of(hip_custom_communicator::select_all_reduce(
-      handle_of(handle_ptr), nullptr, 0, 0, nullptr, m->stride(0), m->stride(1),
-      m->size(0), m->size(1), std::get<hip_custom_communicator::DType>(d), alg, dir, narrowed(tile_m),
-      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream()));
-}
-
-// `add`: fused_add_rms_norm's; otherwise rms_norm's.
-HipCustomCommunicatorAllReduceRmsNormPlan hip_custom_communicator_plan_all_reduce_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, const torch::Tensor& weight, bool add,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  const auto alg = algorithm_from(algorithm);
-  const auto dir = direction_from(direction);
-  const auto d = admitted(inp);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&d))
-    return all_reduce_rms_norm_plan_of<hip_custom_communicator::AllReduceRmsNormLaunch>(*e);
-  const std::optional<hip_custom_communicator::DType> w = dtype_from(weight.scalar_type());
-  if (!w)
-    return all_reduce_rms_norm_plan_of<hip_custom_communicator::AllReduceRmsNormLaunch>(
-        hip_custom_communicator::Error::weight_not_built);
-  auto& h = handle_of(handle_ptr);
-  const hip_custom_communicator::DType dt = std::get<hip_custom_communicator::DType>(d);
-  const auto tm = narrowed(tile_m), tn = narrowed(tile_n), tpb = narrowed(threads_per_block);
-  const auto bpg = narrowed(blocks_per_grid), wpe = narrowed(waves_per_eu);
-  // A plan has inp and the weight; every other buffer is absent: null, its strides 0.
-  const int64_t im = inp.stride(0), in = inp.stride(1), ws = weight.stride(0);
-  if (add)
-    return all_reduce_rms_norm_plan_of(hip_custom_communicator::select_all_reduce_add_rms_norm(
-        h, nullptr, 0, 0, nullptr, 0, 0, nullptr, im, in, nullptr, 0, 0, nullptr, ws, dt, *w,
-        inp.size(0), inp.size(1), 0.f, alg, dir, tm, tn, tpb, bpg, wpe, current_stream()));
-  return all_reduce_rms_norm_plan_of(hip_custom_communicator::select_all_reduce_rms_norm(
-      h, nullptr, 0, 0, nullptr, im, in, nullptr, ws, dt, *w, inp.size(0), inp.size(1), 0.f, alg,
-      dir, tm, tn, tpb, bpg, wpe, current_stream()));
-}
-
-HipCustomCommunicatorAllReduceAddAttnResRmsNormPlan hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm(
-    fptr_t handle_ptr, const torch::Tensor& inp, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> reduce_scatter_blocks, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
-  const auto alg = algorithm_from(algorithm);
-  const auto dir = direction_from(direction);
-  const auto d = admitted(inp);
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&d))
-    return all_reduce_add_attn_res_rms_norm_plan_of(*e);
-  return all_reduce_add_attn_res_rms_norm_plan_of(
-      hip_custom_communicator::select_all_reduce_add_attn_res_rms_norm(
-      // A plan has inp; every other buffer is absent: null, its strides 0.
-      handle_of(handle_ptr), nullptr, 0, 0, nullptr, 0, 0, nullptr, inp.stride(0), inp.stride(1),
-      nullptr, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr, 0, std::get<hip_custom_communicator::DType>(d), inp.size(0), inp.size(1), 0, -1, 0.f, 0.f, false, alg, dir,
-      narrowed(tile_m), narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
-      narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
-      current_stream()));
-}
+using BuildInfoWire =
+    std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names, Names, Names, Names, Names,
+               std::vector<int64_t>, std::vector<int64_t>, Names, Names, std::vector<int64_t>>;
+// AN OP'S ANSWER: the Error's number it was refused for, or none when it ran.
+using Refusal = std::optional<int64_t>;
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group` (which carries the
 // handles) and `device_group`, a collective: this rank's symmetric memory, made and owned here, its
@@ -325,8 +183,8 @@ SupportedWire hip_custom_communicator_supported(int64_t device, int64_t world) {
 
 // WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its worlds, a pack's
 // bytes and a staging's, its ops, errors and fault places by name in their enums' order (each
-// error's name without its reason), which Python's `Op`, `Error` and `Where` are held to, and its
-// templates.
+// error's name without its reason), which Python's `Op`, `Error` and `Where` are held to, its
+// templates, and each op's plain call, which Python's `should` admits.
 BuildInfoWire hip_custom_communicator_build_info() {
   using namespace hip_custom_communicator;
   Names dtypes, ops, errors, wheres;
@@ -358,8 +216,20 @@ BuildInfoWire hip_custom_communicator_build_info() {
           },
           b);
   }
-  return {dtypes, worlds, kBuild.memory.pack_bytes, kBuild.memory.staging_bytes, ops, errors,
-          wheres, templates, template_ops, fields, configs, counts};
+  // EACH OP'S PLAIN CALL (kOps, select.cuh), in `ops`' order: its dtypes and its weight's besides
+  // its input's, flat, and five ints an op: those two counts, widest_row, max_bytes and two_d.
+  Names op_dtypes, op_weights;
+  std::vector<int64_t> op_facts;
+  for (const Op& o : kOps) {
+    for (const DType d : o.dtypes) op_dtypes.push_back(to_string(d));
+    for (const DType d : o.weights) op_weights.push_back(to_string(d));
+    op_facts.insert(op_facts.end(), {static_cast<int64_t>(o.dtypes.size()),
+                                     static_cast<int64_t>(o.weights.size()), widest_row(o.type),
+                                     max_bytes(o.type), o.two_d});
+  }
+  return {dtypes,  worlds,       kBuild.memory.pack_bytes, kBuild.memory.staging_bytes,
+          ops,     errors,       wheres,  templates, template_ops, fields, configs, counts,
+          op_dtypes, op_weights, op_facts};
 }
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr) { delete &handle_of(handle_ptr); }
@@ -422,7 +292,7 @@ void hip_custom_communicator_register_captured(fptr_t handle_ptr, const std::str
     raise(hip_custom_communicator::Error::ranks_disagree);
 }
 
-void hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+Refusal hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                            std::optional<std::string> algorithm,
                            std::optional<std::string> direction,
                            std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
@@ -433,29 +303,26 @@ void hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& out, t
   TORCH_CHECK(out.sizes() == inp.sizes(), "out and inp must have the same shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out and inp must share a dtype");
   const std::optional<torch::Tensor> in_rows = as_rows(inp), out_rows = as_rows(out);
-  if (!in_rows || !out_rows) raise(hip_custom_communicator::Error::not_contiguous);
+  if (!in_rows || !out_rows) return static_cast<int64_t>(hip_custom_communicator::Error::not_contiguous);
   const auto got = hip_custom_communicator::all_reduce(
       handle_of(handle_ptr), out_rows->data_ptr(), out_rows->stride(0), out_rows->stride(1),
       in_rows->data_ptr(), in_rows->stride(0), in_rows->stride(1), in_rows->size(0),
       in_rows->size(1), dtype_of(inp), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) raise(*e);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
+  return std::nullopt;
 }
 
 namespace {
 // A NORM CALL'S TENSORS: inp [tokens, hidden], out (and with a residual, residual and
-// residual_out) its shape and dtype, the weight 1-D of hidden in inp's dtype or fp32.
+// residual_out) its shape and dtype, the weight 1-D of hidden (its dtype is select's to refuse).
 void norm_tensors(const torch::Tensor& out, const torch::Tensor& inp, const torch::Tensor& weight,
                   const torch::Tensor* residual, const torch::Tensor* residual_out) {
   check_device({&out, &inp, &weight});
   TORCH_CHECK(inp.dim() == 2, "inp must be 2-D [tokens, hidden]; got ", inp.dim(), "-D");
   TORCH_CHECK(out.sizes() == inp.sizes(), "out must have inp's shape");
   TORCH_CHECK(out.scalar_type() == inp.scalar_type(), "out must share inp's dtype");
-  // THE WEIGHT IN ITS OWN DTYPE: inp's, or fp32, the two a norm's weight is kept in.
-  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Float ||
-                  weight.scalar_type() == inp.scalar_type(),
-              "weight must be inp's dtype or float32; got ", weight.scalar_type());
   TORCH_CHECK(weight.dim() == 1 && weight.numel() == inp.size(1),
               "weight must be 1-D of hidden=", inp.size(1));
   // The weight is read a pack at a time, a pack's worth of inp's elements per load.
@@ -474,7 +341,7 @@ void norm_tensors(const torch::Tensor& out, const torch::Tensor& inp, const torc
 }
 }  // namespace
 
-void hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
+Refusal hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& inp,
                                     torch::Tensor& weight, double eps,
                                     std::optional<std::string> algorithm,
                                     std::optional<std::string> direction,
@@ -490,10 +357,11 @@ void hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tenso
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid), narrowed(waves_per_eu),
       current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) raise(*e);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
+  return std::nullopt;
 }
 
-void hip_custom_communicator_all_reduce_add_rms_norm(
+Refusal hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& out, torch::Tensor& residual_out, torch::Tensor& inp,
     torch::Tensor& residual, torch::Tensor& weight, double eps,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
@@ -509,7 +377,8 @@ void hip_custom_communicator_all_reduce_add_rms_norm(
       inp.size(1), static_cast<float>(eps), algorithm_from(algorithm), direction_from(direction),
       narrowed(tile_m), narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) raise(*e);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
+  return std::nullopt;
 }
 
 namespace {
@@ -553,7 +422,7 @@ void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
 }
 }  // namespace
 
-void hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+Refusal hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& prefix, torch::Tensor& out, torch::Tensor& inp,
     torch::Tensor& blocks, torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& out_norm_weight, int64_t num_blocks, int64_t write_idx,
@@ -578,7 +447,8 @@ void hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       narrowed(reduce_scatter_blocks), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu),
       current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) raise(*e);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got)) return static_cast<int64_t>(*e);
+  return std::nullopt;
 }
 
 

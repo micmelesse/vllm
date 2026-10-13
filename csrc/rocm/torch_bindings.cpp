@@ -102,30 +102,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("hip_custom_communicator_forget_buffer(int handle_ptr, Tensor buffer) -> ()",
                &hip_custom_communicator_forget_buffer);
   rocm_ops.def("hip_custom_communicator_wall_clock_khz(int device) -> int", &hip_custom_communicator_wall_clock_khz);
-  // The planners: what runs a call, or the Error it meets.
-  rocm_ops.def(
-      "hip_custom_communicator_plan_all_reduce(int handle_ptr, Tensor inp, str? algorithm, str? direction, "
-      "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
-      "int? waves_per_eu) -> (str?, str?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_communicator_plan_all_reduce);
-  rocm_ops.def(
-      "hip_custom_communicator_plan_all_reduce_rms_norm(int handle_ptr, Tensor inp, Tensor weight, "
-      "bool add, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
-      "int? blocks_per_grid, int? waves_per_eu) -> (str?, str?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_communicator_plan_all_reduce_rms_norm);
-  rocm_ops.def(
-      "hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm(int handle_ptr, Tensor inp, "
-      "str? algorithm, str? direction, int? tile_m, int? tile_n, int? tile_k, "
-      "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
-      "int? waves_per_eu) -> (str?, "
-      "str?, int?, int?, int?, int?, int?, int?, int?, int?)",
-      &hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm);
   rocm_ops.def(
       "hip_custom_communicator_supported(int device, int world) -> (str?, int?)",
                &hip_custom_communicator_supported);
   rocm_ops.def(
       "hip_custom_communicator_build_info() -> (str[], int[], int, int, str[], str[], str[], str[], str[], "
-      "str[], int[], int[])",
+      "str[], int[], int[], str[], str[], int[])",
       &hip_custom_communicator_build_info);
   rocm_ops.def(
       "hip_custom_communicator_register_captured", &hip_custom_communicator_register_captured);
@@ -133,7 +115,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "hip_custom_communicator_all_reduce(int handle_ptr, Tensor! out, Tensor inp, str? algorithm, "
       "str? direction, int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
-      "int? waves_per_eu) -> ()");
+      "int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA, &hip_custom_communicator_all_reduce);
 
   // FUSED: all-reduce then vLLM's `rms_norm`, and all-reduce then `fused_add_rms_norm`
@@ -142,13 +124,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "hip_custom_communicator_all_reduce_rms_norm(int handle_ptr, Tensor! out, Tensor inp, Tensor weight, "
       "float eps, str? algorithm, str? direction, int? tile_m, int? tile_n, int? threads_per_block, "
-      "int? blocks_per_grid, int? waves_per_eu) -> ()");
+      "int? blocks_per_grid, int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_rms_norm);
   rocm_ops.def(
       "hip_custom_communicator_all_reduce_add_rms_norm(int handle_ptr, Tensor! out, Tensor! residual_out, "
       "Tensor inp, Tensor residual, Tensor weight, float eps, str? algorithm, str? direction, "
-      "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, int? waves_per_eu) -> ()");
+      "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
 
@@ -158,7 +140,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? out_norm_weight, int num_blocks, int write_idx, float eps, float out_eps, "
       "bool has_prefix, str? algorithm, str? direction, int? tile_m, int? tile_n, int? tile_k, "
       "int? reduce_scatter_blocks, int? threads_per_block, int? blocks_per_grid, "
-      "int? waves_per_eu) -> ()");
+      "int? waves_per_eu) -> int?");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
 }

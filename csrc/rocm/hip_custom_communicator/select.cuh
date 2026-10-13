@@ -563,23 +563,41 @@ constexpr TunedKernel kAttnResKernels[] = {
 };
 
 // =================================================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it) and its tuned kernels.
+// THE OPS, in OpType's order: each one's name (as Python calls it), its tuned kernels, and what a
+// plain call of it (nothing forced) must be to run, which `build_info` hands Python's `should`.
 // =================================================================================================
+
+// A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly these).
+constexpr DType kNormWeights[] = {DType::f32};
 
 struct Op {
   OpType type;
   const char* name;
   std::span<const TunedKernel> kernels;
+  // The dtypes its input may have.
+  std::span<const DType> dtypes;
+  // The dtypes its weight may have besides its input's; none for an op with no weight.
+  std::span<const DType> weights;
+  // Whether a tile holds the whole row (its tile_n at least the row: a norm reads the whole row);
+  // otherwise the tiles cross it.
+  bool tile_holds_row;
+  // Whether its input is [rows, cols] as given (2-D), not any shape read as rows of its last
+  // dimension.
+  bool two_d;
 };
 
 // AN OP AND ITS NAME FROM ONE TOKEN, so the name cannot differ from the enum's.
 #define HIP_CUSTOM_COMMUNICATOR_NAMED(o) OpType::o, #o
 
 constexpr Op kOps[] = {
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce), kAllReduceKernels},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm), kRmsNormKernels},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm), kAttnResKernels},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce), kAllReduceKernels, kBuild.supports.dtypes, {},
+     false, false},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm), kRmsNormKernels, kBuild.supports.dtypes,
+     kNormWeights, true, true},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels,
+     kBuild.supports.dtypes, kNormWeights, true, true},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm), kAttnResKernels,
+     kBuild.supports.dtypes, {}, true, true},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
@@ -722,12 +740,18 @@ constexpr int64_t distance(int64_t a, int64_t b) { return a < b ? b - a : a - b;
 // bytes); then the entry with the most rows the call reaches, the first listed where two tie, the
 // fewest rows where it reaches none. None runs: a row too wide for every tuned tile, or too narrow
 // for every slicing kernel.
+// THE WORLD AN OP'S KERNELS ARE PICKED AT for a call at `world`: its own, else the nearest tuned.
+constexpr int tuned_world(OpType o, int world) {
+  int w = 0;
+  for (const TunedKernel& k : op(o).kernels)
+    if (w == 0 || distance(k.world, world) < distance(w, world)) w = k.world;
+  return w;
+}
+
 constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m, int64_t n,
                                                 int64_t tile_cols, DType dtype) {
   const std::span<const TunedKernel> kernels = op(o).kernels;
-  int w = 0;
-  for (const TunedKernel& k : kernels)
-    if (w == 0 || distance(k.world, world) < distance(w, world)) w = k.world;
+  const int w = tuned_world(o, world);
   const auto columns = [&](const TunedKernel& k) {
     return every_rank_gets_columns(k.fn, n, dtype, world);
   };
@@ -861,11 +885,16 @@ inline std::optional<Error> refused(const Handle* h, Template fn, const KernelCo
 }
 
 
-// THE WEIGHT a norm takes: its input's dtype, or fp32.
-constexpr std::optional<Error> weight_refused(DType dtype, DType weight_dtype) {
-  if (weight_dtype != dtype && weight_dtype != DType::f32) return Error::weight_not_built;
-  return std::nullopt;
+// THE WEIGHT a norm takes: its input's dtype, or one of its op's `weights`.
+constexpr std::optional<Error> weight_refused(OpType o, DType dtype, DType weight_dtype) {
+  if (weight_dtype == dtype) return std::nullopt;
+  for (const DType w : op(o).weights)
+    if (weight_dtype == w) return std::nullopt;
+  return Error::weight_not_built;
 }
+
+// THE COLUMNS AN OP'S TILE MUST HOLD on a row of `n`: the row where its tile holds it, else none.
+constexpr int64_t tile_cols(OpType o, int64_t n) { return op(o).tile_holds_row ? n : 0; }
 
 // =================================================================================================
 // EACH OP'S SELECT: the op's launch, everything decided, from the call's primitives and its
@@ -891,7 +920,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
              [&] {
                return AllReduceBuildConfig{*threads_per_block, *waves_per_eu, *tile_m, *tile_n};
              }),
-      OpType::all_reduce, world, m, n, 0, dtype);
+      OpType::all_reduce, world, m, n, tile_cols(OpType::all_reduce, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Template fn        = std::get<Chosen>(picked).fn;
   const KernelConfig c     = std::get<Chosen>(picked).config;
@@ -906,8 +935,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   if (is_two_shot(fn) && slice_bytes > 0 && h.scratch_bytes() / slice_bytes < band)
     band = h.scratch_bytes() / slice_bytes;
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, 0, std::nullopt, inp,
-                                             staged, stream))
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n,
+                                             tile_cols(OpType::all_reduce, n), std::nullopt,
+                                             inp, staged, stream))
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups for every thread of
@@ -1007,14 +1037,14 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                return AllReduceRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
                                                   *tile_n};
              }),
-      op, world, m, n, n, dtype);
+      op, world, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn     = k.fn;
   const KernelConfig& c = k.config;
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
-                                             weight_refused(dtype, weight_dtype), inp, false,
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, tile_cols(op, n),
+                                             weight_refused(op, dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
   // 3.
@@ -1109,14 +1139,14 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> select_all_reduce_add_rms_
                return AllReduceAddRmsNormBuildConfig{*threads_per_block, *waves_per_eu, *tile_m,
                                                      *tile_n};
              }),
-      op, world, m, n, n, dtype);
+      op, world, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn     = k.fn;
   const KernelConfig& c = k.config;
   // 2.
-  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, n,
-                                             weight_refused(dtype, weight_dtype), inp, false,
+  if (const std::optional<Error> e = refused(&h, fn, c, dtype, m, n, tile_cols(op, n),
+                                             weight_refused(op, dtype, weight_dtype), inp, false,
                                              stream))
     return *e;
   // 3.
@@ -1224,14 +1254,14 @@ select_all_reduce_add_attn_res_rms_norm(
                return AllReduceAddAttnResRmsNormBuildConfig{*threads_per_block, *waves_per_eu,
                                                             *tile_m, *tile_n, *tile_k};
              }),
-      op, world, m, n, n, dtype);
+      op, world, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k        = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn     = k.fn;
   const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, n, std::nullopt, inp, false, stream))
+          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt, inp, false, stream))
     return *e;
   // 3.
   const void* kernel = nullptr;
@@ -1366,5 +1396,59 @@ constexpr bool selections_fit() {
   return true;
 }
 static_assert(selections_fit(), "a selection declines, or exceeds a kernel capability");
+
+// =================================================================================================
+// A PLAIN CALL'S FACTS, an op's (nothing forced, contiguous, whole packs): its row and its bytes up
+// to these always run. `build_info` hands them to Python's `should`, which admits nothing past them.
+// =================================================================================================
+
+// THE WIDEST ROW A PLAIN CALL RUNS, in elements: at every built world, the widest tile of its tuned
+// kernels there; none (0) for an op whose tiles cross the row.
+constexpr int64_t widest_row(OpType o) {
+  if (!op(o).tile_holds_row) return 0;
+  int64_t widest = 0;
+  for (const int world : kBuild.supports.worlds) {
+    const int w      = tuned_world(o, world);
+    int64_t at_world = 0;
+    for (const TunedKernel& k : op(o).kernels)
+      if (k.world == w && tile_n_of(k.config.build) > at_world)
+        at_world = tile_n_of(k.config.build);
+    if (widest == 0 || at_world < widest) widest = at_world;
+  }
+  return widest;
+}
+
+// THE MOST BYTES A PLAIN CALL RUNS: what the staging holds (an eager input is copied in whole), and
+// what the scratch holds at the most scratch a byte of its input needs among its tuned kernels: at
+// one row of one pack, where rounding up is all of it (a row two-shot leaving two results, two).
+constexpr int64_t max_bytes(OpType o) {
+  int64_t per_byte = 0;
+  for (const TunedKernel& k : op(o).kernels) {
+    const int64_t need = scratch_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
+    if (need > per_byte) per_byte = need;
+  }
+  const int64_t staging = kBuild.memory.staging_bytes;
+  if (per_byte == 0) return staging;
+  const int64_t scratch = kBuild.memory.scratch_bytes / per_byte;
+  return scratch < staging ? scratch : staging;
+}
+
+// EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and dtype. Past kMaxRanks
+// packs every kernel takes the row's columns, so its widest tile at the world holds any row up to
+// widest_row; the narrower rows, which a slicing kernel cannot take, are checked one by one.
+constexpr bool plain_rows_pick() {
+  for (const Op& o : kOps)
+    for (const int world : kBuild.supports.worlds)
+      for (const DType d : o.dtypes)
+        for (int64_t p = 1; p <= kMaxRanks; ++p) {
+          const int64_t n = p * kBuild.memory.pack_bytes / elem_bytes(d);
+          if (widest_row(o.type) != 0 && n > widest_row(o.type)) break;
+          if (std::holds_alternative<Error>(
+                  pick(o.type, world, 1, n, tile_cols(o.type, n), d)))
+            return false;
+        }
+  return true;
+}
+static_assert(plain_rows_pick(), "a plain call's row under the widest is picked by no kernel");
 
 }  // namespace hip_custom_communicator

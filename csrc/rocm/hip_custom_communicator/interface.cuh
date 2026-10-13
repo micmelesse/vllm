@@ -5,7 +5,8 @@
 // launch, everything decided, or the first Error the call meets) then launch_<op> (launch.cuh,
 // which decides nothing), and returns the launch it ran or the Error. Every argument is a
 // primitive: pointers, sizes, a DType, and the op's own forcing (an Algorithm and a Direction,
-// then its config fields, each none for select's). Python's plan_<op> is select_<op>.
+// then its config fields, each none for select's). Python's `should` reads its plain call
+// from kOps (build_info).
 
 #pragma once
 
