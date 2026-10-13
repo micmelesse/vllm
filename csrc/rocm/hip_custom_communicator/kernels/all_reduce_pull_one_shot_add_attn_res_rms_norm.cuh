@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                                    int signals_size_parity,
                                                    int signals_size_block,
                                                    int signals_size_writer,
-                                                   uint64_t* __restrict__ status_ptr,
+                                                   uint32_t* __restrict__ status_ptr,
                                                    int64_t status_stride_field,
                                                    int status_size_field,
                                                    int rank,

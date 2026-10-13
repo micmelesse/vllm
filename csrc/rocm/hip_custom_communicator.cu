@@ -240,10 +240,14 @@ std::vector<int64_t> hip_custom_communicator_fault(fptr_t handle_ptr) {
   const auto f = handle_of(handle_ptr).fault();
   if (!f) return {};
   using hip_custom_communicator::StatusField;
-  const auto word = [&](StatusField s) { return static_cast<int64_t>((*f)[static_cast<int>(s)]); };
-  return {word(StatusField::where), word(StatusField::rank),  word(StatusField::block),
-          word(StatusField::peer),  word(StatusField::count), word(StatusField::want),
-          word(StatusField::elapsed_ticks)};
+  const auto word = [&](StatusField s) { return (*f)[static_cast<int>(s)]; };
+  const auto as_int = [](uint32_t w) { return static_cast<int64_t>(static_cast<int32_t>(w)); };
+  const int64_t elapsed = static_cast<int64_t>(uint64_t{word(StatusField::elapsed_high)} << 32 |
+                                               word(StatusField::elapsed_low));
+  return {static_cast<int64_t>(word(StatusField::where)), as_int(word(StatusField::rank)),
+          as_int(word(StatusField::block)), as_int(word(StatusField::peer)),
+          static_cast<int64_t>(word(StatusField::count)), static_cast<int64_t>(word(StatusField::want)),
+          elapsed};
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) { handle_of(handle_ptr).abort(); }
 

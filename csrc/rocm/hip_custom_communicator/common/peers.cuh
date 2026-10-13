@@ -52,8 +52,9 @@ constexpr const char* to_string(Where w) {
 
 // A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it and sets `abort` while
 // a kernel still runs, and a graph replay, which runs none of our host code, still reports: a
-// buffer of 64-bit words, one a field, `status[field]` at its stride (`status_stride_field`), the
-// field a StatusField. A wait that outlives the timeout writes the fault once (the first block to
+// buffer of 32-bit words, one a field, `status[field]` at its stride (`status_stride_field`), the
+// field a StatusField. 32-BIT, as the record's fields always were: 64-bit words cost the fault path
+// a register pair a field and an occupancy step in 157 of 440 kernels (2026-10-13T16-59-48Z). A wait that outlives the timeout writes the fault once (the first block to
 // claim `state` wins) and sets `abort`; every wait checks `abort` with its clock and leaves, so one
 // fault ends the rank's kernel instead of each block spinning out its own timeout. The host sets
 // `abort` to end a kernel it has given up on.
@@ -66,9 +67,10 @@ enum class StatusField : int {
   peer,           // the rank it waited for
   count,          // the flag it read last
   want,           // the value it waited for
-  elapsed_ticks,  // how long it waited, in the device wall clock's ticks
+  elapsed_low,    // how long it waited, in the device wall clock's ticks: the low word
+  elapsed_high,   // and the high
 };
-constexpr int kStatusFields = 9;
+constexpr int kStatusFields = 10;
 
 
 

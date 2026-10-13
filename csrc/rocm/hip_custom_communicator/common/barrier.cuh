@@ -89,31 +89,30 @@ DINLINE void fence() {
 }
 
 // One word of this rank's status, by its field, at the buffer's stride.
-DINLINE uint64_t* status_word(uint64_t* status_ptr, int64_t status_stride_field, StatusField f) {
+DINLINE uint32_t* status_word(uint32_t* status_ptr, int64_t status_stride_field, StatusField f) {
   return status_ptr + static_cast<int64_t>(f) * status_stride_field;
 }
 
 // THE FAULT, written once by the first wait on this rank to give up: `state` claimed 0 -> 1, the
 // fields, then 2 released, so the host reads them only whole. Then `abort`, so every other wait on
 // this rank leaves at its next check rather than spinning out its own timeout.
-DINLINE void record_fault(uint64_t* status_ptr, int64_t status_stride_field, Where where, int rank,
+DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field, Where where, int rank,
                           int peer, uint32_t count, uint32_t want, uint64_t elapsed) {
   const auto word = [&](StatusField f) { return status_word(status_ptr, status_stride_field, f); };
-  uint64_t clear  = 0;
-  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &clear, uint64_t{1}, false,
+  uint32_t clear  = 0;
+  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &clear, 1u, false,
                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
-    *word(StatusField::where)         = static_cast<uint64_t>(where);
-    *word(StatusField::rank)          = static_cast<uint64_t>(rank);
-    *word(StatusField::block)         = blockIdx.x;
-    *word(StatusField::peer)          = static_cast<uint64_t>(peer);
-    *word(StatusField::count)         = count;
-    *word(StatusField::want)          = want;
-    *word(StatusField::elapsed_ticks) = elapsed;
-    __scoped_atomic_store_n(word(StatusField::state), uint64_t{2}, __ATOMIC_RELEASE,
-                            __MEMORY_SCOPE_SYSTEM);
+    *word(StatusField::where)        = static_cast<uint32_t>(where);
+    *word(StatusField::rank)         = static_cast<uint32_t>(rank);
+    *word(StatusField::block)        = blockIdx.x;
+    *word(StatusField::peer)         = static_cast<uint32_t>(peer);
+    *word(StatusField::count)        = count;
+    *word(StatusField::want)         = want;
+    *word(StatusField::elapsed_low)  = static_cast<uint32_t>(elapsed);
+    *word(StatusField::elapsed_high) = static_cast<uint32_t>(elapsed >> 32);
+    __scoped_atomic_store_n(word(StatusField::state), 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
   }
-  __scoped_atomic_store_n(word(StatusField::abort), uint64_t{1}, __ATOMIC_RELAXED,
-                          __MEMORY_SCOPE_SYSTEM);
+  __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
 }
 
 // Spins relaxed and acquires once, after: an acquire per poll would invalidate the caches on every
@@ -124,7 +123,7 @@ DINLINE void record_fault(uint64_t* status_ptr, int64_t status_stride_field, Whe
 // s_barrier, so the block's other waves run on to their own next wait, see `abort`, and end too.
 // The kernel's output is then garbage and the communicator broken (the host's watchdog).
 template <bool ACQUIRE, int MEMORY_SCOPE>
-DINLINE void wait(uint64_t timeout_ticks, uint64_t* status_ptr, int64_t status_stride_field,
+DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr, int64_t status_stride_field,
                   int rank, const Counter& flag, uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
   for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want; ++n) {
@@ -175,7 +174,7 @@ class Sync {
   int64_t signals_stride_parity_;
   int64_t signals_stride_block_;
   int64_t signals_stride_writer_;
-  uint64_t* status_ptr_;
+  uint32_t* status_ptr_;
   int64_t status_stride_field_;
   int rank_;
   uint64_t timeout_ticks_;
@@ -195,7 +194,7 @@ class Sync {
 
  public:
   DINLINE Sync(uint32_t* const* signals_ptrs, int64_t signals_stride_parity,
-               int64_t signals_stride_block, int64_t signals_stride_writer, uint64_t* status_ptr,
+               int64_t signals_stride_block, int64_t signals_stride_writer, uint32_t* status_ptr,
                int64_t status_stride_field, int rank, uint64_t timeout_ticks)
       : signals_ptrs_(signals_ptrs),
         signals_stride_parity_(signals_stride_parity),
