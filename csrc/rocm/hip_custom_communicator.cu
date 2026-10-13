@@ -413,12 +413,11 @@ void attn_res_tensors(const torch::Tensor& prefix, const torch::Tensor& out,
   if (out_norm_weight)
     TORCH_CHECK(out_norm_weight->dim() == 1 && out_norm_weight->numel() == n,
                 "out_norm_weight must be 1-D of hidden=", n);
-  const int64_t lanes = hip_custom_communicator::kBuild.memory.pack_bytes / inp.element_size();
-  TORCH_CHECK(blocks.stride(0) % lanes == 0 && blocks.stride(1) % lanes == 0 &&
-                  reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
-                          hip_custom_communicator::kBuild.memory.pack_bytes ==
-                      0,
-              "blocks must be 16-byte aligned in every row and source");
+  // Its rows' and sources' strides are the interface's to refuse (whole packs); its start is here.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(blocks.data_ptr()) %
+                      hip_custom_communicator::kBuild.memory.pack_bytes ==
+                  0,
+              "blocks must start 16-byte aligned");
 }
 }  // namespace
 
