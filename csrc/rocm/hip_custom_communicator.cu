@@ -252,11 +252,11 @@ std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr) {
           static_cast<int64_t>(uint64_t{word(StatusField::elapsed_high)} << 32 |
                                word(StatusField::elapsed_low))};
 }
-// THE SIGNALS THAT ARE SET, this rank's, flattened four a flag: parity, block, writer, value. Empty
-// between launches; read once they have finished.
+// THIS RANK'S SIGNALS, every flag, flattened four a flag: parity, block, writer, value. Every value
+// zero between launches; read once they have finished.
 std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr) {
   std::vector<int64_t> flat;
-  for (const auto& f : handle_of(handle_ptr).signals_set()) flat.insert(flat.end(), f.begin(), f.end());
+  for (const auto& f : handle_of(handle_ptr).signals()) flat.insert(flat.end(), f.begin(), f.end());
   return flat;
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) { handle_of(handle_ptr).abort(); }

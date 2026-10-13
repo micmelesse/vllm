@@ -1156,7 +1156,9 @@ def exercise(
                 )
                 # NOTHING LEFT BEHIND, after every call of the schedule (run_collective
                 # synchronized): ours returns its signals to zero.
-                if isinstance(comm, HipCustomCommunicator) and (left := comm.signals()):
+                if isinstance(comm, HipCustomCommunicator) and (
+                    left := [f for f in comm.signals() if f.value != 0]
+                ):
                     raise RuntimeError(
                         f"{op_name} left {len(left)} signals set: {left[:4]}"
                     )
@@ -2433,7 +2435,7 @@ def _the_call_left_nothing(comm: HipCustomCommunicator) -> None:
     state the next launch pairs against)."""
     if isinstance(comm.state, Broken):
         raise RuntimeError(f"the call broke the communicator: {comm.state}")
-    if left := comm.signals():
+    if left := [f for f in comm.signals() if f.value != 0]:
         raise RuntimeError(f"the call left {len(left)} signals set: {left[:4]}")
 
 

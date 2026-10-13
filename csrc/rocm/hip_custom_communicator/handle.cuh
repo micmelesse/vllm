@@ -218,22 +218,21 @@ class Handle {
       if (f != static_cast<int>(StatusField::state)) words[f] = status_[f];
     return words;
   }
-  // THE SIGNALS THAT ARE SET, this rank's: each flag not zero, as (parity, block, writer, value).
-  // Between launches there are none (barrier.cuh); read only once the launches have finished, as
-  // this copies device memory that a running kernel is changing.
-  std::vector<std::array<int64_t, 4>> signals_set() const {
+  // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value). Between launches every value
+  // is zero (barrier.cuh); read only once the launches have finished, as this copies device memory
+  // that a running kernel is changing.
+  std::vector<std::array<int64_t, 4>> signals() const {
     std::vector<uint32_t> flags(static_cast<size_t>(kSignalsBytes / sizeof(uint32_t)));
     HIP_CHECK(hipMemcpy(flags.data(), signals_, static_cast<size_t>(kSignalsBytes),
                         hipMemcpyDeviceToHost));
-    std::vector<std::array<int64_t, 4>> set;
+    std::vector<std::array<int64_t, 4>> all;
     for (int64_t p = 0; p < signals_size_parity(); ++p)
       for (int64_t b = 0; b < signals_size_block(); ++b)
-        for (int64_t w = 0; w < signals_size_writer(); ++w) {
-          const uint32_t v = flags[p * signals_stride_parity() + b * signals_stride_block() +
-                                   w * signals_stride_writer()];
-          if (v != 0) set.push_back({p, b, w, v});
-        }
-    return set;
+        for (int64_t w = 0; w < signals_size_writer(); ++w)
+          all.push_back({p, b, w,
+                         flags[p * signals_stride_parity() + b * signals_stride_block() +
+                               w * signals_stride_writer()]});
+    return all;
   }
   // Every wait on this rank leaves at its next check: for a communicator the host has given up on.
   void abort() {

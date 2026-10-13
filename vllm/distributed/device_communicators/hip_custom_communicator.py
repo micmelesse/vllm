@@ -101,9 +101,9 @@ class Where(IntEnum):
 
 @dataclass(frozen=True)
 class Flag:
-    """A SIGNAL THAT IS SET, in this rank's signals: the slot block `block` on rank
-    `writer` sets at a barrier of `parity`. None is set between launches; one that is
-    is state a launch left behind."""
+    """ONE FLAG of this rank's signals: the slot block `block` on rank `writer` sets
+    at a barrier of `parity`, and its value. Every value is zero between launches; one
+    that is not is state a launch left behind."""
 
     parity: int
     block: int
@@ -1034,8 +1034,8 @@ class HipCustomCommunicator:
         return Status(abort=abort != 0, fault=fault)
 
     def signals(self) -> list[Flag]:
-        """This rank's signals that are set; empty between launches. It reads device
-        memory, so call it only once the launches have finished
+        """Every flag of this rank's signals, each value zero between launches. It
+        reads device memory, so call it only once the launches have finished
         (`torch.cuda.synchronize()`)."""
         if self._handle is None:
             return []
