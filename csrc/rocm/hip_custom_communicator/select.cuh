@@ -1436,19 +1436,25 @@ constexpr int64_t max_bytes(OpType o) {
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and dtype. Past kMaxRanks
 // packs every kernel takes the row's columns, so its widest tile at the world holds any row up to
 // widest_row; the narrower rows, which a slicing kernel cannot take, are checked one by one.
-constexpr bool plain_rows_pick() {
-  for (const Op& o : kOps)
-    for (const int world : kBuild.supports.worlds)
-      for (const DType d : o.dtypes)
-        for (int64_t p = 1; p <= kMaxRanks; ++p) {
-          const int64_t n = p * kBuild.memory.pack_bytes / elem_bytes(d);
-          if (widest_row(o.type) != 0 && n > widest_row(o.type)) break;
-          if (std::holds_alternative<Error>(
-                  pick(o.type, world, 1, n, tile_cols(o.type, n), d)))
-            return false;
-        }
+// One op a check, each its own constant evaluation.
+constexpr bool plain_rows_pick(OpType o) {
+  const int64_t widest = widest_row(o);
+  for (const int world : kBuild.supports.worlds)
+    for (const DType d : op(o).dtypes)
+      for (int64_t p = 1; p <= kMaxRanks; ++p) {
+        const int64_t n = p * kBuild.memory.pack_bytes / elem_bytes(d);
+        if (widest != 0 && n > widest) break;
+        if (std::holds_alternative<Error>(pick(o, world, 1, n, tile_cols(o, n), d))) return false;
+      }
   return true;
 }
-static_assert(plain_rows_pick(), "a plain call's row under the widest is picked by no kernel");
+static_assert(plain_rows_pick(OpType::all_reduce),
+              "a plain call's row under the widest is picked by no kernel");
+static_assert(plain_rows_pick(OpType::all_reduce_rms_norm),
+              "a plain call's row under the widest is picked by no kernel");
+static_assert(plain_rows_pick(OpType::all_reduce_add_rms_norm),
+              "a plain call's row under the widest is picked by no kernel");
+static_assert(plain_rows_pick(OpType::all_reduce_add_attn_res_rms_norm),
+              "a plain call's row under the widest is picked by no kernel");
 
 }  // namespace hip_custom_communicator
