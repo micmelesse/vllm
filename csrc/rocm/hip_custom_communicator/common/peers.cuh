@@ -3,8 +3,8 @@
 //
 // THE RANKS' MEMORY: every rank's buffers as plain tensors a tile loads and stores, and the types
 // a kernel takes them in. A RANK'S MEMORY, two places:
-//   ours, one allocation (Handle's symmetric memory), mapped by every peer at startup:
-//     [ signals | scratch | staging ]
+//   ours, two allocations (Handle's symmetric memory), mapped by every peer at startup:
+//     [ signals ]  and  [ scratch | staging ]
 //   each handed to a kernel as its own argument, a device table of every rank's address (its
 //   signals, scratch and staging) and the buffer's strides, written once when the handle opens;
 //   the caller's, one tensor a call:

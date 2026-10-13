@@ -43,22 +43,26 @@ namespace hip_custom_communicator {
 // rank calls it together.
 using Gather = std::function<std::vector<std::string>(const std::string&)>;
 
-// THE SIGNALS' BYTES, the first of a rank's symmetric memory: two flag sets of kMaxBlocks blocks by
-// kMaxRanks writers, rounded to 128 bytes so the scratch after them starts aligned.
+// THE SIGNALS' BYTES, their own allocation: two flag sets of kMaxBlocks blocks by kMaxRanks writers,
+// rounded to 128 bytes.
 constexpr int64_t kSignalsBytes = (2 * int64_t{kMaxBlocks} * kMaxRanks * int64_t{sizeof(uint32_t)} +
                                    127) / 128 * 128;
 
 class Handle {
  public:
-  // OPENED on every rank together: this rank's symmetric memory (the signal block, the scratch,
-  // then the staging) allocated, its IPC handle gathered with every rank's, and the peers' opened.
+  // OPENED on every rank together: this rank's symmetric memory allocated, two allocations, the
+  // signals and the exchange (the scratch, then the staging), each one's IPC handle gathered with
+  // every rank's, and the peers' opened.
   // `world_size` is one the build holds (the opener checks it).
   Handle(int rank, int world_size, const Gather& gather, const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
         scratch_bytes_(build.memory.scratch_bytes),
         staging_bytes_(build.memory.staging_bytes) {
-    symmetric_ = alloc_symmetric();
+    // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging runs off its own
+    // allocation, never into barrier state.
+    signals_  = alloc_symmetric(kSignalsBytes);
+    exchange_ = alloc_symmetric(scratch_bytes_ + staging_bytes_);
     // THE STATUS, host-mapped and coherent: a wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort` (barrier.cuh). The kernels
     // take its device address as their own argument, a buffer of kStatusFields words.
@@ -72,17 +76,19 @@ class Handle {
     HIP_CHECK(hipMalloc(&slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
     slab_end_         = slab_ + slots * kMaxRanks;
     cursor_           = slab_;
-    const auto opened = open_peers(gather(ipc_bytes(symmetric_)), symmetric_);
-    // EVERY RANK'S SIGNALS, SCRATCH AND STAGING, a table each, written once: each rank's symmetric
-    // memory is [ signals | scratch | staging ], at the same offsets on every rank. The staging is
-    // registered here too, so an eager input's launch reads its table.
+    // Two collectives, in the same order on every rank.
+    const auto peer_signals  = open_peers(gather(ipc_bytes(signals_)), signals_);
+    const auto peer_exchange = open_peers(gather(ipc_bytes(exchange_)), exchange_);
+    // EVERY RANK'S SIGNALS, SCRATCH AND STAGING, a table each, written once: each rank's exchange
+    // is [ scratch | staging ], at the same offsets on every rank. The staging is registered here
+    // too, so an eager input's launch reads its table.
     HIP_CHECK(hipMalloc(&signals_ptrs_, kMaxRanks * sizeof(void*)));
     std::vector<void*> signals(kMaxRanks, nullptr);
     std::vector<void*> scratch(world_size_), staging(world_size_);
     for (int i = 0; i < world_size_; ++i) {
-      signals[i] = opened[i];
-      scratch[i] = static_cast<char*>(opened[i]) + kSignalsBytes;
-      staging[i] = static_cast<char*>(opened[i]) + kSignalsBytes + scratch_bytes_;
+      signals[i] = peer_signals[i];
+      scratch[i] = peer_exchange[i];
+      staging[i] = static_cast<char*>(peer_exchange[i]) + scratch_bytes_;
     }
     HIP_CHECK(hipMemcpy(signals_ptrs_, signals.data(), kMaxRanks * sizeof(void*),
                         hipMemcpyHostToDevice));
@@ -102,7 +108,8 @@ class Handle {
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
     hipFree(signals_ptrs_);
-    hipFree(symmetric_);
+    hipFree(exchange_);
+    hipFree(signals_);
     hipHostFree(status_);
   }
 
@@ -114,7 +121,7 @@ class Handle {
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it holds.
   void* staging() const {
-    return static_cast<char*>(symmetric_) + kSignalsBytes + scratch_bytes_;
+    return static_cast<char*>(exchange_) + scratch_bytes_;
   }
   int64_t staging_bytes() const { return staging_bytes_; }
 
@@ -234,12 +241,12 @@ class Handle {
   }
 
  private:
-  // THIS RANK'S SYMMETRIC MEMORY, one allocation, zeroed: the signal block, the scratch, then the
-  // staging. UNCACHED, as aiter and vLLM's custom all-reduce allocate theirs: peers read what this
-  // rank wrote, and cached, those writes sit dirty in L2 for the barrier's writeback to flush.
-  void* alloc_symmetric() const {
+  // ONE ALLOCATION OF THIS RANK'S SYMMETRIC MEMORY, `bytes` of it, zeroed. UNCACHED, as aiter and
+  // vLLM's custom all-reduce allocate theirs: peers read what this rank wrote, and cached, those
+  // writes sit dirty in L2 for the barrier's writeback to flush.
+  static void* alloc_symmetric(int64_t size_bytes) {
     void* p            = nullptr;
-    const size_t bytes = kSignalsBytes + static_cast<size_t>(scratch_bytes_ + staging_bytes_);
+    const size_t bytes = static_cast<size_t>(size_bytes);
     HIP_CHECK(hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached));
     HIP_CHECK(hipMemset(p, 0, bytes));
     HIP_CHECK(hipDeviceSynchronize());
@@ -338,7 +345,8 @@ class Handle {
   int world_size_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
-  void* symmetric_      = nullptr;
+  void* signals_        = nullptr;
+  void* exchange_       = nullptr;
   uint32_t* status_        = nullptr;
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_   = 0;
