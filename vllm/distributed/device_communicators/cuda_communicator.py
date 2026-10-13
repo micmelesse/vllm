@@ -394,8 +394,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not hip_custom_communicator.disabled
             and hip_custom_communicator.should_allreduce(input_)
         ):
-            out, _ = hip_custom_communicator.all_reduce(input_)  # the sum, and what ran
-            return out
+            return hip_custom_communicator.all_reduce(input_)
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm

@@ -145,10 +145,22 @@ class TemplateBuild:
 
 
 @dataclass(frozen=True)
+class OpRecord:
+    """ONE OP'S PLAIN CALL as built (C++'s `kOps`): what a call of it with nothing
+    forced must be to run, which `should` reads."""
+
+    dtypes: frozenset[torch.dtype]  # its input's
+    weight_dtypes: frozenset[torch.dtype]  # its weight's besides its input's; none
+    widest_row: int  # elements a row at most; 0 for any (its tiles cross the row)
+    max_bytes: int  # its input's at most
+    two_d: bool  # its input is [rows, cols], not any shape read as rows of the last
+
+
+@dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack and staging bytes, its ops', errors' and fault places' names, and its
-    templates."""
+    pack and staging bytes, its ops', errors' and fault places' names, its templates,
+    and each op's plain call."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
@@ -161,6 +173,8 @@ class BuildInfo:
     where_names: tuple[str, ...]
     # Each template by name, in C++'s `Template` order: what a tuner searches.
     templates: dict[str, TemplateBuild]
+    # Each op by name, in C++'s `Op` order: its plain call.
+    ops: dict[str, OpRecord]
 
 
 @functools.cache
@@ -179,6 +193,9 @@ def build_info() -> BuildInfo:
         fields,
         flat,
         counts,
+        op_dtypes,
+        op_weights,
+        op_facts,
     ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
     templates: dict[str, TemplateBuild] = {}
     at, width = 0, len(fields)
@@ -189,6 +206,21 @@ def build_info() -> BuildInfo:
             builds.append({f: v for f, v in zip(fields, values) if v != 0})
             at += width
         templates[name] = TemplateBuild(op, tuple(builds))
+    records: dict[str, OpRecord] = {}
+    at_dtype = at_weight = 0
+    for op, at in zip(ops, range(0, len(op_facts), 5)):
+        num_dtypes, num_weights, widest_row, max_bytes, two_d = op_facts[at : at + 5]
+        dtypes_in = op_dtypes[at_dtype : at_dtype + num_dtypes]
+        weights_in = op_weights[at_weight : at_weight + num_weights]
+        at_dtype += num_dtypes
+        at_weight += num_weights
+        records[op] = OpRecord(
+            frozenset(_DTYPES[d] for d in dtypes_in),
+            frozenset(_DTYPES[d] for d in weights_in),
+            widest_row,
+            max_bytes,
+            bool(two_d),
+        )
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
@@ -198,18 +230,34 @@ def build_info() -> BuildInfo:
         tuple(errors),
         tuple(wheres),
         templates,
+        records,
     )
 
 
-# WHAT RAN: the algorithm and direction, then the op's config fields as its kernel had
-# them, in the op's argument order; all None from a backend with no kernels to choose
-# (torch).
-Ran = tuple[str | int | None, ...]
+def should(op: Op, inp: torch.Tensor, weight: torch.Tensor | None = None) -> bool:
+    """Whether a PLAIN call of `op` (nothing forced) on `inp`, and a norm's `weight`,
+    runs: inside the op's record (`build_info().ops`) and whole packs a row. Python
+    alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
+    admits."""
+    built = build_info()
+    record = built.ops[op]
+    if inp.dtype not in record.dtypes or not inp.is_contiguous() or inp.numel() == 0:
+        return False
+    if inp.dim() == 0 or (record.two_d and inp.dim() != 2):
+        return False
+    row = inp.shape[-1]
+    if weight is not None and weight.dtype not in record.weight_dtypes | {inp.dtype}:
+        return False
+    return (
+        row * inp.element_size() % built.pack_bytes == 0
+        and (record.widest_row == 0 or row <= record.widest_row)
+        and inp.numel() * inp.element_size() <= record.max_bytes
+    )
 
 
 class Refused(RuntimeError):
-    """A call this backend does not take, raised by the op (its `should_` said so
-    first): the Error, and the input it was asked to run on."""
+    """A call this backend does not take, raised by the op with the Error C++ refused
+    it for, and the input it was asked to run on. A call `should` admits never is."""
 
     def __init__(self, error: Error, inp: torch.Tensor) -> None:
         super().__init__(f"{error.name}: shape={tuple(inp.shape)} dtype={inp.dtype}")
@@ -291,15 +339,14 @@ class Call:
     op: Op
     shape: tuple[int, ...]
     dtype: torch.dtype
-    ran: "Ran"
     captured: bool
     at_s: float  # time.monotonic() at the launch
 
     def __str__(self) -> str:
         how = " (captured)" if self.captured else ""
         return (
-            f"#{self.seq} {self.op} {list(self.shape)} {self.dtype} "
-            f"ran {self.ran}{how} at {self.at_s:.3f}"
+            f"#{self.seq} {self.op} {list(self.shape)} {self.dtype}{how} "
+            f"at {self.at_s:.3f}"
         )
 
 
@@ -320,16 +367,6 @@ def _require_capture(state: State) -> None:
             "`capture()`. "
             "Use `with comm.capture(), torch.cuda.graph(g): ...`"
         )
-
-
-def _answer(got: tuple[str | int | None, ...]) -> Ran | Error:
-    """A C++ planner's answer: what would run (the algorithm, the direction and the op's
-    config fields), or its last value, the Error's number."""
-    err = got[-1]
-    if err is not None:
-        assert isinstance(err, int)
-        return Error(err)
-    return tuple(got[:-1])
 
 
 class HipCustomCommunicator:
@@ -404,41 +441,22 @@ class HipCustomCommunicator:
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
     #
-    # Each op and its `should_` take the same arguments: the op's own tensors and
-    # values, then, keyword-only, what the sweep and the tests force: ALL OR NOTHING,
-    # the algorithm (`one_shot` or `two_shot`) and the direction (`pull` or `push`)
-    # where the op has more than one template, every field of one of its builds
-    # (`build_info().templates`), and the launch (blocks_per_grid, and the AttnRes
-    # op's reduce_scatter_blocks); some but not all is `forced_incomplete`. All None
-    # is the backend's choice; the model forces none.
-    # `should_` is the op's check; the op runs its check, raises Refused on an Error,
-    # and returns what ran.
+    # Each `should_` asks the module's `should` of the op's own tensors: whether a
+    # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
+    # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
+    # Each op takes its own tensors and values, then, keyword-only, what the sweep and
+    # the tests force: ALL OR NOTHING, the algorithm (`one_shot` or `two_shot`) and the
+    # direction (`pull` or `push`) where the op has more than one template, every field
+    # of one of its builds (`build_info().templates`), and the launch (blocks_per_grid,
+    # and the AttnRes op's reduce_scatter_blocks); some but not all is
+    # `forced_incomplete`. All None is the backend's choice; the model forces none. A
+    # forced call asks no `should_`: C++ answers it. An op raises Refused with the
+    # Error C++ refused it for; a call its `should_` admitted is never refused.
 
     @final
-    def should_allreduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> bool:
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
         """Whether `all_reduce(inp)` runs here."""
-        ran = self._check_all_reduce(
-            inp,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
+        return not self.disabled and should("all_reduce", inp)
 
     @final
     def all_reduce(
@@ -452,11 +470,16 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
-    ) -> tuple[torch.Tensor, Ran]:
+    ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
         picks among a backend's own paths (hip's in C++), never whether it is ours.
-        Returns the sum and what ran."""
-        ran = self._check_all_reduce(
+        Returns the sum."""
+        self._admit(inp)
+        out = torch.empty_like(inp)
+        if self._warming_up():
+            return out
+        refused = self._all_reduce(
+            out,
             inp,
             algorithm,
             direction,
@@ -466,52 +489,15 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        out = torch.empty_like(inp)
-        if not self._warming_up():
-            self._record("all_reduce", inp, ran)
-            self._all_reduce(
-                out,
-                inp,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return out, ran
+        self._launched("all_reduce", inp, refused)
+        return out
 
     @final
     def should_allreduce_rms_norm(
-        self,
-        inp: torch.Tensor,
-        weight: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
+        self, inp: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_rms_norm(inp, weight, ...)` runs here."""
-        ran = self._check_all_reduce_rms_norm(
-            inp,
-            weight,
-            False,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
+        return not self.disabled and should("all_reduce_rms_norm", inp, weight)
 
     @final
     def all_reduce_rms_norm(
@@ -527,13 +513,18 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
-    ) -> tuple[torch.Tensor, Ran]:
+    ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(inp), weight, eps)` in one kernel. Returns
-        the normed sum and what ran."""
-        ran = self._check_all_reduce_rms_norm(
+        the normed sum."""
+        self._admit(inp)
+        out = torch.empty_like(inp)
+        if self._warming_up():
+            return out
+        refused = self._all_reduce_rms_norm(
+            out,
             inp,
             weight,
-            False,
+            eps,
             algorithm,
             direction,
             tile_m,
@@ -542,54 +533,15 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        out = torch.empty_like(inp)
-        if not self._warming_up():
-            self._record("all_reduce_rms_norm", inp, ran)
-            self._all_reduce_rms_norm(
-                out,
-                inp,
-                weight,
-                eps,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return out, ran
+        self._launched("all_reduce_rms_norm", inp, refused)
+        return out
 
     @final
     def should_allreduce_add_rms_norm(
-        self,
-        inp: torch.Tensor,
-        weight: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
+        self, inp: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(inp, ..., weight, ...)` runs here."""
-        ran = self._check_all_reduce_rms_norm(
-            inp,
-            weight,
-            True,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
+        return not self.disabled and should("all_reduce_add_rms_norm", inp, weight)
 
     @final
     def all_reduce_add_rms_norm(
@@ -606,13 +558,20 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(inp), residual, weight, eps)` in
-        one kernel. Returns the normed result, the sum plus residual, and what ran."""
-        ran = self._check_all_reduce_rms_norm(
+        one kernel. Returns the normed result and the sum plus residual."""
+        self._admit(inp)
+        out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
+        if self._warming_up():
+            return out, residual_out
+        refused = self._all_reduce_add_rms_norm(
+            out,
+            residual_out,
             inp,
+            residual,
             weight,
-            True,
+            eps,
             algorithm,
             direction,
             tile_m,
@@ -621,57 +580,13 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
-        out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
-        if not self._warming_up():
-            self._record("all_reduce_add_rms_norm", inp, ran)
-            self._all_reduce_add_rms_norm(
-                out,
-                residual_out,
-                inp,
-                residual,
-                weight,
-                eps,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        return out, residual_out, ran
+        self._launched("all_reduce_add_rms_norm", inp, refused)
+        return out, residual_out
 
     @final
-    def should_allreduce_add_attn_res_rms_norm(
-        self,
-        inp: torch.Tensor,
-        *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        reduce_scatter_blocks: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
-        waves_per_eu: int | None = None,
-    ) -> bool:
+    def should_allreduce_add_attn_res_rms_norm(self, inp: torch.Tensor) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(inp, ...)` runs here."""
-        ran = self._check_all_reduce_add_attn_res_rms_norm(
-            inp,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            reduce_scatter_blocks,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        return not isinstance(ran, Error)
+        return not self.disabled and should("all_reduce_add_attn_res_rms_norm", inp)
 
     @final
     def all_reduce_add_attn_res_rms_norm(
@@ -696,32 +611,18 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Ran]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(inp), blocks, ...)` in one kernel, or with no
-        `prefix` the sum starting one. Returns the prefix (updated in place when given),
-        the AttnRes output, and what ran. `write_idx` >= 0 also stores the prefix as
-        that block."""
-        ran = self._check_all_reduce_add_attn_res_rms_norm(
-            inp,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            reduce_scatter_blocks,
-            threads_per_block,
-            blocks_per_grid,
-            waves_per_eu,
-        )
-        if isinstance(ran, Error):
-            raise Refused(ran, inp)
+        `prefix` the sum starting one. Returns the prefix (updated in place when given)
+        and the AttnRes output. `write_idx` >= 0 also stores the prefix as that
+        block."""
+        self._admit(inp)
         # THE PREFIX IS UPDATED IN PLACE when given; with none, the sum starts one.
         prefix_out = torch.empty_like(inp) if prefix is None else prefix
         out = torch.empty_like(inp)
         if self._warming_up():
-            return prefix_out, out, ran
-        self._record("all_reduce_add_attn_res_rms_norm", inp, ran)
-        self._all_reduce_add_attn_res_rms_norm(
+            return prefix_out, out
+        refused = self._all_reduce_add_attn_res_rms_norm(
             prefix_out,
             out,
             inp,
@@ -744,7 +645,8 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        return prefix_out, out, ran
+        self._launched("all_reduce_add_attn_res_rms_norm", inp, refused)
+        return prefix_out, out
 
     @final
     def close(self) -> None:
@@ -857,7 +759,23 @@ class HipCustomCommunicator:
         )
 
     @final
-    def _record(self, op: Op, inp: torch.Tensor, ran: Ran) -> None:
+    def _admit(self, inp: torch.Tensor) -> None:
+        """Before an op: refused when no call may run (`disabled`), and raise on a
+        capture outside `capture()`."""
+        if self.disabled:
+            raise Refused(Error.disabled, inp)
+        _require_capture(self.state)
+
+    @final
+    def _launched(self, op: Op, inp: torch.Tensor, refused: int | None) -> None:
+        """After an op's kernel hook: Refused with the Error's number it answered, or
+        the launch into the flight recorder."""
+        if refused is not None:
+            raise Refused(Error(refused), inp)
+        self._record(op, inp)
+
+    @final
+    def _record(self, op: Op, inp: torch.Tensor) -> None:
         """Into the flight recorder, as a launch goes out."""
         self._calls.append(
             Call(
@@ -865,7 +783,6 @@ class HipCustomCommunicator:
                 op=op,
                 shape=tuple(inp.shape),
                 dtype=inp.dtype,
-                ran=ran,
                 captured=torch.cuda.is_current_stream_capturing(),
                 at_s=time.monotonic(),
             )
@@ -883,8 +800,8 @@ class HipCustomCommunicator:
             and not torch.cuda.is_current_stream_capturing()
         )
 
-    # ---- THE KERNELS: each op's check (what C++ would run, or the Error) and launch,
-    # and the peer memory's life. ----
+    # ---- THE KERNELS: each op's launch (the Error's number C++ refused it for, or
+    # None), and the peer memory's life. ----
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
@@ -926,34 +843,6 @@ class HipCustomCommunicator:
                 self._handle, self.cpu_group.group_name
             )
 
-    def _check_all_reduce(
-        self,
-        inp: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        if self.disabled:
-            return Error.disabled
-        _require_capture(self.state)
-        return _answer(
-            torch.ops._rocm_C.hip_custom_communicator_plan_all_reduce(
-                self._handle,
-                inp,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
-        )
-
     def _all_reduce(
         self,
         out: torch.Tensor,
@@ -965,9 +854,10 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> None:
-        """Sum `inp` across the TP ranks into `out`."""
-        torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+    ) -> int | None:
+        """Sum `inp` across the TP ranks into `out`; the Error's number C++ refused
+        the call for, or None when it ran (as every kernel hook answers)."""
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
             self._handle,
             out,
             inp,
@@ -978,38 +868,6 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
-        )
-
-    def _check_all_reduce_rms_norm(
-        self,
-        inp: torch.Tensor,
-        weight: torch.Tensor,
-        add: bool,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        if self.disabled:
-            return Error.disabled
-        _require_capture(self.state)
-        return _answer(
-            torch.ops._rocm_C.hip_custom_communicator_plan_all_reduce_rms_norm(
-                self._handle,
-                inp,
-                weight,
-                add,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
         )
 
     def _all_reduce_rms_norm(
@@ -1025,8 +883,8 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> None:
-        torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
+    ) -> int | None:
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
             self._handle,
             out,
             inp,
@@ -1056,9 +914,9 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> None:
+    ) -> int | None:
         """The normed result into `out`, the sum plus residual into `residual_out`."""
-        torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             self._handle,
             out,
             residual_out,
@@ -1073,38 +931,6 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
-        )
-
-    def _check_all_reduce_add_attn_res_rms_norm(
-        self,
-        inp: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        tile_k: int | None,
-        reduce_scatter_blocks: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
-        waves_per_eu: int | None,
-    ) -> Ran | Error:
-        if self.disabled:
-            return Error.disabled
-        _require_capture(self.state)
-        return _answer(
-            torch.ops._rocm_C.hip_custom_communicator_plan_all_reduce_add_attn_res_rms_norm(
-                self._handle,
-                inp,
-                algorithm,
-                direction,
-                tile_m,
-                tile_n,
-                tile_k,
-                reduce_scatter_blocks,
-                threads_per_block,
-                blocks_per_grid,
-                waves_per_eu,
-            )
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -1130,8 +956,11 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> None:
-        torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+    ) -> int | None:
+        launch = (
+            torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm
+        )
+        return launch(
             self._handle,
             prefix_out,
             out,

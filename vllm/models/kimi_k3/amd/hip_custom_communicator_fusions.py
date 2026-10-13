@@ -77,7 +77,7 @@ class ROCmLatentMoERunnerAllReduceRmsNorm(ROCmLatentMoERunner):
                 f"the fused latent tail needs an RMSNorm: {transform.norm!r}"
             )
         # The op raises, naming why, for an input it cannot run.
-        latent, _ = backend.all_reduce_rms_norm(
+        latent = backend.all_reduce_rms_norm(
             fused_output, transform.norm.weight, transform.norm.variance_epsilon
         )
 
@@ -111,7 +111,7 @@ def fused_attn_res(
         "the all_reduce_add_attn_res_rms_norm path runs only with "
         "HipCustomCommunicator live"
     )
-    prefix, out, _ = backend.all_reduce_add_attn_res_rms_norm(
+    prefix, out = backend.all_reduce_add_attn_res_rms_norm(
         delta,
         prefix_sum,
         block_residual,
