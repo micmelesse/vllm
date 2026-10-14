@@ -188,20 +188,18 @@ class OpRecord:
     dtypes: frozenset[torch.dtype]  # its input's
     weight_dtypes: frozenset[torch.dtype]  # its weight's besides its input's; none
     widest_row: int  # elements a row at most; 0 for any (its tiles cross the row)
-    max_bytes: int  # its input's at most
     two_d: bool  # its input is [rows, cols], not any shape read as rows of the last
 
 
 @dataclass(frozen=True)
 class BuildInfo:
     """What the build holds, the same on every device: C++'s `kBuild.supports`, its
-    pack and staging bytes, its ops', errors' and fault places' names, its templates,
-    and each op's plain call."""
+    pack bytes, its ops', errors' and fault places' names, its templates, and each
+    op's plain call. What a call may hold is a communicator's (`Capacity`)."""
 
     dtypes: frozenset[torch.dtype]
     worlds: frozenset[int]
     pack_bytes: int
-    staging_bytes: int
     # C++'s `Op`, `Error` and `Where` members by name, each in its enum's order: an op
     # crosses by name, an Error and a Where by number.
     op_names: tuple[str, ...]
@@ -220,7 +218,6 @@ def build_info() -> BuildInfo:
         dtypes,
         worlds,
         pack,
-        staging,
         ops,
         errors,
         where_names,
@@ -244,8 +241,8 @@ def build_info() -> BuildInfo:
         templates[name] = TemplateBuild(op, tuple(builds))
     records: dict[str, OpRecord] = {}
     at_dtype = at_weight = 0
-    for op, at in zip(ops, range(0, len(op_facts), 5)):
-        num_dtypes, num_weights, widest_row, max_bytes, two_d = op_facts[at : at + 5]
+    for op, at in zip(ops, range(0, len(op_facts), 4)):
+        num_dtypes, num_weights, widest_row, two_d = op_facts[at : at + 4]
         dtypes_in = op_dtypes[at_dtype : at_dtype + num_dtypes]
         weights_in = op_weights[at_weight : at_weight + num_weights]
         at_dtype += num_dtypes
@@ -254,14 +251,12 @@ def build_info() -> BuildInfo:
             frozenset(_DTYPES[d] for d in dtypes_in),
             frozenset(_DTYPES[d] for d in weights_in),
             widest_row,
-            max_bytes,
             bool(two_d),
         )
     return BuildInfo(
         frozenset(_DTYPES[d] for d in dtypes),
         frozenset(worlds),
         pack,
-        staging,
         tuple(ops),
         tuple(errors),
         tuple(where_names),
@@ -270,10 +265,66 @@ def build_info() -> BuildInfo:
     )
 
 
-def should(op: Op, input: torch.Tensor, weight: torch.Tensor | None = None) -> bool:
+@dataclass(frozen=True)
+class Capacity:
+    """WHAT ONE COMMUNICATOR HOLDS (C++'s `hip_custom_communicator_capacity`): the
+    largest call its exchange was sized for, `max_rows` rows of at most `max_cols`
+    elements (for a model, the server's tokens a batch by its hidden size), the
+    exchange's scratch and staging bytes, and each op's most bytes on them whatever
+    a call's shape."""
+
+    max_rows: int
+    max_cols: int
+    scratch_bytes: int
+    staging_bytes: int
+    max_bytes: dict[str, int]
+
+
+def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
+    """What a communicator serving `max_rows` rows of at most `max_cols` columns at
+    `world` ranks holds: C++'s answer, the same function its opener allocates by."""
+    rows, cols, scratch, staging, *most = (
+        torch.ops._rocm_C.hip_custom_communicator_capacity(max_rows, max_cols, world)
+    )
+    return Capacity(
+        rows, cols, scratch, staging, dict(zip(build_info().op_names, most))
+    )
+
+
+def problem_size() -> tuple[int, int]:
+    """THE LARGEST CALL A MODEL'S COMMUNICATOR SERVES, from the server's config: every
+    all-reduce is at most a batch of tokens, `max_num_batched_tokens`, and a row is
+    at most the hidden size, the target's or a speculative draft model's (STANDARDS,
+    *A kernel's own buffers are sized from the problem it serves*). Raises where the
+    config is not there to say it: a communicator is never sized by a guess."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.model_config is None:
+        raise ValueError(
+            "HipCustomCommunicator sizes its exchange from the server's config "
+            "(max_num_batched_tokens, the hidden size) and there is none: pass "
+            "max_rows and max_cols"
+        )
+    widest = config.model_config.get_hidden_size()
+    spec = config.speculative_config
+    draft = getattr(spec, "draft_model_config", None) if spec is not None else None
+    if draft is not None:
+        widest = max(widest, draft.get_hidden_size())
+    return config.scheduler_config.max_num_batched_tokens, widest
+
+
+def should(
+    op: Op,
+    input: torch.Tensor,
+    capacity: Capacity,
+    weight: torch.Tensor | None = None,
+) -> bool:
     """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
-    runs: inside the op's record (`build_info().ops`) and whole packs a row. Python
-    alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
+    runs on a communicator holding `capacity`: inside the op's record
+    (`build_info().ops`), whole packs a row, and inside what its exchange holds,
+    either the box it was sized for (rows and row width) or the op's most bytes.
+    Python alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
     admits."""
     built = build_info()
     record = built.ops[op]
@@ -288,10 +339,12 @@ def should(op: Op, input: torch.Tensor, weight: torch.Tensor | None = None) -> b
     row = input.shape[-1]
     if weight is not None and weight.dtype not in record.weight_dtypes | {input.dtype}:
         return False
+    rows = input.numel() // row
+    in_box = rows <= capacity.max_rows and row <= capacity.max_cols
     return (
         row * input.element_size() % built.pack_bytes == 0
         and (record.widest_row == 0 or row <= record.widest_row)
-        and input.numel() * input.element_size() <= record.max_bytes
+        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes[op])
     )
 
 
@@ -466,11 +519,15 @@ class HipCustomCommunicator:
         device: int | str | torch.device,
         *,
         timeout_seconds: float | None = None,
+        max_rows: int | None = None,
+        max_cols: int | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
         `timeout_seconds`: how long a kernel waits on a peer before it reports a
-        fault; None is the device group's own (`collective_timeout_seconds`)."""
+        fault; None is the device group's own (`collective_timeout_seconds`).
+        `max_rows` and `max_cols`: the largest call it serves, which its exchange is
+        sized for; None is the server's (`problem_size`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -479,6 +536,13 @@ class HipCustomCommunicator:
             if timeout_seconds is None
             else timeout_seconds
         )
+        if max_rows is None or max_cols is None:
+            served_rows, served_cols = problem_size()
+            max_rows = served_rows if max_rows is None else max_rows
+            max_cols = served_cols if max_cols is None else max_cols
+        self.max_rows = max_rows
+        self.max_cols = max_cols
+        self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
         if why is None:
@@ -524,7 +588,7 @@ class HipCustomCommunicator:
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce(input)` runs here."""
-        return not self.disabled and should("all_reduce", input)
+        return not self.disabled and should("all_reduce", input, self.capacity)
 
     @final
     def all_reduce(
@@ -565,7 +629,9 @@ class HipCustomCommunicator:
         self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_rms_norm(input, weight, ...)` runs here."""
-        return not self.disabled and should("all_reduce_rms_norm", input, weight)
+        return not self.disabled and should(
+            "all_reduce_rms_norm", input, self.capacity, weight
+        )
 
     @final
     def all_reduce_rms_norm(
@@ -609,7 +675,9 @@ class HipCustomCommunicator:
         self, input: torch.Tensor, weight: torch.Tensor
     ) -> bool:
         """Whether `all_reduce_add_rms_norm(input, ..., weight, ...)` runs here."""
-        return not self.disabled and should("all_reduce_add_rms_norm", input, weight)
+        return not self.disabled and should(
+            "all_reduce_add_rms_norm", input, self.capacity, weight
+        )
 
     @final
     def all_reduce_add_rms_norm(
@@ -654,7 +722,9 @@ class HipCustomCommunicator:
     @final
     def should_allreduce_add_attn_res_rms_norm(self, input: torch.Tensor) -> bool:
         """Whether `all_reduce_add_attn_res_rms_norm(input, ...)` runs here."""
-        return not self.disabled and should("all_reduce_add_attn_res_rms_norm", input)
+        return not self.disabled and should(
+            "all_reduce_add_attn_res_rms_norm", input, self.capacity
+        )
 
     @final
     def all_reduce_add_attn_res_rms_norm(
@@ -880,6 +950,7 @@ class HipCustomCommunicator:
     _watchdog: threading.Thread | None = None
     # The device wall clock's rate, which the fault record counts its wait in.
     _khz: int = 0
+    capacity: Capacity
     # Whether there is a fault record for the watchdog to read (`_fault`).
     _faults: ClassVar[bool] = True
 
@@ -896,6 +967,8 @@ class HipCustomCommunicator:
             self.device_group.group_name,
             self.device.index,
             self.timeout_seconds,
+            self.max_rows,
+            self.max_cols,
         )
         if err is not None:
             return Error(err).name
@@ -903,7 +976,14 @@ class HipCustomCommunicator:
         self._khz = torch.ops._rocm_C.hip_custom_communicator_wall_clock_khz(
             self.device.index
         )
-        logger.info("HipCustomCommunicator ready")
+        logger.info(
+            "HipCustomCommunicator ready: exchange sized for %d rows of %d "
+            "(scratch %.1f MiB, staging %.1f MiB)",
+            self.capacity.max_rows,
+            self.capacity.max_cols,
+            self.capacity.scratch_bytes / 2**20,
+            self.capacity.staging_bytes / 2**20,
+        )
         return None
 
     @contextmanager

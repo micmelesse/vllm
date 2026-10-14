@@ -169,9 +169,9 @@ using SupportedWire =
     std::tuple<std::optional<std::string>, std::optional<int64_t>>;
 using OpenWire = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using BuildInfoWire =
-    std::tuple<Names, std::vector<int64_t>, int64_t, int64_t, Names, Names,
-               Names, Names, Names, Names, std::vector<int64_t>,
-               std::vector<int64_t>, Names, Names, std::vector<int64_t>>;
+    std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
+               Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
+               Names, std::vector<int64_t>>;
 // AN OP'S ANSWER: the Error's number it was refused for, or none when it ran.
 using Refusal = std::optional<int64_t>;
 
@@ -179,11 +179,19 @@ using Refusal = std::optional<int64_t>;
 // (which carries the handles) and `device_group`, a collective: this rank's
 // symmetric memory, made and owned here, its handle gathered with every rank's,
 // and the peers' opened. `timeout_seconds`: how long a kernel waits on a peer
-// before it reports a fault. A torch op cannot return a variant, so it is two
-// optionals and exactly one is set, the handle or the Error's number.
+// before it reports a fault. `max_rows` and `max_cols`: the largest call it
+// serves (for a model, the server's tokens a batch by its hidden size), from
+// which its exchange is sized (`exchange_sizes`). A torch op cannot return a
+// variant, so it is two optionals and exactly one is set, the handle or the
+// Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
-                                      int64_t device, double timeout_seconds) {
+                                      int64_t device, double timeout_seconds,
+                                      int64_t max_rows, int64_t max_cols) {
+  TORCH_CHECK(max_rows > 0 && max_cols > 0,
+              "the largest call a communicator serves has rows and columns: "
+              "max_rows=",
+              max_rows, " max_cols=", max_cols);
   const auto refused = [](hip_custom_communicator::Error e) {
     return OpenWire{std::nullopt, static_cast<int64_t>(e)};
   };
@@ -197,8 +205,11 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&ok))
     return refused(*e);
+  const auto sizes =
+      hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
-      (*pg)->getRank(), world, gather_over(*pg), timeout_seconds);
+      (*pg)->getRank(), world, gather_over(*pg), timeout_seconds, max_rows,
+      max_cols, sizes.scratch_bytes, sizes.staging_bytes);
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -255,33 +266,42 @@ BuildInfoWire hip_custom_communicator_build_info() {
           b);
   }
   // EACH OP'S PLAIN CALL (kOps, select.cuh), in `ops`' order: its dtypes and
-  // its weight's besides its input's, flat, and five ints an op: those two
-  // counts, widest_row, max_bytes and two_d.
+  // its weight's besides its input's, flat, and four ints an op: those two
+  // counts, widest_row and two_d. What a call may hold is a communicator's
+  // (`hip_custom_communicator_capacity`), not the build's.
   Names op_dtypes, op_weights;
   std::vector<int64_t> op_facts;
   for (const Op& o : kOps) {
     for (const DType d : o.dtypes) op_dtypes.push_back(to_string(d));
     for (const DType d : o.weights) op_weights.push_back(to_string(d));
-    op_facts.insert(op_facts.end(),
-                    {static_cast<int64_t>(o.dtypes.size()),
-                     static_cast<int64_t>(o.weights.size()), widest_row(o.type),
-                     max_bytes(o.type), o.two_d});
+    op_facts.insert(op_facts.end(), {static_cast<int64_t>(o.dtypes.size()),
+                                     static_cast<int64_t>(o.weights.size()),
+                                     widest_row(o.type), o.two_d});
   }
-  return {dtypes,
-          worlds,
-          kBuild.memory.pack_bytes,
-          kBuild.memory.staging_bytes,
-          ops,
-          errors,
-          where_names,
-          templates,
-          template_ops,
-          fields,
-          configs,
-          counts,
-          op_dtypes,
-          op_weights,
-          op_facts};
+  return {dtypes,     worlds,       kBuild.memory.pack_bytes,
+          ops,        errors,       where_names,
+          templates,  template_ops, fields,
+          configs,    counts,       op_dtypes,
+          op_weights, op_facts};
+}
+
+// WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
+// `world` RANKS HOLDS, for Python's `should`: the box, its exchange's scratch
+// and staging bytes (`exchange_sizes`, what the opener allocates), then each
+// op's most bytes on them whatever the call's shape (`max_bytes`), in kOps'
+// order. A pure function of its arguments, so a communicator that is not open
+// can be asked.
+std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
+                                                      int64_t max_cols,
+                                                      int64_t world) {
+  const auto sizes = hip_custom_communicator::exchange_sizes(
+      max_rows, max_cols, static_cast<int>(world));
+  std::vector<int64_t> out{max_rows, max_cols, sizes.scratch_bytes,
+                           sizes.staging_bytes};
+  for (const auto& o : hip_custom_communicator::kOps)
+    out.push_back(hip_custom_communicator::max_bytes(
+        o.type, sizes.scratch_bytes, sizes.staging_bytes));
+  return out;
 }
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr) {

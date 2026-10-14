@@ -74,6 +74,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Supported,
     Where,
     build_info,
+    capacity_of,
     should,
     supported,
 )
@@ -118,6 +119,12 @@ _INPUT_SEED = 20260615
 # self.max_size.
 BASELINE_MAX_SIZE = 8 * 1024 * 1024  # CustomAllreduce's default max_size
 BASELINE_ALIGNMENT = 16  # "input byte size to be multiples of 16"
+
+# THE LARGEST CALL THE SUITE'S COMMUNICATORS SERVE, which their exchange is sized for
+# (as a server's comes from its config, `problem_size`): InferenceX's c1 batches
+# (max-num-batched-tokens 16384) at the widest row the suite draws (HIDDEN_DRAWN, 9600).
+TEST_MAX_ROWS = 16384
+TEST_MAX_COLS = 9600
 
 
 # THE COMMUNICATOR'S API, and the test is a sweep over it. A name is both the collective
@@ -476,11 +483,21 @@ def _build_communicator(
 ) -> HipCustomCommunicator:
     comm = (
         TorchCommunicator(
-            cpu_group, device_group, device, timeout_seconds=TEST_TIMEOUT_SECONDS
+            cpu_group,
+            device_group,
+            device,
+            timeout_seconds=TEST_TIMEOUT_SECONDS,
+            max_rows=TEST_MAX_ROWS,
+            max_cols=TEST_MAX_COLS,
         )
         if backend == "torch"
         else HipCustomCommunicator(
-            cpu_group, device_group, device, timeout_seconds=TEST_TIMEOUT_SECONDS
+            cpu_group,
+            device_group,
+            device,
+            timeout_seconds=TEST_TIMEOUT_SECONDS,
+            max_rows=TEST_MAX_ROWS,
+            max_cols=TEST_MAX_COLS,
         )
     )
     # Every test funnels through here, so this one assertion covers the mapping at every
@@ -1306,6 +1323,7 @@ def _bare(state: State) -> TorchCommunicator:
     base's own fields, and no backend's."""
     comm = object.__new__(TorchCommunicator)
     comm._own_fields(state)
+    comm.capacity = capacity_of(TEST_MAX_ROWS, TEST_MAX_COLS, max(build_info().worlds))
     return comm
 
 
@@ -1949,6 +1967,49 @@ def test_all_reduce_add_attn_res_rms_norm_matches_the_two_ops_it_replaces(
     assert all(agreed for agreed, _ in got), f"{case}: ranks disagreed"
 
 
+# THE LARGEST CALL, as InferenceX's c1 point sends it (STANDARDS, *An intervention owns
+# the hot path*): 16384 tokens of Kimi-K3's 7168, which no point we had run reached
+# and which killed the hip arm's server at startup (the fused AttnRes refused it,
+# scratch_too_small, 2026-10-14). Every shot, so the slicing pull two-shot, whose
+# scratch is the whole input, is at its most.
+@pytest.mark.full
+@pytest.mark.parametrize("shot", FUSED_SHOTS)
+def test_all_reduce_add_attn_res_rms_norm_runs_the_largest_call(
+    shot: FusedShot, world: int, ranks: World
+) -> None:
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    case = ((TEST_MAX_ROWS, 7168), True, 4, -1, True)
+    got = ranks.run(run_add_attn_res_rms_norm_rank, case=case, shot=shot)
+    if any(err == NO_FUSED_KERNEL for _, err in got):
+        pytest.skip(f"hip declines {shot} all_reduce_add_attn_res_rms_norm at {case}")
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{shot} at the largest call: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("op", get_args(Op))
+def test_every_op_admits_the_largest_call_it_was_sized_for(op: Op) -> None:
+    """A communicator admits every call inside the box its exchange was sized for, at
+    every built world, the widest whole-pack row and the most rows included: the box
+    is what the buffers hold, so `should` is never smaller than it."""
+    # example-based: the box's corners at each world, nothing to vary
+    import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
+
+    record = build_info().ops[op]
+    cols = TEST_MAX_COLS
+    if record.widest_row:
+        cols = min(cols, record.widest_row)
+    for world in sorted(build_info().worlds):
+        capacity = capacity_of(TEST_MAX_ROWS, TEST_MAX_COLS, world)
+        for dtype in sorted(record.dtypes, key=str):
+            x = torch.empty(TEST_MAX_ROWS, cols, dtype=dtype, device="meta")
+            weight = torch.empty(cols, dtype=dtype, device="meta")
+            assert should(op, x, capacity, weight), (
+                f"{op} at world {world}, {dtype}: {TEST_MAX_ROWS} x {cols} refused, "
+                f"inside its box of {TEST_MAX_ROWS} x {TEST_MAX_COLS}"
+            )
+
+
 def test_python_names_cpps_errors_and_ops() -> None:
     """Python's `Error` and `Where` are C++'s, name for name in order, so a number names
     the same reason or place on both sides; and its `Op` names exactly C++'s ops, which
@@ -2017,7 +2078,7 @@ def run_eager_beyond_staging_rank(
     # [rows, 7168] (the model's rows) over two and a half stagings: the staged
     # builds run in passes of whole rows, so a pass is a band of rows.
     hidden = 7168
-    rows = build_info().staging_bytes * 5 // 2 // 2 // hidden
+    rows = ctx.comm("hip").capacity.staging_bytes * 5 // 2 // 2 // hidden
     g = torch.Generator(device=ctx.device).manual_seed(_INPUT_SEED + ctx.rank)
     x = torch.randn(rows, hidden, generator=g, device=ctx.device).to(torch.bfloat16)
     want = x.float()
@@ -2235,7 +2296,9 @@ def run_row_wider_than_staging_rank(
 ) -> tuple[bool, str | None]:
     """ONE rank: a single row wider than the staging, which no pass of whole rows
     holds."""
-    x = torch.ones(build_info().staging_bytes, dtype=torch.bfloat16, device=ctx.device)
+    x = torch.ones(
+        ctx.comm("hip").capacity.staging_bytes, dtype=torch.bfloat16, device=ctx.device
+    )
     try:
         ctx.comm("hip").all_reduce(x, **_forced(shot))
     except Refused as no:
@@ -2417,11 +2480,17 @@ def _forcing(forced: dict) -> dict:
 
 
 def _plain(
-    op: Op, forced: dict, x: torch.Tensor, weight: torch.Tensor | None = None
+    op: Op,
+    forced: dict,
+    x: torch.Tensor,
+    world: int,
+    weight: torch.Tensor | None = None,
 ) -> bool:
     """A PLAIN CALL, which must run: nothing forced, and the module's `should` admits
-    it -- the rule every `should_` asks, not a copy of it."""
-    return not _forcing(forced) and should(op, x, weight)
+    it on the suite's communicator at `world` -- the rule every `should_` asks, not a
+    copy of it."""
+    capacity = capacity_of(TEST_MAX_ROWS, TEST_MAX_COLS, world)
+    return not _forcing(forced) and should(op, x, capacity, weight)
 
 
 def _drawn(
@@ -2555,7 +2624,7 @@ def test_all_reduce_api(
         forced=forced,
     )
     x = _drawn(D_DTYPES[dtype], rows, hidden, pad, lead)
-    _refused_or_right(answers, plain=_plain("all_reduce", forced, x))
+    _refused_or_right(answers, plain=_plain("all_reduce", forced, x, world))
 
 
 # -- all_reduce_rms_norm --------------------------------------------------------------
@@ -2628,7 +2697,9 @@ def test_all_reduce_rms_norm_api(
     dt = D_DTYPES[dtype]
     weight = torch.empty(hidden, dtype=torch.float32 if fp32_weight else dt)
     x = _drawn(dt, rows, hidden, pad)
-    _refused_or_right(answers, plain=_plain("all_reduce_rms_norm", forced, x, weight))
+    _refused_or_right(
+        answers, plain=_plain("all_reduce_rms_norm", forced, x, world, weight)
+    )
 
 
 # -- all_reduce_add_rms_norm ----------------------------------------------------------
@@ -2715,7 +2786,7 @@ def test_all_reduce_add_rms_norm_api(
     weight = torch.empty(hidden, dtype=torch.float32 if fp32_weight else dt)
     x = _drawn(dt, rows, hidden, pad)
     _refused_or_right(
-        answers, plain=_plain("all_reduce_add_rms_norm", forced, x, weight)
+        answers, plain=_plain("all_reduce_add_rms_norm", forced, x, world, weight)
     )
 
 
@@ -2837,5 +2908,5 @@ def test_all_reduce_add_attn_res_rms_norm_api(
     )
     x = _drawn(torch.bfloat16, rows, hidden, pad)
     _refused_or_right(
-        answers, plain=_plain("all_reduce_add_attn_res_rms_norm", forced, x)
+        answers, plain=_plain("all_reduce_add_attn_res_rms_norm", forced, x, world)
     )

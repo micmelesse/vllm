@@ -103,8 +103,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "hip_custom_communicator_open(str cpu_group, str device_group, int "
       "device, "
-      "float timeout_seconds) -> (int?, int?)",
+      "float timeout_seconds, int max_rows, int max_cols) -> (int?, int?)",
       &hip_custom_communicator_open);
+  rocm_ops.def(
+      "hip_custom_communicator_capacity(int max_rows, int max_cols, int world) "
+      "-> int[]",
+      &hip_custom_communicator_capacity);
   rocm_ops.def("hip_custom_communicator_dispose",
                &hip_custom_communicator_dispose);
   // The fault record the watchdog polls, and the abort it sets (barrier.cuh).

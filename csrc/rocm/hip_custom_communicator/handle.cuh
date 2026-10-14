@@ -58,13 +58,19 @@ class Handle {
   // `world_size` is one the build holds (the opener checks it).
   // `timeout_seconds`: how long a kernel waits on a peer before it records a
   // fault and leaves (common.cuh's BARRIER), the caller's: the process group's
-  // own timeout, as every other collective on it has.
+  // own timeout, as every other collective on it has. THE EXCHANGE'S SIZES are
+  // the caller's too, computed from the largest call it serves, `max_rows` rows
+  // of at most `max_cols` columns (select.cuh's `exchange_sizes`): kept, so
+  // what the buffers were sized for can be asked.
   Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
-         const BuildInfo& build = kBuild)
+         int64_t max_rows, int64_t max_cols, int64_t scratch_bytes,
+         int64_t staging_bytes, const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
-        scratch_bytes_(build.memory.scratch_bytes),
-        staging_bytes_(build.memory.staging_bytes) {
+        max_rows_(max_rows),
+        max_cols_(max_cols),
+        scratch_bytes_(scratch_bytes),
+        staging_bytes_(staging_bytes) {
     // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging
     // runs off its own allocation, never into barrier state.
     signals_ = alloc_symmetric(kSignalsBytes);
@@ -132,6 +138,8 @@ class Handle {
 
   int rank() const { return rank_; }
   int world_size() const { return world_size_; }
+  int64_t max_rows() const { return max_rows_; }
+  int64_t max_cols() const { return max_cols_; }
   int64_t scratch_bytes() const { return scratch_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it
   // holds.
@@ -407,6 +415,8 @@ class Handle {
 
   int rank_;
   int world_size_;
+  int64_t max_rows_;
+  int64_t max_cols_;
   int64_t scratch_bytes_;
   int64_t staging_bytes_;
   void* signals_ = nullptr;

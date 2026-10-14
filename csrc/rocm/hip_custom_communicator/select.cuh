@@ -1797,21 +1797,55 @@ constexpr int64_t widest_row(OpType o) {
   return widest;
 }
 
-// THE MOST BYTES A PLAIN CALL RUNS: what the staging holds (an eager input is
-// copied in whole), and what the scratch holds at the most scratch a byte of
-// its input needs among its tuned kernels: at one row of one pack, where
-// rounding up is all of it (a row two-shot leaving two results, two).
-constexpr int64_t max_bytes(OpType o) {
+// THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own buffers are
+// sized from the problem it serves*): the largest call a communicator serves is
+// `max_rows` rows of at most `max_cols` columns (for a model, the server's
+// tokens a batch by its hidden size), and its exchange holds every template's
+// need at that call, in every built dtype: the scratch the most any two-shot
+// takes (`scratch_need`), the staging the whole input (an in-place build on an
+// eager input reads it from there). Each need grows with the rows and the
+// row's width, so a call inside the box fits by construction. Each rounded to
+// a whole pack, and at least one.
+struct ExchangeSizes {
+  int64_t scratch_bytes;
+  int64_t staging_bytes;
+};
+constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
+                                       int world) {
+  const int64_t pack = kBuild.memory.pack_bytes;
+  const auto whole = [pack](int64_t bytes) {
+    return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
+  };
+  int64_t scratch = 0, staging = 0;
+  for (const DType d : kBuild.supports.dtypes) {
+    const int64_t packs = packs_of(max_cols, d);
+    for (const TemplateInfo& t : kTemplates) {
+      const int64_t need = scratch_need(t.fn, max_rows, packs, world);
+      if (need > scratch) scratch = need;
+    }
+    const int64_t input = max_rows * max_cols * elem_bytes(d);
+    if (input > staging) staging = input;
+  }
+  return {whole(scratch), whole(staging)};
+}
+
+// THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
+// the staging holds (an eager input is copied in whole), and what the scratch
+// holds at the most scratch a byte of its input needs among its tuned kernels:
+// at one row of one pack, where rounding up is all of it (a row two-shot
+// leaving two results, two). Python admits a call by it or by the box the
+// exchange was sized for (`exchange_sizes`), whichever is larger.
+constexpr int64_t max_bytes(OpType o, int64_t scratch_bytes,
+                            int64_t staging_bytes) {
   int64_t per_byte = 0;
   for (const TunedKernel& k : op(o).kernels) {
     const int64_t need =
         scratch_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
     if (need > per_byte) per_byte = need;
   }
-  const int64_t staging = kBuild.memory.staging_bytes;
-  if (per_byte == 0) return staging;
-  const int64_t scratch = kBuild.memory.scratch_bytes / per_byte;
-  return scratch < staging ? scratch : staging;
+  if (per_byte == 0) return staging_bytes;
+  const int64_t scratch = scratch_bytes / per_byte;
+  return scratch < staging_bytes ? scratch : staging_bytes;
 }
 
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and

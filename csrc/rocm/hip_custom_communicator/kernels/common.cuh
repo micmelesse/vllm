@@ -283,8 +283,6 @@ struct BuildInfo {
   };
   struct Memory {
     int pack_bytes;  // a pack: the unit every kernel loads, sums and stores in
-    int64_t staging_bytes;   // where an eager input is copied for its peers
-    int64_t scratch_bytes;   // a two-shot's partial sums, per rank
     int64_t peer_ptr_slots;  // one per registered or captured buffer: its
                              // peers' addresses
   };
@@ -307,18 +305,9 @@ constexpr BuildInfo derive(const Hardware& hw) {
   // A PACK IS THE WIDEST LOAD, as in vLLM's and aiter's custom all-reduce and
   // NCCL.
   m.pack_bytes = hw.max_load_bytes;
-  // THE STAGING an eager input is copied into for its peers: policy. A staged
-  // build takes any size through it a pass at a time; an in-place build on an
-  // eager input (the fused ops) needs it whole, up to Kimi-K3's widest row (its
-  // 4096 x 7168 bf16 prefill, 59 MB).
-  m.staging_bytes = 256 * kMiB;
-  // THE TWO-SHOT SCRATCH, per rank, after the signal block: policy. It holds
-  // one rank's slice, so it caps a two-shot buffer at scratch_bytes x ngpus (1
-  // GiB at 8 ranks); a quantized two-shot holds every rank's slice at half
-  // width, padded to whole grid strides (Kimi-K3's 4096 x 7168 bf16 prefill
-  // needs 74 MB at 36 blocks). check refuses a call past it
-  // (scratch_too_small).
-  m.scratch_bytes = 128 * kMiB;
+  // THE EXCHANGE (scratch and staging) IS NOT HERE: it is sized at open from
+  // the largest call the communicator serves (select.cuh's `exchange_sizes`),
+  // never a constant.
   // THE PEER-POINTER SLOTS, one per captured launch (capture sizes x
   // collectives a forward): the size vLLM gives the same array, 8 MB of slots.
   // Registration past it fails at capture.
