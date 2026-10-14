@@ -34,8 +34,7 @@
 //   REDUCE     Sum, Max (a reduction's operation), Axis::m | n
 //   SOFTMAX    OnlineSoftmax
 //   PEERS      StatusField, kStatusFields, kMaxRanks, kMaxBlocks
-//   BARRIER    Sync<WORLD>{signals_ptrs and its strides, status_ptr and its
-//              stride, rank, timeout}, Until
+//   BARRIER    Until: what a barrier waits for (launched, visible, read)
 
 #pragma once
 
@@ -1496,11 +1495,11 @@ class Counter {
 namespace impl {
 
 // Debug builds only: up to ~32 x 8K cycles, different per rank, block and
-// barrier (the launch's barriers so far).
-DINLINE void skew(int rank, uint32_t barriers) {
+// barrier parity.
+DINLINE void skew(int rank, uint32_t parity) {
   if (!HIP_CUSTOM_COMMUNICATOR_DEBUG) return;
   uint32_t h = static_cast<uint32_t>(rank) * 73856093u ^
-               blockIdx.x * 19349663u ^ barriers * 83492791u;
+               blockIdx.x * 19349663u ^ parity * 83492791u;
   h ^= h >> 13;
   h *= 0x5bd1e995u;
   for (uint32_t n = (h ^ (h >> 15)) % 32; n > 0; --n)
@@ -1531,9 +1530,18 @@ DINLINE void fence() {
   }
 }
 
+// AN INDEX INSIDE ITS BUFFER'S SIZE, checked in debug builds only (a release
+// build passes the sizes and reads none): one outside is a programming error,
+// not a peer's fault, so it traps.
+DINLINE void debug_in_bounds(int64_t index, int64_t size) {
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size))
+    __builtin_trap();
+}
+
 // One word of this rank's status, by its field, at the buffer's stride.
 DINLINE uint32_t* status_word(uint32_t* status_ptr, int64_t status_stride_field,
-                              StatusField f) {
+                              int status_size_field, StatusField f) {
+  debug_in_bounds(static_cast<int64_t>(f), status_size_field);
   return status_ptr + static_cast<int64_t>(f) * status_stride_field;
 }
 
@@ -1542,10 +1550,11 @@ DINLINE uint32_t* status_word(uint32_t* status_ptr, int64_t status_stride_field,
 // whole. Then `abort`, so every other wait on this rank leaves at its next
 // check rather than spinning out its own timeout.
 DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
-                          Where where, int rank, int peer, uint32_t count,
-                          uint32_t want, uint64_t elapsed) {
+                          int status_size_field, Where where, int rank,
+                          int peer, uint32_t count, uint32_t want,
+                          uint64_t elapsed) {
   const auto word = [&](StatusField f) {
-    return status_word(status_ptr, status_stride_field, f);
+    return status_word(status_ptr, status_stride_field, status_size_field, f);
   };
   uint32_t none = static_cast<uint32_t>(FaultState::none);
   if (__scoped_atomic_compare_exchange_n(
@@ -1579,22 +1588,23 @@ DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
 // communicator broken (the host's watchdog).
 template <bool ACQUIRE, int MEMORY_SCOPE>
 DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
-                  int64_t status_stride_field, int rank, const Counter& flag,
-                  uint32_t want, Where where, int peer) {
+                  int64_t status_stride_field, int status_size_field, int rank,
+                  const Counter& flag, uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
   for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want;
        ++n) {
     __builtin_amdgcn_s_sleep(1);
     if ((n & 255u) != 0) continue;
     const uint64_t waited = wall_clock64() - t0;
-    const bool aborted =
-        __scoped_atomic_load_n(
-            status_word(status_ptr, status_stride_field, StatusField::abort),
-            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+    const bool aborted = __scoped_atomic_load_n(
+                             status_word(status_ptr, status_stride_field,
+                                         status_size_field, StatusField::abort),
+                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
     if (!aborted && waited <= timeout_ticks) continue;
     if (!aborted)
-      record_fault(status_ptr, status_stride_field, where, rank, peer,
-                   flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(), want, waited);
+      record_fault(status_ptr, status_stride_field, status_size_field, where,
+                   rank, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(),
+                   want, waited);
     __builtin_amdgcn_endpgm();
   }
   if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
@@ -1615,64 +1625,35 @@ DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
 // every rank.
 enum class Until { launched, visible, read };
 
-// A KERNEL'S SYNCHRONIZATION, one per kernel: the signals buffer (every rank's
-// address and the strides), the status buffer, this rank, how long a wait may
-// last before it gives up, and the launch's barriers so far, which pick each
-// barrier's flag set (its parity). Nothing in it outlives the launch. A read
-// after a barrier may see only what the SAME BLOCK on the peer wrote before it,
-// so both sides must index the same data by the same block.
-template <int WORLD>
-class Sync;
+// A FLAG: rank `owner`'s for block `block` on rank `writer`, at `parity`,
+// from the signals buffer [R, 2, B, R] (every rank's address, its strides and
+// its sizes; debug builds check each index against its size). AN INDEX KEEPS
+// ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as passed): an int
+// where the caller had an unsigned costs a sign extension in every kernel.
 namespace impl {
-template <Until UNTIL, int WORLD>
-DINLINE void barrier(Sync<WORLD>& sync);
+template <int WORLD, typename OWNER_TYPE, typename WRITER_TYPE>
+DINLINE Counter signal_flag(
+    uint32_t* const* signals_ptrs, int64_t signals_stride_parity,
+    int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    OWNER_TYPE owner, uint32_t parity, unsigned block, WRITER_TYPE writer) {
+  debug_in_bounds(static_cast<int64_t>(owner), WORLD);
+  debug_in_bounds(parity, signals_size_parity);
+  debug_in_bounds(block, signals_size_block);
+  debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
+  return Counter(signals_ptrs[owner] + parity * signals_stride_parity +
+                 block * signals_stride_block + writer * signals_stride_writer);
+}
 }  // namespace impl
 
-template <int WORLD>
-class Sync {
-  uint32_t* const* signals_ptrs_;
-  int64_t signals_stride_parity_;
-  int64_t signals_stride_block_;
-  int64_t signals_stride_writer_;
-  uint32_t* status_ptr_;
-  int64_t status_stride_field_;
-  int rank_;
-  uint64_t timeout_ticks_;
-  uint32_t barriers_ = 0;
-
-  // Rank `owner`'s flag for block `block` on rank `writer`, at `parity`. AN
-  // INDEX KEEPS ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as
-  // passed): an int where the caller had an unsigned costs a sign extension in
-  // every kernel.
-  template <typename OWNER_TYPE, typename WRITER_TYPE>
-  DINLINE Counter flag(OWNER_TYPE owner, uint32_t parity, unsigned block,
-                       WRITER_TYPE writer) const {
-    return Counter(signals_ptrs_[owner] + parity * signals_stride_parity_ +
-                   block * signals_stride_block_ +
-                   writer * signals_stride_writer_);
-  }
-
-  template <Until UNTIL, int W>
-  friend DINLINE void impl::barrier(Sync<W>& sync);
-
- public:
-  DINLINE Sync(uint32_t* const* signals_ptrs, int64_t signals_stride_parity,
-               int64_t signals_stride_block, int64_t signals_stride_writer,
-               uint32_t* status_ptr, int64_t status_stride_field, int rank,
-               uint64_t timeout_ticks)
-      : signals_ptrs_(signals_ptrs),
-        signals_stride_parity_(signals_stride_parity),
-        signals_stride_block_(signals_stride_block),
-        signals_stride_writer_(signals_stride_writer),
-        status_ptr_(status_ptr),
-        status_stride_field_(status_stride_field),
-        rank_(rank),
-        timeout_ticks_(timeout_ticks) {}
-};
-
-// THE BARRIER, one for every case: barrier<Until::read>(sync). A namespace
-// function, as std::get is, so a kernel templated on WORLD calls it without
-// `sync.template barrier<...>`.
+// THE BARRIER, one for every case: barrier<Until::read, 1, WORLD>(the signals
+// buffer, the status buffer, rank, timeout_ticks), each buffer its pointer,
+// strides and sizes, as the kernel took them. Nothing outlives the call. The
+// PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a
+// launch starts on parity 0 and, its barriers even in number, ends on 1
+// (dev/lint_kernels.sh checks both). A read after a barrier may see only what
+// the SAME BLOCK on the peer wrote before it, so both sides must index the same
+// data by the same block.
 //
 // Block b waits for block b on every rank, and for no other block: enough at
 // the ends, where it says "every peer has launched" or "every peer is done
@@ -1690,34 +1671,45 @@ class Sync {
 // for the lane's own stores just before it signals, after the whole phase
 // between, so the clear has long landed.
 namespace impl {
-template <Until UNTIL, int WORLD>
-DINLINE void barrier(Sync<WORLD>& sync) {
+template <Until UNTIL, int PARITY, int WORLD>
+DINLINE void barrier(uint32_t* const* signals_ptrs,
+                     int64_t signals_stride_parity,
+                     int64_t signals_stride_block,
+                     int64_t signals_stride_writer, int signals_size_parity,
+                     int signals_size_block, int signals_size_writer,
+                     uint32_t* status_ptr, int64_t status_stride_field,
+                     int status_size_field, int rank, uint64_t timeout_ticks) {
+  static_assert(PARITY == 0 || PARITY == 1, "a barrier's parity is 0 or 1");
   constexpr bool kOrdered = UNTIL == Until::visible;
   constexpr bool kFirst = UNTIL == Until::launched;
-  const uint32_t parity = sync.barriers_ & 1u;
-  impl::skew(sync.rank_, sync.barriers_);
+  constexpr uint32_t parity = PARITY;
+  impl::skew(rank, parity);
   if constexpr (!kFirst) {
     if constexpr (kOrdered) wait_stores();
     __syncthreads();
   }
   if (threadIdx.x < WORLD) {
     if constexpr (!kOrdered) wait_stores();
-    const Counter theirs =
-        sync.flag(threadIdx.x, parity, blockIdx.x, sync.rank_);
-    const Counter mine = sync.flag(sync.rank_, parity, blockIdx.x, threadIdx.x);
+    const auto flag = [&](auto owner, unsigned block, auto writer) {
+      return signal_flag<WORLD>(
+          signals_ptrs, signals_stride_parity, signals_stride_block,
+          signals_stride_writer, signals_size_parity, signals_size_block,
+          signals_size_writer, owner, parity, block, writer);
+    };
+    const Counter theirs = flag(threadIdx.x, blockIdx.x, rank);
+    const Counter mine = flag(rank, blockIdx.x, threadIdx.x);
     theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
                           __MEMORY_SCOPE_SYSTEM>(
         static_cast<uint32_t>(FlagState::arrived));
     wait<kOrdered, __MEMORY_SCOPE_DEVICE>(
-        sync.timeout_ticks_, sync.status_ptr_, sync.status_stride_field_,
-        sync.rank_, mine, static_cast<uint32_t>(FlagState::arrived),
+        timeout_ticks, status_ptr, status_stride_field, status_size_field, rank,
+        mine, static_cast<uint32_t>(FlagState::arrived),
         kFirst ? Where::start : Where::peer_barrier,
         static_cast<int>(threadIdx.x));
     mine.template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
         static_cast<uint32_t>(FlagState::clear));
   }
   __syncthreads();
-  ++sync.barriers_;
 }
 }  // namespace impl
 
@@ -1733,7 +1725,7 @@ DINLINE void barrier(Sync<WORLD>& sync) {
 // THE LOADS ARE THE COMMUNICATION: `rank_chunk(w)` points into rank + w's
 // memory, mapped into this GPU's (PEERS), so loading the chunk reads it
 // over the links; the sum and the store are local. The kernel syncs around
-// these calls (Sync): before, every peer's data is ready; between the
+// these calls (the barriers): before, every peer's data is ready; between the
 // reduce-scatter and the all-gather, every rank's sums are visible.
 //
 // THE COLLECTIVES WORK A CHUNK AT A TIME, as a tile whose ROWS ARE THE RANKS:
@@ -2216,10 +2208,21 @@ DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n,
 // This block and the same block on every rank, UNTIL launched (every peer's
 // input is ready; a launch's first barrier), visible (what was written before
 // is seen after) or read (every peer is done reading this rank). A kernel's
-// barriers are even in number, so its flags end where they began.
-template <Until UNTIL, int WORLD>
-DINLINE void barrier(Sync<WORLD>& sync) {
-  impl::barrier<UNTIL, WORLD>(sync);
+// barriers are even in number, its k-th taking PARITY k % 2, so its flags end
+// where they began. WORLD is the kernel's, passed on.
+template <Until UNTIL, int PARITY, int WORLD>
+DINLINE void barrier(uint32_t* const* signals_ptrs,
+                     int64_t signals_stride_parity,
+                     int64_t signals_stride_block,
+                     int64_t signals_stride_writer, int signals_size_parity,
+                     int signals_size_block, int signals_size_writer,
+                     uint32_t* status_ptr, int64_t status_stride_field,
+                     int status_size_field, int rank, uint64_t timeout_ticks) {
+  impl::barrier<UNTIL, PARITY, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 }
 
 // ===============================================================================================

@@ -207,14 +207,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
   using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
@@ -235,7 +227,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       local_ptr(output_norm_weight_ptr, 0, output_norm_weight_stride_n, rank);
   const auto output =
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every
   // rank in rank order,
@@ -254,7 +250,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Until::read>(sync);
+  barrier<Until::read, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 #else
   __builtin_trap();
 #endif
@@ -314,14 +314,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps, int reduce_scatter_blocks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
   using Rows =
       Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   constexpr int NL = traits<DTYPE>::N;
@@ -343,7 +335,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       max(0, min(slice, packs - col0));  // a late rank's may be short or none
 
   // 1. Wait until every peer has launched, so its input is ready.
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them:
   // in rank order every GPU read rank 0 first, a link at a time carrying the
@@ -402,7 +398,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   (void)reduce_scatter_blocks;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
-  barrier<Until::visible>(sync);
+  barrier<Until::visible, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
 #else
   __builtin_trap();
@@ -458,14 +458,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
   constexpr int NL = traits<DTYPE>::N;
   using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a
@@ -493,7 +485,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           : 0;
 
   // 1. Wait until every peer has launched, so its input is ready.
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across
   // it they spilled).
@@ -525,7 +521,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read
   // this rank's input.
-  barrier<Until::visible>(sync);
+  barrier<Until::visible, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then
   // AttnRes, as the

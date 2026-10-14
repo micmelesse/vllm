@@ -33,19 +33,13 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
     int64_t input_stride_n, uint32_t* const* __restrict__ signals_ptrs,
     int64_t signals_stride_parity, int64_t signals_stride_block,
-    int64_t signals_stride_writer, uint32_t* __restrict__ status_ptr,
-    int64_t status_stride_field, int rank, uint64_t timeout_ticks,
-    Ptr<DTYPE> output, Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual,
+    int64_t signals_stride_writer, int signals_size_parity,
+    int signals_size_block, int signals_size_writer,
+    uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks, Ptr<DTYPE> output,
+    Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual,
     Ptr<const WEIGHT_DTYPE> weight, float eps, int input_size_m,
     int input_size_n) {
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
   using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF =
       Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
@@ -57,7 +51,11 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // input is ready.
   const auto input =
       rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // 2. Each of this block's rows: read it from every rank in rank order and
   // sum, then (ADD_RESIDUAL) add
@@ -103,7 +101,11 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Until::read>(sync);
+  barrier<Until::read, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 }
 
 // THE KERNELS, one per op, both the body above.
@@ -127,7 +129,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, signals_ptrs,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
-      status_ptr, status_stride_field, rank, timeout_ticks,
+      signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
+      status_stride_field, status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       Ptr<DTYPE>{nullptr, 0, 0, rank}, Ptr<const DTYPE>{nullptr, 0, 0, rank},
       local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, input_size_m,
@@ -162,7 +165,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, signals_ptrs,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
-      status_ptr, status_stride_field, rank, timeout_ticks,
+      signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
+      status_stride_field, status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       local_ptr(residual_output_ptr, residual_output_stride_m,
                 residual_output_stride_n, rank),
@@ -201,18 +205,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     int64_t scratch_stride_m, int64_t scratch_stride_n,
     uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
-    uint32_t* __restrict__ status_ptr, int64_t status_stride_field, int rank,
-    uint64_t timeout_ticks, Ptr<DTYPE> output, Ptr<DTYPE> residual_output,
-    Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight, float eps,
-    int input_size_m, int input_size_n) {
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks, Ptr<DTYPE> output,
+    Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual,
+    Ptr<const WEIGHT_DTYPE> weight, float eps, int input_size_m,
+    int input_size_n) {
   constexpr int NL = traits<DTYPE>::N;
   using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF =
@@ -229,7 +227,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   };
 
   // 1. Wait until every peer has launched, so its input is ready.
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack
   // build keeps 68 B of scratch (the ISA gate, 2026-09-30).
@@ -320,7 +322,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   }
 
   // 3. Every rank's rows are visible to its peers.
-  barrier<Until::visible>(sync);
+  barrier<Until::visible, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The
   // next call's
@@ -401,8 +407,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs,
       scratch_stride_m, scratch_stride_n, signals_ptrs, signals_stride_parity,
-      signals_stride_block, signals_stride_writer, status_ptr,
-      status_stride_field, rank, timeout_ticks,
+      signals_stride_block, signals_stride_writer, signals_size_parity,
+      signals_size_block, signals_size_writer, status_ptr, status_stride_field,
+      status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       Ptr<DTYPE>{nullptr, 0, 0, rank}, Ptr<const DTYPE>{nullptr, 0, 0, rank},
       local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, input_size_m,
@@ -439,8 +446,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs,
       scratch_stride_m, scratch_stride_n, signals_ptrs, signals_stride_parity,
-      signals_stride_block, signals_stride_writer, status_ptr,
-      status_stride_field, rank, timeout_ticks,
+      signals_stride_block, signals_stride_writer, signals_size_parity,
+      signals_size_block, signals_size_writer, status_ptr, status_stride_field,
+      status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       local_ptr(residual_output_ptr, residual_output_stride_m,
                 residual_output_stride_n, rank),
@@ -479,18 +487,12 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     int64_t scratch_stride_m, int64_t scratch_stride_n,
     uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
-    uint32_t* __restrict__ status_ptr, int64_t status_stride_field, int rank,
-    uint64_t timeout_ticks, Ptr<DTYPE> output, Ptr<DTYPE> residual_output,
-    Ptr<const DTYPE> residual, Ptr<const WEIGHT_DTYPE> weight, float eps,
-    int input_size_m, int input_size_n) {
-  Sync<WORLD> sync{signals_ptrs,
-                   signals_stride_parity,
-                   signals_stride_block,
-                   signals_stride_writer,
-                   status_ptr,
-                   status_stride_field,
-                   rank,
-                   timeout_ticks};
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+    int status_size_field, int rank, uint64_t timeout_ticks, Ptr<DTYPE> output,
+    Ptr<DTYPE> residual_output, Ptr<const DTYPE> residual,
+    Ptr<const WEIGHT_DTYPE> weight, float eps, int input_size_m,
+    int input_size_n) {
   constexpr int NL = traits<DTYPE>::N;
   using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
   using RowF =
@@ -521,7 +523,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
            THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
 
   // 1. Wait until every peer has launched, so its input is ready.
-  barrier<Until::launched>(sync);
+  barrier<Until::launched, 0, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across
   // it they spilled).
@@ -552,7 +558,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   }
 
   // 3. Every rank's sums are in this rank's scratch.
-  barrier<Until::visible>(sync);
+  barrier<Until::visible, 1, WORLD>(
+      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
 
   // 4. This block's rows out of this rank's scratch: (ADD_RESIDUAL) add the
   // residual, then RMSNorm,
@@ -614,8 +624,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs,
       scratch_stride_m, scratch_stride_n, signals_ptrs, signals_stride_parity,
-      signals_stride_block, signals_stride_writer, status_ptr,
-      status_stride_field, rank, timeout_ticks,
+      signals_stride_block, signals_stride_writer, signals_size_parity,
+      signals_size_block, signals_size_writer, status_ptr, status_stride_field,
+      status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       Ptr<DTYPE>{nullptr, 0, 0, rank}, Ptr<const DTYPE>{nullptr, 0, 0, rank},
       local_ptr(weight_ptr, 0, weight_stride_n, rank), eps, input_size_m,
@@ -652,8 +663,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptrs, input_stride_m, input_stride_n, scratch_ptrs,
       scratch_stride_m, scratch_stride_n, signals_ptrs, signals_stride_parity,
-      signals_stride_block, signals_stride_writer, status_ptr,
-      status_stride_field, rank, timeout_ticks,
+      signals_stride_block, signals_stride_writer, signals_size_parity,
+      signals_size_block, signals_size_writer, status_ptr, status_stride_field,
+      status_size_field, rank, timeout_ticks,
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank),
       local_ptr(residual_output_ptr, residual_output_stride_m,
                 residual_output_stride_n, rank),
