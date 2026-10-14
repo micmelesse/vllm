@@ -93,13 +93,13 @@ void hip_custom_communicator_abort(fptr_t handle_ptr);
 // set.
 std::tuple<std::optional<std::string>, std::optional<int64_t>>
 hip_custom_communicator_supported(int64_t device, int64_t world);
-// The build's dtypes by name, its worlds, a pack's bytes and a staging's, its
+// The build's dtypes by name, its worlds, a pack's bytes, its
 // ops', errors' and fault places' names in their enums' order, and each
 // template's name, op and BuildConfigs (flat, a build's fields in the names'
 // order, 0 where its op's BuildConfig has none, with each template's count),
 // and each op's plain call (its dtypes and its weight's besides its input's,
-// flat, and five ints an op).
-std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t, int64_t,
+// flat, and four ints an op).
+std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>, std::vector<std::string>,

@@ -224,7 +224,7 @@ SupportedWire hip_custom_communicator_supported(int64_t device, int64_t world) {
 }
 
 // WHAT THE BUILD HOLDS, kBuild's projection for Python: its dtypes by name, its
-// worlds, a pack's bytes and a staging's, its ops, errors and fault places by
+// worlds, a pack's bytes, its ops, errors and fault places by
 // name in their enums' order (each error's name without its reason), which
 // Python's `Op`, `Error` and `Where` are held to, its templates, and each op's
 // plain call, which Python's `should` admits.
