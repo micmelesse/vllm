@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "../common/interface.cuh"
+#include "common.cuh"
 
 namespace hip_custom_communicator {
 
@@ -172,9 +172,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // inp_size_n] buffer at its strides, summed elementwise. Reduce-scatter (each
 // rank sums its share over the ranks into its scratch), sync, all-gather (every
 // rank's summed share out to the output). The kernel states the problem;
-// collectives.cuh walks it as [R, 1, M*N], each rank's share one contiguous
-// range of the elements, for long reads from each peer (its comment says why
-// and what it serves badly). A rank's copy of a chunk is a wave (LANES
+// common.cuh's COLLECTIVES walk it as [R, 1, M*N], each rank's share one
+// contiguous range of the elements, for long reads from each peer (its comment
+// says why and what it serves badly). A rank's copy of a chunk is a wave (LANES
 // threads); the Chunk tile is that [R, 1, TILE_N] chunk. CONTIGUOUS: the
 // input's and the output's rows are back to back, the instance the host picks
 // from their strides.

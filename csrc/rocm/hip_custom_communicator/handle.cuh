@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE RUNTIME STATE, one `Handle` per communicator: everything the running
-// program learns, as common/build.cuh's `BuildInfo` is everything fixed at
+// program learns, as common.cuh's `BuildInfo` is everything fixed at
 // compile time. It maps every peer's signal block, scratch and registered
 // buffers once over HIP IPC handles, and hands a launch the buffers its kernel
 // reads. The collective that exchanges the handles is the caller's
@@ -25,7 +25,7 @@
 #include <variant>
 #include <vector>
 
-#include "common/interface.cuh"
+#include "kernels/common.cuh"
 #include "types.cuh"
 #include "kernels/all_reduce.cuh"
 
@@ -57,8 +57,8 @@ class Handle {
   // each one's IPC handle gathered with every rank's, and the peers' opened.
   // `world_size` is one the build holds (the opener checks it).
   // `timeout_seconds`: how long a kernel waits on a peer before it records a
-  // fault and leaves (barrier.cuh), the caller's: the process group's own
-  // timeout, as every other collective on it has.
+  // fault and leaves (common.cuh's BARRIER), the caller's: the process group's
+  // own timeout, as every other collective on it has.
   Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
          const BuildInfo& build = kBuild)
       : rank_(rank),
@@ -71,8 +71,8 @@ class Handle {
     exchange_ = alloc_symmetric(scratch_bytes_ + staging_bytes_);
     // THE STATUS, host-mapped and coherent: a wait that gives up writes its
     // fault with system-scope atomics while the host polls it, and the host
-    // sets its `abort` (barrier.cuh). The kernels take its device address as
-    // their own argument, a buffer of kStatusFields words.
+    // sets its `abort` (common.cuh's BARRIER). The kernels take its device
+    // address as their own argument, a buffer of kStatusFields words.
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&status_),
                             kStatusFields * sizeof(uint32_t),
                             hipHostMallocMapped | hipHostMallocCoherent));
@@ -245,8 +245,8 @@ class Handle {
   }
   // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value), the
   // value a FlagState unless the memory is corrupt. Between launches every one
-  // is `clear` (barrier.cuh); read only once the launches have finished, as
-  // this copies device memory that a running kernel is changing.
+  // is `clear` (common.cuh's BARRIER); read only once the launches have
+  // finished, as this copies device memory that a running kernel is changing.
   std::vector<std::array<int64_t, 4>> signals() const {
     std::vector<uint32_t> flags(
         static_cast<size_t>(kSignalsBytes / sizeof(uint32_t)));

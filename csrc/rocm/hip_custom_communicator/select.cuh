@@ -556,9 +556,9 @@ constexpr TunedKernel kAllReduceKernels[] = {
 // elements a pack, which its dispatch instantiates and nothing else: the
 // one-shot's TILE_M rows a THREADS / TILE_M-thread row each across TILE_N; the
 // two-shot's [R, 1, TILE_N] chunk, a rank's THREADS / world threads a group
-// each across it (collectives.cuh's flat walk). Every tuned entry must lay out,
-// or select would refuse it at run time (tile_not_built): checked here, at
-// compile time.
+// each across it (common.cuh's COLLECTIVES: the flat walk). Every tuned entry
+// must lay out, or select would refuse it at run time (tile_not_built): checked
+// here, at compile time.
 constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
   return c.threads_per_block % c.tile_m == 0 &&
          c.tile_n % (nl * (c.threads_per_block / c.tile_m)) == 0;
@@ -1204,7 +1204,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr int TM = C.tile_m, TN = C.tile_n;
             // THE INSTANCE FOR THE LAYOUT AS GIVEN: rows back to back read each
             // peer's share as one run, other strides the strided walk
-            // (collectives.cuh); the input is not reshaped.
+            // (common.cuh's COLLECTIVES); the input is not reshaped.
             const bool contiguous = input_stride_m == n * input_stride_n &&
                                     output_stride_m == n * output_stride_n;
             if constexpr (two_shot_lays_out(C, NG, NL)) {

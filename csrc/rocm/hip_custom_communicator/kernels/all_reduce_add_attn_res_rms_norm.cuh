@@ -8,7 +8,7 @@
 #pragma once
 
 #include <type_traits>
-#include "../common/interface.cuh"
+#include "common.cuh"
 
 namespace hip_custom_communicator {
 

@@ -42,7 +42,7 @@
 #include <string>
 #include <variant>
 
-#include "common/interface.cuh"
+#include "kernels/common.cuh"
 #include "handle.cuh"
 #include "types.cuh"
 

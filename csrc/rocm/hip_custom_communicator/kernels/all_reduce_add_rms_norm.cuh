@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include "../common/interface.cuh"
+#include "common.cuh"
 
 namespace hip_custom_communicator {
 
