@@ -343,9 +343,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       max(0, min(slice, packs - col0));  // a late rank's may be short or none
 
   // 1. Wait until every peer has launched, so its input is ready.
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them:
   // in rank order every GPU read rank 0 first, a link at a time carrying the
@@ -404,11 +402,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   (void)reduce_scatter_blocks;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
-  block_stamp(2);
   barrier<Until::visible>(sync);
-  block_stamp(3);
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
-  block_stamp(4);
 #else
   __builtin_trap();
 #endif
@@ -498,9 +493,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           : 0;
 
   // 1. Wait until every peer has launched, so its input is ready.
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across
   // it they spilled).
@@ -529,12 +522,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int r = 0; r < WORLD; ++r) tile_store(sum, scratch[r]);
       }
   }
-  block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read
   // this rank's input.
   barrier<Until::visible>(sync);
-  block_stamp(3);
 
   // 4. This block's tiles (one row): the sum out of this rank's scratch, then
   // AttnRes, as the
@@ -564,7 +555,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         qk_weight, output_norm_weight, prefix_output, output, block_output,
         num_blocks, eps, output_eps, inv_hidden);
   }
-  block_stamp(4);
 #else
   __builtin_trap();
 #endif

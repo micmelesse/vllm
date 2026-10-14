@@ -74,7 +74,6 @@ void hip_custom_communicator_register_buffer(fptr_t handle_ptr,
 void hip_custom_communicator_forget_buffer(fptr_t handle_ptr,
                                            torch::Tensor& buffer);
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
-torch::Tensor hip_custom_communicator_stamps();
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr);
 // The rank's fault record, [where, rank, block, peer, count, want,

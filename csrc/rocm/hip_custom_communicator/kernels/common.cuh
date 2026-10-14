@@ -398,32 +398,6 @@ struct traits {
   using V = vec<DTYPE, N>;
 };
 
-// PER-PHASE TIMESTAMPS, for finding where a kernel's time goes: thread 0 of
-// each block records the device clock (100 MHz) at a phase boundary, after the
-// block's threads have all reached it, into a device-global [block][phase]
-// table the host reads back (hip_custom_communicator_stamps). Built only with
-// HIP_CUSTOM_COMMUNICATOR_STAMPS, since the barrier it adds would perturb a
-// production kernel.
-#ifndef HIP_CUSTOM_COMMUNICATOR_STAMPS
-  #define HIP_CUSTOM_COMMUNICATOR_STAMPS 0
-#endif
-constexpr int kStampBlocks = kMaxComputeUnits;
-constexpr int kStampPhases = 8;
-__device__ uint64_t g_stamps[kStampBlocks][kStampPhases];
-
-namespace impl {
-DINLINE void block_stamp(int phase) {
-  if constexpr (HIP_CUSTOM_COMMUNICATOR_STAMPS) {
-    // Every outstanding load landed first, so a phase owns its own memory
-    // latency.
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    __syncthreads();
-    if (threadIdx.x == 0 && blockIdx.x < kStampBlocks)
-      g_stamps[blockIdx.x][phase] = wall_clock64();
-  }
-}
-}  // namespace impl
-
 // =================================================================================================
 // TILE
 //
@@ -2289,8 +2263,5 @@ DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging,
 // ===============================================================================================
 // UTILS
 // ===============================================================================================
-
-// A timestamp for phase `phase` of this block, in a stamps build only.
-DINLINE void block_stamp(int phase) { impl::block_stamp(phase); }
 
 }  // namespace hip_custom_communicator

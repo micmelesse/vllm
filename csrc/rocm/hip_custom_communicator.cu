@@ -321,25 +321,6 @@ void hip_custom_communicator_abort(fptr_t handle_ptr) {
   handle_of(handle_ptr).abort();
 }
 
-// THE PER-PHASE STAMPS SINCE THE LAST READ, [block][phase] device clock ticks
-// (100 MHz), zero where no block stamped, then zeroed. Only a
-// HIP_CUSTOM_COMMUNICATOR_STAMPS build writes them (block_stamp).
-torch::Tensor hip_custom_communicator_stamps() {
-  auto output = torch::zeros({hip_custom_communicator::kStampBlocks,
-                              hip_custom_communicator::kStampPhases},
-                             torch::TensorOptions().dtype(torch::kInt64));
-  HIP_CHECK(hipDeviceSynchronize());
-  HIP_CHECK(hipMemcpyFromSymbol(output.data_ptr<int64_t>(),
-                                HIP_SYMBOL(hip_custom_communicator::g_stamps),
-                                sizeof(hip_custom_communicator::g_stamps)));
-  // Zeroed after reading, so the next launch's table holds only its own blocks.
-  void* table = nullptr;
-  HIP_CHECK(hipGetSymbolAddress(&table,
-                                HIP_SYMBOL(hip_custom_communicator::g_stamps)));
-  HIP_CHECK(hipMemset(table, 0, sizeof(hip_custom_communicator::g_stamps)));
-  return output;
-}
-
 // `buffer` registered with every rank's over the process group named `group`, a
 // collective: the peers read it where it is until it is forgotten, which must
 // come before it is freed.

@@ -57,9 +57,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // input is ready.
   const auto input =
       rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // 2. Each of this block's rows: read it from every rank in rank order and
   // sum, then (ADD_RESIDUAL) add
@@ -86,7 +84,6 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     Weight w{1, input_size_n, 0, 0};
     tile_load(w, weight);
     RowF s = peers_reduce(peers).template to<float>();
-    block_stamp(2);
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
       tile_store(s.template to<DTYPE>(), residual_output);
@@ -94,7 +91,6 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
     Row normed =
@@ -106,10 +102,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     tile_store(normed, output);
   }
 
-  block_stamp(4);
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read>(sync);
-  block_stamp(5);
 }
 
 // THE KERNELS, one per op, both the body above.
@@ -235,9 +229,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   };
 
   // 1. Wait until every peer has launched, so its input is ready.
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack
   // build keeps 68 B of scratch (the ISA gate, 2026-09-30).
@@ -285,7 +277,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // row: 2026-10-01T01-07-56Z).
     if (row + static_cast<int>(gridDim.x) < last) load(row + gridDim.x, next);
     RowF s = peers_reduce(cur).template to<float>();
-    block_stamp(2);
     // The norm, rounding as the reference does (see the one-shot kernel):
     if constexpr (ADD_RESIDUAL) {
       s = tile_add(s, res.template to<float>());
@@ -296,7 +287,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     float ss[1];
     partial_dot(s, s, ss);
     block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    block_stamp(3);
     const float scale = rsqrtf(ss[0] * inv_hidden + eps);
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
     // every rank norms it while gathering, so the link carries one row a row,
@@ -329,10 +319,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     one_row(row + gridDim.x, b, a);
   }
 
-  block_stamp(4);
   // 3. Every rank's rows are visible to its peers.
   barrier<Until::visible>(sync);
-  block_stamp(5);
 
   // 4. Every owner's rows out of its scratch, at their place in the output. The
   // next call's
@@ -388,7 +376,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       }
     }
   }
-  block_stamp(6);
 }
 
 // THE KERNELS, one per op, both the body above.
@@ -534,9 +521,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
            THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
 
   // 1. Wait until every peer has launched, so its input is ready.
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across
   // it they spilled).
@@ -565,11 +550,9 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
         for (int r = 0; r < WORLD; ++r) tile_store(sum, scratch[r]);
       }
   }
-  block_stamp(2);
 
   // 3. Every rank's sums are in this rank's scratch.
   barrier<Until::visible>(sync);
-  block_stamp(3);
 
   // 4. This block's rows out of this rank's scratch: (ADD_RESIDUAL) add the
   // residual, then RMSNorm,
@@ -606,7 +589,6 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
             .template to<DTYPE>();
     tile_store(normed, output);
   }
-  block_stamp(4);
 }
 
 // THE KERNELS, one per op, both the body above.

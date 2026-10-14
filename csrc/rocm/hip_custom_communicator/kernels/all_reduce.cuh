@@ -57,9 +57,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
   const auto output =
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // 2. Read every rank's input, in rank order, and sum.
   block_for_each_tile(tiles_m, tiles_n, [&](int row, int col) {
@@ -70,11 +68,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     tile_load(peers, input);
     tile_store(peers_reduce(peers), output);
   });
-  block_stamp(2);
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read>(sync);
-  block_stamp(5);
 #else
   __builtin_trap();
 #endif
@@ -127,7 +123,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                  input_stride_m, input_stride_n, rank);
     const auto output = local_ptr(output_ptr + r0 * output_stride_m,
                                   output_stride_m, output_stride_n, rank);
-    block_stamp(0);
     // 1. This rank's band into its staging, then visible to the peers (each has
     // staged its own).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
@@ -137,7 +132,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       tile_store(mine, own_staging);
     }
     barrier<Until::visible>(sync);
-    block_stamp(1);
     // 2. Read every rank's staged band, in rank order, and sum.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       const Block at{band, input_size_n, t / tiles_n * TILE_M,
@@ -148,10 +142,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       tile_load(peers, staging);
       tile_store(peers_reduce(peers), output);
     }
-    block_stamp(2);
     // 3. No rank may stage its next band until every peer has read this one.
     barrier<Until::read>(sync);
-    block_stamp(5);
   }
 #else
   __builtin_trap();
@@ -224,19 +216,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   };
   const auto output =
       local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
-  block_stamp(0);
   barrier<Until::launched>(sync);
-  block_stamp(1);
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks,
   // into its scratch.
   reduce_scatter<Chunk, CONTIGUOUS>(rank, input, input_size_m, input_size_n,
                                     scratch(rank));
 
-  block_stamp(2);
   // 3. Every rank's sums are visible to its peers.
   barrier<Until::visible>(sync);
-  block_stamp(3);
 
   // 4. All-gather: every rank's summed share out of its scratch, at its place
   // in the output. The
@@ -244,7 +232,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    it is read.
   all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, input_size_m,
                                 input_size_n);
-  block_stamp(5);
 #else
   __builtin_trap();
 #endif
@@ -309,31 +296,26 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                  input_stride_m, input_stride_n, rank);
     const auto output = local_ptr(output_ptr + r0 * output_stride_m,
                                   output_stride_m, output_stride_n, rank);
-    block_stamp(0);
     // 1. This band, every rank's share of it, into this rank's staging (the
     // chunks each rank's same
     //    block reads), then visible (and, past the first pass, every peer has
     //    read this rank's scratch).
     stage<Chunk, CONTIGUOUS>(rank, input, staging(rank), band, input_size_n);
     barrier<Until::visible>(sync);
-    block_stamp(1);
 
     // 2. Reduce-scatter: this rank's share of the band from every rank's
     // staging, into its scratch.
     reduce_scatter<Chunk, true>(rank, staging, band, input_size_n,
                                 scratch(rank));  // ours, rows back to back
 
-    block_stamp(2);
     // 3. Every rank's sums are visible to its peers, and every peer has read
     // this rank's staged
     //    band, so the next one may overwrite it.
     barrier<Until::visible>(sync);
-    block_stamp(3);
 
     // 4. All-gather: every rank's summed share out of its scratch, at its place
     // in the output.
     all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, band, input_size_n);
-    block_stamp(5);
   }
 #else
   __builtin_trap();
