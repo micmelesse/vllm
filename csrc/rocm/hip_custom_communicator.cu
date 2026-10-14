@@ -218,7 +218,7 @@ SupportedWire hip_custom_communicator_supported(int64_t device, int64_t world) {
 // plain call, which Python's `should` admits.
 BuildInfoWire hip_custom_communicator_build_info() {
   using namespace hip_custom_communicator;
-  Names dtypes, ops, errors, wheres;
+  Names dtypes, ops, errors, where_names;
   for (const DType d : kBuild.supports.dtypes) dtypes.push_back(to_string(d));
   const std::vector<int64_t> worlds(kBuild.supports.worlds.begin(),
                                     kBuild.supports.worlds.end());
@@ -229,7 +229,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
     errors.push_back(s.substr(0, s.find(':')));
   }
   for (int i = 1; i <= kNumWheres; ++i)
-    wheres.push_back(to_string(static_cast<Where>(i)));
+    where_names.push_back(to_string(static_cast<Where>(i)));
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
   // search space), flat: a build's fields in `fields`' order, 0 where its op's
   // BuildConfig has none (every field it has is set). The launch is not a
@@ -272,7 +272,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
           kBuild.memory.staging_bytes,
           ops,
           errors,
-          wheres,
+          where_names,
           templates,
           template_ops,
           fields,

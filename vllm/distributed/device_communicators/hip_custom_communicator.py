@@ -223,7 +223,7 @@ def build_info() -> BuildInfo:
         staging,
         ops,
         errors,
-        wheres,
+        where_names,
         names,
         template_ops,
         fields,
@@ -264,7 +264,7 @@ def build_info() -> BuildInfo:
         staging,
         tuple(ops),
         tuple(errors),
-        tuple(wheres),
+        tuple(where_names),
         templates,
         records,
     )
@@ -327,8 +327,9 @@ def is_weak_contiguous(input: torch.Tensor) -> bool:
     )
 
 
-# TORCH'S DEFAULT for a collective on a GPU process group (`default_pg_nccl_timeout`): how long a
-# kernel waits on a peer before it reports a fault, where the group does not say its own.
+# TORCH'S DEFAULT for a collective on a GPU process group (`default_pg_nccl_timeout`):
+# how long a kernel waits on a peer before it reports a fault, where the group does not
+# say its own.
 TORCH_COLLECTIVE_TIMEOUT_SECONDS = 600.0
 
 
@@ -502,7 +503,7 @@ class HipCustomCommunicator:
         self._calls: deque[Call] = deque(maxlen=_RECORDED)
         self._launches = 0
         self._stop_watching = threading.Event()
-        self._watchdog: threading.Thread | None = None
+        self._watchdog = None
         if state is not None:
             self.state = state
 
@@ -875,6 +876,8 @@ class HipCustomCommunicator:
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
+    # The thread that reads the fault record, while the communicator is open.
+    _watchdog: threading.Thread | None = None
     # The device wall clock's rate, which the fault record counts its wait in.
     _khz: int = 0
     # Whether there is a fault record for the watchdog to read (`_fault`).
@@ -988,7 +991,8 @@ class HipCustomCommunicator:
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
     ) -> int | None:
-        """The normed result into `output`, the sum plus residual into `residual_output`."""
+        """The normed result into `output`; the sum plus residual into
+        `residual_output`."""
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
             self._handle,
             input,

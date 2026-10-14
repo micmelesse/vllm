@@ -678,7 +678,10 @@ class World:
         if not self._procs:
             failed = self._start()
             if failed is not None:
-                return failed
+                none: list[tuple[T | None, str | None]] = [
+                    (None, why) for _, why in failed
+                ]
+                return none
         self._seq += 1
         for inbox in self._inboxes:
             inbox.put((self._seq, fn, args, kwargs))
@@ -924,9 +927,13 @@ def precheck(
         * (slots * fan + pool * world + pool * fan + sched.buffers * fan)
         for sh in shapes
     )
+
     # The statics are SHARED by the group -- one set sized to the tallest shape, which
     # every other shape reads a prefix of. See `run_collective`.
-    need += sched.buffers * item * math.prod(max(shapes, key=lambda sh: sh[0]))
+    def rows(shape: tuple[int, ...]) -> int:
+        return shape[0]
+
+    need += sched.buffers * item * math.prod(max(shapes, key=rows))
     if need > budget:
         return None, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
     return None, None
@@ -1169,11 +1176,11 @@ def exercise(
                 inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
                 # ALIGNED BEFORE THE CALLS: each rank made its inputs on its own, and a
                 # rank that finishes late reaches the first collective late, which the
-                # others' waits would count against TEST_TIMEOUT_SECONDS. Every rank
-                # reaches this barrier or none does, because `precheck` answers the same
-                # on every rank: its budget is a share of the device's TOTAL memory. Made
-                # from free memory, which differs by rank, one rank could skip the cell
-                # while the others wait here for it.
+                # others' waits would count against TEST_TIMEOUT_SECONDS. Every
+                # rank reaches this barrier or none does, because `precheck` answers
+                # the same on every rank: its budget is a share of the device's TOTAL
+                # memory. Made from free memory, which differs by rank, one rank could
+                # skip the cell while the others wait here for it.
                 torch.cuda.synchronize()
                 dist.barrier(group=comm.cpu_group)
                 got = run_collective(
@@ -1540,6 +1547,7 @@ def test_communicator(
     if err is not None:
         pytest.fail(f"{name}/{mode}: {err}")
     print(f"      => {got}", flush=True)
+    assert got is not None  # no error, so a measurement
     assert got.within_tolerance, f"{name}/{mode}: outside tolerance (cells above)"
 
 

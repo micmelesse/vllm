@@ -682,7 +682,9 @@ class GroupCoordinator:
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
-        maybe_hip_custom_communicator_context = nullcontext()
+        maybe_hip_custom_communicator_context: AbstractContextManager[Any] = (
+            nullcontext()
+        )
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -709,7 +711,7 @@ class GroupCoordinator:
                 if hip_custom_communicator is not None:
                     maybe_hip_custom_communicator_context = (
                         hip_custom_communicator.capture()
-                    )  # type: ignore
+                    )
 
             # Capture each group's own comm. A global lookup would double-capture
             aiter_ar_comm = getattr(self.device_communicator, "aiter_ar_comm", None)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -24,6 +26,11 @@ from vllm.platforms import current_platform
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.hip_custom_communicator import (
+        HipCustomCommunicator,
+    )
 
 logger = init_logger(__name__)
 
@@ -114,7 +121,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
-        self.hip_custom_communicator = None
+        self.hip_custom_communicator: HipCustomCommunicator | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
@@ -146,16 +153,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # upstream's TP all-reduce paths are built -- not AITER's, not
             # CustomAllreduce, not QuickReduce -- so an arm is not a mixture of two.
             # When off, upstream's code below runs untouched.
-            from vllm.distributed.device_communicators.hip_custom_communicator import (
-                HipCustomCommunicator,
-            )
+            from vllm.distributed.device_communicators import hip_custom_communicator
 
             # Both groups (mirrors DeviceCommunicatorBase); it exchanges its IPC
             # handles over the cpu group.
-            self.hip_custom_communicator = HipCustomCommunicator(
-                cpu_group=self.cpu_group,
-                device_group=self.device_group,
-                device=self.device,
+            self.hip_custom_communicator = (
+                hip_custom_communicator.HipCustomCommunicator(
+                    cpu_group=self.cpu_group,
+                    device_group=self.device_group,
+                    device=self.device,
+                )
             )
         else:
             if (
