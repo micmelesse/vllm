@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ALL-REDUCE THEN RMSNORM, AND THEN ADD THEN RMSNORM: their kernels, one section each (pull one-shot, pull two-shot,
-// push two-shot), each kernel of the RMSNorm op a wrapper over its add-RMSNorm body.
+// ALL-REDUCE THEN RMSNORM, AND THEN ADD THEN RMSNORM: their kernels, one
+// section each (pull one-shot, pull two-shot, push two-shot), each kernel of
+// the RMSNorm op a wrapper over its add-RMSNorm body.
 
 #pragma once
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE PLAIN ALL-REDUCE: its kernels, one section each (one-shot and two-shot pull, each with its staged build).
+// THE PLAIN ALL-REDUCE: its kernels, one section each (one-shot and two-shot
+// pull, each with its staged build).
 
 #pragma once
 

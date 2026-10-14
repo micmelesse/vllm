@@ -1094,7 +1094,7 @@ class HipCustomCommunicator:
     def signals(self) -> list[Flag]:
         """Every flag of this rank's signals, each `clear` between launches. It
         reads device memory, so call it only once the launches have finished
-        (`torch.cuda.synchronize()`)."""
+        (`torch.accelerator.synchronize()`)."""
         if self._handle is None:
             return []
         flat = torch.ops._rocm_C.hip_custom_communicator_signals(self._handle)

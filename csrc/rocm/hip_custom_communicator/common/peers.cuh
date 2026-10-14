@@ -45,7 +45,7 @@ enum class Where : uint32_t {
   start = 1,     // a launch's first barrier: the peer had not launched
   peer_barrier,  // a later barrier
 };
-constexpr int kNumWheres = 2;  // numbered from 1
+constexpr int kWhereCount = 2;  // numbered from 1
 constexpr const char* to_string(Where w) {
   switch (w) {
     case Where::start:

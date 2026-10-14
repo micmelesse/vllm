@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ALL-REDUCE THEN ADD, ATTNRES AND RMSNORM: the AttnRes tile every kernel shares, then the kernels, one section
-// each (pull one-shot, pull two-shot, push two-shot).
+// ALL-REDUCE THEN ADD, ATTNRES AND RMSNORM: the AttnRes tile every kernel
+// shares, then the kernels, one section each (pull one-shot, pull two-shot,
+// push two-shot).
 
 #pragma once
 

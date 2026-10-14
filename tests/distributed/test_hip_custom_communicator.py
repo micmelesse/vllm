@@ -34,7 +34,6 @@ declines today.
 import math
 import multiprocessing as mp
 import queue
-import re
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -47,6 +46,7 @@ from multiprocessing.queues import Queue
 from typing import Concatenate, Literal, ParamSpec, TypeVar, cast, get_args
 
 import pytest
+import regex as re
 import torch
 import torch.distributed as dist
 from _pytest.mark import ParameterSet
@@ -557,7 +557,7 @@ class RankContext:
 def _bring_up(rank: int, world: int, init_method: str) -> RankContext:
     """ONE rank's process group and model parallel, once per world."""
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     init_distributed_environment(
         world_size=world, rank=rank, distributed_init_method=init_method
     )
@@ -574,7 +574,7 @@ def _bring_up(rank: int, world: int, init_method: str) -> RankContext:
     dist.all_reduce(
         torch.zeros(1).cuda(), group=group
     )  # force comm init before we measure
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return RankContext(rank, world, device, cpu_group, group)
 
 
@@ -590,7 +590,7 @@ def _tear_down(ctx: RankContext) -> None:
         if dist.is_initialized():
             destroy_model_parallel()
             destroy_distributed_environment()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     except BaseException:
         logger.exception("rank %d: teardown failed", ctx.rank)
 
@@ -1008,7 +1008,7 @@ def run_collective(
     ):  # eager warmup: first-call allocations, and the statics' registration
         for s in range(n):
             body(s)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     # ONE capture context over EVERY graph, the way vLLM's covers every capture size:
     # the deferred registration then happens once for all of them, which is the path a
     # real startup takes and the only place a registration wider than a single graph is
@@ -1043,7 +1043,7 @@ def run_collective(
             # every replay after it is still right -- so it belongs to the mode that
             # models vLLM, and `graph` stays the clean isolator.
             body(s)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return [
         [snaps[s][m][replay] for replay in range(each) for m in range(sched.buffers)]
         for s in range(n)
@@ -1181,7 +1181,7 @@ def exercise(
                 # the same on every rank: its budget is a share of the device's TOTAL
                 # memory. Made from free memory, which differs by rank, one rank could
                 # skip the cell while the others wait here for it.
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 dist.barrier(group=comm.cpu_group)
                 got = run_collective(
                     comm, op_name, [i[rank] for i in inputs], sched, forced
@@ -1213,9 +1213,9 @@ def exercise(
                 _say(rank, f"      {op_name:11} {dtype_name:5} {str(sh):12} {m}")
                 worst = worst.worse_of(m)
                 ran += 1
-            torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
     # COUNTED, because the seed verdict passes: a communicator that declined everything
     # would otherwise fold to `ok worst|diff|=0` and report green having measured
     # nothing.
@@ -1276,7 +1276,7 @@ def run_communicator(
 def world() -> int:
     """Every GPU on the box. A read of the machine, so it is a fixture rather than a
     constant."""
-    return torch.cuda.device_count()
+    return torch.accelerator.device_count()
 
 
 @pytest.fixture(scope="session")
@@ -1891,7 +1891,7 @@ def run_add_attn_res_rms_norm_rank(
         1e-6,
         1e-5,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     forced = _forced(f"{shot}_add_attn_res_rms_norm", hidden)
     comm = ctx.comm("hip")
@@ -1914,7 +1914,7 @@ def run_add_attn_res_rms_norm_rank(
         )
     except Refused:
         return False, NO_FUSED_KERNEL
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     atol, rtol = _fused_tolerance(dtype)
     sum_tol = _atol("all_reduce", dtype)
     checks = [
@@ -2028,7 +2028,7 @@ def run_eager_beyond_staging_rank(
         got = comm.all_reduce(x, **forced).float()
     except Refused as no:
         return False, f"refused for {no.error.name}"
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
         worst = (got - want).abs().max().item()
@@ -2081,7 +2081,7 @@ def run_strided_all_reduce_rank(
     except Refused as no:
         where = f"{tuple(x.shape)} at strides {x.stride()}"
         return False, f"refused {where} for {no.error.name}"
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     atol, rtol = _fused_tolerance(torch.bfloat16)
     if not torch.allclose(got, want, atol=atol, rtol=rtol):
         worst = (got - want).abs().max().item()
@@ -2135,7 +2135,7 @@ def run_skipped_call_rank(ctx: RankContext) -> tuple[bool, str | None]:
         if ctx.rank == skipper:
             return True, None
         comm.all_reduce(torch.ones(16, 1024, dtype=torch.bfloat16, device=ctx.device))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         deadline = time.monotonic() + 2.0
         while not isinstance(comm.state, Broken) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -2511,7 +2511,7 @@ def run_all_reduce_api_rank(
     comm = ctx.comm("hip")
     try:
         out = comm.all_reduce(x, **_forcing(forced))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     except Refused as no:
         return _refusal(forced, comm.should_allreduce(x), no)
     _the_call_left_nothing(comm)
@@ -2582,7 +2582,7 @@ def run_all_reduce_rms_norm_api_rank(
     comm = ctx.comm("hip")
     try:
         out = comm.all_reduce_rms_norm(x, weight, FUSED_EPS, **_forcing(forced))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     except Refused as no:
         return _refusal(forced, comm.should_allreduce_rms_norm(x, weight), no)
     _the_call_left_nothing(comm)
@@ -2659,7 +2659,7 @@ def run_all_reduce_add_rms_norm_api_rank(
         out, out_residual = comm.all_reduce_add_rms_norm(
             x, residual.clone(), weight, FUSED_EPS, **_forcing(forced)
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     except Refused as no:
         return _refusal(forced, comm.should_allreduce_add_rms_norm(x, weight), no)
     _the_call_left_nothing(comm)
@@ -2767,7 +2767,7 @@ def run_all_reduce_add_attn_res_rms_norm_api_rank(
             1e-5,
             **_forcing(forced),
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     except Refused as no:
         return _refusal(forced, comm.should_allreduce_add_attn_res_rms_norm(x), no)
     _the_call_left_nothing(comm)

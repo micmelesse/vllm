@@ -228,7 +228,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
     const std::string s = to_string(static_cast<Error>(i));
     errors.push_back(s.substr(0, s.find(':')));
   }
-  for (int i = 1; i <= kNumWheres; ++i)
+  for (int i = 1; i <= kWhereCount; ++i)
     where_names.push_back(to_string(static_cast<Where>(i)));
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
   // search space), flat: a build's fields in `fields`' order, 0 where its op's
