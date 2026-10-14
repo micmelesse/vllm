@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// SELECT, THE ONLY CHOICE, read by each op's select_<op> (interface.cuh): what
-// was tuned (each op's kernels: for each world and row width, the template and
-// complete KernelConfig, its build and its launch, that won from a number of
-// rows up, written by the tuner, tune.py, from a sweep; an entry says what ran
-// fastest, the why is the sweep's figure, cited beside it), then the steps
-// every select takes, each on primitives: the forced kernel, given whole, or
-// the tuned kernel picked as listed; the grid cut to the tiles there are; and
-// the first Error the kernel meets here. Nothing is filled in: a config is
-// complete wherever it is written.
+// SELECT, THE ONLY CHOICE, read by each op's select_<op> (the API,
+// hip_custom_communicator.cuh): what was tuned (each op's kernels: for each
+// world and row width, the template and complete KernelConfig, its build and
+// its launch, that won from a number of rows up, written by the tuner, tune.py,
+// from a sweep; an entry says what ran fastest, the why is the sweep's figure,
+// cited beside it), then the steps every select takes, each on primitives: the
+// forced kernel, given whole, or the tuned kernel picked as listed; the grid
+// cut to the tiles there are; and the first Error the kernel meets here.
+// Nothing is filled in: a config is complete wherever it is written.
 
 #pragma once
-
-#ifndef HIP_CUSTOM_COMMUNICATOR_INTERFACE
-  #error "include hip_custom_communicator.cuh, the one interface, not its parts"
-#endif
 
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
@@ -36,6 +32,9 @@
 #include "kernels/all_reduce.cuh"
 #include "kernels/all_reduce_add_attn_res_rms_norm.cuh"
 #include "kernels/all_reduce_add_rms_norm.cuh"
+#include "handle.cuh"
+#include "kernels/common.cuh"
+#include "types.cuh"
 
 namespace hip_custom_communicator {
 

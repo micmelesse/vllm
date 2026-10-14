@@ -4,9 +4,10 @@
 // Our HIP collectives as torch ops, built into `_rocm_C`: this file only strips
 // torch. Each op checks its tensors and passes their pointers, shapes and
 // dtypes, its names as enums and its numbers as ints, to its function in
-// hip_custom_communicator/interface.cuh (the API, torch-free), and turns the
-// answer back: an op returns the Error's number it was refused for, or none
-// when it ran. Self-contained: torch and the HIP runtime, nothing from aiter.
+// hip_custom_communicator/hip_custom_communicator.cuh (the API, torch-free),
+// and turns the answer back: an op returns the Error's number it was refused
+// for, or none when it ran. Self-contained: torch and the HIP runtime, nothing
+// from aiter.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/BFloat16.h>
@@ -41,7 +42,7 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-// EACH OP TAKES ITS OWN FORCING LAST, as interface.cuh's does: the algorithm
+// EACH OP TAKES ITS OWN FORCING LAST, as the API's does: the algorithm
 // and direction of the template it forces, and only the config fields that op's
 // kernels have, each none for select's. The model passes none of them; the
 // bench and the tests force with them.

@@ -8,13 +8,13 @@
 
 #pragma once
 
-#ifndef HIP_CUSTOM_COMMUNICATOR_INTERFACE
-  #error "include hip_custom_communicator.cuh, the one interface, not its parts"
-#endif
-
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+
+#include "handle.cuh"
+#include "select.cuh"
+#include "types.cuh"
 
 namespace hip_custom_communicator {
 
