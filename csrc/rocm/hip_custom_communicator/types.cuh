@@ -271,9 +271,11 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // (vLLM's RankData), its strides every rank's.
 // =================================================================================================
 
-// Generated from the kernels' signatures (one alias a signature; the two-shots'
-// pull and push share theirs), each parameter's name beside its type, so a
-// launch's arguments read against it.
+// The kernels' signatures, written out by hand (one alias a signature; the
+// two-shots' pull and push share theirs), each parameter's name beside its
+// type, so a launch's arguments read against it. They cannot drift: select's
+// instance<SIGNATURE>(kernel) fails the build on a kernel whose signature is
+// not its alias.
 using AllReduceOneShotKernel = void (*)(
     const void* const* /*input_ptrs*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
