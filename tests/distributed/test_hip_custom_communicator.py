@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All
 # rights reserved.
 """Does each communicator backend work?
@@ -2460,7 +2463,10 @@ def _refusal(forced: dict, admitted: bool, no: Refused) -> tuple[bool, str | Non
     AttnRes call was refused on its null prefix's strides and passed here as REFUSED,
     2026-10-13)."""
     if not forced and admitted:
-        return False, f"should_ admitted the call and the op refused it: {no.error.name}"
+        return (
+            False,
+            f"should_ admitted the call and the op refused it: {no.error.name}",
+        )
     return True, f"REFUSED {no.error.name}"
 
 

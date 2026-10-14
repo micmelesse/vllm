@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All
 # rights reserved.
 
@@ -274,7 +277,11 @@ def should(op: Op, input: torch.Tensor, weight: torch.Tensor | None = None) -> b
     admits."""
     built = build_info()
     record = built.ops[op]
-    if input.dtype not in record.dtypes or not input.is_contiguous() or input.numel() == 0:
+    if (
+        input.dtype not in record.dtypes
+        or not input.is_contiguous()
+        or input.numel() == 0
+    ):
         return False
     if input.dim() == 0 or (record.two_d and input.dim() != 2):
         return False
@@ -293,7 +300,9 @@ class Refused(RuntimeError):
     it for, and the input it was asked to run on. A call `should` admits never is."""
 
     def __init__(self, error: Error, input: torch.Tensor) -> None:
-        super().__init__(f"{error.name}: shape={tuple(input.shape)} dtype={input.dtype}")
+        super().__init__(
+            f"{error.name}: shape={tuple(input.shape)} dtype={input.dtype}"
+        )
         self.error = error
 
 
