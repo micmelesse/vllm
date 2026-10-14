@@ -27,7 +27,7 @@
 
 #include "common/interface.cuh"
 #include "types.cuh"
-#include "kernels/all_reduce_pull_one_shot.cuh"
+#include "kernels/all_reduce.cuh"
 
 #define HIP_CHECK(expr)                                                   \
   do {                                                                    \

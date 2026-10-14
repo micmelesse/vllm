@@ -33,14 +33,9 @@
 #include <utility>
 #include <variant>
 
-#include "kernels/all_reduce_pull_one_shot.cuh"
-#include "kernels/all_reduce_pull_one_shot_add_attn_res_rms_norm.cuh"
-#include "kernels/all_reduce_pull_one_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_pull_two_shot.cuh"
-#include "kernels/all_reduce_pull_two_shot_add_attn_res_rms_norm.cuh"
-#include "kernels/all_reduce_pull_two_shot_add_rms_norm.cuh"
-#include "kernels/all_reduce_push_two_shot_add_attn_res_rms_norm.cuh"
-#include "kernels/all_reduce_push_two_shot_add_rms_norm.cuh"
+#include "kernels/all_reduce.cuh"
+#include "kernels/all_reduce_add_attn_res_rms_norm.cuh"
+#include "kernels/all_reduce_add_rms_norm.cuh"
 
 namespace hip_custom_communicator {
 
