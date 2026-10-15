@@ -38,17 +38,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  using Block = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M,
-                     THREADS_PER_BLOCK>;
+  // A ROW OF THREADS A TILE ROW: THREADS_M x THREADS_N over the tile, K packs a
+  // thread.
+  constexpr int THREADS_M = TILE_M;
+  constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int ROWS = TILE_M / THREADS_M;
+  constexpr int K = TILE_N / (P * THREADS_N);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles_m = (input_size_m + TILE_M - 1) / TILE_M;
 
-  // 1. Every rank's buffers, then wait until every peer has launched, so its
-  // input is ready.
-  const auto input =
-      rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
-  const auto output =
-      local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
+  // 1. Wait until every peer has launched, so its input is ready.
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -57,12 +57,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Read every rank's input, in rank order, and sum.
   block_for_each_tile(tiles_m, tiles_n, [&](int row, int col) {
-    const Block at{input_size_m, input_size_n, row * TILE_M, col * TILE_N};
-    Block peers[WORLD];
-  #pragma unroll
-    for (int r = 0; r < WORLD; ++r) peers[r] = at;
-    tile_load(peers, input);
-    tile_store(peers_reduce(peers), output);
+    DTYPE peers[WORLD][ROWS][K][P];
+    peers_load<THREADS_M, THREADS_N>(input_ptrs, input_stride_m, input_stride_n,
+                                     input_size_m, input_size_n, peers,
+                                     row * TILE_M, col * TILE_N);
+    float sum[ROWS][K][P];
+    peers_sum(peers, sum);
+    DTYPE rounded[ROWS][K][P];
+    convert(sum, rounded);
+    store<THREADS_M, THREADS_N>(rounded, output_ptr, output_stride_m,
+                                output_stride_n, input_size_m, input_size_n,
+                                row * TILE_M, col * TILE_N);
   });
 
   // 3. No rank may overwrite its input until every peer has read it.
@@ -98,30 +103,27 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  using Block = Tile<DTYPE, TILE_M, TILE_N, TILE_M, THREADS_PER_BLOCK / TILE_M,
-                     THREADS_PER_BLOCK>;
+  constexpr int THREADS_M = TILE_M;
+  constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int ROWS = TILE_M / THREADS_M;
+  constexpr int K = TILE_N / (P * THREADS_N);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
-  const auto staging =
-      rank_ptrs<DTYPE, WORLD>(staging_ptrs, staging_stride_m, staging_stride_n);
-  const auto own_staging = rank_ptr<DTYPE, WORLD>(
-      staging_ptrs, rank, staging_stride_m, staging_stride_n);
 
   for (int r0 = 0; r0 < input_size_m; r0 += staging_size_m) {
     const int band =
         min(staging_size_m, input_size_m - r0);  // this pass's rows
     const int tiles = (band + TILE_M - 1) / TILE_M * tiles_n;
-    // This pass's rows of the input and the output, as Ptrs from its first row.
-    const auto input = local_ptr(input_ptr + r0 * input_stride_m,
-                                 input_stride_m, input_stride_n, rank);
-    const auto output = local_ptr(output_ptr + r0 * output_stride_m,
-                                  output_stride_m, output_stride_n, rank);
-    // 1. This rank's band into its staging, then visible to the peers (each has
-    // staged its own).
+    // 1. This rank's band (its rows from r0) into its staging, then visible to
+    // the peers (each has staged its own).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-      Block mine{band, input_size_n, t / tiles_n * TILE_M,
-                 t % tiles_n * TILE_N};
-      tile_load(mine, input);
-      tile_store(mine, own_staging);
+      DTYPE mine[ROWS][K][P];
+      load<THREADS_M, THREADS_N>(input_ptr + r0 * input_stride_m, input_stride_m,
+                                 input_stride_n, band, input_size_n, mine,
+                                 t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+      store<THREADS_M, THREADS_N>(mine, staging_ptrs[rank], staging_stride_m,
+                                  staging_stride_n, band, input_size_n,
+                                  t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     barrier<Until::visible, 0, WORLD>(
         signals_ptrs, signals_stride_parity, signals_stride_block,
@@ -130,13 +132,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks);
     // 2. Read every rank's staged band, in rank order, and sum.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
-      const Block at{band, input_size_n, t / tiles_n * TILE_M,
-                     t % tiles_n * TILE_N};
-      Block peers[WORLD];
-  #pragma unroll
-      for (int r = 0; r < WORLD; ++r) peers[r] = at;
-      tile_load(peers, staging);
-      tile_store(peers_reduce(peers), output);
+      DTYPE peers[WORLD][ROWS][K][P];
+      peers_load<THREADS_M, THREADS_N>(staging_ptrs, staging_stride_m,
+                                       staging_stride_n, band, input_size_n,
+                                       peers, t / tiles_n * TILE_M,
+                                       t % tiles_n * TILE_N);
+      float sum[ROWS][K][P];
+      peers_sum(peers, sum);
+      DTYPE rounded[ROWS][K][P];
+      convert(sum, rounded);
+      store<THREADS_M, THREADS_N>(rounded, output_ptr + r0 * output_stride_m,
+                                  output_stride_m, output_stride_n, band,
+                                  input_size_n, t / tiles_n * TILE_M,
+                                  t % tiles_n * TILE_N);
     }
     // 3. No rank may stage its next band until every peer has read this one.
     barrier<Until::read, 1, WORLD>(
@@ -160,16 +168,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // where they are; staged, for an eager input the peers cannot read.
 // =============================================================================
 
-// THE PROBLEM, [R, M, N]: R = WORLD ranks' inputs, each an [inp_size_m,
-// inp_size_n] buffer at its strides, summed elementwise. Reduce-scatter (each
+// THE PROBLEM, [R, M, N]: R = WORLD ranks' inputs, each an [input_size_m,
+// input_size_n] buffer at its strides, summed elementwise. Reduce-scatter (each
 // rank sums its share over the ranks into its scratch), sync, all-gather (every
 // rank's summed share out to the output). The kernel states the problem;
-// common.cuh's COLLECTIVES walk it as [R, 1, M*N], each rank's share one
+// common.cuh's flat walk cuts it as [R, 1, M*N], each rank's share one
 // contiguous range of the elements, for long reads from each peer (its comment
-// says why and what it serves badly). A rank's copy of a chunk is a wave (LANES
-// threads); the Chunk tile is that [R, 1, TILE_N] chunk. CONTIGUOUS: the
-// input's and the output's rows are back to back, the instance the host picks
-// from their strides.
+// says why and what it serves badly), a TILE_N chunk a step (TILE_M is the
+// build's, 1: select's two_shot_lays_out). CONTIGUOUS: the input's and the
+// output's rows are back to back, the instance the host picks from their
+// strides.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
@@ -187,27 +195,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  constexpr int LANES = THREADS_PER_BLOCK / WORLD;  // a rank's copy's threads
-  static_assert(LANES * WORLD == THREADS_PER_BLOCK,
-                "a block is a group of threads a rank");
-  // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the
-  // build's, 1: select's two_shot_lays_out): R ranks' copies of TILE_N
-  // elements.
-  using Chunk =
-      Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
-
-  // 1. Every rank's buffers, then wait until every peer has launched, so its
-  // input is ready.
-  const auto input = [&](int r) {
-    return rank_ptr<const DTYPE, WORLD>(input_ptrs, r, input_stride_m,
-                                        input_stride_n);
-  };
-  const auto scratch = [&](int r) {
-    return rank_ptr<DTYPE, WORLD>(scratch_ptrs, r, scratch_stride_m,
-                                  scratch_stride_n);
-  };
-  const auto output =
-      local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
+  // 1. Wait until every peer has launched, so its input is ready.
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -216,8 +204,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks,
   // into its scratch.
-  reduce_scatter<Chunk, CONTIGUOUS>(rank, input, input_size_m, input_size_n,
-                                    scratch(rank));
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+      scratch_size_n, rank);
 
   // 3. Every rank's sums are visible to its peers.
   barrier<Until::visible, 1, WORLD>(
@@ -230,8 +220,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // in the output. The
   //    next call's first sync keeps a rank from overwriting its scratch while
   //    it is read.
-  all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, input_size_m,
-                                input_size_n);
+  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+      scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+      scratch_size_n, output_ptr, output_stride_m, output_stride_n,
+      input_size_m, input_size_n, rank);
 #else
   __builtin_trap();
 #endif
@@ -263,36 +255,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  constexpr int LANES = THREADS_PER_BLOCK / WORLD;
-  static_assert(LANES * WORLD == THREADS_PER_BLOCK,
-                "a block is a group of threads a rank");
-  // THE FLAT WALK'S CHUNK, one row of the flat range by nature (TILE_M is the
-  // build's, 1: select's two_shot_lays_out): R ranks' copies of TILE_N
-  // elements.
-  using Chunk =
-      Tile<DTYPE, 1, TILE_N, 1, LANES, THREADS_PER_BLOCK, DTYPE, WORLD, WORLD>;
-  const auto staging = [&](int r) {
-    return rank_ptr<DTYPE, WORLD>(staging_ptrs, r, staging_stride_m,
-                                  staging_stride_n);
-  };
-  const auto scratch = [&](int r) {
-    return rank_ptr<DTYPE, WORLD>(scratch_ptrs, r, scratch_stride_m,
-                                  scratch_stride_n);
-  };
-
   for (int r0 = 0; r0 < input_size_m; r0 += staging_size_m) {
     const int band =
         min(staging_size_m, input_size_m - r0);  // this pass's rows
-    // This pass's rows of the input and of the output.
-    const auto input = local_ptr(input_ptr + r0 * input_stride_m,
-                                 input_stride_m, input_stride_n, rank);
-    const auto output = local_ptr(output_ptr + r0 * output_stride_m,
-                                  output_stride_m, output_stride_n, rank);
     // 1. This band, every rank's share of it, into this rank's staging (the
     // chunks each rank's same
     //    block reads), then visible (and, past the first pass, every peer has
     //    read this rank's scratch).
-    stage<Chunk, CONTIGUOUS>(rank, input, staging(rank), band, input_size_n);
+    //    This pass's rows of the input and of the output start at row r0.
+    stage<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+        input_ptr + r0 * input_stride_m, input_stride_m, input_stride_n, band,
+        input_size_n, staging_ptrs[rank], staging_stride_m, staging_stride_n,
+        band, input_size_n, rank);
     barrier<Until::visible, 0, WORLD>(
         signals_ptrs, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
@@ -301,8 +275,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 2. Reduce-scatter: this rank's share of the band from every rank's
     // staging, into its scratch.
-    reduce_scatter<Chunk, true>(rank, staging, band, input_size_n,
-                                scratch(rank));  // ours, rows back to back
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, true>(  // ours, rows back to back
+        staging_ptrs, staging_stride_m, staging_stride_n, band, input_size_n,
+        scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+        scratch_size_n, rank);
 
     // 3. Every rank's sums are visible to its peers, and every peer has read
     // this rank's staged
@@ -315,7 +291,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 4. All-gather: every rank's summed share out of its scratch, at its place
     // in the output.
-    all_gather<Chunk, CONTIGUOUS>(rank, scratch, output, band, input_size_n);
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+        scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+        scratch_size_n, output_ptr + r0 * output_stride_m, output_stride_m,
+        output_stride_n, band, input_size_n, rank);
   }
 #else
   __builtin_trap();
