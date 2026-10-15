@@ -373,15 +373,49 @@ def open_handle(
     timeout_seconds: float,
     max_rows: int,
     max_cols: int,
+    quantize_min_bytes: int = -1,
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
-    C++'s opener, so its arguments are written once."""
+    C++'s opener, so its arguments are written once. `quantize_min_bytes`: the least
+    bytes a two-shot call moves INT4 at, or -1, never (`quantize_min_bytes_of`)."""
     handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
-        cpu_group, device_group, device, timeout_seconds, max_rows, max_cols
+        cpu_group,
+        device_group,
+        device,
+        timeout_seconds,
+        max_rows,
+        max_cols,
+        quantize_min_bytes,
     )
     return Error(err) if err is not None else handle
+
+
+def quantize_min_bytes_of(world: int) -> int:
+    """THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT, or -1, never: the default ROCm
+    path's own rule, so INT4 runs on the same calls in both. Quick reduce quantizes
+    when `VLLM_ROCM_QUICK_REDUCE_QUANTIZATION` is INT4, from its
+    `VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB` or else its table's least for INT4 at
+    this world, the fp16 kernels' row while it casts bf16 to fp16 (its default)."""
+    import vllm.envs as envs
+    from vllm.distributed.device_communicators.quick_all_reduce import (
+        MB,
+        QuickAllReduce,
+        QuickReduceRegime,
+    )
+
+    if envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION != "INT4":
+        return -1
+    if envs.VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB is not None:
+        return envs.VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB * MB
+    dtype = (
+        torch.float16
+        if envs.VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16
+        else torch.bfloat16
+    )
+    table = QuickAllReduce._QR_MIN_SIZE.get((dtype, world))
+    return -1 if table is None else table[QuickReduceRegime.INT4.value]
 
 
 def supported(device: torch.device, world: int) -> Supported | Error:
@@ -463,9 +497,10 @@ State = Disabled | Open | Capturing | Broken | Closed
 # AN OP'S ANSWER, C++'s wire (`hip_custom_communicator.cu`'s Answer): the Error's
 # number it was refused for, or -1 when it ran, then what ran.
 Answer = list[int]
-# C++'s `Algorithm` and `Direction`, number for number.
+# C++'s `Algorithm`, `Direction` and `Quantization`, number for number.
 _ALGORITHMS = ("one_shot", "two_shot")
 _DIRECTIONS = ("pull", "push")
+_QUANTIZATIONS = ("none", "int4")
 
 
 @dataclass(frozen=True)
@@ -473,7 +508,7 @@ class Ran:
     """WHAT A LAUNCH RAN, as C++ answered it: the kernel's algorithm and direction,
     its tile and threads, its grid; `staged` (the eager build that copies its input
     through the staging), `tile_k` and `reduce_scatter_blocks` 0 where the op has
-    none."""
+    none; `quantization`, what crossed the links ("none" or "int4")."""
 
     algorithm: str
     direction: str
@@ -485,12 +520,13 @@ class Ran:
     staged: bool
     tile_k: int
     reduce_scatter_blocks: int
+    quantization: str
 
     @classmethod
     def of(cls, answer: Answer) -> "Ran | None":
         """From an answer that ran; None for one that says nothing of what ran (the
         test's torch control answers [-1])."""
-        if len(answer) < 11:
+        if len(answer) < 12:
             return None
         a = answer[1:]
         return cls(
@@ -504,10 +540,12 @@ class Ran:
             bool(a[7]),
             a[8],
             a[9],
+            _QUANTIZATIONS[a[10]],
         )
 
     def __str__(self) -> str:
         how = " staged" if self.staged else ""
+        how += " int4" if self.quantization == "int4" else ""
         return (
             f"{self.direction} {self.algorithm}{how} tile {self.tile_m}x{self.tile_n}"
             f" threads {self.threads_per_block} grid {self.blocks_per_grid}"
@@ -596,13 +634,16 @@ class HipCustomCommunicator:
         timeout_seconds: float | None = None,
         max_rows: int | None = None,
         max_cols: int | None = None,
+        quantize_min_bytes: int | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
         `timeout_seconds`: how long a kernel waits on a peer before it reports a
         fault; None is the device group's own (`collective_timeout_seconds`).
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
-        sized for; None is the server's (`problem_size`)."""
+        sized for; None is the server's (`problem_size`). `quantize_min_bytes`: the
+        least bytes a two-shot call moves INT4 at, -1 never; None is the default
+        ROCm path's rule (`quantize_min_bytes_of`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -617,6 +658,11 @@ class HipCustomCommunicator:
             max_cols = served_cols if max_cols is None else max_cols
         self.max_rows = max_rows
         self.max_cols = max_cols
+        self.quantize_min_bytes = (
+            quantize_min_bytes_of(device_group.size())
+            if quantize_min_bytes is None
+            else quantize_min_bytes
+        )
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
@@ -1045,6 +1091,7 @@ class HipCustomCommunicator:
             self.timeout_seconds,
             self.max_rows,
             self.max_cols,
+            self.quantize_min_bytes,
         )
         if isinstance(handle, Error):
             return handle.name

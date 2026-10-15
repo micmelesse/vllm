@@ -70,6 +70,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     HipCustomCommunicator,
     Op,
     Open,
+    Ran,
     Refused,
     State,
     Supported,
@@ -77,6 +78,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     build_info,
     capacity_of,
     open_handle,
+    quantize_min_bytes_of,
     should,
     supported,
 )
@@ -1987,6 +1989,391 @@ def test_all_reduce_add_attn_res_rms_norm_runs_the_largest_call(
         pytest.skip(f"hip declines {shot} all_reduce_add_attn_res_rms_norm at {case}")
     bad = [err for _, err in got if err is not None]
     assert not bad, f"{shot} at the largest call: " + "; ".join(bad)
+
+
+# ---------------------------------------------------------------------------------
+# INT4 ACROSS THE LINKS (common.cuh's QUANTIZATION): a communicator opened to move
+# every two-shot call it can INT4 (`quantize_min_bytes` 0), each two-shot forced,
+# against an emulation of quick reduce's format written here in torch: each rank's
+# input quantized and landed in its dtype, summed in fp32 in the kernel's rank order,
+# the sum quantized, then the op's reference on it (the pull norms, a row split, sum
+# unquantized and quantize what they gather: the owner's normed rows, or its residual
+# rows beside their RMS scales).
+# ---------------------------------------------------------------------------------
+
+INT4 = "hip_int4"
+INT4_GROUP = 32
+# Each op's two-shot templates (the plain all-reduce has only the pull).
+INT4_KERNELS = (
+    ("all_reduce", "all_reduce_pull_two_shot"),
+    *(
+        (op, f"{direction}_{op.removeprefix('all_reduce_')}")
+        for op in (
+            "all_reduce_rms_norm",
+            "all_reduce_add_rms_norm",
+            "all_reduce_add_attn_res_rms_norm",
+        )
+        for direction in ("all_reduce_pull_two_shot", "all_reduce_push_two_shot")
+    ),
+)
+# Kimi-K3's rows: fewer rows than ranks, decode, a prefill chunk; both widths are whole
+# groups for every rank at 8 (14 and 28 groups a rank), which INT4 needs. FAST: one
+# decode and one prefill shape a kernel; FULL: the rest.
+INT4_SHAPES = ((1, 3584), (16, 7168), (128, 3584), (2048, 7168))
+INT4_FAST_SHAPES = ((16, 7168), (2048, 7168))
+# THE VERDICT: near every element as the emulation computes it, the rest one
+# quantization step off (a value the kernel's last bit -- a reciprocal, a reduction's
+# order -- put on the other side of a rounding boundary); and the whole within INT4's
+# error of the exact op, its RMS against the exact output's.
+INT4_TIGHT = 0.995
+INT4_RELATIVE_RMS = 0.25
+# The landed sum's tolerance (the plain all-reduce, AttnRes's prefix and block): the
+# emulation computes it exactly, so an ULP of bf16.
+INT4_LANDED_TOLERANCE = (1e-6, 2**-7)
+
+
+def _quantizing(ctx: RankContext) -> HipCustomCommunicator:
+    """The world's communicator that moves every two-shot call it can INT4, built the
+    first time a case asks and kept beside the others (`RankContext.comm`)."""
+    if INT4 not in ctx._comms:
+        comm = HipCustomCommunicator(
+            ctx.cpu_group,
+            ctx.device_group,
+            ctx.device,
+            timeout_seconds=TEST_TIMEOUT_SECONDS,
+            max_rows=TEST_MAX_ROWS,
+            max_cols=TEST_MAX_COLS,
+            quantize_min_bytes=0,
+        )
+        if comm.disabled:
+            raise RuntimeError("the INT4 hip communicator is disabled")
+        ctx._comms[INT4] = comm
+    return ctx._comms[INT4]
+
+
+def _int4_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """`x` (fp32, rows of whole groups) through quick reduce's INT4 and back, in fp32:
+    each group's scale its largest magnitude / 7 rounded to fp16 first, each value
+    rounded to the nearest of -8..7 times it."""
+    groups = x.float().reshape(*x.shape[:-1], -1, INT4_GROUP)
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    scale = (
+        torch.clamp(amax * torch.tensor(1.0 / 7.0, dtype=torch.float32), max=65504.0)
+        .to(torch.float16)
+        .float()
+    )
+    inv = torch.where(scale > 0, 1.0 / scale, torch.zeros_like(scale))
+    q = torch.clamp(torch.round(groups * inv), -8.0, 7.0)
+    return (q * scale).reshape(x.shape)
+
+
+def _int4_landed(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """`x` quantized, dequantized and landed in `dtype`, as a quantized load is."""
+    return _int4_round_trip(x).to(dtype)
+
+
+def _int4_sum(terms: Sequence[torch.Tensor], owner: torch.Tensor) -> torch.Tensor:
+    """The fp32 sum of every rank's term in the kernel's order: each element from its
+    `owner` (the rank summing it) on, rank owner, owner + 1, ... (an owner of zeros is
+    rank order)."""
+    stacked = torch.stack([t.float() for t in terms])
+    world = stacked.shape[0]
+    acc = torch.zeros_like(stacked[0])
+    for k in range(world):
+        acc += stacked.gather(0, ((owner + k) % world).unsqueeze(0)).squeeze(0)
+    return acc
+
+
+def _int4_owner(
+    op: str, kernel: str, shape: tuple[int, int], world: int
+) -> torch.Tensor:
+    """Which rank sums each element, and so where its sum's order starts: the plain
+    two-shot's flat share (rotated), the AttnRes pull's column slice (rotated), or rank
+    order (the push kernels and the pull norms sum in rank order)."""
+    rows, hidden = shape
+    if op == "all_reduce":
+        flat = torch.arange(rows * hidden).reshape(rows, hidden)
+        return flat // (rows * hidden // world)
+    if kernel.startswith("all_reduce_pull_two_shot") and "attn_res" in op:
+        return (torch.arange(hidden) // (hidden // world)).expand(rows, hidden)
+    return torch.zeros(rows, hidden, dtype=torch.long)
+
+
+def _int4_verdict(
+    name: str,
+    got: torch.Tensor,
+    want: torch.Tensor,
+    exact: torch.Tensor,
+    tolerance: tuple[float, float],
+) -> str | None:
+    """Why `got` is not the emulation's `want` (INT4_TIGHT of it within `tolerance`,
+    `(atol, rtol)`) or not within INT4's error of the `exact` op; None when it is."""
+    a, b, e = got.float().cpu(), want.float().cpu(), exact.float().cpu()
+    if a.shape != b.shape:
+        return f"{name} shape {tuple(a.shape)}, expected {tuple(b.shape)}"
+    if not torch.isfinite(a).all():
+        return f"{name} is not finite"
+    atol, rtol = tolerance
+    tight = ((a - b).abs() <= atol + rtol * b.abs()).float().mean().item()
+    if tight < INT4_TIGHT:
+        worst = (a - b).abs().max().item()
+        return (
+            f"{name}: {tight:.3%} of elements match the INT4 emulation, under "
+            f"{INT4_TIGHT:.1%} (worst|diff|={worst:.4g})"
+        )
+    relative = ((a - e).norm() / e.norm().clamp_min(1e-30)).item()
+    if relative > INT4_RELATIVE_RMS:
+        return f"{name}: RMS error {relative:.3f} of the exact op's, over INT4's"
+    return None
+
+
+def run_int4_rank(
+    ctx: RankContext, op: str, kernel: str, shape: tuple[int, int]
+) -> tuple[bool, str | None]:
+    """ONE rank: `op` forced onto `kernel` on the INT4 communicator, against the
+    emulation and the exact op, and what it says it ran."""
+    import vllm.ir.ops
+    from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+
+    rank, world, device = ctx.rank, ctx.world, ctx.device
+    dtype = torch.bfloat16
+    rows, hidden = shape
+    inputs = [_one_input(r, 0, shape, dtype) for r in range(world)]
+    landed = [_int4_landed(x, dtype) for x in inputs]
+    total = _int4_sum(landed, _int4_owner(op, kernel, shape, world))
+    exact = _int4_sum(inputs, torch.zeros(shape, dtype=torch.long)).to(dtype)
+    summed = _int4_landed(total, dtype)  # the sum as the two-shot quantizes it
+    pull_norm = kernel.startswith("all_reduce_pull_two_shot") and "rms_norm" in op
+    pull_norm = pull_norm and "attn_res" not in op
+    forced = _forced(kernel, 0 if op == "all_reduce" else hidden)
+    comm = _quantizing(ctx)
+    mine = inputs[rank].to(device)
+    landed_tolerance = INT4_LANDED_TOLERANCE
+    normed_tolerance = _fused_tolerance(dtype)
+    checks: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, tuple]] = []
+    if op == "all_reduce":
+        got = comm.all_reduce(mine, **forced)
+        checks.append(("out", got, summed, exact, landed_tolerance))
+    elif op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
+        residual = _one_input(world, 1, shape, dtype)
+        weight = _one_input(world + 1, 2, (hidden,), dtype)
+        add = op == "all_reduce_add_rms_norm"
+        if add:
+            got, got_residual = comm.all_reduce_add_rms_norm(
+                mine, residual.to(device), weight.to(device), FUSED_EPS, **forced
+            )
+            exact_out, exact_residual = vllm.ir.ops.fused_add_rms_norm(
+                exact, residual, weight, FUSED_EPS
+            )
+        else:
+            got = comm.all_reduce_rms_norm(mine, weight.to(device), FUSED_EPS, **forced)
+            exact_out = vllm.ir.ops.rms_norm(exact, weight, FUSED_EPS)
+        if not pull_norm:
+            # THE PUSH: the quantized sum, landed, then the reference.
+            if add:
+                want, want_residual = vllm.ir.ops.fused_add_rms_norm(
+                    summed, residual, weight, FUSED_EPS
+                )
+            else:
+                want = vllm.ir.ops.rms_norm(summed, weight, FUSED_EPS)
+        elif add:
+            # THE PULL, A ROW SPLIT: the owner adds the residual to the unquantized sum,
+            # takes its RMS scale, and the residual row crosses quantized; every rank
+            # norms the landed row by the owner's scale, rounding as the reference does.
+            s = total.to(dtype).float() + residual.float()
+            scale = torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + FUSED_EPS)
+            want_residual = _int4_landed(s.to(dtype), dtype)
+            want = ((want_residual.float() * scale).to(dtype) * weight).to(dtype)
+        else:
+            # THE PULL: the owner norms the unquantized sum; the normed row crosses.
+            want = _int4_landed(
+                vllm.ir.ops.rms_norm(total.to(dtype), weight, FUSED_EPS), dtype
+            )
+        checks.append(("out", got, want, exact_out, normed_tolerance))
+        if add:
+            checks.append(
+                (
+                    "residual",
+                    got_residual,
+                    want_residual,
+                    exact_residual,
+                    landed_tolerance,
+                )
+            )
+    else:
+        # The block-writing layer, no prefix: the sum starts the prefix and is written
+        # as block `write_idx`, so both are the landed sum itself.
+        blocks = torch.stack(
+            [
+                _one_input(world + 2 + s, 3, shape, dtype)
+                for s in range(ATTN_RES_SOURCES)
+            ],
+            dim=1,
+        ).contiguous()
+        norm_w = _one_input(world + 20, 4, (hidden,), dtype).to(device)
+        qk_w = _one_input(world + 21, 5, (hidden,), dtype).to(device)
+        out_w = _one_input(world + 22, 6, (hidden,), dtype).to(device)
+        num_blocks, write_idx = 4, 4
+
+        def reference(the_sum: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            ref_prefix = the_sum.to(device).clone()
+            ref_blocks = blocks.to(device).clone()
+            out = attn_res(
+                ref_prefix,
+                None,
+                ref_blocks,
+                norm_w,
+                qk_w,
+                out_w,
+                num_blocks,
+                write_idx,
+                1e-6,
+                1e-5,
+            )
+            return out, ref_prefix, ref_blocks
+
+        want, want_prefix, want_blocks = reference(summed)
+        exact_out, exact_prefix, exact_blocks = reference(exact)
+        got_blocks = blocks.to(device).clone()
+        got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
+            mine,
+            None,
+            got_blocks,
+            norm_w,
+            qk_w,
+            out_w,
+            num_blocks,
+            write_idx,
+            1e-6,
+            1e-5,
+            **forced,
+        )
+        checks += [
+            ("out", got, want, exact_out, normed_tolerance),
+            ("prefix", got_prefix, want_prefix, exact_prefix, landed_tolerance),
+            ("blocks", got_blocks, want_blocks, exact_blocks, landed_tolerance),
+        ]
+    torch.accelerator.synchronize()
+    _the_call_left_nothing(comm)
+    ran = comm._calls[-1].ran
+    if ran is None or ran.quantization != "int4" or ran.algorithm != "two_shot":
+        return False, f"{kernel} at {shape} ran {ran}, not an INT4 two-shot"
+    for name, a, b, e, tolerance in checks:
+        if (why := _int4_verdict(name, a, b, e, tolerance)) is not None:
+            return False, why
+    return True, None
+
+
+INT4_PARAMS = tuple(
+    pytest.param(
+        op,
+        kernel,
+        shape,
+        id=f"{kernel}-{_shape_id(shape)}",
+        marks=[] if shape in INT4_FAST_SHAPES else [pytest.mark.full],
+    )
+    for op, kernel in INT4_KERNELS
+    for shape in INT4_SHAPES
+)
+
+
+@pytest.mark.parametrize(("op", "kernel", "shape"), INT4_PARAMS)
+def test_an_int4_two_shot_matches_the_format_it_moves(
+    op: str, kernel: str, shape: tuple[int, int], world: int, ranks: World
+) -> None:
+    """Every two-shot kernel moving INT4, forced, against the format's emulation: each
+    rank's input quantized, the fp32 sum in the kernel's order quantized, the op's
+    reference on it; within INT4's error of the exact op; and it says it ran INT4."""
+    # example-based: each case is a full eight-process run at a Kimi-K3 shape
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    if shape[1] % (INT4_GROUP * world) != 0:
+        pytest.skip(f"{shape[1]} columns are not whole groups for {world} ranks")
+    got = ranks.run(run_int4_rank, op=op, kernel=kernel, shape=shape)
+    bad = [err for _, err in got if err is not None]
+    assert not bad, f"{kernel} {shape}: " + "; ".join(bad)
+    assert all(agreed for agreed, _ in got), f"{kernel} {shape}: ranks disagreed"
+
+
+def run_int4_declines_rank(ctx: RankContext) -> tuple[bool, str | None]:
+    """ONE rank: what does NOT move INT4 says so -- the plain communicator's two-shot
+    (no quantization asked: `VLLM_ROCM_QUICK_REDUCE_QUANTIZATION` unset), the INT4
+    communicator's one-shot, and its two-shot on a row that is not whole groups for
+    every rank -- and each is still the exact sum."""
+    dtype = torch.bfloat16
+    plain, int4 = ctx.comm("hip"), _quantizing(ctx)
+    cases = (
+        (plain, (128, 7168), "all_reduce_pull_two_shot"),
+        (int4, (4, 7168), "all_reduce_pull_one_shot"),
+        (int4, (128, 7168 + 8 * ctx.world), "all_reduce_pull_two_shot"),
+    )
+    for comm, shape, kernel in cases:
+        inputs = [_one_input(r, 7, shape, dtype) for r in range(ctx.world)]
+        exact = _int4_sum(inputs, torch.zeros(shape, dtype=torch.long)).to(dtype)
+        got = comm.all_reduce(inputs[ctx.rank].to(ctx.device), **_forced(kernel))
+        torch.accelerator.synchronize()
+        _the_call_left_nothing(comm)
+        ran = comm._calls[-1].ran
+        if ran is None or ran.quantization != "none":
+            return False, f"{kernel} at {shape} ran {ran}, not unquantized"
+        if (
+            why := _differences([("out", got, exact, _atol("all_reduce", dtype))], RTOL)
+        ) is not None:
+            return False, f"{kernel} at {shape}: {why}"
+    return True, None
+
+
+def test_what_does_not_move_int4_says_none(world: int, ranks: World) -> None:
+    """A call the handle does not quantize answers `none` and is the plain sum: no
+    quantization asked, a one-shot, a row INT4 cannot split by ranks."""
+    # example-based: the three ways a call stays unquantized
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    bad = [err for _, err in ranks.run(run_int4_declines_rank) if err is not None]
+    assert not bad, "; ".join(bad)
+
+
+def test_ran_reads_the_quantization_cpp_answers() -> None:
+    """The answer's last field is C++'s Quantization, number for number."""
+    # example-based: the two values the wire carries
+    answer = [-1, 1, 1, 1, 4096, 512, 16, 1, 0, 1, 0]
+    assert Ran.of([*answer, 0]).quantization == "none"
+    int4 = Ran.of([*answer, 1])
+    assert int4 is not None and int4.quantization == "int4" and "int4" in str(int4)
+    assert Ran.of(answer) is None
+
+
+@pytest.mark.parametrize(
+    ("quantization", "min_mb", "cast", "want"),
+    [
+        ("NONE", None, None, -1),
+        ("INT8", None, None, -1),
+        ("INT4", None, None, 2 * 1024 * 1024),
+        ("INT4", None, "0", 2048 * 1024 * 1024),
+        ("INT4", "3", None, 3 * 1024 * 1024),
+    ],
+)
+def test_int4_follows_the_default_paths_rule(
+    quantization: str,
+    min_mb: str | None,
+    cast: str | None,
+    want: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At 8 ranks the INT4 threshold is quick reduce's: only when it quantizes INT4,
+    its own minimum if set, else its table's INT4 entry, the fp16 row while it casts
+    bf16 to fp16."""
+    # example-based: each branch of the rule once
+    monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", quantization)
+    for name, value in (
+        ("VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB", min_mb),
+        ("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", cast),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert quantize_min_bytes_of(8) == want
 
 
 @pytest.mark.parametrize("op", get_args(Op))
