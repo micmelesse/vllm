@@ -182,14 +182,18 @@ enum class OpType : int {
 // (Triton's num_warps x 64), the waves a SIMD (an EU) the compiler fits its
 // registers to (__launch_bounds__'s second value, Triton's waves_per_eu; 1 asks
 // nothing), and the tile, TILE_M rows x TILE_N columns in elements; TILE_K is
-// the reduced dimension a step (AttnRes's sources a step). One type an op, so a
-// config cannot cross ops, though three hold the same fields. all_reduce: a
-// tile a work item, the grid striding over the buffer's.
+// the reduced dimension a step (AttnRes's sources a step); `quantization`, what
+// crosses the links (common.cuh's QUANTIZATION): a two-shot's build is listed
+// as it is and moving INT4 (select's `and_int4`), which select takes for a call
+// the handle quantizes; a forced build is none. One type an op, so a config
+// cannot cross ops, though three hold the same fields. all_reduce: a tile a
+// work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
   int threads_per_block;
   int waves_per_eu;
   int tile_m;
   int tile_n;
+  Quantization quantization = Quantization::none;
   bool operator==(const AllReduceBuildConfig&) const = default;
 };
 // all_reduce_rms_norm.
@@ -198,6 +202,7 @@ struct AllReduceRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
+  Quantization quantization = Quantization::none;
   bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_rms_norm.
@@ -206,6 +211,7 @@ struct AllReduceAddRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
+  Quantization quantization = Quantization::none;
   bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
@@ -215,6 +221,7 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_m;
   int tile_n;
   int tile_k;
+  Quantization quantization = Quantization::none;
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 using BuildConfig =
@@ -250,6 +257,14 @@ constexpr int tile_m_of(const BuildConfig& b) {
 }
 constexpr int tile_n_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.tile_n; }, b);
+}
+constexpr Quantization quantization_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.quantization; }, b);
+}
+// The same build, moving `q` across the links.
+constexpr BuildConfig quantized(BuildConfig b, Quantization q) {
+  std::visit([q](auto& f) { f.quantization = q; }, b);
+  return b;
 }
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
@@ -293,7 +308,18 @@ using AllReduceTwoShotKernel = void (*)(
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
     void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
     int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
-    int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+    int /*scratch_size_n*/,
+    void* const* /*scratch_values_ptrs*/, int64_t /*scratch_values_stride_m*/,
+    int64_t /*scratch_values_stride_n*/, int /*scratch_values_size_m*/,
+    int /*scratch_values_size_n*/, void* const* /*scratch_scales_ptrs*/,
+    int64_t /*scratch_scales_stride_m*/, int64_t /*scratch_scales_stride_n*/,
+    int /*scratch_scales_size_m*/, int /*scratch_scales_size_n*/,
+    void* const* /*staging_values_ptrs*/, int64_t /*staging_values_stride_m*/,
+    int64_t /*staging_values_stride_n*/, int /*staging_values_size_m*/,
+    int /*staging_values_size_n*/, void* const* /*staging_scales_ptrs*/,
+    int64_t /*staging_scales_stride_m*/, int64_t /*staging_scales_stride_n*/,
+    int /*staging_scales_size_m*/, int /*staging_scales_size_n*/,
+    void* const* /*signals_ptrs*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -348,7 +374,18 @@ using AllReduceRmsNormTwoShotKernel = void (*)(
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
     void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
     int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
-    int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+    int /*scratch_size_n*/,
+    void* const* /*scratch_values_ptrs*/, int64_t /*scratch_values_stride_m*/,
+    int64_t /*scratch_values_stride_n*/, int /*scratch_values_size_m*/,
+    int /*scratch_values_size_n*/, void* const* /*scratch_scales_ptrs*/,
+    int64_t /*scratch_scales_stride_m*/, int64_t /*scratch_scales_stride_n*/,
+    int /*scratch_scales_size_m*/, int /*scratch_scales_size_n*/,
+    void* const* /*staging_values_ptrs*/, int64_t /*staging_values_stride_m*/,
+    int64_t /*staging_values_stride_n*/, int /*staging_values_size_m*/,
+    int /*staging_values_size_n*/, void* const* /*staging_scales_ptrs*/,
+    int64_t /*staging_scales_stride_m*/, int64_t /*staging_scales_stride_n*/,
+    int /*staging_scales_size_m*/, int /*staging_scales_size_n*/,
+    void* const* /*signals_ptrs*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -385,7 +422,18 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
     int /*residual_output_size_m*/, int /*residual_output_size_n*/,
     void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
     int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
-    int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+    int /*scratch_size_n*/,
+    void* const* /*scratch_values_ptrs*/, int64_t /*scratch_values_stride_m*/,
+    int64_t /*scratch_values_stride_n*/, int /*scratch_values_size_m*/,
+    int /*scratch_values_size_n*/, void* const* /*scratch_scales_ptrs*/,
+    int64_t /*scratch_scales_stride_m*/, int64_t /*scratch_scales_stride_n*/,
+    int /*scratch_scales_size_m*/, int /*scratch_scales_size_n*/,
+    void* const* /*staging_values_ptrs*/, int64_t /*staging_values_stride_m*/,
+    int64_t /*staging_values_stride_n*/, int /*staging_values_size_m*/,
+    int /*staging_values_size_n*/, void* const* /*staging_scales_ptrs*/,
+    int64_t /*staging_scales_stride_m*/, int64_t /*staging_scales_stride_n*/,
+    int /*staging_scales_size_m*/, int /*staging_scales_size_n*/,
+    void* const* /*signals_ptrs*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -441,7 +489,18 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     int /*block_output_size_m*/, int /*block_output_size_n*/,
     void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
     int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
-    int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+    int /*scratch_size_n*/,
+    void* const* /*scratch_values_ptrs*/, int64_t /*scratch_values_stride_m*/,
+    int64_t /*scratch_values_stride_n*/, int /*scratch_values_size_m*/,
+    int /*scratch_values_size_n*/, void* const* /*scratch_scales_ptrs*/,
+    int64_t /*scratch_scales_stride_m*/, int64_t /*scratch_scales_stride_n*/,
+    int /*scratch_scales_size_m*/, int /*scratch_scales_size_n*/,
+    void* const* /*staging_values_ptrs*/, int64_t /*staging_values_stride_m*/,
+    int64_t /*staging_values_stride_n*/, int /*staging_values_size_m*/,
+    int /*staging_values_size_n*/, void* const* /*staging_scales_ptrs*/,
+    int64_t /*staging_scales_stride_m*/, int64_t /*staging_scales_stride_n*/,
+    int /*staging_scales_size_m*/, int /*staging_scales_size_n*/,
+    void* const* /*signals_ptrs*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -470,7 +529,18 @@ using AllReduceAddAttnResRmsNormPullKernel = void (*)(
     int /*block_output_size_m*/, int /*block_output_size_n*/,
     void* const* /*scratch_ptrs*/, int64_t /*scratch_stride_m*/,
     int64_t /*scratch_stride_n*/, int /*scratch_size_m*/,
-    int /*scratch_size_n*/, void* const* /*signals_ptrs*/,
+    int /*scratch_size_n*/,
+    void* const* /*scratch_values_ptrs*/, int64_t /*scratch_values_stride_m*/,
+    int64_t /*scratch_values_stride_n*/, int /*scratch_values_size_m*/,
+    int /*scratch_values_size_n*/, void* const* /*scratch_scales_ptrs*/,
+    int64_t /*scratch_scales_stride_m*/, int64_t /*scratch_scales_stride_n*/,
+    int /*scratch_scales_size_m*/, int /*scratch_scales_size_n*/,
+    void* const* /*staging_values_ptrs*/, int64_t /*staging_values_stride_m*/,
+    int64_t /*staging_values_stride_n*/, int /*staging_values_size_m*/,
+    int /*staging_values_size_n*/, void* const* /*staging_scales_ptrs*/,
+    int64_t /*staging_scales_stride_m*/, int64_t /*staging_scales_stride_n*/,
+    int /*staging_scales_size_m*/, int /*staging_scales_size_n*/,
+    void* const* /*signals_ptrs*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -490,8 +560,9 @@ using AllReduceAddAttnResRmsNormPullKernel = void (*)(
 
 // `staged`: the build that copies an eager input through the staging a pass at
 // a time, not the one that reads a registered or captured input in place.
-// Exchange (scratch, staging) is the handle's, so a launch holds only its
-// strides and sizes.
+// Exchange (scratch, staging, and with `quantization` int4 the scratch's and
+// the staged input's values and scales) is the handle's, so a launch holds only
+// their strides and sizes (0 with none: the kernel reads none of them).
 struct AllReduceLaunch {
   const void* kernel;
   Algorithm algorithm;
@@ -502,6 +573,7 @@ struct AllReduceLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
+  Quantization quantization;
   bool staged;
   hipStream_t stream;
   const void* input;
@@ -512,6 +584,14 @@ struct AllReduceLaunch {
   int64_t output_size_m, output_size_n;
   int64_t scratch_stride_m, scratch_stride_n;
   int64_t scratch_size_m, scratch_size_n;
+  int64_t scratch_values_stride_m, scratch_values_stride_n;
+  int64_t scratch_values_size_m, scratch_values_size_n;
+  int64_t scratch_scales_stride_m, scratch_scales_stride_n;
+  int64_t scratch_scales_size_m, scratch_scales_size_n;
+  int64_t staging_values_stride_m, staging_values_stride_n;
+  int64_t staging_values_size_m, staging_values_size_n;
+  int64_t staging_scales_stride_m, staging_scales_stride_n;
+  int64_t staging_scales_size_m, staging_scales_size_n;
   int64_t staging_stride_m, staging_stride_n;
   int64_t staging_size_m, staging_size_n;
   DType dtype;
@@ -528,6 +608,7 @@ struct AllReduceRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
+  Quantization quantization;
   hipStream_t stream;
   const void* input;
   int64_t input_stride_m, input_stride_n;
@@ -540,6 +621,14 @@ struct AllReduceRmsNormLaunch {
   int64_t output_size_m, output_size_n;
   int64_t scratch_stride_m, scratch_stride_n;
   int64_t scratch_size_m, scratch_size_n;
+  int64_t scratch_values_stride_m, scratch_values_stride_n;
+  int64_t scratch_values_size_m, scratch_values_size_n;
+  int64_t scratch_scales_stride_m, scratch_scales_stride_n;
+  int64_t scratch_scales_size_m, scratch_scales_size_n;
+  int64_t staging_values_stride_m, staging_values_stride_n;
+  int64_t staging_values_size_m, staging_values_size_n;
+  int64_t staging_scales_stride_m, staging_scales_stride_n;
+  int64_t staging_scales_size_m, staging_scales_size_n;
   DType dtype;
   DType weight_dtype;
   float eps;
@@ -555,6 +644,7 @@ struct AllReduceAddRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
+  Quantization quantization;
   hipStream_t stream;
   const void* input;
   int64_t input_stride_m, input_stride_n;
@@ -573,6 +663,14 @@ struct AllReduceAddRmsNormLaunch {
   int64_t residual_output_size_m, residual_output_size_n;
   int64_t scratch_stride_m, scratch_stride_n;
   int64_t scratch_size_m, scratch_size_n;
+  int64_t scratch_values_stride_m, scratch_values_stride_n;
+  int64_t scratch_values_size_m, scratch_values_size_n;
+  int64_t scratch_scales_stride_m, scratch_scales_stride_n;
+  int64_t scratch_scales_size_m, scratch_scales_size_n;
+  int64_t staging_values_stride_m, staging_values_stride_n;
+  int64_t staging_values_size_m, staging_values_size_n;
+  int64_t staging_scales_stride_m, staging_scales_stride_n;
+  int64_t staging_scales_size_m, staging_scales_size_n;
   DType dtype;
   DType weight_dtype;
   float eps;
@@ -594,6 +692,7 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
+  Quantization quantization;
   int reduce_scatter_blocks;
   hipStream_t stream;
   const void* input;
@@ -625,6 +724,14 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int64_t block_output_size_m, block_output_size_n;
   int64_t scratch_stride_m, scratch_stride_n;
   int64_t scratch_size_m, scratch_size_n;
+  int64_t scratch_values_stride_m, scratch_values_stride_n;
+  int64_t scratch_values_size_m, scratch_values_size_n;
+  int64_t scratch_scales_stride_m, scratch_scales_stride_n;
+  int64_t scratch_scales_size_m, scratch_scales_size_n;
+  int64_t staging_values_stride_m, staging_values_stride_n;
+  int64_t staging_values_size_m, staging_values_size_n;
+  int64_t staging_scales_stride_m, staging_scales_stride_n;
+  int64_t staging_scales_size_m, staging_scales_size_n;
   DType dtype;
   int num_blocks;
   float eps;

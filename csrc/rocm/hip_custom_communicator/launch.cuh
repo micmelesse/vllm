@@ -39,7 +39,21 @@ struct Call<void (*)(PARAMS...)> {
 // rank's scratch or staging where the kernel uses it, then every rank's signal
 // block, this rank's, its rank and the wait limit; then the kernel's own
 // arguments. A ONE-SHOT reads only the inputs; a TWO-SHOT also every rank's
-// scratch.
+// scratch, and the quantized forms of the scratch and of the staged input
+// (null with none: the kernel reads neither).
+
+// A TWO-SHOT'S QUANTIZED BUFFERS' TABLES: the handle's, or null with none.
+struct QuantizedTables {
+  void* const* scratch_values;
+  void* const* scratch_scales;
+  void* const* staging_values;
+  void* const* staging_scales;
+};
+inline QuantizedTables quantized_tables(const Handle& h, Quantization q) {
+  if (q == Quantization::none) return {nullptr, nullptr, nullptr, nullptr};
+  return {h.scratch_values_ptrs(), h.scratch_scales_ptrs(),
+          h.staging_values_ptrs(), h.staging_scales_ptrs()};
+}
 
 // A [rows, cols] BUFFER'S BYTES at its row stride, first element to last: what
 // an eager input's copy into the registered buffer moves, so the peers read it
@@ -85,6 +99,7 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         h.status_stride_field(), h.status_size_field(), h.rank(),
         h.timeout_ticks());
   else {
+    const QuantizedTables q = quantized_tables(h, l.quantization);
     const void* const* input_ptrs = h.input_ptrs(
         l.input,
         extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype),
@@ -110,7 +125,19 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
           static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n),
           h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
           static_cast<int>(l.scratch_size_m),
-          static_cast<int>(l.scratch_size_n), h.signals_ptrs(),
+          static_cast<int>(l.scratch_size_n), q.scratch_values, l.scratch_values_stride_m,
+          l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
+          static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+          l.scratch_scales_stride_m, l.scratch_scales_stride_n,
+          static_cast<int>(l.scratch_scales_size_m),
+          static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+          l.staging_values_stride_m, l.staging_values_stride_n,
+          static_cast<int>(l.staging_values_size_m),
+          static_cast<int>(l.staging_values_size_n), q.staging_scales,
+          l.staging_scales_stride_m, l.staging_scales_stride_n,
+          static_cast<int>(l.staging_scales_size_m),
+          static_cast<int>(l.staging_scales_size_n),
+          h.signals_ptrs(),
           h.signals_stride_parity(), h.signals_stride_block(),
           h.signals_stride_writer(), h.signals_size_parity(),
           h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -123,6 +150,7 @@ inline void launch_all_reduce_rms_norm(Handle& h,
                                        const AllReduceRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const QuantizedTables q = quantized_tables(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
@@ -146,7 +174,19 @@ inline void launch_all_reduce_rms_norm(Handle& h,
         l.output_stride_n, static_cast<int>(l.output_size_m),
         static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m),
-        static_cast<int>(l.scratch_size_n), h.signals_ptrs(),
+        static_cast<int>(l.scratch_size_n), q.scratch_values, l.scratch_values_stride_m,
+        l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        l.scratch_scales_stride_m, l.scratch_scales_stride_n,
+        static_cast<int>(l.scratch_scales_size_m),
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        l.staging_values_stride_m, l.staging_values_stride_n,
+        static_cast<int>(l.staging_values_size_m),
+        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        l.staging_scales_stride_m, l.staging_scales_stride_n,
+        static_cast<int>(l.staging_scales_size_m),
+        static_cast<int>(l.staging_scales_size_n),
+        h.signals_ptrs(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -158,6 +198,7 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
                                            const AllReduceAddRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const QuantizedTables q = quantized_tables(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
@@ -192,6 +233,18 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         static_cast<int>(l.residual_output_size_n), h.scratch_ptrs(),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
+        q.scratch_values, l.scratch_values_stride_m,
+        l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        l.scratch_scales_stride_m, l.scratch_scales_stride_n,
+        static_cast<int>(l.scratch_scales_size_m),
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        l.staging_values_stride_m, l.staging_values_stride_n,
+        static_cast<int>(l.staging_values_size_m),
+        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        l.staging_scales_stride_m, l.staging_scales_stride_n,
+        static_cast<int>(l.staging_scales_size_m),
+        static_cast<int>(l.staging_scales_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -204,6 +257,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
     Handle& h, const AllReduceAddAttnResRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
+  const QuantizedTables q = quantized_tables(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
@@ -256,6 +310,18 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(l.block_output_size_n), h.scratch_ptrs(),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
+        q.scratch_values, l.scratch_values_stride_m,
+        l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        l.scratch_scales_stride_m, l.scratch_scales_stride_n,
+        static_cast<int>(l.scratch_scales_size_m),
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        l.staging_values_stride_m, l.staging_values_stride_n,
+        static_cast<int>(l.staging_values_size_m),
+        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        l.staging_scales_stride_m, l.staging_scales_stride_n,
+        static_cast<int>(l.staging_scales_size_m),
+        static_cast<int>(l.staging_scales_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -285,6 +351,18 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(l.block_output_size_n), h.scratch_ptrs(),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
+        q.scratch_values, l.scratch_values_stride_m,
+        l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        l.scratch_scales_stride_m, l.scratch_scales_stride_n,
+        static_cast<int>(l.scratch_scales_size_m),
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        l.staging_values_stride_m, l.staging_values_stride_n,
+        static_cast<int>(l.staging_values_size_m),
+        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        l.staging_scales_stride_m, l.staging_scales_stride_n,
+        static_cast<int>(l.staging_scales_size_m),
+        static_cast<int>(l.staging_scales_size_n),
         h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),

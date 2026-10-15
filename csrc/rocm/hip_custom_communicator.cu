@@ -175,7 +175,8 @@ using BuildInfoWire =
 // AN OP'S ANSWER, primitive ints: [the Error's number it was refused for, or -1
 // when it ran; then, when it ran, WHAT RAN, for the flight recorder: algorithm,
 // direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu,
-// staged (1 or 0), tile_k, reduce_scatter_blocks (0 where the op has none)].
+// staged (1 or 0), tile_k, reduce_scatter_blocks (0 where the op has none),
+// quantization (common.cuh's Quantization)].
 using Answer = std::vector<int64_t>;
 Answer refusal(hip_custom_communicator::Error e) {
   return {static_cast<int64_t>(e)};
@@ -200,7 +201,8 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
           l.waves_per_eu,
           staged,
           tile_k,
-          reduce_scatter_blocks};
+          reduce_scatter_blocks,
+          static_cast<int64_t>(l.quantization)};
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
@@ -209,13 +211,15 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
 // and the peers' opened. `timeout_seconds`: how long a kernel waits on a peer
 // before it reports a fault. `max_rows` and `max_cols`: the largest call it
 // serves (for a model, the server's tokens a batch by its hidden size), from
-// which its exchange is sized (`exchange_sizes`). A torch op cannot return a
-// variant, so it is two optionals and exactly one is set, the handle or the
-// Error's number.
+// which its exchange is sized (`exchange_sizes`). `quantize_min_bytes`: the
+// least bytes a two-shot call moves INT4 at, or -1, never (select.cuh's
+// `with_quantization`). A torch op cannot return a variant, so it is two
+// optionals and exactly one is set, the handle or the Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
                                       int64_t device, double timeout_seconds,
-                                      int64_t max_rows, int64_t max_cols) {
+                                      int64_t max_rows, int64_t max_cols,
+                                      int64_t quantize_min_bytes) {
   TORCH_CHECK(max_rows > 0 && max_cols > 0,
               "the largest call a communicator serves has rows and columns: "
               "max_rows=",
@@ -237,7 +241,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
       (*pg)->getRank(), world, gather_over(*pg), timeout_seconds, max_rows,
-      max_cols, sizes.scratch_bytes, sizes.staging_bytes);
+      max_cols, sizes.scratch_bytes, sizes.quantized_values_bytes,
+      sizes.quantized_scales_bytes, sizes.staging_bytes, quantize_min_bytes);
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -273,7 +278,9 @@ BuildInfoWire hip_custom_communicator_build_info() {
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
   // search space), flat: a build's fields in `fields`' order, 0 where its op's
   // BuildConfig has none (every field it has is set). The launch is not a
-  // build's: a forced call gives its own grid.
+  // build's: a forced call gives its own grid. Nor is an INT4 twin a build to
+  // force: the handle quantizes (select.cuh's `with_quantization`), so only the
+  // builds moving their dtype are listed.
   const Names fields = {"tile_m", "tile_n", "tile_k", "threads_per_block",
                         "waves_per_eu"};
   Names templates, template_ops;
@@ -281,8 +288,10 @@ BuildInfoWire hip_custom_communicator_build_info() {
   for (const TemplateInfo& t : kTemplates) {
     templates.push_back(t.name);
     template_ops.push_back(to_string(op_of(t.fn)));
-    counts.push_back(static_cast<int64_t>(t.builds.size()));
-    for (const BuildConfig& b : t.builds)
+    int64_t listed = 0;
+    for (const BuildConfig& b : t.builds) {
+      if (quantization_of(b) != Quantization::none) continue;
+      ++listed;
       std::visit(
           [&](const auto& f) {
             int64_t k = 0;
@@ -292,6 +301,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
                 {f.tile_m, f.tile_n, k, f.threads_per_block, f.waves_per_eu});
           },
           b);
+    }
+    counts.push_back(listed);
   }
   // EACH OP'S PLAIN CALL (kOps, select.cuh), in `ops`' order: its dtypes and
   // its weight's besides its input's, flat, and four ints an op: those two

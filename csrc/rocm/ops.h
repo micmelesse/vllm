@@ -65,7 +65,7 @@ std::tuple<std::optional<int64_t>, std::optional<int64_t>>
 hip_custom_communicator_open(const std::string& cpu_group,
                              const std::string& device_group, int64_t device,
                              double timeout_seconds, int64_t max_rows,
-                             int64_t max_cols);
+                             int64_t max_cols, int64_t quantize_min_bytes);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // scratch_bytes, staging_bytes, then each op's max_bytes in kOps' order].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,

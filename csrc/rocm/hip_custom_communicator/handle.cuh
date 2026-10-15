@@ -61,20 +61,29 @@ class Handle {
   // own timeout, as every other collective on it has. THE EXCHANGE'S SIZES are
   // the caller's too, computed from the largest call it serves, `max_rows` rows
   // of at most `max_cols` columns (select.cuh's `exchange_sizes`): kept, so
-  // what the buffers were sized for can be asked.
+  // what the buffers were sized for can be asked. `quantized_values_bytes` and
+  // `quantized_scales_bytes`: one quantized buffer's values and scales at that
+  // box (common.cuh's QUANTIZATION). `quantize_min_bytes`: the least bytes a
+  // two-shot call moves INT4 at (select.cuh's `with_quantization`), or -1,
+  // never.
   Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
          int64_t max_rows, int64_t max_cols, int64_t scratch_bytes,
-         int64_t staging_bytes, const BuildInfo& build = kBuild)
+         int64_t quantized_values_bytes, int64_t quantized_scales_bytes,
+         int64_t staging_bytes, int64_t quantize_min_bytes,
+         const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
         max_rows_(max_rows),
         max_cols_(max_cols),
         scratch_bytes_(scratch_bytes),
-        staging_bytes_(staging_bytes) {
+        quantized_values_bytes_(quantized_values_bytes),
+        quantized_scales_bytes_(quantized_scales_bytes),
+        staging_bytes_(staging_bytes),
+        quantize_min_bytes_(quantize_min_bytes) {
     // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging
     // runs off its own allocation, never into barrier state.
     signals_ = alloc_symmetric(kSignalsBytes);
-    exchange_ = alloc_symmetric(scratch_bytes_ + staging_bytes_);
+    exchange_ = alloc_symmetric(staging_offset() + staging_bytes_);
     // THE STATUS, host-mapped and coherent: a wait that gives up writes its
     // fault with system-scope atomics while the host polls it, and the host
     // sets its `abort` (common.cuh's BARRIER). The kernels take its device
@@ -97,21 +106,43 @@ class Handle {
     const auto peer_exchange =
         open_peers(gather(ipc_bytes(exchange_)), exchange_);
     // EVERY RANK'S SIGNALS, SCRATCH AND STAGING, a table each, written once:
-    // each rank's exchange is [ scratch | staging ], at the same offsets on
-    // every rank. The staging is registered here too, so an eager input's
-    // launch reads its table.
+    // each rank's exchange is [ scratch | scratch values | scratch scales |
+    // staging values | staging scales | staging ], at the same offsets on every
+    // rank. THE QUANTIZED REGIONS ARE FIXED, so their tables are written once;
+    // the STAGED INPUT'S LIES PAST EVERY KERNEL'S SCRATCH, since an INT4
+    // two-shot writes it before its first barrier, while a peer may still read
+    // this rank's scratch after its last (common.cuh's publish_staged). The
+    // staging is registered here too, so an eager input's launch reads its
+    // table.
     HIP_CHECK(hipMalloc(&signals_ptrs_, kMaxRanks * sizeof(void*)));
     std::vector<void*> signals(kMaxRanks, nullptr);
     std::vector<void*> scratch(world_size_), staging(world_size_);
+    std::vector<void*> scratch_values(world_size_), scratch_scales(world_size_);
+    std::vector<void*> staging_values(world_size_), staging_scales(world_size_);
+    const int64_t quantized = quantized_values_bytes_ + quantized_scales_bytes_;
     for (int i = 0; i < world_size_; ++i) {
+      char* const at = static_cast<char*>(peer_exchange[i]);
       signals[i] = peer_signals[i];
-      scratch[i] = peer_exchange[i];
-      staging[i] = static_cast<char*>(peer_exchange[i]) + scratch_bytes_;
+      scratch[i] = at;
+      scratch_values[i] = at + scratch_bytes_;
+      scratch_scales[i] = at + scratch_bytes_ + quantized_values_bytes_;
+      staging_values[i] = at + scratch_bytes_ + quantized;
+      staging_scales[i] =
+          at + scratch_bytes_ + quantized + quantized_values_bytes_;
+      staging[i] = at + staging_offset();
     }
     HIP_CHECK(hipMemcpy(signals_ptrs_, signals.data(),
                         kMaxRanks * sizeof(void*), hipMemcpyHostToDevice));
     scratch_ptrs_ = next_slot();
     write_slot(scratch_ptrs_, scratch);
+    scratch_values_ptrs_ = next_slot();
+    write_slot(scratch_values_ptrs_, scratch_values);
+    scratch_scales_ptrs_ = next_slot();
+    write_slot(scratch_scales_ptrs_, scratch_scales);
+    staging_values_ptrs_ = next_slot();
+    write_slot(staging_values_ptrs_, staging_values);
+    staging_scales_ptrs_ = next_slot();
+    write_slot(staging_scales_ptrs_, staging_scales);
     staging_ptrs_ = next_slot();
     write_slot(staging_ptrs_, staging);
     registered_[staging[rank_]] = staging_ptrs_;
@@ -141,12 +172,16 @@ class Handle {
   int64_t max_rows() const { return max_rows_; }
   int64_t max_cols() const { return max_cols_; }
   int64_t scratch_bytes() const { return scratch_bytes_; }
+  // One quantized buffer's values and scales, the most each region holds.
+  int64_t quantized_values_bytes() const { return quantized_values_bytes_; }
+  int64_t quantized_scales_bytes() const { return quantized_scales_bytes_; }
   // Where an eager input is copied for its peers to read, and how many bytes it
   // holds.
   void* staging() const {
-    return static_cast<char*>(exchange_) + scratch_bytes_;
+    return static_cast<char*>(exchange_) + staging_offset();
   }
   int64_t staging_bytes() const { return staging_bytes_; }
+  int64_t quantize_min_bytes() const { return quantize_min_bytes_; }
 
   // THE BUFFERS A CAPTURE RECORDED, registered, every rank together. During
   // capture an input's address is not registered yet, so `inp_ptrs` reserves a
@@ -218,9 +253,14 @@ class Handle {
                                 hipStream_t stream) {
     return slot_for(const_cast<void*>(input), bytes, stream);
   }
-  // Every rank's scratch and staging, fixed for the handle's life.
+  // Every rank's scratch and staging, and the quantized forms of the scratch
+  // and of the staged input, fixed for the handle's life.
   void* const* scratch_ptrs() const { return scratch_ptrs_; }
   void* const* staging_ptrs() const { return staging_ptrs_; }
+  void* const* scratch_values_ptrs() const { return scratch_values_ptrs_; }
+  void* const* scratch_scales_ptrs() const { return scratch_scales_ptrs_; }
+  void* const* staging_values_ptrs() const { return staging_values_ptrs_; }
+  void* const* staging_scales_ptrs() const { return staging_scales_ptrs_; }
   // The synchronization state: every rank's signal block, this rank's, and how
   // long a wait may last before it gives up. Every rank's signals, [R, 2,
   // kMaxBlocks, kMaxRanks] (owner, parity, block, writer): the table, then the
@@ -307,6 +347,12 @@ class Handle {
   }
 
  private:
+  // The staging's offset in the exchange: past the scratch and the quantized
+  // regions.
+  int64_t staging_offset() const {
+    return scratch_bytes_ + 2 * (quantized_values_bytes_ + quantized_scales_bytes_);
+  }
+
   // ONE ALLOCATION OF THIS RANK'S SYMMETRIC MEMORY, `bytes` of it, zeroed.
   // UNCACHED, as aiter and vLLM's custom all-reduce allocate theirs: peers read
   // what this rank wrote, and cached, those writes sit dirty in L2 for the
@@ -425,7 +471,10 @@ class Handle {
   int64_t max_rows_;
   int64_t max_cols_;
   int64_t scratch_bytes_;
+  int64_t quantized_values_bytes_;
+  int64_t quantized_scales_bytes_;
   int64_t staging_bytes_;
+  int64_t quantize_min_bytes_;
   void* signals_ = nullptr;
   void* exchange_ = nullptr;
   uint32_t* status_ = nullptr;
@@ -434,6 +483,10 @@ class Handle {
   void** signals_ptrs_ = nullptr;
   void** scratch_ptrs_ = nullptr;
   void** staging_ptrs_ = nullptr;
+  void** scratch_values_ptrs_ = nullptr;
+  void** scratch_scales_ptrs_ = nullptr;
+  void** staging_values_ptrs_ = nullptr;
+  void** staging_scales_ptrs_ = nullptr;
   void** slab_ = nullptr;
   void** slab_end_ = nullptr;
   void** cursor_ = nullptr;
