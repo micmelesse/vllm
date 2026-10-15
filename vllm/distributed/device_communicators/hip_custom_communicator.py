@@ -634,7 +634,8 @@ class HipCustomCommunicator:
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
         sized for; None is the server's (`problem_size`). `quantize_min_bytes`: the
         least bytes a two-shot call moves INT4 at, -1 never; None is what
-        `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks (`quantize_min_bytes_of`)."""
+        `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks
+        (`quantize_min_bytes_of`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
