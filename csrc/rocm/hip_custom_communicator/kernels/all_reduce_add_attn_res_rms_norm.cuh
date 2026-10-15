@@ -239,7 +239,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. Wait until every peer has launched, so its input is ready.
+  // 1. Every rank's input address, then wait until every peer has launched, so
+  // its input is ready. THE TABLE IS READ BEFORE THE WAIT: read after it (in
+  // peers_load, every row), the barrier's stores left the table no longer
+  // provably unwritten, so it was four vector loads and a wait a row where it
+  // is one scalar load (s_load_dwordx16) a launch, and 156 VGPRs where 123 at
+  // 8192 (ISA 2026-10-15T18-25-21Z).
+  const DTYPE* input[WORLD];
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) input[r] = input_ptrs[r];
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -250,7 +258,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
-    peers_load<1, THREADS_PER_BLOCK>(input_ptrs, input_stride_m, input_stride_n,
+    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
                                      input_size_m, input_size_n, peers, row, 0);
     float sum_f[1][K][P];
     peers_sum(peers, sum_f);
