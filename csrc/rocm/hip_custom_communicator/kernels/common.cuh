@@ -35,6 +35,7 @@
 //   SOFTMAX    OnlineSoftmax
 //   PEERS      StatusField, kStatusFields, kMaxRanks, kMaxBlocks
 //   BARRIER    Until: what a barrier waits for (launched, visible, read)
+//   COLLECTIVES Direction: where a reduce-scatter's sum goes (pull, push)
 
 #pragma once
 
@@ -2236,9 +2237,10 @@ DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging,
 // A RANK'S COPY OF A FLAT CHUNK IS LANES = THREADS / WORLD threads, whole waves (its rank's
 // pointer one scalar select), thread t in rank (rank + t / LANES) % WORLD's copy: ROTATED.
 
-// WHICH WAY A REDUCE-SCATTER'S SUM GOES: pull keeps it in this rank's scratch; push stores it in
-// every rank's (itself too), so after the sync each rank holds the whole sum locally.
-enum class Direction { pull, push };
+// WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
+// reads its peers and keeps the sum in its scratch; push, the sum is stored in every rank's
+// (itself too), so after the sync each rank holds the whole sum locally.
+enum class Direction : int { pull = 0, push = 1 };
 
 namespace impl {
 // THE SHARES of total elements over WORLD ranks, in whole packs (the last rank's short): a rank's
