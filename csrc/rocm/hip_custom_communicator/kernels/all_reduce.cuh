@@ -193,7 +193,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // and scales, and the sums' are the scratch values and scales.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,

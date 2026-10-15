@@ -1419,7 +1419,13 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 // whole group of every peer was 46-62 registers and spilled (the int4-wip prototype).
 // =================================================================================================
 
-enum class Quantization : int { none = 0, int4 = 1 };
+// A TEMPLATE INT, not an enum: a kernel's demangled name then reads `0` or `1` where an
+// enum's reads `(hip_custom_communicator::Quantization)1`, which the ISA tools cut at the
+// parenthesis, so a kernel's two builds were one file.
+namespace Quantization {
+constexpr int none = 0;
+constexpr int int4 = 1;
+}  // namespace Quantization
 
 constexpr int kInt4Group = 32;           // elements a group
 constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's values
@@ -1684,7 +1690,7 @@ DINLINE void publish_staged() {
 }
 
 // RANK r'S BUFFER OF A QUANTIZED FORM (rank_of), or null with none, its table unread.
-template <Quantization QUANTIZATION, typename E>
+template <int QUANTIZATION, typename E>
 DINLINE E* quantized_rank_of(E* const* ptrs, int r) {
   if constexpr (QUANTIZATION == Quantization::none)
     return nullptr;
@@ -1695,7 +1701,7 @@ DINLINE E* quantized_rank_of(E* const* ptrs, int r) {
 // THE EXCHANGE'S MEMORY IN QUANTIZATION'S FORM, what the COLLECTIVES and the INTERFACE call: with
 // none MEMORY's own function on the plain buffer (the quantized form's arguments unread), with int4
 // the one above on its values and scales.
-template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, typename U,
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int ROWS, int K, int P>
 DINLINE void exchanged_load(const T* input_ptr, int64_t input_stride_m,
                             const uint8_t* values_ptr, int64_t values_stride_m,
@@ -1711,7 +1717,7 @@ DINLINE void exchanged_load(const T* input_ptr, int64_t input_stride_m,
                                     offs_n, row_step);
 }
 
-template <int THREADS_M, int THREADS_N, int THREADS, Quantization QUANTIZATION, typename T,
+template <int THREADS_M, int THREADS_N, int THREADS, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
 DINLINE void exchanged_store(const U (&input)[ROWS][K][P], T* output_ptr,
                              int64_t output_stride_m, uint8_t* values_ptr,
@@ -1731,7 +1737,7 @@ DINLINE void exchanged_store(const U (&input)[ROWS][K][P], T* output_ptr,
   }
 }
 
-template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, typename U,
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
 DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
                                   const uint8_t* const (&values)[WORLD],
@@ -1749,7 +1755,7 @@ DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_
                                           row_step);
 }
 
-template <int WORLD, int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T,
+template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
 DINLINE void exchanged_all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
                                   const uint8_t* const* values_ptrs, int64_t values_stride_m,
@@ -1966,13 +1972,13 @@ DINLINE void block_sum_rows(const T (&input)[1][K][P], U (&output)[1][K][P]) {
 
 // A SHARE'S GRANULE, in elements: a pack, or with int4 a group, so every rank's sums are whole
 // groups (select quantizes only rows of whole groups for every rank, so the shares are equal).
-template <Quantization QUANTIZATION, int P>
+template <int QUANTIZATION, int P>
 constexpr int kShareGranule = QUANTIZATION == Quantization::none ? P : kInt4Group;
 
 // THE FLAT WALK'S REDUCE-SCATTER: this rank's share, a TILE_N chunk a step, every rank's copy in
 // one round trip, summed over the ranks through LDS, stored in this rank's scratch: with none
 // rounded once to T; with int4 every rank's staged values read and the fp32 sum quantized.
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
                             int64_t input_stride_n, int input_size_m,
@@ -2019,7 +2025,7 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
 
 // THE FLAT WALK'S ALL-GATHER: every rank's summed share out of its scratch (with int4 its values,
 // dequantized to T), at its place in the output, a TILE_N chunk a step.
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
                         __fp16* const* scratch_scales_ptrs, T* output_ptr,
@@ -2080,7 +2086,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
 // input where it is); with int4 every rank's share of it quantized into this rank's staged values
 // and scales (ours, rows back to back), each block the chunks that rank's same block reads, then
 // published (publish_staged).
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                    int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
@@ -2116,7 +2122,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_str
 // band_size_m rows (a row split's slice of rows; else all of them), tiles of TILE_M rows blockIdx.x,
 // blockIdx.x + gridDim.x, ... (the reduce-scatters' walk). kTiles tiles a step, every load in
 // flight before the first is quantized.
-template <int THREADS, int TILE_M, Quantization QUANTIZATION, typename T>
+template <int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_size_m,
                         int input_size_n, uint8_t* values_ptr, int64_t values_stride_m,
                         __fp16* scales_ptr, int64_t scales_stride_m, int band_size_m) {
@@ -2160,7 +2166,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
 // 2026-10-04T21-03-09Z, 21-26-11Z). A ROW OF THREADS' RANK DIFFERS ACROSS THE WAVE (LANES may be
 // half one), so each lane reads its own from the table (an array of every rank's, indexed at run
 // time, was scratch: 136 B). Summed over the rows through LDS into this rank's scratch.
-template <int WORLD, int THREADS, int TILE_M, Quantization QUANTIZATION, typename T>
+template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
                                 int64_t input_stride_m, int input_size_m, int input_size_n,
                                 const uint8_t* const* input_values_ptrs,
@@ -2222,7 +2228,7 @@ DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
 // every peer's packs of a whole slice were 32 at 16384, spilling. Each thread sums every
 // rank's pack in registers in rank order, no LDS; push stores the sum into every rank's
 // scratch, pull into this rank's.
-template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int input_size_m,
@@ -2398,7 +2404,7 @@ DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
 // function on the plain buffer, the quantized form unread; with int4 the values and scales at the
 // same places, a load dequantizing into its registers' dtype and a store quantizing its registers.
 // The sizes that clamp and mask are the plain buffer's (the tensor's, in elements).
-template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, typename U,
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int ROWS, int K, int P>
 DINLINE void load(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                   int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
@@ -2413,7 +2419,7 @@ DINLINE void load(const T* input_ptr, int64_t input_stride_m, int64_t input_stri
       input_scales_stride_m, input_size_m, input_size_n, output, offs_m, offs_n, row_step);
 }
 
-template <int THREADS_M, int THREADS_N, int THREADS, Quantization QUANTIZATION, typename T,
+template <int THREADS_M, int THREADS_N, int THREADS, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
 DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_stride_m,
                    int64_t output_stride_n, int output_size_m, int output_size_n,
@@ -2429,7 +2435,7 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
       offs_n, row_step);
 }
 
-template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, typename U,
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
 DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
                         int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -2455,7 +2461,7 @@ DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
       input_size_m, input_size_n, output, offs_m, offs_n, row_step);
 }
 
-template <int WORLD, int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T,
+template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
 DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
                         int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
@@ -2617,7 +2623,7 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 // exchange followed by its quantized form (int4: the input's staged values and scales, `stage`'s;
 // the sums' values and scales), read in place of it; the overload without them moves the buffers
 // as they are (the staged build's).
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
@@ -2651,7 +2657,7 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
 }
 // All-gather: every rank's summed range, from its scratch (int4: its values, dequantized), at its
 // place in the output.
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void all_gather(
     T* const* scratch_ptrs, int64_t scratch_stride_m, int64_t scratch_stride_n,
@@ -2692,7 +2698,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
 // THE IN-PLACE TWO-SHOT'S STAGE, before its first barrier: with none nothing (its peers read the
 // input where it is); with int4 every rank's range of it quantized into this rank's staged values
 // and scales (the input's quantized form the reduce-scatter reads), published to the peers.
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                    int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
@@ -2711,7 +2717,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_str
 // place, published to the peers. Its rows are the ones this block's twin on every rank reads: in
 // each band of band_size_m rows (a row split's slice of rows; else input_size_m), tiles of TILE_M
 // rows blockIdx.x, blockIdx.x + gridDim.x, ...
-template <int THREADS, int TILE_M, Quantization QUANTIZATION, typename T>
+template <int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                         int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
                         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
@@ -2729,7 +2735,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t inpu
 // rows of threads a chunk, ranks rotated, summed through LDS (block b's tiles of TILE_M rows).
 // QUANTIZATION as the flat walk's: int4 reads every rank's staged values (stage_rows') and stores
 // the sums' values and scales.
-template <int WORLD, int THREADS, int TILE_M, Quantization QUANTIZATION, typename T>
+template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
@@ -2753,7 +2759,7 @@ DINLINE void reduce_scatter_lds(
 // the sum in every rank's scratch (int4: quantized once, stored in every rank's values and
 // scales). This rank's size_n columns from offs_n (in elements) of block b's block_size_m rows b,
 // b + grid, ..., computed by the kernel at its entry.
-template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, Quantization QUANTIZATION,
+template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,

@@ -1178,7 +1178,7 @@ struct QuantizedView {
   int64_t values_stride_m, values_stride_n, values_size_m, values_size_n;
   int64_t scales_stride_m, scales_stride_n, scales_size_m, scales_size_n;
 };
-constexpr QuantizedView quantized_view(Quantization q, int64_t m, int64_t n) {
+constexpr QuantizedView quantized_view(int q, int64_t m, int64_t n) {
   if (q == Quantization::none) return {};
   return {n / 2, 1, m, n / 2, n / kInt4Group, 1, m, n / kInt4Group};
 }

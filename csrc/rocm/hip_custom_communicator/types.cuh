@@ -193,7 +193,7 @@ struct AllReduceBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  Quantization quantization = Quantization::none;
+  int quantization = Quantization::none;  // a Quantization
   bool operator==(const AllReduceBuildConfig&) const = default;
 };
 // all_reduce_rms_norm.
@@ -202,7 +202,7 @@ struct AllReduceRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  Quantization quantization = Quantization::none;
+  int quantization = Quantization::none;  // a Quantization
   bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_rms_norm.
@@ -211,7 +211,7 @@ struct AllReduceAddRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  Quantization quantization = Quantization::none;
+  int quantization = Quantization::none;  // a Quantization
   bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
@@ -221,7 +221,7 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_m;
   int tile_n;
   int tile_k;
-  Quantization quantization = Quantization::none;
+  int quantization = Quantization::none;  // a Quantization
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 using BuildConfig =
@@ -258,11 +258,11 @@ constexpr int tile_m_of(const BuildConfig& b) {
 constexpr int tile_n_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.tile_n; }, b);
 }
-constexpr Quantization quantization_of(const BuildConfig& b) {
+constexpr int quantization_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.quantization; }, b);
 }
 // The same build, moving `q` across the links.
-constexpr BuildConfig quantized(BuildConfig b, Quantization q) {
+constexpr BuildConfig quantized(BuildConfig b, int q) {
   std::visit([q](auto& f) { f.quantization = q; }, b);
   return b;
 }
@@ -573,7 +573,7 @@ struct AllReduceLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
-  Quantization quantization;
+  int quantization;  // a Quantization
   bool staged;
   hipStream_t stream;
   const void* input;
@@ -608,7 +608,7 @@ struct AllReduceRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
-  Quantization quantization;
+  int quantization;  // a Quantization
   hipStream_t stream;
   const void* input;
   int64_t input_stride_m, input_stride_n;
@@ -644,7 +644,7 @@ struct AllReduceAddRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
-  Quantization quantization;
+  int quantization;  // a Quantization
   hipStream_t stream;
   const void* input;
   int64_t input_stride_m, input_stride_n;
@@ -692,7 +692,7 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int threads_per_block;
   int blocks_per_grid;
   int waves_per_eu;
-  Quantization quantization;
+  int quantization;  // a Quantization
   int reduce_scatter_blocks;
   hipStream_t stream;
   const void* input;

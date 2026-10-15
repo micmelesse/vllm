@@ -49,7 +49,7 @@ struct QuantizedTables {
   void* const* staging_values;
   void* const* staging_scales;
 };
-inline QuantizedTables quantized_tables(const Handle& h, Quantization q) {
+inline QuantizedTables quantized_tables(const Handle& h, int q) {
   if (q == Quantization::none) return {nullptr, nullptr, nullptr, nullptr};
   return {h.scratch_values_ptrs(), h.scratch_scales_ptrs(),
           h.staging_values_ptrs(), h.staging_scales_ptrs()};

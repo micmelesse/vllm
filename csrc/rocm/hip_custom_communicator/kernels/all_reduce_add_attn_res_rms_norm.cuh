@@ -306,7 +306,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // stored in and gathered from the scratch values and scales.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_M, int TILE_N,
           int TILE_K, int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
@@ -453,7 +453,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // QUANTIZATION as the pull's: with int4 the sums pushed to and read from the
 // scratch values and scales.
 template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, Quantization QUANTIZATION>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,

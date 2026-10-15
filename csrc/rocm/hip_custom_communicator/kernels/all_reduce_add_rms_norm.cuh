@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // staged values and scales, and the owner's rows stored in and gathered from
 // the scratch values and scales (the row scales stay plain floats).
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
-          int TILE_N, int THREADS_PER_BLOCK, Quantization QUANTIZATION>
+          int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -285,10 +285,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   peers_ptrs<WORLD>(staging_values_ptrs, staging_values);
   __fp16* staging_scales[WORLD];
   peers_ptrs<WORLD>(staging_scales_ptrs, staging_scales);
-  uint8_t* scratch_values[WORLD];
-  peers_ptrs<WORLD>(scratch_values_ptrs, scratch_values);
-  __fp16* scratch_scales[WORLD];
-  peers_ptrs<WORLD>(scratch_scales_ptrs, scratch_scales);
   uint8_t* const own_scratch_values = peer_ptr(scratch_values_ptrs, rank);
   __fp16* const own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
 
@@ -419,6 +415,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // A PACK A THREAD, stepping across the row (THREADS_PER_BLOCK packs a step,
   // K = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
+  // THE QUANTIZED SCRATCH'S POINTERS HERE, after the second barrier: read with
+  // the others, held across the reduce, the int4 8192-column build ran out of
+  // SGPRs (106, 8 spilled) and spilled 30 VGPRs (2026-10-15T22-28-01Z).
+  uint8_t* scratch_values[WORLD];
+  peers_ptrs<WORLD>(scratch_values_ptrs, scratch_values);
+  __fp16* scratch_scales[WORLD];
+  peers_ptrs<WORLD>(scratch_scales_ptrs, scratch_scales);
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
@@ -472,7 +475,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 // THE KERNELS, one per op, both the body above.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
@@ -525,7 +528,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
@@ -605,7 +608,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // from every rank's staged values and scales, and the sums pushed to and read
 // from the scratch values and scales.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
-          int TILE_N, int THREADS_PER_BLOCK, Quantization QUANTIZATION>
+          int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION>
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -754,7 +757,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 // THE KERNELS, one per op, both the body above.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
@@ -807,7 +810,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          Quantization QUANTIZATION>
+          int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(
         const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
