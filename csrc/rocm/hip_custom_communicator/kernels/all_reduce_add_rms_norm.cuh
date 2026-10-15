@@ -278,8 +278,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // time (the one-shot's head).
   const DTYPE* input[WORLD];
   peers_ptrs<WORLD>(input_ptrs, input);
-  DTYPE* scratch[WORLD];
-  peers_ptrs<WORLD>(scratch_ptrs, scratch);
   DTYPE* const own_scratch = peer_ptr(scratch_ptrs, rank);
   uint8_t* staging_values[WORLD];
   peers_ptrs<WORLD>(staging_values_ptrs, staging_values);
@@ -415,9 +413,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // A PACK A THREAD, stepping across the row (THREADS_PER_BLOCK packs a step,
   // K = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
-  // THE QUANTIZED SCRATCH'S POINTERS HERE, after the second barrier: read with
-  // the others, held across the reduce, the int4 8192-column build ran out of
-  // SGPRs (106, 8 spilled) and spilled 30 VGPRs (2026-10-15T22-28-01Z).
+  // THE SCRATCH'S POINTERS HERE, after the second barrier, the only phase that
+  // reads them: read after the first and held across the reduce, the int4
+  // 8192-column build ran out of SGPRs (106, 8 spilled) and spilled 30 VGPRs
+  // (2026-10-15T22-28-01Z), then 8 holding the plain table (22-32-57Z).
+  DTYPE* scratch[WORLD];
+  peers_ptrs<WORLD>(scratch_ptrs, scratch);
   uint8_t* scratch_values[WORLD];
   peers_ptrs<WORLD>(scratch_values_ptrs, scratch_values);
   __fp16* scratch_scales[WORLD];
