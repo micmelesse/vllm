@@ -160,10 +160,9 @@ enum class Template : int {
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's
-// whole input; two-shot reduce-scatters then gathers) and the direction (pull:
-// this rank reads its peers; push: they write into it).
+// whole input; two-shot reduce-scatters then gathers) and the direction
+// (common.cuh's `Direction`, which its reduce-scatters take too).
 enum class Algorithm : int { one_shot = 0, two_shot = 1 };
-enum class Direction : int { pull = 0, push = 1 };
 
 // WHICH OP the caller asked for: an all-reduce, alone or with what it fuses.
 enum class OpType : int {
