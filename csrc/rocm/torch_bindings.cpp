@@ -94,30 +94,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 
-  // ROCm TP collectives. Only the two collectives take tensors, so only they
-  // get a schema plus a device impl. THE REST TAKE NONE, and an op with no
+  // ROCm TP collectives. Only the ops that take tensors get a schema (the
+  // collectives also a device impl). THE REST TAKE NONE, and an op with no
   // tensor argument has nothing for the dispatcher to select a backend from --
   // a `kCPU` impl is then unreachable and the call raises "no fallback function
   // is registered". So they are bound directly, which is what vLLM's
-  // quick-reduce does with its own handle ops.
-  rocm_ops.def(
-      "hip_custom_communicator_open(str cpu_group, str device_group, int "
-      "device, "
-      "float timeout_seconds, int max_rows, int max_cols) -> (int?, int?)",
-      &hip_custom_communicator_open);
-  rocm_ops.def(
-      "hip_custom_communicator_capacity(int max_rows, int max_cols, int world) "
-      "-> int[]",
-      &hip_custom_communicator_capacity);
+  // quick-reduce does with its own handle ops, and their schema is INFERRED
+  // from the C++ signature: one source, nothing to keep in step (a hand-written
+  // schema that disagreed with its function failed the library load,
+  // 2026-10-14).
+  rocm_ops.def("hip_custom_communicator_open", &hip_custom_communicator_open);
+  rocm_ops.def("hip_custom_communicator_capacity",
+               &hip_custom_communicator_capacity);
   rocm_ops.def("hip_custom_communicator_dispose",
                &hip_custom_communicator_dispose);
   // The fault record the watchdog polls, and the abort it sets (barrier.cuh).
-  rocm_ops.def("hip_custom_communicator_status(int handle_ptr) -> int[]",
+  rocm_ops.def("hip_custom_communicator_status",
                &hip_custom_communicator_status);
-  rocm_ops.def("hip_custom_communicator_signals(int handle_ptr) -> int[]",
+  rocm_ops.def("hip_custom_communicator_signals",
                &hip_custom_communicator_signals);
-  rocm_ops.def("hip_custom_communicator_abort(int handle_ptr) -> ()",
-               &hip_custom_communicator_abort);
+  rocm_ops.def("hip_custom_communicator_abort", &hip_custom_communicator_abort);
   rocm_ops.def(
       "hip_custom_communicator_register_buffer(int handle_ptr, Tensor buffer, "
       "str group) -> ()",
@@ -126,17 +122,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hip_custom_communicator_forget_buffer(int handle_ptr, Tensor buffer) -> "
       "()",
       &hip_custom_communicator_forget_buffer);
-  rocm_ops.def("hip_custom_communicator_wall_clock_khz(int device) -> int",
+  rocm_ops.def("hip_custom_communicator_wall_clock_khz",
                &hip_custom_communicator_wall_clock_khz);
-  rocm_ops.def(
-      "hip_custom_communicator_supported(int device, int world) -> (str?, "
-      "int?)",
-      &hip_custom_communicator_supported);
-  rocm_ops.def(
-      "hip_custom_communicator_build_info() -> (str[], int[], int, str[], "
-      "str[], str[], str[], str[], "
-      "str[], int[], int[], str[], str[], int[])",
-      &hip_custom_communicator_build_info);
+  rocm_ops.def("hip_custom_communicator_supported",
+               &hip_custom_communicator_supported);
+  rocm_ops.def("hip_custom_communicator_build_info",
+               &hip_custom_communicator_build_info);
   rocm_ops.def("hip_custom_communicator_register_captured",
                &hip_custom_communicator_register_captured);
 

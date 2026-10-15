@@ -76,6 +76,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Where,
     build_info,
     capacity_of,
+    open_handle,
     should,
     supported,
 )
@@ -1019,11 +1020,6 @@ def run_collective(
             s, replay = k % n, k // n
             feed(s, replay)
             out[s] += [o.clone() for o in body(s)]
-        # SYNCHRONIZED BEFORE RETURNING, as the graph path is: the caller reads the
-        # signals next, and a launch still in flight shows its barrier mid-way (the
-        # peers' flags set, this rank's not yet cleared), which read as a call that
-        # left its signals set (2026-10-15: every eager "hang" since the check).
-        torch.accelerator.synchronize()
         return out
 
     for _ in range(
@@ -1209,8 +1205,8 @@ def exercise(
                 got = run_collective(
                     comm, op_name, [i[rank] for i in inputs], sched, forced
                 )
-                # NOTHING LEFT BEHIND, after every call of the schedule (run_collective
-                # synchronized): ours returns its signals to zero.
+                # NOTHING LEFT BEHIND, after every call of the schedule (`signals()`
+                # waits for the launches itself): ours returns its signals to zero.
                 if isinstance(comm, HipCustomCommunicator) and (
                     left := [
                         f for f in comm.signals() if f.state is not FlagState.clear
@@ -2054,10 +2050,10 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     # example-based: the lookup has one outcome for every unregistered name
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
-    handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
+    got = open_handle(
         "no-such", "no-such", 0, TEST_TIMEOUT_SECONDS, TEST_MAX_ROWS, TEST_MAX_COLS
     )
-    assert handle is None and Error(err) is Error.no_such_group
+    assert got is Error.no_such_group
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])

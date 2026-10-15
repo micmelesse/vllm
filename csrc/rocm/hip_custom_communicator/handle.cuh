@@ -253,11 +253,18 @@ class Handle {
   }
   // THIS RANK'S SIGNALS, every flag, as (parity, block, writer, value), the
   // value a FlagState unless the memory is corrupt. Between launches every one
-  // is `clear` (common.cuh's BARRIER); read only once the launches have
-  // finished, as this copies device memory that a running kernel is changing.
+  // is `clear` (common.cuh's BARRIER); read once every launch has finished,
+  // which this waits for itself.
   std::vector<std::array<int64_t, 4>> signals() const {
     std::vector<uint32_t> flags(
         static_cast<size_t>(kSignalsBytes / sizeof(uint32_t)));
+    // EVERY LAUNCH FINISHED FIRST, here and not at the callers: read
+    // mid-launch, a barrier shows its peers' flags set and this rank's not yet
+    // cleared, which reads as a launch that left its signals set (a test that
+    // synchronized on one of its two paths, 2026-10-15). torch's streams are
+    // non-blocking, so the copy below would not wait for them. A hung launch
+    // hangs this query too: status() is the one readable while a kernel waits.
+    HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipMemcpy(flags.data(), signals_,
                         static_cast<size_t>(kSignalsBytes),
                         hipMemcpyDeviceToHost));

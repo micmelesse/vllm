@@ -366,6 +366,24 @@ class Supported:
     arch: str
 
 
+def open_handle(
+    cpu_group: str,
+    device_group: str,
+    device: int,
+    timeout_seconds: float,
+    max_rows: int,
+    max_cols: int,
+) -> int | Error:
+    """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
+    `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
+    group): the handle, or the Error it was refused for. The one place Python calls
+    C++'s opener, so its arguments are written once."""
+    handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
+        cpu_group, device_group, device, timeout_seconds, max_rows, max_cols
+    )
+    return Error(err) if err is not None else handle
+
+
 def supported(device: torch.device, world: int) -> Supported | Error:
     """Whether our kernels run on `device` in a world of `world`, as the C++ build
     answers it (`hip_custom_communicator::supported`): the Supported, or the Error."""
@@ -1020,7 +1038,7 @@ class HipCustomCommunicator:
         """
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
-        handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
+        handle = open_handle(
             self.cpu_group.group_name,
             self.device_group.group_name,
             self.device.index,
@@ -1028,8 +1046,8 @@ class HipCustomCommunicator:
             self.max_rows,
             self.max_cols,
         )
-        if err is not None:
-            return Error(err).name
+        if isinstance(handle, Error):
+            return handle.name
         self._handle = handle
         self._khz = torch.ops._rocm_C.hip_custom_communicator_wall_clock_khz(
             self.device.index
@@ -1230,9 +1248,10 @@ class HipCustomCommunicator:
         return Status(abort=abort != 0, fault=fault)
 
     def signals(self) -> list[Flag]:
-        """Every flag of this rank's signals, each `clear` between launches. It
-        reads device memory, so call it only once the launches have finished
-        (`torch.accelerator.synchronize()`)."""
+        """Every flag of this rank's signals, each `clear` between launches. C++
+        waits for every launch on the device to finish before it reads them, so a
+        caller need not synchronize; a hung launch hangs this query too (`status()`
+        is readable while a kernel waits)."""
         if self._handle is None:
             return []
         flat = torch.ops._rocm_C.hip_custom_communicator_signals(self._handle)
