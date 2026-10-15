@@ -234,13 +234,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     int64_t scratch_stride_n, uint8_t* const* __restrict__ scratch_values_ptrs,
     int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
     int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* __restrict__ scratch_scales_ptrs,
+    __fp16* const* __restrict__ scratch_scales_ptrs,
     int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
     int scratch_scales_size_m, int scratch_scales_size_n,
     uint8_t* const* __restrict__ staging_values_ptrs,
     int64_t staging_values_stride_m, int64_t staging_values_stride_n,
     int staging_values_size_m, int staging_values_size_n,
-    _Float16* const* __restrict__ staging_scales_ptrs,
+    __fp16* const* __restrict__ staging_scales_ptrs,
     int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
     int staging_scales_size_m, int staging_scales_size_n,
     uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
@@ -283,14 +283,14 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   DTYPE* const own_scratch = peer_ptr(scratch_ptrs, rank);
   uint8_t* staging_values[WORLD];
   peers_ptrs<WORLD>(staging_values_ptrs, staging_values);
-  _Float16* staging_scales[WORLD];
+  __fp16* staging_scales[WORLD];
   peers_ptrs<WORLD>(staging_scales_ptrs, staging_scales);
   uint8_t* scratch_values[WORLD];
   peers_ptrs<WORLD>(scratch_values_ptrs, scratch_values);
-  _Float16* scratch_scales[WORLD];
+  __fp16* scratch_scales[WORLD];
   peers_ptrs<WORLD>(scratch_scales_ptrs, scratch_scales);
   uint8_t* const own_scratch_values = peer_ptr(scratch_values_ptrs, rank);
-  _Float16* const own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
+  __fp16* const own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -486,13 +486,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,
@@ -543,13 +543,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,
@@ -619,13 +619,13 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     uint8_t* const* __restrict__ scratch_values_ptrs,
     int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
     int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* __restrict__ scratch_scales_ptrs,
+    __fp16* const* __restrict__ scratch_scales_ptrs,
     int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
     int scratch_scales_size_m, int scratch_scales_size_n,
     uint8_t* const* __restrict__ staging_values_ptrs,
     int64_t staging_values_stride_m, int64_t staging_values_stride_n,
     int staging_values_size_m, int staging_values_size_n,
-    _Float16* const* __restrict__ staging_scales_ptrs,
+    __fp16* const* __restrict__ staging_scales_ptrs,
     int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
     int staging_scales_size_m, int staging_scales_size_n,
     uint32_t* const* __restrict__ signals_ptrs, int64_t signals_stride_parity,
@@ -699,7 +699,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    finished).
   const DTYPE* const own_scratch = peer_ptr(scratch_ptrs, rank);
   const uint8_t* const own_scratch_values = peer_ptr(scratch_values_ptrs, rank);
-  const _Float16* const own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
+  const __fp16* const own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // scratch's, the residual's and the weight's (one-shot's).
@@ -768,13 +768,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,
@@ -825,13 +825,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,

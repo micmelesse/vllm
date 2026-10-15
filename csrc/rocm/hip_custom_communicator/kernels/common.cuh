@@ -1428,7 +1428,7 @@ constexpr int kInt4ScaleBytes = 2;       // a group's scale
 
 namespace impl {
 typedef __attribute__((address_space(1))) uint32_t global_u32;
-typedef __attribute__((address_space(1))) _Float16 global_f16;
+typedef __attribute__((address_space(1))) __fp16 global_f16;
 
 // `offset` bytes past `base`, the offset opaque so the address is built at its access (at_col's).
 template <typename E>
@@ -1442,7 +1442,7 @@ DINLINE E* at_offset(E* base, uint32_t offset) {
 DINLINE uint32_t int4_word_load(const uint8_t* row, int pack) {
   return *(const global_u32*)at_offset(row, static_cast<uint32_t>(pack) * kInt4WordBytes);
 }
-DINLINE _Float16 int4_scale_load(const _Float16* row, int pack) {
+DINLINE float int4_scale_load(const __fp16* row, int pack) {
   return *(const global_f16*)at_offset(
       row, static_cast<uint32_t>(pack / kInt4GroupPacks) * kInt4ScaleBytes);
 }
@@ -1450,28 +1450,36 @@ DINLINE void int4_word_store(uint8_t* row, int pack, uint32_t word) {
   *(global_u32*)at_offset(row, static_cast<uint32_t>(pack) * kInt4WordBytes) = word;
 }
 // Once a group, by its first pack's lane.
-DINLINE void int4_scale_store(_Float16* row, int pack, _Float16 scale) {
+DINLINE void int4_scale_store(__fp16* row, int pack, float scale) {
   if (pack % kInt4GroupPacks == 0)
     *(global_f16*)at_offset(
-        row, static_cast<uint32_t>(pack / kInt4GroupPacks) * kInt4ScaleBytes) = scale;
+        row, static_cast<uint32_t>(pack / kInt4GroupPacks) * kInt4ScaleBytes) =
+        static_cast<__fp16>(scale);
 }
 
-// A PACK'S WORD AT ITS GROUP'S SCALE: (q - 8) * scale, exact in fp32, rounded once to U.
+// A PACK'S WORD AT ITS GROUP'S SCALE: (q - 8) * scale, exact in fp32, rounded once to U, a
+// 16-bit dtype. MADE AS A LOADED PACK IS, four 32-bit words copied in whole: element by element,
+// each 16-bit value held a register of its own and the pull norms' two rows of every peer's
+// packs spilled 188 VGPRs (256 VGPRs, 592 B of scratch; 2026-10-15T22-21-26Z).
 template <typename U, int P>
-DINLINE void int4_decode(uint32_t word, _Float16 scale, U (&output)[P]) {
-  static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  const float s = static_cast<float>(scale);
+DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
+  static_assert(P * 4 == 32 && sizeof(U) == 2, "a pack is one word of 8 16-bit values");
+  const auto element = [&](int j) {
+    const U x = static_cast<U>(
+        static_cast<float>(static_cast<int>((word >> (4 * j)) & 0xFu) - 8) * scale);
+    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, x));
+  };
+  u32x4 packed;
 #pragma unroll
-  for (int j = 0; j < P; ++j)
-    output[j] = static_cast<U>(
-        static_cast<float>(static_cast<int>((word >> (4 * j)) & 0xFu) - 8) * s);
+  for (int w = 0; w < P / 2; ++w) packed[w] = element(2 * w) | element(2 * w + 1) << 16;
+  __builtin_memcpy(output, &packed, sizeof(packed));
 }
 
 // A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
 // (quad_perm [1,0,3,2], then [2,3,0,1]), / 7, to fp16 (past its largest, clamped to it); then each
 // value rounded to the nearest of -8..7 times the scale stored. A group of zeros is all 8s at scale 0.
 template <typename T, int P>
-DINLINE void int4_encode(const T (&input)[P], uint32_t& word, _Float16& scale) {
+DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
   float x[P];
   float amax = 0.0f;
@@ -1482,9 +1490,8 @@ DINLINE void int4_encode(const T (&input)[P], uint32_t& word, _Float16& scale) {
   }
   amax = Max::apply(dpp<0xb1, 0xf, Max>(amax), amax);
   amax = Max::apply(dpp<0x4e, 0xf, Max>(amax), amax);
-  scale = static_cast<_Float16>(fminf(amax * (1.0f / 7.0f), 65504.0f));
-  const float s = static_cast<float>(scale);
-  const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+  scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
+  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
   word = 0;
 #pragma unroll
   for (int j = 0; j < P; ++j) {
@@ -1496,14 +1503,14 @@ DINLINE void int4_encode(const T (&input)[P], uint32_t& word, _Float16& scale) {
 // Every pack of a thread's registers, encoded or decoded.
 template <typename T, int ROWS, int K, int P>
 DINLINE void int4_encode(const T (&input)[ROWS][K][P], uint32_t (&words)[ROWS][K],
-                         _Float16 (&scales)[ROWS][K]) {
+                         float (&scales)[ROWS][K]) {
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
 #pragma unroll
     for (int k = 0; k < K; ++k) int4_encode(input[i][k], words[i][k], scales[i][k]);
 }
 template <typename U, int ROWS, int K, int P>
-DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const _Float16 (&scales)[ROWS][K],
+DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
                          U (&output)[ROWS][K][P]) {
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
@@ -1516,18 +1523,18 @@ DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const _Float16 (&scal
 // first is decoded.
 template <int THREADS_M, int THREADS_N, typename U, int ROWS, int K, int P>
 DINLINE void int4_load(const uint8_t* values_ptr, int64_t values_stride_m,
-                       const _Float16* scales_ptr, int64_t scales_stride_m, int size_m,
+                       const __fp16* scales_ptr, int64_t scales_stride_m, int size_m,
                        int size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
                        int row_step) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
   uint32_t words[ROWS][K];
-  _Float16 scales[ROWS][K];
+  float scales[ROWS][K];
 #pragma unroll
   for (int i = 0; i < ROWS; ++i) {
     if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
     const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
     const uint8_t* values_row = values_ptr + row * values_stride_m;
-    const _Float16* scales_row = scales_ptr + row * scales_stride_m;
+    const __fp16* scales_row = scales_ptr + row * scales_stride_m;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
       const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
@@ -1540,8 +1547,8 @@ DINLINE void int4_load(const uint8_t* values_ptr, int64_t values_stride_m,
 }
 
 template <int THREADS_M, int THREADS_N, int THREADS, int ROWS, int K>
-DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const _Float16 (&scales)[ROWS][K],
-                        uint8_t* values_ptr, int64_t values_stride_m, _Float16* scales_ptr,
+DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
+                        uint8_t* values_ptr, int64_t values_stride_m, __fp16* scales_ptr,
                         int64_t scales_stride_m, int size_m, int size_n, int offs_m,
                         int offs_n, int row_step) {
   constexpr int P = kInt4Group / kInt4GroupPacks;
@@ -1552,7 +1559,7 @@ DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const _Float16 (&scale
     if (!row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
     const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
     uint8_t* values_row = values_ptr + row * values_stride_m;
-    _Float16* scales_row = scales_ptr + row * scales_stride_m;
+    __fp16* scales_row = scales_ptr + row * scales_stride_m;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
       if (pack_mask<P, THREADS_N>(size_n, offs_n, k) == 0.0f) continue;
@@ -1567,12 +1574,12 @@ DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const _Float16 (&scale
 // and scale an add of it.
 template <int THREADS_M, int THREADS_N, typename U, int WORLD, int ROWS, int K, int P>
 DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
-                             const _Float16* const (&scales)[WORLD], int64_t scales_stride_m,
+                             const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
                              int size_m, int size_n, U (&output)[WORLD][ROWS][K][P],
                              int offs_m, int offs_n, int row_step) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
   uint32_t words[WORLD][ROWS][K];
-  _Float16 group_scales[WORLD][ROWS][K];
+  float group_scales[WORLD][ROWS][K];
 #pragma unroll
   for (int i = 0; i < ROWS; ++i) {
     if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
@@ -1580,9 +1587,12 @@ DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t valu
     for (int k = 0; k < K; ++k) {
       const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
       const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
-      int64_t value_at = row * values_stride_m + int64_t{pack} * kInt4WordBytes;
-      int64_t scale_at =
-          (row * scales_stride_m + pack / kInt4GroupPacks) * kInt4ScaleBytes;
+      // 32-BIT BYTE OFFSETS: a quantized buffer is ours, at most the box's (select's
+      // exchange_sizes), so each rank's address is its base plus one offset register.
+      uint32_t value_at = static_cast<uint32_t>(row * values_stride_m) +
+                          static_cast<uint32_t>(pack) * kInt4WordBytes;
+      uint32_t scale_at = static_cast<uint32_t>(
+          (row * scales_stride_m + pack / kInt4GroupPacks) * kInt4ScaleBytes);
       asm volatile("" : "+v"(value_at));
       asm volatile("" : "+v"(scale_at));
 #pragma unroll
@@ -1601,12 +1611,12 @@ DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t valu
 // Each pack from the rank owning its columns, slice_n a rank (all_gather's).
 template <int WORLD, int THREADS_M, int THREADS_N, typename U, int ROWS, int K, int P>
 DINLINE void int4_all_gather(const uint8_t* const* values_ptrs, int64_t values_stride_m,
-                             const _Float16* const* scales_ptrs, int64_t scales_stride_m,
+                             const __fp16* const* scales_ptrs, int64_t scales_stride_m,
                              int size_m, int size_n, U (&output)[ROWS][K][P], int offs_m,
                              int offs_n, int slice_n) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
   uint32_t words[ROWS][K];
-  _Float16 scales[ROWS][K];
+  float scales[ROWS][K];
 #pragma unroll
   for (int i = 0; i < ROWS; ++i) {
     if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, 1, i)) continue;
@@ -1626,13 +1636,13 @@ DINLINE void int4_all_gather(const uint8_t* const* values_ptrs, int64_t values_s
 // THE FLAT WALK'S (COLLECTIVES): a chunk of the range from element `first` of a quantized buffer
 // whose rows are back to back (ours), `first` a whole group; and stored, its first `len` elements.
 template <int THREADS_N, typename U, int K, int P>
-DINLINE void int4_range_load(const uint8_t* values_ptr, const _Float16* scales_ptr,
+DINLINE void int4_range_load(const uint8_t* values_ptr, const __fp16* scales_ptr,
                              U (&output)[1][K][P], int64_t first, int size_n, int offs_n) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
   const uint8_t* values_run = values_ptr + first / 2;
-  const _Float16* scales_run = scales_ptr + first / kInt4Group;
+  const __fp16* scales_run = scales_ptr + first / kInt4Group;
   uint32_t words[1][K];
-  _Float16 scales[1][K];
+  float scales[1][K];
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
@@ -1643,13 +1653,13 @@ DINLINE void int4_range_load(const uint8_t* values_ptr, const _Float16* scales_p
   int4_decode(words, scales, output);
 }
 template <int THREADS_N, int K>
-DINLINE void int4_range_store(const uint32_t (&words)[1][K], const _Float16 (&scales)[1][K],
-                              uint8_t* values_ptr, _Float16* scales_ptr, int64_t first,
+DINLINE void int4_range_store(const uint32_t (&words)[1][K], const float (&scales)[1][K],
+                              uint8_t* values_ptr, __fp16* scales_ptr, int64_t first,
                               int offs_n, int len) {
   constexpr int P = kInt4Group / kInt4GroupPacks;
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
   uint8_t* values_run = values_ptr + first / 2;
-  _Float16* scales_run = scales_ptr + first / kInt4Group;
+  __fp16* scales_run = scales_ptr + first / kInt4Group;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     const int c =
@@ -1689,7 +1699,7 @@ template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, t
           int ROWS, int K, int P>
 DINLINE void exchanged_load(const T* input_ptr, int64_t input_stride_m,
                             const uint8_t* values_ptr, int64_t values_stride_m,
-                            const _Float16* scales_ptr, int64_t scales_stride_m, int size_m,
+                            const __fp16* scales_ptr, int64_t scales_stride_m, int size_m,
                             int size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
                             int row_step) {
   if constexpr (QUANTIZATION == Quantization::none)
@@ -1705,7 +1715,7 @@ template <int THREADS_M, int THREADS_N, int THREADS, Quantization QUANTIZATION, 
           typename U, int ROWS, int K, int P>
 DINLINE void exchanged_store(const U (&input)[ROWS][K][P], T* output_ptr,
                              int64_t output_stride_m, uint8_t* values_ptr,
-                             int64_t values_stride_m, _Float16* scales_ptr,
+                             int64_t values_stride_m, __fp16* scales_ptr,
                              int64_t scales_stride_m, int size_m, int size_n, int offs_m,
                              int offs_n, int row_step) {
   if constexpr (QUANTIZATION == Quantization::none) {
@@ -1713,7 +1723,7 @@ DINLINE void exchanged_store(const U (&input)[ROWS][K][P], T* output_ptr,
                                          offs_m, offs_n, row_step);
   } else {
     uint32_t words[ROWS][K];
-    _Float16 scales[ROWS][K];
+    float scales[ROWS][K];
     int4_encode(input, words, scales);
     int4_store<THREADS_M, THREADS_N, THREADS>(words, scales, values_ptr, values_stride_m,
                                               scales_ptr, scales_stride_m, size_m, size_n,
@@ -1726,7 +1736,7 @@ template <int THREADS_M, int THREADS_N, Quantization QUANTIZATION, typename T, t
 DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
                                   const uint8_t* const (&values)[WORLD],
                                   int64_t values_stride_m,
-                                  const _Float16* const (&scales)[WORLD],
+                                  const __fp16* const (&scales)[WORLD],
                                   int64_t scales_stride_m, int size_m, int size_n,
                                   U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
                                   int row_step) {
@@ -1743,7 +1753,7 @@ template <int WORLD, int THREADS_M, int THREADS_N, Quantization QUANTIZATION, ty
           typename U, int ROWS, int K, int P>
 DINLINE void exchanged_all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
                                   const uint8_t* const* values_ptrs, int64_t values_stride_m,
-                                  const _Float16* const* scales_ptrs,
+                                  const __fp16* const* scales_ptrs,
                                   int64_t scales_stride_m, int size_m, int size_n,
                                   U (&output)[ROWS][K][P], int offs_m, int offs_n,
                                   int slice_n) {
@@ -1967,9 +1977,9 @@ template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUAN
 DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
                             int64_t input_stride_n, int input_size_m,
                             int input_size_n, const uint8_t* const* input_values_ptrs,
-                            const _Float16* const* input_scales_ptrs,
+                            const __fp16* const* input_scales_ptrs,
                             T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
-                            _Float16* const* scratch_scales_ptrs, int rank) {
+                            __fp16* const* scratch_scales_ptrs, int rank) {
   constexpr int LANES = THREADS / WORLD;
   constexpr int P = traits<T>::N;
   constexpr int K = TILE_N / (P * LANES);
@@ -2012,7 +2022,7 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUANTIZATION,
           typename T>
 DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
-                        _Float16* const* scratch_scales_ptrs, T* output_ptr,
+                        __fp16* const* scratch_scales_ptrs, T* output_ptr,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   constexpr int LANES = THREADS / WORLD;
@@ -2074,7 +2084,7 @@ template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, Quantization QUAN
           typename T>
 DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                    int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
-                   _Float16* staging_scales_ptr, int rank) {
+                   __fp16* staging_scales_ptr, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
     constexpr int LANES = THREADS / WORLD;
     constexpr int P = traits<T>::N;
@@ -2091,7 +2101,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_str
                                     input_size_n, part, share_first(slice, r), len,
                                     chunk * TILE_N);
       uint32_t words[1][K];
-      _Float16 scales[1][K];
+      float scales[1][K];
       int4_encode(part, words, scales);
       int4_range_store<LANES>(words, scales, staging_values_ptr, staging_scales_ptr,
                               share_first(slice, r), chunk * TILE_N, len);
@@ -2109,7 +2119,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_str
 template <int THREADS, int TILE_M, Quantization QUANTIZATION, typename T>
 DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_size_m,
                         int input_size_n, uint8_t* values_ptr, int64_t values_stride_m,
-                        _Float16* scales_ptr, int64_t scales_stride_m, int band_size_m) {
+                        __fp16* scales_ptr, int64_t scales_stride_m, int band_size_m) {
   if constexpr (QUANTIZATION == Quantization::int4) {
     constexpr int P = traits<T>::N;
     constexpr int K = 2;
@@ -2119,7 +2129,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
       const int tiles = (rows + TILE_M - 1) / TILE_M;
       const T* band_input = input_ptr + int64_t{band} * input_stride_m;
       uint8_t* band_values = values_ptr + int64_t{band} * values_stride_m;
-      _Float16* band_scales = scales_ptr + int64_t{band} * scales_stride_m;
+      __fp16* band_scales = scales_ptr + int64_t{band} * scales_stride_m;
       for (int t = blockIdx.x; t < tiles; t += kTiles * gridDim.x)
         for (int c = 0; c < input_size_n; c += THREADS * P * K) {
           T x[kTiles][TILE_M][K][P];
@@ -2130,7 +2140,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
 #pragma unroll
           for (int s = 0; s < kTiles; ++s) {
             uint32_t words[TILE_M][K];
-            _Float16 scales[TILE_M][K];
+            float scales[TILE_M][K];
             int4_encode(x[s], words, scales);
             int4_store<1, THREADS, THREADS>(
                 words, scales, band_values, values_stride_m, band_scales, scales_stride_m,
@@ -2155,11 +2165,11 @@ DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
                                 int64_t input_stride_m, int input_size_m, int input_size_n,
                                 const uint8_t* const* input_values_ptrs,
                                 int64_t input_values_stride_m,
-                                const _Float16* const* input_scales_ptrs,
+                                const __fp16* const* input_scales_ptrs,
                                 int64_t input_scales_stride_m, T* const* scratch_ptrs,
                                 int64_t scratch_stride_m, uint8_t* const* scratch_values_ptrs,
                                 int64_t scratch_values_stride_m,
-                                _Float16* const* scratch_scales_ptrs,
+                                __fp16* const* scratch_scales_ptrs,
                                 int64_t scratch_scales_stride_m, int rank) {
   constexpr int P = traits<T>::N;
   constexpr int LANES = THREADS / WORLD;
@@ -2172,7 +2182,7 @@ DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
   const int own_packs = max(0, min(slice, packs - col0));
   T* const own_scratch = rank_of(scratch_ptrs, rank);
   uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank);
-  _Float16* const own_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank);
+  __fp16* const own_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank);
   const int end = (col0 + own_packs) * P;  // this rank's columns end, in elements
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
@@ -2217,9 +2227,9 @@ template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, Quantization 
 DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int input_size_m,
     const uint8_t* const* input_values_ptrs, int64_t input_values_stride_m,
-    const _Float16* const* input_scales_ptrs, int64_t input_scales_stride_m,
+    const __fp16* const* input_scales_ptrs, int64_t input_scales_stride_m,
     T* const* scratch_ptrs, int64_t scratch_stride_m, uint8_t* const* scratch_values_ptrs,
-    int64_t scratch_values_stride_m, _Float16* const* scratch_scales_ptrs,
+    int64_t scratch_values_stride_m, __fp16* const* scratch_scales_ptrs,
     int64_t scratch_scales_stride_m, int offs_n, int size_n, int block_size_m, int rank) {
   constexpr int P = traits<T>::N;
   constexpr int kSliceWaves =
@@ -2231,14 +2241,14 @@ DINLINE void reduce_scatter_registers(
   const T* input[WORLD];
   peers_of(input_ptrs, input);
   const uint8_t* input_values[WORLD];
-  const _Float16* input_scales[WORLD];
+  const __fp16* input_scales[WORLD];
   if constexpr (kInt4) {
     peers_of(input_values_ptrs, input_values);
     peers_of(input_scales_ptrs, input_scales);
   }
   T* scratch[WORLD];
   uint8_t* scratch_values[WORLD];
-  _Float16* scratch_scales[WORLD];
+  __fp16* scratch_scales[WORLD];
   if constexpr (DIRECTION == Direction::push) {
     peers_of(scratch_ptrs, scratch);
     if constexpr (kInt4) {
@@ -2261,9 +2271,9 @@ DINLINE void reduce_scatter_registers(
       convert(sum, rounded);
       // INT4 QUANTIZES THE SUM ONCE, whichever ranks it is stored in.
       uint32_t words[1][1];
-      _Float16 scales[1][1];
+      float scales[1][1];
       if constexpr (kInt4) int4_encode(rounded, words, scales);
-      const auto store_in = [&](T* plain, uint8_t* values, _Float16* group_scales) {
+      const auto store_in = [&](T* plain, uint8_t* values, __fp16* group_scales) {
         if constexpr (kInt4)
           int4_store<ROWS, LANES, THREADS>(words, scales, values, scratch_values_stride_m,
                                            group_scales, scratch_scales_stride_m,
@@ -2394,7 +2404,7 @@ DINLINE void load(const T* input_ptr, int64_t input_stride_m, int64_t input_stri
                   int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
                   int64_t input_values_stride_m, int64_t input_values_stride_n,
                   int input_values_size_m, int input_values_size_n,
-                  const _Float16* input_scales_ptr, int64_t input_scales_stride_m,
+                  const __fp16* input_scales_ptr, int64_t input_scales_stride_m,
                   int64_t input_scales_stride_n, int input_scales_size_m,
                   int input_scales_size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
                   int row_step = 1) {
@@ -2409,7 +2419,7 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
                    int64_t output_stride_n, int output_size_m, int output_size_n,
                    uint8_t* output_values_ptr, int64_t output_values_stride_m,
                    int64_t output_values_stride_n, int output_values_size_m,
-                   int output_values_size_n, _Float16* output_scales_ptr,
+                   int output_values_size_n, __fp16* output_scales_ptr,
                    int64_t output_scales_stride_m, int64_t output_scales_stride_n,
                    int output_scales_size_m, int output_scales_size_n, int offs_m,
                    int offs_n, int row_step = 1) {
@@ -2426,14 +2436,14 @@ DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
                         const uint8_t* const* input_values_ptrs,
                         int64_t input_values_stride_m, int64_t input_values_stride_n,
                         int input_values_size_m, int input_values_size_n,
-                        const _Float16* const* input_scales_ptrs,
+                        const __fp16* const* input_scales_ptrs,
                         int64_t input_scales_stride_m, int64_t input_scales_stride_n,
                         int input_scales_size_m, int input_scales_size_n,
                         U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
                         int row_step = 1) {
   const T* input[WORLD];
   const uint8_t* values[WORLD];
-  const _Float16* scales[WORLD];
+  const __fp16* scales[WORLD];
   if constexpr (QUANTIZATION == Quantization::none) {
     impl::peers_of(input_ptrs, input);
   } else {
@@ -2452,7 +2462,7 @@ DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
                         const uint8_t* const* scratch_values_ptrs,
                         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
                         int scratch_values_size_m, int scratch_values_size_n,
-                        const _Float16* const* scratch_scales_ptrs,
+                        const __fp16* const* scratch_scales_ptrs,
                         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
                         int scratch_scales_size_m, int scratch_scales_size_n,
                         U (&output)[ROWS][K][P], int offs_m, int offs_n, int slice_n) {
@@ -2613,13 +2623,13 @@ DINLINE void reduce_scatter(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
     int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const _Float16* const* input_scales_ptrs,
+    int input_values_size_n, const __fp16* const* input_scales_ptrs,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
     int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
     int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
     uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
     int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int rank) {
   impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
@@ -2635,9 +2645,9 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
                             int scratch_size_m, int scratch_size_n, int rank) {
   impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
       input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      static_cast<const uint8_t* const*>(nullptr), static_cast<const _Float16* const*>(nullptr),
+      static_cast<const uint8_t* const*>(nullptr), static_cast<const __fp16* const*>(nullptr),
       scratch_ptrs, static_cast<uint8_t* const*>(nullptr),
-      static_cast<_Float16* const*>(nullptr), rank);
+      static_cast<__fp16* const*>(nullptr), rank);
 }
 // All-gather: every rank's summed range, from its scratch (int4: its values, dequantized), at its
 // place in the output.
@@ -2648,7 +2658,7 @@ DINLINE void all_gather(
     int scratch_size_m, int scratch_size_n, uint8_t* const* scratch_values_ptrs,
     int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
     int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     T* output_ptr, int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
     int output_size_n, int rank) {
@@ -2664,7 +2674,7 @@ DINLINE void all_gather(T* const* scratch_ptrs, int64_t scratch_stride_m,
                         int output_size_m, int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
       scratch_ptrs, static_cast<uint8_t* const*>(nullptr),
-      static_cast<_Float16* const*>(nullptr), output_ptr, output_stride_m, output_stride_n,
+      static_cast<__fp16* const*>(nullptr), output_ptr, output_stride_m, output_stride_n,
       output_size_m, output_size_n, rank);
 }
 // Staged, first: this rank's input, every rank's range of it, into its staging.
@@ -2688,7 +2698,7 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_str
                    int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
                    int64_t staging_values_stride_m, int64_t staging_values_stride_n,
                    int staging_values_size_m, int staging_values_size_n,
-                   _Float16* staging_scales_ptr, int64_t staging_scales_stride_m,
+                   __fp16* staging_scales_ptr, int64_t staging_scales_stride_m,
                    int64_t staging_scales_stride_n, int staging_scales_size_m,
                    int staging_scales_size_n, int rank) {
   impl::stage<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
@@ -2706,7 +2716,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t inpu
                         int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
                         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
                         int staging_values_size_m, int staging_values_size_n,
-                        _Float16* staging_scales_ptr, int64_t staging_scales_stride_m,
+                        __fp16* staging_scales_ptr, int64_t staging_scales_stride_m,
                         int64_t staging_scales_stride_n, int staging_scales_size_m,
                         int staging_scales_size_n, int band_size_m) {
   impl::stage_rows<THREADS, TILE_M, QUANTIZATION>(
@@ -2724,13 +2734,13 @@ DINLINE void reduce_scatter_lds(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
     int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const _Float16* const* input_scales_ptrs,
+    int input_values_size_n, const __fp16* const* input_scales_ptrs,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
     int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
     int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
     uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
     int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int rank) {
   impl::reduce_scatter_lds<WORLD, THREADS, TILE_M, QUANTIZATION>(
@@ -2749,13 +2759,13 @@ DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
     int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const _Float16* const* input_scales_ptrs,
+    int input_values_size_n, const __fp16* const* input_scales_ptrs,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
     int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
     int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
     uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
     int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    _Float16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int offs_n, int size_n, int block_size_m, int rank) {
   impl::reduce_scatter_registers<WORLD, THREADS, TILE_N, DIRECTION, QUANTIZATION>(

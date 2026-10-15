@@ -333,13 +333,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,
@@ -480,13 +480,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint8_t* const* __restrict__ scratch_values_ptrs,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        _Float16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* const* __restrict__ scratch_scales_ptrs,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
         uint8_t* const* __restrict__ staging_values_ptrs,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        _Float16* const* __restrict__ staging_scales_ptrs,
+        __fp16* const* __restrict__ staging_scales_ptrs,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
         uint32_t* const* __restrict__ signals_ptrs,
@@ -565,7 +565,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    peer's next kernel starts only once this one has finished).
   const DTYPE* own_scratch = peer_ptr(scratch_ptrs, rank);
   const uint8_t* own_scratch_values = peer_ptr(scratch_values_ptrs, rank);
-  const _Float16* own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
+  const __fp16* own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
     load<1, THREADS_PER_BLOCK, QUANTIZATION>(
