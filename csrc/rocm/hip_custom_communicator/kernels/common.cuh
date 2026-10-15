@@ -2275,29 +2275,36 @@ DINLINE void reduce_scatter_registers(
       peers_sum(peers, sum);
       Summed rounded[1][1][P];
       convert(sum, rounded);
-      // INT4 QUANTIZES THE SUM ONCE, whichever ranks it is stored in.
-      uint32_t words[1][1];
-      float scales[1][1];
-      if constexpr (kInt4) int4_encode(rounded, words, scales);
-      const auto store_in = [&](T* plain, uint8_t* values, __fp16* group_scales) {
-        if constexpr (kInt4)
+      if constexpr (!kInt4) {
+        if constexpr (DIRECTION == Direction::push) {
+#pragma unroll
+          for (int r = 0; r < WORLD; ++r)
+            store<ROWS, LANES, THREADS>(rounded, scratch[r], scratch_stride_m,
+                                        input_size_m, offs_n + size_n, offs_m, c,
+                                        static_cast<int>(gridDim.x));
+        } else {
+          store<ROWS, LANES, THREADS>(rounded, rank_of(scratch_ptrs, rank),
+                                      scratch_stride_m, input_size_m,
+                                      offs_n + size_n, offs_m, c,
+                                      static_cast<int>(gridDim.x));
+        }
+      } else {
+        // INT4 QUANTIZES THE SUM ONCE, whichever ranks it is stored in.
+        uint32_t words[1][1];
+        float scales[1][1];
+        int4_encode(rounded, words, scales);
+        const auto store_in = [&](uint8_t* values, __fp16* group_scales) {
           int4_store<ROWS, LANES, THREADS>(words, scales, values, scratch_values_stride_m,
                                            group_scales, scratch_scales_stride_m,
                                            input_size_m, offs_n + size_n, offs_m, c,
                                            static_cast<int>(gridDim.x));
-        else
-          store<ROWS, LANES, THREADS>(rounded, plain, scratch_stride_m, input_size_m,
-                                      offs_n + size_n, offs_m, c,
-                                      static_cast<int>(gridDim.x));
-      };
-      if constexpr (DIRECTION == Direction::push) {
+        };
+        if constexpr (DIRECTION == Direction::push) {
 #pragma unroll
-        for (int r = 0; r < WORLD; ++r)
-          store_in(scratch[r], scratch_values[r], scratch_scales[r]);
-      } else {
-        store_in(rank_of(scratch_ptrs, rank),
-                 quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank),
-                 quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank));
+          for (int r = 0; r < WORLD; ++r) store_in(scratch_values[r], scratch_scales[r]);
+        } else {
+          store_in(rank_of(scratch_values_ptrs, rank), rank_of(scratch_scales_ptrs, rank));
+        }
       }
     }
 }
