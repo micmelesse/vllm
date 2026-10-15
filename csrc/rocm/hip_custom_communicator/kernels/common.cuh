@@ -2,39 +2,49 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // COMMON: everything a kernel may call and the machine under it, in sections,
-// each built on those above it: HARDWARE, BUILD, UTILS, TILE, MEMORY,
-// ELEMENTWISE, REDUCE, DOT, SOFTMAX, PEERS, PTR, BARRIER, COLLECTIVES, then
-// THE INTERFACE, last because it passes to them all. Each primitive is
-// implemented in its section's namespace impl, and the interface gives each one
-// a small function that passes its arguments on, every template parameter by
-// name, so what reaches each primitive is visible there. A kernel calls the
-// interface and never names impl:: (dev/lint_kernels.sh).
+// each built on those above it: HARDWARE, BUILD, UTILS, TILES, MEMORY,
+// ELEMENTWISE, REDUCE, DOT, SOFTMAX, PEERS, BARRIER, COLLECTIVES, then THE
+// INTERFACE, last because it passes to them all. Each primitive is implemented
+// in its section's namespace impl as plain loops on ints and arrays, and the
+// interface gives each one a small function that passes its arguments on,
+// every template parameter by name, so what reaches each primitive is visible
+// there. A kernel calls the interface and never names impl::
+// (dev/lint_kernels.sh).
+//
+// THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs,
+// then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer
+// (a device table of every rank's for a peer buffer, `x_ptrs`), its strides,
+// its sizes, in elements; stride_n is 1 (the host checks it; the packed loads
+// need it). A thread's registers are a plain array the caller declares,
+// `T v[ROWS][K][P]`, an input or an output like a buffer: P a pack's elements
+// (16 bytes of the kernel's dtype; an fp32 array holds the same P), thread t
+// lane t % THREADS_N of thread-row t / THREADS_N, holding rows offs_m +
+// (t / THREADS_N + i * THREADS_M) * row_step and packs offs_n / P +
+// t % THREADS_N + k * THREADS_N. Every rank's is `T v[WORLD][ROWS][K][P]`. The
+// shape is template ints only (WORLD, THREADS, THREADS_M, THREADS_N, TILE_N,
+// ...), THREADS_M * THREADS_N <= THREADS the block's; array extents are
+// deduced. A row past size_m loads the last row and a pack past size_n the last
+// pack; stores and column reductions skip them.
 //
 // CONCURRENCY IS PART OF EACH PRIMITIVE'S CONTRACT, so a kernel keeps it by
 // using them:
-//   1. Global memory only through the tile loads and stores: a kernel never
+//   1. Global memory only through the loads and stores here: a kernel never
 //      indexes a row.
-//   2. A tile is loaded whole (tile_load, peers_load: one round trip) before
-//      anything is stored; a pack loaded between stores waits a round trip,
-//      since a store may alias it.
+//   2. A thread's registers are loaded whole (load, peers_load: one round
+//      trip) before anything is stored; a pack loaded between stores waits a
+//      round trip, since a store may alias it.
 //   3. A load that does not depend on a reduction is issued before it
 //      (weights, the next row or source), so its round trip runs under the
 //      reduction.
 //
 // THE TYPES a kernel names, by the section that defines them:
-//   HARDWARE   Hardware, kTarget, kWaveSize: the device's documented facts
-//   BUILD      kBuild: what is compiled for the device
-//   TILE       Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-//              THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>
-//              {M, N, offs_m, offs_n, row_step}: a chunk of an M x N tensor,
-//              the block's threads over it THREADS_M x THREADS_N, this
-//              thread's elements held as ACC_DTYPE; R x M x N with a copy a
-//              rank when TILE_R > 1 (a group of threads a rank, slice() this
-//              thread's); to<U>(), like<U>(), zeros<U>()
-//   REDUCE     Sum, Max (a reduction's operation), Axis::m | n
-//   SOFTMAX    OnlineSoftmax
-//   PEERS      StatusField, kStatusFields, kMaxRanks, kMaxBlocks
-//   BARRIER    Until: what a barrier waits for (launched, visible, read)
+//   HARDWARE    Hardware, kTarget, kWaveSize: the device's documented facts
+//   BUILD       kBuild: what is compiled for the device
+//   UTILS       traits<DTYPE>::N: a pack's elements, the P of an array
+//   REDUCE      Sum, Max (a reduction's operation)
+//   SOFTMAX     OnlineSoftmax
+//   PEERS       StatusField, kStatusFields, kMaxRanks, kMaxBlocks
+//   BARRIER     Until: what a barrier waits for (launched, visible, read)
 //   COLLECTIVES Direction: where a reduce-scatter's sum goes (pull, push)
 
 #pragma once
@@ -378,191 +388,20 @@ struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {
   DTYPE d[VEC_SIZE];
 };
 
-// A PACK: kBuild.memory.pack_bytes (BUILD: the widest load, 8 bf16),
-// the unit every kernel loads, sums and stores in. `num_packs` counts them.
-
+// A PACK: kBuild.memory.pack_bytes (BUILD: the widest load, 8 bf16), the unit
+// every kernel loads, sums and stores in; traits<DTYPE>::N its elements, the P
+// of a thread's registers.
 template <typename DTYPE>
 struct traits {
   static constexpr int N = kBuild.memory.pack_bytes / sizeof(DTYPE);
-  using V = vec<DTYPE, N>;
 };
 
 // =================================================================================================
-// TILE
+// TILES
 //
-// THE TILE: how a kernel cuts its work, in Triton's terms (TILE_M, offs_m, M, a
-// mask for the last tile), and what a thread holds of it.
+// WHICH TILES A BLOCK WORKS ON: a kernel cuts its work in Triton's terms (TILE_M x TILE_N tiles
+// of an M x N tensor, the last one masked), and each block walks its share of them.
 // =================================================================================================
-
-// A TILE, in Triton's terms, and THE ONE TYPE A KERNEL WORKS IN: a chunk of an
-// M x N tensor, the block's work at once (TILE_M rows from offs_m, every
-// row_step-th, and TILE_N columns from offs_n), and the elements of it this
-// thread holds. A 3-D TILE IS R x M x N: TILE_R copies of the chunk, one a rank
-// (R the ranks, the axis a collective reduces over; K stays the GEMM's), each
-// read from its own rank's memory at that rank's strides. Rows and columns
-// count elements, as the tensor does. A row is real when it is below M and a
-// column when it is below N (the last tile may be short; a slice is a tile
-// whose N is the slice's end).
-//   DTYPE              the tensor's dtype in memory: a thread holds
-//   kPack-element groups, one
-//                      16-byte load of it, so a quantized DTYPE holds wider
-//                      groups and nothing else changes
-//   THREADS_M x THREADS_N  THE LAYOUT, the block's threads over the tile as the
-//   tile is TILE_M x
-//                      TILE_N elements: THREADS_N threads share a row's
-//                      columns, every THREADS_N-th group each, and THREADS_M
-//                      rows go at once. 1 x the block for a norm, reducing
-//                      along the row; 8 x 64 (a wave a row) for a narrow slice
-//                      of many rows. Compile-time, since it sizes the registers
-//   THREADS_PER_BLOCK  the kernel's block: a layout of all of it holds a place
-//   in every thread, so
-//                      nothing compares threadIdx (the launch bounds do not
-//                      tell the compiler)
-//   TILE_R, THREADS_R  the rank axis and its layout: THREADS_R groups of
-//   THREADS_M x THREADS_N
-//                      threads, group r holding rank r's copy (THREADS_R ==
-//                      TILE_R: a thread holds one rank's elements, the
-//                      collectives meeting in LDS). 1 x 1 for a 2-D tile
-//   ACC_DTYPE          what the elements are held as: DTYPE as loaded, float
-//   for the math
-//                      (`to<float>()` keeps every element where it is), or a
-//                      weight's own dtype
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE = DTYPE, int TILE_R = 1,
-          int THREADS_R = 1>
-struct Tile {
-  static constexpr int kPack = traits<DTYPE>::N;  // elements in a group
-  static constexpr int kTileR =
-      TILE_R;  // the chunk, ranks x rows x columns in elements
-  static constexpr int kTileM = TILE_M;
-  static constexpr int kTileN = TILE_N;
-  static constexpr int kThreadsR = THREADS_R;
-  static constexpr int kSliceThreads =
-      THREADS_M * THREADS_N;                                  // a rank's copy's
-  static constexpr int kThreads = THREADS_R * kSliceThreads;  // the layout's
-  static_assert(THREADS_R == TILE_R || TILE_R == 1,
-                "a thread holds one rank's copy (THREADS_R == TILE_R) or the "
-                "tile is 2-D");
-  static constexpr int kThreadsPerBlock = THREADS_PER_BLOCK;
-  static_assert(kThreads <= THREADS_PER_BLOCK,
-                "a layout is the block's threads or fewer");
-  static constexpr int kThreadsM = THREADS_M;
-  static constexpr int kThreadsN = THREADS_N;
-  static_assert(TILE_M % THREADS_M == 0,
-                "a tile's rows are whole for every row of threads");
-  static_assert(TILE_N % (kPack * THREADS_N) == 0,
-                "a tile's columns are whole groups for every thread of a row");
-  static constexpr int kRows = TILE_M / THREADS_M;  // rows this thread holds
-  static constexpr int K =
-      TILE_N / (kPack * THREADS_N);  // groups of a row it holds
-  using Dtype = DTYPE;
-  using Acc = ACC_DTYPE;
-  using Pack = vec<ACC_DTYPE, kPack>;  // how a group is loaded and stored, not
-                                       // how it is held
-  int M, N;
-  int offs_m, offs_n;
-  int row_step = 1;
-  ACC_DTYPE v[kRows][K][kPack];
-
-  // A TILE IS ITS PLACE; ITS ELEMENTS START UNSET, as registers do: zeroed by
-  // default they were 32 moves a source in AttnRes's loop, every tile then
-  // loaded over them (ISA 2026-10-04T02-22-41Z). zeros<U>() where a sum starts.
-  Tile() = default;
-  DINLINE Tile(int m, int n, int offs_m_, int offs_n_, int row_step_ = 1)
-      : M(m), N(n), offs_m(offs_m_), offs_n(offs_n_), row_step(row_step_) {}
-
-  // THIS THREAD'S GROUP k OF A ROW, in groups from the row's start: past N
-  // clamped to the last, so every load stays in bounds; its mask is 1 below N
-  // and 0 past it (a float, multiplied in, so nothing reading it branches: a
-  // load under a runtime `if` cannot be hoisted past the branch, and loads
-  // meant to be in flight together then wait one at a time). WHETHER THIS
-  // THREAD HOLDS ANY OF THE TILE: a layout may cover fewer threads than the
-  // block (a reduction's one row, the first THREADS_N's); the others store
-  // nothing. A compare only for a layout narrower than the block, and loads do
-  // not branch on it either way.
-  DINLINE bool participates() const {
-    if constexpr (kThreads == THREADS_PER_BLOCK)
-      return true;
-    else
-      return static_cast<int>(threadIdx.x) < kThreads;
-  }
-  DINLINE int lane() const { return static_cast<int>(threadIdx.x) % THREADS_N; }
-  // THIS THREAD'S RANK COPY, r of R: its group of THREADS_M x THREADS_N
-  // threads.
-  DINLINE int slice() const {
-    if constexpr (THREADS_R == 1)
-      return 0;
-    else
-      return static_cast<int>(threadIdx.x) / kSliceThreads;
-  }
-  DINLINE int col(int k) const {
-    const int n = offs_n / kPack + lane() + k * THREADS_N;
-    return n < N / kPack ? n : N / kPack - 1;
-  }
-  DINLINE float mask(int k) const {
-    return offs_n / kPack + lane() + k * THREADS_N < N / kPack ? 1.0f : 0.0f;
-  }
-  // This thread's row m, a row past M reading row M - 1 (and storing nothing).
-  DINLINE int tile_row(int m) const {
-    // One row of threads: the row is the block's, so its address stays scalar.
-    if constexpr (THREADS_M == 1)
-      return m;
-    else if constexpr (THREADS_R == 1)
-      return static_cast<int>(threadIdx.x) / THREADS_N + m * THREADS_M;
-    else
-      return static_cast<int>(threadIdx.x) % kSliceThreads / THREADS_N +
-             m * THREADS_M;
-  }
-  DINLINE bool live(int m) const { return offs_m + tile_row(m) * row_step < M; }
-  DINLINE int row(int m) const {
-    return live(m) ? offs_m + tile_row(m) * row_step : M - 1;
-  }
-
-  // The same place held as AS_DTYPE, its elements converted (rounded once),
-  // unset, or zero.
-  template <typename AS_DTYPE>
-  using As = Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                  THREADS_PER_BLOCK, AS_DTYPE, TILE_R, THREADS_R>;
-  template <typename AS_DTYPE>
-  DINLINE As<AS_DTYPE> like() const {
-    return As<AS_DTYPE>(M, N, offs_m, offs_n, row_step);
-  }
-  template <typename AS_DTYPE>
-  DINLINE As<AS_DTYPE> zeros() const {
-    As<AS_DTYPE> t = like<AS_DTYPE>();
-#pragma unroll
-    for (int m = 0; m < kRows; ++m)
-#pragma unroll
-      for (int k = 0; k < K; ++k)
-#pragma unroll
-        for (int j = 0; j < kPack; ++j) t.v[m][k][j] = AS_DTYPE(0);
-    return t;
-  }
-  template <typename AS_DTYPE>
-  DINLINE As<AS_DTYPE> to() const {
-    As<AS_DTYPE> t = like<AS_DTYPE>();
-#pragma unroll
-    for (int m = 0; m < kRows; ++m)
-#pragma unroll
-      for (int k = 0; k < K; ++k)
-#pragma unroll
-        for (int j = 0; j < kPack; ++j)
-          t.v[m][k][j] = static_cast<AS_DTYPE>(v[m][k][j]);
-    return t;
-  }
-};
-
-// The tile TILE held as AS_DTYPE (a float tile for the math, a weight's own
-// dtype), and whether a type is a tile.
-template <typename TILE, typename AS_DTYPE>
-using TileAs = typename TILE::template As<AS_DTYPE>;
-template <typename X>
-struct is_tile : std::false_type {};
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, int TILE_R, int THREADS_R>
-struct is_tile<Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                    THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>>
-    : std::true_type {};
 
 // THIS BLOCK'S TILES, grid-strided in row-major order over `tiles_m` x
 // `tiles_n` tiles: `body(row, col)` for each, in tiles. The row and column are
@@ -592,10 +431,9 @@ DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
 // =================================================================================================
 // MEMORY
 //
-// THE READS AND WRITES, ON TILES: a tile's load and store (one round trip a
-// tile), every rank's tile, a tile whose rows are tensors, and a row's scalar.
-// How a group is loaded (one 16-byte global instruction, issued together) is
-// impl's.
+// THE READS AND WRITES, a thread's registers from and to buffers: a load and a store (one round
+// trip), every rank's at once, the all-gather into registers, a row's scalar. How a pack is
+// loaded (one 16-byte global instruction, issued together) is impl's.
 // =================================================================================================
 
 // PEER MEMORY THROUGH GLOBAL INSTRUCTIONS. A pointer read out of a struct has
@@ -635,21 +473,6 @@ DINLINE void issued() {
   __builtin_amdgcn_sched_barrier(0);
 }
 
-// A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the
-// form global_load and global_store take with the base in scalar registers
-// (saddr), so every tensor sharing the columns shares one offset register. A
-// signed column added to the pointer was a 64-bit vector address a tensor a
-// pack, 28 VGPRs held across AttnRes's loops (liveness, 2026-10-04T15-28-51Z).
-// THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so the 64-bit
-// sum is not hoisted and held a tensor a pack (an add a load; AttnRes 90 -> 70
-// VGPRs, 2026-10-04 compile).
-template <typename PACK, typename TILE>
-DINLINE PACK* at_col(PACK* row, const TILE& t, int k) {
-  using Byte = std::conditional_t<std::is_const_v<PACK>, const char, char>;
-  uint32_t offset = static_cast<uint32_t>(t.col(k)) * uint32_t{sizeof(PACK)};
-  asm volatile("" : "+v"(offset));
-  return reinterpret_cast<PACK*>(reinterpret_cast<Byte*>(row) + offset);
-}
 template <typename PACK>
 DINLINE PACK pack_load(const PACK* p) {
   if constexpr (sizeof(PACK) == 16)
@@ -657,176 +480,12 @@ DINLINE PACK pack_load(const PACK* p) {
   else
     return *p;
 }
-// WHETHER A LOAD SKIPS ROW m: only a tile of several rows a thread or of rows
-// (a reduce-scatter's at decode), whose rows past M would re-read the last over
-// the links. A one-row tile's row is real wherever a kernel makes one, and a
-// branch around its loads cost registers: the zeros the tile starts with live
-// beside the loads (126 -> 178 VGPRs, spilling at 16384: 23-46-07Z).
-template <typename TILE>
-DINLINE bool skipped(const TILE& t, int m) {
-  if constexpr (TILE::kRows == 1 && TILE::kThreadsM == 1) return false;
-  return !t.live(m);
-}
-// A loaded group into the tile's elements, and a held group out as one load or
-// store's worth.
-template <typename TILE>
-DINLINE void held(TILE& t, int m, int k, const typename TILE::Pack& p) {
-  __builtin_memcpy(t.v[m][k], &p, sizeof(p));
-}
-template <typename TILE>
-DINLINE typename TILE::Pack pack(const TILE& t, int m, int k) {
-  typename TILE::Pack p;
-  __builtin_memcpy(&p, t.v[m][k], sizeof(p));
-  return p;
-}
 }  // namespace impl
 
-// A LOAD NEVER BRANCHES: a thread outside a narrow tile loads its clamped,
-// in-bounds place and its values go unused. Under participates() the load was
-// an exec branch, so every tile's old registers stayed live across AttnRes's
-// loops (threadIdx < 256 is not folded from the launch bounds; ISA
-// 2026-10-04T16-39-15Z).
-namespace impl {
-template <typename TILE>
-DINLINE void tile_load(TILE& t, const typename TILE::Acc* data,
-                       int64_t row_stride) {
-  using P = typename TILE::Pack;
-  const P* at = reinterpret_cast<const P*>(data);
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    if (impl::skipped(t, m)) continue;
-    const P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
-#pragma unroll
-    for (int k = 0; k < t.K; ++k)
-      impl::held(t, m, k, impl::pack_load(impl::at_col(row, t, k)));
-  }
-  impl::issued();
-}
-
-template <typename TILE>
-DINLINE void tile_store(typename TILE::Acc* data, int64_t row_stride,
-                        const TILE& t) {
-  using P = typename TILE::Pack;
-  if (!t.participates()) return;
-  P* at = reinterpret_cast<P*>(data);
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    if (!t.live(m)) continue;
-    P* row = at + int64_t{t.row(m)} * (row_stride / t.kPack);
-#pragma unroll
-    for (int k = 0; k < t.K; ++k) {
-      if (t.mask(k) == 0.0f) continue;
-      if constexpr (sizeof(P) == 16)
-        impl::global_store(impl::at_col(row, t, k), impl::pack(t, m, k));
-      else
-        *impl::at_col(row, t, k) = impl::pack(t, m, k);
-    }
-  }
-}
-}  // namespace impl
-
-// EVERY PEER'S TILE, all in flight together: `data(r)` is rank r's tensor,
-// `row_stride` its elements between rows. A pack position at a time, every
-// rank's for it, so the address is computed once a position (the other way
-// round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z).
-// Nothing waits until a tile is used (peers_reduce), so loads issued here can
-// run under other work.
-namespace impl {
-template <typename TILE, int WORLD, typename RANK_DATA>
-DINLINE void peers_load(TILE (&t)[WORLD], RANK_DATA data, int64_t row_stride) {
-  using P = typename TILE::Pack;
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    if (impl::skipped(t[0], m)) continue;
-#pragma unroll
-    for (int k = 0; k < t[0].K; ++k) {
-      // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the
-      // row's uniform part was added to every rank's base in scalar registers,
-      // an add and a carry a rank (16 instructions a tile at eight ranks, the
-      // plain all-reduce against the flat walk: ISA 2026-10-11); held in a
-      // VGPR, each rank's address is one shift-and-add of it.
-      int64_t i =
-          int64_t{t[0].row(m)} * (row_stride / t[0].kPack) + t[0].col(k);
-      asm volatile("" : "+v"(i));
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        impl::held(t[r], m, k,
-                   impl::pack_load(reinterpret_cast<const P*>(data(r)) + i));
-    }
-  }
-  impl::issued();
-}
-}  // namespace impl
-
-// A TILE WHOSE COLUMNS ARE SPLIT AMONG THE RANKS, `slice` columns each (the
-// last rank's to the end): each pack from its owner's tensor, `data(r)`, `r`
-// the owner in each lane (a wave's packs may have two owners).
-namespace impl {
-template <int WORLD, typename TILE, typename RANK_DATA>
-DINLINE void sliced_load(TILE& t, RANK_DATA data, int64_t row_stride,
-                         int slice) {
-  using P = typename TILE::Pack;
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    if (impl::skipped(t, m)) continue;
-#pragma unroll
-    for (int k = 0; k < t.K; ++k) {
-      const int owner = min(t.col(k) / (slice / t.kPack), WORLD - 1);
-      impl::held(t, m, k,
-                 impl::pack_load(reinterpret_cast<const P*>(data(owner)) +
-                                 int64_t{t.row(m)} * (row_stride / t.kPack) +
-                                 t.col(k)));
-    }
-  }
-  impl::issued();
-}
-}  // namespace impl
-
-// A TILE WHOSE ROWS ARE DIFFERENT TENSORS' (a row a peer): row m's at
-// `row_data(m)`, its first element, the tile's columns counted from it.
-// tile_gather loads every row together, one round trip (the fused AttnRes
-// pull's reduce-scatter).
-namespace impl {
-template <typename TILE, typename ROW_DATA>
-DINLINE void tile_gather(TILE& t, ROW_DATA row_data) {
-  using P = typename TILE::Pack;
-  if (!t.participates()) return;
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    const P* row = reinterpret_cast<const P*>(row_data(t.tile_row(m)));
-#pragma unroll
-    for (int k = 0; k < t.K; ++k)
-      impl::held(t, m, k, impl::pack_load(impl::at_col(row, t, k)));
-  }
-  impl::issued();
-}
-}  // namespace impl
-
-// A ROW'S SCALAR (a norm's scale), one float a row of `scalars`: thread 0
-// stores row `row`'s; every rank's for row `row`, `data(r)` its scalars, loaded
-// by every thread, all in flight together (a wave's lanes read one address: one
-// request a wave), issued after any tile loads before them.
-namespace impl {
-DINLINE void block_store_row_scalar(float* scalars, int row, float v) {
-  if (threadIdx.x == 0)
-    *(__attribute__((address_space(1))) float*)(scalars + row) = v;
-}
-
-template <int WORLD, typename RANK_DATA>
-DINLINE void peers_load_row_scalars(RANK_DATA data, int row,
-                                    float (&output)[WORLD]) {
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    output[r] =
-        *(const __attribute__((address_space(1))) float*)(data(r) + row);
-  impl::issued();
-}
-}  // namespace impl
-
-// THE SAME READS AND WRITES ON PLAIN ARRAYS: a thread's registers `T v[ROWS][K][P]`, P a pack's
-// elements, their place in a buffer as ints (its sizes, offs_m, offs_n, row_step) and the layout
-// as template ints THREADS_M x THREADS_N. Each helper is the Tile's member with the same
-// expressions, so a kernel ported to the arrays compiles to the same code.
+// A THREAD'S REGISTERS AND THEIR PLACE: `T v[ROWS][K][P]`, P a pack's elements; the place in a
+// buffer as ints (its sizes, offs_m, offs_n, row_step) and the layout as template ints
+// THREADS_M x THREADS_N. Thread t holds rows offs_m + (t / THREADS_N + i * THREADS_M) *
+// row_step and packs offs_n / P + t % THREADS_N + k * THREADS_N.
 namespace impl {
 // Thread-row i's row of the block's rows, a row past size_m reading row size_m - 1.
 template <int THREADS_M, int THREADS_N>
@@ -847,8 +506,10 @@ DINLINE int row_of(int size_m, int offs_m, int row_step, int i) {
              ? offs_m + thread_row<THREADS_M, THREADS_N>(i) * row_step
              : size_m - 1;
 }
-// This thread's pack k of a row, in packs from the row's start, past size_n clamped to the last;
-// its mask 1 below size_n and 0 past it, a float multiplied in so nothing reading it branches.
+// This thread's pack k of a row, in packs from the row's start, past size_n clamped to the last,
+// so every load stays in bounds; its mask 1 below size_n and 0 past it, a float multiplied in so
+// nothing reading it branches (a load under a runtime `if` cannot be hoisted past the branch,
+// and loads meant to be in flight together then wait one at a time).
 template <int P, int THREADS_N>
 DINLINE int pack_of(int size_n, int offs_n, int k) {
   const int n =
@@ -874,13 +535,20 @@ DINLINE bool holds() {
   else
     return static_cast<int>(threadIdx.x) < THREADS_M * THREADS_N;
 }
-// WHETHER A LOAD SKIPS ROW i, as skipped(): only several rows a thread or rows of threads.
+// WHETHER A LOAD SKIPS ROW i: only several rows a thread or rows of threads, whose rows past
+// size_m would re-read the last over the links. One row's is real wherever a kernel makes one,
+// and a branch around its loads cost registers (126 -> 178 VGPRs, spilling at 16384: 23-46-07Z).
 template <int ROWS, int THREADS_M, int THREADS_N>
 DINLINE bool skips(int size_m, int offs_m, int row_step, int i) {
   if constexpr (ROWS == 1 && THREADS_M == 1) return false;
   return !row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
 }
-// at_col on ints: this thread's pack k of the row, its offset opaque.
+// A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form global_load
+// and global_store take with the base in scalar registers (saddr), so every tensor sharing the
+// columns shares one offset register. A signed column added to the pointer was a 64-bit vector
+// address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness, 2026-10-04T15-28-51Z).
+// THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so the 64-bit sum is not
+// hoisted and held a tensor a pack (an add a load; AttnRes 90 -> 70 VGPRs, 2026-10-04 compile).
 template <int P, int THREADS_N, typename PACK>
 DINLINE PACK* at_col(PACK* row, int size_n, int offs_n, int k) {
   using Byte = std::conditional_t<std::is_const_v<PACK>, const char, char>;
@@ -907,6 +575,9 @@ DINLINE void pack_store(PACK* p, const PACK& v) {
     *p = v;
 }
 
+// A LOAD NEVER BRANCHES: a thread outside a narrow layout loads its clamped, in-bounds place and
+// its values go unused. Under a thread compare the load was an exec branch, so every array's
+// old registers stayed live across AttnRes's loops (ISA 2026-10-04T16-39-15Z).
 template <int THREADS_M, int THREADS_N, typename T, int ROWS, int K, int P>
 DINLINE void load(const T* input_ptr, int64_t input_stride_m, int input_size_m,
                   int input_size_n, T (&output)[ROWS][K][P], int offs_m,
@@ -956,7 +627,10 @@ DINLINE void store(const T (&input)[ROWS][K][P], T* output_ptr,
   }
 }
 
-// Every rank's, rank r's buffer at input[r] (read from the table once, by the caller).
+// EVERY PEER'S, all in flight together, rank r's buffer at input[r] (read from its table once). A
+// pack position at a time, every rank's for it, so the address is computed once a position (the
+// other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z). Nothing
+// waits until the registers are used, so loads issued here run under other work.
 template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
           int P>
 DINLINE void peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
@@ -970,7 +644,11 @@ DINLINE void peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
       continue;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-      // THE POSITION ONCE, IN A VECTOR REGISTER (peers_load above says why).
+      // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the
+      // row's uniform part was added to every rank's base in scalar registers,
+      // an add and a carry a rank (16 instructions a tile at eight ranks, the
+      // plain all-reduce against the flat walk: ISA 2026-10-11); held in a
+      // VGPR, each rank's address is one shift-and-add of it.
       const int64_t stride = input_stride_m / P;
       int64_t at = int64_t{row_of<THREADS_M, THREADS_N>(input_size_m, offs_m,
                                                          row_step, i)} *
@@ -986,6 +664,8 @@ DINLINE void peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
   issued();
 }
 
+// THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n a rank (the
+// last rank's to the end), its pointer read in each lane (a wave's packs may have two owners).
 template <int WORLD, int THREADS_M, int THREADS_N, typename T, int ROWS, int K,
           int P>
 DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
@@ -1012,6 +692,7 @@ DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
   issued();
 }
 
+// A ROW'S SCALAR (a norm's scale), one float a row: thread 0 stores it.
 DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   if (threadIdx.x == 0)
     *(__attribute__((address_space(1))) float*)(output_ptr + row) = value;
@@ -1022,93 +703,14 @@ DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
 // =================================================================================================
 // ELEMENTWISE
 //
-// THE ELEMENTWISE OPS, at thread scope: TILE MATH, on float tiles (a fused op
-// spells each rounding its reference does as a to<>() between them).
+// THE ELEMENTWISE OPS, at thread scope, on float registers (a fused op spells each rounding its
+// reference does as a round<U> or convert between them).
 // =================================================================================================
 
-// A FLOAT TILE'S MATH, element by element: tile_add and tile_mul with a tile of
-// its shape or a one-row tile (a weight, every row's), and tile_mul by one
-// scalar or a scalar a row (a row's norm scale).
-namespace impl {
-template <typename A, typename B, typename OP>
-DINLINE A zip(const A& a, const B& b, OP op) {
-  static_assert(std::is_same_v<typename A::Acc, float> &&
-                    std::is_same_v<typename B::Acc, float>,
-                "tile math is on float tiles; to<float>() first");
-  static_assert(B::kRows == A::kRows || B::kRows == 1,
-                "b is a's shape or one row");
-  static_assert(B::K == A::K && B::kPack == A::kPack, "b holds a's columns");
-  A output = a;
-#pragma unroll
-  for (int m = 0; m < A::kRows; ++m)
-#pragma unroll
-    for (int k = 0; k < A::K; ++k)
-#pragma unroll
-      for (int j = 0; j < A::kPack; ++j)
-        output.v[m][k][j] = op(a.v[m][k][j], b.v[B::kRows == 1 ? 0 : m][k][j]);
-  return output;
-}
-
-template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
-DINLINE A tile_add(const A& a, const B& b) {
-  return impl::zip(a, b, [](float x, float y) { return x + y; });
-}
-
-template <typename A, typename B, std::enable_if_t<is_tile<B>::value, int> = 0>
-DINLINE A tile_mul(const A& a, const B& b) {
-  return impl::zip(a, b, [](float x, float y) { return x * y; });
-}
-
-template <typename A>
-DINLINE A tile_mul(const A& a, const float (&row_scale)[A::kRows]) {
-  static_assert(std::is_same_v<typename A::Acc, float>,
-                "tile math is on float tiles");
-  A output = a;
-#pragma unroll
-  for (int m = 0; m < A::kRows; ++m)
-#pragma unroll
-    for (int k = 0; k < A::K; ++k)
-#pragma unroll
-      for (int j = 0; j < A::kPack; ++j)
-        output.v[m][k][j] = a.v[m][k][j] * row_scale[m];
-  return output;
-}
-
-template <typename A>
-DINLINE A tile_mul(const A& a, float scale) {
-  float row_scale[A::kRows];
-#pragma unroll
-  for (int m = 0; m < A::kRows; ++m) row_scale[m] = scale;
-  return tile_mul(a, row_scale);
-}
-}  // namespace impl
-
-// a x a_row_scale + b x b_row_scale, element by element, as fused multiply-adds
-// (a softmax's fold: the old sum rescaled plus a new source weighted). b may be
-// held in its stored dtype, converted here. Two multiplies and an add were
-// three VALU an element and, vectorized, packed multiplies with a chain of adds
-// (ISA 2026-10-04T02-22-41Z).
-namespace impl {
-template <typename A, typename B>
-DINLINE A tile_fma(const A& a, const float (&a_row_scale)[A::kRows], const B& b,
-                   const float (&b_row_scale)[A::kRows]) {
-  static_assert(std::is_same_v<typename A::Acc, float>,
-                "the sum is a float tile");
-  A output = a;
-#pragma unroll
-  for (int m = 0; m < A::kRows; ++m)
-#pragma unroll
-    for (int k = 0; k < A::K; ++k)
-#pragma unroll
-      for (int j = 0; j < A::kPack; ++j)
-        output.v[m][k][j] = fmaf(static_cast<float>(b.v[m][k][j]),
-                                 b_row_scale[m], a.v[m][k][j] * a_row_scale[m]);
-  return output;
-}
-}  // namespace impl
-
-// THE SAME MATH ON PLAIN ARRAYS, element by element, each the Tile op's loop: b of a's rows or
-// one row (a weight, every row's); a scale a row or one; an fma's b in any dtype, converted here.
+// ELEMENT BY ELEMENT: b of a's rows or one row (a weight, every row's); a scale a row or one.
+// fma is a x a_row_scale + b x b_row_scale as fused multiply-adds (a softmax's fold), b in any
+// dtype, converted here: two multiplies and an add were three VALU an element and, vectorized,
+// packed multiplies with a chain of adds (ISA 2026-10-04T02-22-41Z).
 namespace impl {
 template <typename T, typename U, int ROWS, int K, int P>
 DINLINE void convert(const T (&input)[ROWS][K][P], U (&output)[ROWS][K][P]) {
@@ -1204,44 +806,15 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // =================================================================================================
 // REDUCE
 //
-// THE REDUCTIONS, by scope, each built on the one below: over the PEERS (a pack
-// or a tile row summed over every rank, fp32, rounded once, in rank order),
+// THE REDUCTIONS, by scope, each built on the one below: over the PEERS (every
+// rank's registers summed elementwise in fp32, in rank order),
 // over a WAVE (shuffles), over a BLOCK (a wave's result, then one LDS pass). N
 // values at once at every scope: each block pass is two barriers and an LDS
 // round trip, so a kernel with several reductions takes them together.
 // =================================================================================================
 
-// EACH PACK SUMMED OVER ITS `ngpus` SOURCES, in fp32 in source order and
-// rounded once to T, into sum[k]: callers whose sources are the ranks agree
-// bitwise. Waits on the loads only here. EVERY PEER'S TILE SUMMED, in rank
-// order in fp32 and rounded once, as a pack's is.
-namespace impl {
-template <typename TILE, int WORLD>
-DINLINE TILE peers_reduce(const TILE (&t)[WORLD]) {
-  constexpr int NL = TILE::kPack;
-  TILE sum = t[0].template like<typename TILE::Acc>();
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m)
-#pragma unroll
-    for (int k = 0; k < sum.K; ++k) {
-      float acc[NL];
-#pragma unroll
-      for (int j = 0; j < NL; ++j) acc[j] = static_cast<float>(t[0].v[m][k][j]);
-#pragma unroll
-      for (int r = 1; r < WORLD; ++r)
-#pragma unroll
-        for (int j = 0; j < NL; ++j)
-          acc[j] += static_cast<float>(t[r].v[m][k][j]);
-#pragma unroll
-      for (int j = 0; j < NL; ++j)
-        sum.v[m][k][j] = static_cast<typename TILE::Acc>(acc[j]);
-    }
-  return sum;
-}
-}  // namespace impl
-
-// The same on plain arrays: every rank's registers summed in rank order in fp32, left in fp32
-// (a convert rounds them, once).
+// EVERY RANK'S REGISTERS SUMMED, in rank order in fp32, left in fp32 (a convert rounds them,
+// once): callers whose sources are the ranks agree bitwise. Waits on the loads only here.
 namespace impl {
 template <typename T, int WORLD, int ROWS, int K, int P>
 DINLINE void peers_sum(const T (&input)[WORLD][ROWS][K][P],
@@ -1363,187 +936,16 @@ DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
 }
 }  // namespace impl
 
-// A TILE REDUCED OVER AN AXIS, Triton's tl.sum(x, axis) for a float tile:
-//   Axis::m  over the rows, every column's: the rows meet in LDS as they are
-//   held (a bf16 tile's
-//            16 bytes a group, as the old two-shot's), reduced in fp32 in row
-//            order, and the one-row fp32 result is the first THREADS_N threads'
-//            (a Tile of one row of threads)
-//   Axis::n  over the columns, every row's, into `out` (a row's value in every
-//   thread of the row):
-//            each thread's groups, then the row's threads (a wave's or the
-//            block's)
-//   Axis::r  over a 3-D tile's ranks, every element's: each rank's copy meets
-//   in LDS as it is held,
-//            reduced in fp32 in rank order, and the TILE_M x TILE_N fp32 result
-//            is the first rank's threads' (a 2-D tile of THREADS_M x THREADS_N
-//            threads)
-enum class Axis { m, n, r };
-
-namespace impl {
-// OVER THE RANKS: every thread's packs into LDS at its rank's place, a pack a
-// thread side by side (consecutive threads' 16 bytes adjacent), then the first
-// rank's threads sum each pack over the ranks. LDS: TILE_R x TILE_M x TILE_N
-// elements as held.
-template <typename REDUCE_OP, typename TILE>
-DINLINE Tile<typename TILE::Dtype, TILE::kTileM, TILE::kTileN, TILE::kThreadsM,
-             TILE::kThreadsN, TILE::kThreadsPerBlock, float>
-block_reduce_ranks(const TILE& t) {
-  static_assert(TILE::kThreadsR == TILE::kTileR,
-                "a thread holds one rank's copy");
-  using Acc = typename TILE::Acc;
-  using P = typename TILE::Pack;
-  constexpr int kPacks = TILE::kRows * TILE::K;  // a thread's
-  __shared__ P part[TILE::kTileR][kPacks][TILE::kSliceThreads];
-  Tile<typename TILE::Dtype, TILE::kTileM, TILE::kTileN, TILE::kThreadsM,
-       TILE::kThreadsN, TILE::kThreadsPerBlock, float>
-      output{t.M, t.N, t.offs_m, t.offs_n, t.row_step};
-  const int mine = static_cast<int>(threadIdx.x) % TILE::kSliceThreads;
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m)
-#pragma unroll
-    for (int k = 0; k < TILE::K; ++k)
-      part[t.slice()][m * TILE::K + k][mine] = pack(t, m, k);
-  __syncthreads();
-  if (output.participates()) {
-#pragma unroll
-    for (int m = 0; m < TILE::kRows; ++m)
-#pragma unroll
-      for (int k = 0; k < TILE::K; ++k) {
-        float x[TILE::kPack];
-        P p = part[0][m * TILE::K + k][mine];
-#pragma unroll
-        for (int j = 0; j < TILE::kPack; ++j)
-          x[j] = static_cast<float>(reinterpret_cast<const Acc*>(&p)[j]);
-#pragma unroll
-        for (int r = 1; r < TILE::kTileR; ++r) {
-          p = part[r][m * TILE::K + k][mine];
-#pragma unroll
-          for (int j = 0; j < TILE::kPack; ++j)
-            x[j] = REDUCE_OP::apply(
-                x[j], static_cast<float>(reinterpret_cast<const Acc*>(&p)[j]));
-        }
-#pragma unroll
-        for (int j = 0; j < TILE::kPack; ++j) output.v[m][k][j] = x[j];
-      }
-  }
-  __syncthreads();  // before the next reduction writes `part`
-  return output;
-}
-
-template <typename REDUCE_OP, Axis AXIS, typename TILE>
-DINLINE Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN,
-             TILE::kThreadsPerBlock, float>
-block_reduce_rows(const TILE& t) {
-  static_assert(AXIS == Axis::m, "a row's reduction (Axis::n) writes `out`");
-  static_assert(TILE::kRows == 1, "a thread holds one row of the rows reduced");
-  constexpr int kRowLanes = TILE::kThreadsM;
-  using Acc = typename TILE::Acc;
-  __shared__ Acc part[kRowLanes][TILE::kTileN];
-  Tile<typename TILE::Dtype, 1, TILE::kTileN, 1, TILE::kThreadsN,
-       TILE::kThreadsPerBlock, float>
-      output{1, t.N, 0, t.offs_n};
-  const int lane_row = static_cast<int>(threadIdx.x) / TILE::kThreadsN;
-#pragma unroll
-  for (int k = 0; k < TILE::K; ++k)
-#pragma unroll
-    for (int j = 0; j < TILE::kPack; ++j) {
-      part[lane_row][(t.lane() + k * TILE::kThreadsN) * TILE::kPack + j] =
-          t.v[0][k][j];
-    }
-  __syncthreads();
-  if (output.participates()) {
-#pragma unroll
-    for (int k = 0; k < TILE::K; ++k)
-#pragma unroll
-      for (int j = 0; j < TILE::kPack; ++j) {
-        const int c = (output.lane() + k * TILE::kThreadsN) * TILE::kPack + j;
-        float x = static_cast<float>(part[0][c]);
-#pragma unroll
-        for (int r = 1; r < kRowLanes; ++r)
-          x = REDUCE_OP::apply(x, static_cast<float>(part[r][c]));
-        output.v[0][k][j] = x;
-      }
-  }
-  __syncthreads();  // before the next reduction writes `part`
-  return output;
-}
-
-// A TILE OVER AN AXIS: the ranks' (a 3-D tile's) or the rows' result tile.
-template <typename REDUCE_OP, Axis AXIS, typename TILE>
-DINLINE auto block_reduce(const TILE& t) {
-  if constexpr (AXIS == Axis::r)
-    return block_reduce_ranks<REDUCE_OP>(t);
-  else
-    return block_reduce_rows<REDUCE_OP, AXIS>(t);
-}
-
-template <typename REDUCE_OP, Axis AXIS, typename TILE>
-DINLINE void block_reduce(const TILE& t, float (&output)[TILE::kRows]) {
-  static_assert(AXIS == Axis::n,
-                "a column's reduction (Axis::m) returns a tile");
-  static_assert(std::is_same_v<typename TILE::Acc, float>,
-                "a reduction is of a float tile");
-#pragma unroll
-  for (int m = 0; m < TILE::kRows; ++m) {
-    float x = REDUCE_OP::kIdentity;
-#pragma unroll
-    for (int k = 0; k < TILE::K; ++k)
-#pragma unroll
-      for (int j = 0; j < TILE::kPack; ++j)
-        x = t.mask(k) != 0.0f ? REDUCE_OP::apply(x, t.v[m][k][j]) : x;
-    output[m] = x;
-  }
-  if constexpr (TILE::kThreadsM == 1)
-    block_reduce<REDUCE_OP, TILE::kThreads>(output);
-  else if constexpr (TILE::kThreadsN == kWaveSize)
-    wave_reduce<REDUCE_OP>(output);
-  else
-    static_assert(TILE::kThreadsN == kWaveSize,
-                  "a row is the block's or a wave's");
-}
-}  // namespace impl
-
-// The LDS a block_reduce<Op, N> takes, for a kernel budgeting the rest.
-constexpr int64_t block_reduce_lds_bytes(int n) {
-  return int64_t{kBuild.kernels.max_waves} * n * sizeof(float);
-}
-
 // =================================================================================================
 // DOT
 //
 // THE DOT: a thread's share of a row's dot (a block_reduce finishes it).
 // =================================================================================================
 
-// This thread's share of dot(a, b) over each row of the tile, columns past N
-// counting zero: the partials a block_reduce turns into the rows' dots (a sum
-// of squares is partial_dot(x, x)). A one-row b (a weight) is every row's.
-namespace impl {
-template <typename A, typename B>
-DINLINE void partial_dot(const A& a, const B& b, float (&d)[A::kRows]) {
-  static_assert(
-      A::kThreadsM == 1,
-      "a dot's partials reduce over the block, so a row is the block's");
-  static_assert(B::kRows == A::kRows || B::kRows == 1,
-                "b is a's shape or one row");
-#pragma unroll
-  for (int m = 0; m < A::kRows; ++m) {
-    const int mb = B::kRows == 1 ? 0 : m;
-    d[m] = 0.0f;
-#pragma unroll
-    for (int k = 0; k < A::K; ++k) {
-      float dk = 0.0f;
-#pragma unroll
-      for (int j = 0; j < A::kPack; ++j)
-        dk = fmaf(static_cast<float>(a.v[m][k][j]),
-                  static_cast<float>(b.v[mb][k][j]), dk);
-      d[m] += a.mask(k) * dk;
-    }
-  }
-}
-}  // namespace impl
-
-// The same on plain arrays, a row of threads THREADS_N wide; a and b in any dtype, converted.
+// This thread's share of dot(a, b) over each row, packs past size_n counting zero: the
+// partials a block_reduce turns into the rows' dots (a sum of squares is partial_dot(x, x)). A
+// one-row b (a weight) is every row's; a and b in any dtype, converted. A row of threads is
+// THREADS_N wide (the block's, or a wave's).
 namespace impl {
 template <int THREADS_N, typename A, typename B, int ROWS, int ROWS_B, int K,
           int P>
@@ -1607,8 +1009,8 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s,
 // =================================================================================================
 // PEERS
 //
-// THE RANKS' MEMORY: every rank's buffers as plain tensors a tile loads and
-// stores, and the types a kernel takes them in. A RANK'S MEMORY, two places:
+// THE RANKS' MEMORY: every rank's buffers as plain tensors the reads and writes
+// take, and the types a kernel takes them in. A RANK'S MEMORY, two places:
 //   ours, two allocations (Handle's symmetric memory), mapped by every peer at
 //   startup:
 //     [ signals ]  and  [ scratch | staging ]
@@ -1619,7 +1021,7 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s,
 //     addresses a device
 //                 table (a captured launch's are filled after the capture);
 //                 otherwise a staged kernel copies it into the staging
-// A buffer is read or written by tile_load / tile_store / peers_load, ordered
+// A buffer is read or written by load / store / peers_load, ordered
 // only by BARRIER's `barrier`. The signals are BARRIER's, never read as
 // data.
 // =================================================================================================
@@ -1693,9 +1095,8 @@ enum class StatusField : int {
 };
 constexpr int kStatusFields = 10;
 
-// RANK r'S BUFFER, its first element, which rank_ptr and rank_ptrs
-// make a Ptr of: a kernel's arguments carry every rank's address of a buffer (a
-// device table, `ptrs`) and this reads one. `r` IS THE SAME ACROSS THE WAVE (a
+// RANK r'S BUFFER, its first element: a kernel's arguments carry every rank's
+// address of a buffer (a device table, `ptrs`) and this reads one. `r` IS THE SAME ACROSS THE WAVE (a
 // constant, or a per-wave rank): read from the first lane, the compiler knows
 // it, and the load is scalar rather than one per lane.
 namespace impl {
@@ -1725,71 +1126,6 @@ DINLINE void peers_load_row_scalars(const T* const* input_ptrs,
         row);
   issued();
 }
-}  // namespace impl
-
-// =================================================================================================
-// PTR
-//
-// THE POINTER, beside the tile (TILE) the other primitive every kernel is
-// written in: what a kernel touches, local or another rank's, as a Ptr -- its
-// data, its layout (both strides, in elements), and whose memory it is -- and
-// the boundary that makes them, a kernel's first lines.
-// =================================================================================================
-
-// A POINTER A KERNEL TOUCHES, local or another rank's: its data, its layout
-// (the strides of its rows and columns, in elements, as the kernel's arguments
-// gave them) and whose memory it is. A kernel turns its arguments into these in
-// its first lines (`rank_ptrs`, `rank_ptr`, `local_ptr`) and every load and
-// store after takes one. The packed loads need stride_n 1; the host checks it.
-template <typename T>
-struct Ptr {
-  T* data;
-  int64_t stride_m;
-  int64_t stride_n;
-  int rank;
-};
-
-namespace impl {
-
-// EVERY RANK'S BUFFER AS A Ptr, rank r's data at r (rank r the same across the
-// wave, as rank_of makes it), each with the buffer's row stride.
-template <typename T, int WORLD>
-DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(T* const* p, int64_t stride_m,
-                                            int64_t stride_n) {
-  std::array<Ptr<T>, WORLD> all;
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    all[r] = Ptr<T>{impl::rank_of(p, r), stride_m, stride_n, r};
-  return all;
-}
-// ONE RANK'S BUFFER AS A Ptr (this rank's own, most often), by the same
-// rank_of.
-template <typename T, int WORLD>
-DINLINE Ptr<T> rank_ptr(T* const* p, int rank, int64_t stride_m,
-                        int64_t stride_n) {
-  return Ptr<T>{impl::rank_of(p, rank), stride_m, stride_n, rank};
-}
-// ELEMENT e OF A BUFFER OF `n`-ELEMENT ROWS, COUNTED ROW-MAJOR (e = row * n +
-// col), at the Ptr's strides: one multiply-add when the rows are back to back
-// (stride_m == n * stride_n, a contiguous tensor), else e's row and column
-// divided out. `e` a pack's first element and `n` whole packs (the host's
-// row_not_packs), so a pack never spans two rows. The division in 32 bits below
-// 2^31 elements (a few instructions, where a 64-bit one is a hundred).
-template <typename T>
-DINLINE T* flat_at(const Ptr<T>& p, int64_t e, int n) {
-  if (p.stride_m == int64_t{n} * p.stride_n) return p.data + e * p.stride_n;
-  const int64_t row =
-      e < (int64_t{1} << 31)
-          ? int64_t{static_cast<uint32_t>(e) / static_cast<uint32_t>(n)}
-          : e / n;
-  return p.data + row * p.stride_m + (e - row * n) * p.stride_n;
-}
-template <typename T>
-DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n,
-                         int rank) {
-  return Ptr<T>{data, stride_m, stride_n, rank};
-}
-
 }  // namespace impl
 
 // =================================================================================================
@@ -2065,198 +1401,42 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 // =================================================================================================
 // COLLECTIVES
 //
-// THE COLLECTIVES' STEPS, built from common's tiles: one tested and tuned way
-// to do each, which the kernels call rather than write again (the fused AttnRes
+// THE COLLECTIVES' STEPS, buffers to buffers: one tested and tuned way to do
+// each, which the kernels call rather than write again (the fused AttnRes
 // pull's own reduce-scatter took 1.6x the plain two-shot's cycles for its
 // bytes, thread traces 2026-10-04T21-03-09Z and 21-26-11Z).
 // =================================================================================================
 
-// THE LOADS ARE THE COMMUNICATION: `rank_chunk(w)` points into rank + w's
-// memory, mapped into this GPU's (PEERS), so loading the chunk reads it
-// over the links; the sum and the store are local. The kernel syncs around
-// these calls (the barriers): before, every peer's data is ready; between the
-// reduce-scatter and the all-gather, every rank's sums are visible.
+// THE LOADS ARE THE COMMUNICATION: a rank's pointer points into its memory,
+// mapped into this GPU's (PEERS), so loading reads it over the links; the sum
+// and the store are local. The kernel syncs around these calls (the barriers):
+// before, every peer's data is ready; between the reduce-scatter and the
+// all-gather, every rank's sums are visible. RANKS ARE READ ROTATED, rank + w's
+// w-th, so at any moment the GPUs read different peers; each range or slice is
+// summed by one rank, so the order differing by rank is harmless.
 //
-// THE COLLECTIVES WORK A CHUNK AT A TIME, as a tile whose ROWS ARE THE RANKS:
-// row w is rank + w's copy of the chunk (ROTATED, so at any moment the GPUs
-// read different peers), a row of threads a rank (TILE::kThreadsM == WORLD).
-// `chunk` is the place: its N the slice's end, its offs_n the chunk's first
-// column. A rank's pointer is picked a wave at a time (`rank_chunk(w)`, a
-// scalar select): every rank's held up front was ~20 scalar loads before the
-// first barrier.
-
-// REDUCE-SCATTER: this rank's slice summed over every rank, a chunk a call.
-//   rank_chunk(w)  where rank + w's copy of the chunk starts
-//   sum_out        where this rank's summed chunk goes (its scratch)
-// The sum's order differs by rank, which is harmless: each chunk is summed by
-// one rank.
-namespace impl {
-template <typename TILE, typename RANK_CHUNK>
-DINLINE void reduce_scatter(TILE& chunk, RANK_CHUNK rank_chunk,
-                            typename TILE::Dtype* sum_out) {
-  // 1. Every rank's copy of the chunk, a row each, in one round trip.
-  tile_gather(chunk, rank_chunk);
-  // 2. Summed over the rows (the ranks), in row order, through LDS.
-  const auto sum = block_reduce<Sum, Axis::m>(chunk);
-  // 3. Stored as DTYPE in this rank's slice.
-  tile_store(sum_out, chunk.N, sum.template to<typename TILE::Dtype>());
-}
-}  // namespace impl
-
-// AN ELEMENTWISE [R, M, N] PROBLEM -- R ranks' copies of an [M, N] buffer, each
-// at its own strides -- WALKED AS [R, 1, M*N]: the rows are only the buffer's
-// layout, so the elements are numbered row-major (e = row * N + col, flat_at)
-// and each rank's SHARE is one contiguous range of them, a rank's tile copy
-// TILE_N of it. WHY: the links and HBM reward long reads from each peer. Cut a
-// row at a time, a rank's share was its slice of every row -- 1.8 KB runs at N
-// = 7168, the plain all-reduce +2% against the flat walk; 128-column tiles, 256
-// B runs, +3-7% (2026-10-11) -- while a contiguous buffer's range is one run of
-// the whole share. IT SERVES BADLY a strided buffer: its runs are its rows
-// wherever it has them, and each pack's row and column are divided out. The
-// walk is the same for every step and every rank, so a block reads in the
-// all-gather what the same block on each rank wrote in the reduce-scatter. A
-// copy is whole waves (its rank's pointer one scalar select); copy w is rank +
-// w's, ROTATED, so at any moment the GPUs read different peers.
-namespace impl {
-// THE SHARES of m x n elements over WORLD ranks, in whole packs (the last
-// rank's short), and the chunks of TILE_N a share takes.
-struct Shares {
-  int64_t total;
-  int slice;
-  int chunks;
-  DINLINE int64_t first(int r) const { return int64_t{r} * slice; }
-  DINLINE int len(int r) const {
-    return static_cast<int>(
-        max(int64_t{0}, min(int64_t{slice}, total - first(r))));
-  }
-};
-template <typename TILE>
-DINLINE Shares shares_of(int m, int n) {
-  constexpr int WORLD = TILE::kTileR;
-  const int64_t total = int64_t{m} * n;
-  const int slice =
-      static_cast<int>((total / TILE::kPack + WORLD - 1) / WORLD * TILE::kPack);
-  return {total, slice, (slice + TILE::kTileN - 1) / TILE::kTileN};
-}
-// WHETHER AN [*, n] BUFFER'S ROWS ARE BACK TO BACK, so its range is one run:
-// CONTIGUOUS, a template parameter of the kernel, its instance chosen on the
+// THE FLAT WALK (the plain two-shot): an elementwise [R, M, N] problem -- R
+// ranks' copies of an [M, N] buffer, each at its own strides -- WALKED AS
+// [R, 1, M*N]: the rows are only the buffer's layout, so the elements are
+// numbered row-major (e = row * N + col, flat_at) and each rank's SHARE is one
+// contiguous range of them, a TILE_N chunk a step. WHY: the links and HBM
+// reward long reads from each peer. Cut a row at a time, a rank's share was its
+// slice of every row -- 1.8 KB runs at N = 7168, the plain all-reduce +2%
+// against the flat walk; 128-column tiles, 256 B runs, +3-7% (2026-10-11) --
+// while a contiguous buffer's range is one run of the whole share. IT SERVES
+// BADLY a strided buffer: its runs are its rows wherever it has them, and each
+// pack's row and column are divided out. The walk is the same for every step
+// and every rank, so a block reads in the all-gather what the same block on
+// each rank wrote in the reduce-scatter. A RANK'S COPY OF A CHUNK IS LANES =
+// THREADS / WORLD threads, whole waves (its rank's pointer one scalar select;
+// every rank's held up front was ~20 scalar loads before the first barrier).
+//
+// CONTIGUOUS, whether an [*, n] buffer's rows are back to back so its range is
+// one run, is a template parameter of the kernel, its instance chosen on the
 // host from the strides as given. A compile-time choice, not a branch in the
 // kernel: both paths in one kernel cost ~0.1 us a call at 128-512 tokens
 // against the contiguous path alone (the strided code and its registers,
-// 2026-10-12T01-17-18Z). THIS THREAD'S COPY OF THE CHUNK, from the range
-// starting at element `first` of an [*, n] buffer: one run when its rows are
-// back to back (the address a uniform base and a lane's offset, as tile_load
-// builds it), else each pack's own row and column.
-template <bool CONTIGUOUS, typename TILE, typename T>
-DINLINE void range_load(TILE& t, const Ptr<T>& p, int n, int64_t first) {
-  using P = typename TILE::Pack;
-  if constexpr (CONTIGUOUS) {
-    tile_load(t, p.data + first * p.stride_n, 0);
-  } else {
-#pragma unroll
-    for (int k = 0; k < t.K; ++k)
-      held(t, 0, k,
-           pack_load(reinterpret_cast<const P*>(
-               flat_at(p, first + int64_t{t.col(k)} * t.kPack, n))));
-    issued();
-  }
-}
-// ...and stored, its first `len` elements.
-template <bool CONTIGUOUS, typename TILE, typename T>
-DINLINE void range_store(const TILE& t, const Ptr<T>& p, int n, int64_t first,
-                         int len) {
-  using P = typename TILE::Pack;
-  P* run = reinterpret_cast<P*>(p.data + first * p.stride_n);
-#pragma unroll
-  for (int k = 0; k < t.K; ++k) {
-    const int c = t.offs_n / t.kPack + t.lane() + k * t.kThreadsN;
-    if (c >= len / t.kPack) continue;
-    P* at;
-    if constexpr (CONTIGUOUS)
-      at = at_col(run, t, k);
-    else
-      at = reinterpret_cast<P*>(flat_at(p, first + int64_t{c} * t.kPack, n));
-    if constexpr (sizeof(P) == 16)
-      global_store(at, pack(t, 0, k));
-    else
-      *at = pack(t, 0, k);
-  }
-}
-
-// REDUCE-SCATTER: this rank's share of the inputs, summed over the ranks, into
-// its scratch (one contiguous run from scratch.data). inp(r) is rank r's input
-// at its strides, every rank's alike.
-template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void reduce_scatter(int rank, RANK_PTR input, int m, int n,
-                            const Ptr<T>& scratch) {
-  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR,
-                "an [R, 1, TILE_N] chunk");
-  static_assert(TILE::kSliceThreads % kWaveSize == 0,
-                "a rank's copy is whole waves");
-  constexpr int WORLD = TILE::kTileR;
-  const Shares s = shares_of<TILE>(m, n);
-  if (s.len(rank) == 0)
-    return;  // a late rank's share is empty at few packs (every block alike)
-  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
-    TILE got{1, s.len(rank), 0, chunk * TILE::kTileN};
-    // 1. Every rank's copy of this chunk of this rank's share, in one round
-    // trip.
-    range_load<CONTIGUOUS>(got, input((rank + got.slice()) % WORLD), n,
-                           s.first(rank));
-    // 2. Summed over the ranks, in rank order, through LDS.
-    const auto sum = block_reduce<Sum, Axis::r>(got);
-    // 3. Stored as T in this rank's scratch.
-    tile_store(scratch.data, 0, sum.template to<T>());
-  });
-}
-
-// ALL-GATHER: every rank's summed share out of its scratch, at its place in the
-// output.
-template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& output, int m,
-                        int n) {
-  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR,
-                "an [R, 1, TILE_N] chunk");
-  static_assert(TILE::kSliceThreads % kWaveSize == 0,
-                "a rank's copy is whole waves");
-  constexpr int WORLD = TILE::kTileR;
-  const Shares s = shares_of<TILE>(m, n);
-  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
-    TILE got{1, s.slice, 0, chunk * TILE::kTileN};
-    const int r = (rank + got.slice()) % WORLD;
-    // 1. Rank r's summed chunk, in one round trip.
-    tile_load(got, scratch(r).data, 0);
-    // 2. Stored where rank r's share goes.
-    range_store<CONTIGUOUS>(got, output, n, s.first(r), s.len(r));
-  });
-}
-
-// STAGED, BEFORE THE REDUCE-SCATTER: this rank's input, every rank's share of
-// it, into its staging (an [m, n] buffer, ours, its rows back to back: the
-// host's staging_stride_m = n), each block the chunks that rank's same block
-// reads.
-template <typename TILE, bool CONTIGUOUS, typename T>
-DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging,
-                   int m, int n) {
-  static_assert(TILE::kTileM == 1 && TILE::kThreadsR == TILE::kTileR,
-                "an [R, 1, TILE_N] chunk");
-  constexpr int WORLD = TILE::kTileR;
-  const Shares s = shares_of<TILE>(m, n);
-  block_for_each_tile(1, s.chunks, [&](int, int chunk) {
-    const int r = (rank + TILE{}.slice()) % WORLD;
-    const int len = s.len(r);
-    if (len == 0) return;
-    TILE part{1, len, 0, chunk * TILE::kTileN};
-    range_load<CONTIGUOUS>(part, input, n, s.first(r));
-    range_store<true>(part, staging, n, s.first(r), len);
-  });
-}
-}  // namespace impl
-
-// THE SAME STEPS ON PLAIN ARRAYS AND INTS, each the Tile version's loop with the same
-// expressions: the flat walk (the plain two-shot), and the two per-row reduce-scatters.
-// A RANK'S COPY OF A FLAT CHUNK IS LANES = THREADS / WORLD threads, whole waves (its rank's
-// pointer one scalar select), thread t in rank (rank + t / LANES) % WORLD's copy: ROTATED.
+// 2026-10-12T01-17-18Z).
 
 // WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
 // reads its peers and keeps the sum in its scratch; push, the sum is stored in every rank's
@@ -2288,8 +1468,10 @@ DINLINE T* flat_at(T* ptr, int64_t stride_m, int64_t stride_n, int64_t e,
   return ptr + row * stride_m + (e - row * n) * stride_n;
 }
 
-// range_load and range_store: a chunk of the range from element `first` of an [*, input_size_n]
-// buffer, the chunk's place size_n (a tile's N) and offs_n; the store's first `len` elements.
+// THIS THREAD'S COPY OF A CHUNK of the range from element `first` of an [*, input_size_n]
+// buffer, the chunk's place size_n and offs_n: one run when its rows are back to back (the
+// address a uniform base and a lane's offset, as load builds it), else each pack's own row and
+// column; and stored, its first `len` elements.
 template <bool CONTIGUOUS, int THREADS_N, typename T, int K, int P>
 DINLINE void range_load(const T* input_ptr, int64_t input_stride_m,
                         int64_t input_stride_n, int input_size_n,
@@ -2297,8 +1479,8 @@ DINLINE void range_load(const T* input_ptr, int64_t input_stride_m,
                         int offs_n) {
   using V = vec<T, P>;
   if constexpr (CONTIGUOUS) {
-    // The last pack, the run's start, then the column: the order the Tile
-    // version's instructions came out in (ISA 2026-10-15).
+    // The last pack, the run's start, then the column: the order the two-shot's
+    // instructions came out in before this interface (ISA 2026-10-15).
 #pragma unroll
     for (int k = 0; k < K; ++k) {
       const int last = size_n / P - 1;
@@ -2623,101 +1805,16 @@ DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
 }
 
 // ===============================================================================================
-// MEMORY: GLOBAL MEMORY ONLY THROUGH TILES
+// MEMORY: REGISTERS FROM AND TO BUFFERS
 // ===============================================================================================
 
-// One round trip a tile; a row past M reads the last row.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE>
-DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                            THREADS_PER_BLOCK, ACC_DTYPE>& tile,
-                       const ACC_DTYPE* data, int64_t row_stride) {
-  impl::tile_load(tile, data, row_stride);
-}
-
-// Stores only the rows below M and the columns below N.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE>
-DINLINE void tile_store(ACC_DTYPE* data, int64_t row_stride,
-                        const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                                   THREADS_PER_BLOCK, ACC_DTYPE>& tile) {
-  impl::tile_store(data, row_stride, tile);
-}
-
-// Every rank's tile in flight together: rank r's tensor at rank_data(r).
-// TILE FIRST, POINTER SECOND: a tile from a Ptr, a tile to a Ptr; a group of
-// tiles from a group of Ptrs (every load issued together, each pack's address
-// computed once; the group shares a stride).
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, typename T>
-DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                            THREADS_PER_BLOCK, ACC_DTYPE>& tile,
-                       const Ptr<T>& ptr) {
-  impl::tile_load(tile, ptr.data, ptr.stride_m);
-}
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE>
-DINLINE void tile_store(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                                   THREADS_PER_BLOCK, ACC_DTYPE>& tile,
-                        const Ptr<ACC_DTYPE>& ptr) {
-  impl::tile_store(ptr.data, ptr.stride_m, tile);
-}
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, std::size_t N, typename T>
-DINLINE void tile_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                            THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[N],
-                       const std::array<Ptr<T>, N>& ptrs) {
-  impl::peers_load(
-      tiles, [&](int r) { return ptrs[r].data; }, ptrs[0].stride_m);
-}
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, int WORLD,
-          typename RANK_DATA>
-DINLINE void peers_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                             THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[WORLD],
-                        RANK_DATA rank_data, int64_t row_stride) {
-  impl::peers_load(tiles, rank_data, row_stride);
-}
-
-// Each column from the rank owning it, `slice` columns a rank (the owner picked
-// in each lane).
-template <int WORLD, typename DTYPE, int TILE_M, int TILE_N, int THREADS_M,
-          int THREADS_N, int THREADS_PER_BLOCK, typename ACC_DTYPE,
-          typename RANK_DATA>
-DINLINE void sliced_load(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                              THREADS_PER_BLOCK, ACC_DTYPE>& tile,
-                         RANK_DATA rank_data, int64_t row_stride, int slice) {
-  impl::sliced_load<WORLD>(tile, rank_data, row_stride, slice);
-}
-
-// A tile whose rows are different tensors (a row a rank): row m at row_data(m).
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, typename ROW_DATA>
-DINLINE void tile_gather(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                              THREADS_PER_BLOCK, ACC_DTYPE>& tile,
-                         ROW_DATA row_data) {
-  impl::tile_gather(tile, row_data);
-}
-
-// A row's scalar (a norm's scale), stored once a block.
-DINLINE void block_store_row_scalar(float* scalars, int row, float value) {
-  impl::block_store_row_scalar(scalars, row, value);
-}
-
-// Every rank's scalar for `row`.
-template <int WORLD, typename RANK_DATA>
-DINLINE void peers_load_row_scalars(RANK_DATA rank_data, int row,
-                                    float (&output)[WORLD]) {
-  impl::peers_load_row_scalars<WORLD>(rank_data, row, output);
-}
-
-// ON PLAIN ARRAYS: a thread's registers `T v[ROWS][K][P]` (P a pack, 16 bytes of the kernel's
+// A THREAD'S REGISTERS `T v[ROWS][K][P]` (P a pack, 16 bytes of the kernel's
 // dtype), the buffer as pointer, strides and sizes, the place as ints. Thread t holds rows
 // offs_m + (t / THREADS_N + i * THREADS_M) * row_step and packs offs_n / P + t % THREADS_N +
 // k * THREADS_N; stride_n must be 1. One round trip; a row past size_m reads the last row.
 // THE SIZES ARE WHERE ROWS AND PACKS CLAMP AND MASK, the tensor's: a buffer holding part of
 // a tensor at the tensor's places (the scratch, a band of staging) passes the tensor's (or the
-// band's) sizes, as the Tile's M and N were, not its own allocation's.
+// band's) sizes, not its own allocation's.
 template <int THREADS_M, int THREADS_N, typename T, int ROWS, int K, int P>
 DINLINE void load(const T* input_ptr, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_m, int input_size_n,
@@ -2799,82 +1896,16 @@ DINLINE void peers_load_row_scalars(const T* const* input_ptrs,
 }
 
 // ===============================================================================================
-// ELEMENTWISE: FLOAT TILE MATH
+// ELEMENTWISE: FLOAT REGISTER MATH
 // ===============================================================================================
 
-// a + b, b of a's shape or one row (a weight).
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE,
-          typename B_DTYPE, int B_TILE_M, int B_TILE_N, int B_THREADS_M,
-          int B_THREADS_N, int B_THREADS_PER_BLOCK, typename B_ACC_DTYPE>
-DINLINE Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-             A_THREADS_PER_BLOCK, A_ACC_DTYPE>
-tile_add(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-                    A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-         const Tile<B_DTYPE, B_TILE_M, B_TILE_N, B_THREADS_M, B_THREADS_N,
-                    B_THREADS_PER_BLOCK, B_ACC_DTYPE>& b) {
-  return impl::tile_add(a, b);
-}
-
-// a * b, b of a's shape or one row (a weight).
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE,
-          typename B_DTYPE, int B_TILE_M, int B_TILE_N, int B_THREADS_M,
-          int B_THREADS_N, int B_THREADS_PER_BLOCK, typename B_ACC_DTYPE>
-DINLINE Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-             A_THREADS_PER_BLOCK, A_ACC_DTYPE>
-tile_mul(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-                    A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-         const Tile<B_DTYPE, B_TILE_M, B_TILE_N, B_THREADS_M, B_THREADS_N,
-                    B_THREADS_PER_BLOCK, B_ACC_DTYPE>& b) {
-  return impl::tile_mul(a, b);
-}
-
-// Each row of a times its scale.
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE>
-DINLINE Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-             A_THREADS_PER_BLOCK, A_ACC_DTYPE>
-tile_mul(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-                    A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-         const float (&row_scale)[A_TILE_M / A_THREADS_M]) {
-  return impl::tile_mul(a, row_scale);
-}
-
-// Every element of a times one scale.
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE>
-DINLINE Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-             A_THREADS_PER_BLOCK, A_ACC_DTYPE>
-tile_mul(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-                    A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-         float scale) {
-  return impl::tile_mul(a, scale);
-}
-
-// a * a_row_scale + b * b_row_scale, a row's scales each.
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE,
-          typename B_DTYPE, int B_TILE_M, int B_TILE_N, int B_THREADS_M,
-          int B_THREADS_N, int B_THREADS_PER_BLOCK, typename B_ACC_DTYPE>
-DINLINE Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-             A_THREADS_PER_BLOCK, A_ACC_DTYPE>
-tile_fma(const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-                    A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-         const float (&a_row_scale)[A_TILE_M / A_THREADS_M],
-         const Tile<B_DTYPE, B_TILE_M, B_TILE_N, B_THREADS_M, B_THREADS_N,
-                    B_THREADS_PER_BLOCK, B_ACC_DTYPE>& b,
-         const float (&b_row_scale)[A_TILE_M / A_THREADS_M]) {
-  return impl::tile_fma(a, a_row_scale, b, b_row_scale);
-}
-
-// ON PLAIN ARRAYS, element by element: b of a's rows or one row (a weight).
+// Element by element: b of a's rows or one row (a weight).
 // Each element converted, rounded once.
 template <typename T, typename U, int ROWS, int K, int P>
 DINLINE void convert(const T (&input)[ROWS][K][P], U (&output)[ROWS][K][P]) {
   impl::convert(input, output);
 }
-// Every element zero, where a sum starts (registers start unset, as the Tile's did).
+// Every element zero, where a sum starts (registers start unset).
 template <typename T, int ROWS, int K, int P>
 DINLINE void zeros(T (&output)[ROWS][K][P]) {
   impl::zeros(output);
@@ -2917,16 +1948,6 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // REDUCE: OVER THE RANKS, A WAVE OR THE BLOCK
 // ===============================================================================================
 
-// Every rank's tile summed, in rank order in fp32, rounded once.
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, int WORLD>
-DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK,
-             ACC_DTYPE>
-peers_reduce(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                        THREADS_PER_BLOCK, ACC_DTYPE> (&tiles)[WORLD]) {
-  return impl::peers_reduce(tiles);
-}
-
 // Every rank's registers summed, in rank order in fp32, left in fp32.
 template <typename T, int WORLD, int ROWS, int K, int P>
 DINLINE void peers_sum(const T (&input)[WORLD][ROWS][K][P],
@@ -2946,62 +1967,12 @@ DINLINE void block_reduce(float (&values)[NUM_VALUES]) {
   impl::block_reduce<REDUCE_OP, THREADS_PER_BLOCK, NUM_VALUES>(values);
 }
 
-// A tile reduced over its rows (Axis::m): one fp32 row, the first THREADS_N
-// threads'.
-template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N,
-          int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK,
-          typename ACC_DTYPE>
-DINLINE Tile<DTYPE, 1, TILE_N, 1, THREADS_N, THREADS_PER_BLOCK, float>
-block_reduce(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                        THREADS_PER_BLOCK, ACC_DTYPE>& tile) {
-  return impl::block_reduce<REDUCE_OP, AXIS>(tile);
-}
-
-// A 3-D tile reduced over its ranks (Axis::r): the TILE_M x TILE_N fp32 tile,
-// the first rank's threads'.
-template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N,
-          int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK,
-          typename ACC_DTYPE, int TILE_R, int THREADS_R>
-DINLINE Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK,
-             float>
-block_reduce(const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                        THREADS_PER_BLOCK, ACC_DTYPE, TILE_R, THREADS_R>& tile)
-  requires(AXIS == Axis::r)
-{
-  return impl::block_reduce<REDUCE_OP, AXIS>(tile);
-}
-
-// Each row of a tile reduced over its columns (Axis::n), into out[row].
-template <typename REDUCE_OP, Axis AXIS, typename DTYPE, int TILE_M, int TILE_N,
-          int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK,
-          typename ACC_DTYPE>
-DINLINE void block_reduce(
-    const Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N, THREADS_PER_BLOCK,
-               ACC_DTYPE>& tile,
-    float (&output)[TILE_M / THREADS_M]) {
-  impl::block_reduce<REDUCE_OP, AXIS>(tile, output);
-}
-
 // ===============================================================================================
 // DOT
 // ===============================================================================================
 
-// This thread's share of each row's dot of a and b (b of a's shape or one row,
-// a weight).
-template <typename A_DTYPE, int A_TILE_M, int A_TILE_N, int A_THREADS_M,
-          int A_THREADS_N, int A_THREADS_PER_BLOCK, typename A_ACC_DTYPE,
-          typename B_DTYPE, int B_TILE_M, int B_TILE_N, int B_THREADS_M,
-          int B_THREADS_N, int B_THREADS_PER_BLOCK, typename B_ACC_DTYPE>
-DINLINE void partial_dot(
-    const Tile<A_DTYPE, A_TILE_M, A_TILE_N, A_THREADS_M, A_THREADS_N,
-               A_THREADS_PER_BLOCK, A_ACC_DTYPE>& a,
-    const Tile<B_DTYPE, B_TILE_M, B_TILE_N, B_THREADS_M, B_THREADS_N,
-               B_THREADS_PER_BLOCK, B_ACC_DTYPE>& b,
-    float (&d)[A_TILE_M / A_THREADS_M]) {
-  impl::partial_dot(a, b, d);
-}
-
-// The same on plain arrays, a row of threads THREADS_N wide, packs past size_n counting zero.
+// This thread's share of each row's dot of a and b (b of a's rows or one row, a weight), a
+// row of threads THREADS_N wide, packs past size_n counting zero.
 template <int THREADS_N, typename A, typename B, int ROWS, int ROWS_B, int K,
           int P>
 DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
@@ -3013,39 +1984,12 @@ DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
 // SOFTMAX
 // ===============================================================================================
 
-// A tile of logits folded into a running softmax: each logit's scale, and the
-// old sum's.
+// Logits folded into a running softmax: each logit's scale, and the old sum's.
 template <int NUM_LOGITS>
 DINLINE float thread_softmax_fold(OnlineSoftmax& softmax,
                                   const float (&logit)[NUM_LOGITS],
                                   float (&scale)[NUM_LOGITS]) {
   return impl::thread_softmax_fold<NUM_LOGITS>(softmax, logit, scale);
-}
-
-// ===============================================================================================
-// POINTERS: A KERNEL'S ARGUMENTS AS Ptrs
-// ===============================================================================================
-
-// ONE FORMAT (STANDARDS 3.2): a kernel's arguments are raw pointers, strides,
-// sizes and scalars; a peer buffer is a device table of every rank's address
-// (`x_ptrs`, as vLLM's RankData). Its first lines make them Ptrs, named for the
-// buffer (`inp`, `scratch`, `out`), and its body touches memory only through
-// them. THE BOUNDARY (PTR): every rank's buffer as a Ptr (rank r's at r),
-// and a local one as one.
-template <typename T, int WORLD>
-DINLINE std::array<Ptr<T>, WORLD> rank_ptrs(T* const* ptrs, int64_t stride_m,
-                                            int64_t stride_n) {
-  return impl::rank_ptrs<T, WORLD>(ptrs, stride_m, stride_n);
-}
-template <typename T, int WORLD>
-DINLINE Ptr<T> rank_ptr(T* const* ptrs, int rank, int64_t stride_m,
-                        int64_t stride_n) {
-  return impl::rank_ptr<T, WORLD>(ptrs, rank, stride_m, stride_n);
-}
-template <typename T>
-DINLINE Ptr<T> local_ptr(T* data, int64_t stride_m, int64_t stride_n,
-                         int rank) {
-  return impl::local_ptr<T>(data, stride_m, stride_n, rank);
 }
 
 // ===============================================================================================
@@ -3075,40 +2019,6 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 // ===============================================================================================
 // COLLECTIVES: THE TWO-SHOT'S STEPS, ONE TESTED WAY EACH
 // ===============================================================================================
-
-// A chunk of this rank's slice summed over the ranks into sum_out: rank w's
-// copy at rank_chunk(w).
-template <typename DTYPE, int TILE_M, int TILE_N, int THREADS_M, int THREADS_N,
-          int THREADS_PER_BLOCK, typename ACC_DTYPE, typename RANK_CHUNK>
-DINLINE void reduce_scatter(Tile<DTYPE, TILE_M, TILE_N, THREADS_M, THREADS_N,
-                                 THREADS_PER_BLOCK, ACC_DTYPE>& chunk,
-                            RANK_CHUNK rank_chunk, DTYPE* sum_out) {
-  impl::reduce_scatter(chunk, rank_chunk, sum_out);
-}
-
-// AN ELEMENTWISE [R, M, N] PROBLEM: R ranks' copies of an [m, n] buffer, rank
-// r's at inp(r) (a Ptr at its strides). TILE is the [R, 1, TILE_N] chunk the
-// walk moves (COLLECTIVES: walked as [R, 1, m*n], each rank's share one
-// contiguous range of the elements, for long runs). Reduce-scatter: this rank's
-// share, summed over the ranks, into its scratch.
-template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void reduce_scatter(int rank, RANK_PTR input, int m, int n,
-                            const Ptr<T>& scratch) {
-  impl::reduce_scatter<TILE, CONTIGUOUS>(rank, input, m, n, scratch);
-}
-// All-gather: every rank's summed share, rank r's at scratch(r), at its place
-// in `out`.
-template <typename TILE, bool CONTIGUOUS, typename RANK_PTR, typename T>
-DINLINE void all_gather(int rank, RANK_PTR scratch, const Ptr<T>& output, int m,
-                        int n) {
-  impl::all_gather<TILE, CONTIGUOUS>(rank, scratch, output, m, n);
-}
-// Staged, first: this rank's input, every rank's share of it, into its staging.
-template <typename TILE, bool CONTIGUOUS, typename T>
-DINLINE void stage(int rank, const Ptr<const T>& input, const Ptr<T>& staging,
-                   int m, int n) {
-  impl::stage<TILE, CONTIGUOUS>(rank, input, staging, m, n);
-}
 
 // THE FLAT WALK (the plain two-shot): the [m, n] tensor's elements numbered row-major and cut
 // into WORLD ranges, a TILE_N chunk a step (COLLECTIVES says why). Reduce-scatter: this rank's
