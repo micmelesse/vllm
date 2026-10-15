@@ -1396,8 +1396,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("true", "1")
     ),
     # What HipCustomCommunicator's two-shot all-reduces move across the links: NONE,
-    # the input as it is (the default), or INT4, quick reduce's format, on the calls
-    # quick reduce quantizes (2 MiB and up). Lossy, so opt-in, as quick reduce's is.
+    # the input as it is (the default), or INT4, quick reduce's format, from each op's
+    # crossover up (select.cuh's). Lossy, so opt-in, as quick reduce's is.
     "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION": env_with_choices(
         "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", "NONE", ["NONE", "INT4"]
     ),

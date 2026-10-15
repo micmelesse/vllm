@@ -52,8 +52,9 @@ namespace hip_custom_communicator {
 // kernels carry.
 
 // A TWO-SHOT TEMPLATE'S BUILDS: each listed build as it is, then the same
-// moving INT4 (common.cuh's QUANTIZATION), which select takes for a call the
-// handle quantizes (`with_quantization`). A one-shot moves its input as it is.
+// moving INT4 (common.cuh's QUANTIZATION), forced as any build is or taken by
+// select for a call the handle quantizes (`with_quantization`). A one-shot
+// moves its input as it is.
 template <size_t N>
 constexpr std::array<BuildConfig, 2 * N> and_int4(
     const BuildConfig (&exact)[N]) {
@@ -742,6 +743,27 @@ constexpr TunedKernel kAttnResKernels[] = {
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
 };
 
+// INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
+// the handle's quantization is int4, the exact build below it. 2 MiB every op
+// for now, quick reduce's INT4 minimum at 8 ranks (vLLM's quick_all_reduce.py,
+// `_QR_MIN_SIZE`, the fp16 kernels' row bf16 takes by default), so INT4 runs on
+// the calls the default ROCm path quantizes; a sweep may refine it per op.
+struct Int4Crossover {
+  OpType op;
+  int64_t min_bytes;
+};
+constexpr Int4Crossover kInt4Crossovers[] = {
+    {OpType::all_reduce, 2 * 1024 * 1024},
+    {OpType::all_reduce_rms_norm, 2 * 1024 * 1024},
+    {OpType::all_reduce_add_rms_norm, 2 * 1024 * 1024},
+    {OpType::all_reduce_add_attn_res_rms_norm, 2 * 1024 * 1024},
+};
+constexpr int64_t int4_min_bytes(OpType o) {
+  for (const Int4Crossover& c : kInt4Crossovers)
+    if (c.op == o) return c.min_bytes;
+  return -1;  // never: every op has one (ops_have_crossovers)
+}
+
 // =================================================================================================
 // THE OPS, in OpType's order: each one's name (as Python calls it), its tuned
 // kernels, and what a plain call of it (nothing forced) must be to run, which
@@ -802,6 +824,15 @@ constexpr bool ops_in_order() {
   return true;
 }
 static_assert(ops_in_order(), "kOps must list every OpType in its order");
+
+constexpr bool ops_have_crossovers() {
+  if (sizeof(kInt4Crossovers) / sizeof(Int4Crossover) != kNumOps) return false;
+  for (const Op& o : kOps)
+    if (int4_min_bytes(o.type) < 0) return false;
+  return true;
+}
+static_assert(ops_have_crossovers(),
+              "kInt4Crossovers must give every op its crossover once");
 
 // EVERY OP HAS KERNELS, each one of its own templates, its build listed and its
 // launch one the forcing would accept (a grid of 1 to kMaxBlocks blocks, a
@@ -868,7 +899,9 @@ constexpr bool every_rank_gets_columns(Template k, int64_t n, DType dtype,
 // where the op has more than one), every field of its build, and its launch, or
 // none of them. Some but not all is forced_incomplete; a value out of range is
 // its Error; a build the template does not list is the check's to name. None:
-// select picks.
+// select picks. The build's `quantization` alone may be left out of a forcing,
+// which is then none (the build as listed), never the handle's: a forced call
+// runs what it names; given without the rest, it is forced_incomplete.
 // =================================================================================================
 
 // The kernel a call runs: its template and its complete config.
@@ -878,15 +911,16 @@ struct Chosen {
 };
 
 // `build_fields` are the op's BuildConfig's fields as the call forced them, in
-// its order; `reduce_scatter_blocks` the AttnRes split, which only that op
-// takes (another passes none); `build_of` makes the op's BuildConfig from the
-// fields, called only when every one is given.
+// its order, but its quantization, which is `quantization`;
+// `reduce_scatter_blocks` the AttnRes split, which only that op takes (another
+// passes none); `build_of` makes the op's BuildConfig from the fields, called
+// only when every one is given.
 template <typename BUILD_OF>
 constexpr std::variant<std::optional<Chosen>, Error> forced(
     OpType o, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction,
     std::initializer_list<std::optional<int>> build_fields,
-    std::optional<int> blocks_per_grid,
+    std::optional<int> quantization, std::optional<int> blocks_per_grid,
     std::optional<int> reduce_scatter_blocks, BUILD_OF build_of) {
   const bool names_template = templates_of(o) > 1;
   const bool splits = o == OpType::all_reduce_add_attn_res_rms_norm;
@@ -902,8 +936,12 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
   for (const std::optional<int>& f : build_fields) count(f.has_value());
   count(blocks_per_grid.has_value());
   if (splits) count(reduce_scatter_blocks.has_value());
-  if (given == 0 && !algorithm && !direction) return std::optional<Chosen>{};
+  if (given == 0 && !algorithm && !direction && !quantization)
+    return std::optional<Chosen>{};
   if (given != needed) return Error::forced_incomplete;
+  const int q = quantization.value_or(Quantization::none);
+  if (q != Quantization::none && q != Quantization::int4)
+    return Error::no_such_quantization;
   // THE TEMPLATE: the one an op with one template has, else the algorithm and
   // direction's.
   const std::optional<Template> fn =
@@ -931,7 +969,7 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
       *fn != Template::all_reduce_pull_two_shot_add_attn_res_rms_norm)
     return Error::field_not_this_templates;
   return std::optional<Chosen>{
-      Chosen{*fn, {build_of(), {*blocks_per_grid, split}}}};
+      Chosen{*fn, {quantized(build_of(), q), {*blocks_per_grid, split}}}};
 }
 
 // =================================================================================================
@@ -990,18 +1028,71 @@ constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
   return most ? *most : *least;
 }
 
-// THE KERNEL A CALL RUNS: the forced one, else the tuned one.
+// =================================================================================================
+// THE QUANTIZATION: which calls move INT4 (common.cuh's QUANTIZATION), by the
+// handle's quantization and the op's crossover (kInt4Crossovers), and the
+// quantized buffers as a kernel reads them.
+// =================================================================================================
+
+// A QUANTIZED [m, n] BUFFER'S VALUES AND SCALES, in bytes.
+constexpr int64_t int4_values_bytes(int64_t m, int64_t n) { return m * n / 2; }
+constexpr int64_t int4_scales_bytes(int64_t m, int64_t n) {
+  return m * (n / kInt4Group) * 2;
+}
+
+// WHETHER AN INT4 TWO-SHOT TAKES A ROW OF `n` ELEMENTS at `world` ranks: whole
+// groups, and whole groups for every rank, so every rank's slice (a column
+// split's columns, the flat walk's share) starts on a group and a group is 4
+// lanes' packs in every layout. 3584 and 7168 at 8 ranks: 14 and 28 groups a
+// rank.
+constexpr bool int4_takes_row(int64_t n, int world) {
+  return n % kInt4Group == 0 && (n / kInt4Group) % world == 0;
+}
+
+// THE TUNED KERNEL MOVES INT4 when the handle's quantization is int4, the call
+// is its op's crossover or more, its kernel a two-shot, its dtype 16-bit (a
+// pack is a word of its group), its row `int4_takes_row` and the quantized
+// regions hold it; then its build moves INT4, its template, tile and grid as
+// tuned. Else, and for every one-shot, its build as it is. A forced call is
+// never changed here: its quantization is its own.
+inline Chosen with_quantization(const Handle& h, Chosen k, int64_t m, int64_t n,
+                                DType dtype) {
+  if (h.quantization() != Quantization::int4 || !is_two_shot(k.fn) ||
+      elem_bytes(dtype) != 2 ||
+      m * n * elem_bytes(dtype) < int4_min_bytes(op_of(k.fn)) ||
+      !int4_takes_row(n, h.world_size()) ||
+      int4_values_bytes(m, n) > h.quantized_values_bytes() ||
+      int4_scales_bytes(m, n) > h.quantized_scales_bytes())
+    return k;
+  k.config.build = quantized(k.config.build, Quantization::int4);
+  return k;
+}
+
+// A QUANTIZED [m, n] BUFFER AS ITS KERNEL READS IT, values then scales, each
+// its strides then its sizes, rows back to back (ours); with none, no buffer:
+// zeros.
+struct QuantizedView {
+  int64_t values_stride_m, values_stride_n, values_size_m, values_size_n;
+  int64_t scales_stride_m, scales_stride_n, scales_size_m, scales_size_n;
+};
+constexpr QuantizedView quantized_view(int q, int64_t m, int64_t n) {
+  if (q == Quantization::none) return {};
+  return {n / 2, 1, m, n / 2, n / kInt4Group, 1, m, n / kInt4Group};
+}
+
+// THE KERNEL A CALL RUNS: the forced one as forced, else the tuned one at the
+// handle's quantization.
 inline std::variant<Chosen, Error> chosen(
-    const std::variant<std::optional<Chosen>, Error>& forcing, OpType o,
-    int world, int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
+    const Handle& h, const std::variant<std::optional<Chosen>, Error>& forcing,
+    OpType o, int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing))
     return *f;
   const std::variant<TunedKernel, Error> tuned =
-      pick(o, world, m, n, tile_cols, dtype);
+      pick(o, h.world_size(), m, n, tile_cols, dtype);
   if (const Error* e = std::get_if<Error>(&tuned)) return *e;
   const TunedKernel& k = std::get<TunedKernel>(tuned);
-  return Chosen{k.fn, k.config};
+  return with_quantization(h, Chosen{k.fn, k.config}, m, n, dtype);
 }
 
 // =================================================================================================
@@ -1091,6 +1182,10 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (own_error) return own_error;
   if (n * elem_bytes(dtype) % kBuild.memory.pack_bytes != 0)
     return Error::row_not_packs;
+  // INT4 ON A ONE-SHOT, which reads its peers' inputs as they are: named before
+  // the build lookup, which lists no such build.
+  const bool int4 = quantization_of(c.build) == Quantization::int4;
+  if (int4 && !is_two_shot(fn)) return Error::quantization_not_two_shot;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its threads, its
   // waves, its tile.
   const int threads = threads_of(c.build);
@@ -1107,6 +1202,13 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // Refused, so the caller takes the one-shot or RCCL.
   if (!every_rank_gets_columns(fn, n, dtype, world))
     return Error::row_narrower_than_world;
+  // AN INT4 ROW is whole groups for every rank, its values and scales inside
+  // the quantized regions (with_quantization's rule, which a forced call meets
+  // here).
+  if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
+  if (int4 && (int4_values_bytes(m, n) > h->quantized_values_bytes() ||
+               int4_scales_bytes(m, n) > h->quantized_scales_bytes()))
+    return Error::quantized_too_small;
   if (!staged && scratch_need(fn, m, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
   // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in
@@ -1134,56 +1236,6 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 }
 
 // =================================================================================================
-// THE QUANTIZATION: which calls move INT4 (common.cuh's QUANTIZATION), the
-// handle's rule, and the quantized buffers as a kernel reads them.
-// =================================================================================================
-
-// A QUANTIZED [m, n] BUFFER'S VALUES AND SCALES, in bytes.
-constexpr int64_t int4_values_bytes(int64_t m, int64_t n) { return m * n / 2; }
-constexpr int64_t int4_scales_bytes(int64_t m, int64_t n) {
-  return m * (n / kInt4Group) * 2;
-}
-
-// WHETHER AN INT4 TWO-SHOT TAKES A ROW OF `n` ELEMENTS at `world` ranks: whole
-// groups, and whole groups for every rank, so every rank's slice (a column
-// split's columns, the flat walk's share) starts on a group and a group is 4
-// lanes' packs in every layout. 3584 and 7168 at 8 ranks: 14 and 28 groups a
-// rank.
-constexpr bool int4_takes_row(int64_t n, int world) {
-  return n % kInt4Group == 0 && (n / kInt4Group) % world == 0;
-}
-
-// A CALL MOVES INT4 when the handle quantizes (its least bytes set, the
-// default ROCm path's rule: Python's `quantize_min_bytes_of`), the call is that
-// many bytes or more, its kernel a two-shot, its dtype 16-bit (a pack is a word
-// of its group), its row `int4_takes_row` and the quantized regions hold it;
-// then its build moves INT4, its template, tile and grid as chosen. Else, and
-// for every one-shot, its build as it is.
-inline Chosen with_quantization(const Handle& h, Chosen k, int64_t m, int64_t n,
-                                DType dtype) {
-  const int64_t least = h.quantize_min_bytes();
-  if (least < 0 || !is_two_shot(k.fn) || elem_bytes(dtype) != 2 ||
-      m * n * elem_bytes(dtype) < least || !int4_takes_row(n, h.world_size()) ||
-      int4_values_bytes(m, n) > h.quantized_values_bytes() ||
-      int4_scales_bytes(m, n) > h.quantized_scales_bytes())
-    return k;
-  k.config.build = quantized(k.config.build, Quantization::int4);
-  return k;
-}
-
-// A QUANTIZED [m, n] BUFFER AS ITS KERNEL READS IT, values then scales, each
-// its strides then its sizes, rows back to back (ours); with none, no buffer:
-// zeros.
-struct QuantizedView {
-  int64_t values_stride_m, values_stride_n, values_size_m, values_size_n;
-  int64_t scales_stride_m, scales_stride_n, scales_size_m, scales_size_n;
-};
-constexpr QuantizedView quantized_view(int q, int64_t m, int64_t n) {
-  if (q == Quantization::none) return {};
-  return {n / 2, 1, m, n / 2, n / kInt4Group, 1, m, n / kInt4Group};
-}
-
-// =================================================================================================
 // EACH OP'S SELECT: the op's launch, everything decided, from the call's
 // primitives and its forcing, or the first Error the call meets. Each in four
 // steps: 1. the kernel (the forced template and config, else the op's tuned
@@ -1203,23 +1255,24 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu, hipStream_t stream) {
+    std::optional<int> waves_per_eu, std::optional<int> quantization,
+    hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   const int world = h.world_size();
   // 1. The tile does not hold the row: the all-reduce tiles across it.
   const std::variant<Chosen, Error> picked = chosen(
+      h,
       forced(OpType::all_reduce, algorithm, direction,
-             {threads_per_block, waves_per_eu, tile_m, tile_n}, blocks_per_grid,
-             std::nullopt,
+             {threads_per_block, waves_per_eu, tile_m, tile_n}, quantization,
+             blocks_per_grid, std::nullopt,
              [&] {
                return AllReduceBuildConfig{*threads_per_block, *waves_per_eu,
                                            *tile_m, *tile_n};
              }),
-      OpType::all_reduce, world, m, n, tile_cols(OpType::all_reduce, n), dtype);
+      OpType::all_reduce, m, n, tile_cols(OpType::all_reduce, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k =
-      with_quantization(h, std::get<Chosen>(picked), m, n, dtype);
+  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
@@ -1375,7 +1428,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
-    hipStream_t stream) {
+    std::optional<int> quantization, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
@@ -1383,17 +1436,17 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked =
-      chosen(forced(op, algorithm, direction,
+      chosen(h,
+             forced(op, algorithm, direction,
                     {threads_per_block, waves_per_eu, tile_m, tile_n},
-                    blocks_per_grid, std::nullopt,
+                    quantization, blocks_per_grid, std::nullopt,
                     [&] {
                       return AllReduceRmsNormBuildConfig{
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
                     }),
-             op, world, m, n, tile_cols(op, n), dtype);
+             op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = with_quantization(
-      h, cut_to_the_work(std::get<Chosen>(picked), m, n, world), m, n, dtype);
+  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   // 2.
@@ -1532,7 +1585,7 @@ select_all_reduce_add_rms_norm(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
-    hipStream_t stream) {
+    std::optional<int> quantization, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
@@ -1540,17 +1593,17 @@ select_all_reduce_add_rms_norm(
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked =
-      chosen(forced(op, algorithm, direction,
+      chosen(h,
+             forced(op, algorithm, direction,
                     {threads_per_block, waves_per_eu, tile_m, tile_n},
-                    blocks_per_grid, std::nullopt,
+                    quantization, blocks_per_grid, std::nullopt,
                     [&] {
                       return AllReduceAddRmsNormBuildConfig{
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
                     }),
-             op, world, m, n, tile_cols(op, n), dtype);
+             op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = with_quantization(
-      h, cut_to_the_work(std::get<Chosen>(picked), m, n, world), m, n, dtype);
+  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   // 2.
@@ -1715,7 +1768,8 @@ select_all_reduce_add_attn_res_rms_norm(
     std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu, hipStream_t stream) {
+    std::optional<int> waves_per_eu, std::optional<int> quantization,
+    hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
@@ -1723,18 +1777,18 @@ select_all_reduce_add_attn_res_rms_norm(
   const int world = h.world_size();
   // 1.
   const std::variant<Chosen, Error> picked =
-      chosen(forced(op, algorithm, direction,
+      chosen(h,
+             forced(op, algorithm, direction,
                     {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k},
-                    blocks_per_grid, reduce_scatter_blocks,
+                    quantization, blocks_per_grid, reduce_scatter_blocks,
                     [&] {
                       return AllReduceAddAttnResRmsNormBuildConfig{
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n,
                           *tile_k};
                     }),
-             op, world, m, n, tile_cols(op, n), dtype);
+             op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = with_quantization(
-      h, cut_to_the_work(std::get<Chosen>(picked), m, n, world), m, n, dtype);
+  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   // 2.

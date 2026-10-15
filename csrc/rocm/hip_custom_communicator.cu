@@ -44,8 +44,8 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 
 // EACH OP TAKES ITS OWN FORCING LAST, as the API's does: the algorithm
 // and direction of the template it forces, and only the config fields that op's
-// kernels have, each none for select's. The model passes none of them; the
-// bench and the tests force with them.
+// kernels have, its build's quantization last, each none for select's. The
+// model passes none of them; the bench and the tests force with them.
 
 namespace {
 using ProcessGroupPtr = c10::intrusive_ptr<c10d::ProcessGroup>;
@@ -120,6 +120,13 @@ std::optional<hip_custom_communicator::Direction> direction_from(
   TORCH_CHECK(*s == "push",
               "hip_custom_communicator: direction is pull or push");
   return hip_custom_communicator::Direction::push;
+}
+std::optional<int> quantization_from(const std::optional<std::string>& s) {
+  if (!s) return std::nullopt;
+  if (*s == "none") return hip_custom_communicator::Quantization::none;
+  TORCH_CHECK(*s == "int4",
+              "hip_custom_communicator: quantization is none or int4");
+  return hip_custom_communicator::Quantization::int4;
 }
 std::optional<int> narrowed(std::optional<int64_t> v) {
   if (!v) return std::nullopt;
@@ -211,19 +218,23 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
 // and the peers' opened. `timeout_seconds`: how long a kernel waits on a peer
 // before it reports a fault. `max_rows` and `max_cols`: the largest call it
 // serves (for a model, the server's tokens a batch by its hidden size), from
-// which its exchange is sized (`exchange_sizes`). `quantize_min_bytes`: the
-// least bytes a two-shot call moves INT4 at, or -1, never (select.cuh's
+// which its exchange is sized (`exchange_sizes`). `quantization`: what its
+// tuned calls move across the links, a Quantization (select.cuh's
 // `with_quantization`). A torch op cannot return a variant, so it is two
 // optionals and exactly one is set, the handle or the Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
                                       int64_t device, double timeout_seconds,
                                       int64_t max_rows, int64_t max_cols,
-                                      int64_t quantize_min_bytes) {
+                                      int64_t quantization) {
   TORCH_CHECK(max_rows > 0 && max_cols > 0,
               "the largest call a communicator serves has rows and columns: "
               "max_rows=",
               max_rows, " max_cols=", max_cols);
+  TORCH_CHECK(quantization == hip_custom_communicator::Quantization::none ||
+                  quantization == hip_custom_communicator::Quantization::int4,
+              "a communicator's quantization is none (0) or int4 (1): ",
+              quantization);
   const auto refused = [](hip_custom_communicator::Error e) {
     return OpenWire{std::nullopt, static_cast<int64_t>(e)};
   };
@@ -242,7 +253,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
   auto* handle = new hip_custom_communicator::Handle(
       (*pg)->getRank(), world, gather_over(*pg), timeout_seconds, max_rows,
       max_cols, sizes.scratch_bytes, sizes.quantized_values_bytes,
-      sizes.quantized_scales_bytes, sizes.staging_bytes, quantize_min_bytes);
+      sizes.quantized_scales_bytes, sizes.staging_bytes,
+      static_cast<int>(quantization));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -276,33 +288,29 @@ BuildInfoWire hip_custom_communicator_build_info() {
   for (int i = 1; i <= kWhereCount; ++i)
     where_names.push_back(to_string(static_cast<Where>(i)));
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
-  // search space), flat: a build's fields in `fields`' order, 0 where its op's
-  // BuildConfig has none (every field it has is set). The launch is not a
-  // build's: a forced call gives its own grid. Nor is an INT4 twin a build to
-  // force: the handle quantizes (select.cuh's `with_quantization`), so only the
-  // builds moving their dtype are listed.
-  const Names fields = {"tile_m", "tile_n", "tile_k", "threads_per_block",
-                        "waves_per_eu"};
+  // search space, each one a forcing can name), flat: a build's fields in
+  // `fields`' order, 0 where its op's BuildConfig has none (every field it has
+  // is set), its quantization a Quantization. The launch is not a build's: a
+  // forced call gives its own grid.
+  const Names fields = {"tile_m",       "tile_n",
+                        "tile_k",       "threads_per_block",
+                        "waves_per_eu", "quantization"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
     templates.push_back(t.name);
     template_ops.push_back(to_string(op_of(t.fn)));
-    int64_t listed = 0;
-    for (const BuildConfig& b : t.builds) {
-      if (quantization_of(b) != Quantization::none) continue;
-      ++listed;
+    for (const BuildConfig& b : t.builds)
       std::visit(
           [&](const auto& f) {
             int64_t k = 0;
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
-            configs.insert(
-                configs.end(),
-                {f.tile_m, f.tile_n, k, f.threads_per_block, f.waves_per_eu});
+            configs.insert(configs.end(),
+                           {f.tile_m, f.tile_n, k, f.threads_per_block,
+                            f.waves_per_eu, f.quantization});
           },
           b);
-    }
-    counts.push_back(listed);
+    counts.push_back(static_cast<int64_t>(t.builds.size()));
   }
   // EACH OP'S PLAIN CALL (kOps, select.cuh), in `ops`' order: its dtypes and
   // its weight's besides its input's, flat, and four ints an op: those two
@@ -481,8 +489,8 @@ Answer hip_custom_communicator_all_reduce(
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization) {
   check_device({&input, &output});
   TORCH_CHECK(output.sizes() == input.sizes(),
               "output and input must have the same shape");
@@ -500,7 +508,8 @@ Answer hip_custom_communicator_all_reduce(
       output_rows->size(0), output_rows->size(1), dtype_of(input),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
       narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
+      narrowed(waves_per_eu), quantization_from(quantization),
+      current_stream());
   return answer(got);
 }
 
@@ -545,8 +554,8 @@ Answer hip_custom_communicator_all_reduce_rms_norm(
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization) {
   norm_tensors(input, nullptr, weight, output, nullptr);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
       handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1),
@@ -556,7 +565,8 @@ Answer hip_custom_communicator_all_reduce_rms_norm(
       static_cast<float>(eps), algorithm_from(algorithm),
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
+      narrowed(waves_per_eu), quantization_from(quantization),
+      current_stream());
   return answer(got);
 }
 
@@ -567,8 +577,8 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization) {
   norm_tensors(input, &residual, weight, output, &residual_output);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
       handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1),
@@ -582,7 +592,8 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(
       static_cast<float>(eps), algorithm_from(algorithm),
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
+      narrowed(waves_per_eu), quantization_from(quantization),
+      current_stream());
   return answer(got);
 }
 
@@ -677,8 +688,8 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
     std::optional<int64_t> reduce_scatter_blocks,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu) {
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization) {
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
                    num_blocks);
@@ -703,6 +714,7 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
       narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
-      narrowed(waves_per_eu), current_stream());
+      narrowed(waves_per_eu), quantization_from(quantization),
+      current_stream());
   return answer(got);
 }

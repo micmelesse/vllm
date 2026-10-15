@@ -70,6 +70,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     HipCustomCommunicator,
     Op,
     Open,
+    Quantization,
     Ran,
     Refused,
     State,
@@ -78,7 +79,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     build_info,
     capacity_of,
     open_handle,
-    quantize_min_bytes_of,
     should,
     supported,
 )
@@ -218,6 +218,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         """The sum, torch's; nothing forced, having no template to force."""
         if any(
@@ -230,6 +231,7 @@ class TorchCommunicator(HipCustomCommunicator):
                 threads_per_block,
                 blocks_per_grid,
                 waves_per_eu,
+                quantization,
             )
         ):
             return [Error.no_such_template]
@@ -250,6 +252,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         return [Error.no_such_op]
 
@@ -268,6 +271,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         return [Error.no_such_op]
 
@@ -294,6 +298,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         return [Error.no_such_op]
 
@@ -873,14 +878,18 @@ def _chunks(
 Forced = dict[str, str | int]
 
 
-def _forced(kernel: str, cols: int = 0) -> Forced:
+def _forced(kernel: str, cols: int = 0, quantization: Quantization = "none") -> Forced:
     """The template a case names (`all_reduce_push_two_shot...`) forced WHOLE, as a
-    forced call must be: its algorithm and direction, its first build whose tile holds
-    `cols` columns (the row a norm reduces; 0 where the tile tiles across the row), and
-    a launch every template admits (16 blocks, no reduce-scatter split), for a case that
-    forces one only to check it."""
+    forced call must be: its algorithm and direction, its first build moving
+    `quantization` whose tile holds `cols` columns (the row a norm reduces; 0 where the
+    tile tiles across the row), and a launch every template admits (16 blocks, no
+    reduce-scatter split), for a case that forces one only to check it."""
     builds = build_info().templates[kernel].builds
-    build = next(b for b in builds if b["tile_n"] >= cols)
+    build = next(
+        b
+        for b in builds
+        if b["quantization"] == quantization and int(b["tile_n"]) >= cols
+    )
     split = {"reduce_scatter_blocks": 0} if "attn_res" in kernel else {}
     return {
         "algorithm": "two_shot" if "two_shot" in kernel else "one_shot",
@@ -1992,16 +2001,14 @@ def test_all_reduce_add_attn_res_rms_norm_runs_the_largest_call(
 
 
 # ---------------------------------------------------------------------------------
-# INT4 ACROSS THE LINKS (common.cuh's QUANTIZATION): a communicator opened to move
-# every two-shot call it can INT4 (`quantize_min_bytes` 0), each two-shot forced,
-# against an emulation of quick reduce's format written here in torch: each rank's
-# input quantized and landed in its dtype, summed in fp32 in the kernel's rank order,
-# the sum quantized, then the op's reference on it (the pull norms, a row split, sum
-# unquantized and quantize what they gather: the owner's normed rows, or its residual
-# rows beside their RMS scales).
+# INT4 ACROSS THE LINKS (common.cuh's QUANTIZATION): each two-shot forced onto its INT4
+# build (a forcing's `quantization`), against an emulation of quick reduce's format
+# written here in torch: each rank's input quantized and landed in its dtype, summed in
+# fp32 in the kernel's rank order, the sum quantized, then the op's reference on it (the
+# pull norms, a row split, sum unquantized and quantize what they gather: the owner's
+# normed rows, or its residual rows beside their RMS scales).
 # ---------------------------------------------------------------------------------
 
-INT4 = "hip_int4"
 INT4_GROUP = 32
 # Each op's two-shot templates (the plain all-reduce has only the pull).
 INT4_KERNELS = (
@@ -2030,25 +2037,6 @@ INT4_RELATIVE_RMS = 0.25
 # The landed sum's tolerance (the plain all-reduce, AttnRes's prefix and block): the
 # emulation computes it exactly, so an ULP of bf16.
 INT4_LANDED_TOLERANCE = (1e-6, 2**-7)
-
-
-def _quantizing(ctx: RankContext) -> HipCustomCommunicator:
-    """The world's communicator that moves every two-shot call it can INT4, built the
-    first time a case asks and kept beside the others (`RankContext.comm`)."""
-    if INT4 not in ctx._comms:
-        comm = HipCustomCommunicator(
-            ctx.cpu_group,
-            ctx.device_group,
-            ctx.device,
-            timeout_seconds=TEST_TIMEOUT_SECONDS,
-            max_rows=TEST_MAX_ROWS,
-            max_cols=TEST_MAX_COLS,
-            quantize_min_bytes=0,
-        )
-        if comm.disabled:
-            raise RuntimeError("the INT4 hip communicator is disabled")
-        ctx._comms[INT4] = comm
-    return ctx._comms[INT4]
 
 
 def _int4_round_trip(x: torch.Tensor) -> torch.Tensor:
@@ -2130,8 +2118,8 @@ def _int4_verdict(
 def run_int4_rank(
     ctx: RankContext, op: str, kernel: str, shape: tuple[int, int]
 ) -> tuple[bool, str | None]:
-    """ONE rank: `op` forced onto `kernel` on the INT4 communicator, against the
-    emulation and the exact op, and what it says it ran."""
+    """ONE rank: `op` forced onto `kernel`'s INT4 build, against the emulation and the
+    exact op, and what it says it ran."""
     import vllm.ir.ops
     from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 
@@ -2145,8 +2133,8 @@ def run_int4_rank(
     summed = _int4_landed(total, dtype)  # the sum as the two-shot quantizes it
     pull_norm = kernel.startswith("all_reduce_pull_two_shot") and "rms_norm" in op
     pull_norm = pull_norm and "attn_res" not in op
-    forced = _forced(kernel, 0 if op == "all_reduce" else hidden)
-    comm = _quantizing(ctx)
+    forced = _forced(kernel, 0 if op == "all_reduce" else hidden, "int4")
+    comm = ctx.comm("hip")
     mine = inputs[rank].to(device)
     landed_tolerance = INT4_LANDED_TOLERANCE
     normed_tolerance = _fused_tolerance(dtype)
@@ -2296,41 +2284,88 @@ def test_an_int4_two_shot_matches_the_format_it_moves(
 
 
 def run_int4_declines_rank(ctx: RankContext) -> tuple[bool, str | None]:
-    """ONE rank: what does NOT move INT4 says so -- the plain communicator's two-shot
-    (no quantization asked: `VLLM_ROCM_QUICK_REDUCE_QUANTIZATION` unset), the INT4
-    communicator's one-shot, and its two-shot on a row that is not whole groups for
-    every rank -- and each is still the exact sum."""
+    """ONE rank: what does not ask for INT4 says none and is the exact sum -- a plain
+    call on the suite's communicator (quantization none, the environment's default)
+    at a size past every crossover, and a forced two-shot whose forcing leaves its
+    quantization out."""
     dtype = torch.bfloat16
-    plain, int4 = ctx.comm("hip"), _quantizing(ctx)
-    cases = (
-        (plain, (128, 7168), "all_reduce_pull_two_shot"),
-        (int4, (4, 7168), "all_reduce_pull_one_shot"),
-        (int4, (128, 7168 + 8 * ctx.world), "all_reduce_pull_two_shot"),
-    )
-    for comm, shape, kernel in cases:
+    comm = ctx.comm("hip")
+    shape = (128, 7168)
+    forced = _forced("all_reduce_pull_two_shot")
+    del forced["quantization"]
+    for name, forcing in (("plain", {}), ("forced", forced)):
         inputs = [_one_input(r, 7, shape, dtype) for r in range(ctx.world)]
         exact = _int4_sum(inputs, torch.zeros(shape, dtype=torch.long)).to(dtype)
-        got = comm.all_reduce(inputs[ctx.rank].to(ctx.device), **_forced(kernel))
+        got = comm.all_reduce(inputs[ctx.rank].to(ctx.device), **forcing)
         torch.accelerator.synchronize()
         _the_call_left_nothing(comm)
         ran = comm._calls[-1].ran
         if ran is None or ran.quantization != "none":
-            return False, f"{kernel} at {shape} ran {ran}, not unquantized"
-        if (
-            why := _differences([("out", got, exact, _atol("all_reduce", dtype))], RTOL)
-        ) is not None:
-            return False, f"{kernel} at {shape}: {why}"
+            return False, f"the {name} call at {shape} ran {ran}, not unquantized"
+        outputs = [("out", got.cpu(), exact, _atol("all_reduce", dtype))]
+        if (why := _differences(outputs, RTOL)) is not None:
+            return False, f"the {name} call at {shape}: {why}"
     return True, None
 
 
-def test_what_does_not_move_int4_says_none(world: int, ranks: World) -> None:
-    """A call the handle does not quantize answers `none` and is the plain sum: no
-    quantization asked, a one-shot, a row INT4 cannot split by ranks."""
-    # example-based: the three ways a call stays unquantized
+def test_what_does_not_ask_for_int4_says_none(world: int, ranks: World) -> None:
+    """A call that does not ask for INT4 answers `none` and is the exact sum: a plain
+    call on a communicator whose quantization is none, and a forcing without one."""
+    # example-based: the two ways a call is left unquantized
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
     bad = [err for _, err in ranks.run(run_int4_declines_rank) if err is not None]
     assert not bad, "; ".join(bad)
+
+
+def run_int4_refused_rank(
+    ctx: RankContext, kernel: str, cols: int, quantization_only: bool
+) -> tuple[str | None, None]:
+    """ONE rank: an all-reduce of `cols` columns forced onto `kernel`'s first build
+    moving INT4 (a one-shot lists none, so its exact build renamed int4), or with
+    `quantization_only` a forcing of int4 alone; the Error's name it was refused for."""
+    if quantization_only:
+        forced: Forced = {"quantization": "int4"}
+    else:
+        forced = _forced(kernel) | {"quantization": "int4"}
+    x = torch.ones(128, cols, dtype=torch.bfloat16, device=ctx.device)
+    try:
+        ctx.comm("hip").all_reduce(x, **forced)
+    except Refused as no:
+        return no.error.name, None
+    return None, None
+
+
+@pytest.mark.parametrize(
+    ("kernel", "extra_cols", "quantization_only", "want"),
+    [
+        ("all_reduce_pull_one_shot", 0, False, "quantization_not_two_shot"),
+        ("all_reduce_pull_two_shot", 8, False, "row_not_int4_groups"),
+        ("all_reduce_pull_two_shot", 0, True, "forced_incomplete"),
+    ],
+)
+def test_a_forced_int4_it_cannot_run_is_refused_by_name(
+    kernel: str,
+    extra_cols: int,
+    quantization_only: bool,
+    want: str,
+    world: int,
+    ranks: World,
+) -> None:
+    """INT4 forced where it cannot run is refused for why: on a one-shot (it reads its
+    peers' inputs as they are), on a row that is not whole groups for every rank, and
+    named alone, without the rest of a forcing."""
+    # example-based: one call for each reason
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    cols = 7168 + extra_cols * world
+    got = ranks.run(
+        run_int4_refused_rank,
+        kernel=kernel,
+        cols=cols,
+        quantization_only=quantization_only,
+    )
+    assert {refused for refused, _ in got} == {want}, got
 
 
 def test_ran_reads_the_quantization_cpp_answers() -> None:
@@ -2344,18 +2379,53 @@ def test_ran_reads_the_quantization_cpp_answers() -> None:
 
 
 @pytest.mark.parametrize(
-    ("quantization", "want"),
-    [("NONE", -1), ("INT4", 2 * 1024 * 1024)],
+    ("variable", "given", "want"),
+    [
+        ("NONE", None, "none"),
+        ("INT4", None, "int4"),
+        ("NONE", "int4", "int4"),
+        ("INT4", "none", "none"),
+    ],
 )
-def test_int4_is_opt_in_on_our_own_variable(
-    quantization: str, want: int, monkeypatch: pytest.MonkeyPatch
+def test_the_quantization_asked_reaches_the_handle(
+    variable: str,
+    given: Quantization | None,
+    want: Quantization,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """INT4 only when our variable asks for it, at quick reduce's 2 MiB minimum; quick
-    reduce's own variable does not turn ours on."""
-    # example-based: each value once, and the other backend's variable
-    monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", quantization)
+    """The communicator opens its handle at the quantization it is given, else at what
+    our variable asks; quick reduce's own variable does not turn ours on."""
+    # example-based: each value of the variable, with and without one given
+    import vllm.distributed.device_communicators.hip_custom_communicator as module
+
+    monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", variable)
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
-    assert quantize_min_bytes_of() == want
+    opened: list[Quantization] = []
+
+    def open_handle(*args: str | int | float) -> Error:
+        opened.append(args[-1])
+        return Error.no_such_group
+
+    monkeypatch.setattr(module, "open_handle", open_handle)
+    monkeypatch.setattr(module, "capacity_of", lambda rows, cols, world: None)
+
+    class Group:
+        group_name = "fake"
+
+        def size(self) -> int:
+            return 8
+
+    comm = HipCustomCommunicator(
+        Group(),
+        Group(),
+        "cuda:0",
+        timeout_seconds=TEST_TIMEOUT_SECONDS,
+        max_rows=TEST_MAX_ROWS,
+        max_cols=TEST_MAX_COLS,
+        quantization=given,
+    )
+    assert opened == [want] and comm.quantization == want
+    assert comm.disabled
 
 
 @pytest.mark.parametrize("op", get_args(Op))
@@ -2410,8 +2480,25 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         for b in t.builds:
             assert b["threads_per_block"] > 0 and b["waves_per_eu"] >= 1, (name, b)
             assert b["tile_m"] >= 1 and b["tile_n"] > 0, (name, b)
+            assert b["quantization"] in get_args(Quantization), (name, b)
             launched = {"blocks_per_grid", "reduce_scatter_blocks"} & b.keys()
             assert not launched, (name, b)
+
+
+def test_build_info_lists_every_two_shot_build_moving_int4() -> None:
+    """Every two-shot template lists each of its exact builds again moving INT4, so a
+    forcing and a tuner can name either; a one-shot lists its exact builds only."""
+    # example-based: one fixed catalog
+    import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
+
+    for name, t in build_info().templates.items():
+        exact = [b for b in t.builds if b["quantization"] == "none"]
+        int4 = [b for b in t.builds if b["quantization"] == "int4"]
+        assert exact, name
+        if "two_shot" in name:
+            assert [b | {"quantization": "none"} for b in int4] == exact, name
+        else:
+            assert not int4, name
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
@@ -2420,7 +2507,13 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     got = open_handle(
-        "no-such", "no-such", 0, TEST_TIMEOUT_SECONDS, TEST_MAX_ROWS, TEST_MAX_COLS
+        "no-such",
+        "no-such",
+        0,
+        TEST_TIMEOUT_SECONDS,
+        TEST_MAX_ROWS,
+        TEST_MAX_COLS,
+        "none",
     )
     assert got is Error.no_such_group
 
@@ -2720,6 +2813,7 @@ def run_forcing_rank(
         ("tile_n", None, "forced_incomplete"),
         ("waves_per_eu", None, "forced_incomplete"),
         ("blocks_per_grid", None, "forced_incomplete"),
+        ("quantization", None, None),
         (None, 100, "tile_not_built"),
     ],
 )
@@ -2732,8 +2826,9 @@ def test_a_forcing_is_whole_or_refused_by_name(
     ranks: World,
 ) -> None:
     """A forced call gives every field of its config or none: one field short is
-    forced_incomplete, never filled in; a whole forcing of a build the template does not
-    list is refused for what differs; a whole listed one runs."""
+    forced_incomplete, never filled in, but its quantization, which is then none; a
+    whole forcing of a build the template does not list is refused for what differs; a
+    whole listed one runs."""
     # example-based: one shape, each way a forcing can be short
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
@@ -2813,12 +2908,15 @@ def _forced_drawn(op: str) -> st.SearchStrategy[dict]:
             assert shot, f"{name} names no direction and algorithm"
             direction, algorithm = shot.groups()
             split = {"reduce_scatter_blocks": 0} if "attn_res" in name else {}
+            # THE EXACT BUILDS ONLY: the reference is the exact op, and INT4 is held to
+            # its own format by the INT4 tests.
             forcings += [
                 dict.fromkeys(FORCED_DRAWN_FIELDS)
                 | {"algorithm": algorithm, "direction": direction}
                 | b
                 | split
                 for b in template.builds
+                if b["quantization"] == "none"
             ]
         return st.tuples(st.sampled_from(forcings), GRIDS_DRAWN).map(
             lambda forcing_grid: forcing_grid[0] | {"blocks_per_grid": forcing_grid[1]}

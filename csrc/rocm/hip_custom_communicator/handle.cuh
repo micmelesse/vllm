@@ -63,13 +63,12 @@ class Handle {
   // of at most `max_cols` columns (select.cuh's `exchange_sizes`): kept, so
   // what the buffers were sized for can be asked. `quantized_values_bytes` and
   // `quantized_scales_bytes`: one quantized buffer's values and scales at that
-  // box (common.cuh's QUANTIZATION). `quantize_min_bytes`: the least bytes a
-  // two-shot call moves INT4 at (select.cuh's `with_quantization`), or -1,
-  // never.
+  // box (common.cuh's QUANTIZATION). `quantization`: what the tuned path moves
+  // across the links, a Quantization (select.cuh's `with_quantization`).
   Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
          int64_t max_rows, int64_t max_cols, int64_t scratch_bytes,
          int64_t quantized_values_bytes, int64_t quantized_scales_bytes,
-         int64_t staging_bytes, int64_t quantize_min_bytes,
+         int64_t staging_bytes, int quantization,
          const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
@@ -79,7 +78,7 @@ class Handle {
         quantized_values_bytes_(quantized_values_bytes),
         quantized_scales_bytes_(quantized_scales_bytes),
         staging_bytes_(staging_bytes),
-        quantize_min_bytes_(quantize_min_bytes) {
+        quantization_(quantization) {
     // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging
     // runs off its own allocation, never into barrier state.
     signals_ = alloc_symmetric(kSignalsBytes);
@@ -181,7 +180,8 @@ class Handle {
     return static_cast<char*>(exchange_) + staging_offset();
   }
   int64_t staging_bytes() const { return staging_bytes_; }
-  int64_t quantize_min_bytes() const { return quantize_min_bytes_; }
+  // What the tuned path moves across the links, a Quantization.
+  int quantization() const { return quantization_; }
 
   // THE BUFFERS A CAPTURE RECORDED, registered, every rank together. During
   // capture an input's address is not registered yet, so `inp_ptrs` reserves a
@@ -474,7 +474,7 @@ class Handle {
   int64_t quantized_values_bytes_;
   int64_t quantized_scales_bytes_;
   int64_t staging_bytes_;
-  int64_t quantize_min_bytes_;
+  int quantization_;
   void* signals_ = nullptr;
   void* exchange_ = nullptr;
   uint32_t* status_ = nullptr;

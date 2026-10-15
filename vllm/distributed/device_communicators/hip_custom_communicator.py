@@ -9,11 +9,11 @@ CustomAllreduce) extended to every collective Kimi-K3 needs -- the all-reduce an
 all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 (`csrc/rocm/hip_custom_communicator.cu`).
 
-The caller names an op and C++ picks the kernel and its launch (`select.cuh`); the
-keyword arguments an op takes after its own (the algorithm, the direction, every field
-of one build and the launch, all or none) are the one way to force one, for the sweep
-and the tests. Every one is passed through as it came: C++ builds the config, checks
-it, and answers.
+The caller names an op and C++ picks the kernel and its launch (`select.cuh`), moving
+INT4 where the communicator's `quantization` asks; the keyword arguments an op takes
+after its own (the algorithm, the direction, every field of one build and the launch,
+all or none) are the one way to force one, for the sweep and the tests. Every one is
+passed through as it came: C++ builds the config, checks it, and answers.
 
 TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
 is held by vLLM for the graph's life, so it is registered once at capture exit and read
@@ -57,6 +57,10 @@ Op = Literal[
     "all_reduce_add_attn_res_rms_norm",
 ]
 
+# WHAT CROSSES THE LINKS, C++'s `Quantization` by name: a communicator's setting for
+# the calls it picks, and a build field a forcing names.
+Quantization = Literal["none", "int4"]
+
 
 class Error(IntEnum):
     """WHY A CALL CANNOT RUN: C++'s `hip_custom_communicator::Error`, number for
@@ -92,6 +96,10 @@ class Error(IntEnum):
     row_stride_not_packs = 27
     row_narrower_than_world = 28
     forced_incomplete = 29
+    no_such_quantization = 30
+    quantization_not_two_shot = 31
+    row_not_int4_groups = 32
+    quantized_too_small = 33
 
 
 class Where(IntEnum):
@@ -173,11 +181,12 @@ _DTYPES: Mapping[str, torch.dtype] = {
 @dataclass(frozen=True)
 class TemplateBuild:
     """One C++ template as built: its op, and the builds dispatch instantiates (its
-    catalog list), each its fields by name (threads_per_block, waves_per_eu and its
-    tile; never the launch, which a forced call gives itself)."""
+    catalog list), each its fields by name as a forcing passes them
+    (threads_per_block, waves_per_eu, its tile and its quantization; never the launch,
+    which a forced call gives itself)."""
 
     op: str
-    builds: tuple[dict[str, int], ...]
+    builds: tuple[dict[str, int | str], ...]
 
 
 @dataclass(frozen=True)
@@ -233,10 +242,12 @@ def build_info() -> BuildInfo:
     templates: dict[str, TemplateBuild] = {}
     at, width = 0, len(fields)
     for name, op, count in zip(names, template_ops, counts):
-        builds = []
+        builds: list[dict[str, int | str]] = []
         for _ in range(count):
-            values = flat[at : at + width]
-            builds.append({f: v for f, v in zip(fields, values) if v != 0})
+            given = dict(zip(fields, flat[at : at + width]))
+            q = _QUANTIZATIONS[given.pop("quantization")]
+            fields_set = {f: v for f, v in given.items() if v != 0}
+            builds.append(fields_set | {"quantization": q})
             at += width
         templates[name] = TemplateBuild(op, tuple(builds))
     records: dict[str, OpRecord] = {}
@@ -373,13 +384,13 @@ def open_handle(
     timeout_seconds: float,
     max_rows: int,
     max_cols: int,
-    quantize_min_bytes: int = -1,
+    quantization: Quantization,
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
-    C++'s opener, so its arguments are written once. `quantize_min_bytes`: the least
-    bytes a two-shot call moves INT4 at, or -1, never (`quantize_min_bytes_of`)."""
+    C++'s opener, so its arguments are written once. `quantization`: what the calls C++
+    picks move across the links (each op's crossover is C++'s, `select.cuh`)."""
     handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
         cpu_group,
         device_group,
@@ -387,26 +398,18 @@ def open_handle(
         timeout_seconds,
         max_rows,
         max_cols,
-        quantize_min_bytes,
+        _QUANTIZATIONS.index(quantization),
     )
     return Error(err) if err is not None else handle
 
 
-# THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT: quick reduce's INT4 minimum at 8 ranks
-# (its fp16 kernels' table, which bf16 takes by default), so INT4 runs on the calls the
-# default ROCm path quantizes, and below it the exact kernels run.
-INT4_MIN_BYTES = 2 * 1024 * 1024
-
-
-def quantize_min_bytes_of() -> int:
-    """THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT, or -1, never: INT4_MIN_BYTES when
-    `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` is INT4 (opt-in: it is lossy),
-    else -1."""
+def configured_quantization() -> Quantization:
+    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks (NONE by default:
+    INT4 is lossy, so opt-in)."""
     import vllm.envs as envs
 
-    if envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION == "INT4":
-        return INT4_MIN_BYTES
-    return -1
+    asked = envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION
+    return "int4" if asked == "INT4" else "none"
 
 
 def supported(device: torch.device, world: int) -> Supported | Error:
@@ -491,7 +494,7 @@ Answer = list[int]
 # C++'s `Algorithm`, `Direction` and `Quantization`, number for number.
 _ALGORITHMS = ("one_shot", "two_shot")
 _DIRECTIONS = ("pull", "push")
-_QUANTIZATIONS = ("none", "int4")
+_QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
 
 
 @dataclass(frozen=True)
@@ -511,7 +514,7 @@ class Ran:
     staged: bool
     tile_k: int
     reduce_scatter_blocks: int
-    quantization: str
+    quantization: Quantization
 
     @classmethod
     def of(cls, answer: Answer) -> "Ran | None":
@@ -625,17 +628,16 @@ class HipCustomCommunicator:
         timeout_seconds: float | None = None,
         max_rows: int | None = None,
         max_cols: int | None = None,
-        quantize_min_bytes: int | None = None,
+        quantization: Quantization | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
         `timeout_seconds`: how long a kernel waits on a peer before it reports a
         fault; None is the device group's own (`collective_timeout_seconds`).
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
-        sized for; None is the server's (`problem_size`). `quantize_min_bytes`: the
-        least bytes a two-shot call moves INT4 at, -1 never; None is what
-        `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks
-        (`quantize_min_bytes_of`)."""
+        sized for; None is the server's (`problem_size`). `quantization`: what the
+        calls C++ picks move across the links, from each op's crossover up; None is
+        what the environment asks (`configured_quantization`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -650,10 +652,8 @@ class HipCustomCommunicator:
             max_cols = served_cols if max_cols is None else max_cols
         self.max_rows = max_rows
         self.max_cols = max_cols
-        self.quantize_min_bytes = (
-            quantize_min_bytes_of()
-            if quantize_min_bytes is None
-            else quantize_min_bytes
+        self.quantization: Quantization = (
+            configured_quantization() if quantization is None else quantization
         )
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
@@ -694,9 +694,11 @@ class HipCustomCommunicator:
     # direction (`pull` or `push`) where the op has more than one template, every field
     # of one of its builds (`build_info().templates`), and the launch (blocks_per_grid,
     # and the AttnRes op's reduce_scatter_blocks); some but not all is
-    # `forced_incomplete`. All None is the backend's choice; the model forces none. A
-    # forced call asks no `should_`: C++ answers it. An op raises Refused with the
-    # Error C++ refused it for; a call its `should_` admitted is never refused.
+    # `forced_incomplete`. The build's `quantization` alone may be left out, and is
+    # then none, never the communicator's: a forced call runs what it names. All None
+    # is the backend's choice; the model forces none. A forced call asks no `should_`:
+    # C++ answers it. An op raises Refused with the Error C++ refused it for; a call
+    # its `should_` admitted is never refused.
 
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
@@ -715,6 +717,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
+        quantization: Quantization | None = None,
     ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
         picks among a backend's own paths (hip's in C++), never whether it is ours.
@@ -733,6 +736,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
         self._launched("all_reduce", input, answer)
         return output
@@ -760,6 +764,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
+        quantization: Quantization | None = None,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)` in one kernel. Returns
         the normed sum."""
@@ -779,6 +784,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
         self._launched("all_reduce_rms_norm", input, answer)
         return output
@@ -807,6 +813,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
+        quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)` in
         one kernel. Returns the normed result and the sum plus residual."""
@@ -828,6 +835,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
         self._launched("all_reduce_add_rms_norm", input, answer)
         return output, residual_output
@@ -862,6 +870,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None = None,
         blocks_per_grid: int | None = None,
         waves_per_eu: int | None = None,
+        quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(input), blocks, ...)` in one kernel, or with no
         `prefix` the sum starting one. Returns the new prefix and the AttnRes output,
@@ -898,6 +907,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
         self._launched("all_reduce_add_attn_res_rms_norm", input, answer)
         return prefix_output, output
@@ -1083,7 +1093,7 @@ class HipCustomCommunicator:
             self.timeout_seconds,
             self.max_rows,
             self.max_cols,
-            self.quantize_min_bytes,
+            self.quantization,
         )
         if isinstance(handle, Error):
             return handle.name
@@ -1125,6 +1135,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         """Sum `input` across the TP ranks into `output`; the Error's number C++ refused
         the call for, or -1 and what ran (as every kernel hook answers: `Answer`)."""
@@ -1139,6 +1150,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
 
     def _all_reduce_rms_norm(
@@ -1154,6 +1166,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
             self._handle,
@@ -1168,6 +1181,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
 
     def _all_reduce_add_rms_norm(
@@ -1185,6 +1199,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         """The normed result into `output`; the sum plus residual into
         `residual_output`."""
@@ -1203,6 +1218,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -1228,6 +1244,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
+        quantization: Quantization | None,
     ) -> Answer:
         launch = (
             torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm
@@ -1255,6 +1272,7 @@ class HipCustomCommunicator:
             threads_per_block,
             blocks_per_grid,
             waves_per_eu,
+            quantization,
         )
 
     def _on_close(self) -> None:

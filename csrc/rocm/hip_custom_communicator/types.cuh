@@ -55,8 +55,12 @@ enum class Error : int {
   row_stride_not_packs = 27,
   row_narrower_than_world = 28,
   forced_incomplete = 29,
+  no_such_quantization = 30,
+  quantization_not_two_shot = 31,
+  row_not_int4_groups = 32,
+  quantized_too_small = 33,
 };
-constexpr int kNumErrors = 30;
+constexpr int kNumErrors = 34;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -139,6 +143,17 @@ constexpr const char* to_string(Error e) {
       return "forced_incomplete: a forced call gives every field of its config "
              "(the template, "
              "its build and its launch) or none";
+    case Error::no_such_quantization:
+      return "no_such_quantization: the quantization is none or int4";
+    case Error::quantization_not_two_shot:
+      return "quantization_not_two_shot: only a two-shot moves INT4; a "
+             "one-shot reads its peers' inputs as they are";
+    case Error::row_not_int4_groups:
+      return "row_not_int4_groups: an INT4 row is whole groups of 32 for every "
+             "rank";
+    case Error::quantized_too_small:
+      return "quantized_too_small: the call's INT4 values or scales exceed the "
+             "quantized regions";
   }
   return "unknown";
 }
@@ -184,8 +199,8 @@ enum class OpType : int {
 // nothing), and the tile, TILE_M rows x TILE_N columns in elements; TILE_K is
 // the reduced dimension a step (AttnRes's sources a step); `quantization`, what
 // crosses the links (common.cuh's QUANTIZATION): a two-shot's build is listed
-// as it is and moving INT4 (select's `and_int4`), which select takes for a call
-// the handle quantizes; a forced build is none. One type an op, so a config
+// as it is and moving INT4 (select's `and_int4`), forced like any field or
+// taken by select for a call the handle quantizes. One type an op, so a config
 // cannot cross ops, though three hold the same fields. all_reduce: a tile a
 // work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {

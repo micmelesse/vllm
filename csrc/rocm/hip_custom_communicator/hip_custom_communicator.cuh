@@ -53,7 +53,8 @@ inline std::variant<AllReduceLaunch, Error> all_reduce(
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu, hipStream_t stream) {
+    std::optional<int> waves_per_eu, std::optional<int> quantization,
+    hipStream_t stream) {
   if (const std::optional<Error> e =
           layout_refused(dtype, {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -62,7 +63,7 @@ inline std::variant<AllReduceLaunch, Error> all_reduce(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
       dtype, algorithm, direction, tile_m, tile_n, threads_per_block,
-      blocks_per_grid, waves_per_eu, stream);
+      blocks_per_grid, waves_per_eu, quantization, stream);
   if (const AllReduceLaunch* got = std::get_if<AllReduceLaunch>(&l))
     launch_all_reduce(h, *got);
   return l;
@@ -84,7 +85,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> all_reduce_rms_norm(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
-    hipStream_t stream) {
+    std::optional<int> quantization, hipStream_t stream) {
   if (const std::optional<Error> e =
           layout_refused(dtype, {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -97,7 +98,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> all_reduce_rms_norm(
       weight, weight_stride_n, weight_size_n, output, output_stride_m,
       output_stride_n, output_size_m, output_size_n, dtype, weight_dtype, eps,
       algorithm, direction, tile_m, tile_n, threads_per_block, blocks_per_grid,
-      waves_per_eu, stream);
+      waves_per_eu, quantization, stream);
   if (const AllReduceRmsNormLaunch* got =
           std::get_if<AllReduceRmsNormLaunch>(&l))
     launch_all_reduce_rms_norm(h, *got);
@@ -118,7 +119,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> all_reduce_add_rms_norm(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> threads_per_block,
     std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
-    hipStream_t stream) {
+    std::optional<int> quantization, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
@@ -137,7 +138,7 @@ inline std::variant<AllReduceAddRmsNormLaunch, Error> all_reduce_add_rms_norm(
           residual_output, residual_output_stride_m, residual_output_stride_n,
           residual_output_size_m, residual_output_size_n, dtype, weight_dtype,
           eps, algorithm, direction, tile_m, tile_n, threads_per_block,
-          blocks_per_grid, waves_per_eu, stream);
+          blocks_per_grid, waves_per_eu, quantization, stream);
   if (const AllReduceAddRmsNormLaunch* got =
           std::get_if<AllReduceAddRmsNormLaunch>(&l))
     launch_all_reduce_add_rms_norm(h, *got);
@@ -176,7 +177,8 @@ all_reduce_add_attn_res_rms_norm(
     std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks,
     std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
-    std::optional<int> waves_per_eu, hipStream_t stream) {
+    std::optional<int> waves_per_eu, std::optional<int> quantization,
+    hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
@@ -216,7 +218,7 @@ all_reduce_add_attn_res_rms_norm(
           block_output_stride_n, block_output_size_m, block_output_size_n,
           dtype, num_blocks, eps, output_eps, algorithm, direction, tile_m,
           tile_n, tile_k, reduce_scatter_blocks, threads_per_block,
-          blocks_per_grid, waves_per_eu, stream);
+          blocks_per_grid, waves_per_eu, quantization, stream);
   if (const auto* got = std::get_if<AllReduceAddAttnResRmsNormLaunch>(&l))
     launch_all_reduce_add_attn_res_rms_norm(h, *got);
   return l;

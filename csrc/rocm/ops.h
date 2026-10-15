@@ -65,7 +65,7 @@ std::tuple<std::optional<int64_t>, std::optional<int64_t>>
 hip_custom_communicator_open(const std::string& cpu_group,
                              const std::string& device_group, int64_t device,
                              double timeout_seconds, int64_t max_rows,
-                             int64_t max_cols, int64_t quantize_min_bytes);
+                             int64_t max_cols, int64_t quantization);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // scratch_bytes, staging_bytes, then each op's max_bytes in kOps' order].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
@@ -108,7 +108,8 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
 hip_custom_communicator_build_info();
 
 // Each op takes its own forcing last: the template by name, every field of one
-// of its builds, and the launch, all or none (none: select's). It returns the
+// of its builds, and the launch, all or none (none: select's), the build's
+// quantization ("none" or "int4") optional within it. It returns the
 // Error's number it was refused for, or -1 and what ran
 // (hip_custom_communicator.cu's Answer).
 
@@ -117,15 +118,15 @@ std::vector<int64_t> hip_custom_communicator_all_reduce(
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
@@ -133,8 +134,8 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
@@ -147,5 +148,5 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
     std::optional<int64_t> reduce_scatter_blocks,
     std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid,
-    std::optional<int64_t> waves_per_eu);
+    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<std::string> quantization);

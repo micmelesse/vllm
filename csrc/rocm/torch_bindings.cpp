@@ -136,7 +136,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! output, str? algorithm, "
       "str? direction, int? tile_m, int? tile_n, int? threads_per_block, int? "
       "blocks_per_grid, "
-      "int? waves_per_eu) -> int[]");
+      "int? waves_per_eu, str? quantization) -> int[]");
   rocm_ops.impl("hip_custom_communicator_all_reduce", torch::kCUDA,
                 &hip_custom_communicator_all_reduce);
 
@@ -149,7 +149,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "input, Tensor weight, Tensor! output, "
       "float eps, str? algorithm, str? direction, int? tile_m, int? tile_n, "
       "int? threads_per_block, "
-      "int? blocks_per_grid, int? waves_per_eu) -> int[]");
+      "int? blocks_per_grid, int? waves_per_eu, str? quantization) -> "
+      "int[]");
   rocm_ops.impl("hip_custom_communicator_all_reduce_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_rms_norm);
   rocm_ops.def(
@@ -158,7 +159,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor weight, Tensor! output, Tensor! residual_output, float eps, str? "
       "algorithm, str? direction, "
       "int? tile_m, int? tile_n, int? threads_per_block, int? blocks_per_grid, "
-      "int? waves_per_eu) -> int[]");
+      "int? waves_per_eu, str? quantization) -> int[]");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_rms_norm", torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_rms_norm);
 
@@ -173,7 +174,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int? tile_n, int? tile_k, "
       "int? reduce_scatter_blocks, int? threads_per_block, int? "
       "blocks_per_grid, "
-      "int? waves_per_eu) -> int[]");
+      "int? waves_per_eu, str? quantization) -> int[]");
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm",
                 torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
