@@ -392,30 +392,21 @@ def open_handle(
     return Error(err) if err is not None else handle
 
 
-def quantize_min_bytes_of(world: int) -> int:
-    """THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT, or -1, never: the default ROCm
-    path's own rule, so INT4 runs on the same calls in both. Quick reduce quantizes
-    when `VLLM_ROCM_QUICK_REDUCE_QUANTIZATION` is INT4, from its
-    `VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB` or else its table's least for INT4 at
-    this world, the fp16 kernels' row while it casts bf16 to fp16 (its default)."""
-    import vllm.envs as envs
-    from vllm.distributed.device_communicators.quick_all_reduce import (
-        MB,
-        QuickAllReduce,
-        QuickReduceRegime,
-    )
+# THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT: quick reduce's INT4 minimum at 8 ranks
+# (its fp16 kernels' table, which bf16 takes by default), so INT4 runs on the calls the
+# default ROCm path quantizes, and below it the exact kernels run.
+INT4_MIN_BYTES = 2 * 1024 * 1024
 
-    if envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION != "INT4":
-        return -1
-    if envs.VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB is not None:
-        return envs.VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB * MB
-    dtype = (
-        torch.float16
-        if envs.VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16
-        else torch.bfloat16
-    )
-    table = QuickAllReduce._QR_MIN_SIZE.get((dtype, world))
-    return -1 if table is None else table[QuickReduceRegime.INT4.value]
+
+def quantize_min_bytes_of() -> int:
+    """THE LEAST BYTES A TWO-SHOT CALL MOVES INT4 AT, or -1, never: INT4_MIN_BYTES when
+    `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` is INT4 (opt-in: it is lossy),
+    else -1."""
+    import vllm.envs as envs
+
+    if envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION == "INT4":
+        return INT4_MIN_BYTES
+    return -1
 
 
 def supported(device: torch.device, world: int) -> Supported | Error:
@@ -642,8 +633,8 @@ class HipCustomCommunicator:
         fault; None is the device group's own (`collective_timeout_seconds`).
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
         sized for; None is the server's (`problem_size`). `quantize_min_bytes`: the
-        least bytes a two-shot call moves INT4 at, -1 never; None is the default
-        ROCm path's rule (`quantize_min_bytes_of`)."""
+        least bytes a two-shot call moves INT4 at, -1 never; None is what
+        `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION` asks (`quantize_min_bytes_of`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -659,7 +650,7 @@ class HipCustomCommunicator:
         self.max_rows = max_rows
         self.max_cols = max_cols
         self.quantize_min_bytes = (
-            quantize_min_bytes_of(device_group.size())
+            quantize_min_bytes_of()
             if quantize_min_bytes is None
             else quantize_min_bytes
         )

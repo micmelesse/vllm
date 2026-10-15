@@ -2344,36 +2344,18 @@ def test_ran_reads_the_quantization_cpp_answers() -> None:
 
 
 @pytest.mark.parametrize(
-    ("quantization", "min_mb", "cast", "want"),
-    [
-        ("NONE", None, None, -1),
-        ("INT8", None, None, -1),
-        ("INT4", None, None, 2 * 1024 * 1024),
-        ("INT4", None, "0", 2048 * 1024 * 1024),
-        ("INT4", "3", None, 3 * 1024 * 1024),
-    ],
+    ("quantization", "want"),
+    [("NONE", -1), ("INT4", 2 * 1024 * 1024)],
 )
-def test_int4_follows_the_default_paths_rule(
-    quantization: str,
-    min_mb: str | None,
-    cast: str | None,
-    want: int,
-    monkeypatch: pytest.MonkeyPatch,
+def test_int4_is_opt_in_on_our_own_variable(
+    quantization: str, want: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """At 8 ranks the INT4 threshold is quick reduce's: only when it quantizes INT4,
-    its own minimum if set, else its table's INT4 entry, the fp16 row while it casts
-    bf16 to fp16."""
-    # example-based: each branch of the rule once
-    monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", quantization)
-    for name, value in (
-        ("VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB", min_mb),
-        ("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", cast),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    assert quantize_min_bytes_of(8) == want
+    """INT4 only when our variable asks for it, at quick reduce's 2 MiB minimum; quick
+    reduce's own variable does not turn ours on."""
+    # example-based: each value once, and the other backend's variable
+    monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", quantization)
+    monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+    assert quantize_min_bytes_of() == want
 
 
 @pytest.mark.parametrize("op", get_args(Op))
