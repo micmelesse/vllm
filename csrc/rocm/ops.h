@@ -109,23 +109,24 @@ hip_custom_communicator_build_info();
 
 // Each op takes its own forcing last: the template by name, every field of one
 // of its builds, and the launch, all or none (none: select's). It returns the
-// Error's number it was refused for, or none when it ran.
+// Error's number it was refused for, or -1 and what ran
+// (hip_custom_communicator.cu's Answer).
 
-std::optional<int64_t> hip_custom_communicator_all_reduce(
+std::vector<int64_t> hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
     std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
-std::optional<int64_t> hip_custom_communicator_all_reduce_rms_norm(
+std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
+std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
@@ -134,7 +135,7 @@ std::optional<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     std::optional<int64_t> threads_per_block,
     std::optional<int64_t> blocks_per_grid,
     std::optional<int64_t> waves_per_eu);
-std::optional<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,

@@ -172,8 +172,36 @@ using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
                Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
                Names, std::vector<int64_t>>;
-// AN OP'S ANSWER: the Error's number it was refused for, or none when it ran.
-using Refusal = std::optional<int64_t>;
+// AN OP'S ANSWER, primitive ints: [the Error's number it was refused for, or -1
+// when it ran; then, when it ran, WHAT RAN, for the flight recorder: algorithm,
+// direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu,
+// staged (1 or 0), tile_k, reduce_scatter_blocks (0 where the op has none)].
+using Answer = std::vector<int64_t>;
+Answer refusal(hip_custom_communicator::Error e) {
+  return {static_cast<int64_t>(e)};
+}
+template <typename LAUNCH>
+Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
+    return refusal(*e);
+  const LAUNCH& l = std::get<LAUNCH>(got);
+  int64_t staged = 0, tile_k = 0, reduce_scatter_blocks = 0;
+  if constexpr (requires { l.staged; }) staged = l.staged ? 1 : 0;
+  if constexpr (requires { l.tile_k; }) tile_k = l.tile_k;
+  if constexpr (requires { l.reduce_scatter_blocks; })
+    reduce_scatter_blocks = l.reduce_scatter_blocks;
+  return {-1,
+          static_cast<int64_t>(l.algorithm),
+          static_cast<int64_t>(l.direction),
+          l.tile_m,
+          l.tile_n,
+          l.threads_per_block,
+          l.blocks_per_grid,
+          l.waves_per_eu,
+          staged,
+          tile_k,
+          reduce_scatter_blocks};
+}
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
 // (which carries the handles) and `device_group`, a collective: this rank's
@@ -437,7 +465,7 @@ void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
 }
 }  // namespace
 
-Refusal hip_custom_communicator_all_reduce(
+Answer hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
@@ -453,7 +481,7 @@ Refusal hip_custom_communicator_all_reduce(
   const std::optional<torch::Tensor> input_rows = as_rows(input),
                                      output_rows = as_rows(output);
   if (!input_rows || !output_rows)
-    return static_cast<int64_t>(hip_custom_communicator::Error::not_contiguous);
+    return refusal(hip_custom_communicator::Error::not_contiguous);
   const auto got = hip_custom_communicator::all_reduce(
       handle_of(handle_ptr), input_rows->data_ptr(), input_rows->stride(0),
       input_rows->stride(1), input_rows->size(0), input_rows->size(1),
@@ -462,9 +490,7 @@ Refusal hip_custom_communicator_all_reduce(
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
       narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return static_cast<int64_t>(*e);
-  return std::nullopt;
+  return answer(got);
 }
 
 namespace {
@@ -503,7 +529,7 @@ void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
 }
 }  // namespace
 
-Refusal hip_custom_communicator_all_reduce_rms_norm(
+Answer hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
@@ -520,12 +546,10 @@ Refusal hip_custom_communicator_all_reduce_rms_norm(
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return static_cast<int64_t>(*e);
-  return std::nullopt;
+  return answer(got);
 }
 
-Refusal hip_custom_communicator_all_reduce_add_rms_norm(
+Answer hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
@@ -548,9 +572,7 @@ Refusal hip_custom_communicator_all_reduce_add_rms_norm(
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return static_cast<int64_t>(*e);
-  return std::nullopt;
+  return answer(got);
 }
 
 namespace {
@@ -632,7 +654,7 @@ Rows rows_of(const std::optional<torch::Tensor>& t) {
 }
 }  // namespace
 
-Refusal hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
@@ -671,7 +693,5 @@ Refusal hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
       narrowed(threads_per_block), narrowed(blocks_per_grid),
       narrowed(waves_per_eu), current_stream());
-  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
-    return static_cast<int64_t>(*e);
-  return std::nullopt;
+  return answer(got);
 }

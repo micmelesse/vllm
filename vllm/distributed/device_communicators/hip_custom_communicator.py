@@ -442,10 +442,65 @@ class Closed:
 State = Disabled | Open | Capturing | Broken | Closed
 
 
+# AN OP'S ANSWER, C++'s wire (`hip_custom_communicator.cu`'s Answer): the Error's
+# number it was refused for, or -1 when it ran, then what ran.
+Answer = list[int]
+# C++'s `Algorithm` and `Direction`, number for number.
+_ALGORITHMS = ("one_shot", "two_shot")
+_DIRECTIONS = ("pull", "push")
+
+
+@dataclass(frozen=True)
+class Ran:
+    """WHAT A LAUNCH RAN, as C++ answered it: the kernel's algorithm and direction,
+    its tile and threads, its grid; `staged` (the eager build that copies its input
+    through the staging), `tile_k` and `reduce_scatter_blocks` 0 where the op has
+    none."""
+
+    algorithm: str
+    direction: str
+    tile_m: int
+    tile_n: int
+    threads_per_block: int
+    blocks_per_grid: int
+    waves_per_eu: int
+    staged: bool
+    tile_k: int
+    reduce_scatter_blocks: int
+
+    @classmethod
+    def of(cls, answer: Answer) -> "Ran | None":
+        """From an answer that ran; None for one that says nothing of what ran (the
+        test's torch control answers [-1])."""
+        if len(answer) < 11:
+            return None
+        a = answer[1:]
+        return cls(
+            _ALGORITHMS[a[0]],
+            _DIRECTIONS[a[1]],
+            a[2],
+            a[3],
+            a[4],
+            a[5],
+            a[6],
+            bool(a[7]),
+            a[8],
+            a[9],
+        )
+
+    def __str__(self) -> str:
+        how = " staged" if self.staged else ""
+        return (
+            f"{self.direction} {self.algorithm}{how} tile {self.tile_m}x{self.tile_n}"
+            f" threads {self.threads_per_block} grid {self.blocks_per_grid}"
+        )
+
+
 @dataclass(frozen=True)
 class Call:
-    """ONE LAUNCH, as the flight recorder keeps it. A graph's replays run none of this
-    code, so a captured launch is recorded once, at its capture."""
+    """ONE LAUNCH, as the flight recorder keeps it, with what it ran. A graph's
+    replays run none of this code, so a captured launch is recorded once, at its
+    capture."""
 
     seq: int  # this communicator's launches before it
     op: Op
@@ -453,11 +508,13 @@ class Call:
     dtype: torch.dtype
     captured: bool
     at_s: float  # time.monotonic() at the launch
+    ran: Ran | None
 
     def __str__(self) -> str:
         how = " (captured)" if self.captured else ""
+        what = f" {self.ran}" if self.ran is not None else ""
         return (
-            f"#{self.seq} {self.op} {list(self.shape)} {self.dtype}{how} "
+            f"#{self.seq} {self.op} {list(self.shape)} {self.dtype}{how}{what} "
             f"at {self.at_s:.3f}"
         )
 
@@ -610,7 +667,7 @@ class HipCustomCommunicator:
         output = torch.empty_like(input)
         if self._warming_up():
             return output
-        refused = self._all_reduce(
+        answer = self._all_reduce(
             input,
             output,
             algorithm,
@@ -621,7 +678,7 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce", input, refused)
+        self._launched("all_reduce", input, answer)
         return output
 
     @final
@@ -654,7 +711,7 @@ class HipCustomCommunicator:
         output = torch.empty_like(input)
         if self._warming_up():
             return output
-        refused = self._all_reduce_rms_norm(
+        answer = self._all_reduce_rms_norm(
             input,
             weight,
             output,
@@ -667,7 +724,7 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_rms_norm", input, refused)
+        self._launched("all_reduce_rms_norm", input, answer)
         return output
 
     @final
@@ -701,7 +758,7 @@ class HipCustomCommunicator:
         output, residual_output = torch.empty_like(input), torch.empty_like(input)
         if self._warming_up():
             return output, residual_output
-        refused = self._all_reduce_add_rms_norm(
+        answer = self._all_reduce_add_rms_norm(
             input,
             residual,
             weight,
@@ -716,7 +773,7 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_add_rms_norm", input, refused)
+        self._launched("all_reduce_add_rms_norm", input, answer)
         return output, residual_output
 
     @final
@@ -763,7 +820,7 @@ class HipCustomCommunicator:
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        refused = self._all_reduce_add_attn_res_rms_norm(
+        answer = self._all_reduce_add_attn_res_rms_norm(
             input,
             prefix,
             blocks,
@@ -786,7 +843,7 @@ class HipCustomCommunicator:
             blocks_per_grid,
             waves_per_eu,
         )
-        self._launched("all_reduce_add_attn_res_rms_norm", input, refused)
+        self._launched("all_reduce_add_attn_res_rms_norm", input, answer)
         return prefix_output, output
 
     @final
@@ -908,15 +965,15 @@ class HipCustomCommunicator:
         _require_capture(self.state)
 
     @final
-    def _launched(self, op: Op, input: torch.Tensor, refused: int | None) -> None:
+    def _launched(self, op: Op, input: torch.Tensor, answer: Answer) -> None:
         """After an op's kernel hook: Refused with the Error's number it answered, or
-        the launch into the flight recorder."""
-        if refused is not None:
-            raise Refused(Error(refused), input)
-        self._record(op, input)
+        the launch, and what it ran, into the flight recorder."""
+        if answer[0] >= 0:
+            raise Refused(Error(answer[0]), input)
+        self._record(op, input, Ran.of(answer))
 
     @final
-    def _record(self, op: Op, input: torch.Tensor) -> None:
+    def _record(self, op: Op, input: torch.Tensor, ran: Ran | None = None) -> None:
         """Into the flight recorder, as a launch goes out."""
         self._calls.append(
             Call(
@@ -926,6 +983,7 @@ class HipCustomCommunicator:
                 dtype=input.dtype,
                 captured=torch.cuda.is_current_stream_capturing(),
                 at_s=time.monotonic(),
+                ran=ran,
             )
         )
         self._launches += 1
@@ -941,8 +999,8 @@ class HipCustomCommunicator:
             and not torch.cuda.is_current_stream_capturing()
         )
 
-    # ---- THE KERNELS: each op's launch (the Error's number C++ refused it for, or
-    # None), and the peer memory's life. ----
+    # ---- THE KERNELS: each op's launch (its `Answer`: the Error's number C++
+    # refused it for, or -1 and what ran), and the peer memory's life. ----
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
@@ -1010,9 +1068,9 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
+    ) -> Answer:
         """Sum `input` across the TP ranks into `output`; the Error's number C++ refused
-        the call for, or None when it ran (as every kernel hook answers)."""
+        the call for, or -1 and what ran (as every kernel hook answers: `Answer`)."""
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
             self._handle,
             input,
@@ -1039,7 +1097,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
+    ) -> Answer:
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
             self._handle,
             input,
@@ -1070,7 +1128,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
+    ) -> Answer:
         """The normed result into `output`; the sum plus residual into
         `residual_output`."""
         return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
@@ -1113,7 +1171,7 @@ class HipCustomCommunicator:
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
+    ) -> Answer:
         launch = (
             torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm
         )

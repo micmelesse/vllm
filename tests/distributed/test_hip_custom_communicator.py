@@ -59,6 +59,7 @@ from vllm.distributed.device_communicators import (
     hip_custom_communicator as comms_module,
 )
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    Answer,
     Broken,
     Capturing,
     Closed,
@@ -214,7 +215,7 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
+    ) -> Answer:
         """The sum, torch's; nothing forced, having no template to force."""
         if any(
             f is not None
@@ -228,10 +229,10 @@ class TorchCommunicator(HipCustomCommunicator):
                 waves_per_eu,
             )
         ):
-            return Error.no_such_template
+            return [Error.no_such_template]
         output.copy_(input)
         dist.all_reduce(output, group=self.device_group)  # SUM
-        return None
+        return [-1]
 
     def _all_reduce_rms_norm(
         self,
@@ -246,8 +247,8 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
-        return Error.no_such_op
+    ) -> Answer:
+        return [Error.no_such_op]
 
     def _all_reduce_add_rms_norm(
         self,
@@ -264,8 +265,8 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
-        return Error.no_such_op
+    ) -> Answer:
+        return [Error.no_such_op]
 
     def _all_reduce_add_attn_res_rms_norm(
         self,
@@ -290,8 +291,8 @@ class TorchCommunicator(HipCustomCommunicator):
         threads_per_block: int | None,
         blocks_per_grid: int | None,
         waves_per_eu: int | None,
-    ) -> int | None:
-        return Error.no_such_op
+    ) -> Answer:
+        return [Error.no_such_op]
 
     def _on_capture(self) -> AbstractContextManager[None]:
         return nullcontext()
