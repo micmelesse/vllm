@@ -2055,7 +2055,7 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401  (registers torch.ops._rocm_C)
 
     handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
-        "no-such", "no-such", 0, TEST_TIMEOUT_SECONDS
+        "no-such", "no-such", 0, TEST_TIMEOUT_SECONDS, TEST_MAX_ROWS, TEST_MAX_COLS
     )
     assert handle is None and Error(err) is Error.no_such_group
 
