@@ -1576,16 +1576,15 @@ DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const float (&scales)[
   }
 }
 
-// Every peer's, the position once a pack in a vector register (peers_load's), each rank's word
-// and scale an add of it.
-template <int THREADS_M, int THREADS_N, typename U, int WORLD, int ROWS, int K, int P>
-DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
-                             const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
-                             int size_m, int size_n, U (&output)[WORLD][ROWS][K][P],
-                             int offs_m, int offs_n, int row_step) {
+// Every peer's words and scales, the position once a pack in a vector register (peers_load's),
+// each rank's word and scale an add of it; all in flight, none waited on.
+template <int THREADS_M, int THREADS_N, int P, int WORLD, int ROWS, int K>
+DINLINE void int4_peers_issue(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
+                              const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
+                              int size_m, int size_n, uint32_t (&words)[WORLD][ROWS][K],
+                              float (&group_scales)[WORLD][ROWS][K], int offs_m, int offs_n,
+                              int row_step) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-  uint32_t words[WORLD][ROWS][K];
-  float group_scales[WORLD][ROWS][K];
 #pragma unroll
   for (int i = 0; i < ROWS; ++i) {
     if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
@@ -1610,8 +1609,43 @@ DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t valu
     }
   }
   issued();
+}
+template <int THREADS_M, int THREADS_N, typename U, int WORLD, int ROWS, int K, int P>
+DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
+                             const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
+                             int size_m, int size_n, U (&output)[WORLD][ROWS][K][P],
+                             int offs_m, int offs_n, int row_step) {
+  uint32_t words[WORLD][ROWS][K];
+  float group_scales[WORLD][ROWS][K];
+  int4_peers_issue<THREADS_M, THREADS_N, P>(values, values_stride_m, scales, scales_stride_m,
+                                            size_m, size_n, words, group_scales, offs_m,
+                                            offs_n, row_step);
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) int4_decode(words[r], group_scales[r], output[r]);
+}
+
+// EVERY PEER'S QUANTIZED PACKS SUMMED, peers_sum's: each element (q - 8) * scale landed in T, as a
+// quantized load lands it, then added in fp32 in rank order. From the words, no pack of every
+// peer made first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
+// 2026-10-15T22-47-01Z).
+template <typename T, int WORLD, int ROWS, int K, int P>
+DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
+                            const float (&group_scales)[WORLD][ROWS][K],
+                            float (&output)[ROWS][K][P]) {
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int r = 0; r < WORLD; ++r)
+          acc += static_cast<float>(static_cast<T>(
+              static_cast<float>(static_cast<int>((words[r][i][k] >> (4 * j)) & 0xFu) - 8) *
+              group_scales[r][i][k]));
+        output[i][k][j] = acc;
+      }
 }
 
 // Each pack from the rank owning its columns, slice_n a rank (all_gather's).
@@ -2266,13 +2300,22 @@ DINLINE void reduce_scatter_registers(
   for (int q = 0; q < block_size_m; q += ROWS)
     for (int c = offs_n; c < offs_n + size_n; c += LANES * P) {
       const int offs_m = static_cast<int>(blockIdx.x + q * gridDim.x);
-      T peers[WORLD][1][1][P];
-      exchanged_peers_load<ROWS, LANES, QUANTIZATION>(
-          input, input_stride_m, input_values, input_values_stride_m, input_scales,
-          input_scales_stride_m, input_size_m, offs_n + size_n, peers, offs_m, c,
-          static_cast<int>(gridDim.x));
       float sum[1][1][P];
-      peers_sum(peers, sum);
+      if constexpr (!kInt4) {
+        T peers[WORLD][1][1][P];
+        peers_load<ROWS, LANES>(input, input_stride_m, input_size_m,
+                                offs_n + size_n, peers, offs_m, c,
+                                static_cast<int>(gridDim.x));
+        peers_sum(peers, sum);
+      } else {
+        uint32_t peer_words[WORLD][1][1];
+        float peer_scales[WORLD][1][1];
+        int4_peers_issue<ROWS, LANES, P>(input_values, input_values_stride_m, input_scales,
+                                         input_scales_stride_m, input_size_m,
+                                         offs_n + size_n, peer_words, peer_scales, offs_m,
+                                         c, static_cast<int>(gridDim.x));
+        int4_peers_sum<T>(peer_words, peer_scales, sum);
+      }
       Summed rounded[1][1][P];
       convert(sum, rounded);
       if constexpr (!kInt4) {
