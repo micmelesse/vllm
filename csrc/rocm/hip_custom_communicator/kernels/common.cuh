@@ -2128,7 +2128,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
                         __fp16* scales_ptr, int64_t scales_stride_m, int band_size_m) {
   if constexpr (QUANTIZATION == Quantization::int4) {
     constexpr int P = traits<T>::N;
-    constexpr int K = 2;
+    constexpr int K = 1;  // a pack a row a thread, rows in flight instead
     constexpr int kTiles = TILE_M < 4 ? 4 / TILE_M : 1;
     for (int band = 0; band < input_size_m; band += band_size_m) {
       const int rows = min(band_size_m, input_size_m - band);
