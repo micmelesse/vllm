@@ -48,7 +48,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles_m = (input_size_m + TILE_M - 1) / TILE_M;
 
-  // 1. Wait until every peer has launched, so its input is ready.
+  // 1. Every rank's input pointer, then wait until every peer has launched, so
+  // its input is ready.
+  const DTYPE* input[WORLD];
+  peers_ptrs(input_ptrs, input);
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -57,17 +60,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Read every rank's input, in rank order, and sum.
   block_for_each_tile(tiles_m, tiles_n, [&](int row, int col) {
+    const int offs_m = row * TILE_M;
+    const int offs_n = col * TILE_N;
     DTYPE peers[WORLD][ROWS][K][P];
-    peers_load<THREADS_M, THREADS_N>(input_ptrs, input_stride_m, input_stride_n,
-                                     input_size_m, input_size_n, peers,
-                                     row * TILE_M, col * TILE_N);
+    peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_stride_n,
+                                     input_size_m, input_size_n, peers, offs_m,
+                                     offs_n);
     float sum[ROWS][K][P];
     peers_sum(peers, sum);
     DTYPE rounded[ROWS][K][P];
     convert(sum, rounded);
-    store<THREADS_M, THREADS_N>(rounded, output_ptr, output_stride_m,
+    store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, output_ptr, output_stride_m,
                                 output_stride_n, input_size_m, input_size_n,
-                                row * TILE_M, col * TILE_N);
+                                offs_m, offs_n);
   });
 
   // 3. No rank may overwrite its input until every peer has read it.
@@ -109,19 +114,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int ROWS = TILE_M / THREADS_M;
   constexpr int K = TILE_N / (P * THREADS_N);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
+  DTYPE* staging[WORLD];
+  peers_ptrs(staging_ptrs, staging);
+  DTYPE* const own_staging = peer_ptr(staging_ptrs, rank);
 
   for (int r0 = 0; r0 < input_size_m; r0 += staging_size_m) {
     const int band =
         min(staging_size_m, input_size_m - r0);  // this pass's rows
     const int tiles = (band + TILE_M - 1) / TILE_M * tiles_n;
-    // 1. This rank's band (its rows from r0) into its staging, then visible to
-    // the peers (each has staged its own).
+    // This pass's rows of the input and the output, from its first row.
+    const DTYPE* const band_input = input_ptr + r0 * input_stride_m;
+    DTYPE* const band_output = output_ptr + r0 * output_stride_m;
+    // 1. This rank's band into its staging, then visible to the peers (each
+    // has staged its own).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE mine[ROWS][K][P];
-      load<THREADS_M, THREADS_N>(input_ptr + r0 * input_stride_m, input_stride_m,
+      load<THREADS_M, THREADS_N>(band_input, input_stride_m,
                                  input_stride_n, band, input_size_n, mine,
                                  t / tiles_n * TILE_M, t % tiles_n * TILE_N);
-      store<THREADS_M, THREADS_N>(mine, staging_ptrs[rank], staging_stride_m,
+      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(mine, own_staging, staging_stride_m,
                                   staging_stride_n, band, input_size_n,
                                   t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
@@ -133,7 +144,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Read every rank's staged band, in rank order, and sum.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][ROWS][K][P];
-      peers_load<THREADS_M, THREADS_N>(staging_ptrs, staging_stride_m,
+      peers_load<THREADS_M, THREADS_N>(staging, staging_stride_m,
                                        staging_stride_n, band, input_size_n,
                                        peers, t / tiles_n * TILE_M,
                                        t % tiles_n * TILE_N);
@@ -141,7 +152,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       peers_sum(peers, sum);
       DTYPE rounded[ROWS][K][P];
       convert(sum, rounded);
-      store<THREADS_M, THREADS_N>(rounded, output_ptr + r0 * output_stride_m,
+      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, band_output,
                                   output_stride_m, output_stride_n, band,
                                   input_size_n, t / tiles_n * TILE_M,
                                   t % tiles_n * TILE_N);
@@ -258,14 +269,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int r0 = 0; r0 < input_size_m; r0 += staging_size_m) {
     const int band =
         min(staging_size_m, input_size_m - r0);  // this pass's rows
+    // This pass's rows of the input and of the output.
+    const DTYPE* const band_input = input_ptr + r0 * input_stride_m;
+    DTYPE* const band_output = output_ptr + r0 * output_stride_m;
     // 1. This band, every rank's share of it, into this rank's staging (the
     // chunks each rank's same
     //    block reads), then visible (and, past the first pass, every peer has
     //    read this rank's scratch).
-    //    This pass's rows of the input and of the output start at row r0.
     stage<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        input_ptr + r0 * input_stride_m, input_stride_m, input_stride_n, band,
-        input_size_n, staging_ptrs[rank], staging_stride_m, staging_stride_n,
+        band_input, input_stride_m, input_stride_n, band,
+        input_size_n, peer_ptr(staging_ptrs, rank), staging_stride_m, staging_stride_n,
         band, input_size_n, rank);
     barrier<Until::visible, 0, WORLD>(
         signals_ptrs, signals_stride_parity, signals_stride_block,
@@ -293,7 +306,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // in the output.
     all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
         scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
-        scratch_size_n, output_ptr + r0 * output_stride_m, output_stride_m,
+        scratch_size_n, band_output, output_stride_m,
         output_stride_n, band, input_size_n, rank);
   }
 #else
