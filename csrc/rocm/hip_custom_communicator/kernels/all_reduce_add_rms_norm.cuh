@@ -49,7 +49,14 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. Wait until every peer has launched, so its input is ready.
+  // 1. Every rank's input pointer, then wait until every peer has launched, so
+  // its input is ready. THE TABLE READ ONCE, BEFORE THE BARRIER: read by
+  // peers_load in the loop, after the barrier's atomics, the compiler could
+  // not prove it unchanged and loaded it again every row, 4 vector loads a row
+  // where it was one scalar load a kernel (ISA 2026-10-15T18-32-04Z).
+  const DTYPE* input[WORLD];
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) input[r] = input_ptrs[r];
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -72,9 +79,9 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][K][P];
-    peers_load<1, THREADS_PER_BLOCK>(input_ptrs, input_stride_m,
-                                     input_stride_n, input_size_m,
-                                     input_size_n, peers, row, 0);
+    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
+                                     input_size_m, input_size_n, peers, row,
+                                     0);
     DTYPE res[1][K][P];
     if constexpr (ADD_RESIDUAL)
       load<1, THREADS_PER_BLOCK>(residual_ptr, residual_stride_m,
@@ -244,8 +251,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       rank, timeout_ticks);
 
   // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack
-  // build keeps 68 B of scratch (the ISA gate, 2026-09-30). peers_load reads
-  // every rank's from its table where it is called.
+  // build keeps 68 B of scratch (the ISA gate, 2026-09-30). Read once, out of
+  // the loops: peers_load reading its table every row loaded it again each
+  // time (the one-shot's head).
+  const DTYPE* input[WORLD];
+  DTYPE* scratch[WORLD];
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) {
+    input[r] = input_ptrs[r];
+    scratch[r] = scratch_ptrs[r];
+  }
   DTYPE* const own_scratch = scratch_ptrs[rank];
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
@@ -261,9 +276,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const int last = min(first + slice_m, input_size_m);
   // Row `row` from every rank.
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
-    peers_load<1, THREADS_PER_BLOCK>(input_ptrs, input_stride_m,
-                                     input_stride_n, input_size_m,
-                                     input_size_n, got, row, 0);
+    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
+                                     input_size_m, input_size_n, got, row, 0);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete
   // in issue order, so waiting on one issued after the peers' would wait on the
@@ -369,11 +383,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
-      peers_load_row_scalars<WORLD>(scratch_ptrs, sc,
+      peers_load_row_scalars<WORLD>(scratch, sc,
                                     scale_at * int64_t{sizeof(DTYPE)}, l);
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
       DTYPE got[WORLD][1][1][P];
-      peers_load<1, THREADS_PER_BLOCK>(scratch_ptrs, scratch_stride_m,
+      peers_load<1, THREADS_PER_BLOCK>(scratch, scratch_stride_m,
                                        scratch_stride_n, slice_m, input_size_n,
                                        got, l, c);
       WEIGHT_DTYPE w_step[1][1][P];
