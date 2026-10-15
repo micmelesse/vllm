@@ -71,11 +71,11 @@ DINLINE void block_attn_res_tile(
   } else {
     convert(sum, new_prefix);
   }
-  store<1, THREADS>(new_prefix, prefix_output_ptr, prefix_output_stride_m,
+  store<1, THREADS, THREADS>(new_prefix, prefix_output_ptr, prefix_output_stride_m,
                     prefix_output_stride_n, input_size_m, input_size_n, offs_m,
                     offs_n);
   if (block_output_ptr != nullptr)
-    store<1, THREADS>(new_prefix, block_output_ptr, block_output_stride_m,
+    store<1, THREADS, THREADS>(new_prefix, block_output_ptr, block_output_stride_m,
                       block_output_stride_n, input_size_m, input_size_n, offs_m,
                       offs_n);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
@@ -94,14 +94,9 @@ DINLINE void block_attn_res_tile(
     convert(norm_weight, norm_weight_f);
     convert(qk_weight, qk_weight_f);
     mul(norm_weight_f, qk_weight_f, w);
-    // THE SUM STARTS AT ZERO, filled here: registers start unset (a zeroed
-    // default was 32 moves a source in the loop, ISA 2026-10-04T02-22-41Z).
-#pragma unroll
-    for (int m = 0; m < ROWS; ++m)
-#pragma unroll
-      for (int k = 0; k < K; ++k)
-#pragma unroll
-        for (int j = 0; j < P; ++j) acc[m][k][j] = 0.0f;
+    // THE SUM STARTS AT ZERO, here: registers start unset (a zeroed default
+    // was 32 moves a source in the loop, ISA 2026-10-04T02-22-41Z).
+    zeros(acc);
     OnlineSoftmax softmax[ROWS];
     // FULL STEPS OF SOURCES, THEN ONE LAST STEP with what remains, the prefix
     // and any padding: in the loop every source is a block's, so it has no
@@ -190,7 +185,7 @@ DINLINE void block_attn_res_tile(
   } else {
     convert(acc, result);
   }
-  store<1, THREADS>(result, output_ptr, output_stride_m, output_stride_n,
+  store<1, THREADS, THREADS>(result, output_ptr, output_stride_m, output_stride_n,
                     input_size_m, input_size_n, offs_m, offs_n);
 }
 
@@ -246,8 +241,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // is one scalar load (s_load_dwordx16) a launch, and 156 VGPRs where 123 at
   // 8192 (ISA 2026-10-15T18-25-21Z).
   const DTYPE* input[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) input[r] = input_ptrs[r];
+  peers_ptrs(input_ptrs, input);
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -378,13 +372,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 4. Each of this block's tiles: its packs from the ranks that own them (A
   //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's scratch
-  //    from the table), at the input's place in the scratch, then AttnRes.
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+  //    from the table), at the input's place in the scratch, then AttnRes. A
+  //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
+  //    body, a row past input_size_m (never loaded) kept the last tile's
+  //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
+  //    (150 -> 166; ISA harness 2026-10-15).
+  const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][K][P];
     all_gather<WORLD, 1, THREADS_PER_BLOCK>(
         scratch_ptrs, scratch_stride_m, scratch_stride_n, input_size_m,
-        input_size_n, sum, t * TILE_M, 0, slice_n);
+        input_size_n, sum, offs_m, 0, slice_n);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -393,8 +390,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         prefix_output_stride_m, prefix_output_stride_n, output_ptr,
         output_stride_m, output_stride_n, block_output_ptr,
         block_output_stride_m, block_output_stride_n, input_size_m,
-        input_size_n, t * TILE_M, 0, num_blocks, eps, output_eps, inv_hidden);
-  }
+        input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
+  };
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
 #else
   __builtin_trap();
 #endif
@@ -452,6 +451,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
+  // THIS RANK'S COLUMNS AND THIS BLOCK'S ROWS, worked out before the first
+  // barrier, in scalar registers: after it they were vector arithmetic (a
+  // division by the grid a lane; ISA 2026-10-15T18-38-16Z).
+  const int packs = input_size_n / P;  // the row, in packs (n is whole packs)
+  const int slice = (packs + WORLD - 1) / WORLD;
+  const int col0 = rank * slice;
+  const int own_packs =
+      max(0, min(slice, packs - col0));  // the last rank's may be short
+  const int my_rows =
+      input_size_m > static_cast<int>(blockIdx.x)
+          ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
+          : 0;
 
   // 1. Wait until every peer has launched, so its input is ready.
   barrier<Until::launched, 0, WORLD>(
@@ -472,7 +483,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push>(
       input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
       scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
-      scratch_size_n, rank);
+      scratch_size_n, col0 * P, own_packs * P, my_rows, rank);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read
   // this rank's input.
@@ -486,7 +497,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    place in it), then AttnRes, as the one-shot does. The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a
   //    peer's next kernel starts only once this one has finished).
-  const DTYPE* own_scratch = scratch_ptrs[rank];
+  const DTYPE* own_scratch = peer_ptr(scratch_ptrs, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
     load<1, THREADS_PER_BLOCK>(own_scratch, scratch_stride_m, scratch_stride_n,
