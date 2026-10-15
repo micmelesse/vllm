@@ -55,8 +55,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // not prove it unchanged and loaded it again every row, 4 vector loads a row
   // where it was one scalar load a kernel (ISA 2026-10-15T18-32-04Z).
   const DTYPE* input[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) input[r] = input_ptrs[r];
+  peers_ptrs<WORLD>(input_ptrs, input);
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -99,7 +98,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK>(added, residual_output_ptr,
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, residual_output_ptr,
                                   residual_output_stride_m,
                                   residual_output_stride_n, input_size_m,
                                   input_size_n, row, 0);
@@ -119,7 +118,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
                                 output_stride_n, input_size_m, input_size_n,
                                 row, 0);
   }
@@ -255,13 +254,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // the loops: peers_load reading its table every row loaded it again each
   // time (the one-shot's head).
   const DTYPE* input[WORLD];
+  peers_ptrs<WORLD>(input_ptrs, input);
   DTYPE* scratch[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) {
-    input[r] = input_ptrs[r];
-    scratch[r] = scratch_ptrs[r];
-  }
-  DTYPE* const own_scratch = scratch_ptrs[rank];
+  peers_ptrs<WORLD>(scratch_ptrs, scratch);
+  DTYPE* const own_scratch = peer_ptr(scratch_ptrs, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -312,7 +308,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK>(added, own_scratch, scratch_stride_m,
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, own_scratch, scratch_stride_m,
                                   scratch_stride_n, input_size_m, input_size_n,
                                   row - first, 0);
     }
@@ -341,7 +337,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK>(normed, own_scratch, scratch_stride_m,
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, own_scratch, scratch_stride_m,
                                 scratch_stride_n, input_size_m, input_size_n,
                                 row - first, 0);
   };
@@ -399,7 +395,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         const int row = r * slice_m + l;
         if (row >= input_size_m) continue;
         if constexpr (ADD_RESIDUAL) {
-          store<1, THREADS_PER_BLOCK>(got[r], residual_output_ptr,
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], residual_output_ptr,
                                       residual_output_stride_m,
                                       residual_output_stride_n, input_size_m,
                                       input_size_n, row, c);
@@ -414,11 +410,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
           convert(normed_f, normed_w);
           DTYPE normed[1][1][P];
           convert(normed_w, normed);
-          store<1, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
                                       output_stride_n, input_size_m,
                                       input_size_n, row, c);
         } else {
-          store<1, THREADS_PER_BLOCK>(got[r], output_ptr, output_stride_m,
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], output_ptr, output_stride_m,
                                       output_stride_n, input_size_m,
                                       input_size_n, row, c);
         }
@@ -538,6 +534,17 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
+  // THIS RANK'S COLUMNS AND THIS BLOCK'S ROWS, AT KERNEL ENTRY: worked out after
+  // the barrier, the grid division ran in VALU and the reduce-scatter's loops
+  // were exec-masked (ISA 2026-10-15T18-36-19Z).
+  const int slice =
+      (input_size_n / P + WORLD - 1) / WORLD * P;  // a rank's, in elements
+  const int col0 = rank * slice;
+  const int own_n =
+      max(0, min(slice, input_size_n - col0));  // the last rank's may be short
+  const int my_m = input_size_m > static_cast<int>(blockIdx.x)
+                       ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
+                       : 0;
 
   // 1. Wait until every peer has launched, so its input is ready.
   barrier<Until::launched, 0, WORLD>(
@@ -556,7 +563,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push>(
       input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
       scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
-      scratch_size_n, rank);
+      scratch_size_n, col0, own_n, my_m, rank);
 
   // 3. Every rank's sums are in this rank's scratch.
   barrier<Until::visible, 1, WORLD>(
@@ -571,7 +578,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    next call's first sync keeps a peer from pushing into this scratch while
   //    it is read (a peer's next kernel starts only once this one has
   //    finished).
-  const DTYPE* const own_scratch = scratch_ptrs[rank];
+  const DTYPE* const own_scratch = peer_ptr(scratch_ptrs, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // scratch's, the residual's and the weight's (one-shot's).
@@ -593,7 +600,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK>(added, residual_output_ptr,
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, residual_output_ptr,
                                   residual_output_stride_m,
                                   residual_output_stride_n, input_size_m,
                                   input_size_n, row, 0);
@@ -613,7 +620,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, output_stride_m,
                                 output_stride_n, input_size_m, input_size_n,
                                 row, 0);
   }
