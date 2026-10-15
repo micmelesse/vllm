@@ -133,7 +133,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int?)",
       &hip_custom_communicator_supported);
   rocm_ops.def(
-      "hip_custom_communicator_build_info() -> (str[], int[], int, int, str[], "
+      "hip_custom_communicator_build_info() -> (str[], int[], int, str[], "
       "str[], str[], str[], str[], "
       "str[], int[], int[], str[], str[], int[])",
       &hip_custom_communicator_build_info);
