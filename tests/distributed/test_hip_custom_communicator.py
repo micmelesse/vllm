@@ -1018,6 +1018,11 @@ def run_collective(
             s, replay = k % n, k // n
             feed(s, replay)
             out[s] += [o.clone() for o in body(s)]
+        # SYNCHRONIZED BEFORE RETURNING, as the graph path is: the caller reads the
+        # signals next, and a launch still in flight shows its barrier mid-way (the
+        # peers' flags set, this rank's not yet cleared), which read as a call that
+        # left its signals set (2026-10-15: every eager "hang" since the check).
+        torch.accelerator.synchronize()
         return out
 
     for _ in range(
