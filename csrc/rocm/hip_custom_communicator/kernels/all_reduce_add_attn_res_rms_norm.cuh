@@ -20,7 +20,7 @@ namespace hip_custom_communicator {
 // neither a kernel nor a primitive.
 // =============================================================================
 
-// A TILE OF ATTNRES, every AttnRes kernel's: the tile's TILE_M rows at once,
+// A TILE OF ATTNRES, every AttnRes kernel's: the tile's ROWS rows at once,
 // TILE_K sources a step (the reduced dimension, Triton's BLOCK_L), so each step
 // pays ONE block reduction for every row and source of the tile. Rounds as
 // `vllm/models/kimi_k3/amd/ops/attn_res.py` does:
@@ -29,90 +29,109 @@ namespace hip_custom_communicator {
 //   eps), src the blocks, then u m = softmax(logits) . sources, online, a tile
 //   of sources at a time; out = T(m), or T(m * rsqrt(mean(m^2) + out_eps) *
 //   out_w)
-// `sum` is the tile's rows summed over the ranks; the prefix, its output and
-// the output are rows of the tile's width at their Ptrs' strides, `blocks` [m,
-// sources, n] at its row and source strides in elements (its columns
-// contiguous, the host checks), and `block_output` the one block written, a
-// null Ptr when none is. An input is only read and an output only written
-// (STANDARDS): the old prefix is read from `prefix`, the new one written to
-// `prefix_output`, never the same memory. A row past M (the last tile's) reads
-// row M - 1 and writes nothing, so every thread still reaches every reduction.
-template <bool HAS_PREFIX, int TILE_K, typename DTYPE, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK>
+// `sum` is this thread's registers of the tile's rows summed over the ranks, a
+// row the block's (THREADS threads along it). THE TILE'S PLACE IS THE SUM'S:
+// rows offs_m.. of an input_size_m x input_size_n tensor, every buffer read and
+// written at that place (rows at its own row stride: the prefix, its output,
+// the output, `blocks` [m, sources, n] at its row and source strides in
+// elements, its columns contiguous, the host checks), so every tensor sharing
+// the columns shares one clamped column (one offset register, at_col's).
+// `block_output_ptr` is the one block written, null when none is. An input is
+// only read and an output only written (STANDARDS): the old prefix is read from
+// `prefix_ptr`, the new one written to `prefix_output_ptr`, never the same
+// memory. A row past input_size_m (the last tile's) reads row input_size_m - 1
+// and writes nothing, so every thread still reaches every reduction.
+template <bool HAS_PREFIX, int TILE_K, int THREADS, typename DTYPE, int ROWS,
+          int K, int P>
 DINLINE void block_attn_res_tile(
-    const Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>&
-        sum,
-    Ptr<const DTYPE> prefix, const DTYPE* blocks, int64_t blocks_stride_m,
-    int64_t blocks_stride_r, Ptr<const DTYPE> norm_weight,
-    Ptr<const DTYPE> qk_weight, Ptr<const DTYPE> output_norm_weight,
-    Ptr<DTYPE> prefix_output, Ptr<DTYPE> output, Ptr<DTYPE> block_output,
-    int num_blocks, float eps, float output_eps, float inv_hidden) {
-  using Rows =
-      Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  using RowsF = Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK,
-                     THREADS_PER_BLOCK, float>;
-  using Weight =
-      Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  using WeightF =
-      Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, float>;
-  const Weight at_cols{1, sum.N, 0, sum.offs_n};
-
+    const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
+    int64_t prefix_stride_m, int64_t prefix_stride_n, const DTYPE* blocks_ptr,
+    int64_t blocks_stride_m, int64_t blocks_stride_r, int64_t blocks_stride_n,
+    const DTYPE* norm_weight_ptr, int64_t norm_weight_stride_n,
+    const DTYPE* qk_weight_ptr, int64_t qk_weight_stride_n,
+    const DTYPE* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
+    DTYPE* prefix_output_ptr, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
+    int64_t output_stride_n, DTYPE* block_output_ptr,
+    int64_t block_output_stride_m, int64_t block_output_stride_n,
+    int input_size_m, int input_size_n, int offs_m, int offs_n, int num_blocks,
+    float eps, float output_eps, float inv_hidden) {
   // The new prefix: the sum over the ranks added to the old one, rounded once
   // to DTYPE; the old prefix loaded whole before anything is stored.
-  Rows np = sum;
+  DTYPE new_prefix[ROWS][K][P];
   if constexpr (HAS_PREFIX) {
-    Rows old = sum.template like<DTYPE>();
-    tile_load(old, prefix);
-    np = tile_add(old.template to<float>(), sum.template to<float>())
-             .template to<DTYPE>();
+    DTYPE old_prefix[ROWS][K][P];
+    load<1, THREADS>(prefix_ptr, prefix_stride_m, prefix_stride_n, input_size_m,
+                     input_size_n, old_prefix, offs_m, offs_n);
+    float old_f[ROWS][K][P], sum_f[ROWS][K][P], new_f[ROWS][K][P];
+    convert(old_prefix, old_f);
+    convert(sum, sum_f);
+    add(old_f, sum_f, new_f);
+    convert(new_f, new_prefix);
+  } else {
+    convert(sum, new_prefix);
   }
-  tile_store(np, prefix_output);
-  if (block_output.data != nullptr) tile_store(np, block_output);
+  store<1, THREADS, THREADS>(new_prefix, prefix_output_ptr, prefix_output_stride_m,
+                    prefix_output_stride_n, input_size_m, input_size_n, offs_m,
+                    offs_n);
+  if (block_output_ptr != nullptr)
+    store<1, THREADS, THREADS>(new_prefix, block_output_ptr, block_output_stride_m,
+                      block_output_stride_n, input_size_m, input_size_n, offs_m,
+                      offs_n);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
-  // from `prefix_output`, where this launch just stored it (Triton's kernel
+  // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
-  RowsF acc = np.template to<float>();
+  float acc[ROWS][K][P];
+  convert(new_prefix, acc);
   if (num_blocks != 0) {
-    Weight nw = at_cols, qk = at_cols;
-    tile_load(nw, norm_weight);
-    tile_load(qk, qk_weight);
-    const WeightF w =
-        tile_mul(nw.template to<float>(), qk.template to<float>());
-    acc = sum.template zeros<float>();
-    OnlineSoftmax softmax[TILE_M];
+    // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
+    DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
+    load<1, THREADS>(norm_weight_ptr, 0, norm_weight_stride_n, 1, input_size_n,
+                     norm_weight, 0, offs_n);
+    load<1, THREADS>(qk_weight_ptr, 0, qk_weight_stride_n, 1, input_size_n,
+                     qk_weight, 0, offs_n);
+    float norm_weight_f[1][K][P], qk_weight_f[1][K][P], w[1][K][P];
+    convert(norm_weight, norm_weight_f);
+    convert(qk_weight, qk_weight_f);
+    mul(norm_weight_f, qk_weight_f, w);
+    // THE SUM STARTS AT ZERO, here: registers start unset (a zeroed default
+    // was 32 moves a source in the loop, ISA 2026-10-04T02-22-41Z).
+    zeros(acc);
+    OnlineSoftmax softmax[ROWS];
     // FULL STEPS OF SOURCES, THEN ONE LAST STEP with what remains, the prefix
     // and any padding: in the loop every source is a block's, so it has no
-    // branch and no zeroed tile a source (16 moves a step at 3584, ISA
+    // branch and no zeroed registers a source (16 moves a step at 3584, ISA
     // 2026-10-04T03-31-28Z).
     const int full = num_blocks / TILE_K * TILE_K;
     const auto step = [&](int src0, auto last) {
-      Rows v[TILE_K];
-      float sums[TILE_M * 2 * TILE_K];
+      DTYPE v[TILE_K][ROWS][K][P];
+      float sums[ROWS * 2 * TILE_K];
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
         // THE LAST STEP'S SOURCE IS A BLOCK OR THE PREFIX, picked by its
-        // pointer and loaded once: a zeroed tile and a load under a branch held
-        // 16 VGPRs at the kernel's peak (ISA 2026-10-04T16-26-29Z). A padding
-        // source re-reads the prefix; its logit is -inf.
+        // pointer and loaded once: zeroed registers and a load under a branch
+        // held 16 VGPRs at the kernel's peak (ISA 2026-10-04T16-26-29Z). A
+        // padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
-        v[s] = sum.template like<DTYPE>();
-        tile_load(v[s],
-                  block ? blocks + src * blocks_stride_r : prefix_output.data,
-                  block ? blocks_stride_m : prefix_output.stride_m);
-        float ss[TILE_M], dw[TILE_M];
-        partial_dot(v[s], v[s], ss);
-        partial_dot(v[s], w, dw);
+        load<1, THREADS>(
+            block ? blocks_ptr + src * blocks_stride_r : prefix_output_ptr,
+            block ? blocks_stride_m : prefix_output_stride_m,
+            block ? blocks_stride_n : prefix_output_stride_n, input_size_m,
+            input_size_n, v[s], offs_m, offs_n);
+        float ss[ROWS], dw[ROWS];
+        partial_dot<THREADS>(v[s], v[s], ss, input_size_n, offs_n);
+        partial_dot<THREADS>(v[s], w, dw, input_size_n, offs_n);
 #pragma unroll
-        for (int m = 0; m < TILE_M; ++m) {
+        for (int m = 0; m < ROWS; ++m) {
           sums[(m * TILE_K + s) * 2] = ss[m];
           sums[(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      block_reduce<Sum, THREADS_PER_BLOCK>(sums);
-      float old_scale[TILE_M], scale[TILE_K][TILE_M];
+      block_reduce<Sum, THREADS>(sums);
+      float old_scale[ROWS], scale[TILE_K][ROWS];
 #pragma unroll
-      for (int m = 0; m < TILE_M; ++m) {
+      for (int m = 0; m < ROWS; ++m) {
         float logit[TILE_K];
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s)
@@ -126,44 +145,48 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s) scale[s][m] = row_scale[s];
       }
-      acc = tile_fma(acc, old_scale, v[0], scale[0]);
+      fma(acc, old_scale, v[0], scale[0], acc);
       if constexpr (TILE_K > 1) {
-        float ones[TILE_M];
+        float ones[ROWS];
 #pragma unroll
-        for (int m = 0; m < TILE_M; ++m) ones[m] = 1.0f;
+        for (int m = 0; m < ROWS; ++m) ones[m] = 1.0f;
 #pragma unroll
-        for (int s = 1; s < TILE_K; ++s)
-          acc = tile_fma(acc, ones, v[s], scale[s]);
+        for (int s = 1; s < TILE_K; ++s) fma(acc, ones, v[s], scale[s], acc);
       }
     };
     for (int src0 = 0; src0 < full; src0 += TILE_K)
       step(src0, std::false_type{});
     step(full, std::true_type{});
-    float inv_den[TILE_M];
+    float inv_den[ROWS];
 #pragma unroll
-    for (int m = 0; m < TILE_M; ++m) inv_den[m] = 1.0f / softmax[m].denominator;
-    acc = tile_mul(acc, inv_den);
+    for (int m = 0; m < ROWS; ++m) inv_den[m] = 1.0f / softmax[m].denominator;
+    mul(acc, inv_den, acc);
   }
 
   // The output, normed when out_norm_w is given: its weight in flight under the
   // one reduction for every row's sum of squares.
-  Rows result = sum.template like<DTYPE>();
-  if (output_norm_weight.data != nullptr) {
-    Weight g_in = at_cols;
-    tile_load(g_in, output_norm_weight);
-    float ss[TILE_M];
-    partial_dot(acc, acc, ss);
-    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    float scale[TILE_M];
+  DTYPE result[ROWS][K][P];
+  if (output_norm_weight_ptr != nullptr) {
+    DTYPE output_norm_weight[1][K][P];
+    load<1, THREADS>(output_norm_weight_ptr, 0, output_norm_weight_stride_n, 1,
+                     input_size_n, output_norm_weight, 0, offs_n);
+    float ss[ROWS];
+    partial_dot<THREADS>(acc, acc, ss, input_size_n, offs_n);
+    block_reduce<Sum, THREADS>(ss);
+    float scale[ROWS];
 #pragma unroll
-    for (int m = 0; m < TILE_M; ++m)
+    for (int m = 0; m < ROWS; ++m)
       scale[m] = rsqrtf(ss[m] * inv_hidden + output_eps);
-    result = tile_mul(tile_mul(acc, scale), g_in.template to<float>())
-                 .template to<DTYPE>();
+    float normed[ROWS][K][P], output_norm_weight_f[1][K][P];
+    mul(acc, scale, normed);
+    convert(output_norm_weight, output_norm_weight_f);
+    mul(normed, output_norm_weight_f, normed);
+    convert(normed, result);
   } else {
-    result = acc.template to<DTYPE>();
+    convert(acc, result);
   }
-  tile_store(result, output);
+  store<1, THREADS, THREADS>(result, output_ptr, output_stride_m, output_stride_n,
+                    input_size_m, input_size_n, offs_m, offs_n);
 }
 
 // =============================================================================
@@ -207,46 +230,43 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. Every rank's buffers, then wait until every peer has launched, so its
-  // input is ready.
-  const auto input =
-      rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
-  const auto prefix =
-      local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
-  const auto prefix_output = local_ptr(
-      prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, rank);
-  const auto block_output = local_ptr(block_output_ptr, block_output_stride_m,
-                                      block_output_stride_n, rank);
-  const auto norm_weight =
-      local_ptr(norm_weight_ptr, 0, norm_weight_stride_n, rank);
-  const auto qk_weight = local_ptr(qk_weight_ptr, 0, qk_weight_stride_n, rank);
-  const auto output_norm_weight =
-      local_ptr(output_norm_weight_ptr, 0, output_norm_weight_stride_n, rank);
-  const auto output =
-      local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
+  // 1. Every rank's input address, then wait until every peer has launched, so
+  // its input is ready. THE TABLE IS READ BEFORE THE WAIT: read after it (in
+  // peers_load, every row), the barrier's stores left the table no longer
+  // provably unwritten, so it was four vector loads and a wait a row where it
+  // is one scalar load (s_load_dwordx16) a launch, and 156 VGPRs where 123 at
+  // 8192 (ISA 2026-10-15T18-25-21Z).
+  const DTYPE* input[WORLD];
+  peers_ptrs(input_ptrs, input);
   barrier<Until::launched, 0, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // 2. Each of this block's tiles (one row: TILE_M = 1): read it from every
-  // rank in rank order,
-  //    sum, AttnRes.
+  // 2. Each of this block's rows: read it from every rank in rank order, sum,
+  //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    Row peers[WORLD];
-  #pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      peers[r] = Row{input_size_m, input_size_n, row, 0};
-    tile_load(peers, input);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(
-        peers_reduce(peers), prefix, blocks_ptr, blocks_stride_m,
-        blocks_stride_r, norm_weight, qk_weight, output_norm_weight,
-        prefix_output, output, block_output, num_blocks, eps, output_eps,
-        inv_hidden);
+    DTYPE peers[WORLD][1][K][P];
+    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
+                                     input_size_m, input_size_n, peers, row, 0);
+    float sum_f[1][K][P];
+    peers_sum(peers, sum_f);
+    DTYPE sum[1][K][P];
+    convert(sum_f, sum);
+    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+        sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
+        blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+        norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+        output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
+        prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+        output_stride_m, output_stride_n, block_output_ptr,
+        block_output_stride_m, block_output_stride_n, input_size_m,
+        input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
@@ -314,25 +334,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps, int reduce_scatter_blocks) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  using Rows =
-      Tile<DTYPE, TILE_M, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  constexpr int NL = traits<DTYPE>::N;
-  const int packs = input_size_n / NL;  // the row, in packs (n is whole packs)
-  // THE REDUCE-SCATTER'S CHUNK, the plain two-shot's: its rows are the ranks, a
-  // row of threads a rank (common's reduce_scatter).
-  constexpr int LANES = THREADS_PER_BLOCK / WORLD;
-  static_assert(LANES * WORLD == THREADS_PER_BLOCK,
-                "a block is a row of threads a rank");
-  using Ranks = Tile<DTYPE, WORLD, LANES * NL, WORLD, LANES, THREADS_PER_BLOCK>;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  const int per_rank = (packs + WORLD - 1) / WORLD;
-  // EVERY RANK AN EQUAL SLICE: rounded up to whole waves (so a wave's packs had
-  // one owner), rank 7 owned nothing at 3584 and 7168 and the others
-  // reduce-scattered 8/7 of the row.
-  const int slice = per_rank;
-  const int col0 = min(rank * slice, packs);
-  const int own_packs =
-      max(0, min(slice, packs - col0));  // a late rank's may be short or none
+  // EVERY RANK AN EQUAL SLICE OF THE ROW, in elements: rounded up to whole
+  // waves (so a wave's packs had one owner), rank 7 owned nothing at 3584 and
+  // 7168 and the others reduce-scattered 8/7 of the row.
+  const int slice_n = (input_size_n / P + WORLD - 1) / WORLD * P;
 
   // 1. Wait until every peer has launched, so its input is ready.
   barrier<Until::launched, 0, WORLD>(
@@ -341,68 +349,50 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // THE PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them:
-  // in rank order every GPU read rank 0 first, a link at a time carrying the
-  // machine's reads, and the reduce-scatter took 1.6x the plain two-shot's
-  // cycles for its bytes (thread traces 2026-10-04T21-03-09Z, 21-26-11Z). Each
-  // slice is summed by one rank, so the order differing by rank is harmless. A
-  // TILE ROW'S RANK DIFFERS ACROSS THE WAVE, so each lane reads its own from
-  // the table (an array of every rank's, indexed at run time, was scratch: 136
-  // B, 520 B as Ptrs).
-  const auto input = [&](int r) { return input_ptrs[(rank + r) % WORLD]; };
-  const auto own_scratch =
-      rank_ptr<DTYPE, WORLD>(scratch_ptrs, rank, scratch_stride_m,
-                             scratch_stride_n)
-          .data;
-  const auto prefix =
-      local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
-  const auto prefix_output = local_ptr(
-      prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, rank);
-  const auto block_output = local_ptr(block_output_ptr, block_output_stride_m,
-                                      block_output_stride_n, rank);
-  const auto norm_weight =
-      local_ptr(norm_weight_ptr, 0, norm_weight_stride_n, rank);
-  const auto qk_weight = local_ptr(qk_weight_ptr, 0, qk_weight_stride_n, rank);
-  const auto output_norm_weight =
-      local_ptr(output_norm_weight_ptr, 0, output_norm_weight_stride_n, rank);
-  const auto output =
-      local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
-
-  // A WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's scratch
-  // from the table.
-  const auto scratch_of = [&](int r) { return scratch_ptrs[r]; };
-  const int end =
-      (col0 + own_packs) * NL;  // this rank's columns end, in elements
-  // One tile's reduce-scatter: this rank's columns of its rows summed over the
-  // ranks into this rank's scratch, a chunk at a time.
-  const auto reduce_tile = [&](int offs_m) {
-    for (int row = offs_m; row < min(offs_m + TILE_M, input_size_m); ++row)
-      for (int c = col0 * NL; c < end; c += Ranks::kTileN) {
-        Ranks chunk{WORLD, end, 0, c};
-        reduce_scatter(
-            chunk, [&](int w) { return input(w) + row * input_stride_m; },
-            own_scratch + row * scratch_stride_m);
-      }
-  };
-  // One tile's packs from the ranks that own them, then AttnRes on it.
-  const auto attn_res_tile = [&](int offs_m) {
-    Rows sum{input_size_m, input_size_n, offs_m, 0};
-    sliced_load<WORLD>(sum, scratch_of, scratch_stride_m, slice * NL);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(
-        sum, prefix, blocks_ptr, blocks_stride_m, blocks_stride_r, norm_weight,
-        qk_weight, output_norm_weight, prefix_output, output, block_output,
-        num_blocks, eps, output_eps, inv_hidden);
-  };
-  // Every block its own tiles: reduce-scatter them, meet its twins, AttnRes on
-  // them.
+  // 2. This rank's columns of this block's rows (tiles of TILE_M, every
+  //    gridDim.x-th), summed over the ranks into this rank's scratch: THE
+  //    PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them
+  //    (in rank order every GPU read rank 0 first, a link at a time carrying
+  //    the machine's reads, and the reduce-scatter took 1.6x the plain
+  //    two-shot's cycles for its bytes: thread traces 2026-10-04T21-03-09Z,
+  //    21-26-11Z), summed through LDS (reduce_scatter_lds).
   (void)reduce_scatter_blocks;
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) reduce_tile(t * TILE_M);
+  reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M>(
+      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+      scratch_size_n, rank);
+
+  // 3. Every rank's sums are in its scratch: this block's twin on every rank
+  //    has reduced the same rows.
   barrier<Until::visible, 1, WORLD>(
       signals_ptrs, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
+
+  // 4. Each of this block's tiles: its packs from the ranks that own them (A
+  //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's scratch
+  //    from the table), at the input's place in the scratch, then AttnRes. A
+  //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
+  //    body, a row past input_size_m (never loaded) kept the last tile's
+  //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
+  //    (150 -> 166; ISA harness 2026-10-15).
+  const auto attn_res_tile = [&](int offs_m) {
+    DTYPE sum[TILE_M][K][P];
+    all_gather<WORLD, 1, THREADS_PER_BLOCK>(
+        scratch_ptrs, scratch_stride_m, scratch_stride_n, input_size_m,
+        input_size_n, sum, offs_m, 0, slice_n);
+    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+        sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
+        blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+        norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+        output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
+        prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+        output_stride_m, output_stride_n, block_output_ptr,
+        block_output_stride_m, block_output_stride_n, input_size_m,
+        input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
+  };
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
 #else
   __builtin_trap();
@@ -458,23 +448,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  constexpr int NL = traits<DTYPE>::N;
-  using Row = Tile<DTYPE, 1, TILE_N, 1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>;
-  // A REDUCE-SCATTER TILE: a row of threads as wide as a rank's slice of a
-  // TILE_N row (in whole waves), a group a thread, so a row's slice is one
-  // round trip (a wave a row took two at 7168, 0.8 us at 16-32 tokens), and as
-  // many rows at once as the block holds. A group a thread, not a slice's
-  // worth: every peer's groups of a whole slice were 32 packs at 16384,
-  // spilling.
-  constexpr int kSliceWaves =
-      (TILE_N / WORLD / NL + kWaveSize - 1) / kWaveSize * kWaveSize;
-  constexpr int SLICE_LANES =
-      kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
-  using Slice =
-      Tile<DTYPE, THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES * NL,
-           THREADS_PER_BLOCK / SLICE_LANES, SLICE_LANES, THREADS_PER_BLOCK>;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  const int packs = input_size_n / NL;  // the row, in packs (n is whole packs)
+  // THIS RANK'S COLUMNS AND THIS BLOCK'S ROWS, worked out before the first
+  // barrier, in scalar registers: after it they were vector arithmetic (a
+  // division by the grid a lane; ISA 2026-10-15T18-38-16Z).
+  const int packs = input_size_n / P;  // the row, in packs (n is whole packs)
   const int slice = (packs + WORLD - 1) / WORLD;
   const int col0 = rank * slice;
   const int own_packs =
@@ -491,33 +471,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // THE RANKS' POINTERS AFTER THE BARRIER, as in the pull kernels (held across
-  // it they spilled).
-  const auto input =
-      rank_ptrs<const DTYPE, WORLD>(input_ptrs, input_stride_m, input_stride_n);
-  const auto scratch =
-      rank_ptrs<DTYPE, WORLD>(scratch_ptrs, scratch_stride_m, scratch_stride_n);
-
   // 2. This rank's columns of this block's rows, summed over the ranks in rank
-  // order and pushed
-  //    to every rank (itself too), at their place in the tensor: tiles of this
-  //    block's rows (every gridDim.x-th), A WAVE A ROW, since a rank's columns
-  //    are a narrow slice.
-  if (own_packs > 0) {
-    for (int q = 0; q < my_rows; q += Slice::kThreadsM)
-      for (int c = col0 * NL; c < (col0 + own_packs) * NL; c += Slice::kTileN) {
-        const Slice at{input_size_m, (col0 + own_packs) * NL,
-                       static_cast<int>(blockIdx.x + q * gridDim.x), c,
-                       static_cast<int>(gridDim.x)};
-        Slice peers[WORLD];
-  #pragma unroll
-        for (int r = 0; r < WORLD; ++r) peers[r] = at;
-        tile_load(peers, input);
-        const Slice sum = peers_reduce(peers);
-  #pragma unroll
-        for (int r = 0; r < WORLD; ++r) tile_store(sum, scratch[r]);
-      }
-  }
+  //    order and pushed to every rank (itself too), at their place in the
+  //    tensor (reduce_scatter_registers<push>): A SLICE OF LANES A ROW, as wide
+  //    as a rank's slice of a TILE_N row in whole waves, so a row's slice is
+  //    one round trip (a wave a row took two at 7168, 0.8 us at 16-32 tokens),
+  //    and as many rows at once as the block holds; a pack a thread, not a
+  //    slice's worth (every peer's packs of a whole slice were 32 packs at
+  //    16384, spilling). The ranks' pointers are read after the barrier (held
+  //    across it they spilled).
+  reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push>(
+      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      scratch_ptrs, scratch_stride_m, scratch_stride_n, scratch_size_m,
+      scratch_size_n, col0 * P, own_packs * P, my_rows, rank);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read
   // this rank's input.
@@ -527,33 +493,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // 4. This block's tiles (one row): the sum out of this rank's scratch, then
-  // AttnRes, as the
-  //    one-shot does. The next call's first sync keeps a peer from pushing into
-  //    this scratch while it is read (a peer's next kernel starts only once
-  //    this one has finished).
-  const auto own_scratch = rank_ptr<DTYPE, WORLD>(
-      scratch_ptrs, rank, scratch_stride_m, scratch_stride_n);
-  const auto prefix =
-      local_ptr(prefix_ptr, prefix_stride_m, prefix_stride_n, rank);
-  const auto prefix_output = local_ptr(
-      prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, rank);
-  const auto block_output = local_ptr(block_output_ptr, block_output_stride_m,
-                                      block_output_stride_n, rank);
-  const auto norm_weight =
-      local_ptr(norm_weight_ptr, 0, norm_weight_stride_n, rank);
-  const auto qk_weight = local_ptr(qk_weight_ptr, 0, qk_weight_stride_n, rank);
-  const auto output_norm_weight =
-      local_ptr(output_norm_weight_ptr, 0, output_norm_weight_stride_n, rank);
-  const auto output =
-      local_ptr(output_ptr, output_stride_m, output_stride_n, rank);
+  // 4. This block's rows: the sum out of this rank's scratch (at the input's
+  //    place in it), then AttnRes, as the one-shot does. The next call's first
+  //    sync keeps a peer from pushing into this scratch while it is read (a
+  //    peer's next kernel starts only once this one has finished).
+  const DTYPE* own_scratch = peer_ptr(scratch_ptrs, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    Row sum{input_size_m, input_size_n, row, 0};
-    tile_load(sum, own_scratch);
-    block_attn_res_tile<HAS_PREFIX, TILE_K>(
-        sum, prefix, blocks_ptr, blocks_stride_m, blocks_stride_r, norm_weight,
-        qk_weight, output_norm_weight, prefix_output, output, block_output,
-        num_blocks, eps, output_eps, inv_hidden);
+    DTYPE sum[1][K][P];
+    load<1, THREADS_PER_BLOCK>(own_scratch, scratch_stride_m, scratch_stride_n,
+                               input_size_m, input_size_n, sum, row, 0);
+    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+        sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
+        blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+        norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+        output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
+        prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+        output_stride_m, output_stride_n, block_output_ptr,
+        block_output_stride_m, block_output_stride_n, input_size_m,
+        input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden);
   }
 #else
   __builtin_trap();
