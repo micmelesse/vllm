@@ -99,7 +99,7 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 //   hipDeviceMallocFinegrained exchange was 4-10% slower than the uncached flag
 //   at 16-256 tokens and the same at 1024-4096 (2026-10-16T15-36-54Z); this
 //   choice is measured against both on n11.
-constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypeUncached;
+constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;  // DIAGNOSTIC 2026-10-16: does Pinned stop the driver wedge? Kernels still assume uncached.
 
 // THE ARENA'S LAYOUT, one rank's slice, the same offsets on every rank (bytes
 // from the slice's start; `arena_layout` computes it from the sizes open is
