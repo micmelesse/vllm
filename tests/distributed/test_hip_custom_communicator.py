@@ -258,9 +258,17 @@ def _on_every_rank(
 
 
 def _assert_clean(comm: HipCustomCommunicator, where: str) -> None:
-    """The calls so far left the communicator open and every barrier flag clear."""
-    assert isinstance(comm.state, Open), f"{where}: {comm.state}"
+    """The calls so far left the communicator open and every barrier flag clear.
+    Every rank looks BETWEEN CALLS: a CPU barrier after this rank's work is done
+    and before it reads its signals, another after, so a faster peer cannot have
+    started the next call and set its first barrier's flags here (the race seen
+    as "96 flags left set", 2026-10-16T19-40-10Z)."""
+    torch.accelerator.synchronize()
+    dist.barrier(group=comm.cpu_group)
+    state = comm.state
     left = [f for f in comm.signals() if f.state is not FlagState.clear]
+    dist.barrier(group=comm.cpu_group)
+    assert isinstance(state, Open), f"{where}: {state}"
     assert not left, f"{where}: {len(left)} flags left set, {left[:4]}"
 
 
