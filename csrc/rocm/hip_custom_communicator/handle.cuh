@@ -18,6 +18,7 @@
 #include <c10/util/BFloat16.h>
 #include <hip/hip_runtime.h>
 #include <poll.h>
+#include <iomanip>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -135,7 +136,11 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
   if (listener.get() < 0) sys_fail("socket");
   std::random_device entropy;
   std::ostringstream os;
-  os << "hip_custom_communicator/" << ::getpid() << "/" << entropy() << "/"
+  // FIXED WIDTH: the gather moves a byte string the same length on every rank
+  // (all_gathered), and pids and entropy vary in digits; a ragged name breaks
+  // the CPU group's allgather (gloo: "21 vs 20", f9a8dc6f00 on n11).
+  os << "hip_custom_communicator/" << std::setfill('0') << std::setw(10)
+     << ::getpid() << "/" << std::setw(10) << entropy() << "/" << std::setw(5)
      << rank;
   const std::string name = os.str();
   const auto address = [](const std::string& s, sockaddr_un& a) {
