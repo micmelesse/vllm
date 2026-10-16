@@ -190,7 +190,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // output's rows are back to back, the instance the host picks from their
 // strides. QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION);
 // with int4 the input's quantized form is staged in this rank's staging values
-// and scales, and the sums' are the scratch values and scales.
+// and scales, and the sums' are the scratch values and scales, a group a thread
+// (the INT4 flat walk's).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS,
           int QUANTIZATION>

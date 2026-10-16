@@ -1418,7 +1418,9 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 // A THREAD'S PACK IS ONE WORD OF ITS GROUP (8 elements of a 16-bit dtype), so a group is the packs
 // of 4 consecutive lanes: a layout's THREADS_N and offs_n are whole groups, and its scale is the
 // lanes' largest magnitude, two DPP steps with every lane of the quad active. One thread holding a
-// whole group of every peer was 46-62 registers and spilled (the int4-wip prototype).
+// whole group of every peer was 46-62 registers and spilled (the int4-wip prototype); the flat
+// walk's (COLLECTIVES) holds one, a group a thread: the plain kernel 135 VGPRs, none spilled (ISA
+// 2026-10-16T03-10-32Z).
 // =================================================================================================
 
 // A TEMPLATE INT, not an enum: a kernel's demangled name then reads `0` or `1` where an
@@ -1470,8 +1472,9 @@ DINLINE void int4_scale_store(__fp16* row, int pack, float scale) {
 // 1024 + 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd with 0x6400; then one
 // v_fma_mix_f32 a value takes a half at scale (or scale / 16) plus bias (-1032 * scale, or -72 *
 // scale): a 22-bit product, then an exact difference. 13 instructions a word, in one asm block:
-// left to the compiler, each half was converted and fed to packed fmas (1.5 a value). VOLATILE,
-// so the blocks keep their order (int4_used_by pins what consumes them between).
+// left to the compiler, each half was converted and fed to packed fmas (1.5 a value, a gfx950
+// probe compile, 2026-10-16). VOLATILE, so the blocks keep their order (int4_used_by pins what
+// consumes them between).
 DINLINE void int4_terms(uint32_t word, float scale, float (&term)[8]) {
   const float scale16 = scale * 0.0625f;
   const float bias = scale * -1032.0f;
@@ -1504,7 +1507,8 @@ template <typename U>
 constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 
 // THE VALUES DONE BEFORE THE NEXT VOLATILE ASM (int4_terms): the scheduler, free to use 256
-// VGPRs at 512 threads, decoded every peer's words of a group ahead of the first sum and spilled.
+// VGPRs at 512 threads, decoded every peer's words of a group ahead of the first sum and spilled
+// (the plain kernel 256 VGPRs, 264 B of scratch: ISA 2026-10-16T02-22-15Z).
 template <int N>
 DINLINE void int4_used_by(const float (&values)[N]) {
 #pragma unroll
@@ -1512,7 +1516,8 @@ DINLINE void int4_used_by(const float (&values)[N]) {
 }
 
 // TWO VALUES LANDED IN U, a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
-// conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4).
+// conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
+// 2026-10-16T02-01-12Z).
 template <typename U>
 DINLINE uint32_t int4_landed(float a, float b) {
   if constexpr (kBf16<U>) {
@@ -2110,7 +2115,11 @@ DINLINE void block_sum_rows(const T (&input)[1][K][P], U (&output)[1][K][P]) {
 // each scale 4 times and held one 4-byte load in flight a rank). EACH BLOCK A CONTIGUOUS RANGE OF
 // EVERY SHARE'S GROUPS, ceil(groups / grid) of them, THREADS a step: the same range on every rank
 // in the stage, the reduce-scatter and the all-gather (what the per-block barrier needs), and every
-// block busy at any size. `body(g, end)`: group g of a share, live below end.
+// block busy at any size (TILE_N is the exact walk's). `body(g, end)`: group g of a share, live
+// below end. The plain all-reduce at 72 blocks: 71.8 / 109.0 / 178.2 / 286.6 us at 1024-8192
+// tokens of 7168, against the exact 75.5 / 142.0 / 273.3 / 535.4 and quick reduce INT4's own
+// launch 69.7 / 118.0 / 197.2 / 333.3 (2026-10-16T03-14-06Z; before, a word a thread through LDS,
+// 103.2 / 195.2 / 366.9 / 741.7, 01-43-26Z).
 template <int THREADS, typename BODY>
 DINLINE void int4_for_each_group(int slice, BODY body) {
   const int groups = slice / kInt4Group;
