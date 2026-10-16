@@ -53,7 +53,7 @@ namespace hip_custom_communicator {
 
 // A TWO-SHOT TEMPLATE'S BUILDS: each listed build as it is, then the same
 // moving INT4 (common.cuh's QUANTIZATION), forced as any build is or taken by
-// select for a call the handle quantizes (`with_quantization`). A one-shot
+// select for a call the handle quantizes (`quantizes`). A one-shot
 // moves its input as it is.
 template <size_t N>
 constexpr std::array<BuildConfig, 2 * N> and_int4(
@@ -758,6 +758,58 @@ constexpr Int4Crossover kInt4Crossovers[] = {
     {OpType::all_reduce_add_rms_norm, 2 * 1024 * 1024},
     {OpType::all_reduce_add_attn_res_rms_norm, 2 * 1024 * 1024},
 };
+// EACH OP'S INT4 KERNELS, gfx950 on n11, bf16, 8 ranks, 7168 (other widths read
+// as rows of the same bytes, as the exact lists are): what a call the handle
+// quantizes runs, from the crossover up. INT4 IS COMPUTE A BYTE where the exact
+// kernels are link-bound, so it wants many more blocks than the exact grids: at
+// the exact two-shot's 72 blocks the INT4 plain all-reduce ran 7.9x the exact
+// kernel's VALU on the same 576 waves and lost to it (+37% at 1024 tokens;
+// instruction counters 2026-10-16T00-26-40Z against 00-31-41Z), and at 256 it
+// beats quick reduce's INT4 (2026-10-16T00-41-03Z). Grids swept at 1024-8192
+// tokens (plain 72-512, 2026-10-16T00-41-03Z; fused 36-256 on 8192-column builds,
+// 00-51-04Z; AttnRes pull past 256 pending); below 1024 tokens not
+// swept, the 1024 grid held down to the crossover.
+//   plain, 256 blocks: 54.7 / 84.7 / 141.2 / 268.1 us at 1024-8192 tokens (exact
+//     75.5 / 141.8 / 273.6 / 535.3; quick reduce INT4 70.1 / 119.1 / 197.7 / 334.4)
+//   rms_norm pull, 144: 55.1 / 84.6 / 143.5 / 295.2 (exact 77.1 / 146.5 / 278.5 /
+//     546.9); the push's best (256) 63.3 / 109.9 / 201.0 / 393.1
+//   add_rms_norm pull, 144: 62.5 / 97.3 / 160.8 / 329.5 (exact 92.9 / 159.5 /
+//     291.9 / 567.4); the push's best (256) 66.2 / 113.4 / 220.9 / 443.0
+//   AttnRes pull, 256: 76.2 / 135.0 / 257.3 / 485.6 (exact 92.4 / 169.2 / 335.8 /
+//     643.2; quick reduce INT4 + attn_res 98.8 / 176.6 / 325.8 / 603.2); the push's best
+//     (256) 82.7 / 162.6 / 324.9 / 634.1
+constexpr TunedKernel kAllReduceInt4Kernels[] = {
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {256, 0}}},
+};
+constexpr TunedKernel kRmsNormInt4Kernels[] = {
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192, Quantization::int4},
+      {144, 0}}},
+};
+constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192, Quantization::int4},
+      {144, 0}}},
+};
+constexpr TunedKernel kAttnResInt4Kernels[] = {
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1, Quantization::int4},
+      {256, 0}}},
+};
+
 constexpr int64_t int4_min_bytes(OpType o) {
   for (const Int4Crossover& c : kInt4Crossovers)
     if (c.op == o) return c.min_bytes;
@@ -778,6 +830,8 @@ struct Op {
   OpType type;
   const char* name;
   std::span<const TunedKernel> kernels;
+  // Its INT4 kernels: what a call the handle quantizes runs (kInt4Crossovers).
+  std::span<const TunedKernel> int4_kernels;
   // The dtypes its input may have.
   std::span<const DType> dtypes;
   // The dtypes its weight may have besides its input's; none for an op with no
@@ -796,17 +850,17 @@ struct Op {
 
 constexpr Op kOps[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce),
-     kAllReduceKernels,
+     kAllReduceKernels, kAllReduceInt4Kernels,
      kBuild.supports.dtypes,
      {},
      false,
      false},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm), kRmsNormKernels,
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm), kRmsNormKernels, kRmsNormInt4Kernels,
      kBuild.supports.dtypes, kNormWeights, true, true},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels,
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels, kAddRmsNormInt4Kernels,
      kBuild.supports.dtypes, kNormWeights, true, true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm),
-     kAttnResKernels,
+     kAttnResKernels, kAttnResInt4Kernels,
      kBuild.supports.dtypes,
      {},
      true,
@@ -853,6 +907,20 @@ constexpr bool ops_have_kernels() {
   }
   return true;
 }
+// EVERY OP'S INT4 KERNELS ARE ITS OWN TWO-SHOTS, BUILT MOVING INT4 and launchable.
+constexpr bool ops_have_int4_kernels() {
+  for (const Op& o : kOps) {
+    if (o.int4_kernels.empty()) return false;
+    for (const TunedKernel& k : o.int4_kernels)
+      if (op_of(k.fn) != o.type || !is_two_shot(k.fn) ||
+          quantization_of(k.config.build) != Quantization::int4 ||
+          !built(k.fn, k.config.build) || !launch_fits(k.fn, k.config.launch))
+        return false;
+  }
+  return true;
+}
+static_assert(ops_have_int4_kernels(),
+              "an op has no INT4 kernels, or one is not its own INT4 two-shot");
 static_assert(ops_have_kernels(),
               "an op has no kernels, or one is another op's, not built or not "
               "launchable");
@@ -998,10 +1066,9 @@ constexpr int tuned_world(OpType o, int world) {
   return w;
 }
 
-constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
-                                                int64_t n, int64_t tile_cols,
-                                                DType dtype) {
-  const std::span<const TunedKernel> kernels = op(o).kernels;
+constexpr std::variant<TunedKernel, Error> pick(
+    OpType o, int world, int64_t m, int64_t n, int64_t tile_cols, DType dtype,
+    std::span<const TunedKernel> kernels) {
   const int w = tuned_world(o, world);
   const auto columns = [&](const TunedKernel& k) {
     return every_rank_gets_columns(k.fn, n, dtype, world);
@@ -1026,6 +1093,12 @@ constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
     if (k.m <= as_rows && (!most || k.m > most->m)) most = &k;
   }
   return most ? *most : *least;
+}
+// The op's exact kernels.
+constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
+                                                int64_t n, int64_t tile_cols,
+                                                DType dtype) {
+  return pick(o, world, m, n, tile_cols, dtype, op(o).kernels);
 }
 
 // =================================================================================================
@@ -1055,17 +1128,13 @@ constexpr bool int4_takes_row(int64_t n, int world) {
 // regions hold it; then its build moves INT4, its template, tile and grid as
 // tuned. Else, and for every one-shot, its build as it is. A forced call is
 // never changed here: its quantization is its own.
-inline Chosen with_quantization(const Handle& h, Chosen k, int64_t m, int64_t n,
-                                DType dtype) {
-  if (h.quantization() != Quantization::int4 || !is_two_shot(k.fn) ||
-      elem_bytes(dtype) != 2 ||
-      m * n * elem_bytes(dtype) < int4_min_bytes(op_of(k.fn)) ||
-      !int4_takes_row(n, h.world_size()) ||
-      int4_values_bytes(m, n) > h.quantized_values_bytes() ||
-      int4_scales_bytes(m, n) > h.quantized_scales_bytes())
-    return k;
-  k.config.build = quantized(k.config.build, Quantization::int4);
-  return k;
+inline bool quantizes(const Handle& h, OpType o, int64_t m, int64_t n,
+                      DType dtype) {
+  return h.quantization() == Quantization::int4 && elem_bytes(dtype) == 2 &&
+         m * n * elem_bytes(dtype) >= int4_min_bytes(o) &&
+         int4_takes_row(n, h.world_size()) &&
+         int4_values_bytes(m, n) <= h.quantized_values_bytes() &&
+         int4_scales_bytes(m, n) <= h.quantized_scales_bytes();
 }
 
 // A QUANTIZED [m, n] BUFFER AS ITS KERNEL READS IT, values then scales, each
@@ -1089,10 +1158,11 @@ inline std::variant<Chosen, Error> chosen(
   if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing))
     return *f;
   const std::variant<TunedKernel, Error> tuned =
-      pick(o, h.world_size(), m, n, tile_cols, dtype);
+      pick(o, h.world_size(), m, n, tile_cols, dtype,
+           quantizes(h, o, m, n, dtype) ? op(o).int4_kernels : op(o).kernels);
   if (const Error* e = std::get_if<Error>(&tuned)) return *e;
   const TunedKernel& k = std::get<TunedKernel>(tuned);
-  return with_quantization(h, Chosen{k.fn, k.config}, m, n, dtype);
+  return Chosen{k.fn, k.config};
 }
 
 // =================================================================================================
@@ -1203,7 +1273,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (!every_rank_gets_columns(fn, n, dtype, world))
     return Error::row_narrower_than_world;
   // AN INT4 ROW is whole groups for every rank, its values and scales inside
-  // the quantized regions (with_quantization's rule, which a forced call meets
+  // the quantized regions (quantizes's rule, which a forced call meets
   // here).
   if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
   if (int4 && (int4_values_bytes(m, n) > h->quantized_values_bytes() ||
@@ -2057,7 +2127,7 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
   }
   // ONE QUANTIZED BUFFER'S VALUES AND SCALES at the box, the most any INT4
   // two-shot keeps (the staged input whole; its sums at most that): the handle
-  // holds two, the sums and the staged input (with_quantization).
+  // holds two, the sums and the staged input (quantizes).
   return {whole(scratch), whole(int4_values_bytes(max_rows, max_cols)),
           whole(int4_scales_bytes(max_rows, max_cols)), whole(staging)};
 }

@@ -64,7 +64,7 @@ class Handle {
   // what the buffers were sized for can be asked. `quantized_values_bytes` and
   // `quantized_scales_bytes`: one quantized buffer's values and scales at that
   // box (common.cuh's QUANTIZATION). `quantization`: what the tuned path moves
-  // across the links, a Quantization (select.cuh's `with_quantization`).
+  // across the links, a Quantization (select.cuh's `quantizes`).
   Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
          int64_t max_rows, int64_t max_cols, int64_t scratch_bytes,
          int64_t quantized_values_bytes, int64_t quantized_scales_bytes,

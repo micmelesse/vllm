@@ -220,7 +220,7 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
 // serves (for a model, the server's tokens a batch by its hidden size), from
 // which its exchange is sized (`exchange_sizes`). `quantization`: what its
 // tuned calls move across the links, a Quantization (select.cuh's
-// `with_quantization`). A torch op cannot return a variant, so it is two
+// `quantizes`). A torch op cannot return a variant, so it is two
 // optionals and exactly one is set, the handle or the Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
