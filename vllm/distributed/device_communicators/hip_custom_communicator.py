@@ -24,15 +24,19 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
 """
 
+import atexit
 import functools
+import os
+import signal
 import threading
 import time
 import warnings
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
+from types import FrameType
 from typing import ClassVar, Literal, final, get_args
 
 import torch
@@ -189,6 +193,7 @@ class LogKind(IntEnum):
     stream_seen = 6
     kernel_seen = 7
     deadline_expired = 8
+    close_phase = 9
     entered = 16
     barrier_signal = 17
     barrier_passed = 18
@@ -200,8 +205,8 @@ class LogKind(IntEnum):
 class OpenPhase(IntEnum):
     none = 0
     log_ready = 1
-    signals_allocated = 2
-    exchange_allocated = 3
+    arena_allocated = 2
+    exchange_allocated = 3  # retired: one arena; kept so the numbers hold
     zeroed = 4
     exported = 5
     socket_exchange_begun = 6
@@ -212,6 +217,22 @@ class OpenPhase(IntEnum):
     tables_written = 11  # retired: no peer tables; kept so the numbers hold
     checked = 12
     open_done = 13
+
+
+class ClosePhase(IntEnum):
+    """THE MEMORY'S TEARDOWN, in order (C++'s `ClosePhase`, log.cuh): a close runs
+    every phase with its two handshakes; an abandon (an error, a signal, exit) runs
+    closing, synchronized, peers_released, released (only once the device
+    finished) and close_done, never waiting on a peer."""
+
+    none = 0
+    closing = 1
+    synchronized = 2
+    stopped = 3
+    peers_released = 4
+    peers_done = 5
+    released = 6
+    close_done = 7
 
 
 class OpenCheck(IntEnum):
@@ -239,6 +260,7 @@ class OpenWarning(IntEnum):
 
 _LOG_MAGIC = 0x474F4C48
 _HEADER = 16  # the header's first word
+_CLOSE_PHASE = 32  # the header's close_phase word
 _DTYPE_NAMES = ("f16", "bf16", "f32")
 
 
@@ -325,6 +347,13 @@ class LogRecord:
             )
         if k is LogKind.open_warning:
             return f"open_warning {OpenWarning(self.barrier).name}: {self.warning()}"
+        if k is LogKind.close_phase:
+            how = "close" if self.peer else "abandon"
+            failed = f" FAILED ({self.extra})" if self.extra else ""
+            return (
+                f"close_phase {ClosePhase(self.barrier).name} ({how}) "
+                f"seen={self.seen} want={self.want}{failed}"
+            )
         if k is LogKind.launch_issued:
             dtype = (
                 _DTYPE_NAMES[self.extra]
@@ -363,6 +392,7 @@ class Log:
     timeout_ticks: int
     clock_khz: int
     phase: OpenPhase
+    close_phase: ClosePhase
     launches: int
     abort: bool
     cursor: int
@@ -395,6 +425,7 @@ class Log:
             timeout_ticks=h[6] | (h[7] << 32),
             clock_khz=khz,
             phase=OpenPhase(h[9]),
+            close_phase=ClosePhase(words[_CLOSE_PHASE]),
             launches=h[10],
             abort=words[0] != 0,
             cursor=cursor,
@@ -414,7 +445,8 @@ class Log:
         out = [
             f"hip_custom_communicator log: rank {self.rank} of {self.world}, device "
             f"{self.device}, mode {self.mode}, open phase {self.phase.name}, "
-            f"launches {self.launches}, timeout {timeout_s:.2f} s "
+            f"close phase {self.close_phase.name}, launches {self.launches}, "
+            f"timeout {timeout_s:.2f} s "
             f"({self.timeout_ticks} ticks at {self.clock_khz} kHz), abort "
             f"{int(self.abort)}, records {self.cursor} (dropped {self.dropped})"
         ]
@@ -456,6 +488,68 @@ def last_log() -> Log | None:
     """THE LAST LOG THIS PROCESS MADE, kept by C++ past a failed open and readable
     while an open still runs: where an open failed or hangs."""
     return Log.of(torch.ops._rocm_C.hip_custom_communicator_log(0))
+
+
+# ---- ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"). On 2026-10-16
+# n11's GPU driver wedged (a kfd_restore_wq kworker in D state; every later GPU process
+# hung until a reboot) after EVERY abnormal exit of a process holding peers' VMM memory,
+# never with legacy IPC. The suspect: a process dying with live mappings of its peers'
+# memory, and theirs of its. So an exit, SIGTERM and SIGINT tear every open
+# communicator down ALONE (C++'s `Handle::abandon`): every wait told to leave, the
+# device given a bounded wait, every BORROWED peer mapping unmapped and its handle
+# released, then our own memory once the device finished, each step in the state log.
+# It never waits on a peer: one may be dead. C++ also runs it from its own process-exit
+# hook; it is idempotent. ----
+
+# How long an abandon gives a device to finish its launches, a communicator.
+ABANDON_WAIT_S = 2.0
+# What the signal handlers cover: what a supervisor and a terminal send.
+_EXIT_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+_exit_hooks_installed = False
+SignalHandler = Callable[[int, FrameType | None], None] | int | None
+
+
+def abandon_open(wait_s: float = ABANDON_WAIT_S) -> None:
+    """EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS torn down alone, borrowed peer
+    mappings first: for an exit, a signal, a harness about to kill this process.
+    Never waits on a peer; waits at most `wait_s` a communicator for its device. A
+    communicator abandoned here can still be `close()`d (it does what is left)."""
+    torch.ops._rocm_C.hip_custom_communicator_abandon_all(wait_s)
+
+
+def _on_exit_signal(
+    previous: SignalHandler, signum: int, frame: FrameType | None
+) -> None:
+    """Abandon, then what was there before: the previous handler, or the default
+    action (re-raised with the default restored), or nothing when it was ignored.
+    Python runs this on the main thread between bytecodes, so a main thread stuck
+    in a C++ call (a synchronize) reaches it only when that returns; a harness that
+    must not wait calls `abandon_open` from its own thread."""
+    abandon_open()
+    if callable(previous):
+        previous(signum, frame)
+    elif previous != signal.SIG_IGN:
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+
+def _install_exit_hooks() -> None:
+    """Once a process, at the first open: atexit, and SIGTERM and SIGINT handlers
+    chained in front of whatever is there (from the main thread only: Python sets
+    handlers nowhere else)."""
+    global _exit_hooks_installed
+    if _exit_hooks_installed:
+        return
+    _exit_hooks_installed = True
+    atexit.register(abandon_open)
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "HipCustomCommunicator opened off the main thread: no SIGTERM/SIGINT "
+            "teardown (process exit still runs it)"
+        )
+        return
+    for sig in _EXIT_SIGNALS:
+        signal.signal(sig, functools.partial(_on_exit_signal, signal.getsignal(sig)))
 
 
 def configured_log_mode() -> LogMode:
@@ -1234,10 +1328,14 @@ class HipCustomCommunicator:
         exception TRACEBACK holds the frames that hold the communicator -- so a failing
         call is exactly when `del` does not release. This does.
 
-        LOCAL only, deliberately: nothing here coordinates across ranks, so a rank
-        closing early or late cannot hang its peers. Ordering that does matter is the
-        caller's -- close before the process group is destroyed, and after any captured
-        graph is gone.
+        A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
+        every rank's device finishes, a handshake over the CPU group, every rank
+        unmaps its peers' memory, a second handshake, then every rank releases its own
+        (C++'s `Handle::close`; each step a `ClosePhase` in `log()`). Each handshake
+        is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
+        costs at most that, never a hang: the failed handshake is logged and the
+        teardown carries on alone. Ordering that matters is the caller's -- close
+        before the process group is destroyed, and after any captured graph is gone.
         """
         if isinstance(self.state, Closed):
             return
@@ -1389,6 +1487,8 @@ class HipCustomCommunicator:
 
     # Declared here so a disabled communicator is still safe to hold and close.
     _handle: int | None = None
+    # The state log as close left it.
+    _closed_log: Log | None = None
     # The thread that reads the fault record, while the communicator is open.
     _watchdog: threading.Thread | None = None
     # The device wall clock's rate, which the fault record counts its wait in.
@@ -1419,6 +1519,7 @@ class HipCustomCommunicator:
         if isinstance(handle, Error):
             return handle.name
         self._handle = handle
+        _install_exit_hooks()
         # WHAT OPEN OBSERVED of the broader state: warnings, never a failure.
         opened = self.log()
         for warning in opened.warnings() if opened is not None else []:
@@ -1595,12 +1696,25 @@ class HipCustomCommunicator:
         )
 
     def _on_close(self) -> None:
-        """Release the peer memory now. Idempotent. Dropping the object does not close
-        the IPC handles the C++ side opened; this does."""
+        """Release the peer memory now, collectively (`close`), then the handle; the
+        log as it stood is kept for `log()`. Idempotent. Dropping the object does not
+        release what the C++ side mapped; this does."""
         if self._handle is None:
             return
+        failed = ClosePhase(
+            torch.ops._rocm_C.hip_custom_communicator_close(
+                self._handle, self.cpu_group.group_name, self.timeout_seconds
+            )
+        )
+        self._closed_log = self.log()
         torch.ops._rocm_C.hip_custom_communicator_dispose(self._handle)
         self._handle = None
+        if failed is not ClosePhase.none:
+            logger.error(
+                "HipCustomCommunicator close failed at %s (it finished alone):\n%s",
+                failed.name,
+                self._closed_log,
+            )
 
     def status(self) -> Status:
         """This rank's status, read from host-mapped memory, so it never waits on the
@@ -1625,9 +1739,10 @@ class HipCustomCommunicator:
 
     def log(self) -> Log | None:
         """This rank's state log (`Log`), read from host-mapped memory, so it never
-        waits on the device: readable while a kernel is hung. None once closed."""
+        waits on the device: readable while a kernel is hung. Once closed, the log as
+        the close left it (its close phases); None when it never opened."""
         if self._handle is None:
-            return None
+            return self._closed_log
         return Log.of(torch.ops._rocm_C.hip_custom_communicator_log(self._handle))
 
     def signals(self) -> list[Flag]:

@@ -30,6 +30,7 @@ import torch.distributed as dist
 
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    ABANDON_WAIT_S,
     Error,
     FlagState,
     HipCustomCommunicator,
@@ -40,6 +41,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Refused,
     Supported,
     Where,
+    abandon_open,
     build_info,
     last_log,
     open_handle,
@@ -90,8 +92,11 @@ PROCESS_TIMEOUT_S = 900
 # not a PROCESS_TIMEOUT_S.
 SMOKE_KERNEL_TIMEOUT_S = 5.0
 SMOKE_PROCESS_TIMEOUT_S = 120
-# How long a hung rank has to print its state log before the harness kills it.
+# How long a hung rank has to print its state log before the harness terminates it,
+# and how long it then has to tear its communicator down alone (SIGTERM, `abandon_open`)
+# before it is killed.
 DUMP_GRACE_S = 5.0
+TERM_GRACE_S = ABANDON_WAIT_S + 5.0
 
 Forced = dict[str, str | int]
 Tolerance = tuple[float, float]
@@ -134,11 +139,24 @@ def _state_log(rank: int) -> str:
 
 
 def _dump_on_signal(rank: int) -> None:
-    """Waits for SIGUSR1, the harness's word that it is about to kill a hung rank,
-    and prints the rank's state log. Its own thread, so it runs while the main
-    thread is stuck in a call that released the GIL (a synchronize, an op)."""
-    signal.sigwait({signal.SIGUSR1})
-    print(f"rank {rank}: hung; its state log:\n{_state_log(rank)}", flush=True)
+    """Waits for the harness's signals to a hung rank: SIGUSR1, print the state log;
+    SIGTERM, tear the communicator down alone (`abandon_open`: borrowed peer mappings
+    first, never waiting on a peer), print the log with its close phases, and exit,
+    before the SIGKILL that would leave the driver to untangle live peer mappings
+    (what wedged n11, 2026-10-16). Its own thread, so it runs while the main thread
+    is stuck in a call that released the GIL (a synchronize, an op)."""
+    while True:
+        got = signal.sigwait({signal.SIGUSR1, signal.SIGTERM})
+        if got == signal.SIGUSR1:
+            print(f"rank {rank}: hung; its state log:\n{_state_log(rank)}", flush=True)
+            continue
+        print(f"rank {rank}: terminated; abandoning its communicator", flush=True)
+        try:
+            abandon_open()
+        except RuntimeError as e:
+            print(f"rank {rank}: abandon failed: {e}", flush=True)
+        print(f"rank {rank}: after abandon:\n{_state_log(rank)}", flush=True)
+        os._exit(1)
 
 
 @contextmanager
@@ -163,9 +181,9 @@ def _rank_main(
     log_mode: LogMode,
 ) -> None:
     global _COMM
-    # SIGUSR1 TO THE DUMPER ONLY: blocked here before any thread starts (threads
-    # inherit it), taken by `_dump_on_signal`'s sigwait.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    # SIGUSR1 AND SIGTERM TO THE DUMPER ONLY: blocked here before any thread starts
+    # (threads inherit it), taken by `_dump_on_signal`'s sigwait.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1, signal.SIGTERM})
     threading.Thread(target=_dump_on_signal, args=(rank,), daemon=True).start()
     try:
         device = torch.device(f"cuda:{rank}")
@@ -215,7 +233,8 @@ def _on_every_rank(
     """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`. A
     rank still running at the deadline is told to print its state log (SIGUSR1),
-    given DUMP_GRACE_S, then killed."""
+    given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
+    TERM_GRACE_S, then killed."""
     ctx = mp.get_context("spawn")
     failures = ctx.Queue()
     port = get_open_port()
@@ -237,6 +256,13 @@ def _on_every_rank(
         if pid is not None:
             os.kill(pid, signal.SIGUSR1)
     grace = time.monotonic() + DUMP_GRACE_S
+    for r in hung:
+        procs[r].join(timeout=max(0.0, grace - time.monotonic()))
+    for r in hung:
+        pid = procs[r].pid
+        if pid is not None and procs[r].is_alive():
+            os.kill(pid, signal.SIGTERM)
+    grace = time.monotonic() + TERM_GRACE_S
     for r in hung:
         procs[r].join(timeout=max(0.0, grace - time.monotonic()))
     for p in procs:
