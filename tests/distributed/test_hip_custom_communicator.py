@@ -133,6 +133,15 @@ def _rank_main(
         torch.accelerator.set_device_index(device)
         init_test_distributed_environment(WORLD_SIZE, 1, rank, str(port), rank)
         tp = get_tp_group()
+        # RCCL UP BEFORE THE COMMUNICATOR OPENS, as vLLM's own startup does (and the
+        # old harness did): torch builds its RCCL communicator lazily, at the first
+        # collective, and on 2026-10-16 RCCL's setup hung when that came after our
+        # VMM open (the reference all-reduce in the first call).
+        with _step(rank, "rccl warm-up"):
+            torch.distributed.all_reduce(
+                torch.zeros(1, device=device), group=tp.device_group
+            )
+            torch.accelerator.synchronize()
         with _step(rank, "open"):
             comm = HipCustomCommunicator(
                 tp.cpu_group,
