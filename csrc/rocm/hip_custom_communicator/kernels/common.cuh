@@ -1522,31 +1522,22 @@ DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
   __builtin_memcpy(output, &packed, sizeof(packed));
 }
 
-// A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
-// (quad_perm [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each step),
-// / 7, to fp16 (past its largest, clamped to it); then each value rounded to the nearest of -8..7
-// times the scale stored. A group of zeros is all 8s at scale 0. ROUNDED BY THE MAGIC NUMBER, in
-// place: fma(x, inv * 16^p, 1.5 * 2^(23 + 4p) + 8 * 16^p) rounds to a multiple of 16^p, so q + 8
-// lands in bits 4p..4p+3, clamped (med3) and masked into the word; elements 2p and 2p + 1 share
-// p (one packed fma), the odd ones' half then shifted up 16.
-template <typename T, int P>
-DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
+// A GROUP'S SCALE from its largest magnitude: / 7, to fp16 (past its largest, clamped to it);
+// and the inverse its values are rounded at (a group of zeros: 0, so all 8s at scale 0).
+DINLINE float int4_scale(float amax) {
+  return static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
+}
+DINLINE float int4_inverse(float scale) {
+  return scale > 0.0f ? __builtin_amdgcn_rcpf(scale) : 0.0f;
+}
+
+// A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale stored, BY THE MAGIC
+// NUMBER, in place: fma(x, inv * 16^p, 1.5 * 2^(23 + 4p) + 8 * 16^p) rounds to a multiple of 16^p,
+// so q + 8 lands in bits 4p..4p+3, clamped (med3) and masked into the word; elements 2p and 2p + 1
+// share p (one packed fma), the odd ones' half then shifted up 16.
+template <int P>
+DINLINE uint32_t int4_word(const float (&x)[P], float inv) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  float x[P];
-  float amax = 0.0f;
-#pragma unroll
-  for (int j = 0; j < P; ++j) {
-    x[j] = static_cast<float>(input[j]);
-    amax = fmaxf(amax, fabsf(x[j]));
-  }
-  uint32_t bits = __builtin_bit_cast(uint32_t, amax);
-  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
-  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
-  amax = __builtin_bit_cast(float, bits);
-  scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
-  const float inv = scale > 0.0f ? __builtin_amdgcn_rcpf(scale) : 0.0f;
   uint32_t half[2] = {0, 0};
 #pragma unroll
   for (int p = 0; p < P / 2; ++p) {
@@ -1561,7 +1552,47 @@ DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
                      uint32_t, __builtin_amdgcn_fmed3f(y[e], lowest, lowest + 15.0f * unit)) &
                  (0xFu << (4 * p));
   }
-  word = half[0] | half[1] << 16;
+  return half[0] | half[1] << 16;
+}
+
+// A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
+// (quad_perm [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each step).
+template <typename T, int P>
+DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
+  float x[P];
+  float amax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < P; ++j) {
+    x[j] = static_cast<float>(input[j]);
+    amax = fmaxf(amax, fabsf(x[j]));
+  }
+  uint32_t bits = __builtin_bit_cast(uint32_t, amax);
+  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
+  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
+  scale = int4_scale(__builtin_bit_cast(float, bits));
+  word = int4_word(x, int4_inverse(scale));
+}
+
+// A WHOLE GROUP IN ONE THREAD (the flat walk's): its 4 packs to their words and its scale, the
+// largest magnitude the thread's own.
+template <typename T, int P>
+DINLINE void int4_encode_group(const T (&input)[kInt4GroupPacks][P], u32x4& words,
+                               float& scale) {
+  float x[kInt4GroupPacks][P];
+  float amax = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+      x[k][j] = static_cast<float>(input[k][j]);
+      amax = fmaxf(amax, fabsf(x[k][j]));
+    }
+  scale = int4_scale(amax);
+  const float inv = int4_inverse(scale);
+#pragma unroll
+  for (int k = 0; k < kInt4GroupPacks; ++k) words[k] = int4_word(x[k], inv);
 }
 
 // Every pack of a thread's registers, encoded or decoded.
@@ -1749,43 +1780,6 @@ DINLINE void int4_all_gather(const uint8_t* const* values_ptrs, int64_t values_s
   }
   issued();
   int4_decode(words, scales, output);
-}
-
-// THE FLAT WALK'S (COLLECTIVES): a chunk of the range from element `first` of a quantized buffer
-// whose rows are back to back (ours), `first` a whole group; and stored, its first `len` elements.
-template <int THREADS_N, typename U, int K, int P>
-DINLINE void int4_range_load(const uint8_t* values_ptr, const __fp16* scales_ptr,
-                             U (&output)[1][K][P], int64_t first, int size_n, int offs_n) {
-  static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-  const uint8_t* values_run = values_ptr + first / 2;
-  const __fp16* scales_run = scales_ptr + first / kInt4Group;
-  uint32_t words[1][K];
-  float scales[1][K];
-#pragma unroll
-  for (int k = 0; k < K; ++k) {
-    const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
-    words[0][k] = int4_word_load(values_run, pack);
-    scales[0][k] = int4_scale_load(scales_run, pack);
-  }
-  issued();
-  int4_decode(words, scales, output);
-}
-template <int THREADS_N, int K>
-DINLINE void int4_range_store(const uint32_t (&words)[1][K], const float (&scales)[1][K],
-                              uint8_t* values_ptr, __fp16* scales_ptr, int64_t first,
-                              int offs_n, int len) {
-  constexpr int P = kInt4Group / kInt4GroupPacks;
-  static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-  uint8_t* values_run = values_ptr + first / 2;
-  __fp16* scales_run = scales_ptr + first / kInt4Group;
-#pragma unroll
-  for (int k = 0; k < K; ++k) {
-    const int c =
-        offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N + k * THREADS_N;
-    if (c >= len / P) continue;
-    int4_word_store(values_run, c, words[0][k]);
-    int4_scale_store(scales_run, c, scales[0][k]);
-  }
 }
 
 // THE STAGED INPUT PUBLISHED, a stage's last step: every wave's stores done, the block met, then
@@ -2082,14 +2076,178 @@ DINLINE void block_sum_rows(const T (&input)[1][K][P], U (&output)[1][K][P]) {
   __syncthreads();  // before the next reduction writes `part`
 }
 
-// A SHARE'S GRANULE, in elements: a pack, or with int4 a group, so every rank's sums are whole
-// groups (select quantizes only rows of whole groups for every rank, so the shares are equal).
-template <int QUANTIZATION, int P>
-constexpr int kShareGranule = QUANTIZATION == Quantization::none ? P : kInt4Group;
+// THE INT4 FLAT WALK: the shares in whole groups, A GROUP A THREAD, so its largest magnitude is
+// the thread's own (no DPP), its values one 16-byte load and its scale one (a word a thread loaded
+// each scale 4 times and held one 4-byte load in flight a rank). EACH BLOCK A CONTIGUOUS RANGE OF
+// EVERY SHARE'S GROUPS, ceil(groups / grid) of them, THREADS a step: the same range on every rank
+// in the stage, the reduce-scatter and the all-gather (what the per-block barrier needs), and every
+// block busy at any size. `body(g, end)`: group g of a share, live below end.
+template <int THREADS, typename BODY>
+DINLINE void int4_for_each_group(int slice, BODY body) {
+  const int groups = slice / kInt4Group;
+  const int grid = static_cast<int>(gridDim.x);
+  const int per_block = (groups + grid - 1) / grid;
+  const int first = static_cast<int>(blockIdx.x) * per_block;
+  const int end = min(first + per_block, groups);
+  for (int g = first; g < end; g += THREADS) body(g + static_cast<int>(threadIdx.x), end);
+}
+
+// Group g of a quantized run (its values and scales from the run's first group), and stored.
+DINLINE u32x4 int4_group_words_load(const uint8_t* values_run, int g) {
+  return *(const global_u32x4*)at_offset(values_run, static_cast<uint32_t>(g) * 16);
+}
+DINLINE float int4_group_scale_load(const __fp16* scales_run, int g) {
+  return *(const global_f16*)at_offset(scales_run, static_cast<uint32_t>(g) * kInt4ScaleBytes);
+}
+DINLINE void int4_group_store(const u32x4& words, float scale, uint8_t* values_run,
+                              __fp16* scales_run, int g) {
+  *(global_u32x4*)at_offset(values_run, static_cast<uint32_t>(g) * 16) = words;
+  *(global_f16*)at_offset(scales_run, static_cast<uint32_t>(g) * kInt4ScaleBytes) =
+      static_cast<__fp16>(scale);
+}
+
+// Group g's first element in an [*, size_n] buffer, from element `first` (a whole group, so the
+// group is in one row): one run when its rows are back to back (range_load's).
+template <bool CONTIGUOUS, typename T>
+DINLINE T* int4_group_at(T* ptr, int64_t stride_m, int64_t stride_n, int size_n, int64_t first,
+                         int g) {
+  if constexpr (CONTIGUOUS)
+    return at_offset(ptr + first * stride_n,
+                     static_cast<uint32_t>(g) * (kInt4Group * sizeof(T)));
+  else
+    return flat_at(ptr, stride_m, stride_n, first + int64_t{g} * kInt4Group, size_n);
+}
+
+// THE INT4 STAGE: every rank's share of this rank's input, a group a thread, quantized into its
+// staged values and scales (ours, rows back to back), then published.
+template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
+DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+                             int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
+                             __fp16* staging_scales_ptr) {
+  constexpr int P = traits<T>::N;
+  using V = vec<T, P>;
+  const int64_t total = int64_t{input_size_m} * input_size_n;
+  const int slice = share_slice<WORLD, kInt4Group>(total);
+  int4_for_each_group<THREADS>(slice, [&](int g, int end) {
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) {
+      const int groups = share_len(total, slice, r) / kInt4Group;
+      if (groups == 0) continue;  // a late rank's empty share (every block alike)
+      const int64_t first = share_first(slice, r);
+      const V* group = reinterpret_cast<const V*>(int4_group_at<CONTIGUOUS>(
+          input_ptr, input_stride_m, input_stride_n, input_size_n, first, min(g, groups - 1)));
+      T x[kInt4GroupPacks][P];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k) held(x[k], pack_load(group + k));
+      u32x4 words;
+      float scale;
+      int4_encode_group(x, words, scale);
+      if (g < end && g < groups)
+        int4_group_store(words, scale, staging_values_ptr + first / 2,
+                         staging_scales_ptr + first / kInt4Group, g);
+    }
+  });
+  publish_staged();
+}
+
+// THE INT4 REDUCE-SCATTER: this rank's share, a group a thread, every rank's staged group in
+// flight at once (rotated rank order), summed in fp32 in registers (int4_peers_sum: each term
+// landed in T), quantized and stored in this rank's scratch (the share's own run). Through LDS, a
+// rank's copy a wave, one wave in 8 summed and quantized while the others waited at the barrier.
+template <int WORLD, int THREADS, typename T>
+DINLINE void int4_flat_reduce_scatter(const uint8_t* const* input_values_ptrs,
+                                      const __fp16* const* input_scales_ptrs,
+                                      uint8_t* const* scratch_values_ptrs,
+                                      __fp16* const* scratch_scales_ptrs, int64_t total,
+                                      int rank) {
+  constexpr int P = traits<T>::N;
+  const int slice = share_slice<WORLD, kInt4Group>(total);
+  const int groups = share_len(total, slice, rank) / kInt4Group;
+  if (groups == 0) return;  // a late rank's share is empty at few groups (every block alike)
+  const int64_t first = share_first(slice, rank);
+  const uint8_t* values[WORLD];
+  const __fp16* scales[WORLD];
+#pragma unroll
+  for (int w = 0; w < WORLD; ++w) {
+    values[w] = rank_of(input_values_ptrs, (rank + w) % WORLD) + first / 2;
+    scales[w] = rank_of(input_scales_ptrs, (rank + w) % WORLD) + first / kInt4Group;
+  }
+  uint8_t* const own_values = rank_of(scratch_values_ptrs, rank);
+  __fp16* const own_scales = rank_of(scratch_scales_ptrs, rank);
+  int4_for_each_group<THREADS>(slice, [&](int g, int end) {
+    const int at = min(g, groups - 1);
+    uint32_t words[WORLD][1][kInt4GroupPacks];
+    float group_scales[WORLD][1][kInt4GroupPacks];
+#pragma unroll
+    for (int w = 0; w < WORLD; ++w) {
+      const u32x4 v = int4_group_words_load(values[w], at);
+      const float scale = int4_group_scale_load(scales[w], at);
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k) {
+        words[w][0][k] = v[k];
+        group_scales[w][0][k] = scale;
+      }
+    }
+    issued();
+    float sum[1][kInt4GroupPacks][P];
+    int4_peers_sum<T>(words, group_scales, sum);
+    u32x4 out;
+    float scale;
+    int4_encode_group(sum[0], out, scale);
+    if (g < end && g < groups) int4_group_store(out, scale, own_values, own_scales, g);
+  });
+}
+
+// THE INT4 ALL-GATHER: every rank's group g of its summed share, all in flight, dequantized to T
+// and stored at its place in the output.
+template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
+DINLINE void int4_flat_all_gather(uint8_t* const* scratch_values_ptrs,
+                                  __fp16* const* scratch_scales_ptrs, T* output_ptr,
+                                  int64_t output_stride_m, int64_t output_stride_n,
+                                  int output_size_m, int output_size_n, int rank) {
+  constexpr int P = traits<T>::N;
+  using V = vec<T, P>;
+  const int64_t total = int64_t{output_size_m} * output_size_n;
+  const int slice = share_slice<WORLD, kInt4Group>(total);
+  const uint8_t* values[WORLD];
+  const __fp16* scales[WORLD];
+#pragma unroll
+  for (int w = 0; w < WORLD; ++w) {
+    values[w] = rank_of(scratch_values_ptrs, (rank + w) % WORLD);
+    scales[w] = rank_of(scratch_scales_ptrs, (rank + w) % WORLD);
+  }
+  int4_for_each_group<THREADS>(slice, [&](int g, int end) {
+    u32x4 words[WORLD];
+    float group_scales[WORLD];
+#pragma unroll
+    for (int w = 0; w < WORLD; ++w) {
+      const int groups = share_len(total, slice, (rank + w) % WORLD) / kInt4Group;
+      const int at = max(min(g, groups - 1), 0);
+      words[w] = int4_group_words_load(values[w], at);
+      group_scales[w] = int4_group_scale_load(scales[w], at);
+    }
+    issued();
+#pragma unroll
+    for (int w = 0; w < WORLD; ++w) {
+      const int r = (rank + w) % WORLD;
+      const int groups = share_len(total, slice, r) / kInt4Group;
+      if (!(g < end && g < groups)) continue;
+      V* group = reinterpret_cast<V*>(int4_group_at<CONTIGUOUS>(
+          output_ptr, output_stride_m, output_stride_n, output_size_n, share_first(slice, r),
+          g));
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k) {
+        T x[P];
+        int4_decode(words[w][k], group_scales[w], x);
+        pack_store(group + k, pack(x));
+      }
+    }
+  });
+}
 
 // THE FLAT WALK'S REDUCE-SCATTER: this rank's share, a TILE_N chunk a step, every rank's copy in
-// one round trip, summed over the ranks through LDS, stored in this rank's scratch: with none
-// rounded once to T; with int4 every rank's staged values read and the fp32 sum quantized.
+// one round trip, summed over the ranks through LDS, rounded once to T, stored in this rank's
+// scratch; with int4 the int4 walk's above.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
@@ -2098,84 +2256,72 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
                             const __fp16* const* input_scales_ptrs,
                             T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
                             __fp16* const* scratch_scales_ptrs, int rank) {
-  constexpr int LANES = THREADS / WORLD;
-  constexpr int P = traits<T>::N;
-  constexpr int K = TILE_N / (P * LANES);
-  static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
-  static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
-  static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
-  using Summed = std::conditional_t<QUANTIZATION == Quantization::none, T, float>;
-  T* const scratch = rank_of(scratch_ptrs, rank);
-  const int64_t total = int64_t{input_size_m} * input_size_n;
-  const int slice = share_slice<WORLD, kShareGranule<QUANTIZATION, P>>(total);
-  const int chunks = (slice + TILE_N - 1) / TILE_N;
-  if (share_len(total, slice, rank) == 0)
-    return;  // a late rank's share is empty at few packs (every block alike)
-  // THE QUANTIZED FORM'S POINTERS, ONCE: read in the loop, each was a load from its table and a
-  // wait every step (the stores to the scratch may alias the tables).
-  const int peer = QUANTIZATION == Quantization::none
-                       ? 0  // unread: none's ISA as it was
-                       : (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-  const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(input_values_ptrs, peer);
-  const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(input_scales_ptrs, peer);
-  uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank);
-  __fp16* const own_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank);
-  block_for_each_tile(1, chunks, [&](int, int chunk) {
-    const int len = share_len(total, slice, rank);
-    const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-    T got[1][K][P];
-    // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
-    if constexpr (QUANTIZATION == Quantization::none)
-      range_load<CONTIGUOUS, LANES>(rank_of(input_ptrs, r), input_stride_m,
-                                    input_stride_n, input_size_n, got,
-                                    share_first(slice, rank), len,
+  if constexpr (QUANTIZATION == Quantization::int4) {
+    int4_flat_reduce_scatter<WORLD, THREADS, T>(input_values_ptrs, input_scales_ptrs,
+                                                scratch_values_ptrs, scratch_scales_ptrs,
+                                                int64_t{input_size_m} * input_size_n, rank);
+  } else {
+    constexpr int LANES = THREADS / WORLD;
+    constexpr int P = traits<T>::N;
+    constexpr int K = TILE_N / (P * LANES);
+    static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
+    static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
+    static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
+    T* const scratch = rank_of(scratch_ptrs, rank);
+    const int64_t total = int64_t{input_size_m} * input_size_n;
+    const int slice = share_slice<WORLD, P>(total);
+    const int chunks = (slice + TILE_N - 1) / TILE_N;
+    if (share_len(total, slice, rank) == 0)
+      return;  // a late rank's share is empty at few packs (every block alike)
+    block_for_each_tile(1, chunks, [&](int, int chunk) {
+      const int len = share_len(total, slice, rank);
+      const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+      T got[1][K][P];
+      // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
+      range_load<CONTIGUOUS, LANES>(rank_of(input_ptrs, r), input_stride_m, input_stride_n,
+                                    input_size_n, got, share_first(slice, rank), len,
                                     chunk * TILE_N);
-    else
-      int4_range_load<LANES>(peer_values, peer_scales, got, share_first(slice, rank), len,
-                             chunk * TILE_N);
-    // 2. Summed over the ranks, in rotated rank order, through LDS, rounded once.
-    Summed rounded[1][K][P];
-    block_sum_ranks<WORLD, LANES>(got, rounded);
-    // 3. Stored in this rank's scratch.
-    exchanged_store<1, LANES, THREADS, QUANTIZATION>(rounded, scratch, 0, own_values, 0,
-                                                     own_scales, 0, 1, len, 0,
-                                                     chunk * TILE_N, 1);
-  });
+      // 2. Summed over the ranks, in rotated rank order, through LDS, rounded once.
+      T rounded[1][K][P];
+      block_sum_ranks<WORLD, LANES>(got, rounded);
+      // 3. Stored in this rank's scratch.
+      store<1, LANES, THREADS>(rounded, scratch, 0, 1, len, 0, chunk * TILE_N, 1);
+    });
+  }
 }
 
-// THE FLAT WALK'S ALL-GATHER: every rank's summed share out of its scratch (with int4 its values,
-// dequantized to T), at its place in the output, a TILE_N chunk a step.
+// THE FLAT WALK'S ALL-GATHER: every rank's summed share out of its scratch, at its place in the
+// output, a TILE_N chunk a step; with int4 the int4 walk's above.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
                         __fp16* const* scratch_scales_ptrs, T* output_ptr,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
-  constexpr int LANES = THREADS / WORLD;
-  constexpr int P = traits<T>::N;
-  constexpr int K = TILE_N / (P * LANES);
-  static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
-  static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
-  const int64_t total = int64_t{output_size_m} * output_size_n;
-  const int slice = share_slice<WORLD, kShareGranule<QUANTIZATION, P>>(total);
-  // The quantized form's pointers once (reduce_scatter's).
-  const int peer = QUANTIZATION == Quantization::none
-                       ? 0  // unread: none's ISA as it was
-                       : (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-  const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, peer);
-  const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, peer);
-  block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
-    const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-    T got[1][K][P];
-    // 1. Rank r's summed chunk, in one round trip.
-    exchanged_load<1, LANES, QUANTIZATION>(rank_of(scratch_ptrs, r), 0, peer_values, 0,
-                                           peer_scales, 0, 1, slice, got, 0, chunk * TILE_N, 1);
-    // 2. Stored where rank r's share goes.
-    range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m,
-                                   output_stride_n, output_size_n,
-                                   share_first(slice, r), slice, chunk * TILE_N,
-                                   share_len(total, slice, r));
-  });
+  if constexpr (QUANTIZATION == Quantization::int4) {
+    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(scratch_values_ptrs, scratch_scales_ptrs,
+                                                     output_ptr, output_stride_m,
+                                                     output_stride_n, output_size_m,
+                                                     output_size_n, rank);
+  } else {
+    constexpr int LANES = THREADS / WORLD;
+    constexpr int P = traits<T>::N;
+    constexpr int K = TILE_N / (P * LANES);
+    static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
+    static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
+    const int64_t total = int64_t{output_size_m} * output_size_n;
+    const int slice = share_slice<WORLD, P>(total);
+    block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
+      const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+      T got[1][K][P];
+      // 1. Rank r's summed chunk, in one round trip.
+      load<1, LANES>(rank_of(scratch_ptrs, r), 0, 1, slice, got, 0, chunk * TILE_N, 1);
+      // 2. Stored where rank r's share goes.
+      range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m, output_stride_n,
+                                     output_size_n, share_first(slice, r), slice,
+                                     chunk * TILE_N, share_len(total, slice, r));
+    });
+  }
 }
 
 // STAGED, BEFORE THE REDUCE-SCATTER: this rank's input, every rank's share of it, into its
@@ -2207,37 +2353,16 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
 }
 
 // THE IN-PLACE TWO-SHOT'S STAGE, in QUANTIZATION's form: with none nothing (the peers read the
-// input where it is); with int4 every rank's share of it quantized into this rank's staged values
-// and scales (ours, rows back to back), each block the chunks that rank's same block reads, then
-// published (publish_staged).
+// input where it is); with int4 the int4 walk's.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
                    int input_size_m, int input_size_n, uint8_t* staging_values_ptr,
                    __fp16* staging_scales_ptr, int rank) {
-  if constexpr (QUANTIZATION == Quantization::int4) {
-    constexpr int LANES = THREADS / WORLD;
-    constexpr int P = traits<T>::N;
-    constexpr int K = TILE_N / (P * LANES);
-    static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
-    const int64_t total = int64_t{input_size_m} * input_size_n;
-    const int slice = share_slice<WORLD, kInt4Group>(total);
-    block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
-      const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-      const int len = share_len(total, slice, r);
-      if (len == 0) return;
-      T part[1][K][P];
-      range_load<CONTIGUOUS, LANES>(input_ptr, input_stride_m, input_stride_n,
-                                    input_size_n, part, share_first(slice, r), len,
-                                    chunk * TILE_N);
-      uint32_t words[1][K];
-      float scales[1][K];
-      int4_encode(part, words, scales);
-      int4_range_store<LANES>(words, scales, staging_values_ptr, staging_scales_ptr,
-                              share_first(slice, r), chunk * TILE_N, len);
-    });
-    publish_staged();
-  }
+  if constexpr (QUANTIZATION == Quantization::int4)
+    int4_flat_stage<WORLD, THREADS, CONTIGUOUS>(input_ptr, input_stride_m, input_stride_n,
+                                                input_size_m, input_size_n,
+                                                staging_values_ptr, staging_scales_ptr);
 }
 
 // THE PER-ROW TWO-SHOTS' STAGE, in QUANTIZATION's form: with none nothing; with int4 this block's
