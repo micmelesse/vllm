@@ -2113,7 +2113,9 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
     return;  // a late rank's share is empty at few packs (every block alike)
   // THE QUANTIZED FORM'S POINTERS, ONCE: read in the loop, each was a load from its table and a
   // wait every step (the stores to the scratch may alias the tables).
-  const int peer = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+  const int peer = QUANTIZATION == Quantization::none
+                       ? 0  // unread: none's ISA as it was
+                       : (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
   const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(input_values_ptrs, peer);
   const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(input_scales_ptrs, peer);
   uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank);
@@ -2157,7 +2159,9 @@ DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_p
   const int64_t total = int64_t{output_size_m} * output_size_n;
   const int slice = share_slice<WORLD, kShareGranule<QUANTIZATION, P>>(total);
   // The quantized form's pointers once (reduce_scatter's).
-  const int peer = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+  const int peer = QUANTIZATION == Quantization::none
+                       ? 0  // unread: none's ISA as it was
+                       : (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
   const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, peer);
   const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, peer);
   block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
