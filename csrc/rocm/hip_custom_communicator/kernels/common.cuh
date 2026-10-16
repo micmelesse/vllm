@@ -55,6 +55,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace hip_custom_communicator {
@@ -1486,6 +1487,24 @@ DINLINE float int4_term(uint32_t pair, float scale, float bias) {
 }
 DINLINE float int4_bias(float scale) { return scale * -1032.0f; }
 
+typedef float f32x2 __attribute__((ext_vector_type(2)));
+typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
+// A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
+template <typename U>
+constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
+
+// TWO VALUES LANDED IN U, a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
+// conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4).
+template <typename U>
+DINLINE uint32_t int4_landed(float a, float b) {
+  if constexpr (kBf16<U>) {
+    return __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
+  } else {
+    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(a))) |
+           static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(b))) << 16;
+  }
+}
+
 // A PACK'S WORD AT ITS GROUP'S SCALE, each element rounded once to U, a 16-bit dtype. MADE AS A
 // LOADED PACK IS, four 32-bit words copied in whole: element by element, each 16-bit value held a
 // register of its own and the pull norms' two rows of every peer's packs spilled 188 VGPRs (256
@@ -1494,15 +1513,11 @@ template <typename U, int P>
 DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P * 4 == 32 && sizeof(U) == 2, "a pack is one word of 8 16-bit values");
   const float bias = int4_bias(scale);
-  const auto bits = [](float x) {
-    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(x)));
-  };
   u32x4 packed;
 #pragma unroll
   for (int w = 0; w < P / 2; ++w) {
     const uint32_t pair = int4_pair(word, w);
-    packed[w] = bits(int4_term<0>(pair, scale, bias)) |
-                bits(int4_term<1>(pair, scale, bias)) << 16;
+    packed[w] = int4_landed<U>(int4_term<0>(pair, scale, bias), int4_term<1>(pair, scale, bias));
   }
   __builtin_memcpy(output, &packed, sizeof(packed));
 }
@@ -1517,7 +1532,6 @@ DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
 template <typename T, int P>
 DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  typedef float f32x2 __attribute__((ext_vector_type(2)));
   float x[P];
   float amax = 0.0f;
 #pragma unroll
@@ -1671,11 +1685,14 @@ DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t valu
 // EVERY PEER'S QUANTIZED PACKS SUMMED, peers_sum's: each element (q - 8) * scale landed in T, as a
 // quantized load lands it, then added in fp32 in rank order. From the words, no pack of every
 // peer made first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
-// 2026-10-15T22-47-01Z).
+// 2026-10-15T22-47-01Z). WITH BF16, TWO RANKS' TERMS A STEP: landed together (one
+// v_cvt_pk_bf16_f32) and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
+// conversion, a shift and an add.
 template <typename T, int WORLD, int ROWS, int K, int P>
 DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
                             const float (&group_scales)[WORLD][ROWS][K],
                             float (&output)[ROWS][K][P]) {
+  const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -1683,16 +1700,29 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 #pragma unroll
       for (int w = 0; w < P / 2; ++w) {
         float acc[2] = {0.0f, 0.0f};
+        float term[WORLD][2];
 #pragma unroll
         for (int r = 0; r < WORLD; ++r) {
           const float scale = group_scales[r][i][k];
           const float bias = int4_bias(scale);
           const uint32_t pair = int4_pair(words[r][i][k], w);
-          acc[0] += static_cast<float>(static_cast<T>(int4_term<0>(pair, scale, bias)));
-          acc[1] += static_cast<float>(static_cast<T>(int4_term<1>(pair, scale, bias)));
+          term[r][0] = int4_term<0>(pair, scale, bias);
+          term[r][1] = int4_term<1>(pair, scale, bias);
         }
-        output[i][k][2 * w] = acc[0];
-        output[i][k][2 * w + 1] = acc[1];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          int r = 0;
+          if constexpr (kBf16<T>) {
+#pragma unroll
+            for (; r + 1 < WORLD; r += 2)
+              acc[e] = __builtin_amdgcn_fdot2_f32_bf16(
+                  __builtin_convertvector(f32x2{term[r][e], term[r + 1][e]}, bf16x2), ones,
+                  acc[e], false);
+          }
+#pragma unroll
+          for (; r < WORLD; ++r) acc[e] += static_cast<float>(static_cast<T>(term[r][e]));
+          output[i][k][2 * w + e] = acc[e];
+        }
       }
 }
 
@@ -2081,6 +2111,13 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
   const int chunks = (slice + TILE_N - 1) / TILE_N;
   if (share_len(total, slice, rank) == 0)
     return;  // a late rank's share is empty at few packs (every block alike)
+  // THE QUANTIZED FORM'S POINTERS, ONCE: read in the loop, each was a load from its table and a
+  // wait every step (the stores to the scratch may alias the tables).
+  const int peer = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+  const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(input_values_ptrs, peer);
+  const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(input_scales_ptrs, peer);
+  uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank);
+  __fp16* const own_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank);
   block_for_each_tile(1, chunks, [&](int, int chunk) {
     const int len = share_len(total, slice, rank);
     const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
@@ -2092,16 +2129,15 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
                                     share_first(slice, rank), len,
                                     chunk * TILE_N);
     else
-      int4_range_load<LANES>(rank_of(input_values_ptrs, r), rank_of(input_scales_ptrs, r),
-                             got, share_first(slice, rank), len, chunk * TILE_N);
+      int4_range_load<LANES>(peer_values, peer_scales, got, share_first(slice, rank), len,
+                             chunk * TILE_N);
     // 2. Summed over the ranks, in rotated rank order, through LDS, rounded once.
     Summed rounded[1][K][P];
     block_sum_ranks<WORLD, LANES>(got, rounded);
     // 3. Stored in this rank's scratch.
-    exchanged_store<1, LANES, THREADS, QUANTIZATION>(
-        rounded, scratch, 0, quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank), 0,
-        quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank), 0, 1, len, 0,
-        chunk * TILE_N, 1);
+    exchanged_store<1, LANES, THREADS, QUANTIZATION>(rounded, scratch, 0, own_values, 0,
+                                                     own_scales, 0, 1, len, 0,
+                                                     chunk * TILE_N, 1);
   });
 }
 
@@ -2120,14 +2156,16 @@ DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_p
   static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
   const int64_t total = int64_t{output_size_m} * output_size_n;
   const int slice = share_slice<WORLD, kShareGranule<QUANTIZATION, P>>(total);
+  // The quantized form's pointers once (reduce_scatter's).
+  const int peer = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+  const uint8_t* const peer_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, peer);
+  const __fp16* const peer_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, peer);
   block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
     const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
     T got[1][K][P];
     // 1. Rank r's summed chunk, in one round trip.
-    exchanged_load<1, LANES, QUANTIZATION>(
-        rank_of(scratch_ptrs, r), 0, quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, r),
-        0, quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, r), 0, 1, slice, got, 0,
-        chunk * TILE_N, 1);
+    exchanged_load<1, LANES, QUANTIZATION>(rank_of(scratch_ptrs, r), 0, peer_values, 0,
+                                           peer_scales, 0, 1, slice, got, 0, chunk * TILE_N, 1);
     // 2. Stored where rank r's share goes.
     range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m,
                                    output_stride_n, output_size_n,
