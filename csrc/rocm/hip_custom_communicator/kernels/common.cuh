@@ -2129,7 +2129,9 @@ DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t
   const int64_t total = int64_t{input_size_m} * input_size_n;
   const int slice = share_slice<WORLD, kInt4Group>(total);
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
-#pragma unroll
+    // TWO RANKS' GROUPS IN FLIGHT: unrolled whole, every rank's 4 loads were hoisted together,
+    // 128 VGPRs of input, 256 in all, spilling.
+#pragma unroll 2
     for (int r = 0; r < WORLD; ++r) {
       const int groups = share_len(total, slice, r) / kInt4Group;
       if (groups == 0) continue;  // a late rank's empty share (every block alike)
