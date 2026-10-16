@@ -531,19 +531,19 @@ class Arena {
     if (e != hipSuccess && out.error == hipSuccess) out.error = e;
     if (e != hipSuccess) (void)hipGetLastError();
   }
-  // EVERY LOCAL GPU may read and write rank r's slice through this range: the
-  // kernels run on this rank's, and a mapping no device may access faults.
+  // THIS RANK'S GPU, and only it, may read and write rank r's slice through
+  // this range: our kernels run only on this rank's GPU, and a mapping no device
+  // may access faults. The textbook pattern (the CUDA guide's VMM IPC section:
+  // the importer sets access for its own device; torch SymmetricMemory's
+  // map_block, CUDA and ROCm alike: one descriptor, the local device). Granting
+  // every GPU made every process a client of all eight in the driver, which on
+  // 2026-10-16 coincided with the driver wedging after every run.
   void allow_access(int r) {
-    int devices = 0;
-    HIP_CHECK(hipGetDeviceCount(&devices));
-    std::vector<hipMemAccessDesc> access(devices);
-    for (int d = 0; d < devices; ++d) {
-      access[d].location.type = hipMemLocationTypeDevice;
-      access[d].location.id = d;
-      access[d].flags = hipMemAccessFlagsProtReadWrite;
-    }
-    HIP_CHECK(hipMemSetAccess(at(r), static_cast<size_t>(slice_),
-                              access.data(), access.size()));
+    hipMemAccessDesc access{};
+    access.location.type = hipMemLocationTypeDevice;
+    access.location.id = device_;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    HIP_CHECK(hipMemSetAccess(at(r), static_cast<size_t>(slice_), &access, 1));
   }
 
   int rank_;
