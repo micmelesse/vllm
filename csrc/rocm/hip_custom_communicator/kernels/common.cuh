@@ -1765,6 +1765,10 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 #pragma unroll
       for (int j = 0; j < P; ++j) acc[j] = 0.0f;
       int r = 0;
+      // v_dot2_f32_bf16 IS GFX950'S (dot12-insts): gfx942 sums every rank by the loop
+      // below. The image builds both targets, the dev loop one, so this broke only the
+      // image (2026-10-16, e2e 04-18-33Z's test step).
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
       if constexpr (kBf16<T>) {
 #pragma unroll
         for (; r + 1 < WORLD; r += 2) {
@@ -1778,6 +1782,7 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
           int4_used_by(acc);
         }
       }
+#endif
 #pragma unroll
       for (; r < WORLD; ++r) {
         float a[P];
