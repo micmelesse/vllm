@@ -222,7 +222,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        uint32_t* const* __restrict__ signals_ptrs,
+        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -243,7 +243,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const DTYPE* input[WORLD];
   peers_ptrs(input_ptrs, input);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read, 1, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -328,21 +328,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
+        DTYPE* __restrict__ scratch_ptr, int64_t scratch_stride_rank, int64_t scratch_stride_m,
         int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-        uint8_t* const* __restrict__ scratch_values_ptrs,
+        uint8_t* __restrict__ scratch_values_ptr, int64_t scratch_values_stride_rank,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        __fp16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* const* __restrict__ staging_values_ptrs,
+        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        __fp16* const* __restrict__ staging_scales_ptrs,
+        __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
-        uint32_t* const* __restrict__ signals_ptrs,
+        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -363,13 +363,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    input is ready.
   stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
       peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptrs, rank), staging_values_stride_m,
+      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
-      peer_ptr(staging_scales_ptrs, rank), staging_scales_stride_m,
+      peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
       input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -384,20 +384,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   (void)reduce_scatter_blocks;
   reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
       input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_values_ptrs, staging_values_stride_m, staging_values_stride_n,
-      staging_values_size_m, staging_values_size_n, staging_scales_ptrs,
+      staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
+      staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
-      staging_scales_size_n, scratch_ptrs, scratch_stride_m, scratch_stride_n,
-      scratch_size_m, scratch_size_n, scratch_values_ptrs,
+      staging_scales_size_n, scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n,
+      scratch_size_m, scratch_size_n, scratch_values_ptr, scratch_values_stride_rank,
       scratch_values_stride_m, scratch_values_stride_n, scratch_values_size_m,
-      scratch_values_size_n, scratch_scales_ptrs, scratch_scales_stride_m,
+      scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank, scratch_scales_stride_m,
       scratch_scales_stride_n, scratch_scales_size_m, scratch_scales_size_n,
       rank);
 
   // 3. Every rank's sums are in its scratch: this block's twin on every rank
   //    has reduced the same rows.
   barrier<Until::visible, 1, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -412,10 +412,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][K][P];
     all_gather<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION>(
-        scratch_ptrs, scratch_stride_m, scratch_stride_n, input_size_m,
-        input_size_n, scratch_values_ptrs, scratch_values_stride_m,
+        scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n, input_size_m,
+        input_size_n, scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m,
         scratch_values_stride_n, scratch_values_size_m, scratch_values_size_n,
-        scratch_scales_ptrs, scratch_scales_stride_m, scratch_scales_stride_n,
+        scratch_scales_ptr, scratch_scales_stride_rank, scratch_scales_stride_m, scratch_scales_stride_n,
         scratch_scales_size_m, scratch_scales_size_n, sum, offs_m, 0, slice_n);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
@@ -475,21 +475,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        DTYPE* const* __restrict__ scratch_ptrs, int64_t scratch_stride_m,
+        DTYPE* __restrict__ scratch_ptr, int64_t scratch_stride_rank, int64_t scratch_stride_m,
         int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-        uint8_t* const* __restrict__ scratch_values_ptrs,
+        uint8_t* __restrict__ scratch_values_ptr, int64_t scratch_values_stride_rank,
         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
         int scratch_values_size_m, int scratch_values_size_n,
-        __fp16* const* __restrict__ scratch_scales_ptrs,
+        __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* const* __restrict__ staging_values_ptrs,
+        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
-        __fp16* const* __restrict__ staging_scales_ptrs,
+        __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
         int64_t staging_scales_stride_m, int64_t staging_scales_stride_n,
         int staging_scales_size_m, int staging_scales_size_n,
-        uint32_t* const* __restrict__ signals_ptrs,
+        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -518,13 +518,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    ready.
   stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
       peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptrs, rank), staging_values_stride_m,
+      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
-      peer_ptr(staging_scales_ptrs, rank), staging_scales_stride_m,
+      peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
       input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -541,20 +541,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION>(
       input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_values_ptrs, staging_values_stride_m, staging_values_stride_n,
-      staging_values_size_m, staging_values_size_n, staging_scales_ptrs,
+      staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
+      staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
-      staging_scales_size_n, scratch_ptrs, scratch_stride_m, scratch_stride_n,
-      scratch_size_m, scratch_size_n, scratch_values_ptrs,
+      staging_scales_size_n, scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n,
+      scratch_size_m, scratch_size_n, scratch_values_ptr, scratch_values_stride_rank,
       scratch_values_stride_m, scratch_values_stride_n, scratch_values_size_m,
-      scratch_values_size_n, scratch_scales_ptrs, scratch_scales_stride_m,
+      scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank, scratch_scales_stride_m,
       scratch_scales_stride_n, scratch_scales_size_m, scratch_scales_size_n,
       col0 * P, own_packs * P, my_rows, rank);
 
   // 3. Every rank's sums are in this rank's scratch, and every peer has read
   // this rank's input.
   barrier<Until::visible, 1, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -563,9 +563,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    place in it), then AttnRes, as the one-shot does. The next call's first
   //    sync keeps a peer from pushing into this scratch while it is read (a
   //    peer's next kernel starts only once this one has finished).
-  const DTYPE* own_scratch = peer_ptr(scratch_ptrs, rank);
-  const uint8_t* own_scratch_values = peer_ptr(scratch_values_ptrs, rank);
-  const __fp16* own_scratch_scales = peer_ptr(scratch_scales_ptrs, rank);
+  const DTYPE* own_scratch = peer_ptr(scratch_ptr, scratch_stride_rank, rank);
+  const uint8_t* own_scratch_values = peer_ptr(scratch_values_ptr, scratch_values_stride_rank, rank);
+  const __fp16* own_scratch_scales = peer_ptr(scratch_scales_ptr, scratch_scales_stride_rank, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
     load<1, THREADS_PER_BLOCK, QUANTIZATION>(

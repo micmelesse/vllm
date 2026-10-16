@@ -12,10 +12,14 @@
 // (dev/lint_kernels.sh).
 //
 // THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs,
-// then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer
-// (a device table of every rank's for a peer buffer, `x_ptrs`), its strides,
-// its sizes, in elements; stride_n is 1 (the host checks it; the packed loads
-// need it). A thread's registers are a plain array the caller declares,
+// then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer,
+// its strides, its sizes, in elements; stride_n is 1 (the host checks it; the
+// packed loads need it). OUR PEER BUFFERS (the exchange's, the signals) are
+// rank 0's pointer and a rank stride, `x_ptr, x_stride_rank, ...`: every rank's
+// is mapped into one virtual range (handle.cuh's SymmetricMemory), rank r's at
+// x_ptr + r * x_stride_rank. THE CALLER'S INPUT, read on every rank, is the one
+// table, `input_ptrs` (every rank's address of a torch tensor, opened over
+// legacy IPC: its ranks' addresses have no common stride). A thread's registers are a plain array the caller declares,
 // `T v[ROWS][K][P]`, an input or an output like a buffer: P a pack's elements
 // (16 bytes of the kernel's dtype; an fp32 array holds the same P), thread t
 // lane t % THREADS_N of thread-row t / THREADS_N, holding rows offs_m +
@@ -667,11 +671,12 @@ DINLINE void peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
 }
 
 // THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n a rank (the
-// last rank's to the end), its pointer read in each lane (a wave's packs may have two owners).
+// last rank's to the end), its owner's address computed in each lane (a wave's packs may have two
+// owners).
 template <int WORLD, int THREADS_M, int THREADS_N, typename T, int ROWS, int K,
           int P>
-DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
-                        int scratch_size_m, int scratch_size_n,
+DINLINE void all_gather(const T* scratch_ptr, int64_t scratch_stride_rank,
+                        int64_t scratch_stride_m, int scratch_size_m, int scratch_size_n,
                         T (&output)[ROWS][K][P], int offs_m, int offs_n,
                         int slice_n) {
   using V = vec<T, P>;
@@ -684,7 +689,7 @@ DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
       const int col = pack_of<P, THREADS_N>(scratch_size_n, offs_n, k);
       const int owner = min(col / (slice_n / P), WORLD - 1);
       held(output[i][k],
-           pack_load(reinterpret_cast<const V*>(scratch_ptrs[owner]) +
+           pack_load(reinterpret_cast<const V*>(scratch_ptr + owner * scratch_stride_rank) +
                      int64_t{row_of<THREADS_M, THREADS_N>(scratch_size_m,
                                                           offs_m, 1, i)} *
                          (scratch_stride_m / P) +
@@ -1013,16 +1018,16 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s,
 //
 // THE RANKS' MEMORY: every rank's buffers as plain tensors the reads and writes
 // take, and the types a kernel takes them in. A RANK'S MEMORY, two places:
-//   ours, two allocations (Handle's symmetric memory), mapped by every peer at
-//   startup:
+//   ours, two allocations (Handle's symmetric memory), every rank's mapped by
+//   every rank into one virtual range at startup:
 //     [ signals ]  and  [ scratch | staging ]
-//   each handed to a kernel as its own argument, a device table of every rank's
-//   address (its signals, scratch and staging) and the buffer's strides,
-//   written once when the handle opens; the caller's, one tensor a call:
+//   each handed to a kernel as its own argument, rank 0's address, the rank
+//   stride (rank r's is r strides on) and the buffer's other strides; the
+//   caller's, one tensor a call:
 //     [ input ]   read in place only when registered or captured, its peers'
-//     addresses a device
-//                 table (a captured launch's are filled after the capture);
-//                 otherwise a staged kernel copies it into the staging
+//                 addresses a device table (a captured launch's are filled
+//                 after the capture); otherwise a staged kernel copies it into
+//                 the staging
 // A buffer is read or written by load / store / peers_load, ordered
 // only by BARRIER's `barrier`. The signals are BARRIER's, never read as
 // data.
@@ -1097,21 +1102,33 @@ enum class StatusField : int {
 };
 constexpr int kStatusFields = 10;
 
-// RANK r'S BUFFER, its first element: a kernel's arguments carry every rank's
-// address of a buffer (a device table, `ptrs`) and this reads one. `r` IS THE SAME ACROSS THE WAVE (a
-// constant, or a per-wave rank): read from the first lane, the compiler knows
-// it, and the load is scalar rather than one per lane.
+// RANK r'S BUFFER, its first element, from the input's table (`ptrs`, a load)
+// or from one of ours, rank 0's pointer and the rank stride (arithmetic: r
+// strides on). `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank):
+// read from the first lane, the compiler knows it, and the load or the multiply
+// is scalar rather than one per lane. A RANK THAT DIFFERS ACROSS THE WAVE (a
+// lane's owner) is indexed in place, `ptr + r * stride_rank`, a lane's own.
 namespace impl {
 template <typename T>
 DINLINE T* rank_of(T* const* ptrs, int r) {
   return ptrs[__builtin_amdgcn_readfirstlane(r)];
 }
+template <typename T>
+DINLINE T* rank_of(T* ptr, int64_t stride_rank, int r) {
+  return ptr + int64_t{__builtin_amdgcn_readfirstlane(r)} * stride_rank;
+}
 
-// Every rank's buffer from its table, rank r's at r (rank_of: one scalar load each).
+// Every rank's buffer, rank r's at r (rank_of: one scalar load, or a scalar
+// multiply-add, each).
 template <int WORLD, typename T>
 DINLINE void peers_of(T* const* ptrs, T* (&output)[WORLD]) {
 #pragma unroll
   for (int r = 0; r < WORLD; ++r) output[r] = rank_of(ptrs, r);
+}
+template <int WORLD, typename T, typename U>
+DINLINE void peers_of(T* ptr, int64_t stride_rank, U* (&output)[WORLD]) {
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) output[r] = rank_of(ptr, stride_rank, r);
 }
 
 // Every rank's row scalar, `offset_bytes` into rank r's buffer, after any loads before it.
@@ -1128,6 +1145,14 @@ DINLINE void peers_load_row_scalars(const T* const* input_ptrs,
         row);
   issued();
 }
+template <int WORLD, typename T>
+DINLINE void peers_load_row_scalars(const T* input_ptr, int64_t input_stride_rank,
+                                    float (&output)[WORLD], int64_t offset_bytes,
+                                    int row) {
+  const T* input[WORLD];
+  peers_of(input_ptr, input_stride_rank, input);
+  peers_load_row_scalars<WORLD>(input, output, offset_bytes, row);
+}
 }  // namespace impl
 
 // =================================================================================================
@@ -1135,9 +1160,38 @@ DINLINE void peers_load_row_scalars(const T* const* input_ptrs,
 //
 // THE RANKS' SYNCHRONIZATION, over the SIGNALS buffer, [R, 2, B, R]:
 // `signals[owner][parity][block] [writer]` is the flag block `block` on rank
-// `writer` sets in rank `owner`'s memory, at a barrier of that parity. The
-// outer R is a table of every rank's address; the inner dimensions are the
-// buffer's strides, passed like any other buffer's. Each flag is touched only
+// `writer` sets in rank `owner`'s memory, at a barrier of that parity. Every
+// dimension is a stride, the outer R's too (`signals_stride_rank`: every rank's
+// signals mapped into one range).
+//
+// THE MEMORY ORDERING, under that mapping. Both of our allocations are created
+// UNCACHED (handle.cuh's kSignalsAllocation, kExchangeAllocation: the physical
+// memory's own property, so every rank's mapping of it is uncached, not a
+// property of how a runtime backs a malloc flag). So no GPU's L2 ever holds a
+// line of the signals or the exchange: a peer's store over the fabric lands in
+// the owner's memory, and the owner's next load of it reads memory.
+//   SIGNAL: the flag store is a SYSTEM-scope atomic, release when ordered. The
+//   release (buffer_wbl2 + s_waitcnt) completes every store this wave issued
+//   before it, local and remote, before the flag can be seen: the data a peer
+//   reads after the barrier is in memory when the flag is. An ordered barrier
+//   first waits for every wave's stores (wait_stores) and meets the block, so
+//   the one releasing lane covers the block's stores.
+//   WAIT: relaxed DEVICE-scope loads of this rank's own flag (uncached, so each
+//   poll reads memory, where the peer's system-scope store lands), then one
+//   device-scope acquire (buffer_inv: the vector L1, which an uncached load
+//   still fills, holds nothing stale for the reads after it) once the flag is
+//   seen. The reads after it are uncached too, so they read what the peer
+//   stored before its release.
+//   CLEAR: a relaxed system-scope store into this rank's own flag, ordered
+//   before this lane's next flag store by that barrier's own release or
+//   wait_stores (below).
+// The caller's input (registered or captured torch memory, read over legacy
+// IPC) is not ours and not changed by this mapping: a peer reads it only after
+// the launch's first barrier, and the owner wrote it in an earlier kernel, whose
+// end released it at system scope (the dispatch's release fence), as before.
+// The tests that would catch a stale line: every op's output against
+// torch.distributed's across back-to-back calls on the same buffers, and the
+// signals' return to clear after every launch. Each flag is touched only
 // atomically (`Counter`); `barrier`, and in `impl` what it is made of. A rank's
 // data buffers are PEERS's.
 //
@@ -1320,7 +1374,7 @@ enum class Until { launched, visible, read };
 namespace impl {
 template <int WORLD, typename OWNER_TYPE, typename WRITER_TYPE>
 DINLINE Counter signal_flag(
-    uint32_t* const* signals_ptrs, int64_t signals_stride_parity,
+    uint32_t* signals_ptr, int64_t signals_stride_rank, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     OWNER_TYPE owner, uint32_t parity, unsigned block, WRITER_TYPE writer) {
@@ -1328,7 +1382,7 @@ DINLINE Counter signal_flag(
   debug_in_bounds(parity, signals_size_parity);
   debug_in_bounds(block, signals_size_block);
   debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
-  return Counter(signals_ptrs[owner] + parity * signals_stride_parity +
+  return Counter(signals_ptr + owner * signals_stride_rank + parity * signals_stride_parity +
                  block * signals_stride_block + writer * signals_stride_writer);
 }
 }  // namespace impl
@@ -1359,7 +1413,7 @@ DINLINE Counter signal_flag(
 // between, so the clear has long landed.
 namespace impl {
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(uint32_t* const* signals_ptrs,
+DINLINE void barrier(uint32_t* signals_ptr, int64_t signals_stride_rank,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -1379,7 +1433,7 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
     if constexpr (!kOrdered) wait_stores();
     const auto flag = [&](auto owner, unsigned block, auto writer) {
       return signal_flag<WORLD>(
-          signals_ptrs, signals_stride_parity, signals_stride_block,
+          signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
           signals_stride_writer, signals_size_parity, signals_size_block,
           signals_size_writer, owner, parity, block, writer);
     };
@@ -1798,8 +1852,9 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 
 // Each pack from the rank owning its columns, slice_n a rank (all_gather's).
 template <int WORLD, int THREADS_M, int THREADS_N, typename U, int ROWS, int K, int P>
-DINLINE void int4_all_gather(const uint8_t* const* values_ptrs, int64_t values_stride_m,
-                             const __fp16* const* scales_ptrs, int64_t scales_stride_m,
+DINLINE void int4_all_gather(const uint8_t* values_ptr, int64_t values_stride_rank,
+                             int64_t values_stride_m, const __fp16* scales_ptr,
+                             int64_t scales_stride_rank, int64_t scales_stride_m,
                              int size_m, int size_n, U (&output)[ROWS][K][P], int offs_m,
                              int offs_n, int slice_n) {
   static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
@@ -1813,8 +1868,10 @@ DINLINE void int4_all_gather(const uint8_t* const* values_ptrs, int64_t values_s
       const int col = pack_of<P, THREADS_N>(size_n, offs_n, k);
       const int owner = min(col / (slice_n / P), WORLD - 1);
       const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, 1, i);
-      words[i][k] = int4_word_load(values_ptrs[owner] + row * values_stride_m, col);
-      scales[i][k] = int4_scale_load(scales_ptrs[owner] + row * scales_stride_m, col);
+      words[i][k] = int4_word_load(
+          values_ptr + owner * values_stride_rank + row * values_stride_m, col);
+      scales[i][k] = int4_scale_load(
+          scales_ptr + owner * scales_stride_rank + row * scales_stride_m, col);
     }
   }
   issued();
@@ -1834,13 +1891,13 @@ DINLINE void publish_staged() {
   fence<__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM>();
 }
 
-// RANK r'S BUFFER OF A QUANTIZED FORM (rank_of), or null with none, its table unread.
+// RANK r'S BUFFER OF A QUANTIZED FORM (rank_of), or null with none, its pointer unread.
 template <int QUANTIZATION, typename E>
-DINLINE E* quantized_rank_of(E* const* ptrs, int r) {
+DINLINE E* quantized_rank_of(E* ptr, int64_t stride_rank, int r) {
   if constexpr (QUANTIZATION == Quantization::none)
     return nullptr;
   else
-    return rank_of(ptrs, r);
+    return rank_of(ptr, stride_rank, r);
 }
 
 // THE EXCHANGE'S MEMORY IN QUANTIZATION'S FORM, what the COLLECTIVES and the INTERFACE call: with
@@ -1902,19 +1959,21 @@ DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_
 
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
-DINLINE void exchanged_all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
-                                  const uint8_t* const* values_ptrs, int64_t values_stride_m,
-                                  const __fp16* const* scales_ptrs,
+DINLINE void exchanged_all_gather(const T* scratch_ptr, int64_t scratch_stride_rank,
+                                  int64_t scratch_stride_m, const uint8_t* values_ptr,
+                                  int64_t values_stride_rank, int64_t values_stride_m,
+                                  const __fp16* scales_ptr, int64_t scales_stride_rank,
                                   int64_t scales_stride_m, int size_m, int size_n,
                                   U (&output)[ROWS][K][P], int offs_m, int offs_n,
                                   int slice_n) {
   if constexpr (QUANTIZATION == Quantization::none)
-    all_gather<WORLD, THREADS_M, THREADS_N>(scratch_ptrs, scratch_stride_m, size_m, size_n,
-                                            output, offs_m, offs_n, slice_n);
+    all_gather<WORLD, THREADS_M, THREADS_N>(scratch_ptr, scratch_stride_rank,
+                                            scratch_stride_m, size_m, size_n, output,
+                                            offs_m, offs_n, slice_n);
   else
-    int4_all_gather<WORLD, THREADS_M, THREADS_N>(values_ptrs, values_stride_m, scales_ptrs,
-                                                 scales_stride_m, size_m, size_n, output,
-                                                 offs_m, offs_n, slice_n);
+    int4_all_gather<WORLD, THREADS_M, THREADS_N>(
+        values_ptr, values_stride_rank, values_stride_m, scales_ptr, scales_stride_rank,
+        scales_stride_m, size_m, size_n, output, offs_m, offs_n, slice_n);
 }
 }  // namespace impl
 
@@ -2200,10 +2259,14 @@ DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t
 // landed in T), quantized and stored in this rank's scratch (the share's own run). Through LDS, a
 // rank's copy a wave, one wave in 8 summed and quantized while the others waited at the barrier.
 template <int WORLD, int THREADS, typename T>
-DINLINE void int4_flat_reduce_scatter(const uint8_t* const* input_values_ptrs,
-                                      const __fp16* const* input_scales_ptrs,
-                                      uint8_t* const* scratch_values_ptrs,
-                                      __fp16* const* scratch_scales_ptrs, int64_t total,
+DINLINE void int4_flat_reduce_scatter(const uint8_t* input_values_ptr,
+                                      int64_t input_values_stride_rank,
+                                      const __fp16* input_scales_ptr,
+                                      int64_t input_scales_stride_rank,
+                                      uint8_t* scratch_values_ptr,
+                                      int64_t scratch_values_stride_rank,
+                                      __fp16* scratch_scales_ptr,
+                                      int64_t scratch_scales_stride_rank, int64_t total,
                                       int rank) {
   constexpr int P = traits<T>::N;
   const int slice = share_slice<WORLD, kInt4Group>(total);
@@ -2214,11 +2277,13 @@ DINLINE void int4_flat_reduce_scatter(const uint8_t* const* input_values_ptrs,
   const __fp16* scales[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
-    values[w] = rank_of(input_values_ptrs, (rank + w) % WORLD) + first / 2;
-    scales[w] = rank_of(input_scales_ptrs, (rank + w) % WORLD) + first / kInt4Group;
+    values[w] =
+        rank_of(input_values_ptr, input_values_stride_rank, (rank + w) % WORLD) + first / 2;
+    scales[w] = rank_of(input_scales_ptr, input_scales_stride_rank, (rank + w) % WORLD) +
+                first / kInt4Group;
   }
-  uint8_t* const own_values = rank_of(scratch_values_ptrs, rank);
-  __fp16* const own_scales = rank_of(scratch_scales_ptrs, rank);
+  uint8_t* const own_values = rank_of(scratch_values_ptr, scratch_values_stride_rank, rank);
+  __fp16* const own_scales = rank_of(scratch_scales_ptr, scratch_scales_stride_rank, rank);
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     const int at = min(g, groups - 1);
     uint32_t words[WORLD][1][kInt4GroupPacks];
@@ -2246,8 +2311,10 @@ DINLINE void int4_flat_reduce_scatter(const uint8_t* const* input_values_ptrs,
 // THE INT4 ALL-GATHER: every rank's group g of its summed share, all in flight, dequantized to T
 // and stored at its place in the output.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
-DINLINE void int4_flat_all_gather(uint8_t* const* scratch_values_ptrs,
-                                  __fp16* const* scratch_scales_ptrs, T* output_ptr,
+DINLINE void int4_flat_all_gather(uint8_t* scratch_values_ptr,
+                                  int64_t scratch_values_stride_rank,
+                                  __fp16* scratch_scales_ptr,
+                                  int64_t scratch_scales_stride_rank, T* output_ptr,
                                   int64_t output_stride_m, int64_t output_stride_n,
                                   int output_size_m, int output_size_n, int rank) {
   constexpr int P = traits<T>::N;
@@ -2258,8 +2325,8 @@ DINLINE void int4_flat_all_gather(uint8_t* const* scratch_values_ptrs,
   const __fp16* scales[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
-    values[w] = rank_of(scratch_values_ptrs, (rank + w) % WORLD);
-    scales[w] = rank_of(scratch_scales_ptrs, (rank + w) % WORLD);
+    values[w] = rank_of(scratch_values_ptr, scratch_values_stride_rank, (rank + w) % WORLD);
+    scales[w] = rank_of(scratch_scales_ptr, scratch_scales_stride_rank, (rank + w) % WORLD);
   }
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     u32x4 words[WORLD];
@@ -2292,19 +2359,26 @@ DINLINE void int4_flat_all_gather(uint8_t* const* scratch_values_ptrs,
 
 // THE FLAT WALK'S REDUCE-SCATTER: this rank's share, a TILE_N chunk a step, every rank's copy in
 // one round trip, summed over the ranks through LDS, rounded once to T, stored in this rank's
-// scratch; with int4 the int4 walk's above.
+// scratch; with int4 the int4 walk's above. THE INPUT IS THE CALLER'S (a table) OR OUR STAGING
+// (a pointer and a rank stride): `input_of(r)` is rank r's, r the same across the wave, which the
+// interface's two overloads write, so one body serves both.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
-          typename T>
-DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
+          typename T, typename INPUT_OF>
+DINLINE void reduce_scatter(INPUT_OF input_of, int64_t input_stride_m,
                             int64_t input_stride_n, int input_size_m,
-                            int input_size_n, const uint8_t* const* input_values_ptrs,
-                            const __fp16* const* input_scales_ptrs,
-                            T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
-                            __fp16* const* scratch_scales_ptrs, int rank) {
+                            int input_size_n, const uint8_t* input_values_ptr,
+                            int64_t input_values_stride_rank,
+                            const __fp16* input_scales_ptr,
+                            int64_t input_scales_stride_rank, T* scratch_ptr,
+                            int64_t scratch_stride_rank, uint8_t* scratch_values_ptr,
+                            int64_t scratch_values_stride_rank, __fp16* scratch_scales_ptr,
+                            int64_t scratch_scales_stride_rank, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
-    int4_flat_reduce_scatter<WORLD, THREADS, T>(input_values_ptrs, input_scales_ptrs,
-                                                scratch_values_ptrs, scratch_scales_ptrs,
-                                                int64_t{input_size_m} * input_size_n, rank);
+    int4_flat_reduce_scatter<WORLD, THREADS, T>(
+        input_values_ptr, input_values_stride_rank, input_scales_ptr,
+        input_scales_stride_rank, scratch_values_ptr, scratch_values_stride_rank,
+        scratch_scales_ptr, scratch_scales_stride_rank,
+        int64_t{input_size_m} * input_size_n, rank);
   } else {
     constexpr int LANES = THREADS / WORLD;
     constexpr int P = traits<T>::N;
@@ -2312,7 +2386,7 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
     static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
     static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
     static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
-    T* const scratch = rank_of(scratch_ptrs, rank);
+    T* const scratch = rank_of(scratch_ptr, scratch_stride_rank, rank);
     const int64_t total = int64_t{input_size_m} * input_size_n;
     const int slice = share_slice<WORLD, P>(total);
     const int chunks = (slice + TILE_N - 1) / TILE_N;
@@ -2323,7 +2397,7 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
       const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
       // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
-      range_load<CONTIGUOUS, LANES>(rank_of(input_ptrs, r), input_stride_m, input_stride_n,
+      range_load<CONTIGUOUS, LANES>(input_of(r), input_stride_m, input_stride_n,
                                     input_size_n, got, share_first(slice, rank), len,
                                     chunk * TILE_N);
       // 2. Summed over the ranks, in rotated rank order, through LDS, rounded once.
@@ -2339,12 +2413,16 @@ DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
 // output, a TILE_N chunk a step; with int4 the int4 walk's above.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_ptrs,
-                        __fp16* const* scratch_scales_ptrs, T* output_ptr,
-                        int64_t output_stride_m, int64_t output_stride_n,
+DINLINE void all_gather(T* scratch_ptr, int64_t scratch_stride_rank,
+                        uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
+                        __fp16* scratch_scales_ptr, int64_t scratch_scales_stride_rank,
+                        T* output_ptr, int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
-    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(scratch_values_ptrs, scratch_scales_ptrs,
+    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(scratch_values_ptr,
+                                                     scratch_values_stride_rank,
+                                                     scratch_scales_ptr,
+                                                     scratch_scales_stride_rank,
                                                      output_ptr, output_stride_m,
                                                      output_stride_n, output_size_m,
                                                      output_size_n, rank);
@@ -2360,7 +2438,8 @@ DINLINE void all_gather(T* const* scratch_ptrs, uint8_t* const* scratch_values_p
       const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
       // 1. Rank r's summed chunk, in one round trip.
-      load<1, LANES>(rank_of(scratch_ptrs, r), 0, 1, slice, got, 0, chunk * TILE_N, 1);
+      load<1, LANES>(rank_of(scratch_ptr, scratch_stride_rank, r), 0, 1, slice, got, 0,
+                     chunk * TILE_N, 1);
       // 2. Stored where rank r's share goes.
       range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m, output_stride_n,
                                      output_size_n, share_first(slice, r), slice,
@@ -2463,13 +2542,18 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
                                 int64_t input_stride_m, int input_size_m, int input_size_n,
-                                const uint8_t* const* input_values_ptrs,
+                                const uint8_t* input_values_ptr,
+                                int64_t input_values_stride_rank,
                                 int64_t input_values_stride_m,
-                                const __fp16* const* input_scales_ptrs,
-                                int64_t input_scales_stride_m, T* const* scratch_ptrs,
-                                int64_t scratch_stride_m, uint8_t* const* scratch_values_ptrs,
+                                const __fp16* input_scales_ptr,
+                                int64_t input_scales_stride_rank,
+                                int64_t input_scales_stride_m, T* scratch_ptr,
+                                int64_t scratch_stride_rank, int64_t scratch_stride_m,
+                                uint8_t* scratch_values_ptr,
+                                int64_t scratch_values_stride_rank,
                                 int64_t scratch_values_stride_m,
-                                __fp16* const* scratch_scales_ptrs,
+                                __fp16* scratch_scales_ptr,
+                                int64_t scratch_scales_stride_rank,
                                 int64_t scratch_scales_stride_m, int rank) {
   constexpr int P = traits<T>::N;
   constexpr int LANES = THREADS / WORLD;
@@ -2480,9 +2564,11 @@ DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
   const int slice = (packs + WORLD - 1) / WORLD;
   const int col0 = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));
-  T* const own_scratch = rank_of(scratch_ptrs, rank);
-  uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(scratch_values_ptrs, rank);
-  __fp16* const own_scales = quantized_rank_of<QUANTIZATION>(scratch_scales_ptrs, rank);
+  T* const own_scratch = rank_of(scratch_ptr, scratch_stride_rank, rank);
+  uint8_t* const own_values = quantized_rank_of<QUANTIZATION>(
+      scratch_values_ptr, scratch_values_stride_rank, rank);
+  __fp16* const own_scales = quantized_rank_of<QUANTIZATION>(
+      scratch_scales_ptr, scratch_scales_stride_rank, rank);
   const int end = (col0 + own_packs) * P;  // this rank's columns end, in elements
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
@@ -2497,8 +2583,10 @@ DINLINE void reduce_scatter_lds(const T* const* input_ptrs,
           held(got[0][0], pack_load(at_col<P, LANES>(at, end, c, 0)));
           issued();
         } else {
-          int4_load<1, LANES>(input_values_ptrs[r], input_values_stride_m,
-                              input_scales_ptrs[r], input_scales_stride_m, input_size_m,
+          int4_load<1, LANES>(input_values_ptr + r * input_values_stride_rank,
+                              input_values_stride_m,
+                              input_scales_ptr + r * input_scales_stride_rank,
+                              input_scales_stride_m, input_size_m,
                               end, got, row, c, 1);
         }
         // 2. Summed over the rows (the ranks), in row order, through LDS, rounded once.
@@ -2526,10 +2614,12 @@ template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZAT
           typename T>
 DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int input_size_m,
-    const uint8_t* const* input_values_ptrs, int64_t input_values_stride_m,
-    const __fp16* const* input_scales_ptrs, int64_t input_scales_stride_m,
-    T* const* scratch_ptrs, int64_t scratch_stride_m, uint8_t* const* scratch_values_ptrs,
-    int64_t scratch_values_stride_m, __fp16* const* scratch_scales_ptrs,
+    const uint8_t* input_values_ptr, int64_t input_values_stride_rank,
+    int64_t input_values_stride_m, const __fp16* input_scales_ptr,
+    int64_t input_scales_stride_rank, int64_t input_scales_stride_m, T* scratch_ptr,
+    int64_t scratch_stride_rank, int64_t scratch_stride_m, uint8_t* scratch_values_ptr,
+    int64_t scratch_values_stride_rank, int64_t scratch_values_stride_m,
+    __fp16* scratch_scales_ptr, int64_t scratch_scales_stride_rank,
     int64_t scratch_scales_stride_m, int offs_n, int size_n, int block_size_m, int rank) {
   constexpr int P = traits<T>::N;
   constexpr int kSliceWaves =
@@ -2543,17 +2633,17 @@ DINLINE void reduce_scatter_registers(
   const uint8_t* input_values[WORLD];
   const __fp16* input_scales[WORLD];
   if constexpr (kInt4) {
-    peers_of(input_values_ptrs, input_values);
-    peers_of(input_scales_ptrs, input_scales);
+    peers_of(input_values_ptr, input_values_stride_rank, input_values);
+    peers_of(input_scales_ptr, input_scales_stride_rank, input_scales);
   }
   T* scratch[WORLD];
   uint8_t* scratch_values[WORLD];
   __fp16* scratch_scales[WORLD];
   if constexpr (DIRECTION == Direction::push) {
-    peers_of(scratch_ptrs, scratch);
+    peers_of(scratch_ptr, scratch_stride_rank, scratch);
     if constexpr (kInt4) {
-      peers_of(scratch_values_ptrs, scratch_values);
-      peers_of(scratch_scales_ptrs, scratch_scales);
+      peers_of(scratch_values_ptr, scratch_values_stride_rank, scratch_values);
+      peers_of(scratch_scales_ptr, scratch_scales_stride_rank, scratch_scales);
     }
   }
   if (size_n <= 0) return;  // a late rank owns no columns
@@ -2586,7 +2676,7 @@ DINLINE void reduce_scatter_registers(
                                         input_size_m, offs_n + size_n, offs_m, c,
                                         static_cast<int>(gridDim.x));
         } else {
-          store<ROWS, LANES, THREADS>(rounded, rank_of(scratch_ptrs, rank),
+          store<ROWS, LANES, THREADS>(rounded, rank_of(scratch_ptr, scratch_stride_rank, rank),
                                       scratch_stride_m, input_size_m,
                                       offs_n + size_n, offs_m, c,
                                       static_cast<int>(gridDim.x));
@@ -2606,7 +2696,8 @@ DINLINE void reduce_scatter_registers(
 #pragma unroll
           for (int r = 0; r < WORLD; ++r) store_in(scratch_values[r], scratch_scales[r]);
         } else {
-          store_in(rank_of(scratch_values_ptrs, rank), rank_of(scratch_scales_ptrs, rank));
+          store_in(rank_of(scratch_values_ptr, scratch_values_stride_rank, rank),
+                   rank_of(scratch_scales_ptr, scratch_scales_stride_rank, rank));
         }
       }
     }
@@ -2665,23 +2756,33 @@ DINLINE void store(const T (&input)[ROWS][K][P], T* output_ptr,
                                     offs_n, row_step);
 }
 
-// EVERY RANK'S POINTER of a buffer, read from its table where the kernel wants them: before the
-// first barrier they are held in scalar registers and every tile's loads issue at once (the
-// one-shot); held across a barrier the norm kernels spilled (the 8-pack build, 68 B: ISA
-// 2026-09-30), so there they are read after it. peers_load takes the array as a table.
+// EVERY RANK'S POINTER of a buffer where the kernel wants them: the input's read from its table,
+// ours computed from rank 0's and the rank stride. Before the first barrier they are held in
+// scalar registers and every tile's loads issue at once (the one-shot); held across a barrier the
+// norm kernels spilled (the 8-pack build, 68 B: ISA 2026-09-30), so there they are read after it.
+// peers_load takes the array as a table.
 template <int WORLD, typename T>
 DINLINE void peers_ptrs(T* const* ptrs, T* (&output)[WORLD]) {
   impl::peers_of(ptrs, output);
 }
+template <int WORLD, typename T, typename U>
+DINLINE void peers_ptrs(T* ptr, int64_t stride_rank, U* (&output)[WORLD]) {
+  impl::peers_of(ptr, stride_rank, output);
+}
 
-// ONE RANK'S POINTER of a buffer (this rank's own, most often), the same way: a scalar load.
+// ONE RANK'S POINTER of a buffer (this rank's own, most often), the same way: a scalar load from
+// the input's table, or a scalar multiply-add from ours.
 template <typename T>
 DINLINE T* peer_ptr(T* const* ptrs, int rank) {
   return impl::rank_of(ptrs, rank);
 }
+template <typename T>
+DINLINE T* peer_ptr(T* ptr, int64_t stride_rank, int rank) {
+  return impl::rank_of(ptr, stride_rank, rank);
+}
 
 // Every rank's, in rank order, all in flight together: rank r's at input_ptrs[r] (the table,
-// or the array peers_ptrs read).
+// or the array peers_ptrs read), or, one of ours, r rank strides past input_ptr.
 template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
           int P>
 DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
@@ -2694,19 +2795,32 @@ DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
                                          input_size_n, output, offs_m, offs_n,
                                          row_step);
 }
+template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
+          int P>
+DINLINE void peers_load(const T* input_ptr, int64_t input_stride_rank,
+                        int64_t input_stride_m, int64_t input_stride_n,
+                        int input_size_m, int input_size_n,
+                        T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
+                        int row_step = 1) {
+  const T* input[WORLD];
+  impl::peers_of(input_ptr, input_stride_rank, input);
+  impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
+                                         input_size_n, output, offs_m, offs_n,
+                                         row_step);
+}
 
 // THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n columns a
 // rank (the last rank's to the end), the owner picked in each lane. scratch_size_m and
 // scratch_size_n clamp as load's do: the tensor's rows and columns, not the scratch's own.
 template <int WORLD, int THREADS_M, int THREADS_N, typename T, int ROWS, int K,
           int P>
-DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
-                        int64_t scratch_stride_n, int scratch_size_m,
-                        int scratch_size_n, T (&output)[ROWS][K][P], int offs_m,
-                        int offs_n, int slice_n) {
+DINLINE void all_gather(const T* scratch_ptr, int64_t scratch_stride_rank,
+                        int64_t scratch_stride_m, int64_t scratch_stride_n,
+                        int scratch_size_m, int scratch_size_n,
+                        T (&output)[ROWS][K][P], int offs_m, int offs_n, int slice_n) {
   impl::all_gather<WORLD, THREADS_M, THREADS_N>(
-      scratch_ptrs, scratch_stride_m, scratch_size_m, scratch_size_n, output,
-      offs_m, offs_n, slice_n);
+      scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_size_m, scratch_size_n,
+      output, offs_m, offs_n, slice_n);
 }
 
 // A BUFFER OF THE EXCHANGE, in QUANTIZATION's form (the QUANTIZATION section): each function
@@ -2745,14 +2859,17 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
       offs_n, row_step);
 }
 
+// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (the caller's table, or
+// one of ours as a pointer and a rank stride), its quantized form ours (the staged or summed
+// values and scales).
 template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
 DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
                         int64_t input_stride_n, int input_size_m, int input_size_n,
-                        const uint8_t* const* input_values_ptrs,
+                        const uint8_t* input_values_ptr, int64_t input_values_stride_rank,
                         int64_t input_values_stride_m, int64_t input_values_stride_n,
                         int input_values_size_m, int input_values_size_n,
-                        const __fp16* const* input_scales_ptrs,
+                        const __fp16* input_scales_ptr, int64_t input_scales_stride_rank,
                         int64_t input_scales_stride_m, int64_t input_scales_stride_n,
                         int input_scales_size_m, int input_scales_size_n,
                         U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
@@ -2763,8 +2880,33 @@ DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
   if constexpr (QUANTIZATION == Quantization::none) {
     impl::peers_of(input_ptrs, input);
   } else {
-    impl::peers_of(input_values_ptrs, values);
-    impl::peers_of(input_scales_ptrs, scales);
+    impl::peers_of(input_values_ptr, input_values_stride_rank, values);
+    impl::peers_of(input_scales_ptr, input_scales_stride_rank, scales);
+  }
+  impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
+      input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
+      input_size_m, input_size_n, output, offs_m, offs_n, row_step);
+}
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
+          int WORLD, int ROWS, int K, int P>
+DINLINE void peers_load(const T* input_ptr, int64_t input_stride_rank,
+                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
+                        int input_size_n, const uint8_t* input_values_ptr,
+                        int64_t input_values_stride_rank, int64_t input_values_stride_m,
+                        int64_t input_values_stride_n, int input_values_size_m,
+                        int input_values_size_n, const __fp16* input_scales_ptr,
+                        int64_t input_scales_stride_rank, int64_t input_scales_stride_m,
+                        int64_t input_scales_stride_n, int input_scales_size_m,
+                        int input_scales_size_n, U (&output)[WORLD][ROWS][K][P],
+                        int offs_m, int offs_n, int row_step = 1) {
+  const T* input[WORLD];
+  const uint8_t* values[WORLD];
+  const __fp16* scales[WORLD];
+  if constexpr (QUANTIZATION == Quantization::none) {
+    impl::peers_of(input_ptr, input_stride_rank, input);
+  } else {
+    impl::peers_of(input_values_ptr, input_values_stride_rank, values);
+    impl::peers_of(input_scales_ptr, input_scales_stride_rank, scales);
   }
   impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
       input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
@@ -2773,19 +2915,21 @@ DINLINE void peers_load(const T* const* input_ptrs, int64_t input_stride_m,
 
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
-DINLINE void all_gather(const T* const* scratch_ptrs, int64_t scratch_stride_m,
-                        int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-                        const uint8_t* const* scratch_values_ptrs,
+DINLINE void all_gather(const T* scratch_ptr, int64_t scratch_stride_rank,
+                        int64_t scratch_stride_m, int64_t scratch_stride_n,
+                        int scratch_size_m, int scratch_size_n,
+                        const uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
                         int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
                         int scratch_values_size_m, int scratch_values_size_n,
-                        const __fp16* const* scratch_scales_ptrs,
+                        const __fp16* scratch_scales_ptr, int64_t scratch_scales_stride_rank,
                         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
                         int scratch_scales_size_m, int scratch_scales_size_n,
                         U (&output)[ROWS][K][P], int offs_m, int offs_n, int slice_n) {
   impl::exchanged_all_gather<WORLD, THREADS_M, THREADS_N, QUANTIZATION>(
-      scratch_ptrs, scratch_stride_m, scratch_values_ptrs, scratch_values_stride_m,
-      scratch_scales_ptrs, scratch_scales_stride_m, scratch_size_m, scratch_size_n, output,
-      offs_m, offs_n, slice_n);
+      scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_values_ptr,
+      scratch_values_stride_rank, scratch_values_stride_m, scratch_scales_ptr,
+      scratch_scales_stride_rank, scratch_scales_stride_m, scratch_size_m, scratch_size_n,
+      output, offs_m, offs_n, slice_n);
 }
 
 // A row's scalar, stored once a block (thread 0's).
@@ -2793,12 +2937,20 @@ DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   impl::store_row_scalar(value, output_ptr, row);
 }
 
-// Every rank's scalar for `row`, `offset_bytes` into each rank's buffer.
+// Every rank's scalar for `row`, `offset_bytes` into each rank's buffer (a table, or one of ours
+// as a pointer and a rank stride).
 template <int WORLD, typename T>
 DINLINE void peers_load_row_scalars(const T* const* input_ptrs,
                                     float (&output)[WORLD],
                                     int64_t offset_bytes, int row) {
   impl::peers_load_row_scalars<WORLD>(input_ptrs, output, offset_bytes, row);
+}
+template <int WORLD, typename T>
+DINLINE void peers_load_row_scalars(const T* input_ptr, int64_t input_stride_rank,
+                                    float (&output)[WORLD], int64_t offset_bytes,
+                                    int row) {
+  impl::peers_load_row_scalars<WORLD>(input_ptr, input_stride_rank, output, offset_bytes,
+                                      row);
 }
 
 // ===============================================================================================
@@ -2908,7 +3060,7 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& softmax,
 // barriers are even in number, its k-th taking PARITY k % 2, so its flags end
 // where they began. WORLD is the kernel's, passed on.
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(uint32_t* const* signals_ptrs,
+DINLINE void barrier(uint32_t* signals_ptr, int64_t signals_stride_rank,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -2916,7 +3068,7 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, int rank, uint64_t timeout_ticks) {
   impl::barrier<UNTIL, PARITY, WORLD>(
-      signals_ptrs, signals_stride_parity, signals_stride_block,
+      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -2937,60 +3089,69 @@ template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
-    int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const __fp16* const* input_scales_ptrs,
+    int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
+    int64_t input_values_stride_rank, int64_t input_values_stride_m,
+    int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
+    const __fp16* input_scales_ptr, int64_t input_scales_stride_rank,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
-    int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
-    int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-    uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
-    int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    int input_scales_size_n, T* scratch_ptr, int64_t scratch_stride_rank,
+    int64_t scratch_stride_m, int64_t scratch_stride_n, int scratch_size_m,
+    int scratch_size_n, uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
+    int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
+    int scratch_values_size_m, int scratch_values_size_n, __fp16* scratch_scales_ptr,
+    int64_t scratch_scales_stride_rank, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int rank) {
   impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_values_ptrs, input_scales_ptrs, scratch_ptrs, scratch_values_ptrs,
-      scratch_scales_ptrs, rank);
+      [&](int r) { return impl::rank_of(input_ptrs, r); }, input_stride_m, input_stride_n,
+      input_size_m, input_size_n, input_values_ptr, input_values_stride_rank,
+      input_scales_ptr, input_scales_stride_rank, scratch_ptr, scratch_stride_rank,
+      scratch_values_ptr, scratch_values_stride_rank, scratch_scales_ptr,
+      scratch_scales_stride_rank, rank);
 }
+// The staged build's: its input is our staging, every rank's at a rank stride.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void reduce_scatter(const T* const* input_ptrs, int64_t input_stride_m,
-                            int64_t input_stride_n, int input_size_m,
-                            int input_size_n, T* const* scratch_ptrs,
-                            int64_t scratch_stride_m, int64_t scratch_stride_n,
-                            int scratch_size_m, int scratch_size_n, int rank) {
+DINLINE void reduce_scatter(const T* input_ptr, int64_t input_stride_rank,
+                            int64_t input_stride_m, int64_t input_stride_n,
+                            int input_size_m, int input_size_n, T* scratch_ptr,
+                            int64_t scratch_stride_rank, int64_t scratch_stride_m,
+                            int64_t scratch_stride_n, int scratch_size_m,
+                            int scratch_size_n, int rank) {
   impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      static_cast<const uint8_t* const*>(nullptr), static_cast<const __fp16* const*>(nullptr),
-      scratch_ptrs, static_cast<uint8_t* const*>(nullptr),
-      static_cast<__fp16* const*>(nullptr), rank);
+      [&](int r) { return impl::rank_of(input_ptr, input_stride_rank, r); },
+      input_stride_m, input_stride_n, input_size_m, input_size_n,
+      static_cast<const uint8_t*>(nullptr), 0, static_cast<const __fp16*>(nullptr), 0,
+      scratch_ptr, scratch_stride_rank, static_cast<uint8_t*>(nullptr), 0,
+      static_cast<__fp16*>(nullptr), 0, rank);
 }
 // All-gather: every rank's summed range, from its scratch (int4: its values, dequantized), at its
 // place in the output.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void all_gather(
-    T* const* scratch_ptrs, int64_t scratch_stride_m, int64_t scratch_stride_n,
-    int scratch_size_m, int scratch_size_n, uint8_t* const* scratch_values_ptrs,
+    T* scratch_ptr, int64_t scratch_stride_rank, int64_t scratch_stride_m,
+    int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
+    uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
     int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
-    int scratch_values_size_m, int scratch_values_size_n,
-    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    int scratch_values_size_m, int scratch_values_size_n, __fp16* scratch_scales_ptr,
+    int64_t scratch_scales_stride_rank, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     T* output_ptr, int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
     int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      scratch_ptrs, scratch_values_ptrs, scratch_scales_ptrs, output_ptr, output_stride_m,
+      scratch_ptr, scratch_stride_rank, scratch_values_ptr, scratch_values_stride_rank,
+      scratch_scales_ptr, scratch_scales_stride_rank, output_ptr, output_stride_m,
       output_stride_n, output_size_m, output_size_n, rank);
 }
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void all_gather(T* const* scratch_ptrs, int64_t scratch_stride_m,
-                        int64_t scratch_stride_n, int scratch_size_m,
-                        int scratch_size_n, T* output_ptr,
+DINLINE void all_gather(T* scratch_ptr, int64_t scratch_stride_rank,
+                        int64_t scratch_stride_m, int64_t scratch_stride_n,
+                        int scratch_size_m, int scratch_size_n, T* output_ptr,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
-      scratch_ptrs, static_cast<uint8_t* const*>(nullptr),
-      static_cast<__fp16* const*>(nullptr), output_ptr, output_stride_m, output_stride_n,
+      scratch_ptr, scratch_stride_rank, static_cast<uint8_t*>(nullptr), 0,
+      static_cast<__fp16*>(nullptr), 0, output_ptr, output_stride_m, output_stride_n,
       output_size_m, output_size_n, rank);
 }
 // Staged, first: this rank's input, every rank's range of it, into its staging.
@@ -3048,21 +3209,25 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t inpu
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
-    int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const __fp16* const* input_scales_ptrs,
+    int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
+    int64_t input_values_stride_rank, int64_t input_values_stride_m,
+    int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
+    const __fp16* input_scales_ptr, int64_t input_scales_stride_rank,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
-    int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
-    int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-    uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
-    int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    int input_scales_size_n, T* scratch_ptr, int64_t scratch_stride_rank,
+    int64_t scratch_stride_m, int64_t scratch_stride_n, int scratch_size_m,
+    int scratch_size_n, uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
+    int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
+    int scratch_values_size_m, int scratch_values_size_n, __fp16* scratch_scales_ptr,
+    int64_t scratch_scales_stride_rank, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int rank) {
   impl::reduce_scatter_lds<WORLD, THREADS, TILE_M, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_size_m, input_size_n, input_values_ptrs,
-      input_values_stride_m, input_scales_ptrs, input_scales_stride_m, scratch_ptrs,
-      scratch_stride_m, scratch_values_ptrs, scratch_values_stride_m, scratch_scales_ptrs,
+      input_ptrs, input_stride_m, input_size_m, input_size_n, input_values_ptr,
+      input_values_stride_rank, input_values_stride_m, input_scales_ptr,
+      input_scales_stride_rank, input_scales_stride_m, scratch_ptr, scratch_stride_rank,
+      scratch_stride_m, scratch_values_ptr, scratch_values_stride_rank,
+      scratch_values_stride_m, scratch_scales_ptr, scratch_scales_stride_rank,
       scratch_scales_stride_m, rank);
 }
 // _registers: a slice of lanes a row, every rank's pack in registers, summed there; push stores
@@ -3073,22 +3238,26 @@ template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZAT
           typename T>
 DINLINE void reduce_scatter_registers(
     const T* const* input_ptrs, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, const uint8_t* const* input_values_ptrs,
-    int64_t input_values_stride_m, int64_t input_values_stride_n, int input_values_size_m,
-    int input_values_size_n, const __fp16* const* input_scales_ptrs,
+    int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
+    int64_t input_values_stride_rank, int64_t input_values_stride_m,
+    int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
+    const __fp16* input_scales_ptr, int64_t input_scales_stride_rank,
     int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
-    int input_scales_size_n, T* const* scratch_ptrs, int64_t scratch_stride_m,
-    int64_t scratch_stride_n, int scratch_size_m, int scratch_size_n,
-    uint8_t* const* scratch_values_ptrs, int64_t scratch_values_stride_m,
-    int64_t scratch_values_stride_n, int scratch_values_size_m, int scratch_values_size_n,
-    __fp16* const* scratch_scales_ptrs, int64_t scratch_scales_stride_m,
+    int input_scales_size_n, T* scratch_ptr, int64_t scratch_stride_rank,
+    int64_t scratch_stride_m, int64_t scratch_stride_n, int scratch_size_m,
+    int scratch_size_n, uint8_t* scratch_values_ptr, int64_t scratch_values_stride_rank,
+    int64_t scratch_values_stride_m, int64_t scratch_values_stride_n,
+    int scratch_values_size_m, int scratch_values_size_n, __fp16* scratch_scales_ptr,
+    int64_t scratch_scales_stride_rank, int64_t scratch_scales_stride_m,
     int64_t scratch_scales_stride_n, int scratch_scales_size_m, int scratch_scales_size_n,
     int offs_n, int size_n, int block_size_m, int rank) {
   impl::reduce_scatter_registers<WORLD, THREADS, TILE_N, DIRECTION, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_size_m, input_values_ptrs, input_values_stride_m,
-      input_scales_ptrs, input_scales_stride_m, scratch_ptrs, scratch_stride_m,
-      scratch_values_ptrs, scratch_values_stride_m, scratch_scales_ptrs,
-      scratch_scales_stride_m, offs_n, size_n, block_size_m, rank);
+      input_ptrs, input_stride_m, input_size_m, input_values_ptr, input_values_stride_rank,
+      input_values_stride_m, input_scales_ptr, input_scales_stride_rank,
+      input_scales_stride_m, scratch_ptr, scratch_stride_rank, scratch_stride_m,
+      scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m,
+      scratch_scales_ptr, scratch_scales_stride_rank, scratch_scales_stride_m, offs_n,
+      size_n, block_size_m, rank);
 }
 
 // ===============================================================================================

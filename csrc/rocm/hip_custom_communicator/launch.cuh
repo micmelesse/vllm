@@ -38,21 +38,38 @@ struct Call<void (*)(PARAMS...)> {
 // eager input's is the staging's, copied in on the launch's stream), every
 // rank's scratch or staging where the kernel uses it, then every rank's signal
 // block, this rank's, its rank and the wait limit; then the kernel's own
-// arguments. A ONE-SHOT reads only the inputs; a TWO-SHOT also every rank's
+// arguments. Our buffers (the exchange's regions and the signals) are rank 0's
+// address and a rank stride (handle.cuh's SymmetricMemory); the input is the
+// caller's, a table. A ONE-SHOT reads only the inputs; a TWO-SHOT also every rank's
 // scratch, and the quantized forms of the scratch and of the staged input
 // (null with none: the kernel reads neither).
 
-// A TWO-SHOT'S QUANTIZED BUFFERS' TABLES: the handle's, or null with none.
-struct QuantizedTables {
-  void* const* scratch_values;
-  void* const* scratch_scales;
-  void* const* staging_values;
-  void* const* staging_scales;
+// A TWO-SHOT'S QUANTIZED BUFFERS: each rank 0's address and its rank stride in
+// its own elements (bytes for the values, fp16 for the scales), the handle's,
+// or null and 0 with none.
+struct QuantizedBuffers {
+  void* scratch_values;
+  int64_t scratch_values_stride_rank;
+  void* scratch_scales;
+  int64_t scratch_scales_stride_rank;
+  void* staging_values;
+  int64_t staging_values_stride_rank;
+  void* staging_scales;
+  int64_t staging_scales_stride_rank;
 };
-inline QuantizedTables quantized_tables(const Handle& h, int q) {
-  if (q == Quantization::none) return {nullptr, nullptr, nullptr, nullptr};
-  return {h.scratch_values_ptrs(), h.scratch_scales_ptrs(),
-          h.staging_values_ptrs(), h.staging_scales_ptrs()};
+inline QuantizedBuffers quantized_buffers(const Handle& h, int q) {
+  if (q == Quantization::none)
+    return {nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0};
+  const int64_t bytes = h.exchange_stride_rank_bytes();
+  const int64_t halves = bytes / 2;  // __fp16
+  return {h.scratch_values_ptr(), bytes, h.scratch_scales_ptr(), halves,
+          h.staging_values_ptr(), bytes, h.staging_scales_ptr(), halves};
+}
+
+// THE EXCHANGE'S RANK STRIDE in a buffer of `dtype`'s elements (the scratch,
+// the staging): the stride is whole allocation granules, so it divides.
+inline int64_t exchange_stride_rank(const Handle& h, DType dtype) {
+  return h.exchange_stride_rank_bytes() / elem_bytes(dtype);
 }
 
 // A [rows, cols] BUFFER'S BYTES at its row stride, first element to last: what
@@ -74,9 +91,9 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         l.input_stride_m, l.input_stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.staging_ptrs(), l.staging_stride_m,
+        static_cast<int>(l.output_size_n), h.staging_ptr(), exchange_stride_rank(h, l.dtype), l.staging_stride_m,
         l.staging_stride_n, static_cast<int>(l.staging_size_m),
-        static_cast<int>(l.staging_size_n), h.signals_ptrs(),
+        static_cast<int>(l.staging_size_n), h.signals_ptr(), h.signals_stride_rank(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -88,18 +105,18 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         l.input_stride_m, l.input_stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        static_cast<int>(l.output_size_n), h.scratch_ptr(), exchange_stride_rank(h, l.dtype), l.scratch_stride_m,
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m),
-        static_cast<int>(l.scratch_size_n), h.staging_ptrs(),
+        static_cast<int>(l.scratch_size_n), h.staging_ptr(), exchange_stride_rank(h, l.dtype),
         l.staging_stride_m, l.staging_stride_n,
         static_cast<int>(l.staging_size_m), static_cast<int>(l.staging_size_n),
-        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_ptr(), h.signals_stride_rank(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
         h.status_stride_field(), h.status_size_field(), h.rank(),
         h.timeout_ticks());
   else {
-    const QuantizedTables q = quantized_tables(h, l.quantization);
+    const QuantizedBuffers q = quantized_buffers(h, l.quantization);
     const void* const* input_ptrs = h.input_ptrs(
         l.input,
         extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype),
@@ -111,7 +128,7 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
           static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
           l.output, l.output_stride_m, l.output_stride_n,
           static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n),
-          h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+          h.signals_ptr(), h.signals_stride_rank(), h.signals_stride_parity(), h.signals_stride_block(),
           h.signals_stride_writer(), h.signals_size_parity(),
           h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
           h.status_stride_field(), h.status_size_field(), h.rank(),
@@ -123,21 +140,21 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
           static_cast<int>(l.input_size_m), static_cast<int>(l.input_size_n),
           l.output, l.output_stride_m, l.output_stride_n,
           static_cast<int>(l.output_size_m), static_cast<int>(l.output_size_n),
-          h.scratch_ptrs(), l.scratch_stride_m, l.scratch_stride_n,
+          h.scratch_ptr(), exchange_stride_rank(h, l.dtype), l.scratch_stride_m, l.scratch_stride_n,
           static_cast<int>(l.scratch_size_m),
-          static_cast<int>(l.scratch_size_n), q.scratch_values, l.scratch_values_stride_m,
+          static_cast<int>(l.scratch_size_n), q.scratch_values, q.scratch_values_stride_rank, l.scratch_values_stride_m,
           l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
-          static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+          static_cast<int>(l.scratch_values_size_n), q.scratch_scales, q.scratch_scales_stride_rank,
           l.scratch_scales_stride_m, l.scratch_scales_stride_n,
           static_cast<int>(l.scratch_scales_size_m),
-          static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+          static_cast<int>(l.scratch_scales_size_n), q.staging_values, q.staging_values_stride_rank,
           l.staging_values_stride_m, l.staging_values_stride_n,
           static_cast<int>(l.staging_values_size_m),
-          static_cast<int>(l.staging_values_size_n), q.staging_scales,
+          static_cast<int>(l.staging_values_size_n), q.staging_scales, q.staging_scales_stride_rank,
           l.staging_scales_stride_m, l.staging_scales_stride_n,
           static_cast<int>(l.staging_scales_size_m),
           static_cast<int>(l.staging_scales_size_n),
-          h.signals_ptrs(),
+          h.signals_ptr(), h.signals_stride_rank(),
           h.signals_stride_parity(), h.signals_stride_block(),
           h.signals_stride_writer(), h.signals_size_parity(),
           h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -150,7 +167,7 @@ inline void launch_all_reduce_rms_norm(Handle& h,
                                        const AllReduceRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
-  const QuantizedTables q = quantized_tables(h, l.quantization);
+  const QuantizedBuffers q = quantized_buffers(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceRmsNormOneShotKernel>::run(
@@ -159,7 +176,7 @@ inline void launch_all_reduce_rms_norm(Handle& h,
         static_cast<int>(l.input_size_n), l.weight, l.weight_stride_n,
         static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.signals_ptrs(),
+        static_cast<int>(l.output_size_n), h.signals_ptr(), h.signals_stride_rank(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -172,21 +189,21 @@ inline void launch_all_reduce_rms_norm(Handle& h,
         static_cast<int>(l.input_size_n), l.weight, l.weight_stride_n,
         static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.scratch_ptrs(), l.scratch_stride_m,
+        static_cast<int>(l.output_size_n), h.scratch_ptr(), exchange_stride_rank(h, l.dtype), l.scratch_stride_m,
         l.scratch_stride_n, static_cast<int>(l.scratch_size_m),
-        static_cast<int>(l.scratch_size_n), q.scratch_values, l.scratch_values_stride_m,
+        static_cast<int>(l.scratch_size_n), q.scratch_values, q.scratch_values_stride_rank, l.scratch_values_stride_m,
         l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
-        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales, q.scratch_scales_stride_rank,
         l.scratch_scales_stride_m, l.scratch_scales_stride_n,
         static_cast<int>(l.scratch_scales_size_m),
-        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values, q.staging_values_stride_rank,
         l.staging_values_stride_m, l.staging_values_stride_n,
         static_cast<int>(l.staging_values_size_m),
-        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        static_cast<int>(l.staging_values_size_n), q.staging_scales, q.staging_scales_stride_rank,
         l.staging_scales_stride_m, l.staging_scales_stride_n,
         static_cast<int>(l.staging_scales_size_m),
         static_cast<int>(l.staging_scales_size_n),
-        h.signals_ptrs(),
+        h.signals_ptr(), h.signals_stride_rank(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -198,7 +215,7 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
                                            const AllReduceAddRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
-  const QuantizedTables q = quantized_tables(h, l.quantization);
+  const QuantizedBuffers q = quantized_buffers(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddRmsNormOneShotKernel>::run(
@@ -212,7 +229,7 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         static_cast<int>(l.output_size_n), l.residual_output,
         l.residual_output_stride_m, l.residual_output_stride_n,
         static_cast<int>(l.residual_output_size_m),
-        static_cast<int>(l.residual_output_size_n), h.signals_ptrs(),
+        static_cast<int>(l.residual_output_size_n), h.signals_ptr(), h.signals_stride_rank(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -230,22 +247,22 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         static_cast<int>(l.output_size_n), l.residual_output,
         l.residual_output_stride_m, l.residual_output_stride_n,
         static_cast<int>(l.residual_output_size_m),
-        static_cast<int>(l.residual_output_size_n), h.scratch_ptrs(),
+        static_cast<int>(l.residual_output_size_n), h.scratch_ptr(), exchange_stride_rank(h, l.dtype),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
-        q.scratch_values, l.scratch_values_stride_m,
+        q.scratch_values, q.scratch_values_stride_rank, l.scratch_values_stride_m,
         l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
-        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales, q.scratch_scales_stride_rank,
         l.scratch_scales_stride_m, l.scratch_scales_stride_n,
         static_cast<int>(l.scratch_scales_size_m),
-        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values, q.staging_values_stride_rank,
         l.staging_values_stride_m, l.staging_values_stride_n,
         static_cast<int>(l.staging_values_size_m),
-        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        static_cast<int>(l.staging_values_size_n), q.staging_scales, q.staging_scales_stride_rank,
         l.staging_scales_stride_m, l.staging_scales_stride_n,
         static_cast<int>(l.staging_scales_size_m),
         static_cast<int>(l.staging_scales_size_n),
-        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_ptr(), h.signals_stride_rank(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
         h.status_stride_field(), h.status_size_field(), h.rank(),
@@ -257,7 +274,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
     Handle& h, const AllReduceAddAttnResRmsNormLaunch& l) {
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
-  const QuantizedTables q = quantized_tables(h, l.quantization);
+  const QuantizedBuffers q = quantized_buffers(h, l.quantization);
   const void* const* input_ptrs = h.input_ptrs(l.input, bytes, l.stream);
   if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceAddAttnResRmsNormOneShotKernel>::run(
@@ -280,7 +297,7 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(l.output_size_n), l.block_output,
         l.block_output_stride_m, l.block_output_stride_n,
         static_cast<int>(l.block_output_size_m),
-        static_cast<int>(l.block_output_size_n), h.signals_ptrs(),
+        static_cast<int>(l.block_output_size_n), h.signals_ptr(), h.signals_stride_rank(),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
@@ -307,22 +324,22 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(l.output_size_n), l.block_output,
         l.block_output_stride_m, l.block_output_stride_n,
         static_cast<int>(l.block_output_size_m),
-        static_cast<int>(l.block_output_size_n), h.scratch_ptrs(),
+        static_cast<int>(l.block_output_size_n), h.scratch_ptr(), exchange_stride_rank(h, l.dtype),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
-        q.scratch_values, l.scratch_values_stride_m,
+        q.scratch_values, q.scratch_values_stride_rank, l.scratch_values_stride_m,
         l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
-        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales, q.scratch_scales_stride_rank,
         l.scratch_scales_stride_m, l.scratch_scales_stride_n,
         static_cast<int>(l.scratch_scales_size_m),
-        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values, q.staging_values_stride_rank,
         l.staging_values_stride_m, l.staging_values_stride_n,
         static_cast<int>(l.staging_values_size_m),
-        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        static_cast<int>(l.staging_values_size_n), q.staging_scales, q.staging_scales_stride_rank,
         l.staging_scales_stride_m, l.staging_scales_stride_n,
         static_cast<int>(l.staging_scales_size_m),
         static_cast<int>(l.staging_scales_size_n),
-        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_ptr(), h.signals_stride_rank(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
         h.status_stride_field(), h.status_size_field(), h.rank(),
@@ -348,22 +365,22 @@ inline void launch_all_reduce_add_attn_res_rms_norm(
         static_cast<int>(l.output_size_n), l.block_output,
         l.block_output_stride_m, l.block_output_stride_n,
         static_cast<int>(l.block_output_size_m),
-        static_cast<int>(l.block_output_size_n), h.scratch_ptrs(),
+        static_cast<int>(l.block_output_size_n), h.scratch_ptr(), exchange_stride_rank(h, l.dtype),
         l.scratch_stride_m, l.scratch_stride_n,
         static_cast<int>(l.scratch_size_m), static_cast<int>(l.scratch_size_n),
-        q.scratch_values, l.scratch_values_stride_m,
+        q.scratch_values, q.scratch_values_stride_rank, l.scratch_values_stride_m,
         l.scratch_values_stride_n, static_cast<int>(l.scratch_values_size_m),
-        static_cast<int>(l.scratch_values_size_n), q.scratch_scales,
+        static_cast<int>(l.scratch_values_size_n), q.scratch_scales, q.scratch_scales_stride_rank,
         l.scratch_scales_stride_m, l.scratch_scales_stride_n,
         static_cast<int>(l.scratch_scales_size_m),
-        static_cast<int>(l.scratch_scales_size_n), q.staging_values,
+        static_cast<int>(l.scratch_scales_size_n), q.staging_values, q.staging_values_stride_rank,
         l.staging_values_stride_m, l.staging_values_stride_n,
         static_cast<int>(l.staging_values_size_m),
-        static_cast<int>(l.staging_values_size_n), q.staging_scales,
+        static_cast<int>(l.staging_values_size_n), q.staging_scales, q.staging_scales_stride_rank,
         l.staging_scales_stride_m, l.staging_scales_stride_n,
         static_cast<int>(l.staging_scales_size_m),
         static_cast<int>(l.staging_scales_size_n),
-        h.signals_ptrs(), h.signals_stride_parity(), h.signals_stride_block(),
+        h.signals_ptr(), h.signals_stride_rank(), h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
         h.status_stride_field(), h.status_size_field(), h.rank(),
