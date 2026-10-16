@@ -106,6 +106,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("hip_custom_communicator_open", &hip_custom_communicator_open);
   rocm_ops.def("hip_custom_communicator_capacity",
                &hip_custom_communicator_capacity);
+  rocm_ops.def("hip_custom_communicator_close", &hip_custom_communicator_close);
+  rocm_ops.def("hip_custom_communicator_abandon_all",
+               &hip_custom_communicator_abandon_all);
   rocm_ops.def("hip_custom_communicator_dispose",
                &hip_custom_communicator_dispose);
   // The fault record the watchdog polls, and the abort it sets (barrier.cuh).

@@ -65,9 +65,10 @@ enum class LogHeader : int {
   capacity,        // the ring's records
   records_offset,  // the ring's byte offset
   failed,          // 0, or the OpenCheck that failed open
+  close_phase,     // the last ClosePhase reached: the memory's teardown
 };
 static_assert(kStatusFields <= 16, "the status words end before the header");
-constexpr int kLogHeaderEnd = 32;
+constexpr int kLogHeaderEnd = 33;
 constexpr int64_t kLogRecordsOffset = 256;  // bytes
 constexpr int64_t kLogCapacity = 4096;      // records
 
@@ -89,6 +90,10 @@ enum class LogKind : uint8_t {
                        // low and high words
   kernel_seen = 7,     // kernel: its index; seen, want: its address's words
   deadline_expired = 8,  // reserved: a host deadline (what: extra)
+  close_phase = 9,       // barrier: the ClosePhase; peer: 1 collective (close),
+                         // 0 alone (abandon: an error, a signal, exit);
+                         // seen, want: the phase's numbers; extra: 0, or what
+                         // it failed with (a hipError_t, or 1)
   // Kernel kinds, the next cycle's.
   entered = 16,
   barrier_signal = 17,
@@ -102,8 +107,9 @@ enum class LogKind : uint8_t {
 enum class OpenPhase : uint8_t {
   none = 0,
   log_ready,           // seen: the ring's capacity
-  signals_allocated,   // seen, want: bytes requested, stride
-  exchange_allocated,  // seen, want: bytes requested (MiB), stride (MiB)
+  arena_allocated,     // the one allocation, this rank's slice mapped; seen,
+                       // want: bytes requested (KiB), rank stride (KiB)
+  exchange_allocated,  // retired (one arena); kept so the numbers hold
   zeroed,              // this rank's signals read back zero
   exported,
   socket_exchange_begun,  // seen: peers expected
@@ -114,6 +120,40 @@ enum class OpenPhase : uint8_t {
   tables_written,  // retired (no peer tables); kept so the numbers hold
   checked,  // every OpenCheck passed; seen: warnings
   open_done,
+};
+
+// THE PHASE AFTER `p`, skipping retired ones: where an open that reached `p`
+// stopped.
+constexpr OpenPhase next_open_phase(OpenPhase p) {
+  auto n = static_cast<uint8_t>(static_cast<uint8_t>(p) + 1);
+  if (n == static_cast<uint8_t>(OpenPhase::exchange_allocated) ||
+      n == static_cast<uint8_t>(OpenPhase::tables_written))
+    ++n;
+  return static_cast<OpenPhase>(n);
+}
+
+// THE PHASES OF THE MEMORY'S TEARDOWN, in order (STANDARDS 3.5); the header
+// holds the last reached. CLOSE (collective, every rank): closing ->
+// synchronized -> stopped (handshake 1: every rank has stopped using the
+// memory) -> peers_released (our mappings of peers gone) -> peers_done
+// (handshake 2: every rank's are) -> released (our own memory and the range
+// freed) -> close_done. ABANDON (alone: an error path, a signal, process exit;
+// never waits on a peer): closing -> synchronized (bounded; failed when the
+// device did not finish) -> peers_released -> released (only when the device
+// finished) -> close_done. A failed handshake (a peer that did not come within
+// the timeout) is recorded and the teardown carries on alone.
+enum class ClosePhase : uint8_t {
+  none = 0,
+  closing,         // seen: 1 collective, 0 abandoned
+  synchronized,    // every launch on this device finished; failed: it did not
+                   // within the bounded wait (abandon)
+  stopped,         // handshake 1 passed; failed: a peer did not arrive
+  peers_released,  // seen: peer slices unmapped, want: handles released;
+                   // extra: the first hipError_t
+  peers_done,      // handshake 2 passed; failed: a peer did not arrive
+  released,        // our slice unmapped, our memory released, the range
+                   // freed; extra: the first hipError_t
+  close_done,
 };
 
 // OPEN'S INTERNAL ASSERTS: each a definite error when it fails, and open
@@ -265,6 +305,17 @@ class Log {
     if (everything() || failed != 0)
       write({static_cast<uint8_t>(LogKind::open_phase), static_cast<uint8_t>(p),
              0, 0, 0, 0, seen, want, failed, host_ns()});
+  }
+  // THE TEARDOWN'S PHASE `p` (`failed`: what it failed with), in the header
+  // when it did not fail, and ALWAYS a record: a teardown is rare and its
+  // steps are what an abnormal exit is read by. `collective`: close (1) or
+  // abandon (0).
+  void close_phase(ClosePhase p, bool collective, uint32_t seen = 0,
+                   uint32_t want = 0, uint32_t failed = 0) {
+    if (failed == 0) set(LogHeader::close_phase, static_cast<uint32_t>(p));
+    write({static_cast<uint8_t>(LogKind::close_phase), static_cast<uint8_t>(p),
+           static_cast<uint16_t>(collective ? 1 : 0), 0, 0, 0, seen, want,
+           failed, host_ns()});
   }
   void check(OpenCheck c, bool ok, int peer = 0, uint32_t seen = 0,
              uint32_t want = 0) {

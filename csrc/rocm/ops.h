@@ -74,6 +74,14 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t world);
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
 
+// The collective close, its handshakes over `cpu_group` bounded by
+// `timeout_seconds`: 0, or the ClosePhase that failed. Then dispose.
+int64_t hip_custom_communicator_close(fptr_t handle_ptr,
+                                      const std::string& cpu_group,
+                                      double timeout_seconds);
+// Every open communicator torn down alone (exit, a signal): never waits on a
+// peer.
+void hip_custom_communicator_abandon_all(double wait_seconds);
 void hip_custom_communicator_dispose(fptr_t handle_ptr);
 // The rank's fault record, [where, rank, block, peer, count, want,
 // elapsed_ticks], or empty while no wait has given up; and the abort every wait

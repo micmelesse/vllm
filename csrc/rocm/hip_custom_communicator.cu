@@ -21,6 +21,7 @@
 #include "ops.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -81,6 +82,28 @@ std::vector<std::string> all_gathered(const ProcessGroupPtr& pg,
 // THE HANDLE'S COLLECTIVE, over `pg`: what the IPC handles go round in.
 hip_custom_communicator::Gather gather_over(const ProcessGroupPtr& pg) {
   return [pg](const std::string& mine) { return all_gathered(pg, mine); };
+}
+
+// THE CLOSE'S HANDSHAKE, over `pg`: an allgather of one byte, true when every
+// rank arrived within `timeout_seconds` (c10d's Work::wait raises past it) and
+// false when one did not or the group failed. Bounded, so a dead peer cannot
+// hang a close.
+hip_custom_communicator::Handle::Barrier barrier_over(const ProcessGroupPtr& pg,
+                                                      double timeout_seconds) {
+  return [pg, timeout_seconds]() {
+    try {
+      const auto as_bytes = torch::TensorOptions().dtype(torch::kUInt8);
+      std::vector<at::Tensor> in{torch::zeros({1}, as_bytes)};
+      std::vector<std::vector<at::Tensor>> output(1);
+      for (int r = 0; r < pg->getSize(); ++r)
+        output[0].push_back(torch::empty_like(in[0]));
+      return pg->allgather(output, in)
+          ->wait(std::chrono::milliseconds(
+              static_cast<int64_t>(timeout_seconds * 1000.0)));
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
 }
 }  // namespace
 
@@ -356,6 +379,25 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
     out.push_back(hip_custom_communicator::max_bytes(
         o.type, sizes.scratch_bytes, sizes.staging_bytes));
   return out;
+}
+
+// THE COLLECTIVE CLOSE (Handle::close), its handshakes over the process group
+// named `cpu_group`, each bounded by `timeout_seconds`: 0, or the ClosePhase
+// that failed (the teardown carried on alone past it). A group that no longer
+// resolves fails both handshakes.
+int64_t hip_custom_communicator_close(fptr_t handle_ptr,
+                                      const std::string& cpu_group,
+                                      double timeout_seconds) {
+  const auto pg = resolved(cpu_group);
+  const hip_custom_communicator::Handle::Barrier none = [] { return false; };
+  return handle_of(handle_ptr).close(pg ? barrier_over(*pg, timeout_seconds)
+                                        : none);
+}
+// EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS ABANDONED (Handle::abandon):
+// for an exit, a signal, an error path. Never waits on a peer; waits at most
+// `wait_seconds` a handle for its device.
+void hip_custom_communicator_abandon_all(double wait_seconds) {
+  hip_custom_communicator::Handle::abandon_all(wait_seconds);
 }
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr) {
