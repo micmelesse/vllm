@@ -744,19 +744,26 @@ constexpr TunedKernel kAttnResKernels[] = {
 };
 
 // INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
-// the handle's quantization is int4, the exact build below it. 2 MiB every op,
-// quick reduce's INT4 minimum at 8 ranks (vLLM's quick_all_reduce.py,
-// _QR_MIN_SIZE), while the cheap codec's crossover against our exact kernels is
-// measured.
+// the handle's quantization is int4, the exact build below it. Measured at each
+// op's exact grids, INT4 on against off (tuned picks, 7168 bf16, 8 ranks,
+// 2026-10-16T03-50-18Z against 04-01-55Z), us at 512 / 1024 / 8192 tokens:
+//   plain      41.7 / 75.4 / 535.1 exact, 88.2 / 72.4 / 284.4 INT4: 1024 tokens up
+//   rms_norm   42.8 / 76.8 / 547.8 exact, 48.8 / 62.0 / 362.2 INT4: 1024 up
+//   add_rms    51.2 / 92.4 / 566.5 exact, 58.1 / 84.2 / 471.4 INT4: 1024 up
+//   AttnRes    57.7 / 92.9 / 643.1 exact, 51.3 / 105.5 / 762.5 INT4: NEVER for now
+//     (its reduce-scatter is still the LDS one, a word a thread, one wave summing;
+//     the plain path's register sum, a group a thread, is what made INT4 win there)
+// So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never.
+constexpr int64_t kInt4Never = int64_t{1} << 62;
 struct Int4Crossover {
   OpType op;
   int64_t min_bytes;
 };
 constexpr Int4Crossover kInt4Crossovers[] = {
-    {OpType::all_reduce, 2 * 1024 * 1024},
-    {OpType::all_reduce_rms_norm, 2 * 1024 * 1024},
-    {OpType::all_reduce_add_rms_norm, 2 * 1024 * 1024},
-    {OpType::all_reduce_add_attn_res_rms_norm, 2 * 1024 * 1024},
+    {OpType::all_reduce, 14 * 1024 * 1024},
+    {OpType::all_reduce_rms_norm, 14 * 1024 * 1024},
+    {OpType::all_reduce_add_rms_norm, 14 * 1024 * 1024},
+    {OpType::all_reduce_add_attn_res_rms_norm, kInt4Never},
 };
 // EACH OP'S INT4 KERNELS: ITS EXACT KERNELS, EVERY TWO-SHOT ONE MOVING INT4, at
 // the same template, tile, threads and grid. INT4 AT THE BASELINE'S OWN CONFIG,
