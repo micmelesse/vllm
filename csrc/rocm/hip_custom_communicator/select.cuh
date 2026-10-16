@@ -767,7 +767,7 @@ constexpr Int4Crossover kInt4Crossovers[] = {
 // instruction counters 2026-10-16T00-26-40Z against 00-31-41Z), and at 256 it
 // beats quick reduce's INT4 (2026-10-16T00-41-03Z). Grids swept at 1024-8192
 // tokens (plain 72-512, 2026-10-16T00-41-03Z; fused 36-256 on 8192-column builds,
-// 00-51-04Z; AttnRes pull past 256 pending); below 1024 tokens not
+// 00-51-04Z; AttnRes pull 192-512, 01-01-56Z); below 1024 tokens not
 // swept, the 1024 grid held down to the crossover.
 //   plain, 256 blocks: 54.7 / 84.7 / 141.2 / 268.1 us at 1024-8192 tokens (exact
 //     75.5 / 141.8 / 273.6 / 535.3; quick reduce INT4 70.1 / 119.1 / 197.7 / 334.4)
@@ -775,9 +775,10 @@ constexpr Int4Crossover kInt4Crossovers[] = {
 //     546.9); the push's best (256) 63.3 / 109.9 / 201.0 / 393.1
 //   add_rms_norm pull, 144: 62.5 / 97.3 / 160.8 / 329.5 (exact 92.9 / 159.5 /
 //     291.9 / 567.4); the push's best (256) 66.2 / 113.4 / 220.9 / 443.0
-//   AttnRes pull, 256: 76.2 / 135.0 / 257.3 / 485.6 (exact 92.4 / 169.2 / 335.8 /
-//     643.2; quick reduce INT4 + attn_res 98.8 / 176.6 / 325.8 / 603.2); the push's best
-//     (256) 82.7 / 162.6 / 324.9 / 634.1
+//   AttnRes pull, 256 to 2048 tokens then 512: 45.4 at 384, 76.2 at 1024; 129.1 / 225.1
+//     / 403.1 at 2048-8192 (exact 92.4 / 169.2 / 335.8 / 643.2 at 1024-8192; quick reduce
+//     INT4 + attn_res 98.8 / 176.6 / 325.8 / 603.2); 192-512 blocks, 2026-10-16T01-01-56Z;
+//     the push's best (256) 82.7 / 162.6 / 324.9 / 634.1
 constexpr TunedKernel kAllReduceInt4Kernels[] = {
     {8,
      1,
@@ -808,6 +809,12 @@ constexpr TunedKernel kAttnResInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1, Quantization::int4},
       {256, 0}}},
+    {8,
+     2048,
+     7168,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1, Quantization::int4},
+      {512, 0}}},
 };
 
 constexpr int64_t int4_min_bytes(OpType o) {
