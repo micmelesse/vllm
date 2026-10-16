@@ -428,16 +428,6 @@ template <typename PARAM>
 struct erase<const PARAM*> {
   using t = const void*;
 };
-// A peer table, every rank's address of a buffer: its elements erased, the
-// table kept.
-template <typename PARAM>
-struct erase<PARAM* const*> {
-  using t = void* const*;
-};
-template <typename PARAM>
-struct erase<const PARAM* const*> {
-  using t = const void* const*;
-};
 template <typename KERNEL_PTR>
 struct erased;
 template <typename... PARAMS>
@@ -1198,7 +1188,7 @@ constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols,
 // the compiled kernel, is each select's last check.
 // =================================================================================================
 
-// A KERNEL'S SCRATCH, row-major (a staged build needs none: it runs in passes
+// A KERNEL'S SCRATCH, row-major (a build in passes needs none: it runs in passes
 // of what the scratch holds): the plain two-shot its slice of every row; a
 // column two-shot the whole reduced tensor (each rank's columns at their
 // place); a row two-shot its rank's rows, twice where it leaves two results
@@ -1235,7 +1225,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
                                     const KernelConfig& c, DType dtype,
                                     int64_t m, int64_t n, int64_t tile_cols,
                                     std::optional<Error> own_error,
-                                    bool staged) {
+                                    bool in_passes) {
   const int world = h ? h->world_size() : 1;
   if (h && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
@@ -1269,12 +1259,12 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (int4 && (int4_values_bytes(m, n) > h->quantized_values_bytes() ||
                int4_scales_bytes(m, n) > h->quantized_scales_bytes()))
     return Error::quantized_too_small;
-  if (!staged && scratch_need(fn, m, packs, world) > h->scratch_bytes())
+  if (!in_passes && scratch_need(fn, m, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
-  // AN IN-PLACE BUILD reads its input through the staging, copied in whole
-  // first (every input: Handle::slot_for).
+  // A BUILD THAT DOES NOT RUN IN PASSES copies its input into the staging
+  // whole, inside the kernel, before its first barrier.
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!staged && bytes > h->staging_bytes())
+  if (!in_passes && bytes > h->staging_bytes())
     return Error::staging_too_small;
   return std::nullopt;
 }
@@ -1303,9 +1293,8 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 // =================================================================================================
 
 // all_reduce: the sum of every rank's `inp` ([rows, cols] of `dtype` at its
-// strides) into `out`. In place when the peers can read the input where it is
-// (registered, or captured on this stream), otherwise its staged kernel, a band
-// of rows a pass.
+// strides) into `out`. The kernel copies its input into its staging itself: a
+// band of rows a pass (none), or quantized whole (INT4's two-shot).
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
@@ -1335,9 +1324,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const Template fn = k.fn;
   const KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  // INT4 READS ONLY THIS RANK'S INPUT, staging it quantized itself, so it is
-  // never the staged build.
-  const bool staged = a.quantization == Quantization::none;
+  // IN PASSES (none): a band of rows of the input through the staging a pass.
+  // INT4 quantizes its input into its staging values whole instead.
+  const bool in_passes = a.quantization == Quantization::none;
   // THE STAGED BAND: the rows a pass, what the staging holds (and the
   // two-shot's scratch, a row of its slice a row).
   const int64_t row_bytes = n * elem_bytes(dtype);
@@ -1351,9 +1340,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
-                  std::nullopt, staged))
+                  std::nullopt, in_passes))
     return *e;
-  if (staged && band < 1) return Error::staging_too_small;
+  if (in_passes && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups
   // for every thread of
   //    a tile row (the two-shot's rows are the ranks).
@@ -1372,14 +1361,9 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                               WAVES = C.waves_per_eu;
                 constexpr int TM = C.tile_m, TN = C.tile_n;
                 if constexpr (one_shot_lays_out(C, NL))
-                  kernel =
-                      staged
-                          ? instance<AllReduceOneShotStagedKernel>(
-                                all_reduce_pull_one_shot_staged<T, NG, TM, TN,
-                                                                THREADS, WAVES>)
-                          : instance<AllReduceOneShotKernel>(
-                                all_reduce_pull_one_shot<T, NG, TM, TN, THREADS,
-                                                         WAVES>);
+                  kernel = instance<AllReduceOneShotStagedKernel>(
+                      all_reduce_pull_one_shot_staged<T, NG, TM, TN, THREADS,
+                                                      WAVES>);
               });
           return;
         case Template::all_reduce_pull_two_shot:
@@ -1396,14 +1380,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             if constexpr (two_shot_lays_out(C, NG, NL)) {
               const auto at = [&](auto layout) {
                 constexpr bool CONTIGUOUS = decltype(layout)::value;
-                return staged
-                           ? instance<AllReduceTwoShotStagedKernel>(
-                                 all_reduce_pull_two_shot_staged<
-                                     T, NG, TM, TN, THREADS, WAVES, CONTIGUOUS>)
-                           : instance<AllReduceTwoShotKernel>(
-                                 all_reduce_pull_two_shot<
-                                     T, NG, TM, TN, THREADS, WAVES, CONTIGUOUS,
-                                     C.quantization>);
+                if constexpr (C.quantization == Quantization::none)
+                  return instance<AllReduceTwoShotStagedKernel>(
+                      all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS,
+                                                      WAVES, CONTIGUOUS>);
+                else
+                  return instance<AllReduceTwoShotKernel>(
+                      all_reduce_pull_two_shot<T, NG, TM, TN, THREADS, WAVES,
+                                               CONTIGUOUS, C.quantization>);
               };
               kernel =
                   contiguous ? at(std::true_type{}) : at(std::false_type{});
@@ -1431,7 +1415,6 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       .blocks_per_grid = c.launch.blocks_per_grid,
       .waves_per_eu = a.waves_per_eu,
       .quantization = a.quantization,
-      .staged = staged,
       .stream = stream,
       .input = input,
       .input_stride_m = input_stride_m,
@@ -1445,7 +1428,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       .output_size_n = output_size_n,
       .scratch_stride_m = slice_bytes / elem_bytes(dtype),
       .scratch_stride_n = 1,
-      .scratch_size_m = staged ? (band < m ? band : m) : m,
+      .scratch_size_m = in_passes ? (band < m ? band : m) : m,
       .scratch_size_n = slice_bytes / elem_bytes(dtype),
       .scratch_values_stride_m = sums.values_stride_m,
       .scratch_values_stride_n = sums.values_stride_n,
@@ -1617,6 +1600,10 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                .staging_scales_stride_n = staged_input.scales_stride_n,
                                .staging_scales_size_m = staged_input.scales_size_m,
                                .staging_scales_size_n = staged_input.scales_size_n,
+                               .staging_stride_m = n,
+                               .staging_stride_n = 1,
+                               .staging_size_m = m,
+                               .staging_size_n = n,
                                  .dtype = dtype,
                                  .weight_dtype = weight_dtype,
                                  .eps = eps};
@@ -1788,6 +1775,10 @@ select_all_reduce_add_rms_norm(
       .staging_scales_stride_n = staged_input.scales_stride_n,
       .staging_scales_size_m = staged_input.scales_size_m,
       .staging_scales_size_n = staged_input.scales_size_n,
+      .staging_stride_m = n,
+      .staging_stride_n = 1,
+      .staging_size_m = m,
+      .staging_size_n = n,
       .dtype = dtype,
       .weight_dtype = weight_dtype,
       .eps = eps};
@@ -2010,6 +2001,10 @@ select_all_reduce_add_attn_res_rms_norm(
       .staging_scales_stride_n = staged_input.scales_stride_n,
       .staging_scales_size_m = staged_input.scales_size_m,
       .staging_scales_size_n = staged_input.scales_size_n,
+      .staging_stride_m = n,
+      .staging_stride_n = 1,
+      .staging_size_m = m,
+      .staging_size_n = n,
       .dtype = dtype,
       .num_blocks = num_blocks,
       .eps = eps,
@@ -2086,8 +2081,8 @@ constexpr int64_t widest_row(OpType o) {
 // `max_rows` rows of at most `max_cols` columns (for a model, the server's
 // tokens a batch by its hidden size), and its exchange holds every template's
 // need at that call, in every built dtype: the scratch the most any two-shot
-// takes (`scratch_need`), the staging the whole input (an in-place build on an
-// eager input reads it from there), and the quantized buffers an INT4 two-shot
+// takes (`scratch_need`), the staging the whole input (every per-row kernel
+// copies its input into it whole; the plain all-reduce in bands), and the quantized buffers an INT4 two-shot
 // keeps. Each need grows with the rows and the row's width, so a call inside
 // the box fits by construction. Each rounded to a whole pack, and at least
 // one.

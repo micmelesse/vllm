@@ -2,7 +2,8 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE PLAIN ALL-REDUCE: its kernels, one section each (one-shot and two-shot
-// pull, each with its staged build).
+// pull, each staged: the kernel copies its input into its staging a band of
+// rows a pass; the int4 two-shot stages its input quantized).
 
 #pragma once
 
@@ -15,79 +16,13 @@ namespace hip_custom_communicator {
 //
 // One-shot pull all-reduce: every rank sums every rank's input over the whole
 // buffer. Modelled on aiter's `cross_device_reduce_1stage`: sync, read every
-// peer, sum, sync. Two kernels: in place, every rank reads every peer's
-// registered or captured input where it is; staged, for an eager input the
-// peers cannot read.
+// peer, sum, sync. One kernel, staged: no peer reads the caller's input.
 // =============================================================================
 
 // THE BUFFER AS [m, n] AT ITS STRIDES, a work item a TILE_M x TILE_N tile (a
 // row of threads a tile row), the grid striding over the tiles row-major. Both
-// tile sides are tuned (select.cuh).
-template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
-        int64_t input_stride_n, int input_size_m, int input_size_n,
-        DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
-        int64_t output_stride_n, int output_size_m, int output_size_n,
-        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
-        int64_t signals_stride_parity, int64_t signals_stride_block,
-        int64_t signals_stride_writer, int signals_size_parity,
-        int signals_size_block, int signals_size_writer,
-        uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
-        int status_size_field, int rank, uint64_t timeout_ticks) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  // A ROW OF THREADS A TILE ROW: THREADS_M x THREADS_N over the tile, K packs a
-  // thread.
-  constexpr int THREADS_M = TILE_M;
-  constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
-  constexpr int P = traits<DTYPE>::N;
-  constexpr int ROWS = TILE_M / THREADS_M;
-  constexpr int K = TILE_N / (P * THREADS_N);
-  const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
-  const int tiles_m = (input_size_m + TILE_M - 1) / TILE_M;
-
-  // 1. Every rank's input pointer, then wait until every peer has launched, so
-  // its input is ready.
-  const DTYPE* input[WORLD];
-  peers_ptrs(input_ptrs, input);
-  barrier<Until::launched, 0, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-
-  // 2. Read every rank's input, in rank order, and sum.
-  block_for_each_tile(tiles_m, tiles_n, [&](int row, int col) {
-    const int offs_m = row * TILE_M;
-    const int offs_n = col * TILE_N;
-    DTYPE peers[WORLD][ROWS][K][P];
-    peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_stride_n,
-                                     input_size_m, input_size_n, peers, offs_m,
-                                     offs_n);
-    float sum[ROWS][K][P];
-    peers_sum(peers, sum);
-    DTYPE rounded[ROWS][K][P];
-    convert(sum, rounded);
-    store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, output_ptr, output_stride_m,
-                                output_stride_n, input_size_m, input_size_n,
-                                offs_m, offs_n);
-  });
-
-  // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Until::read, 1, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-#else
-  __builtin_trap();
-#endif
-}
-
-// STAGED: each rank copies its input into its staging `staging_size_m` rows at
-// a time and every rank reads every peer's staging, so any size runs in one
+// tile sides are tuned (select.cuh). STAGED: each rank copies its input into
+// its staging `staging_size_m` rows at a time and every rank reads every peer's staging, so any size runs in one
 // launch. The staging is ours, a band dense at its strides. EACH BLOCK STAGES
 // THE TILES IT READS: what the same block on a peer copied is what a peers
 // barrier makes visible.
@@ -174,8 +109,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // Two-shot pull all-reduce: reduce-scatter, then all-gather. aiter's
 // `cross_device_reduce_2stage` as written: sync, sum this rank's slice from
 // every peer into its scratch, sync, copy every rank's summed slice out of its
-// scratch. Two kernels: in place, the peers' registered or captured inputs read
-// where they are; staged, for an eager input the peers cannot read.
+// scratch. Two kernels: int4, the input quantized into the staging values by
+// the kernel itself; staged (none), the input copied into the staging a band a
+// pass. No peer reads the caller's input.
 // =============================================================================
 
 // THE PROBLEM, [R, M, N]: R = WORLD ranks' inputs, each an [input_size_m,
@@ -190,13 +126,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // strides. QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION);
 // with int4 the input's quantized form is staged in this rank's staging values
 // and scales, and the sums' are the scratch values and scales, a group a thread
-// (the INT4 flat walk's).
+// (the INT4 flat walk's). INT4 ONLY: none is the staged build below.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
@@ -220,12 +156,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
+  static_assert(QUANTIZATION == Quantization::int4,
+                "none is all_reduce_pull_two_shot_staged");
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  // 1. This rank's input staged in QUANTIZATION's form (none: nothing, the
-  // peers read it in place), then wait until every peer has launched, so its
-  // input is ready.
+  // 1. This rank's input quantized into its staging values and scales, then
+  // wait until every peer has launched and staged its own (ordered).
   stage<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
+      input_ptr, input_stride_m, input_stride_n, input_size_m,
       input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
@@ -239,8 +176,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 2. Reduce-scatter: this rank's share of the inputs, summed over the ranks,
   // into its scratch.
+  // (The plain input form is not read with int4: the staging values are.)
   reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, 0, input_stride_m, input_stride_n, input_size_m, input_size_n,
       staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
       staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,

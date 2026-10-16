@@ -15,9 +15,10 @@ after its own (the algorithm, the direction, every field of one build and the la
 all or none) are the one way to force one, for the sweep and the tests. Every one is
 passed through as it came: C++ builds the config, checks it, and answers.
 
-ONE MEMORY PATH (C++'s `Handle`): every input, eager or captured, is copied into a
-staging buffer the communicator owns, which every rank mapped at open (HIP virtual
-memory); peers read only that, never the caller's tensor, so nothing is registered.
+ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, copies its input
+into a staging buffer the communicator owns, which every rank mapped at open (HIP
+virtual memory), before its first barrier; peers read only that, never the caller's
+tensor, so nothing is registered.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -184,7 +185,7 @@ class LogKind(IntEnum):
     open_check = 2
     open_warning = 3
     launch_issued = 4
-    copy_in_issued = 5
+    copy_in_issued = 5  # retired: the kernels copy their input in themselves
     stream_seen = 6
     kernel_seen = 7
     deadline_expired = 8
@@ -208,7 +209,7 @@ class OpenPhase(IntEnum):
     imported = 8
     mapped = 9
     access_set = 10
-    tables_written = 11
+    tables_written = 11  # retired: no peer tables; kept so the numbers hold
     checked = 12
     open_done = 13
 
@@ -337,18 +338,12 @@ class LogRecord:
                 else str(self.extra)
             )
             mode = "captured" if self.barrier & 1 else "eager"
-            staged = " staged" if self.barrier & 2 else ""
             ops = get_args(Op)
             op = ops[self.block] if self.block < len(ops) else str(self.block)
             return (
                 f"launch_issued #{self.launch} {op} kernel "
                 f"{self.kernel} {self.seen}x{self.want} {dtype} stream {self.peer} "
-                f"{mode}{staged}"
-            )
-        if k is LogKind.copy_in_issued:
-            return (
-                f"copy_in_issued #{self.launch} {self.seen} bytes of the "
-                f"{self.want}-byte staging, stream {self.peer}"
+                f"{mode}"
             )
         if k is LogKind.stream_seen:
             return f"stream_seen {self.peer} = {self.seen | (self.want << 32):#x}"
@@ -834,9 +829,8 @@ _QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
 @dataclass(frozen=True)
 class Ran:
     """WHAT A LAUNCH RAN, as C++ answered it: the kernel's algorithm and direction,
-    its tile and threads, its grid; `staged` (the eager build that copies its input
-    through the staging), `tile_k` and `reduce_scatter_blocks` 0 where the op has
-    none; `quantization`, what crossed the links ("none" or "int4")."""
+    its tile and threads, its grid; `tile_k` and `reduce_scatter_blocks` 0 where
+    the op has none; `quantization`, what crossed the links ("none" or "int4")."""
 
     algorithm: str
     direction: str
@@ -845,7 +839,6 @@ class Ran:
     threads_per_block: int
     blocks_per_grid: int
     waves_per_eu: int
-    staged: bool
     tile_k: int
     reduce_scatter_blocks: int
     quantization: Quantization
@@ -854,7 +847,7 @@ class Ran:
     def of(cls, answer: Answer) -> "Ran | None":
         """From an answer that ran; None for one that says nothing of what ran (the
         test's torch control answers [-1])."""
-        if len(answer) < 12:
+        if len(answer) < 11:
             return None
         a = answer[1:]
         return cls(
@@ -865,15 +858,13 @@ class Ran:
             a[4],
             a[5],
             a[6],
-            bool(a[7]),
+            a[7],
             a[8],
-            a[9],
-            _QUANTIZATIONS[a[10]],
+            _QUANTIZATIONS[a[9]],
         )
 
     def __str__(self) -> str:
-        how = " staged" if self.staged else ""
-        how += " int4" if self.quantization == "int4" else ""
+        how = " int4" if self.quantization == "int4" else ""
         return (
             f"{self.direction} {self.algorithm}{how} tile {self.tile_m}x{self.tile_n}"
             f" threads {self.threads_per_block} grid {self.blocks_per_grid}"
@@ -1453,8 +1444,8 @@ class HipCustomCommunicator:
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture. Nothing is registered: every input is copied into
-        our staging on the launch's stream (a copy node in the graph), so a captured
+        """Wrap a cudagraph capture. Nothing is registered: every kernel copies its
+        input into our staging itself (no copy node in the graph), so a captured
         launch reads only memory every rank mapped at open."""
         yield
 

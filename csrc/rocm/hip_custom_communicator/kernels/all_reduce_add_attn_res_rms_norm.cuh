@@ -203,7 +203,7 @@ template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
@@ -222,7 +222,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -234,14 +236,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. Every rank's input address, then wait until every peer has launched, so
-  // its input is ready. THE TABLE IS READ BEFORE THE WAIT: read after it (in
-  // peers_load, every row), the barrier's stores left the table no longer
-  // provably unwritten, so it was four vector loads and a wait a row where it
-  // is one scalar load (s_load_dwordx16) a launch, and 156 VGPRs where 123 at
-  // 8192 (ISA 2026-10-15T18-25-21Z).
-  const DTYPE* input[WORLD];
-  peers_ptrs(input_ptrs, input);
+  // 1. This rank's input copied into its staging, this block's rows (the ones
+  // this block's twin on every rank reads), then wait until every peer has
+  // launched and copied its own (the first barrier is ordered).
+  stage_rows<THREADS_PER_BLOCK, 1, Quantization::none>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n,
+      static_cast<uint8_t*>(nullptr), 0, 0, 0, 0, static_cast<__fp16*>(nullptr), 0, 0, 0,
+      0, input_size_m);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -252,7 +255,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
-    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
+    peers_load<1, THREADS_PER_BLOCK>(
+        staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
                                      input_size_m, input_size_n, peers, row, 0);
     float sum_f[1][K][P];
     peers_sum(peers, sum_f);
@@ -309,7 +313,7 @@ template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_M, int TILE_N,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
@@ -336,7 +340,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -358,12 +364,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 7168 and the others reduce-scattered 8/7 of the row.
   const int slice_n = (input_size_n / P + WORLD - 1) / WORLD * P;
 
-  // 1. This rank's input staged in QUANTIZATION's form (none: nothing), this
-  //    block's tiles of rows, then wait until every peer has launched, so its
-  //    input is ready.
+  // 1. This rank's input copied into its staging in QUANTIZATION's form (none:
+  // as it is; int4: quantized into the staging values and scales), the rows
+  // this block's twin on every rank reads, then wait until every peer has
+  // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
-      peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
+      input_ptr, input_stride_m, input_stride_n, input_size_m,
+      input_size_n, peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
@@ -383,8 +391,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    21-26-11Z), summed through LDS (reduce_scatter_lds).
   (void)reduce_scatter_blocks;
   reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
+      staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      input_size_m, input_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
       staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
       staging_scales_size_n, scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n,
@@ -404,7 +412,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 4. Each of this block's tiles: its packs from the ranks that own them (A
   //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's scratch
-  //    from the table), at the input's place in the scratch, then AttnRes. A
+  //    at its rank stride), at the input's place in the scratch, then AttnRes. A
   //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
   //    body, a row past input_size_m (never loaded) kept the last tile's
   //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
@@ -456,7 +464,7 @@ template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
@@ -483,7 +491,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -513,12 +523,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
           : 0;
 
-  // 1. This rank's input staged in QUANTIZATION's form (none: nothing), this
-  //    block's rows, then wait until every peer has launched, so its input is
-  //    ready.
+  // 1. This rank's input copied into its staging in QUANTIZATION's form (none:
+  // as it is; int4: quantized into the staging values and scales), the rows
+  // this block's twin on every rank reads, then wait until every peer has
+  // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
+      input_ptr, input_stride_m, input_stride_n, input_size_m,
+      input_size_n, peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
@@ -540,8 +552,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
+      staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      input_size_m, input_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
       staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
       staging_scales_size_n, scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n,

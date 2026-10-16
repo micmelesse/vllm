@@ -33,13 +33,15 @@ namespace hip_custom_communicator {
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
           int TILE_N, int THREADS_PER_BLOCK>
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
-    const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
     int64_t output_stride_n, DTYPE* residual_output_ptr,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
+    DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
@@ -49,13 +51,15 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. Every rank's input pointer, then wait until every peer has launched, so
-  // its input is ready. THE TABLE READ ONCE, BEFORE THE BARRIER: read by
-  // peers_load in the loop, after the barrier's atomics, the compiler could
-  // not prove it unchanged and loaded it again every row, 4 vector loads a row
-  // where it was one scalar load a kernel (ISA 2026-10-15T18-32-04Z).
-  const DTYPE* input[WORLD];
-  peers_ptrs<WORLD>(input_ptrs, input);
+  // 1. This rank's input copied into its staging, this block's rows (the ones
+  // this block's twin on every rank reads), then wait until every peer has
+  // launched and copied its own (the first barrier is ordered).
+  stage_rows<THREADS_PER_BLOCK, 1, Quantization::none>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n,
+      static_cast<uint8_t*>(nullptr), 0, 0, 0, 0, static_cast<__fp16*>(nullptr), 0, 0, 0,
+      0, input_size_m);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -78,7 +82,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][K][P];
-    peers_load<1, THREADS_PER_BLOCK>(input, input_stride_m, input_stride_n,
+    peers_load<1, THREADS_PER_BLOCK>(
+        staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
                                      input_size_m, input_size_n, peers, row,
                                      0);
     DTYPE res[1][K][P];
@@ -136,12 +141,14 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+        int output_size_n, DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -150,9 +157,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
-      output_stride_n, nullptr, 0, 0, signals_ptr, signals_stride_rank, signals_stride_parity,
+      output_stride_n, nullptr, 0, 0, staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, signals_ptr, signals_stride_rank, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
       signals_size_block, signals_size_writer, status_ptr, status_stride_field,
       status_size_field, rank, timeout_ticks, eps);
@@ -165,7 +173,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
@@ -175,7 +183,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ residual_output_ptr,
         int64_t residual_output_stride_m, int64_t residual_output_stride_n,
         int residual_output_size_m, int residual_output_size_n,
-        uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -184,11 +194,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);
@@ -223,7 +234,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
           int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION>
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
-    const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
@@ -237,6 +248,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
     int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
     int scratch_scales_size_m, int scratch_scales_size_n,
+    DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
     int64_t staging_values_stride_m, int64_t staging_values_stride_n,
     int staging_values_size_m, int staging_values_size_n,
@@ -256,12 +269,14 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // scratch.
   const int64_t scale_at = int64_t{slice_m} * scratch_stride_m;  // in elements
 
-  // 1. This rank's input staged in QUANTIZATION's form (none: nothing), the
-  // rows each owner's same block reads, then wait until every peer has
-  // launched, so its input is ready.
+  // 1. This rank's input copied into its staging in QUANTIZATION's form (none:
+  // as it is; int4: quantized into the staging values and scales), the rows
+  // this block's twin on every rank reads, then wait until every peer has
+  // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
+      input_ptr, input_stride_m, input_stride_n, input_size_m,
+      input_size_n, peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
@@ -272,12 +287,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // THE RANKS' POINTERS AFTER THE BARRIER here: held across it, the 8-pack
-  // build keeps 68 B of scratch (the ISA gate, 2026-09-30). Read once, out of
-  // the loops: peers_load reading its table every row loaded it again each
-  // time (the one-shot's head).
-  const DTYPE* input[WORLD];
-  peers_ptrs<WORLD>(input_ptrs, input);
   DTYPE* const own_scratch = peer_ptr(scratch_ptr, scratch_stride_rank, rank);
   uint8_t* const own_scratch_values = peer_ptr(scratch_values_ptr, scratch_values_stride_rank, rank);
   __fp16* const own_scratch_scales = peer_ptr(scratch_scales_ptr, scratch_scales_stride_rank, rank);
@@ -296,7 +305,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // Row `row` from every rank.
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
     peers_load<1, THREADS_PER_BLOCK, QUANTIZATION>(
-        input, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n, input_size_m, input_size_n,
         staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
         staging_values_stride_n, staging_values_size_m, staging_values_size_n,
         staging_scales_ptr, staging_scales_stride_rank, staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
@@ -470,7 +479,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
@@ -484,7 +493,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -499,14 +510,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, scratch_ptr, scratch_stride_rank, scratch_stride_m,
       scratch_stride_n,
       scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m, scratch_values_stride_n,
       scratch_values_size_m, scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank,
       scratch_scales_stride_m, scratch_scales_stride_n, scratch_scales_size_m,
-      scratch_scales_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
+      scratch_scales_size_n, staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       staging_scales_ptr, staging_scales_stride_rank, staging_scales_stride_m, staging_scales_stride_n,
       staging_scales_size_m, staging_scales_size_n, signals_ptr, signals_stride_rank, signals_stride_parity,
@@ -523,7 +535,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
@@ -541,7 +553,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -556,7 +570,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -564,7 +578,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m, scratch_values_stride_n,
       scratch_values_size_m, scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank,
       scratch_scales_stride_m, scratch_scales_stride_n, scratch_scales_size_m,
-      scratch_scales_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
+      scratch_scales_size_n, staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       staging_scales_ptr, staging_scales_stride_rank, staging_scales_stride_m, staging_scales_stride_n,
       staging_scales_size_m, staging_scales_size_n, signals_ptr, signals_stride_rank,
@@ -602,7 +617,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
           int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION>
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
-    const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
@@ -617,6 +632,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
     int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
     int scratch_scales_size_m, int scratch_scales_size_n,
+    DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
     int64_t staging_values_stride_m, int64_t staging_values_stride_n,
     int staging_values_size_m, int staging_values_size_n,
@@ -643,12 +660,14 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                        ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
                        : 0;
 
-  // 1. This rank's input staged in QUANTIZATION's form (none: nothing), this
-  // block's rows, then wait until every peer has launched, so its input is
-  // ready.
+  // 1. This rank's input copied into its staging in QUANTIZATION's form (none:
+  // as it is; int4: quantized into the staging values and scales), the rows
+  // this block's twin on every rank reads, then wait until every peer has
+  // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      peer_ptr(input_ptrs, rank), input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
+      input_ptr, input_stride_m, input_stride_n, input_size_m,
+      input_size_n, peer_ptr(staging_ptr, staging_stride_rank, rank), staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n, peer_ptr(staging_values_ptr, staging_values_stride_rank, rank), staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       peer_ptr(staging_scales_ptr, staging_scales_stride_rank, rank), staging_scales_stride_m,
       staging_scales_stride_n, staging_scales_size_m, staging_scales_size_n,
@@ -668,8 +687,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
+      staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      input_size_m, input_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m, staging_values_stride_n,
       staging_values_size_m, staging_values_size_n, staging_scales_ptr, staging_scales_stride_rank,
       staging_scales_stride_m, staging_scales_stride_n, staging_scales_size_m,
       staging_scales_size_n, scratch_ptr, scratch_stride_rank, scratch_stride_m, scratch_stride_n,
@@ -752,7 +771,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
@@ -766,7 +785,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -781,14 +802,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, scratch_ptr, scratch_stride_rank, scratch_stride_m,
       scratch_stride_n, scratch_size_m, scratch_size_n,
       scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m, scratch_values_stride_n,
       scratch_values_size_m, scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank,
       scratch_scales_stride_m, scratch_scales_stride_n, scratch_scales_size_m,
-      scratch_scales_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
+      scratch_scales_size_n, staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       staging_scales_ptr, staging_scales_stride_rank, staging_scales_stride_m, staging_scales_stride_n,
       staging_scales_size_m, staging_scales_size_n, signals_ptr, signals_stride_rank,
@@ -805,7 +827,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(
-        const DTYPE* const* __restrict__ input_ptrs, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
@@ -823,7 +845,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         __fp16* __restrict__ scratch_scales_ptr, int64_t scratch_scales_stride_rank,
         int64_t scratch_scales_stride_m, int64_t scratch_scales_stride_n,
         int scratch_scales_size_m, int scratch_scales_size_n,
-        uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
+        DTYPE* __restrict__ staging_ptr, int64_t staging_stride_rank, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint8_t* __restrict__ staging_values_ptr, int64_t staging_values_stride_rank,
         int64_t staging_values_stride_m, int64_t staging_values_stride_n,
         int staging_values_size_m, int staging_values_size_n,
         __fp16* __restrict__ staging_scales_ptr, int64_t staging_scales_stride_rank,
@@ -838,7 +862,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
-      input_ptrs, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -847,7 +871,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       scratch_values_ptr, scratch_values_stride_rank, scratch_values_stride_m, scratch_values_stride_n,
       scratch_values_size_m, scratch_values_size_n, scratch_scales_ptr, scratch_scales_stride_rank,
       scratch_scales_stride_m, scratch_scales_stride_n, scratch_scales_size_m,
-      scratch_scales_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
+      scratch_scales_size_n, staging_ptr, staging_stride_rank, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, staging_values_ptr, staging_values_stride_rank, staging_values_stride_m,
       staging_values_stride_n, staging_values_size_m, staging_values_size_n,
       staging_scales_ptr, staging_scales_stride_rank, staging_scales_stride_m, staging_scales_stride_n,
       staging_scales_size_m, staging_scales_size_n, signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,

@@ -8,9 +8,11 @@
 // exports it as a POSIX file descriptor, and every rank maps every rank's into
 // ONE reserved virtual range, rank r's at base + r * stride, so a kernel
 // reaches a peer's buffer by a pointer and a rank stride. THE CALLER'S INPUT
-// is never read by a peer where it is: every input is copied into this rank's
-// staging first (`slot_for`), eager or captured, so no peer reads memory we did
-// not allocate, and nothing is registered or opened over IPC. The collective
+// is never read by a peer where it is: every kernel copies this rank's input
+// into this rank's staging itself (INT4: quantized into the staging values),
+// before its first barrier, which is ordered; the peers then read the staging
+// at ptr + r * stride. One path, eager and captured alike: no host copy, no
+// pointer table, nothing registered or opened over IPC. The collective
 // that exchanges the socket names is the caller's (`Gather`), so this names no
 // process group.
 
@@ -510,8 +512,7 @@ class Handle {
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
          int64_t scratch_bytes, int64_t quantized_values_bytes,
          int64_t quantized_scales_bytes, int64_t staging_bytes,
-         int quantization, LogMode log_mode, int rccl_ready,
-         const BuildInfo& build = kBuild)
+         int quantization, LogMode log_mode, int rccl_ready)
       : rank_(rank),
         world_size_(world_size),
         device_(device),
@@ -527,23 +528,19 @@ class Handle {
     // an open that fails or hangs is read there.
     set_last_log(log_);
     try {
-      open(gather, timeout_seconds, rccl_ready, build);
+      open(gather, timeout_seconds, rccl_ready);
     } catch (...) {
       // THE PHASE AFTER THE LAST REACHED is the one that failed.
       const uint32_t reached = log_->get(LogHeader::open_phase);
       if (reached < static_cast<uint32_t>(OpenPhase::open_done))
         log_->phase(static_cast<OpenPhase>(reached + 1), 0, 0, 1);
-      if (slab_ != nullptr) (void)hipFree(slab_);
       throw;
     }
   }
 
   // The symmetric memory unmaps and releases itself (SymmetricMemory), after
   // every launch on it has finished.
-  ~Handle() {
-    (void)hipDeviceSynchronize();
-    hipFree(slab_);
-  }
+  ~Handle() { (void)hipDeviceSynchronize(); }
 
   Handle(const Handle&) = delete;
   Handle& operator=(const Handle&) = delete;
@@ -556,22 +553,13 @@ class Handle {
   // One quantized buffer's values and scales, the most each region holds.
   int64_t quantized_values_bytes() const { return quantized_values_bytes_; }
   int64_t quantized_scales_bytes() const { return quantized_scales_bytes_; }
-  // Where an eager input is copied for its peers to read, and how many bytes it
-  // holds.
+  // Where every kernel copies its input for its peers to read, and how many
+  // bytes it holds.
   void* staging() const { return exchange_->at(rank_) + staging_offset(); }
   int64_t staging_bytes() const { return staging_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
 
-  // WHAT A KERNEL IS HANDED, each its own argument, a peer buffer as a device
-  // table of every rank's address. Every rank's input for a launch over `input`
-  // (`bytes` long) on `stream`: filled after the capture for a captured launch
-  // (an eager input is copied into the staging, and the table is the
-  // staging's).
-  const void* const* input_ptrs(const void* input, int64_t bytes,
-                                hipStream_t stream) {
-    return slot_for(const_cast<void*>(input), bytes, stream);
-  }
   // EVERY RANK'S SCRATCH AND STAGING, and the quantized forms of the scratch
   // and of the staged input, fixed for the handle's life: each region is rank
   // 0's address, rank r's exchange_stride_rank_bytes() * r past it (a kernel
@@ -667,13 +655,13 @@ class Handle {
   // of what it is. A captured launch is numbered at capture; its replays are
   // not counted (a graph replay runs none of our host code).
   uint32_t begin_launch(OpType op, const void* kernel, int64_t m, int64_t n,
-                        DType dtype, hipStream_t stream, bool staged) {
+                        DType dtype, hipStream_t stream) {
     const uint32_t launch = log_->next_launch();
     if (!log_->everything()) return launch;
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     HIP_CHECK(hipStreamIsCapturing(stream, &capture));
     const uint8_t flags = static_cast<uint8_t>(
-        (capture == hipStreamCaptureStatusActive ? 1 : 0) | (staged ? 2 : 0));
+        capture == hipStreamCaptureStatusActive ? 1 : 0);
     log_->write({static_cast<uint8_t>(LogKind::launch_issued), flags,
                  stream_index(stream), launch, kernel_index(kernel),
                  static_cast<uint16_t>(op), static_cast<uint32_t>(m),
@@ -705,8 +693,7 @@ class Handle {
   // logged OpenCheck that fails open naming it, each observation of the
   // broader state a logged OpenWarning. No collective beyond the CPU group's
   // gather the descriptor exchange already makes.
-  void open(const Gather& gather, double timeout_seconds, int rccl_ready,
-            const BuildInfo& build) {
+  void open(const Gather& gather, double timeout_seconds, int rccl_ready) {
     Log& log = *log_;
     log.phase(OpenPhase::log_ready, static_cast<uint32_t>(kLogCapacity));
     int current = -1;
@@ -829,28 +816,16 @@ class Handle {
     // own argument, a buffer of kStatusFields words.
     status_ = log.status_host();
     device_status_ = log.status_device();
-    // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table:
-    // read by this rank's kernels only.
-    const int64_t slots = build.memory.peer_ptr_slots;
-    HIP_CHECK(hipMalloc(
-        &slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
-    slab_end_ = slab_ + slots * kMaxRanks;
-    cursor_ = slab_;
     // EACH RANK'S EXCHANGE is [ scratch | scratch values | scratch scales |
     // staging values | staging scales | staging ], at the same offsets on every
     // rank, so each region is rank 0's address and the exchange's rank stride
     // (scratch_ptr(), exchange_stride_rank_bytes()). The STAGED INPUT'S LIES
     // PAST EVERY KERNEL'S SCRATCH, since an INT4 two-shot writes it before its
     // first barrier, while a peer may still read this rank's scratch after its
-    // last (common.cuh's publish_staged). AN EAGER INPUT IS READ AS AN INPUT,
-    // through a table like any registered one (`input_ptrs`), so the staging
-    // also has its table, written once, registered here.
-    std::vector<void*> staging(world_size_);
-    for (int i = 0; i < world_size_; ++i)
-      staging[i] = exchange_->at(i) + staging_offset();
-    staging_ptrs_ = next_slot();
-    write_slot(staging_ptrs_, staging);
-    log.phase(OpenPhase::tables_written);
+    // last. Every kernel copies its input into its staging (or, INT4, its
+    // staging values and scales) before its first barrier, which is ordered,
+    // and its peers read it there, at rank 0's address and the rank stride:
+    // no table.
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -897,28 +872,6 @@ class Handle {
            2 * (quantized_values_bytes_ + quantized_scales_bytes_);
   }
 
-  // The peers' view of `input`: EVERY INPUT is copied into this rank's staging
-  // on the launch's stream (a copy node when captured), and the peers read the
-  // staging, which every rank mapped at open: one path, eager and captured
-  // alike, and no peer ever reads memory we did not allocate (no IPC, no
-  // registration). aiter's VMM transport does the same (copy-in on gfx1250).
-  void** slot_for(void* input, int64_t bytes, hipStream_t stream) {
-    if (bytes > staging_bytes_) {
-      std::ostringstream os;
-      os << "hip_custom_communicator: a " << bytes
-         << "-byte input exceeds the " << staging_bytes_ << "-byte staging";
-      throw std::runtime_error(os.str());
-    }
-    HIP_CHECK(hipMemcpyAsync(staging(), input, static_cast<size_t>(bytes),
-                             hipMemcpyDeviceToDevice, stream));
-    if (log_->everything())
-      log_->write({static_cast<uint8_t>(LogKind::copy_in_issued), 0,
-                   stream_index(stream), log_->launches(), 0, 0,
-                   static_cast<uint32_t>(bytes),
-                   static_cast<uint32_t>(staging_bytes_), 0, host_ns()});
-    return staging_ptrs_;
-  }
-
   // A STREAM'S AND A KERNEL'S INDEX in the log, recorded the first time each
   // is seen with its address (stream_seen, kernel_seen).
   uint16_t stream_index(hipStream_t stream) {
@@ -944,24 +897,6 @@ class Handle {
     return i;
   }
 
-  // A TABLE, kMaxRanks addresses of the slab.
-  void** next_slot() {
-    if (cursor_ >= slab_end_)
-      throw std::runtime_error(
-          "hip_custom_communicator: peer-pointer slab is full; allocate a "
-          "larger one");
-    void** slot = cursor_;
-    cursor_ += kMaxRanks;
-    return slot;
-  }
-
-  void write_slot(void** slot, const std::vector<void*>& ptrs) {
-    std::vector<void*> host(kMaxRanks, nullptr);
-    for (int i = 0; i < world_size_; ++i) host[i] = ptrs[i];
-    HIP_CHECK(hipMemcpy(slot, host.data(), kMaxRanks * sizeof(void*),
-                        hipMemcpyHostToDevice));
-  }
-
   int rank_;
   int world_size_;
   int device_;
@@ -982,10 +917,6 @@ class Handle {
   uint32_t* status_ = nullptr;
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
-  void** staging_ptrs_ = nullptr;
-  void** slab_ = nullptr;
-  void** slab_end_ = nullptr;
-  void** cursor_ = nullptr;
   mutable std::unordered_map<const void*, Resources> resources_;
 };
 
@@ -1018,9 +949,9 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   hipFuncAttributes attrs;
   const hipError_t found = hipFuncGetAttributes(
       &attrs, reinterpret_cast<const void*>(
-                  all_reduce_pull_one_shot<c10::BFloat16, 2, 1,
-                                           kWaveSize * traits<c10::BFloat16>::N,
-                                           kWaveSize, 1>));
+                  all_reduce_pull_one_shot_staged<
+                      c10::BFloat16, 2, 1, kWaveSize * traits<c10::BFloat16>::N,
+                      kWaveSize, 1>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;

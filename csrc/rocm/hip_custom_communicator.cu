@@ -182,7 +182,7 @@ using BuildInfoWire =
 // AN OP'S ANSWER, primitive ints: [the Error's number it was refused for, or -1
 // when it ran; then, when it ran, WHAT RAN, for the flight recorder: algorithm,
 // direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu,
-// staged (1 or 0), tile_k, reduce_scatter_blocks (0 where the op has none),
+// tile_k, reduce_scatter_blocks (0 where the op has none),
 // quantization (common.cuh's Quantization)].
 using Answer = std::vector<int64_t>;
 Answer refusal(hip_custom_communicator::Error e) {
@@ -193,8 +193,7 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
     return refusal(*e);
   const LAUNCH& l = std::get<LAUNCH>(got);
-  int64_t staged = 0, tile_k = 0, reduce_scatter_blocks = 0;
-  if constexpr (requires { l.staged; }) staged = l.staged ? 1 : 0;
+  int64_t tile_k = 0, reduce_scatter_blocks = 0;
   if constexpr (requires { l.tile_k; }) tile_k = l.tile_k;
   if constexpr (requires { l.reduce_scatter_blocks; })
     reduce_scatter_blocks = l.reduce_scatter_blocks;
@@ -206,7 +205,6 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
           l.threads_per_block,
           l.blocks_per_grid,
           l.waves_per_eu,
-          staged,
           tile_k,
           reduce_scatter_blocks,
           static_cast<int64_t>(l.quantization)};

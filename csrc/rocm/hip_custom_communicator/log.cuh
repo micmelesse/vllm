@@ -80,11 +80,11 @@ enum class LogKind : uint8_t {
                        // it failed (open fails), else 0
   open_warning = 3,    // barrier: the OpenWarning; peer; seen, want
   launch_issued = 4,   // launch; kernel: the kernel's index (kernel_seen);
-                       // block: the OpType; barrier: bit 0 capturing, bit 1
-                       // staged; peer: the stream's index (stream_seen);
+                       // block: the OpType; barrier: bit 0 capturing;
+                       // peer: the stream's index (stream_seen);
                        // seen, want: m, n; extra: the DType
-  copy_in_issued = 5,  // launch; peer: the stream's index; seen: bytes;
-                       // want: the staging's bytes
+  copy_in_issued = 5,  // retired (the kernels copy their input into the
+                       // staging themselves); kept so the numbers hold
   stream_seen = 6,     // peer: the stream's index; seen, want: its handle's
                        // low and high words
   kernel_seen = 7,     // kernel: its index; seen, want: its address's words
@@ -111,7 +111,7 @@ enum class OpenPhase : uint8_t {
   imported,               // seen: peers imported, a buffer each
   mapped,
   access_set,
-  tables_written,
+  tables_written,  // retired (no peer tables); kept so the numbers hold
   checked,  // every OpenCheck passed; seen: warnings
   open_done,
 };
