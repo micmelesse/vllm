@@ -1548,27 +1548,36 @@ DINLINE float int4_inverse(float scale) {
 }
 
 // A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale stored, BY THE MAGIC
-// NUMBER, in place: fma(x, inv * 16^p, 1.5 * 2^(23 + 4p) + 8 * 16^p) rounds to a multiple of 16^p,
-// so q + 8 lands in bits 4p..4p+3, clamped (med3) and masked into the word; elements 2p and 2p + 1
-// share p (one packed fma), the odd ones' half then shifted up 16.
+// NUMBER: fma(x, inv, 1.5 * 2^23 + 8) rounds x * inv to an integer (the sum's ulp is 1) and leaves
+// q + 8 in the low 4 bits, the rest of its low byte 0; clamped by med3 (two elements a packed fma).
+// Then packed by bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the
+// word, and two v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word,
+// where a shift and an OR an element was 16).
 template <int P>
 DINLINE uint32_t int4_word(const float (&x)[P], float inv) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  uint32_t half[2] = {0, 0};
+  constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
+  uint32_t q[P];
 #pragma unroll
   for (int p = 0; p < P / 2; ++p) {
-    const float unit = static_cast<float>(1 << (4 * p));
-    const float lowest = 12582912.0f * unit;  // 1.5 * 2^23, q + 8 = 0
-    const f32x2 y = __builtin_elementwise_fma(f32x2{x[2 * p], x[2 * p + 1]},
-                                              f32x2{inv * unit, inv * unit},
-                                              f32x2{lowest + 8.0f * unit, lowest + 8.0f * unit});
+    const f32x2 y = __builtin_elementwise_fma(f32x2{x[2 * p], x[2 * p + 1]}, f32x2{inv, inv},
+                                              f32x2{kLowest + 8.0f, kLowest + 8.0f});
 #pragma unroll
     for (int e = 0; e < 2; ++e)
-      half[e] |= __builtin_bit_cast(
-                     uint32_t, __builtin_amdgcn_fmed3f(y[e], lowest, lowest + 15.0f * unit)) &
-                 (0xFu << (4 * p));
+      q[2 * p + e] = __builtin_bit_cast(
+          uint32_t, __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + 15.0f));
   }
-  return half[0] | half[1] << 16;
+  // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2 (QUANTIZATION's layout)
+  const auto nibbles = [](uint32_t high, uint32_t low) {
+    uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift and an or)
+    asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
+    return byte;
+  };
+  const uint32_t even_low = nibbles(q[2], q[0]), even_high = nibbles(q[6], q[4]);
+  const uint32_t odd_low = nibbles(q[3], q[1]), odd_high = nibbles(q[7], q[5]);
+  return __builtin_amdgcn_perm(__builtin_amdgcn_perm(odd_high, odd_low, 0x0c0c0400u),
+                               __builtin_amdgcn_perm(even_high, even_low, 0x0c0c0400u),
+                               0x05040100u);
 }
 
 // A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
