@@ -84,6 +84,8 @@ inline int64_t extent_bytes(int64_t m, int64_t n, int64_t stride_m,
 // so no peer reads it where it is; in place, the peers read it through its
 // input table.
 inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
+  h.begin_launch(OpType::all_reduce, l.kernel, l.input_size_m, l.input_size_n,
+                 l.dtype, l.stream, l.staged);
   const bool one_shot = l.algorithm == Algorithm::one_shot;
   if (l.staged && one_shot)
     Call<AllReduceOneShotStagedKernel>::run(
@@ -168,6 +170,8 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
 
 inline void launch_all_reduce_rms_norm(Handle& h,
                                        const AllReduceRmsNormLaunch& l) {
+  h.begin_launch(OpType::all_reduce_rms_norm, l.kernel, l.input_size_m,
+                 l.input_size_n, l.dtype, l.stream, false);
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
   const QuantizedBuffers q = quantized_buffers(h, l.quantization);
@@ -217,6 +221,8 @@ inline void launch_all_reduce_rms_norm(Handle& h,
 
 inline void launch_all_reduce_add_rms_norm(Handle& h,
                                            const AllReduceAddRmsNormLaunch& l) {
+  h.begin_launch(OpType::all_reduce_add_rms_norm, l.kernel, l.input_size_m,
+                 l.input_size_n, l.dtype, l.stream, false);
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
   const QuantizedBuffers q = quantized_buffers(h, l.quantization);
@@ -277,6 +283,8 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
 // THE PULL TWO-SHOT takes its reduce-scatter blocks last.
 inline void launch_all_reduce_add_attn_res_rms_norm(
     Handle& h, const AllReduceAddAttnResRmsNormLaunch& l) {
+  h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, l.kernel,
+                 l.input_size_m, l.input_size_n, l.dtype, l.stream, false);
   const int64_t bytes =
       extent_bytes(l.input_size_m, l.input_size_n, l.input_stride_m, l.dtype);
   const QuantizedBuffers q = quantized_buffers(h, l.quantization);

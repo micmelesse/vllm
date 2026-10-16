@@ -220,13 +220,20 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
 // serves (for a model, the server's tokens a batch by its hidden size), from
 // which its exchange is sized (`exchange_sizes`). `quantization`: what its
 // tuned calls move across the links, a Quantization (select.cuh's
-// `quantizes`). A torch op cannot return a variant, so it is two
-// optionals and exactly one is set, the handle or the Error's number.
+// `quantizes`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
+// caller found the device group's RCCL communicator set up (1), not (0), or
+// could not tell (-1), logged as an observation. A torch op cannot return a
+// variant, so it is two optionals and exactly one is set, the handle or the
+// Error's number.
 OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
                                       int64_t device, double timeout_seconds,
                                       int64_t max_rows, int64_t max_cols,
-                                      int64_t quantization) {
+                                      int64_t quantization, int64_t log_mode,
+                                      int64_t rccl_ready) {
+  TORCH_CHECK(
+      log_mode == 0 || log_mode == 1,
+      "a communicator's log mode is errors (0) or everything (1): ", log_mode);
   TORCH_CHECK(max_rows > 0 && max_cols > 0,
               "the largest call a communicator serves has rows and columns: "
               "max_rows=",
@@ -251,10 +258,12 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
   const auto sizes =
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
-      (*pg)->getRank(), world, gather_over(*pg), timeout_seconds, max_rows,
-      max_cols, sizes.scratch_bytes, sizes.quantized_values_bytes,
-      sizes.quantized_scales_bytes, sizes.staging_bytes,
-      static_cast<int>(quantization));
+      (*pg)->getRank(), world, static_cast<int>(device), gather_over(*pg),
+      timeout_seconds, max_rows, max_cols, sizes.scratch_bytes,
+      sizes.quantized_values_bytes, sizes.quantized_scales_bytes,
+      sizes.staging_bytes, static_cast<int>(quantization),
+      static_cast<hip_custom_communicator::LogMode>(log_mode),
+      static_cast<int>(rccl_ready));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -384,6 +393,15 @@ std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr) {
   for (const auto& f : handle_of(handle_ptr).signals())
     flat.insert(flat.end(), f.begin(), f.end());
   return flat;
+}
+std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr) {
+  std::vector<uint32_t> words;
+  if (handle_ptr != 0) {
+    words = handle_of(handle_ptr).log_words();
+  } else if (const auto log = hip_custom_communicator::last_log()) {
+    words = log->words();
+  }
+  return std::vector<int64_t>(words.begin(), words.end());
 }
 void hip_custom_communicator_abort(fptr_t handle_ptr) {
   handle_of(handle_ptr).abort();

@@ -29,11 +29,11 @@ import threading
 import time
 import warnings
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar, Literal, final
+from typing import ClassVar, Literal, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -168,6 +168,331 @@ class Status:
 
     abort: bool
     fault: Fault | None
+
+
+# --------------------------------------------------------------------------------
+# THE STATE LOG (C++'s log.cuh): the kernels' status words, a header, and a ring of
+# 32-byte records, in host-mapped memory. Each enum is C++'s, number for number.
+# --------------------------------------------------------------------------------
+
+LogMode = Literal["errors", "everything"]
+_LOG_MODES: tuple[LogMode, ...] = ("errors", "everything")
+
+
+class LogKind(IntEnum):
+    empty = 0
+    open_phase = 1
+    open_check = 2
+    open_warning = 3
+    launch_issued = 4
+    copy_in_issued = 5
+    stream_seen = 6
+    kernel_seen = 7
+    deadline_expired = 8
+    entered = 16
+    barrier_signal = 17
+    barrier_passed = 18
+    wait_timeout = 19
+    aborted = 20
+    exited = 21
+
+
+class OpenPhase(IntEnum):
+    none = 0
+    log_ready = 1
+    signals_allocated = 2
+    exchange_allocated = 3
+    zeroed = 4
+    exported = 5
+    socket_exchange_begun = 6
+    socket_exchange_done = 7
+    imported = 8
+    mapped = 9
+    access_set = 10
+    tables_written = 11
+    checked = 12
+    open_done = 13
+
+
+class OpenCheck(IntEnum):
+    none = 0
+    current_device = 1
+    peer_imported = 2
+    access_rw = 3
+    geometry = 4
+    can_access_peer = 5
+    signals_zero = 6
+
+
+class OpenWarning(IntEnum):
+    none = 0
+    rccl_not_ready = 1
+    rccl_unknown = 2
+    other_processes = 3
+    duplicate_device = 4
+    host_mismatch = 5
+    granularity_mismatch = 6
+    low_memory = 7
+    pointer_device = 8
+    peer_not_visible = 9
+
+
+_LOG_MAGIC = 0x474F4C48
+_HEADER = 16  # the header's first word
+_DTYPE_NAMES = ("f16", "bf16", "f32")
+
+
+@dataclass(frozen=True)
+class LogRecord:
+    """ONE RECORD of the ring, its fields as C++'s `LogRecord` holds them."""
+
+    kind: LogKind
+    barrier: int  # a barrier index, or the phase, check or warning
+    peer: int
+    launch: int
+    kernel: int
+    block: int
+    seen: int
+    want: int
+    extra: int
+    clock: int  # host records: CLOCK_MONOTONIC ns
+
+    @staticmethod
+    def of(w: Sequence[int]) -> "LogRecord":
+        return LogRecord(
+            kind=LogKind(w[0] & 0xFF),
+            barrier=(w[0] >> 8) & 0xFF,
+            peer=w[0] >> 16,
+            launch=w[1],
+            kernel=w[2] & 0xFFFF,
+            block=w[2] >> 16,
+            seen=w[3],
+            want=w[4],
+            extra=w[5],
+            clock=w[6] | (w[7] << 32),
+        )
+
+    def warning(self) -> str:
+        """An open_warning record as the sentence it stands for."""
+        w = OpenWarning(self.barrier)
+        match w:
+            case OpenWarning.rccl_not_ready:
+                return (
+                    "RCCL for this group is not set up yet; its lazy setup will "
+                    "run after our VMM mapping (on 2026-10-16 that hung)"
+                )
+            case OpenWarning.rccl_unknown:
+                return "whether RCCL for this group is set up could not be told"
+            case OpenWarning.other_processes:
+                return (
+                    f"{self.seen} other processes hold {self.want} MiB of device "
+                    "memory on this GPU"
+                )
+            case OpenWarning.duplicate_device:
+                return (
+                    f"rank {self.peer} (pid {self.seen}) is on this rank's GPU "
+                    f"(pid {self.want})"
+                )
+            case OpenWarning.host_mismatch:
+                return f"rank {self.peer} is on another host"
+            case OpenWarning.granularity_mismatch:
+                return (
+                    f"rank {self.peer}'s VMM granularity {self.seen} differs from "
+                    f"this rank's {self.want}"
+                )
+            case OpenWarning.low_memory:
+                return f"{self.seen} MiB free, open allocates {self.want} MiB"
+            case OpenWarning.pointer_device:
+                got = "an error" if self.seen == 0xFFFFFFFF else f"device {self.seen}"
+                return (
+                    f"rank {self.peer}'s mapped slice reports {got}, its GPU is "
+                    f"device {self.want}"
+                )
+            case OpenWarning.peer_not_visible:
+                return (
+                    f"rank {self.peer}'s GPU is not visible in this process; its "
+                    "device checks were skipped"
+                )
+        return w.name
+
+    def __str__(self) -> str:
+        k = self.kind
+        if k is LogKind.open_phase:
+            failed = f" FAILED (error {self.extra})" if self.extra else ""
+            return (
+                f"open_phase {OpenPhase(self.barrier).name} seen={self.seen} "
+                f"want={self.want}{failed}"
+            )
+        if k is LogKind.open_check:
+            verdict = "FAILED" if self.extra else "ok"
+            return (
+                f"open_check {OpenCheck(self.barrier).name} rank {self.peer} "
+                f"{verdict} seen={self.seen} want={self.want}"
+            )
+        if k is LogKind.open_warning:
+            return f"open_warning {OpenWarning(self.barrier).name}: {self.warning()}"
+        if k is LogKind.launch_issued:
+            dtype = (
+                _DTYPE_NAMES[self.extra]
+                if self.extra < len(_DTYPE_NAMES)
+                else str(self.extra)
+            )
+            mode = "captured" if self.barrier & 1 else "eager"
+            staged = " staged" if self.barrier & 2 else ""
+            ops = get_args(Op)
+            op = ops[self.block] if self.block < len(ops) else str(self.block)
+            return (
+                f"launch_issued #{self.launch} {op} kernel "
+                f"{self.kernel} {self.seen}x{self.want} {dtype} stream {self.peer} "
+                f"{mode}{staged}"
+            )
+        if k is LogKind.copy_in_issued:
+            return (
+                f"copy_in_issued #{self.launch} {self.seen} bytes of the "
+                f"{self.want}-byte staging, stream {self.peer}"
+            )
+        if k is LogKind.stream_seen:
+            return f"stream_seen {self.peer} = {self.seen | (self.want << 32):#x}"
+        if k is LogKind.kernel_seen:
+            return f"kernel_seen {self.kernel} = {self.seen | (self.want << 32):#x}"
+        return (
+            f"{k.name} launch {self.launch} kernel {self.kernel} block {self.block} "
+            f"barrier {self.barrier} peer {self.peer} seen {self.seen} want "
+            f"{self.want} extra {self.extra} clock {self.clock}"
+        )
+
+
+@dataclass(frozen=True)
+class Log:
+    """A RANK'S STATE LOG, the host's fold of C++'s header and ring: what open
+    reached, how many launches were issued, the fault if one was recorded, and the
+    records still in the ring, oldest first."""
+
+    mode: LogMode
+    rank: int
+    world: int
+    device: int
+    timeout_ticks: int
+    clock_khz: int
+    phase: OpenPhase
+    launches: int
+    abort: bool
+    cursor: int
+    dropped: int
+    failed: OpenCheck
+    fault: "Fault | None"
+    records: tuple[LogRecord, ...]
+
+    @staticmethod
+    def of(words: Sequence[int]) -> "Log | None":
+        """The log from its words, None when there are none (no log was made)."""
+        if len(words) <= _HEADER or words[_HEADER] != _LOG_MAGIC:
+            return None
+        h = words[_HEADER : _HEADER + 16]
+        capacity, offset = h[13], h[14] // 4
+        cursor = h[11]
+        first = max(0, cursor - capacity)
+        records = []
+        for n in range(first, cursor):
+            at = offset + 8 * (n % capacity)
+            r = LogRecord.of(words[at : at + 8])
+            if r.kind is not LogKind.empty:
+                records.append(r)
+        khz = h[8]
+        return Log(
+            mode=_LOG_MODES[h[2]],
+            rank=h[3],
+            world=h[4],
+            device=h[5],
+            timeout_ticks=h[6] | (h[7] << 32),
+            clock_khz=khz,
+            phase=OpenPhase(h[9]),
+            launches=h[10],
+            abort=words[0] != 0,
+            cursor=cursor,
+            dropped=h[12],
+            failed=OpenCheck(h[15]),
+            fault=_fault_of(words, khz),
+            records=tuple(records),
+        )
+
+    def warnings(self) -> list[str]:
+        return [r.warning() for r in self.records if r.kind is LogKind.open_warning]
+
+    def lines(self, last: int = 40) -> list[str]:
+        timeout_s = (
+            self.timeout_ticks / (self.clock_khz * 1000.0) if self.clock_khz else 0.0
+        )
+        out = [
+            f"hip_custom_communicator log: rank {self.rank} of {self.world}, device "
+            f"{self.device}, mode {self.mode}, open phase {self.phase.name}, "
+            f"launches {self.launches}, timeout {timeout_s:.2f} s "
+            f"({self.timeout_ticks} ticks at {self.clock_khz} kHz), abort "
+            f"{int(self.abort)}, records {self.cursor} (dropped {self.dropped})"
+        ]
+        if self.failed is not OpenCheck.none:
+            out.append(f"open failed its check: {self.failed.name}")
+        out.append(f"fault: {self.fault}" if self.fault else "fault: none")
+        shown = self.records[-last:]
+        if shown:
+            t0 = shown[0].clock
+            out.append(f"last {len(shown)} of {len(self.records)} records:")
+            out += [f"  +{(r.clock - t0) / 1e9:10.6f} s  {r}" for r in shown]
+        return out
+
+    def __str__(self) -> str:
+        return "\n".join(self.lines())
+
+
+def _fault_of(words: Sequence[int], khz: int) -> "Fault | None":
+    """The kernels' fault record, from the status words at the log's front."""
+    if FaultState(words[1]) is not FaultState.written:
+        return None
+
+    def signed(w: int) -> int:
+        return w - (1 << 32) if w >= 1 << 31 else w
+
+    ticks = words[8] | (words[9] << 32)
+    return Fault(
+        where=Where(words[2]),
+        rank=signed(words[3]),
+        block=signed(words[4]),
+        peer=signed(words[5]),
+        count=words[6],
+        want=words[7],
+        waited_s=ticks / (khz * 1000.0) if khz else 0.0,
+    )
+
+
+def last_log() -> Log | None:
+    """THE LAST LOG THIS PROCESS MADE, kept by C++ past a failed open and readable
+    while an open still runs: where an open failed or hangs."""
+    return Log.of(torch.ops._rocm_C.hip_custom_communicator_log(0))
+
+
+def configured_log_mode() -> LogMode:
+    """What `VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG` asks (errors by default)."""
+    import vllm.envs as envs
+
+    return (
+        "everything"
+        if envs.VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG == "everything"
+        else "errors"
+    )
+
+
+def rccl_ready(group: ProcessGroup, device: torch.device) -> int:
+    """Whether `group`'s RCCL communicator is set up already (1), not yet (0), or
+    cannot be told (-1). torch's ProcessGroupNCCL builds it lazily, at the first
+    collective; `_is_initialized` reads that without starting it."""
+    try:
+        backend = group._get_backend(device)
+        is_initialized = getattr(backend, "_is_initialized", None)
+        if is_initialized is None:
+            return -1
+        return 1 if is_initialized() else 0
+    except (RuntimeError, AttributeError, ValueError):
+        return -1
 
 
 # C++'s `DType` names, as torch's dtypes.
@@ -385,21 +710,31 @@ def open_handle(
     max_rows: int,
     max_cols: int,
     quantization: Quantization,
+    log_mode: LogMode = "errors",
+    rccl_ready: int = -1,
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
     C++'s opener, so its arguments are written once. `quantization`: what the calls C++
-    picks move across the links (each op's crossover is C++'s, `select.cuh`)."""
-    handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
-        cpu_group,
-        device_group,
-        device,
-        timeout_seconds,
-        max_rows,
-        max_cols,
-        _QUANTIZATIONS.index(quantization),
-    )
+    picks move across the links (each op's crossover is C++'s, `select.cuh`).
+    `log_mode`: what the state log records. `rccl_ready`: whether the device group's
+    RCCL communicator was found set up (`rccl_ready`), logged as an observation. An
+    open that fails one of its checks raises, naming it, with the log appended."""
+    try:
+        handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
+            cpu_group,
+            device_group,
+            device,
+            timeout_seconds,
+            max_rows,
+            max_cols,
+            _QUANTIZATIONS.index(quantization),
+            _LOG_MODES.index(log_mode),
+            rccl_ready,
+        )
+    except RuntimeError as e:
+        raise RuntimeError(f"{e}\n{last_log() or 'no log was made'}") from e
     return Error(err) if err is not None else handle
 
 
@@ -629,6 +964,7 @@ class HipCustomCommunicator:
         max_rows: int | None = None,
         max_cols: int | None = None,
         quantization: Quantization | None = None,
+        log_mode: LogMode | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
@@ -637,7 +973,9 @@ class HipCustomCommunicator:
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
         sized for; None is the server's (`problem_size`). `quantization`: what the
         calls C++ picks move across the links, from each op's crossover up; None is
-        what the environment asks (`configured_quantization`)."""
+        what the environment asks (`configured_quantization`). `log_mode`: what the
+        state log records (`log()`); None is what the environment asks
+        (`configured_log_mode`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -655,6 +993,7 @@ class HipCustomCommunicator:
         self.quantization: Quantization = (
             configured_quantization() if quantization is None else quantization
         )
+        self.log_mode: LogMode = configured_log_mode() if log_mode is None else log_mode
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
@@ -1015,12 +1354,21 @@ class HipCustomCommunicator:
         self._abort()
         calls = "\n".join(f"  {c}" for c in reversed(self._calls))
         logger.error(
-            "%s broken: %s. Its last %d launches, the last first:\n%s",
+            "%s broken: %s. Its last %d launches, the last first:\n%s\n%s",
             type(self).__name__,
             cause,
             len(self._calls),
             calls or "  (none)",
+            self._log_text(),
         )
+
+    def _log_text(self) -> str:
+        """The state log as text, or why there is none (a test's bare instance)."""
+        try:
+            got = self.log()
+        except (RuntimeError, AttributeError) as e:
+            return f"(no log: {e})"
+        return str(got) if got is not None else "(no log)"
 
     @final
     def _admit(self, input: torch.Tensor) -> None:
@@ -1094,10 +1442,16 @@ class HipCustomCommunicator:
             self.max_rows,
             self.max_cols,
             self.quantization,
+            self.log_mode,
+            rccl_ready(self.device_group, self.device),
         )
         if isinstance(handle, Error):
             return handle.name
         self._handle = handle
+        # WHAT OPEN OBSERVED of the broader state: warnings, never a failure.
+        opened = self.log()
+        for warning in opened.warnings() if opened is not None else []:
+            logger.warning("HipCustomCommunicator open: %s", warning)
         self._khz = torch.ops._rocm_C.hip_custom_communicator_wall_clock_khz(
             self.device.index
         )
@@ -1303,6 +1657,13 @@ class HipCustomCommunicator:
                 waited_s=ticks / (self._khz * 1000.0),
             )
         return Status(abort=abort != 0, fault=fault)
+
+    def log(self) -> Log | None:
+        """This rank's state log (`Log`), read from host-mapped memory, so it never
+        waits on the device: readable while a kernel is hung. None once closed."""
+        if self._handle is None:
+            return None
+        return Log.of(torch.ops._rocm_C.hip_custom_communicator_log(self._handle))
 
     def signals(self) -> list[Flag]:
         """Every flag of this rank's signals, each `clear` between launches. C++

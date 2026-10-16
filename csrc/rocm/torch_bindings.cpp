@@ -114,6 +114,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("hip_custom_communicator_signals",
                &hip_custom_communicator_signals);
   rocm_ops.def("hip_custom_communicator_abort", &hip_custom_communicator_abort);
+  rocm_ops.def("hip_custom_communicator_log", &hip_custom_communicator_log);
   rocm_ops.def(
       "hip_custom_communicator_register_buffer(int handle_ptr, Tensor buffer, "
       "str group) -> ()",

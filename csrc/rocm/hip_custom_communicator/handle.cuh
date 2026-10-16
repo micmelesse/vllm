@@ -17,6 +17,7 @@
 
 #include <c10/util/BFloat16.h>
 #include <hip/hip_runtime.h>
+#include <dirent.h>
 #include <poll.h>
 #include <iomanip>
 #include <sys/socket.h>
@@ -24,6 +25,8 @@
 #include <unistd.h>
 
 #include <array>
+#include <fstream>
+#include <memory>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -38,6 +41,7 @@
 #include <vector>
 
 #include "kernels/common.cuh"
+#include "log.cuh"
 #include "types.cuh"
 #include "kernels/all_reduce.cuh"
 
@@ -118,6 +122,19 @@ class Fd {
                            std::strerror(errno));
 }
 
+// WHAT EACH RANK SAYS ABOUT ITSELF, gathered with the socket names (the one
+// gather open already makes): what open compares across ranks (warnings) and
+// how a peer's GPU is found in this process (its PCI bus id). Fixed width, as
+// the gather moves equal lengths.
+struct RankInfo {
+  char socket[64];
+  char pci_bus_id[32];
+  char host[64];
+  int32_t pid;
+  int32_t device;
+  int64_t granularity;
+};
+
 // EVERY RANK'S FILE DESCRIPTORS, `mine` sent to every peer and theirs received,
 // over Unix sockets (a descriptor crosses processes only as SCM_RIGHTS), a
 // collective: every rank calls it together. Each rank listens on an abstract
@@ -129,10 +146,10 @@ class Fd {
 // buffered before the peer accepts it (the backlog holds every peer).
 // `theirs[r]` is rank r's, `mine` again at this rank. A peer that has not sent
 // within `timeout_seconds` is an error naming how many did.
-inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
-                                                 const Gather& gather,
-                                                 const std::vector<int>& mine,
-                                                 double timeout_seconds) {
+// `me` goes round with the names; `all[r]` is rank r's, `me` at this rank.
+inline std::vector<std::vector<Fd>> exchange_fds(
+    int rank, int world, const Gather& gather, const std::vector<int>& mine,
+    double timeout_seconds, RankInfo me, Log& log, std::vector<RankInfo>& all) {
   const size_t n = mine.size();
   Fd listener(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
   if (listener.get() < 0) sys_fail("socket");
@@ -145,6 +162,10 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
      << ::getpid() << "/" << std::setw(10) << entropy() << "/" << std::setw(5)
      << rank;
   const std::string name = os.str();
+  if (name.size() + 1 > sizeof(me.socket))
+    throw std::runtime_error("hip_custom_communicator: socket name too long");
+  std::memset(me.socket, 0, sizeof(me.socket));
+  std::memcpy(me.socket, name.data(), name.size());
   const auto address = [](const std::string& s, sockaddr_un& a) {
     std::memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
@@ -160,7 +181,19 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
   if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&a), len) != 0)
     sys_fail("bind " + name);
   if (::listen(listener.get(), world) != 0) sys_fail("listen");
-  const std::vector<std::string> names = gather(name);
+  log.phase(OpenPhase::socket_exchange_begun, static_cast<uint32_t>(world - 1));
+  const std::vector<std::string> gathered =
+      gather(std::string(reinterpret_cast<const char*>(&me), sizeof(me)));
+  all.assign(world, RankInfo{});
+  std::vector<std::string> names(world);
+  for (int p = 0; p < world; ++p) {
+    if (gathered[p].size() != sizeof(RankInfo))
+      throw std::runtime_error(
+          "hip_custom_communicator: a gathered rank record of the wrong size");
+    std::memcpy(&all[p], gathered[p].data(), sizeof(RankInfo));
+    all[p].socket[sizeof(all[p].socket) - 1] = 0;
+    names[p] = all[p].socket;
+  }
   // A rank's message: its rank, then its descriptors as SCM_RIGHTS.
   for (int p = 0; p < world; ++p) {
     if (p == rank) continue;
@@ -190,11 +223,14 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
     pollfd pf{listener.get(), POLLIN, 0};
     const int ready = ::poll(&pf, 1, static_cast<int>(timeout_seconds * 1000));
     if (ready <= 0) {
-      if (ready == 0)
+      if (ready == 0) {
+        log.phase(OpenPhase::socket_exchange_done, static_cast<uint32_t>(got),
+                  static_cast<uint32_t>(world - 1), 1);
         throw std::runtime_error(
             "hip_custom_communicator: " + std::to_string(got) + " of " +
             std::to_string(world - 1) +
             " peers sent their memory's descriptors before the timeout");
+      }
       sys_fail("poll");
     }
     Fd c(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
@@ -221,6 +257,8 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
     std::memcpy(fds.data(), CMSG_DATA(c0), n * sizeof(int));
     for (int fd : fds) theirs[payload].emplace_back(fd);
   }
+  log.phase(OpenPhase::socket_exchange_done, static_cast<uint32_t>(world - 1),
+            static_cast<uint32_t>(world - 1));
   return theirs;
 }
 
@@ -270,17 +308,71 @@ class SymmetricMemory {
     return Fd(fd);
   }
 
-  // Every peer's memory, imported from its descriptor (`fds[r]`, rank r's) and
-  // mapped at its place.
-  void map_peers(const std::vector<int>& fds) {
+  // Every peer's memory, imported from its descriptor (`fds[r]`, rank r's),
+  // then mapped at its place, then made accessible: three steps, so open's log
+  // says which one it reached.
+  void import_peers(const std::vector<int>& fds) {
     for (int r = 0; r < world_; ++r) {
       if (r == rank_) continue;
       HIP_CHECK(hipMemImportFromShareableHandle(
           &peers_[r], reinterpret_cast<void*>(static_cast<intptr_t>(fds[r])),
           hipMemHandleTypePosixFileDescriptor));
-      map(r);
-      allow_access(r);
     }
+  }
+  void map_peers() {
+    for (int r = 0; r < world_; ++r)
+      if (r != rank_) map(r);
+  }
+  void allow_peers() {
+    for (int r = 0; r < world_; ++r)
+      if (r != rank_) allow_access(r);
+  }
+
+  // OPEN'S ASSERTS ON THIS ALLOCATION, each logged (Log::check): every
+  // peer's imported and mapped, every slice read-write from this device, the
+  // geometry what was asked. False when one failed (the log names it).
+  // `peer_devices[r]`: rank r's GPU in this process, -1 if not visible; a
+  // slice whose hipPointerGetAttributes names another device is a warning,
+  // not a failure (what the runtime reports for an imported VMM slice is not
+  // established).
+  bool verify(Log& log, const std::vector<int>& peer_devices) const {
+    bool ok = true;
+    const bool geometry =
+        granularity_ > 0 && stride_ % granularity_ == 0 && stride_ >= bytes_ &&
+        reinterpret_cast<uintptr_t>(base_) % granularity_ == 0;
+    log.check(OpenCheck::geometry, geometry, rank_,
+              static_cast<uint32_t>(stride_ / 1024),
+              static_cast<uint32_t>(granularity_ / 1024));
+    ok = ok && geometry;
+    for (int r = 0; r < world_; ++r) {
+      const bool present = peers_[r] != nullptr &&
+                           mapped_.size() == size_t(world_) && mapped_[r];
+      log.check(OpenCheck::peer_imported, present, r);
+      ok = ok && present;
+      if (!present) continue;
+      hipMemLocation here{};
+      here.type = hipMemLocationTypeDevice;
+      here.id = device_;
+      unsigned long long flags = 0;
+      const hipError_t e = hipMemGetAccess(&flags, &here, at(r));
+      const bool rw =
+          e == hipSuccess && flags == hipMemAccessFlagsProtReadWrite;
+      log.check(OpenCheck::access_rw, rw, r, static_cast<uint32_t>(flags),
+                static_cast<uint32_t>(e));
+      ok = ok && rw;
+      hipPointerAttribute_t attrs{};
+      if (hipPointerGetAttributes(&attrs, at(r)) == hipSuccess) {
+        if (peer_devices[r] >= 0 && attrs.device != peer_devices[r])
+          log.warn(OpenWarning::pointer_device, r,
+                   static_cast<uint32_t>(attrs.device),
+                   static_cast<uint32_t>(peer_devices[r]));
+      } else {
+        (void)hipGetLastError();
+        log.warn(OpenWarning::pointer_device, r, 0xFFFFFFFFu,
+                 static_cast<uint32_t>(peer_devices[r]));
+      }
+    }
+    return ok;
   }
 
   ~SymmetricMemory() {
@@ -299,6 +391,7 @@ class SymmetricMemory {
   char* base() const { return static_cast<char*>(base_); }
   int64_t stride_bytes() const { return stride_; }
   int64_t bytes() const { return bytes_; }
+  int64_t granularity() const { return granularity_; }
   char* at(int r) const { return base() + int64_t{r} * stride_; }
 
  private:
@@ -333,6 +426,66 @@ class SymmetricMemory {
   std::vector<bool> mapped_;
 };
 
+// OTHER PROCESSES HOLDING DEVICE MEMORY ON `device`, read from the KFD's sysfs
+// (/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>): how many, and their MiB. The
+// GPU's KFD id is the topology node whose PCI location is the device's. {0, 0}
+// when sysfs cannot be read: an observation, never a failure.
+struct OtherProcesses {
+  uint32_t count = 0;
+  uint32_t mib = 0;
+};
+inline OtherProcesses other_processes_on(int device) {
+  OtherProcesses out;
+  int domain = 0, bus = 0, dev = 0;
+  if (hipDeviceGetAttribute(&domain, hipDeviceAttributePciDomainID, device) !=
+          hipSuccess ||
+      hipDeviceGetAttribute(&bus, hipDeviceAttributePciBusId, device) !=
+          hipSuccess ||
+      hipDeviceGetAttribute(&dev, hipDeviceAttributePciDeviceId, device) !=
+          hipSuccess) {
+    (void)hipGetLastError();
+    return out;
+  }
+  const std::string topology = "/sys/class/kfd/kfd/topology/nodes";
+  std::string gpu_id;
+  if (DIR* d = ::opendir(topology.c_str())) {
+    while (dirent* e = ::readdir(d)) {
+      if (e->d_name[0] == '.') continue;
+      const std::string node = topology + "/" + e->d_name;
+      std::ifstream props(node + "/properties");
+      std::string key;
+      long long value = 0, node_domain = -1, location = -1;
+      while (props >> key >> value) {
+        if (key == "domain") node_domain = value;
+        if (key == "location_id") location = value;
+      }
+      if (location < 0 || node_domain != domain || (location >> 8) != bus ||
+          ((location >> 3) & 0x1f) != dev)
+        continue;
+      std::ifstream id(node + "/gpu_id");
+      id >> gpu_id;
+      break;
+    }
+    ::closedir(d);
+  }
+  if (gpu_id.empty() || gpu_id == "0") return out;
+  const std::string procs = "/sys/class/kfd/kfd/proc";
+  const std::string self = std::to_string(::getpid());
+  if (DIR* d = ::opendir(procs.c_str())) {
+    while (dirent* e = ::readdir(d)) {
+      if (e->d_name[0] == '.' || self == e->d_name) continue;
+      std::ifstream vram(procs + "/" + e->d_name + "/vram_" + gpu_id);
+      unsigned long long bytes = 0;
+      if (vram >> bytes && bytes > 0) {
+        ++out.count;
+        out.mib += static_cast<uint32_t>(bytes >> 20);
+      }
+    }
+    ::closedir(d);
+  }
+  return out;
+}
+
 class Handle {
  public:
   // OPENED on every rank together: this rank's symmetric memory allocated, two
@@ -348,82 +501,40 @@ class Handle {
   // `quantized_scales_bytes`: one quantized buffer's values and scales at that
   // box (common.cuh's QUANTIZATION). `quantization`: what the tuned path moves
   // across the links, a Quantization (select.cuh's `quantizes`).
-  Handle(int rank, int world_size, const Gather& gather, double timeout_seconds,
-         int64_t max_rows, int64_t max_cols, int64_t scratch_bytes,
-         int64_t quantized_values_bytes, int64_t quantized_scales_bytes,
-         int64_t staging_bytes, int quantization,
+  // `device`: the device the communicator was given (open checks it is the
+  // current one). `log_mode`: what the log records (log.cuh). `rccl_ready`:
+  // whether the caller found the device group's RCCL communicator set up (1),
+  // not (0), or could not tell (-1): observed and logged, never acted on.
+  Handle(int rank, int world_size, int device, const Gather& gather,
+         double timeout_seconds, int64_t max_rows, int64_t max_cols,
+         int64_t scratch_bytes, int64_t quantized_values_bytes,
+         int64_t quantized_scales_bytes, int64_t staging_bytes,
+         int quantization, LogMode log_mode, int rccl_ready,
          const BuildInfo& build = kBuild)
       : rank_(rank),
         world_size_(world_size),
+        device_(device),
         max_rows_(max_rows),
         max_cols_(max_cols),
         scratch_bytes_(scratch_bytes),
         quantized_values_bytes_(quantized_values_bytes),
         quantized_scales_bytes_(quantized_scales_bytes),
         staging_bytes_(staging_bytes),
-        quantization_(quantization) {
-    // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging
-    // runs off its own allocation, never into barrier state. Each made and
-    // zeroed here, then every rank's descriptors exchanged (one collective) and
-    // every peer's mapped beside this rank's.
-    signals_.emplace(rank_, world_size_, kSignalsBytes, kSignalsAllocation);
-    exchange_.emplace(rank_, world_size_, staging_offset() + staging_bytes_,
-                      kExchangeAllocation);
-    {
-      const Fd signals_fd = signals_->exported();
-      const Fd exchange_fd = exchange_->exported();
-      const std::vector<std::vector<Fd>> theirs =
-          exchange_fds(rank_, world_size_, gather,
-                       {signals_fd.get(), exchange_fd.get()}, timeout_seconds);
-      std::vector<int> signals_fds(world_size_, -1),
-          exchange_fds_of(world_size_, -1);
-      for (int r = 0; r < world_size_; ++r) {
-        if (r == rank_) continue;
-        signals_fds[r] = theirs[r][0].get();
-        exchange_fds_of[r] = theirs[r][1].get();
-      }
-      signals_->map_peers(signals_fds);
-      exchange_->map_peers(exchange_fds_of);
+        quantization_(quantization),
+        log_(std::make_shared<Log>(log_mode, rank, world_size, device)) {
+    // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
+    // an open that fails or hangs is read there.
+    set_last_log(log_);
+    try {
+      open(gather, timeout_seconds, rccl_ready, build);
+    } catch (...) {
+      // THE PHASE AFTER THE LAST REACHED is the one that failed.
+      const uint32_t reached = log_->get(LogHeader::open_phase);
+      if (reached < static_cast<uint32_t>(OpenPhase::open_done))
+        log_->phase(static_cast<OpenPhase>(reached + 1), 0, 0, 1);
+      if (slab_ != nullptr) (void)hipFree(slab_);
+      throw;
     }
-    // THE STATUS, host-mapped and coherent: a wait that gives up writes its
-    // fault with system-scope atomics while the host polls it, and the host
-    // sets its `abort` (common.cuh's BARRIER). The kernels take its device
-    // address as their own argument, a buffer of kStatusFields words.
-    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&status_),
-                            kStatusFields * sizeof(uint32_t),
-                            hipHostMallocMapped | hipHostMallocCoherent));
-    std::memset(status_, 0, kStatusFields * sizeof(uint32_t));
-    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&device_status_),
-                                      status_, 0));
-    // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table:
-    // read by this rank's kernels only.
-    const int64_t slots = build.memory.peer_ptr_slots;
-    HIP_CHECK(hipMalloc(
-        &slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
-    slab_end_ = slab_ + slots * kMaxRanks;
-    cursor_ = slab_;
-    // EACH RANK'S EXCHANGE is [ scratch | scratch values | scratch scales |
-    // staging values | staging scales | staging ], at the same offsets on every
-    // rank, so each region is rank 0's address and the exchange's rank stride
-    // (scratch_ptr(), exchange_stride_rank_bytes()). The STAGED INPUT'S LIES
-    // PAST EVERY KERNEL'S SCRATCH, since an INT4 two-shot writes it before its
-    // first barrier, while a peer may still read this rank's scratch after its
-    // last (common.cuh's publish_staged). AN EAGER INPUT IS READ AS AN INPUT,
-    // through a table like any registered one (`input_ptrs`), so the staging
-    // also has its table, written once, registered here.
-    std::vector<void*> staging(world_size_);
-    for (int i = 0; i < world_size_; ++i)
-      staging[i] = exchange_->at(i) + staging_offset();
-    staging_ptrs_ = next_slot();
-    write_slot(staging_ptrs_, staging);
-    registered_[staging[rank_]] = staging_ptrs_;
-    // The device wall clock is fixed-rate, in kHz; the kernels count the
-    // timeout in it.
-    int device = 0, khz = 0;
-    HIP_CHECK(hipGetDevice(&device));
-    HIP_CHECK(
-        hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device));
-    timeout_ticks_ = static_cast<uint64_t>(timeout_seconds * khz * 1000.0);
   }
 
   // The symmetric memory unmaps and releases itself (SymmetricMemory), after
@@ -432,7 +543,6 @@ class Handle {
     (void)hipDeviceSynchronize();
     for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
-    hipHostFree(status_);
   }
 
   Handle(const Handle&) = delete;
@@ -608,6 +718,31 @@ class Handle {
                      w * signals_stride_writer()]});
     return all;
   }
+  // THE LOG (log.cuh): every word of it, as the host reads it now, and the
+  // number the last launch was given.
+  std::vector<uint32_t> log_words() const { return log_->words(); }
+  uint32_t launch_number() const { return log_->launches(); }
+
+  // A LAUNCH ABOUT TO BE ISSUED: its number, in the header always (the
+  // kernel echoes it from the next cycle on), and in everything mode a record
+  // of what it is. A captured launch is numbered at capture; its replays are
+  // not counted (a graph replay runs none of our host code).
+  uint32_t begin_launch(OpType op, const void* kernel, int64_t m, int64_t n,
+                        DType dtype, hipStream_t stream, bool staged) {
+    const uint32_t launch = log_->next_launch();
+    if (!log_->everything()) return launch;
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+    const uint8_t flags = static_cast<uint8_t>(
+        (capture == hipStreamCaptureStatusActive ? 1 : 0) | (staged ? 2 : 0));
+    log_->write({static_cast<uint8_t>(LogKind::launch_issued), flags,
+                 stream_index(stream), launch, kernel_index(kernel),
+                 static_cast<uint16_t>(op), static_cast<uint32_t>(m),
+                 static_cast<uint32_t>(n), static_cast<uint32_t>(dtype),
+                 host_ns()});
+    return launch;
+  }
+
   // Every wait on this rank leaves at its next check: for a communicator the
   // host has given up on.
   void abort() {
@@ -637,6 +772,196 @@ class Handle {
   }
 
  private:
+  // OPEN, every phase logged (log.cuh's OpenPhase), each internal assert a
+  // logged OpenCheck that fails open naming it, each observation of the
+  // broader state a logged OpenWarning. No collective beyond the CPU group's
+  // gather the descriptor exchange already makes.
+  void open(const Gather& gather, double timeout_seconds, int rccl_ready,
+            const BuildInfo& build) {
+    Log& log = *log_;
+    log.phase(OpenPhase::log_ready, static_cast<uint32_t>(kLogCapacity));
+    int current = -1;
+    HIP_CHECK(hipGetDevice(&current));
+    log.check(OpenCheck::current_device, current == device_, rank_,
+              static_cast<uint32_t>(current), static_cast<uint32_t>(device_));
+    if (current != device_)
+      fail(OpenCheck::current_device,
+           "the current device is " + std::to_string(current) +
+               ", not the communicator's " + std::to_string(device_));
+    // THE BROADER STATE, observed: RCCL's lazy setup, other processes on this
+    // GPU, and whether what open allocates fits.
+    if (rccl_ready == 0)
+      log.warn(OpenWarning::rccl_not_ready);
+    else if (rccl_ready < 0)
+      log.warn(OpenWarning::rccl_unknown);
+    const OtherProcesses others = other_processes_on(device_);
+    if (others.count > 0)
+      log.warn(OpenWarning::other_processes, 0, others.count, others.mib);
+    {
+      size_t free = 0, total = 0;
+      HIP_CHECK(hipMemGetInfo(&free, &total));
+      const int64_t needed = kSignalsBytes + staging_offset() + staging_bytes_;
+      if (static_cast<int64_t>(free) < needed)
+        log.warn(OpenWarning::low_memory, 0, static_cast<uint32_t>(free >> 20),
+                 static_cast<uint32_t>(needed >> 20));
+    }
+    // THE SIGNALS APART FROM THE DATA: an overrun of the scratch or the staging
+    // runs off its own allocation, never into barrier state. Each made and
+    // zeroed here, then every rank's descriptors exchanged (one collective) and
+    // every peer's mapped beside this rank's.
+    signals_.emplace(rank_, world_size_, kSignalsBytes, kSignalsAllocation);
+    log.phase(OpenPhase::signals_allocated,
+              static_cast<uint32_t>(kSignalsBytes),
+              static_cast<uint32_t>(signals_->stride_bytes()));
+    exchange_.emplace(rank_, world_size_, staging_offset() + staging_bytes_,
+                      kExchangeAllocation);
+    log.phase(OpenPhase::exchange_allocated,
+              static_cast<uint32_t>(exchange_->bytes() >> 20),
+              static_cast<uint32_t>(exchange_->stride_bytes() >> 20));
+    {
+      // THIS RANK'S SIGNALS READ ZERO after the memset, before any peer can
+      // write them: a few words, host-side.
+      std::array<uint32_t, 64> words{};
+      HIP_CHECK(hipMemcpy(words.data(), signals_->at(rank_), sizeof(words),
+                          hipMemcpyDeviceToHost));
+      uint32_t nonzero = 0;
+      for (uint32_t w : words) nonzero += w != 0;
+      log.check(OpenCheck::signals_zero, nonzero == 0, rank_, nonzero, 0);
+      if (nonzero != 0)
+        fail(OpenCheck::signals_zero, std::to_string(nonzero) +
+                                          " of the first 64 signal words are "
+                                          "not zero after the memset");
+      log.phase(OpenPhase::zeroed);
+    }
+    std::vector<RankInfo> ranks;
+    {
+      const Fd signals_fd = signals_->exported();
+      const Fd exchange_fd = exchange_->exported();
+      log.phase(OpenPhase::exported);
+      RankInfo me{};
+      HIP_CHECK(
+          hipDeviceGetPCIBusId(me.pci_bus_id, sizeof(me.pci_bus_id), device_));
+      (void)::gethostname(me.host, sizeof(me.host) - 1);
+      me.pid = static_cast<int32_t>(::getpid());
+      me.device = device_;
+      me.granularity = exchange_->granularity();
+      const std::vector<std::vector<Fd>> theirs = exchange_fds(
+          rank_, world_size_, gather, {signals_fd.get(), exchange_fd.get()},
+          timeout_seconds, me, log, ranks);
+      observe_peers(ranks);
+      std::vector<int> signals_fds(world_size_, -1),
+          exchange_fds_of(world_size_, -1);
+      for (int r = 0; r < world_size_; ++r) {
+        if (r == rank_) continue;
+        signals_fds[r] = theirs[r][0].get();
+        exchange_fds_of[r] = theirs[r][1].get();
+      }
+      signals_->import_peers(signals_fds);
+      exchange_->import_peers(exchange_fds_of);
+      log.phase(OpenPhase::imported, static_cast<uint32_t>(world_size_ - 1), 2);
+    }
+    signals_->map_peers();
+    exchange_->map_peers();
+    log.phase(OpenPhase::mapped);
+    signals_->allow_peers();
+    exchange_->allow_peers();
+    log.phase(OpenPhase::access_set);
+    // EVERY PEER'S GPU in this process (by its PCI bus id), and whether this
+    // device reaches it: a peer that cannot be reached is a definite error.
+    std::vector<int> peer_devices(world_size_, -1);
+    for (int r = 0; r < world_size_; ++r) {
+      int d = -1;
+      if (hipDeviceGetByPCIBusId(&d, ranks[r].pci_bus_id) != hipSuccess) {
+        (void)hipGetLastError();
+        log.warn(OpenWarning::peer_not_visible, r);
+        continue;
+      }
+      peer_devices[r] = d;
+      if (r == rank_ || d == device_) continue;
+      int can = 0;
+      HIP_CHECK(hipDeviceCanAccessPeer(&can, device_, d));
+      log.check(OpenCheck::can_access_peer, can != 0, r,
+                static_cast<uint32_t>(device_), static_cast<uint32_t>(d));
+      if (can == 0)
+        fail(OpenCheck::can_access_peer,
+             "device " + std::to_string(device_) + " cannot access rank " +
+                 std::to_string(r) + "'s device " + std::to_string(d));
+    }
+    if (!signals_->verify(log, peer_devices))
+      fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
+           "the signals' mapping");
+    if (!exchange_->verify(log, peer_devices))
+      fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
+           "the exchange's mapping");
+    // THE STATUS, host-mapped and coherent: the log's first words
+    // (log.cuh). A wait that gives up writes its fault with system-scope
+    // atomics while the host polls it, and the host sets its `abort`
+    // (common.cuh's BARRIER). The kernels take its device address as their
+    // own argument, a buffer of kStatusFields words.
+    status_ = log.status_host();
+    device_status_ = log.status_device();
+    // THE SLAB the launches' peer tables live in, kMaxRanks addresses a table:
+    // read by this rank's kernels only.
+    const int64_t slots = build.memory.peer_ptr_slots;
+    HIP_CHECK(hipMalloc(
+        &slab_, static_cast<size_t>(slots) * kMaxRanks * sizeof(void*)));
+    slab_end_ = slab_ + slots * kMaxRanks;
+    cursor_ = slab_;
+    // EACH RANK'S EXCHANGE is [ scratch | scratch values | scratch scales |
+    // staging values | staging scales | staging ], at the same offsets on every
+    // rank, so each region is rank 0's address and the exchange's rank stride
+    // (scratch_ptr(), exchange_stride_rank_bytes()). The STAGED INPUT'S LIES
+    // PAST EVERY KERNEL'S SCRATCH, since an INT4 two-shot writes it before its
+    // first barrier, while a peer may still read this rank's scratch after its
+    // last (common.cuh's publish_staged). AN EAGER INPUT IS READ AS AN INPUT,
+    // through a table like any registered one (`input_ptrs`), so the staging
+    // also has its table, written once, registered here.
+    std::vector<void*> staging(world_size_);
+    for (int i = 0; i < world_size_; ++i)
+      staging[i] = exchange_->at(i) + staging_offset();
+    staging_ptrs_ = next_slot();
+    write_slot(staging_ptrs_, staging);
+    registered_[staging[rank_]] = staging_ptrs_;
+    log.phase(OpenPhase::tables_written);
+    // The device wall clock is fixed-rate, in kHz; the kernels count the
+    // timeout in it.
+    int khz = 0;
+    HIP_CHECK(
+        hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device_));
+    timeout_ticks_ = static_cast<uint64_t>(timeout_seconds * khz * 1000.0);
+    log.set_timeout(timeout_ticks_, khz);
+    log.phase(OpenPhase::checked);
+    log.phase(OpenPhase::open_done);
+  }
+
+  // WHAT THE RANKS SAID ABOUT THEMSELVES, compared: two ranks on one GPU,
+  // a rank on another host, granularities that differ. Warnings only.
+  void observe_peers(const std::vector<RankInfo>& ranks) {
+    const RankInfo& me = ranks[rank_];
+    for (int r = 0; r < world_size_; ++r) {
+      if (r == rank_) continue;
+      const RankInfo& p = ranks[r];
+      const bool same_host =
+          std::strncmp(p.host, me.host, sizeof(me.host)) == 0;
+      if (!same_host) log_->warn(OpenWarning::host_mismatch, r);
+      if (same_host &&
+          std::strncmp(p.pci_bus_id, me.pci_bus_id, sizeof(me.pci_bus_id)) == 0)
+        log_->warn(OpenWarning::duplicate_device, r,
+                   static_cast<uint32_t>(p.pid), static_cast<uint32_t>(me.pid));
+      if (p.granularity != me.granularity)
+        log_->warn(OpenWarning::granularity_mismatch, r,
+                   static_cast<uint32_t>(p.granularity),
+                   static_cast<uint32_t>(me.granularity));
+    }
+  }
+
+  // OPEN FAILS, naming the check (already logged) and the phase reached.
+  [[noreturn]] void fail(OpenCheck c, const std::string& why) const {
+    throw std::runtime_error(
+        std::string("hip_custom_communicator: open check failed: ") +
+        to_string(c) + ": " + why + " (rank " + std::to_string(rank_) + ")");
+  }
+
   // The staging's offset in the exchange: past the scratch and the quantized
   // regions.
   int64_t staging_offset() const {
@@ -723,7 +1048,37 @@ class Handle {
     }
     HIP_CHECK(hipMemcpyAsync(staging(), input, static_cast<size_t>(bytes),
                              hipMemcpyDeviceToDevice, stream));
+    if (log_->everything())
+      log_->write({static_cast<uint8_t>(LogKind::copy_in_issued), 0,
+                   stream_index(stream), log_->launches(), 0, 0,
+                   static_cast<uint32_t>(bytes),
+                   static_cast<uint32_t>(staging_bytes_), 0, host_ns()});
     return registered_.at(staging());
+  }
+
+  // A STREAM'S AND A KERNEL'S INDEX in the log, recorded the first time each
+  // is seen with its address (stream_seen, kernel_seen).
+  uint16_t stream_index(hipStream_t stream) {
+    for (size_t i = 0; i < streams_seen_.size(); ++i)
+      if (streams_seen_[i] == stream) return static_cast<uint16_t>(i);
+    streams_seen_.push_back(stream);
+    const uint16_t i = static_cast<uint16_t>(streams_seen_.size() - 1);
+    const auto a = reinterpret_cast<uintptr_t>(stream);
+    log_->write({static_cast<uint8_t>(LogKind::stream_seen), 0, i, 0, 0, 0,
+                 static_cast<uint32_t>(a), static_cast<uint32_t>(a >> 32), 0,
+                 host_ns()});
+    return i;
+  }
+  uint16_t kernel_index(const void* kernel) {
+    for (size_t i = 0; i < kernels_seen_.size(); ++i)
+      if (kernels_seen_[i] == kernel) return static_cast<uint16_t>(i);
+    kernels_seen_.push_back(kernel);
+    const uint16_t i = static_cast<uint16_t>(kernels_seen_.size() - 1);
+    const auto a = reinterpret_cast<uintptr_t>(kernel);
+    log_->write({static_cast<uint8_t>(LogKind::kernel_seen), 0, 0, 0, i, 0,
+                 static_cast<uint32_t>(a), static_cast<uint32_t>(a >> 32), 0,
+                 host_ns()});
+    return i;
   }
 
   // A TABLE, kMaxRanks addresses of the slab.
@@ -746,6 +1101,7 @@ class Handle {
 
   int rank_;
   int world_size_;
+  int device_;
   int64_t max_rows_;
   int64_t max_cols_;
   int64_t scratch_bytes_;
@@ -753,6 +1109,11 @@ class Handle {
   int64_t quantized_scales_bytes_;
   int64_t staging_bytes_;
   int quantization_;
+  std::shared_ptr<Log> log_;
+  // KERNELS AND STREAMS BY INDEX, as the log names them (kernel_seen,
+  // stream_seen): first seen, first numbered.
+  std::vector<const void*> kernels_seen_;
+  std::vector<hipStream_t> streams_seen_;
   std::optional<SymmetricMemory> signals_;
   std::optional<SymmetricMemory> exchange_;
   uint32_t* status_ = nullptr;

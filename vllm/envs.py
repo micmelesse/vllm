@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_HIP_CUSTOM_COMMUNICATOR: bool = False
     VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION: Literal["NONE", "INT4"] = "NONE"
+    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG: Literal["errors", "everything"] = "errors"
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1400,6 +1401,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # crossover up (select.cuh's). Lossy, so opt-in, as quick reduce's is.
     "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION": env_with_choices(
         "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", "NONE", ["NONE", "INT4"]
+    ),
+    # What HipCustomCommunicator's state log records: errors (the default: failures
+    # and open's warnings) or everything (every open phase and check, every launch).
+    "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG": env_with_choices(
+        "VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_LOG", "errors", ["errors", "everything"]
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

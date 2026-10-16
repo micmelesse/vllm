@@ -65,7 +65,8 @@ std::tuple<std::optional<int64_t>, std::optional<int64_t>>
 hip_custom_communicator_open(const std::string& cpu_group,
                              const std::string& device_group, int64_t device,
                              double timeout_seconds, int64_t max_rows,
-                             int64_t max_cols, int64_t quantization);
+                             int64_t max_cols, int64_t quantization,
+                             int64_t log_mode, int64_t rccl_ready);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // scratch_bytes, staging_bytes, then each op's max_bytes in kOps' order].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
@@ -87,6 +88,9 @@ void hip_custom_communicator_dispose(fptr_t handle_ptr);
 // on the rank then leaves at.
 std::vector<int64_t> hip_custom_communicator_status(fptr_t handle_ptr);
 std::vector<int64_t> hip_custom_communicator_signals(fptr_t handle_ptr);
+// The state log's every word (log.cuh): the handle's, or with 0 the last log
+// this process made (an open that failed or is still running).
+std::vector<int64_t> hip_custom_communicator_log(fptr_t handle_ptr);
 void hip_custom_communicator_abort(fptr_t handle_ptr);
 
 // A variant at the torch boundary: the arch or the Error's number, exactly one

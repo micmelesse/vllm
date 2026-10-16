@@ -11,7 +11,10 @@ call must leave the communicator open and its barrier flags clear.
 """
 
 import multiprocessing as mp
+import os
 import queue
+import signal
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
@@ -30,6 +33,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Error,
     FlagState,
     HipCustomCommunicator,
+    LogMode,
     Op,
     Open,
     Quantization,
@@ -37,6 +41,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Supported,
     Where,
     build_info,
+    last_log,
     open_handle,
     supported,
 )
@@ -81,9 +86,12 @@ GRAPH_LAYERS = 2
 GRAPH_REPLAYS = 3
 KERNEL_TIMEOUT_S = 30.0
 PROCESS_TIMEOUT_S = 900
-# The basic-correctness (smoke) test's world: a broken basic fails in minutes, not a PROCESS_TIMEOUT_S.
+# The basic-correctness (smoke) test's world: a broken basic fails in minutes,
+# not a PROCESS_TIMEOUT_S.
 SMOKE_KERNEL_TIMEOUT_S = 5.0
 SMOKE_PROCESS_TIMEOUT_S = 120
+# How long a hung rank has to print its state log before the harness kills it.
+DUMP_GRACE_S = 5.0
 
 Forced = dict[str, str | int]
 Tolerance = tuple[float, float]
@@ -109,14 +117,39 @@ def _tolerance(dtype: torch.dtype, normed: bool) -> Tolerance:
 # --------------------------------------------------------------------------------
 
 
+# This rank's communicator once open, for the state log a failure or a hang prints.
+_COMM: HipCustomCommunicator | None = None
+
+
+def _state_log(rank: int) -> str:
+    """This rank's state log as text: its communicator's, or, before one is open,
+    the last log this process made (an open that failed or still runs)."""
+    if _COMM is not None:
+        return f"rank {rank}: {_COMM._log_text()}"
+    try:
+        got = last_log()
+    except RuntimeError as e:
+        return f"rank {rank}: no state log: {e}"
+    return f"rank {rank}: {got if got is not None else 'no state log made yet'}"
+
+
+def _dump_on_signal(rank: int) -> None:
+    """Waits for SIGUSR1, the harness's word that it is about to kill a hung rank,
+    and prints the rank's state log. Its own thread, so it runs while the main
+    thread is stuck in a call that released the GIL (a synchronize, an op)."""
+    signal.sigwait({signal.SIGUSR1})
+    print(f"rank {rank}: hung; its state log:\n{_state_log(rank)}", flush=True)
+
+
 @contextmanager
 def _step(rank: int, name: str) -> Iterator[None]:
     """Prints the step a rank enters, so the captured output of a hung world names
-    it, and names it in any failure it raises."""
+    it, and names it in any failure it raises, with the rank's state log."""
     print(f"rank {rank}: {name}", flush=True)
     try:
         yield
     except Exception as e:
+        print(f"rank {rank}: step {name!r} failed\n{_state_log(rank)}", flush=True)
         raise AssertionError(f"rank {rank}: step {name!r} failed: {e}") from e
 
 
@@ -127,7 +160,13 @@ def _rank_main(
     kwargs: dict[str, str],
     failures: "Queue[str]",
     kernel_timeout_s: float,
+    log_mode: LogMode,
 ) -> None:
+    global _COMM
+    # SIGUSR1 TO THE DUMPER ONLY: blocked here before any thread starts (threads
+    # inherit it), taken by `_dump_on_signal`'s sigwait.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    threading.Thread(target=_dump_on_signal, args=(rank,), daemon=True).start()
     try:
         device = torch.device(f"cuda:{rank}")
         torch.accelerator.set_device_index(device)
@@ -150,11 +189,14 @@ def _rank_main(
                 timeout_seconds=kernel_timeout_s,
                 max_rows=MAX_TOKENS,
                 max_cols=HIDDEN,
+                log_mode=log_mode,
             )
+        _COMM = comm
         try:
             assert not comm.disabled, f"rank {rank}: open: disabled: {comm.state}"
             target(comm, rank, **kwargs)
         finally:
+            _COMM = None
             comm.close()
     except BaseException:
         failures.put(f"rank {rank}:\n{traceback.format_exc()}")
@@ -167,17 +209,20 @@ def _on_every_rank(
     target: Callable[..., None],
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
+    log_mode: LogMode = "errors",
     **kwargs: str,
 ) -> None:
     """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
-    communicator sized for Kimi-K3's largest call."""
+    communicator sized for Kimi-K3's largest call, its state log in `log_mode`. A
+    rank still running at the deadline is told to print its state log (SIGUSR1),
+    given DUMP_GRACE_S, then killed."""
     ctx = mp.get_context("spawn")
     failures = ctx.Queue()
     port = get_open_port()
     procs = [
         ctx.Process(
             target=_rank_main,
-            args=(r, port, target, kwargs, failures, kernel_timeout_s),
+            args=(r, port, target, kwargs, failures, kernel_timeout_s, log_mode),
         )
         for r in range(WORLD_SIZE)
     ]
@@ -187,6 +232,13 @@ def _on_every_rank(
     for p in procs:
         p.join(timeout=max(0.0, deadline - time.monotonic()))
     hung = [r for r, p in enumerate(procs) if p.is_alive()]
+    for r in hung:
+        pid = procs[r].pid
+        if pid is not None:
+            os.kill(pid, signal.SIGUSR1)
+    grace = time.monotonic() + DUMP_GRACE_S
+    for r in hung:
+        procs[r].join(timeout=max(0.0, grace - time.monotonic()))
     for p in procs:
         if p.is_alive():
             p.kill()
@@ -200,7 +252,7 @@ def _on_every_rank(
     assert not errors, "\n".join(errors)
     assert not hung, (
         f"ranks {hung} still running after {process_timeout_s} s; each rank's last "
-        "printed step is where it hung"
+        "printed step is where it hung, and its state log follows it"
     )
     assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
 
@@ -464,6 +516,7 @@ def test_basic_correctness() -> None:
         _smoke_on_rank,
         process_timeout_s=SMOKE_PROCESS_TIMEOUT_S,
         kernel_timeout_s=SMOKE_KERNEL_TIMEOUT_S,
+        log_mode="everything",
     )
 
 
@@ -1038,7 +1091,7 @@ def test_quantization_reaches_the_opener(
     opened: list[Quantization] = []
 
     def fake_open_handle(*args: str | int | float) -> Error:
-        opened.append(args[-1])
+        opened.append(args[6])
         return Error.no_such_group
 
     monkeypatch.setattr(module, "open_handle", fake_open_handle)
