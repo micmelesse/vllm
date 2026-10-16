@@ -231,10 +231,10 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
               "the largest call a communicator serves has rows and columns: "
               "max_rows=",
               max_rows, " max_cols=", max_cols);
-  TORCH_CHECK(quantization == hip_custom_communicator::Quantization::none ||
-                  quantization == hip_custom_communicator::Quantization::int4,
-              "a communicator's quantization is none (0) or int4 (1): ",
-              quantization);
+  TORCH_CHECK(
+      quantization == hip_custom_communicator::Quantization::none ||
+          quantization == hip_custom_communicator::Quantization::int4,
+      "a communicator's quantization is none (0) or int4 (1): ", quantization);
   const auto refused = [](hip_custom_communicator::Error e) {
     return OpenWire{std::nullopt, static_cast<int64_t>(e)};
   };

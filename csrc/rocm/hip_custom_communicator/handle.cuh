@@ -6,8 +6,8 @@
 // compile time. OUR OWN MEMORY (the signals and the exchange) is HIP virtual
 // memory: each rank creates its physical memory with explicit properties,
 // exports it as a POSIX file descriptor, and every rank maps every rank's into
-// ONE reserved virtual range, rank r's at base + r * stride, so a kernel reaches
-// a peer's buffer by a pointer and a rank stride. The CALLER'S buffers
+// ONE reserved virtual range, rank r's at base + r * stride, so a kernel
+// reaches a peer's buffer by a pointer and a rank stride. The CALLER'S buffers
 // (registered or captured inputs: torch's, not ours) are opened over legacy HIP
 // IPC handles, a device table of every rank's address each. The collective
 // that exchanges the handles and the socket names is the caller's (`Gather`),
@@ -78,12 +78,14 @@ constexpr int64_t kSignalsBytes =
 //   the peer wrote in its own L2's place. Coarse-grained (cacheable) memory
 //   would need every reader's L2 invalidated at the barrier and every writer's
 //   written back, which the barrier's device-scope acquire does not do for
-//   local lines (common.cuh's BARRIER). On HIP 7.15 a hipDeviceMallocFinegrained
-//   exchange was 4-10% slower than the uncached flag at 16-256 tokens and the
-//   same at 1024-4096 (2026-10-16T15-36-54Z); this choice is measured against
-//   both on n11.
-constexpr hipMemAllocationType kSignalsAllocation = hipMemAllocationTypeUncached;
-constexpr hipMemAllocationType kExchangeAllocation = hipMemAllocationTypeUncached;
+//   local lines (common.cuh's BARRIER). On HIP 7.15 a
+//   hipDeviceMallocFinegrained exchange was 4-10% slower than the uncached flag
+//   at 16-256 tokens and the same at 1024-4096 (2026-10-16T15-36-54Z); this
+//   choice is measured against both on n11.
+constexpr hipMemAllocationType kSignalsAllocation =
+    hipMemAllocationTypeUncached;
+constexpr hipMemAllocationType kExchangeAllocation =
+    hipMemAllocationTypeUncached;
 
 // A FILE DESCRIPTOR WE OWN, closed when it goes.
 class Fd {
@@ -148,8 +150,10 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
     a.sun_family = AF_UNIX;
     if (s.size() + 1 > sizeof(a.sun_path))
       throw std::runtime_error("hip_custom_communicator: socket name too long");
-    std::memcpy(a.sun_path + 1, s.data(), s.size());  // sun_path[0] = 0: abstract
-    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + s.size());
+    std::memcpy(a.sun_path + 1, s.data(),
+                s.size());  // sun_path[0] = 0: abstract
+    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 +
+                                  s.size());
   };
   sockaddr_un a;
   socklen_t len = address(name, a);
@@ -208,7 +212,8 @@ inline std::vector<std::vector<Fd>> exchange_fds(int rank, int world,
     cmsghdr* c0 = CMSG_FIRSTHDR(&m);
     if (payload < 0 || payload >= world || payload == rank ||
         !theirs[payload].empty() || c0 == nullptr ||
-        c0->cmsg_type != SCM_RIGHTS || c0->cmsg_len != CMSG_LEN(n * sizeof(int)))
+        c0->cmsg_type != SCM_RIGHTS ||
+        c0->cmsg_len != CMSG_LEN(n * sizeof(int)))
       throw std::runtime_error(
           "hip_custom_communicator: a malformed descriptor message (rank " +
           std::to_string(payload) + ")");
@@ -246,9 +251,11 @@ class SymmetricMemory {
         &recommended, &prop, hipMemAllocationGranularityRecommended));
     granularity_ = static_cast<int64_t>(std::max(minimum, recommended));
     stride_ = (bytes_ + granularity_ - 1) / granularity_ * granularity_;
-    HIP_CHECK(hipMemCreate(&peers_[rank_], static_cast<size_t>(stride_), &prop, 0));
-    HIP_CHECK(hipMemAddressReserve(&base_, static_cast<size_t>(stride_ * world_),
-                                   static_cast<size_t>(granularity_), nullptr, 0));
+    HIP_CHECK(
+        hipMemCreate(&peers_[rank_], static_cast<size_t>(stride_), &prop, 0));
+    HIP_CHECK(
+        hipMemAddressReserve(&base_, static_cast<size_t>(stride_ * world_),
+                             static_cast<size_t>(granularity_), nullptr, 0));
     map(rank_);
     allow_access(rank_);
     HIP_CHECK(hipMemset(at(rank_), 0, static_cast<size_t>(stride_)));
@@ -365,10 +372,11 @@ class Handle {
     {
       const Fd signals_fd = signals_->exported();
       const Fd exchange_fd = exchange_->exported();
-      const std::vector<std::vector<Fd>> theirs = exchange_fds(
-          rank_, world_size_, gather, {signals_fd.get(), exchange_fd.get()},
-          timeout_seconds);
-      std::vector<int> signals_fds(world_size_, -1), exchange_fds_of(world_size_, -1);
+      const std::vector<std::vector<Fd>> theirs =
+          exchange_fds(rank_, world_size_, gather,
+                       {signals_fd.get(), exchange_fd.get()}, timeout_seconds);
+      std::vector<int> signals_fds(world_size_, -1),
+          exchange_fds_of(world_size_, -1);
       for (int r = 0; r < world_size_; ++r) {
         if (r == rank_) continue;
         signals_fds[r] = theirs[r][0].get();
@@ -520,7 +528,9 @@ class Handle {
   // 0's address, rank r's exchange_stride_rank_bytes() * r past it (a kernel
   // takes the stride in its buffer's elements: the launch divides).
   void* scratch_ptr() const { return exchange_->base(); }
-  void* scratch_values_ptr() const { return exchange_->base() + scratch_bytes_; }
+  void* scratch_values_ptr() const {
+    return exchange_->base() + scratch_bytes_;
+  }
   void* scratch_scales_ptr() const {
     return exchange_->base() + scratch_bytes_ + quantized_values_bytes_;
   }
@@ -533,7 +543,9 @@ class Handle {
            quantized_scales_bytes_;
   }
   void* staging_ptr() const { return exchange_->base() + staging_offset(); }
-  int64_t exchange_stride_rank_bytes() const { return exchange_->stride_bytes(); }
+  int64_t exchange_stride_rank_bytes() const {
+    return exchange_->stride_bytes();
+  }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Every rank's signals, [R, 2, kMaxBlocks,
   // kMaxRanks] (owner, parity, block, writer): rank 0's address, then the
@@ -628,7 +640,8 @@ class Handle {
   // The staging's offset in the exchange: past the scratch and the quantized
   // regions.
   int64_t staging_offset() const {
-    return scratch_bytes_ + 2 * (quantized_values_bytes_ + quantized_scales_bytes_);
+    return scratch_bytes_ +
+           2 * (quantized_values_bytes_ + quantized_scales_bytes_);
   }
 
   // A BUFFER AS THE GATHER CARRIES IT: its allocation's IPC handle, then its
