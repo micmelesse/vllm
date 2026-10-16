@@ -140,8 +140,9 @@ enum class OpenWarning : uint8_t {
   host_mismatch,         // peer: a rank on another host
   granularity_mismatch,  // peer; seen: its granularity, want: ours
   low_memory,            // seen: free MiB, want: MiB open allocates
-  pointer_device,        // peer; seen: the device hipPointerGetAttributes
-                         // gives the peer's slice, want: the peer's device
+  pointer_device,        // retired: hipPointerGetAttributes on an imported
+                         // VMM slice reports the importing device, on every
+                         // slice, so it was noise; kept so the numbering holds
   peer_not_visible,      // peer: its GPU (by PCI bus id) is not visible here,
                          // so its device checks are skipped
 };

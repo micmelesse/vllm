@@ -334,11 +334,7 @@ class SymmetricMemory {
   // OPEN'S ASSERTS ON THIS ALLOCATION, each logged (Log::check): every
   // peer's imported and mapped, every slice read-write from this device, the
   // geometry what was asked. False when one failed (the log names it).
-  // `peer_devices[r]`: rank r's GPU in this process, -1 if not visible; a
-  // slice whose hipPointerGetAttributes names another device is a warning,
-  // not a failure (what the runtime reports for an imported VMM slice is not
-  // established).
-  bool verify(Log& log, const std::vector<int>& peer_devices) const {
+  bool verify(Log& log) const {
     bool ok = true;
     const bool geometry =
         granularity_ > 0 && stride_ % granularity_ == 0 && stride_ >= bytes_ &&
@@ -363,17 +359,6 @@ class SymmetricMemory {
       log.check(OpenCheck::access_rw, rw, r, static_cast<uint32_t>(flags),
                 static_cast<uint32_t>(e));
       ok = ok && rw;
-      hipPointerAttribute_t attrs{};
-      if (hipPointerGetAttributes(&attrs, at(r)) == hipSuccess) {
-        if (peer_devices[r] >= 0 && attrs.device != peer_devices[r])
-          log.warn(OpenWarning::pointer_device, r,
-                   static_cast<uint32_t>(attrs.device),
-                   static_cast<uint32_t>(peer_devices[r]));
-      } else {
-        (void)hipGetLastError();
-        log.warn(OpenWarning::pointer_device, r, 0xFFFFFFFFu,
-                 static_cast<uint32_t>(peer_devices[r]));
-      }
     }
     return ok;
   }
@@ -803,10 +788,10 @@ class Handle {
              "device " + std::to_string(device_) + " cannot access rank " +
                  std::to_string(r) + "'s device " + std::to_string(d));
     }
-    if (!signals_->verify(log, peer_devices))
+    if (!signals_->verify(log))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
            "the signals' mapping");
-    if (!exchange_->verify(log, peer_devices))
+    if (!exchange_->verify(log))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
            "the exchange's mapping");
     // THE STATUS, host-mapped and coherent: the log's first words

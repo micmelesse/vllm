@@ -233,7 +233,7 @@ class OpenWarning(IntEnum):
     host_mismatch = 5
     granularity_mismatch = 6
     low_memory = 7
-    pointer_device = 8
+    pointer_device = 8  # retired: never written (noise on imported VMM slices)
     peer_not_visible = 9
 
 
@@ -302,12 +302,6 @@ class LogRecord:
                 )
             case OpenWarning.low_memory:
                 return f"{self.seen} MiB free, open allocates {self.want} MiB"
-            case OpenWarning.pointer_device:
-                got = "an error" if self.seen == 0xFFFFFFFF else f"device {self.seen}"
-                return (
-                    f"rank {self.peer}'s mapped slice reports {got}, its GPU is "
-                    f"device {self.want}"
-                )
             case OpenWarning.peer_not_visible:
                 return (
                     f"rank {self.peer}'s GPU is not visible in this process; its "
