@@ -90,8 +90,10 @@ KERNEL_TIMEOUT_S = 30.0
 PROCESS_TIMEOUT_S = 900
 # The basic-correctness (smoke) test's world: a broken basic fails in minutes,
 # not a PROCESS_TIMEOUT_S.
-SMOKE_KERNEL_TIMEOUT_S = 5.0
-SMOKE_PROCESS_TIMEOUT_S = 120
+# 30 s, as every other test: on 2026-10-16 one rank's first 2048-row launch ran
+# ~6 s late (a first launch can load its code object), and a 5 s wait gave up.
+SMOKE_KERNEL_TIMEOUT_S = 30.0
+SMOKE_PROCESS_TIMEOUT_S = 240
 # How long a hung rank has to print its state log before the harness terminates it,
 # and how long it then has to tear its communicator down alone (SIGTERM, `abandon_open`)
 # before it is killed.
