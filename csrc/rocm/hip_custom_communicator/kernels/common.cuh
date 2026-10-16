@@ -1756,7 +1756,7 @@ template <typename T, int WORLD, int ROWS, int K, int P>
 DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
                             const float (&group_scales)[WORLD][ROWS][K],
                             float (&output)[ROWS][K][P]) {
-  const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
+  [[maybe_unused]] const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
 #pragma unroll
