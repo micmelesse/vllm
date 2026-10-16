@@ -81,7 +81,7 @@ GRAPH_LAYERS = 2
 GRAPH_REPLAYS = 3
 KERNEL_TIMEOUT_S = 30.0
 PROCESS_TIMEOUT_S = 900
-# The smoke test's world: a broken basic fails in minutes, not a PROCESS_TIMEOUT_S.
+# The basic-correctness (smoke) test's world: a broken basic fails in minutes, not a PROCESS_TIMEOUT_S.
 SMOKE_KERNEL_TIMEOUT_S = 5.0
 SMOKE_PROCESS_TIMEOUT_S = 120
 
@@ -447,7 +447,7 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
 
 
 @on_eight_gpus
-def test_smoke() -> None:
+def test_basic_correctness() -> None:
     """Open, each op once at a decode row, a prefill-sized all-reduce and one
     CUDA graph, against the ops they replace, every call leaving the communicator
     open and its flags clear: a broken basic fails in minutes, naming its step."""
