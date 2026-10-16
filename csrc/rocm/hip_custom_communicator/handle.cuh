@@ -131,15 +131,18 @@ constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypeUncached;
 //
 // WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
 // INT4, never both, and its sums exact or INT4, never both (the one exact word
-// beside an INT4 payload, the add-RMS-norm row two-shot's row scalars, lies at
-// its exact rows' end, past the payload of those rows: 9/16 of a byte an
-// element against 2). Across calls: a rank writes its inputs before its first
+// beside an INT4 payload, the add-RMS-norm row two-shot's row scalars, starts
+// at its exact slice's end, 2 bytes a slice element in, while the payload, over
+// the region's rows, twice the slice, ends at 9/8). Across calls: a rank writes its inputs before its first
 // barrier, and a peer reads them only before its barrier that every peer's
 // sums are visible (or, a one-shot, its last), which this rank passed in the
-// previous call only once every peer arrived, done reading; a rank writes its
-// partials only after its first barrier, which a peer reaches only once it
-// finished the previous call, its all-gather's reads of them included. So the
-// previous call's readers are done whichever encoding either call used.
+// previous call only once every peer arrived, done reading; partials are
+// written (by their rank, or a push kernel's peers) only after the writer's
+// first barrier, which every peer reaches only once it finished the previous
+// call, its all-gather's reads included. Not every launch ENDS with a barrier
+// (a two-shot ends with its all-gather): the next launch's first barrier is
+// the one that orders it. So the previous call's readers are done whichever
+// encoding either call used.
 // Every kernel copies its input into its inputs (or, INT4, their payload)
 // before its first barrier, which is ordered, and its peers read it there, at
 // rank 0's address and the rank stride: no table.
