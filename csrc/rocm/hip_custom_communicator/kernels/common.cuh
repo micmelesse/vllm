@@ -1543,13 +1543,15 @@ DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
 DINLINE float int4_scale(float amax) {
   return static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
 }
-DINLINE float int4_inverse(float scale) {
-  return scale > 0.0f ? __builtin_amdgcn_rcpf(scale) : 0.0f;
-}
+// CORRECTLY ROUNDED, as the format's 1 / scale: v_rcp_f32's ulp flipped 0.6% of a two-shot's
+// elements a step against it (torch emulation of the 2048 x 7168 test, 2026-10-16).
+DINLINE float int4_inverse(float scale) { return scale > 0.0f ? 1.0f / scale : 0.0f; }
 
 // A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale stored, BY THE MAGIC
-// NUMBER: fma(x, inv, 1.5 * 2^23 + 8) rounds x * inv to an integer (the sum's ulp is 1) and leaves
-// q + 8 in the low 4 bits, the rest of its low byte 0; clamped by med3 (two elements a packed fma).
+// NUMBER: x * inv, rounded to fp32 as the format's product is, plus 1.5 * 2^23 + 8 rounds it to an
+// integer (the sum's ulp is 1) and leaves q + 8 in the low 4 bits, the rest of its low byte 0;
+// clamped by med3 (two elements a packed mul and add). NOT AN FMA: the exact product rounded once
+// flipped 0.8% of the elements (the emulation's double rounding, 2026-10-16).
 // Then packed by bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the
 // word, and two v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word,
 // where a shift and an OR an element was 16).
@@ -1560,8 +1562,9 @@ DINLINE uint32_t int4_word(const float (&x)[P], float inv) {
   uint32_t q[P];
 #pragma unroll
   for (int p = 0; p < P / 2; ++p) {
-    const f32x2 y = __builtin_elementwise_fma(f32x2{x[2 * p], x[2 * p + 1]}, f32x2{inv, inv},
-                                              f32x2{kLowest + 8.0f, kLowest + 8.0f});
+#pragma clang fp contract(off)
+    const f32x2 y = f32x2{x[2 * p], x[2 * p + 1]} * f32x2{inv, inv} +
+                    f32x2{kLowest + 8.0f, kLowest + 8.0f};
 #pragma unroll
     for (int e = 0; e < 2; ++e)
       q[2 * p + e] = __builtin_bit_cast(
