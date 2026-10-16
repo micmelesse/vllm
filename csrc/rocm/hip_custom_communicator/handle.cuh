@@ -76,30 +76,25 @@ constexpr int64_t kSignalsBytes =
     128 * 128;
 constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 
-// HOW THE ARENA IS BACKED, stated here and not left to how a runtime backs a
-// malloc flag (hipDeviceMallocUncached was fine-grained under ROCm 7.2 and, at
-// 2 MiB and up, coarse-grained under HIP 7.15: aiter 0.1.24's
-// custom_all_reduce.py). hipMemAllocationTypeUncached: the memory is mapped
-// uncached on EVERY GPU that maps it, this rank's and its peers', so no L2
-// holds a line of it: a store is in memory (or the memory-side infinity cache,
-// which every agent sees alike) once it has completed, and a load reads memory.
-// ONE ARENA holds the signals and the exchange, both uncached as they were
-// when they were two allocations (both were hipMemAllocationTypeUncached), so
-// nothing about how either is cached changed:
-//   SIGNALS: uncached. A flag is written by a peer over the fabric and polled
-//   by its owner; an L2 copy of it in the owner would never see the peer's
-//   store (an agent's L2 is not coherent with a remote agent's writes to its
-//   memory, and a device-scope acquire invalidates only non-local lines).
-//   EXCHANGE: uncached, for the same reason: a push kernel stores into its
-//   peers' partials and then reads its own; a pull kernel reads a peer's partials
-//   the peer wrote in its own L2's place. Coarse-grained (cacheable) memory
-//   would need every reader's L2 invalidated at the barrier and every writer's
-//   written back, which the barrier's device-scope acquire does not do for
-//   local lines (common.cuh's BARRIER). On HIP 7.15 a
-//   hipDeviceMallocFinegrained exchange was 4-10% slower than the uncached flag
-//   at 16-256 tokens and the same at 1024-4096 (2026-10-16T15-36-54Z); this
-//   choice is measured against both on n11.
-constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;  // DIAGNOSTIC 2026-10-16: does Pinned stop the driver wedge? Kernels still assume uncached.
+// HOW THE ARENA IS BACKED: hipMemAllocationTypePinned, VMM's textbook type
+// (the CUDA and HIP VMM guides; torch's SymmetricMemory on CUDA and ROCm,
+// CUDASymmetricMemory.cu; aiter's vmm_allocator.py), stated here and not left
+// to how a runtime backs a malloc flag (hipDeviceMallocUncached was
+// fine-grained under ROCm 7.2 and, at 2 MiB and up, coarse-grained under HIP
+// 7.15: aiter 0.1.24's custom_all_reduce.py). Pinned device memory is
+// coarse-grained, CACHEABLE: the owner's L2 holds its lines (MTYPE RW), and a
+// peer's L2 holds the lines it reads or writes through its mapping (MTYPE NC).
+// ONE ARENA holds the signals and the exchange, both under the one memory model
+// LLVM's AMDGPUUsage gives for cacheable memory shared across agents ("Memory
+// Model GFX942"): every flag store a system-scope atomic, released (buffer_wbl2
+// sc0 sc1: this L2's dirty lines written back) when it publishes data; every
+// flag wait a system-scope load, then a system-scope acquire (buffer_inv sc0
+// sc1: the peers' lines in this L2 dropped) before the data is read. That is
+// common.cuh's BARRIER, the one place a kernel synchronizes with a peer, so no
+// kernel depends on how the arena is cached. Before 2026-10-16 the arena was
+// hipMemAllocationTypeUncached and the waits device-scope, correct only because
+// no L2 held a line of it (a departure; hip.md's VMM section).
+constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;
 
 // THE ARENA'S LAYOUT, one rank's slice, the same offsets on every rank (bytes
 // from the slice's start; `arena_layout` computes it from the sizes open is

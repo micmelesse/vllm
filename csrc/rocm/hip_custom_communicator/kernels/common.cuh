@@ -1161,24 +1161,32 @@ DINLINE void peers_load_row_scalars(const T* input_ptr, int64_t input_stride_ran
 // dimension is a stride, the outer R's too (`signals_stride_rank`: every rank's
 // signals mapped into one range).
 //
-// THE MEMORY ORDERING, under that mapping. Both of our allocations are created
-// UNCACHED (handle.cuh's kSignalsAllocation, kExchangeAllocation: the physical
-// memory's own property, so every rank's mapping of it is uncached, not a
-// property of how a runtime backs a malloc flag). So no GPU's L2 ever holds a
-// line of the signals or the exchange: a peer's store over the fabric lands in
-// the owner's memory, and the owner's next load of it reads memory.
-//   SIGNAL: the flag store is a SYSTEM-scope atomic, release when ordered. The
-//   release (buffer_wbl2 + s_waitcnt) completes every store this wave issued
-//   before it, local and remote, before the flag can be seen: the data a peer
-//   reads after the barrier is in memory when the flag is. An ordered barrier
-//   first waits for every wave's stores (wait_stores) and meets the block, so
-//   the one releasing lane covers the block's stores.
-//   WAIT: relaxed DEVICE-scope loads of this rank's own flag (uncached, so each
-//   poll reads memory, where the peer's system-scope store lands), then one
-//   device-scope acquire (buffer_inv: the vector L1, which an uncached load
-//   still fills, holds nothing stale for the reads after it) once the flag is
-//   seen. The reads after it are uncached too, so they read what the peer
-//   stored before its release.
+// THE MEMORY ORDERING, under that mapping: the textbook one for cacheable
+// memory shared across GPUs, nothing that depends on the arena bypassing a
+// cache. The arena is VMM `Pinned` (handle.cuh's kArenaAllocation), as torch's
+// SymmetricMemory and aiter's vmm_allocator allocate it: coarse-grained, cached
+// in the owner's L2 (MTYPE RW) and, through a peer's mapping, in the peer's L2
+// (MTYPE NC). The rules are LLVM's AMDGPU memory model (AMDGPUUsage, "Memory
+// Model GFX942" and its code-sequence table; gfx950 takes the same scope bits):
+// keeping L2s of different agents coherent takes `buffer_wbl2 sc0 sc1` on the
+// writer and `buffer_inv sc0 sc1` on the reader, which is what a SYSTEM-scope
+// release and acquire compile to. Torch's ROCm symmetric-memory barrier does
+// the same (system-scope release/acquire on the flag, then plain loads of the
+// peers' data).
+//   SIGNAL: the flag store is a SYSTEM-scope atomic (store sc0 sc1), release
+//   when ordered: buffer_wbl2 sc0 sc1 + s_waitcnt first, which writes back this
+//   L2's dirty lines -- this rank's own writes the peers will read (its inputs'
+//   copy-in, its partials) and its pushes into peers' memory held as NC lines --
+//   and completes every store this wave issued, before the flag can be seen.
+//   An ordered barrier first waits for every wave's stores (wait_stores) and
+//   meets the block, so the one releasing lane covers the block's stores.
+//   WAIT: relaxed SYSTEM-scope loads of this rank's own flag (load sc0 sc1),
+//   then one SYSTEM-scope acquire once the flag is seen: s_waitcnt +
+//   buffer_inv sc0 sc1, which invalidates this CU's L1 and this L2's non-local
+//   (peer) lines. The peers' data read after it are plain loads: a peer's line
+//   is fetched again from the peer, which wrote it back before its flag; a
+//   local line a peer stored into was invalidated by that store's probe (the
+//   PTE C-bit, same section).
 //   CLEAR: a relaxed system-scope store into this rank's own flag, ordered
 //   before this lane's next flag store by that barrier's own release or
 //   wait_stores (below).
@@ -1315,8 +1323,9 @@ DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
                           __MEMORY_SCOPE_SYSTEM);
 }
 
-// Spins relaxed and acquires once, after: an acquire per poll would invalidate
-// the caches on every iteration of every spinning block. A sleep a poll (64
+// AT SYSTEM SCOPE, the flag a peer's system-scope release stored (BARRIER's
+// memory ordering). Spins relaxed and acquires once, after: an acquire per poll
+// would invalidate the caches on every iteration of every spinning block. A sleep a poll (64
 // cycles) keeps a spinning block from hammering the link. EVERY 256 POLLS, the
 // slow path: the clock, and the status's `abort` (host-mapped, so only here,
 // never in the fast path). Past the timeout the wait records the fault; timed
@@ -1324,12 +1333,12 @@ DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
 // the block's s_barrier, so the block's other waves run on to their own next
 // wait, see `abort`, and end too. The kernel's output is then garbage and the
 // communicator broken (the host's watchdog).
-template <bool ACQUIRE, int MEMORY_SCOPE>
+template <bool ACQUIRE>
 DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
                   int64_t status_stride_field, int status_size_field, int rank,
                   const Counter& flag, uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>() < want;
+  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>() < want;
        ++n) {
     __builtin_amdgcn_s_sleep(1);
     if ((n & 255u) != 0) continue;
@@ -1341,11 +1350,11 @@ DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
     if (!aborted && waited <= timeout_ticks) continue;
     if (!aborted)
       record_fault(status_ptr, status_stride_field, status_size_field, where,
-                   rank, peer, flag.load<__ATOMIC_RELAXED, MEMORY_SCOPE>(),
+                   rank, peer, flag.load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(),
                    want, waited);
     __builtin_amdgcn_endpgm();
   }
-  if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, MEMORY_SCOPE>();
+  if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>();
 }
 
 }  // namespace impl
@@ -1439,7 +1448,7 @@ DINLINE void barrier(uint32_t* signals_ptr, int64_t signals_stride_rank,
     theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
                           __MEMORY_SCOPE_SYSTEM>(
         static_cast<uint32_t>(FlagState::arrived));
-    wait<kOrdered, __MEMORY_SCOPE_DEVICE>(
+    wait<kOrdered>(
         timeout_ticks, status_ptr, status_stride_field, status_size_field, rank,
         mine, static_cast<uint32_t>(FlagState::arrived),
         kFirst ? Where::start : Where::peer_barrier,
