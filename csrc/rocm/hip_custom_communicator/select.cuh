@@ -744,82 +744,55 @@ constexpr TunedKernel kAttnResKernels[] = {
 };
 
 // INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
-// the handle's quantization is int4, the exact build below it. 7 MiB every op,
-// 512 tokens of 7168 bf16: from there INT4 wins or ties for every op, and below
-// it the exact kernels win (at 256 and 384 tokens, INT4 against exact: plain 30.6
-// / 35.7 against 25.0 / 33.7 us, AttnRes 38.4 / 45.3 against 31.0 / 42.5, rms_norm
-// 37.1 / 39.8 against 25.3 / 34.0; at 512 plain 39.2 against 41.7, AttnRes 52.1
-// against 57.4; tuned picks, 2026-10-16T01-06-29Z against 00-22-04Z). Quick
-// reduce's own INT4 minimum is 2 MiB (vLLM's quick_all_reduce.py, _QR_MIN_SIZE);
-// ours is higher because our exact kernels are faster below it.
+// the handle's quantization is int4, the exact build below it. 2 MiB every op,
+// quick reduce's INT4 minimum at 8 ranks (vLLM's quick_all_reduce.py,
+// _QR_MIN_SIZE), while the cheap codec's crossover against our exact kernels is
+// measured.
 struct Int4Crossover {
   OpType op;
   int64_t min_bytes;
 };
 constexpr Int4Crossover kInt4Crossovers[] = {
-    {OpType::all_reduce, 7 * 1024 * 1024},
-    {OpType::all_reduce_rms_norm, 7 * 1024 * 1024},
-    {OpType::all_reduce_add_rms_norm, 7 * 1024 * 1024},
-    {OpType::all_reduce_add_attn_res_rms_norm, 7 * 1024 * 1024},
+    {OpType::all_reduce, 2 * 1024 * 1024},
+    {OpType::all_reduce_rms_norm, 2 * 1024 * 1024},
+    {OpType::all_reduce_add_rms_norm, 2 * 1024 * 1024},
+    {OpType::all_reduce_add_attn_res_rms_norm, 2 * 1024 * 1024},
 };
-// EACH OP'S INT4 KERNELS, gfx950 on n11, bf16, 8 ranks, 7168 (other widths read
-// as rows of the same bytes, as the exact lists are): what a call the handle
-// quantizes runs, from the crossover up. INT4 IS COMPUTE A BYTE where the exact
-// kernels are link-bound, so it wants many more blocks than the exact grids: at
-// the exact two-shot's 72 blocks the INT4 plain all-reduce ran 7.9x the exact
-// kernel's VALU on the same 576 waves and lost to it (+37% at 1024 tokens;
-// instruction counters 2026-10-16T00-26-40Z against 00-31-41Z), and at 256 it
-// beats quick reduce's INT4 (2026-10-16T00-41-03Z). Grids swept at 1024-8192
-// tokens (plain 72-512, 2026-10-16T00-41-03Z; fused 36-256 on 8192-column builds,
-// 00-51-04Z; AttnRes pull 192-512, 01-01-56Z); below 1024 tokens not
-// swept, the 1024 grid held down to the crossover.
-//   plain, 256 blocks: 54.7 / 84.7 / 141.2 / 268.1 us at 1024-8192 tokens (exact
-//     75.5 / 141.8 / 273.6 / 535.3; quick reduce INT4 70.1 / 119.1 / 197.7 / 334.4)
-//   rms_norm pull, 144: 55.1 / 84.6 / 143.5 / 295.2 (exact 77.1 / 146.5 / 278.5 /
-//     546.9); the push's best (256) 63.3 / 109.9 / 201.0 / 393.1
-//   add_rms_norm pull, 144: 62.5 / 97.3 / 160.8 / 329.5 (exact 92.9 / 159.5 /
-//     291.9 / 567.4); the push's best (256) 66.2 / 113.4 / 220.9 / 443.0
-//   AttnRes pull, 256 to 2048 tokens then 512: 45.4 at 384, 76.2 at 1024; 129.1 / 225.1
-//     / 403.1 at 2048-8192 (exact 92.4 / 169.2 / 335.8 / 643.2 at 1024-8192; quick reduce
-//     INT4 + attn_res 98.8 / 176.6 / 325.8 / 603.2); 192-512 blocks, 2026-10-16T01-01-56Z;
-//     the push's best (256) 82.7 / 162.6 / 324.9 / 634.1
-constexpr TunedKernel kAllReduceInt4Kernels[] = {
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {256, 0}}},
-};
-constexpr TunedKernel kRmsNormInt4Kernels[] = {
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192, Quantization::int4},
-      {144, 0}}},
-};
-constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192, Quantization::int4},
-      {144, 0}}},
-};
-constexpr TunedKernel kAttnResInt4Kernels[] = {
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1, Quantization::int4},
-      {256, 0}}},
-    {8,
-     2048,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1, Quantization::int4},
-      {512, 0}}},
-};
+// EACH OP'S INT4 KERNELS: ITS EXACT KERNELS, EVERY TWO-SHOT ONE MOVING INT4, at
+// the same template, tile, threads and grid. INT4 AT THE BASELINE'S OWN CONFIG,
+// by construction: with the codec cheap (quick reduce's magic numbers, a group a
+// thread), the INT4 plain all-reduce beats the exact one at the exact path's 72
+// blocks (71.8 / 109.0 / 178.2 / 286.6 against 75.5 / 142.0 / 273.3 / 535.4 us at
+// 1024-8192 tokens of 7168, and quick reduce INT4's 69.7 / 118.0 / 197.2 / 333.3;
+// 2026-10-16T03-14-06Z), and the rms_norm pull at its 48 (362.0 against 547.7 at
+// 8192; 03-31-44Z). A one-shot moves its input as it is, so it has no INT4 entry;
+// the INT4 list is consulted only from the op's crossover up (kInt4Crossovers),
+// where the exact lists pick two-shots.
+template <size_t N>
+constexpr size_t two_shots(const TunedKernel (&exact)[N]) {
+  size_t n = 0;
+  for (const TunedKernel& k : exact) n += is_two_shot(k.fn);
+  return n;
+}
+template <size_t M, size_t N>
+constexpr std::array<TunedKernel, M> int4_of(const TunedKernel (&exact)[N]) {
+  std::array<TunedKernel, M> int4{};
+  size_t i = 0;
+  for (const TunedKernel& k : exact)
+    if (is_two_shot(k.fn))
+      int4[i++] = TunedKernel{k.world, k.m, k.n, k.fn,
+                              {quantized(k.config.build, Quantization::int4),
+                               k.config.launch}};
+  return int4;
+}
+constexpr auto kAllReduceInt4Kernels =
+    int4_of<two_shots(kAllReduceKernels)>(kAllReduceKernels);
+constexpr auto kRmsNormInt4Kernels =
+    int4_of<two_shots(kRmsNormKernels)>(kRmsNormKernels);
+constexpr auto kAddRmsNormInt4Kernels =
+    int4_of<two_shots(kAddRmsNormKernels)>(kAddRmsNormKernels);
+constexpr auto kAttnResInt4Kernels =
+    int4_of<two_shots(kAttnResKernels)>(kAttnResKernels);
 
 constexpr int64_t int4_min_bytes(OpType o) {
   for (const Int4Crossover& c : kInt4Crossovers)
