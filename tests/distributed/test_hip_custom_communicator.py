@@ -14,7 +14,8 @@ import multiprocessing as mp
 import queue
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from multiprocessing.queues import Queue
@@ -80,6 +81,9 @@ GRAPH_LAYERS = 2
 GRAPH_REPLAYS = 3
 KERNEL_TIMEOUT_S = 30.0
 PROCESS_TIMEOUT_S = 900
+# The smoke test's world: a broken basic fails in minutes, not a PROCESS_TIMEOUT_S.
+SMOKE_KERNEL_TIMEOUT_S = 5.0
+SMOKE_PROCESS_TIMEOUT_S = 120
 
 Forced = dict[str, str | int]
 Tolerance = tuple[float, float]
@@ -105,28 +109,41 @@ def _tolerance(dtype: torch.dtype, normed: bool) -> Tolerance:
 # --------------------------------------------------------------------------------
 
 
+@contextmanager
+def _step(rank: int, name: str) -> Iterator[None]:
+    """Prints the step a rank enters, so the captured output of a hung world names
+    it, and names it in any failure it raises."""
+    print(f"rank {rank}: {name}", flush=True)
+    try:
+        yield
+    except Exception as e:
+        raise AssertionError(f"rank {rank}: step {name!r} failed: {e}") from e
+
+
 def _rank_main(
     rank: int,
     port: int,
     target: Callable[..., None],
     kwargs: dict[str, str],
     failures: "Queue[str]",
+    kernel_timeout_s: float,
 ) -> None:
     try:
         device = torch.device(f"cuda:{rank}")
         torch.accelerator.set_device_index(device)
         init_test_distributed_environment(WORLD_SIZE, 1, rank, str(port), rank)
         tp = get_tp_group()
-        comm = HipCustomCommunicator(
-            tp.cpu_group,
-            tp.device_group,
-            device,
-            timeout_seconds=KERNEL_TIMEOUT_S,
-            max_rows=MAX_TOKENS,
-            max_cols=HIDDEN,
-        )
+        with _step(rank, "open"):
+            comm = HipCustomCommunicator(
+                tp.cpu_group,
+                tp.device_group,
+                device,
+                timeout_seconds=kernel_timeout_s,
+                max_rows=MAX_TOKENS,
+                max_cols=HIDDEN,
+            )
         try:
-            assert not comm.disabled, f"disabled: {comm.state}"
+            assert not comm.disabled, f"rank {rank}: open: disabled: {comm.state}"
             target(comm, rank, **kwargs)
         finally:
             comm.close()
@@ -137,19 +154,27 @@ def _rank_main(
         cleanup_dist_env_and_memory()
 
 
-def _on_every_rank(target: Callable[..., None], **kwargs: str) -> None:
+def _on_every_rank(
+    target: Callable[..., None],
+    process_timeout_s: float = PROCESS_TIMEOUT_S,
+    kernel_timeout_s: float = KERNEL_TIMEOUT_S,
+    **kwargs: str,
+) -> None:
     """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
     communicator sized for Kimi-K3's largest call."""
     ctx = mp.get_context("spawn")
     failures = ctx.Queue()
     port = get_open_port()
     procs = [
-        ctx.Process(target=_rank_main, args=(r, port, target, kwargs, failures))
+        ctx.Process(
+            target=_rank_main,
+            args=(r, port, target, kwargs, failures, kernel_timeout_s),
+        )
         for r in range(WORLD_SIZE)
     ]
     for p in procs:
         p.start()
-    deadline = time.monotonic() + PROCESS_TIMEOUT_S
+    deadline = time.monotonic() + process_timeout_s
     for p in procs:
         p.join(timeout=max(0.0, deadline - time.monotonic()))
     hung = [r for r, p in enumerate(procs) if p.is_alive()]
@@ -164,7 +189,10 @@ def _on_every_rank(target: Callable[..., None], **kwargs: str) -> None:
         except queue.Empty:
             break
     assert not errors, "\n".join(errors)
-    assert not hung, f"ranks {hung} still running after {PROCESS_TIMEOUT_S} s"
+    assert not hung, (
+        f"ranks {hung} still running after {process_timeout_s} s; each rank's last "
+        "printed step is where it hung"
+    )
     assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
 
 
@@ -396,6 +424,38 @@ def _tile_cols(op: Op, hidden: int) -> int:
     """The columns a forced build's tile must hold: the row, where the op's tile
     holds it."""
     return 0 if op == "all_reduce" else hidden
+
+
+# --------------------------------------------------------------------------------
+# The basics, first and fast: one short-deadline world, each step named.
+# --------------------------------------------------------------------------------
+
+
+def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
+    bf16 = torch.bfloat16
+    with _step(rank, f"all_reduce 1x{HIDDEN} eager"):
+        _eager(comm, rank, "all_reduce", 1, HIDDEN, bf16, {}, None, 1)
+    for op in get_args(Op):
+        if op != "all_reduce":
+            layer = ATTN_RES_LAYERS[0] if "attn_res" in op else None
+            with _step(rank, f"{op} 1x{HIDDEN} eager"):
+                _eager(comm, rank, op, 1, HIDDEN, bf16, {}, layer, 2)
+    with _step(rank, f"all_reduce 2048x{HIDDEN} eager"):
+        _eager(comm, rank, "all_reduce", 2048, HIDDEN, bf16, {}, None, 3)
+    with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay"):
+        _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, {}, None)
+
+
+@on_eight_gpus
+def test_smoke() -> None:
+    """Open, each op once at a decode row, a prefill-sized all-reduce and one
+    CUDA graph, against the ops they replace, every call leaving the communicator
+    open and its flags clear: a broken basic fails in minutes, naming its step."""
+    _on_every_rank(
+        _smoke_on_rank,
+        process_timeout_s=SMOKE_PROCESS_TIMEOUT_S,
+        kernel_timeout_s=SMOKE_KERNEL_TIMEOUT_S,
+    )
 
 
 # --------------------------------------------------------------------------------
