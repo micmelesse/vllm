@@ -1404,9 +1404,10 @@ DINLINE void barrier(uint32_t* const* signals_ptrs,
 //
 // WHAT CROSSES THE LINKS in a two-shot, its QUANTIZATION: each buffer of the exchange in its own
 // dtype (none), or INT4, quick reduce's format (csrc/quickreduce): a GROUP is 32 consecutive
-// elements of a row, held as 4-bit values (element j in bits 4 * (j % 8) of word j / 8, biased by 8)
-// and one fp16 scale, the group's largest magnitude / 7, ROUNDED TO FP16 BEFORE THE VALUES ARE, so
-// each is rounded against the scale stored; an element is (q - 8) * scale. A quantized buffer is two
+// elements of a row, held as 4-bit values biased by 8 (a word 8 elements, its elements 2i and
+// 2i + 1 in bits 4i and 16 + 4i, so one shift and mask puts both in a 16-bit pair, quick reduce's
+// layout) and one fp16 scale, the group's largest magnitude / 7, ROUNDED TO FP16 BEFORE THE VALUES
+// ARE, so each is rounded against the scale stored; an element is (q - 8) * scale. A quantized buffer is two
 // buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32] fp16), each a pointer, its
 // strides and its sizes. Every function that moves the exchange takes a QUANTIZATION and both forms
 // of each buffer it moves (MEMORY's load, store, peers_load and all_gather; the COLLECTIVES), and
@@ -1463,30 +1464,60 @@ DINLINE void int4_scale_store(__fp16* row, int pack, float scale) {
         static_cast<__fp16>(scale);
 }
 
-// A PACK'S WORD AT ITS GROUP'S SCALE: (q - 8) * scale, exact in fp32, rounded once to U, a
-// 16-bit dtype. MADE AS A LOADED PACK IS, four 32-bit words copied in whole: element by element,
-// each 16-bit value held a register of its own and the pull norms' two rows of every peer's
-// packs spilled 188 VGPRs (256 VGPRs, 592 B of scratch; 2026-10-15T22-21-26Z).
+// THE 0x6400 MAGIC (quick reduce's): a word's elements 2i and 2i + 1 as the halves of an fp16
+// pair, each 1024 + q (q in the low bits of 1024's mantissa).
+DINLINE uint32_t int4_pair(uint32_t word, int i) {
+  return ((word >> (4 * i)) & 0x000F000Fu) | 0x64006400u;
+}
+
+// HALF OF A PAIR AT ITS GROUP'S SCALE, (q - 8) * scale, EXACT in fp32, one v_fma_mix_f32: (1024 + q)
+// * scale is 22 bits, and bias = -1032 * scale (exact) leaves (q - 8) * scale, which fits. Left to
+// the compiler, each half was converted and fed to packed fmas, 1.5 instructions a value.
+template <int HALF>
+DINLINE float int4_term(uint32_t pair, float scale, float bias) {
+  float term;
+  if constexpr (HALF == 0)
+    asm("v_fma_mix_f32 %0, %1, %2, %3 op_sel_hi:[1,0,0]"
+        : "=v"(term) : "v"(pair), "v"(scale), "v"(bias));
+  else
+    asm("v_fma_mix_f32 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,0]"
+        : "=v"(term) : "v"(pair), "v"(scale), "v"(bias));
+  return term;
+}
+DINLINE float int4_bias(float scale) { return scale * -1032.0f; }
+
+// A PACK'S WORD AT ITS GROUP'S SCALE, each element rounded once to U, a 16-bit dtype. MADE AS A
+// LOADED PACK IS, four 32-bit words copied in whole: element by element, each 16-bit value held a
+// register of its own and the pull norms' two rows of every peer's packs spilled 188 VGPRs (256
+// VGPRs, 592 B of scratch; 2026-10-15T22-21-26Z).
 template <typename U, int P>
 DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P * 4 == 32 && sizeof(U) == 2, "a pack is one word of 8 16-bit values");
-  const auto element = [&](int j) {
-    const U x = static_cast<U>(
-        static_cast<float>(static_cast<int>((word >> (4 * j)) & 0xFu) - 8) * scale);
-    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, x));
+  const float bias = int4_bias(scale);
+  const auto bits = [](float x) {
+    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(x)));
   };
   u32x4 packed;
 #pragma unroll
-  for (int w = 0; w < P / 2; ++w) packed[w] = element(2 * w) | element(2 * w + 1) << 16;
+  for (int w = 0; w < P / 2; ++w) {
+    const uint32_t pair = int4_pair(word, w);
+    packed[w] = bits(int4_term<0>(pair, scale, bias)) |
+                bits(int4_term<1>(pair, scale, bias)) << 16;
+  }
   __builtin_memcpy(output, &packed, sizeof(packed));
 }
 
 // A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
-// (quad_perm [1,0,3,2], then [2,3,0,1]), / 7, to fp16 (past its largest, clamped to it); then each
-// value rounded to the nearest of -8..7 times the scale stored. A group of zeros is all 8s at scale 0.
+// (quad_perm [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each step),
+// / 7, to fp16 (past its largest, clamped to it); then each value rounded to the nearest of -8..7
+// times the scale stored. A group of zeros is all 8s at scale 0. ROUNDED BY THE MAGIC NUMBER, in
+// place: fma(x, inv * 16^p, 1.5 * 2^(23 + 4p) + 8 * 16^p) rounds to a multiple of 16^p, so q + 8
+// lands in bits 4p..4p+3, clamped (med3) and masked into the word; elements 2p and 2p + 1 share
+// p (one packed fma), the odd ones' half then shifted up 16.
 template <typename T, int P>
 DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
+  typedef float f32x2 __attribute__((ext_vector_type(2)));
   float x[P];
   float amax = 0.0f;
 #pragma unroll
@@ -1494,16 +1525,29 @@ DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
     x[j] = static_cast<float>(input[j]);
     amax = fmaxf(amax, fabsf(x[j]));
   }
-  amax = Max::apply(dpp<0xb1, 0xf, Max>(amax), amax);
-  amax = Max::apply(dpp<0x4e, 0xf, Max>(amax), amax);
+  uint32_t bits = __builtin_bit_cast(uint32_t, amax);
+  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
+  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                       static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
+  amax = __builtin_bit_cast(float, bits);
   scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
-  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
-  word = 0;
+  const float inv = scale > 0.0f ? __builtin_amdgcn_rcpf(scale) : 0.0f;
+  uint32_t half[2] = {0, 0};
 #pragma unroll
-  for (int j = 0; j < P; ++j) {
-    const float q = fminf(fmaxf(rintf(x[j] * inv), -8.0f), 7.0f);
-    word |= static_cast<uint32_t>(static_cast<int>(q) + 8) << (4 * j);
+  for (int p = 0; p < P / 2; ++p) {
+    const float unit = static_cast<float>(1 << (4 * p));
+    const float lowest = 12582912.0f * unit;  // 1.5 * 2^23, q + 8 = 0
+    const f32x2 y = __builtin_elementwise_fma(f32x2{x[2 * p], x[2 * p + 1]},
+                                              f32x2{inv * unit, inv * unit},
+                                              f32x2{lowest + 8.0f * unit, lowest + 8.0f * unit});
+#pragma unroll
+    for (int e = 0; e < 2; ++e)
+      half[e] |= __builtin_bit_cast(
+                     uint32_t, __builtin_amdgcn_fmed3f(y[e], lowest, lowest + 15.0f * unit)) &
+                 (0xFu << (4 * p));
   }
+  word = half[0] | half[1] << 16;
 }
 
 // Every pack of a thread's registers, encoded or decoded.
@@ -1637,14 +1681,18 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 #pragma unroll
     for (int k = 0; k < K; ++k)
 #pragma unroll
-      for (int j = 0; j < P; ++j) {
-        float acc = 0.0f;
+      for (int w = 0; w < P / 2; ++w) {
+        float acc[2] = {0.0f, 0.0f};
 #pragma unroll
-        for (int r = 0; r < WORLD; ++r)
-          acc += static_cast<float>(static_cast<T>(
-              static_cast<float>(static_cast<int>((words[r][i][k] >> (4 * j)) & 0xFu) - 8) *
-              group_scales[r][i][k]));
-        output[i][k][j] = acc;
+        for (int r = 0; r < WORLD; ++r) {
+          const float scale = group_scales[r][i][k];
+          const float bias = int4_bias(scale);
+          const uint32_t pair = int4_pair(words[r][i][k], w);
+          acc[0] += static_cast<float>(static_cast<T>(int4_term<0>(pair, scale, bias)));
+          acc[1] += static_cast<float>(static_cast<T>(int4_term<1>(pair, scale, bias)));
+        }
+        output[i][k][2 * w] = acc[0];
+        output[i][k][2 * w + 1] = acc[1];
       }
 }
 
