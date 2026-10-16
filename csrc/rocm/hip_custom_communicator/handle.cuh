@@ -7,11 +7,12 @@
 // memory: each rank creates its physical memory with explicit properties,
 // exports it as a POSIX file descriptor, and every rank maps every rank's into
 // ONE reserved virtual range, rank r's at base + r * stride, so a kernel
-// reaches a peer's buffer by a pointer and a rank stride. The CALLER'S buffers
-// (registered or captured inputs: torch's, not ours) are opened over legacy HIP
-// IPC handles, a device table of every rank's address each. The collective
-// that exchanges the handles and the socket names is the caller's (`Gather`),
-// so this names no process group.
+// reaches a peer's buffer by a pointer and a rank stride. THE CALLER'S INPUT
+// is never read by a peer where it is: every input is copied into this rank's
+// staging first (`slot_for`), eager or captured, so no peer reads memory we did
+// not allocate, and nothing is registered or opened over IPC. The collective
+// that exchanges the socket names is the caller's (`Gather`), so this names no
+// process group.
 
 #pragma once
 
@@ -541,7 +542,6 @@ class Handle {
   // every launch on it has finished.
   ~Handle() {
     (void)hipDeviceSynchronize();
-    for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
     hipFree(slab_);
   }
 
@@ -562,67 +562,6 @@ class Handle {
   int64_t staging_bytes() const { return staging_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
-
-  // THE BUFFERS A CAPTURE RECORDED, registered, every rank together. During
-  // capture an input's address is not registered yet, so `inp_ptrs` reserves a
-  // slot and remembers the pointer; this gathers every rank's handle for each
-  // and fills the slots in. Sound because a captured address is fixed for the
-  // graph's life: the kernel reads a slot filled AFTER the capture that
-  // recorded the launch. False, with nothing registered, when the ranks
-  // captured different numbers (every rank must run the same graphs); a
-  // collective even with none, or the other ranks wait in it.
-  bool register_captured(const Gather& gather) {
-    const int64_t mine = static_cast<int64_t>(pending_.size());
-    for (const std::string& c : gather(
-             std::string(reinterpret_cast<const char*>(&mine), sizeof(mine)))) {
-      int64_t n = 0;
-      std::memcpy(&n, c.data(), sizeof(n));
-      if (n != mine) return false;
-    }
-    if (pending_.empty()) return true;
-    std::string all;
-    for (void* p : pending_) all += ipc_bytes(p);
-    const size_t each = all.size() / pending_.size();
-    std::vector<std::vector<std::string>> theirs(pending_.size());
-    for (const std::string& rank_bytes : gather(all))
-      for (size_t i = 0; i < pending_.size(); ++i)
-        theirs[i].push_back(rank_bytes.substr(i * each, each));
-    // Nothing goes into `registered_`, which means "an address this object
-    // keeps alive": a captured buffer dies with its graph, and its slot is
-    // baked into the recorded launch.
-    for (size_t i = 0; i < pending_.size(); ++i)
-      write_slot(pending_slots_[i], open_peers(theirs[i], pending_[i]));
-    pending_.clear();
-    pending_slots_.clear();
-    return true;
-  }
-
-  // A BUFFER EVERY RANK ALLOCATED, registered every rank together: launches
-  // over `self` read the peers' copies where they are. `forget_buffer` undoes
-  // it before the buffer is freed, or a later allocation at the same address
-  // would read the dead buffer's peers.
-  void register_buffer(void* self, const Gather& gather) {
-    const std::vector<std::string> theirs = gather(ipc_bytes(self));
-    void** slot = next_slot();
-    write_slot(slot, open_peers(theirs, self));
-    registered_[self] = slot;
-    buffer_handles_[self] = theirs;
-  }
-  void forget_buffer(void* self) {
-    registered_.erase(self);
-    const auto it = buffer_handles_.find(self);
-    if (it == buffer_handles_.end()) return;
-    for (int i = 0; i < world_size_; ++i) {
-      if (i == rank_) continue;
-      if (auto o =
-              opened_.find(it->second[i].substr(0, sizeof(hipIpcMemHandle_t)));
-          o != opened_.end()) {
-        HIP_CHECK(hipIpcCloseMemHandle(o->second));
-        opened_.erase(o);
-      }
-    }
-    buffer_handles_.erase(it);
-  }
 
   // WHAT A KERNEL IS HANDED, each its own argument, a peer buffer as a device
   // table of every rank's address. Every rank's input for a launch over `input`
@@ -748,16 +687,6 @@ class Handle {
   void abort() {
     __atomic_store_n(&status_[static_cast<int>(StatusField::abort)],
                      uint32_t{1}, __ATOMIC_RELEASE);
-  }
-
-  // Whether the peers can read `input` where it is, on `stream`: registered, or
-  // captured (it is registered at capture exit, before any replay). Otherwise
-  // it goes through the staging.
-  bool reads_in_place(const void* input, hipStream_t stream) const {
-    hipStreamCaptureStatus status;
-    HIP_CHECK(hipStreamIsCapturing(stream, &status));
-    return status == hipStreamCaptureStatusActive ||
-           registered_.count(const_cast<void*>(input)) != 0;
   }
 
   // What a compiled kernel uses, read once from the code object loaded on this
@@ -921,7 +850,6 @@ class Handle {
       staging[i] = exchange_->at(i) + staging_offset();
     staging_ptrs_ = next_slot();
     write_slot(staging_ptrs_, staging);
-    registered_[staging[rank_]] = staging_ptrs_;
     log.phase(OpenPhase::tables_written);
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
@@ -969,80 +897,15 @@ class Handle {
            2 * (quantized_values_bytes_ + quantized_scales_bytes_);
   }
 
-  // A BUFFER AS THE GATHER CARRIES IT: its allocation's IPC handle, then its
-  // offset in that allocation. hipIpcGetMemHandle must be given an allocation's
-  // BASE, and a torch tensor sits at an offset inside one.
-  static std::string ipc_bytes(const void* ptr) {
-    void* base = nullptr;
-    HIP_CHECK(hipPointerGetAttribute(
-        &base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
-        reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(ptr))));
-    hipIpcMemHandle_t h;
-    HIP_CHECK(hipIpcGetMemHandle(&h, base));
-    const int64_t offset =
-        static_cast<const char*>(ptr) - static_cast<char*>(base);
-    return std::string(reinterpret_cast<const char*>(&h), sizeof(h)) +
-           std::string(reinterpret_cast<const char*>(&offset), sizeof(offset));
-  }
-
-  // Every rank's `ipc_bytes` opened into a local pointer, `self` for this
-  // rank's: our OWN handle is never opened (hipIpcOpenMemHandle refuses a
-  // self-handle). Once per distinct allocation: a capture-heavy run gathers the
-  // same peer BASES over and over, and vLLM's CustomAllreduce keeps the same
-  // cache, keyed the same way.
-  std::vector<void*> open_peers(const std::vector<std::string>& theirs,
-                                void* self) {
-    constexpr size_t kIpc = sizeof(hipIpcMemHandle_t);
-    std::vector<void*> output(world_size_, nullptr);
-    for (int i = 0; i < world_size_; ++i) {
-      if (i == rank_) {
-        output[i] = self;
-        continue;
-      }
-      if (theirs[i].size() != kIpc + sizeof(int64_t))
-        throw std::runtime_error(
-            "hip_custom_communicator: a gathered buffer is an IPC handle and "
-            "an offset");
-      const std::string handle = theirs[i].substr(0, kIpc);
-      int64_t offset = 0;
-      std::memcpy(&offset, theirs[i].data() + kIpc, sizeof(offset));
-      auto it = opened_.find(handle);
-      if (it == opened_.end()) {
-        hipIpcMemHandle_t h;
-        std::memcpy(&h, handle.data(), kIpc);
-        void* base = nullptr;
-        HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
-        it = opened_.emplace(handle, base).first;
-      }
-      output[i] = static_cast<char*>(it->second) + offset;
-    }
-    return output;
-  }
-
-  // The peers' view of `input`: a capture's deferred slot, a registered
-  // buffer's, or the staging's with the input copied in.
+  // The peers' view of `input`: EVERY INPUT is copied into this rank's staging
+  // on the launch's stream (a copy node when captured), and the peers read the
+  // staging, which every rank mapped at open: one path, eager and captured
+  // alike, and no peer ever reads memory we did not allocate (no IPC, no
+  // registration). aiter's VMM transport does the same (copy-in on gfx1250).
   void** slot_for(void* input, int64_t bytes, hipStream_t stream) {
-    hipStreamCaptureStatus status;
-    HIP_CHECK(hipStreamIsCapturing(stream, &status));
-    if (status == hipStreamCaptureStatusActive) {
-      // A fresh slot ALWAYS, even for an address `registered_` already knows: a
-      // graph's buffers are freed with the graph and the allocator hands the
-      // same address back. Skipping the record would make the recorded COUNT
-      // depend on that luck, and the exchange after capture is COLLECTIVE, so
-      // ranks would exchange different counts.
-      void** slot = next_slot();
-      pending_.push_back(input);
-      pending_slots_.push_back(slot);
-      return slot;
-    }
-    if (auto it = registered_.find(input); it != registered_.end())
-      return it->second;
-    // AN EAGER INPUT the peers cannot read (the caching allocator's, borrowed
-    // for the call): copied into the staging, which they mapped once, on the
-    // launch's stream.
     if (bytes > staging_bytes_) {
       std::ostringstream os;
-      os << "hip_custom_communicator: an eager " << bytes
+      os << "hip_custom_communicator: a " << bytes
          << "-byte input exceeds the " << staging_bytes_ << "-byte staging";
       throw std::runtime_error(os.str());
     }
@@ -1053,7 +916,7 @@ class Handle {
                    stream_index(stream), log_->launches(), 0, 0,
                    static_cast<uint32_t>(bytes),
                    static_cast<uint32_t>(staging_bytes_), 0, host_ns()});
-    return registered_.at(staging());
+    return staging_ptrs_;
   }
 
   // A STREAM'S AND A KERNEL'S INDEX in the log, recorded the first time each
@@ -1123,12 +986,7 @@ class Handle {
   void** slab_ = nullptr;
   void** slab_end_ = nullptr;
   void** cursor_ = nullptr;
-  std::unordered_map<void*, void**> registered_;
-  std::unordered_map<void*, std::vector<std::string>> buffer_handles_;
   mutable std::unordered_map<const void*, Resources> resources_;
-  std::vector<void*> pending_;
-  std::vector<void**> pending_slots_;
-  std::unordered_map<std::string, void*> opened_;
 };
 
 // =================================================================================================

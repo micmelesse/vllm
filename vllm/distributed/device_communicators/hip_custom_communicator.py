@@ -15,10 +15,9 @@ after its own (the algorithm, the direction, every field of one build and the la
 all or none) are the one way to force one, for the sweep and the tests. Every one is
 passed through as it came: C++ builds the config, checks it, and answers.
 
-TWO MEMORY PATHS, split by lifetime, both C++'s (`Handle::dev_comm`). A captured buffer
-is held by vLLM for the graph's life, so it is registered once at capture exit and read
-in place. An eager input is the caching allocator's, borrowed for the call, so C++
-copies it into a staging buffer it owns.
+ONE MEMORY PATH (C++'s `Handle`): every input, eager or captured, is copied into a
+staging buffer the communicator owns, which every rank mapped at open (HIP virtual
+memory); peers read only that, never the caller's tensor, so nothing is registered.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -911,18 +910,6 @@ _RECORDED = 64
 _WATCH_S = 0.1
 
 
-def _require_capture(state: State) -> None:
-    """Raise on a launch being recorded into a cudagraph outside `capture()`: peers are
-    registered when that context exits, and a graph captured without it replays against
-    addresses that were never registered."""
-    if torch.cuda.is_current_stream_capturing() and not isinstance(state, Capturing):
-        raise RuntimeError(
-            "HipCustomCommunicator is being captured into a cudagraph without "
-            "`capture()`. "
-            "Use `with comm.capture(), torch.cuda.graph(g): ...`"
-        )
-
-
 class HipCustomCommunicator:
     """vLLM's TP all-reduce and its fused ops over our HIP kernels, behind
     CudaCommunicator. One per process group, because peer pointers are group-scoped.
@@ -1376,7 +1363,6 @@ class HipCustomCommunicator:
         capture outside `capture()`."""
         if self.disabled:
             raise Refused(Error.disabled, input)
-        _require_capture(self.state)
 
     @final
     def _launched(self, op: Op, input: torch.Tensor, answer: Answer) -> None:
@@ -1467,16 +1453,10 @@ class HipCustomCommunicator:
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture; the buffers its launches recorded are registered
-        on exit, by C++, a collective over the CPU group. A captured address is fixed
-        for the graph's life, so filling the slots after capture is sound."""
-        try:
-            yield
-        finally:
-            # Even on error: unfilled slots fault later on a null peer pointer.
-            torch.ops._rocm_C.hip_custom_communicator_register_captured(
-                self._handle, self.cpu_group.group_name
-            )
+        """Wrap a cudagraph capture. Nothing is registered: every input is copied into
+        our staging on the launch's stream (a copy node in the graph), so a captured
+        launch reads only memory every rank mapped at open."""
+        yield
 
     def _all_reduce(
         self,

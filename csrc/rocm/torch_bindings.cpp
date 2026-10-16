@@ -115,22 +115,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                &hip_custom_communicator_signals);
   rocm_ops.def("hip_custom_communicator_abort", &hip_custom_communicator_abort);
   rocm_ops.def("hip_custom_communicator_log", &hip_custom_communicator_log);
-  rocm_ops.def(
-      "hip_custom_communicator_register_buffer(int handle_ptr, Tensor buffer, "
-      "str group) -> ()",
-      &hip_custom_communicator_register_buffer);
-  rocm_ops.def(
-      "hip_custom_communicator_forget_buffer(int handle_ptr, Tensor buffer) -> "
-      "()",
-      &hip_custom_communicator_forget_buffer);
   rocm_ops.def("hip_custom_communicator_wall_clock_khz",
                &hip_custom_communicator_wall_clock_khz);
   rocm_ops.def("hip_custom_communicator_supported",
                &hip_custom_communicator_supported);
   rocm_ops.def("hip_custom_communicator_build_info",
                &hip_custom_communicator_build_info);
-  rocm_ops.def("hip_custom_communicator_register_captured",
-               &hip_custom_communicator_register_captured);
 
   rocm_ops.def(
       "hip_custom_communicator_all_reduce(int handle_ptr, Tensor input, "

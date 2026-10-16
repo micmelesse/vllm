@@ -407,38 +407,12 @@ void hip_custom_communicator_abort(fptr_t handle_ptr) {
   handle_of(handle_ptr).abort();
 }
 
-// `buffer` registered with every rank's over the process group named `group`, a
-// collective: the peers read it where it is until it is forgotten, which must
-// come before it is freed.
-void hip_custom_communicator_register_buffer(fptr_t handle_ptr,
-                                             torch::Tensor& buffer,
-                                             const std::string& group) {
-  check_device_contiguous({&buffer});
-  const auto pg = resolved(group);
-  if (!pg) raise(hip_custom_communicator::Error::no_such_group);
-  handle_of(handle_ptr).register_buffer(buffer.data_ptr(), gather_over(*pg));
-}
-void hip_custom_communicator_forget_buffer(fptr_t handle_ptr,
-                                           torch::Tensor& buffer) {
-  handle_of(handle_ptr).forget_buffer(buffer.data_ptr());
-}
-
 // The device clock's rate, kHz: what its ticks are per ms.
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device) {
   int khz = 0;
   HIP_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
                                   static_cast<int>(device)));
   return khz;
-}
-
-// THE BUFFERS A CAPTURE RECORDED, registered over the process group named
-// `group`, every rank together (Handle::register_captured).
-void hip_custom_communicator_register_captured(fptr_t handle_ptr,
-                                               const std::string& group) {
-  const auto pg = resolved(group);
-  if (!pg) raise(hip_custom_communicator::Error::no_such_group);
-  if (!handle_of(handle_ptr).register_captured(gather_over(*pg)))
-    raise(hip_custom_communicator::Error::ranks_disagree);
 }
 
 namespace {

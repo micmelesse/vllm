@@ -72,14 +72,6 @@ hip_custom_communicator_open(const std::string& cpu_group,
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t max_cols,
                                                       int64_t world);
-// The buffers a capture recorded, registered over `group`, a collective.
-void hip_custom_communicator_register_captured(fptr_t handle_ptr,
-                                               const std::string& group);
-void hip_custom_communicator_register_buffer(fptr_t handle_ptr,
-                                             torch::Tensor& buffer,
-                                             const std::string& group);
-void hip_custom_communicator_forget_buffer(fptr_t handle_ptr,
-                                           torch::Tensor& buffer);
 int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
 
 void hip_custom_communicator_dispose(fptr_t handle_ptr);

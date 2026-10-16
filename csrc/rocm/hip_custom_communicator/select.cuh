@@ -1235,8 +1235,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
                                     const KernelConfig& c, DType dtype,
                                     int64_t m, int64_t n, int64_t tile_cols,
                                     std::optional<Error> own_error,
-                                    const void* input, bool staged,
-                                    hipStream_t stream) {
+                                    bool staged) {
   const int world = h ? h->world_size() : 1;
   if (h && !world_built(world)) return Error::world_not_built;
   if (!dtype_built(dtype)) return Error::dtype_not_built;
@@ -1272,11 +1271,10 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
     return Error::quantized_too_small;
   if (!staged && scratch_need(fn, m, packs, world) > h->scratch_bytes())
     return Error::scratch_too_small;
-  // AN IN-PLACE BUILD ON AN EAGER INPUT reads it through the staging, copied in
-  // whole first.
+  // AN IN-PLACE BUILD reads its input through the staging, copied in whole
+  // first (every input: Handle::slot_for).
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!staged && !h->reads_in_place(input, stream) &&
-      bytes > h->staging_bytes())
+  if (!staged && bytes > h->staging_bytes())
     return Error::staging_too_small;
   return std::nullopt;
 }
@@ -1339,8 +1337,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
   // INT4 READS ONLY THIS RANK'S INPUT, staging it quantized itself, so it is
   // never the staged build.
-  const bool staged = a.quantization == Quantization::none &&
-                      !h.reads_in_place(input, stream);
+  const bool staged = a.quantization == Quantization::none;
   // THE STAGED BAND: the rows a pass, what the staging holds (and the
   // two-shot's scratch, a row of its slice a row).
   const int64_t row_bytes = n * elem_bytes(dtype);
@@ -1354,7 +1351,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
-                  std::nullopt, input, staged, stream))
+                  std::nullopt, staged))
     return *e;
   if (staged && band < 1) return Error::staging_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups
@@ -1513,7 +1510,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   // 2.
   if (const std::optional<Error> e = refused(
           &h, fn, c, dtype, m, n, tile_cols(op, n),
-          weight_refused(op, dtype, weight_dtype), input, false, stream))
+          weight_refused(op, dtype, weight_dtype), false))
     return *e;
   // 3.
   const void* kernel = nullptr;
@@ -1670,7 +1667,7 @@ select_all_reduce_add_rms_norm(
   // 2.
   if (const std::optional<Error> e = refused(
           &h, fn, c, dtype, m, n, tile_cols(op, n),
-          weight_refused(op, dtype, weight_dtype), input, false, stream))
+          weight_refused(op, dtype, weight_dtype), false))
     return *e;
   // 3.
   const void* kernel = nullptr;
@@ -1854,8 +1851,8 @@ select_all_reduce_add_attn_res_rms_norm(
   const KernelConfig& c = k.config;
   // 2.
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt, input,
-                  false, stream))
+          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt,
+                  false))
     return *e;
   // 3.
   const void* kernel = nullptr;
