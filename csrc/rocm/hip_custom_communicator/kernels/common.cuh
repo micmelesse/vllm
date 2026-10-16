@@ -2167,27 +2167,21 @@ DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t
   const int64_t total = int64_t{input_size_m} * input_size_n;
   const int slice = share_slice<WORLD, kInt4Group>(total);
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
-    // EVERY RANK'S GROUP IN FLIGHT AT ONCE, one round trip: no branch between the ranks (a late
-    // rank's empty share loads group 0 of the input and stores nothing), so all 32 loads issue
-    // before the first is encoded; with a branch a rank, two ranks' loads issued a time.
-    T x[WORLD][kInt4GroupPacks][P];
-#pragma unroll
+    // TWO RANKS' GROUPS IN FLIGHT: unrolled whole, every rank's 4 loads were hoisted together,
+    // 128 VGPRs of input, 256 in all, spilling.
+#pragma unroll 2
     for (int r = 0; r < WORLD; ++r) {
       const int groups = share_len(total, slice, r) / kInt4Group;
-      const V* group = reinterpret_cast<const V*>(int4_group_at<CONTIGUOUS>(
-          input_ptr, input_stride_m, input_stride_n, input_size_n,
-          groups > 0 ? share_first(slice, r) : 0, max(min(g, groups - 1), 0)));
-#pragma unroll
-      for (int k = 0; k < kInt4GroupPacks; ++k) held(x[r][k], pack_load(group + k));
-    }
-    issued();
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) {
-      const int groups = share_len(total, slice, r) / kInt4Group;
+      if (groups == 0) continue;  // a late rank's empty share (every block alike)
       const int64_t first = share_first(slice, r);
+      const V* group = reinterpret_cast<const V*>(int4_group_at<CONTIGUOUS>(
+          input_ptr, input_stride_m, input_stride_n, input_size_n, first, min(g, groups - 1)));
+      T x[kInt4GroupPacks][P];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k) held(x[k], pack_load(group + k));
       u32x4 words;
       float scale;
-      int4_encode_group(x[r], words, scale);
+      int4_encode_group(x, words, scale);
       if (g < end && g < groups)
         int4_group_store(words, scale, staging_values_ptr + first / 2,
                          staging_scales_ptr + first / kInt4Group, g);
