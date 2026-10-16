@@ -9,8 +9,8 @@
 // ONE reserved virtual range, rank r's at base + r * stride, so a kernel
 // reaches a peer's buffer by a pointer and a rank stride. THE CALLER'S INPUT
 // is never read by a peer where it is: every kernel copies this rank's input
-// into this rank's staging itself (INT4: quantized into the staging values),
-// before its first barrier, which is ordered; the peers then read the staging
+// into this rank's inputs itself (INT4: quantized into the inputs' INT4 values),
+// before its first barrier, which is ordered; the peers then read the inputs
 // at ptr + r * stride. One path, eager and captured alike: no host copy, no
 // pointer table, nothing registered or opened over IPC. The collective
 // that exchanges the socket names is the caller's (`Gather`), so this names no
@@ -70,9 +70,7 @@ using Gather = std::function<std::vector<std::string>(const std::string&)>;
 
 // THE SIGNALS' BYTES: two flag sets of kMaxBlocks blocks by kMaxRanks writers,
 // rounded to 128 bytes; their region in the arena is padded to 4 KiB
-// (kSignalsRegionBytes), so every region after it keeps the alignment it had
-// when the exchange was its own allocation (a granule multiple plus the same
-// region sizes).
+// (kSignalsRegionBytes), so every region after it starts aligned.
 constexpr int64_t kSignalsBytes =
     (2 * int64_t{kMaxBlocks} * kMaxRanks * int64_t{sizeof(uint32_t)} + 127) /
     128 * 128;
@@ -93,7 +91,7 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 //   store (an agent's L2 is not coherent with a remote agent's writes to its
 //   memory, and a device-scope acquire invalidates only non-local lines).
 //   EXCHANGE: uncached, for the same reason: a push kernel stores into its
-//   peers' scratch and then reads its own; a pull kernel reads a peer's scratch
+//   peers' partials and then reads its own; a pull kernel reads a peer's partials
 //   the peer wrote in its own L2's place. Coarse-grained (cacheable) memory
 //   would need every reader's L2 invalidated at the barrier and every writer's
 //   written back, which the barrier's device-scope acquire does not do for
@@ -104,53 +102,63 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypeUncached;
 
 // THE ARENA'S LAYOUT, one rank's slice, the same offsets on every rank (bytes
-// from the slice's start; Handle's `arena_layout` computes it from the sizes
-// open is given, select.cuh's `exchange_sizes`):
+// from the slice's start; `arena_layout` computes it from the sizes open is
+// given, select.cuh's `exchange_sizes`). A signal pad, then ONE PUBLISHED
+// REGION PER PHASE, whose data peers may still read while this rank writes the
+// next phase's:
 //
-//   region            offset                              bytes
-//   signals           0                                   kSignalsRegionBytes
-//   scratch           signals end                         scratch
-//   scratch values    scratch end                         quantized values
-//   scratch scales    scratch values end                  quantized scales
-//   staging values    scratch scales end                  quantized values
-//   staging scales    staging values end                  quantized scales
-//   staging           staging scales end                  staging
-//   (slice end)       staging end, rounded up to the allocation granularity
-//   guard             slice end                           one granule, NEVER
-//                                                         mapped
+//   region     offset                     bytes (each region kRegionAlign-aligned)
+//   signals    0                          kSignalsRegionBytes: the barrier
+//                                         flags (torch SymmetricMemory's
+//                                         "signal pad")
+//   inputs     signals end                what this rank publishes of its
+//                                         input: one-shot peers read all of it,
+//                                         two-shot peers their slice
+//   partials   inputs end                 what this rank publishes of its
+//                                         reduced slice for the all-gather
+//                                         (two-shot only)
+//   (slice end) partials end, rounded up to the allocation granularity
+//   guard      slice end                  one granule, NEVER mapped
 //
 // Rank r's slice is at base + r * stride, stride = the slice plus the guard
-// granule: an overrun past the staging runs into unmapped memory and faults,
-// never into the next rank's signals. The signals come first, apart from the
-// data by their own region; the staged input lies past every kernel's scratch,
-// since an INT4 two-shot writes it before its first barrier while a peer may
-// still read this rank's scratch after its last. Every kernel copies its input
-// into its staging (or, INT4, its staging values and scales) before its first
-// barrier, which is ordered, and its peers read it there, at rank 0's address
-// and the rank stride: no table.
+// granule: an overrun past the partials runs into unmapped memory and faults,
+// never into the next rank's signals. INT4 IS AN ENCODING, NOT A REGION: each
+// region is sized for the largest encoding it may hold (select.cuh's
+// `exchange_sizes`: the larger of the exact bytes and the INT4 values plus
+// scales at the largest problem), and the encoding lays out the inside
+// (common.cuh's `int4_payload`: values, then scales at an offset from the
+// call's m and n, the same on every rank).
+//
+// WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
+// INT4, never both, and its sums exact or INT4, never both (the one exact word
+// beside an INT4 payload, the add-RMS-norm row two-shot's row scalars, lies at
+// its exact rows' end, past the payload of those rows: 9/16 of a byte an
+// element against 2). Across calls: a rank writes its inputs before its first
+// barrier, and a peer reads them only before its barrier that every peer's
+// sums are visible (or, a one-shot, its last), which this rank passed in the
+// previous call only once every peer arrived, done reading; a rank writes its
+// partials only after its first barrier, which a peer reaches only once it
+// finished the previous call, its all-gather's reads of them included. So the
+// previous call's readers are done whichever encoding either call used.
+// Every kernel copies its input into its inputs (or, INT4, their payload)
+// before its first barrier, which is ordered, and its peers read it there, at
+// rank 0's address and the rank stride: no table.
+constexpr int64_t kRegionAlign = 4096;
+constexpr int64_t region_aligned(int64_t bytes) {
+  return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
+}
 struct ArenaLayout {
   int64_t signals = 0;
-  int64_t scratch = 0;
-  int64_t scratch_values = 0;
-  int64_t scratch_scales = 0;
-  int64_t staging_values = 0;
-  int64_t staging_scales = 0;
-  int64_t staging = 0;
+  int64_t inputs = 0;
+  int64_t partials = 0;
   int64_t end = 0;  // the bytes the regions use
 };
-inline ArenaLayout arena_layout(int64_t scratch_bytes,
-                                int64_t quantized_values_bytes,
-                                int64_t quantized_scales_bytes,
-                                int64_t staging_bytes) {
+inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes) {
   ArenaLayout l;
   l.signals = 0;
-  l.scratch = l.signals + kSignalsRegionBytes;
-  l.scratch_values = l.scratch + scratch_bytes;
-  l.scratch_scales = l.scratch_values + quantized_values_bytes;
-  l.staging_values = l.scratch_scales + quantized_scales_bytes;
-  l.staging_scales = l.staging_values + quantized_values_bytes;
-  l.staging = l.staging_scales + quantized_scales_bytes;
-  l.end = l.staging + staging_bytes;
+  l.inputs = l.signals + kSignalsRegionBytes;
+  l.partials = l.inputs + region_aligned(inputs_bytes);
+  l.end = l.partials + region_aligned(partials_bytes);
   return l;
 }
 
@@ -610,18 +618,16 @@ inline OtherProcesses other_processes_on(int device) {
 
 class Handle {
  public:
-  // OPENED on every rank together: this rank's symmetric memory allocated, two
-  // allocations, the signals and the exchange (the scratch, then the staging),
-  // each one's IPC handle gathered with every rank's, and the peers' opened.
+  // OPENED on every rank together: this rank's arena allocated (the signals,
+  // the inputs, the partials: `arena_layout`), its descriptor exchanged with
+  // every rank's, and the peers' mapped.
   // `world_size` is one the build holds (the opener checks it).
   // `timeout_seconds`: how long a kernel waits on a peer before it records a
   // fault and leaves (common.cuh's BARRIER), the caller's: the process group's
   // own timeout, as every other collective on it has. THE EXCHANGE'S SIZES are
   // the caller's too, computed from the largest call it serves, `max_rows` rows
   // of at most `max_cols` columns (select.cuh's `exchange_sizes`): kept, so
-  // what the buffers were sized for can be asked. `quantized_values_bytes` and
-  // `quantized_scales_bytes`: one quantized buffer's values and scales at that
-  // box (common.cuh's QUANTIZATION). `quantization`: what the tuned path moves
+  // what the buffers were sized for can be asked. `quantization`: what the tuned path moves
   // across the links, a Quantization (select.cuh's `quantizes`).
   // `device`: the device the communicator was given (open checks it is the
   // current one). `log_mode`: what the log records (log.cuh). `rccl_ready`:
@@ -629,22 +635,18 @@ class Handle {
   // not (0), or could not tell (-1): observed and logged, never acted on.
   Handle(int rank, int world_size, int device, const Gather& gather,
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
-         int64_t scratch_bytes, int64_t quantized_values_bytes,
-         int64_t quantized_scales_bytes, int64_t staging_bytes,
+         int64_t inputs_bytes, int64_t partials_bytes,
          int quantization, LogMode log_mode, int rccl_ready)
       : rank_(rank),
         world_size_(world_size),
         device_(device),
         max_rows_(max_rows),
         max_cols_(max_cols),
-        scratch_bytes_(scratch_bytes),
-        quantized_values_bytes_(quantized_values_bytes),
-        quantized_scales_bytes_(quantized_scales_bytes),
-        staging_bytes_(staging_bytes),
+        inputs_bytes_(inputs_bytes),
+        partials_bytes_(partials_bytes),
         quantization_(quantization),
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
-        layout_(arena_layout(scratch_bytes, quantized_values_bytes,
-                             quantized_scales_bytes, staging_bytes)) {
+        layout_(arena_layout(inputs_bytes, partials_bytes)) {
     // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
     // an open that fails or hangs is read there.
     set_last_log(log_);
@@ -795,36 +797,18 @@ class Handle {
   int world_size() const { return world_size_; }
   int64_t max_rows() const { return max_rows_; }
   int64_t max_cols() const { return max_cols_; }
-  int64_t scratch_bytes() const { return scratch_bytes_; }
-  // One quantized buffer's values and scales, the most each region holds.
-  int64_t quantized_values_bytes() const { return quantized_values_bytes_; }
-  int64_t quantized_scales_bytes() const { return quantized_scales_bytes_; }
-  // Where every kernel copies its input for its peers to read, and how many
-  // bytes it holds.
-  void* staging() const { return arena_->at(rank_) + layout_.staging; }
-  int64_t staging_bytes() const { return staging_bytes_; }
+  // Each region's bytes, what its largest payload in either encoding takes.
+  int64_t inputs_bytes() const { return inputs_bytes_; }
+  int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
 
-  // EVERY RANK'S SCRATCH AND STAGING, and the quantized forms of the scratch
-  // and of the staged input, fixed for the handle's life: each region is rank
-  // 0's address in the arena (its offset in the layout, `arena_layout`), rank
-  // r's exchange_stride_rank_bytes() * r past it (a kernel takes the stride in
-  // its buffer's elements: the launch divides).
-  void* scratch_ptr() const { return arena_->base() + layout_.scratch; }
-  void* scratch_values_ptr() const {
-    return arena_->base() + layout_.scratch_values;
-  }
-  void* scratch_scales_ptr() const {
-    return arena_->base() + layout_.scratch_scales;
-  }
-  void* staging_values_ptr() const {
-    return arena_->base() + layout_.staging_values;
-  }
-  void* staging_scales_ptr() const {
-    return arena_->base() + layout_.staging_scales;
-  }
-  void* staging_ptr() const { return arena_->base() + layout_.staging; }
+  // EVERY RANK'S INPUTS AND PARTIALS, fixed for the handle's life: each
+  // region is rank 0's address in the arena (its offset in the layout,
+  // `arena_layout`), rank r's exchange_stride_rank_bytes() * r past it (a
+  // kernel takes the stride in its buffer's elements: the launch divides).
+  void* inputs_ptr() const { return arena_->base() + layout_.inputs; }
+  void* partials_ptr() const { return arena_->base() + layout_.partials; }
   // The arena's rank stride, every region's: whole allocation granules.
   int64_t exchange_stride_rank_bytes() const { return arena_->stride_bytes(); }
   // The synchronization state: every rank's signal block and how long a wait
@@ -1048,7 +1032,7 @@ class Handle {
     device_status_ = log.status_device();
     // EACH RANK'S SLICE is the arena's layout (`arena_layout`), at the same
     // offsets on every rank, so each region is rank 0's address and the
-    // arena's rank stride (scratch_ptr(), exchange_stride_rank_bytes()).
+    // arena's rank stride (partials_ptr(), exchange_stride_rank_bytes()).
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -1165,10 +1149,8 @@ class Handle {
   int device_;
   int64_t max_rows_;
   int64_t max_cols_;
-  int64_t scratch_bytes_;
-  int64_t quantized_values_bytes_;
-  int64_t quantized_scales_bytes_;
-  int64_t staging_bytes_;
+  int64_t inputs_bytes_;
+  int64_t partials_bytes_;
   int quantization_;
   std::shared_ptr<Log> log_;
   // THE ARENA'S REGIONS (`arena_layout`), fixed at construction.

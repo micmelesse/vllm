@@ -1085,14 +1085,8 @@ constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
 // =================================================================================================
 // THE QUANTIZATION: which calls move INT4 (common.cuh's QUANTIZATION), by the
 // handle's quantization and the op's crossover (kInt4Crossovers), and the
-// quantized buffers as a kernel reads them.
+// INT4 payload's room in the regions.
 // =================================================================================================
-
-// A QUANTIZED [m, n] BUFFER'S VALUES AND SCALES, in bytes.
-constexpr int64_t int4_values_bytes(int64_t m, int64_t n) { return m * n / 2; }
-constexpr int64_t int4_scales_bytes(int64_t m, int64_t n) {
-  return m * (n / kInt4Group) * 2;
-}
 
 // WHETHER AN INT4 TWO-SHOT TAKES A ROW OF `n` ELEMENTS at `world` ranks: whole
 // groups, and whole groups for every rank, so every rank's slice (a column
@@ -1114,20 +1108,8 @@ inline bool quantizes(const Handle& h, OpType o, int64_t m, int64_t n,
   return h.quantization() == Quantization::int4 && elem_bytes(dtype) == 2 &&
          m * n * elem_bytes(dtype) >= int4_min_bytes(o) &&
          int4_takes_row(n, h.world_size()) &&
-         int4_values_bytes(m, n) <= h.quantized_values_bytes() &&
-         int4_scales_bytes(m, n) <= h.quantized_scales_bytes();
-}
-
-// A QUANTIZED [m, n] BUFFER AS ITS KERNEL READS IT, values then scales, each
-// its strides then its sizes, rows back to back (ours); with none, no buffer:
-// zeros.
-struct QuantizedView {
-  int64_t values_stride_m, values_stride_n, values_size_m, values_size_n;
-  int64_t scales_stride_m, scales_stride_n, scales_size_m, scales_size_n;
-};
-constexpr QuantizedView quantized_view(int q, int64_t m, int64_t n) {
-  if (q == Quantization::none) return {};
-  return {n / 2, 1, m, n / 2, n / kInt4Group, 1, m, n / kInt4Group};
+         int4_payload_bytes(m, n) <= h.inputs_bytes() &&
+         int4_payload_bytes(1, m * n) <= h.partials_bytes();
 }
 
 // THE KERNEL A CALL RUNS: the forced one as forced, else the tuned one at the
@@ -1188,12 +1170,12 @@ constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols,
 // the compiled kernel, is each select's last check.
 // =================================================================================================
 
-// A KERNEL'S SCRATCH, row-major (a build in passes needs none: it runs in passes
-// of what the scratch holds): the plain two-shot its slice of every row; a
+// A KERNEL'S PARTIALS, row-major (a build in passes needs none: it runs in passes
+// of what the partials holds): the plain two-shot its slice of every row; a
 // column two-shot the whole reduced tensor (each rank's columns at their
 // place); a row two-shot its rank's rows, twice where it leaves two results
 // (out and the residual). A one-shot reads the inputs and keeps nothing.
-constexpr int64_t scratch_need(Template t, int64_t m, int64_t packs,
+constexpr int64_t partials_need(Template t, int64_t m, int64_t packs,
                                int world) {
   if (!is_two_shot(t)) return 0;
   const OpType o = op_of(t);
@@ -1252,20 +1234,25 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // Refused, so the caller takes the one-shot or RCCL.
   if (!every_rank_gets_columns(fn, n, dtype, world))
     return Error::row_narrower_than_world;
-  // AN INT4 ROW is whole groups for every rank, its values and scales inside
-  // the quantized regions (quantizes's rule, which a forced call meets
-  // here).
+  // AN INT4 ROW is whole groups for every rank (quantizes's rule, which a
+  // forced call meets here).
   if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
-  if (int4 && (int4_values_bytes(m, n) > h->quantized_values_bytes() ||
-               int4_scales_bytes(m, n) > h->quantized_scales_bytes()))
-    return Error::quantized_too_small;
-  if (!in_passes && scratch_need(fn, m, packs, world) > h->scratch_bytes())
-    return Error::scratch_too_small;
-  // A BUILD THAT DOES NOT RUN IN PASSES copies its input into the staging
+  // An INT4 payload lies in the region that holds it exact (common.cuh's
+  // `int4_payload`): the input's in the inputs, the sums' in the partials, at
+  // most one row of the partials's elements (its every view's bound).
+  if (int4 && int4_payload_bytes(m, n) > h->inputs_bytes())
+    return Error::inputs_too_small;
+  const int64_t partials = partials_need(fn, m, packs, world);
+  if (int4 && int4_payload_bytes(1, partials / elem_bytes(dtype)) >
+                  h->partials_bytes())
+    return Error::partials_too_small;
+  if (!in_passes && partials > h->partials_bytes())
+    return Error::partials_too_small;
+  // A BUILD THAT DOES NOT RUN IN PASSES copies its input into the inputs
   // whole, inside the kernel, before its first barrier.
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!in_passes && bytes > h->staging_bytes())
-    return Error::staging_too_small;
+  if (!in_passes && bytes > h->inputs_bytes())
+    return Error::inputs_too_small;
   return std::nullopt;
 }
 
@@ -1293,7 +1280,7 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 // =================================================================================================
 
 // all_reduce: the sum of every rank's `inp` ([rows, cols] of `dtype` at its
-// strides) into `out`. The kernel copies its input into its staging itself: a
+// strides) into `out`. The kernel copies its input into its inputs itself: a
 // band of rows a pass (none), or quantized whole (INT4's two-shot).
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, const void* input, int64_t input_stride_m,
@@ -1324,25 +1311,25 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const Template fn = k.fn;
   const KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  // IN PASSES (none): a band of rows of the input through the staging a pass.
-  // INT4 quantizes its input into its staging values whole instead.
+  // IN PASSES (none): a band of rows of the input through the inputs a pass.
+  // INT4 quantizes its input into its inputs' INT4 values whole instead.
   const bool in_passes = a.quantization == Quantization::none;
-  // THE STAGED BAND: the rows a pass, what the staging holds (and the
-  // two-shot's scratch, a row of its slice a row).
+  // THE STAGED BAND: the rows a pass, what the inputs holds (and the
+  // two-shot's partials, a row of its slice a row).
   const int64_t row_bytes = n * elem_bytes(dtype);
   const int64_t packs = n * elem_bytes(dtype) / kBuild.memory.pack_bytes;
   const int64_t slice_bytes =
       (packs + world - 1) / world * kBuild.memory.pack_bytes;
-  int64_t band = row_bytes > 0 ? h.staging_bytes() / row_bytes : 0;
+  int64_t band = row_bytes > 0 ? h.inputs_bytes() / row_bytes : 0;
   if (is_two_shot(fn) && slice_bytes > 0 &&
-      h.scratch_bytes() / slice_bytes < band)
-    band = h.scratch_bytes() / slice_bytes;
+      h.partials_bytes() / slice_bytes < band)
+    band = h.partials_bytes() / slice_bytes;
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
                   std::nullopt, in_passes))
     return *e;
-  if (in_passes && band < 1) return Error::staging_too_small;
+  if (in_passes && band < 1) return Error::inputs_too_small;
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups
   // for every thread of
   //    a tile row (the two-shot's rows are the ranks).
@@ -1400,10 +1387,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     });
   });
   if (kernel == nullptr) return Error::tile_not_built;
-  // 4. INT4'S BUFFERS: the input staged whole, the sums a rank's share of each
-  // row (whole groups: int4_takes_row).
-  const QuantizedView sums = quantized_view(a.quantization, m, n / world);
-  const QuantizedView staged_input = quantized_view(a.quantization, m, n);
+  // 4.
   const AllReduceLaunch l{
       .kernel = kernel,
       .algorithm = algorithm_of(fn),
@@ -1426,30 +1410,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       .output_stride_n = output_stride_n,
       .output_size_m = output_size_m,
       .output_size_n = output_size_n,
-      .scratch_stride_m = slice_bytes / elem_bytes(dtype),
-      .scratch_stride_n = 1,
-      .scratch_size_m = in_passes ? (band < m ? band : m) : m,
-      .scratch_size_n = slice_bytes / elem_bytes(dtype),
-      .scratch_values_stride_m = sums.values_stride_m,
-      .scratch_values_stride_n = sums.values_stride_n,
-      .scratch_values_size_m = sums.values_size_m,
-      .scratch_values_size_n = sums.values_size_n,
-      .scratch_scales_stride_m = sums.scales_stride_m,
-      .scratch_scales_stride_n = sums.scales_stride_n,
-      .scratch_scales_size_m = sums.scales_size_m,
-      .scratch_scales_size_n = sums.scales_size_n,
-      .staging_values_stride_m = staged_input.values_stride_m,
-      .staging_values_stride_n = staged_input.values_stride_n,
-      .staging_values_size_m = staged_input.values_size_m,
-      .staging_values_size_n = staged_input.values_size_n,
-      .staging_scales_stride_m = staged_input.scales_stride_m,
-      .staging_scales_stride_n = staged_input.scales_stride_n,
-      .staging_scales_size_m = staged_input.scales_size_m,
-      .staging_scales_size_n = staged_input.scales_size_n,
-      .staging_stride_m = n,
-      .staging_stride_n = 1,
-      .staging_size_m = static_cast<int>(band < m ? band : m),
-      .staging_size_n = n,
+      .partials_stride_m = slice_bytes / elem_bytes(dtype),
+      .partials_stride_n = 1,
+      .partials_size_m = in_passes ? (band < m ? band : m) : m,
+      .partials_size_n = slice_bytes / elem_bytes(dtype),
+      .inputs_stride_m = n,
+      .inputs_stride_n = 1,
+      .inputs_size_m = in_passes ? (band < m ? band : m) : m,
+      .inputs_size_n = n,
       .dtype = dtype};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1543,19 +1511,13 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
   // 4.
   const AllReduceRmsNormBuildConfig& r =
       std::get<AllReduceRmsNormBuildConfig>(c.build);
-  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
-  const int64_t scratch_rows =
-      n > 0 ? scratch_need(fn, m,
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
+  const int64_t partials_rows =
+      n > 0 ? partials_need(fn, m,
                            n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
                            world) /
                   (n * elem_bytes(dtype))
             : 0;
-  // INT4'S BUFFERS: the input staged whole, the sums the rows this rank keeps
-  // (a column split's every row, a row split's slice; one result each).
-  const QuantizedView sums = quantized_view(
-      quantization_of(c.build),
-      slices_columns(fn) ? m : (m + world - 1) / world, n);
-  const QuantizedView staged_input = quantized_view(quantization_of(c.build), m, n);
   const AllReduceRmsNormLaunch l{.kernel = kernel,
                                  .algorithm = algorithm_of(fn),
                                  .direction = direction_of(fn),
@@ -1580,30 +1542,14 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .output_stride_n = output_stride_n,
                                  .output_size_m = output_size_m,
                                  .output_size_n = output_size_n,
-                                 .scratch_stride_m = n,
-                                 .scratch_stride_n = 1,
-                                 .scratch_size_m = scratch_rows,
-                                 .scratch_size_n = n,
-                               .scratch_values_stride_m = sums.values_stride_m,
-                               .scratch_values_stride_n = sums.values_stride_n,
-                               .scratch_values_size_m = sums.values_size_m,
-                               .scratch_values_size_n = sums.values_size_n,
-                               .scratch_scales_stride_m = sums.scales_stride_m,
-                               .scratch_scales_stride_n = sums.scales_stride_n,
-                               .scratch_scales_size_m = sums.scales_size_m,
-                               .scratch_scales_size_n = sums.scales_size_n,
-                               .staging_values_stride_m = staged_input.values_stride_m,
-                               .staging_values_stride_n = staged_input.values_stride_n,
-                               .staging_values_size_m = staged_input.values_size_m,
-                               .staging_values_size_n = staged_input.values_size_n,
-                               .staging_scales_stride_m = staged_input.scales_stride_m,
-                               .staging_scales_stride_n = staged_input.scales_stride_n,
-                               .staging_scales_size_m = staged_input.scales_size_m,
-                               .staging_scales_size_n = staged_input.scales_size_n,
-                               .staging_stride_m = n,
-                               .staging_stride_n = 1,
-                               .staging_size_m = m,
-                               .staging_size_n = n,
+                                 .partials_stride_m = n,
+                                 .partials_stride_n = 1,
+                                 .partials_size_m = partials_rows,
+                                 .partials_size_n = n,
+                               .inputs_stride_m = n,
+                               .inputs_stride_n = 1,
+                               .inputs_size_m = m,
+                               .inputs_size_n = n,
                                  .dtype = dtype,
                                  .weight_dtype = weight_dtype,
                                  .eps = eps};
@@ -1707,19 +1653,13 @@ select_all_reduce_add_rms_norm(
   // 4.
   const AllReduceAddRmsNormBuildConfig& r =
       std::get<AllReduceAddRmsNormBuildConfig>(c.build);
-  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
-  const int64_t scratch_rows =
-      n > 0 ? scratch_need(fn, m,
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
+  const int64_t partials_rows =
+      n > 0 ? partials_need(fn, m,
                            n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
                            world) /
                   (n * elem_bytes(dtype))
             : 0;
-  // INT4'S BUFFERS: the input staged whole, the sums the rows this rank keeps
-  // (a column split's every row, a row split's slice; one result each).
-  const QuantizedView sums = quantized_view(
-      quantization_of(c.build),
-      slices_columns(fn) ? m : (m + world - 1) / world, n);
-  const QuantizedView staged_input = quantized_view(quantization_of(c.build), m, n);
   const AllReduceAddRmsNormLaunch l{
       .kernel = kernel,
       .algorithm = algorithm_of(fn),
@@ -1755,30 +1695,14 @@ select_all_reduce_add_rms_norm(
       .residual_output_stride_n = residual_output_stride_n,
       .residual_output_size_m = residual_output_size_m,
       .residual_output_size_n = residual_output_size_n,
-      .scratch_stride_m = n,
-      .scratch_stride_n = 1,
-      .scratch_size_m = scratch_rows,
-      .scratch_size_n = n,
-      .scratch_values_stride_m = sums.values_stride_m,
-      .scratch_values_stride_n = sums.values_stride_n,
-      .scratch_values_size_m = sums.values_size_m,
-      .scratch_values_size_n = sums.values_size_n,
-      .scratch_scales_stride_m = sums.scales_stride_m,
-      .scratch_scales_stride_n = sums.scales_stride_n,
-      .scratch_scales_size_m = sums.scales_size_m,
-      .scratch_scales_size_n = sums.scales_size_n,
-      .staging_values_stride_m = staged_input.values_stride_m,
-      .staging_values_stride_n = staged_input.values_stride_n,
-      .staging_values_size_m = staged_input.values_size_m,
-      .staging_values_size_n = staged_input.values_size_n,
-      .staging_scales_stride_m = staged_input.scales_stride_m,
-      .staging_scales_stride_n = staged_input.scales_stride_n,
-      .staging_scales_size_m = staged_input.scales_size_m,
-      .staging_scales_size_n = staged_input.scales_size_n,
-      .staging_stride_m = n,
-      .staging_stride_n = 1,
-      .staging_size_m = m,
-      .staging_size_n = n,
+      .partials_stride_m = n,
+      .partials_stride_n = 1,
+      .partials_size_m = partials_rows,
+      .partials_size_n = n,
+      .inputs_stride_m = n,
+      .inputs_stride_n = 1,
+      .inputs_size_m = m,
+      .inputs_size_n = n,
       .dtype = dtype,
       .weight_dtype = weight_dtype,
       .eps = eps};
@@ -1913,19 +1837,13 @@ select_all_reduce_add_attn_res_rms_norm(
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
   const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
-  // THE SCRATCH'S ROWS, what scratch_need sized it for (a one-shot keeps none).
-  const int64_t scratch_rows =
-      n > 0 ? scratch_need(fn, m,
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
+  const int64_t partials_rows =
+      n > 0 ? partials_need(fn, m,
                            n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
                            world) /
                   (n * elem_bytes(dtype))
             : 0;
-  // INT4'S BUFFERS: the input staged whole, the sums the rows this rank keeps
-  // (a column split's every row, a row split's slice; one result each).
-  const QuantizedView sums = quantized_view(
-      quantization_of(c.build),
-      slices_columns(fn) ? m : (m + world - 1) / world, n);
-  const QuantizedView staged_input = quantized_view(quantization_of(c.build), m, n);
   const AllReduceAddAttnResRmsNormLaunch l{
       .kernel = kernel,
       .algorithm = algorithm_of(fn),
@@ -1981,30 +1899,14 @@ select_all_reduce_add_attn_res_rms_norm(
       .block_output_stride_n = block_output_stride_n,
       .block_output_size_m = block_output_size_m,
       .block_output_size_n = block_output_size_n,
-      .scratch_stride_m = n,
-      .scratch_stride_n = 1,
-      .scratch_size_m = scratch_rows,
-      .scratch_size_n = n,
-      .scratch_values_stride_m = sums.values_stride_m,
-      .scratch_values_stride_n = sums.values_stride_n,
-      .scratch_values_size_m = sums.values_size_m,
-      .scratch_values_size_n = sums.values_size_n,
-      .scratch_scales_stride_m = sums.scales_stride_m,
-      .scratch_scales_stride_n = sums.scales_stride_n,
-      .scratch_scales_size_m = sums.scales_size_m,
-      .scratch_scales_size_n = sums.scales_size_n,
-      .staging_values_stride_m = staged_input.values_stride_m,
-      .staging_values_stride_n = staged_input.values_stride_n,
-      .staging_values_size_m = staged_input.values_size_m,
-      .staging_values_size_n = staged_input.values_size_n,
-      .staging_scales_stride_m = staged_input.scales_stride_m,
-      .staging_scales_stride_n = staged_input.scales_stride_n,
-      .staging_scales_size_m = staged_input.scales_size_m,
-      .staging_scales_size_n = staged_input.scales_size_n,
-      .staging_stride_m = n,
-      .staging_stride_n = 1,
-      .staging_size_m = m,
-      .staging_size_n = n,
+      .partials_stride_m = n,
+      .partials_stride_n = 1,
+      .partials_size_m = partials_rows,
+      .partials_size_n = n,
+      .inputs_stride_m = n,
+      .inputs_stride_n = 1,
+      .inputs_size_m = m,
+      .inputs_size_n = n,
       .dtype = dtype,
       .num_blocks = num_blocks,
       .eps = eps,
@@ -2079,18 +1981,17 @@ constexpr int64_t widest_row(OpType o) {
 // THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own buffers are
 // sized from the problem it serves*): the largest call a communicator serves is
 // `max_rows` rows of at most `max_cols` columns (for a model, the server's
-// tokens a batch by its hidden size), and its exchange holds every template's
-// need at that call, in every built dtype: the scratch the most any two-shot
-// takes (`scratch_need`), the staging the whole input (every per-row kernel
-// copies its input into it whole; the plain all-reduce in bands), and the quantized buffers an INT4 two-shot
-// keeps. Each need grows with the rows and the row's width, so a call inside
-// the box fits by construction. Each rounded to a whole pack, and at least
-// one.
+// tokens a batch by its hidden size), and each region holds its largest
+// payload at that call, in every built dtype and in either encoding (exact or
+// INT4: common.cuh's `int4_payload`): the inputs the whole input (every
+// per-row kernel copies its input into it whole; the plain all-reduce in
+// bands), or its INT4 payload; the partials the most any two-shot keeps
+// (`partials_need`), or its INT4 payload (bounded as one row of its elements).
+// Each need grows with the rows and the row's width, so a call inside the box
+// fits by construction. Each rounded to a whole pack, and at least one.
 struct ExchangeSizes {
-  int64_t scratch_bytes;
-  int64_t quantized_values_bytes;
-  int64_t quantized_scales_bytes;
-  int64_t staging_bytes;
+  int64_t partials_bytes;
+  int64_t inputs_bytes;
 };
 constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
                                        int world) {
@@ -2098,40 +1999,38 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
   const auto whole = [pack](int64_t bytes) {
     return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
   };
-  int64_t scratch = 0, staging = 0;
+  int64_t partials = 0, inputs = int4_payload_bytes(max_rows, max_cols);
   for (const DType d : kBuild.supports.dtypes) {
     const int64_t packs = packs_of(max_cols, d);
     for (const TemplateInfo& t : kTemplates) {
-      const int64_t need = scratch_need(t.fn, max_rows, packs, world);
-      if (need > scratch) scratch = need;
+      const int64_t need = partials_need(t.fn, max_rows, packs, world);
+      if (need > partials) partials = need;
+      const int64_t int4 = int4_payload_bytes(1, need / elem_bytes(d));
+      if (need > 0 && int4 > partials) partials = int4;
     }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
-    if (input > staging) staging = input;
+    if (input > inputs) inputs = input;
   }
-  // ONE QUANTIZED BUFFER'S VALUES AND SCALES at the box, the most any INT4
-  // two-shot keeps (the staged input whole; its sums at most that): the handle
-  // holds two, the sums and the staged input (quantizes).
-  return {whole(scratch), whole(int4_values_bytes(max_rows, max_cols)),
-          whole(int4_scales_bytes(max_rows, max_cols)), whole(staging)};
+  return {whole(partials), whole(inputs)};
 }
 
 // THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
-// the staging holds (an eager input is copied in whole), and what the scratch
-// holds at the most scratch a byte of its input needs among its tuned kernels:
+// the inputs holds (an eager input is copied in whole), and what the partials
+// holds at the most partials a byte of its input needs among its tuned kernels:
 // at one row of one pack, where rounding up is all of it (a row two-shot
 // leaving two results, two). Python admits a call by it or by the box the
 // exchange was sized for (`exchange_sizes`), whichever is larger.
-constexpr int64_t max_bytes(OpType o, int64_t scratch_bytes,
-                            int64_t staging_bytes) {
+constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
+                            int64_t inputs_bytes) {
   int64_t per_byte = 0;
   for (const TunedKernel& k : op(o).kernels) {
     const int64_t need =
-        scratch_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
+        partials_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
     if (need > per_byte) per_byte = need;
   }
-  if (per_byte == 0) return staging_bytes;
-  const int64_t scratch = scratch_bytes / per_byte;
-  return scratch < staging_bytes ? scratch : staging_bytes;
+  if (per_byte == 0) return inputs_bytes;
+  const int64_t partials = partials_bytes / per_byte;
+  return partials < inputs_bytes ? partials : inputs_bytes;
 }
 
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and

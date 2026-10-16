@@ -16,7 +16,7 @@ all or none) are the one way to force one, for the sweep and the tests. Every on
 passed through as it came: C++ builds the config, checks it, and answers.
 
 ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, copies its input
-into a staging buffer the communicator owns, which every rank mapped at open (HIP
+into its inputs region the communicator owns, which every rank mapped at open (HIP
 virtual memory), before its first barrier; peers read only that, never the caller's
 tensor, so nothing is registered.
 
@@ -80,9 +80,9 @@ class Error(IntEnum):
     template_not_this_ops = 7
     row_too_wide = 8
     block_not_a_wave_per_peer = 9
-    scratch_too_small = 10
+    partials_too_small = 10
     grid_not_resident = 11
-    staging_too_small = 12
+    inputs_too_small = 12
     device_not_built = 13
     device_not_tuned = 14
     weight_not_built = 15
@@ -103,7 +103,7 @@ class Error(IntEnum):
     no_such_quantization = 30
     quantization_not_two_shot = 31
     row_not_int4_groups = 32
-    quantized_too_small = 33
+    quantized_too_small = 33  # retired: INT4 lies inside inputs and partials
 
 
 class Where(IntEnum):
@@ -688,24 +688,24 @@ class Capacity:
     """WHAT ONE COMMUNICATOR HOLDS (C++'s `hip_custom_communicator_capacity`): the
     largest call its exchange was sized for, `max_rows` rows of at most `max_cols`
     elements (for a model, the server's tokens a batch by its hidden size), the
-    exchange's scratch and staging bytes, and each op's most bytes on them whatever
+    exchange's partials and inputs bytes, and each op's most bytes on them whatever
     a call's shape."""
 
     max_rows: int
     max_cols: int
-    scratch_bytes: int
-    staging_bytes: int
+    partials_bytes: int
+    inputs_bytes: int
     max_bytes: dict[str, int]
 
 
 def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
     """What a communicator serving `max_rows` rows of at most `max_cols` columns at
     `world` ranks holds: C++'s answer, the same function its opener allocates by."""
-    rows, cols, scratch, staging, *most = (
+    rows, cols, partials, inputs, *most = (
         torch.ops._rocm_C.hip_custom_communicator_capacity(max_rows, max_cols, world)
     )
     return Capacity(
-        rows, cols, scratch, staging, dict(zip(build_info().op_names, most))
+        rows, cols, partials, inputs, dict(zip(build_info().op_names, most))
     )
 
 
@@ -1529,18 +1529,18 @@ class HipCustomCommunicator:
         )
         logger.info(
             "HipCustomCommunicator ready: exchange sized for %d rows of %d "
-            "(scratch %.1f MiB, staging %.1f MiB)",
+            "(partials %.1f MiB, inputs %.1f MiB)",
             self.capacity.max_rows,
             self.capacity.max_cols,
-            self.capacity.scratch_bytes / 2**20,
-            self.capacity.staging_bytes / 2**20,
+            self.capacity.partials_bytes / 2**20,
+            self.capacity.inputs_bytes / 2**20,
         )
         return None
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
         """Wrap a cudagraph capture. Nothing is registered: every kernel copies its
-        input into our staging itself (no copy node in the graph), so a captured
+        input into our inputs itself (no copy node in the graph), so a captured
         launch reads only memory every rank mapped at open."""
         yield
 

@@ -68,7 +68,7 @@ hip_custom_communicator_open(const std::string& cpu_group,
                              int64_t max_cols, int64_t quantization,
                              int64_t log_mode, int64_t rccl_ready);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
-// scratch_bytes, staging_bytes, then each op's max_bytes in kOps' order].
+// partials_bytes, inputs_bytes, then each op's max_bytes in kOps' order].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t max_cols,
                                                       int64_t world);

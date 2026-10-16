@@ -85,7 +85,7 @@ enum class LogKind : uint8_t {
                        // peer: the stream's index (stream_seen);
                        // seen, want: m, n; extra: the DType
   copy_in_issued = 5,  // retired (the kernels copy their input into the
-                       // staging themselves); kept so the numbers hold
+                       // inputs themselves); kept so the numbers hold
   stream_seen = 6,     // peer: the stream's index; seen, want: its handle's
                        // low and high words
   kernel_seen = 7,     // kernel: its index; seen, want: its address's words

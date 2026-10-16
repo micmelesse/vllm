@@ -980,12 +980,12 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     )
     assert error is Error.weight_not_built, error
 
-    # Out of capacity: one row wider than the staging, which no pass holds.
-    wide = torch.ones(comm.capacity.staging_bytes, dtype=bf16, device=comm.device)
+    # Out of capacity: one row wider than the inputs, which no pass holds.
+    wide = torch.ones(comm.capacity.inputs_bytes, dtype=bf16, device=comm.device)
     for shot in ("all_reduce_pull_one_shot", "all_reduce_pull_two_shot"):
         forced = _forced_whole(shot)
         error = _refused(comm, rank, shot, partial(comm.all_reduce, wide, **forced))
-        assert error is Error.staging_too_small, (shot, error)
+        assert error is Error.inputs_too_small, (shot, error)
 
     # Out of capacity: past the rows the exchange was sized for, a fused call the
     # communicator does not admit is refused by name or runs right.
@@ -997,7 +997,7 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         got = _call(comm, op, big, args.clone(), {})
     except Refused as no:
         assert not admitted, f"an admitted call was refused: {no}"
-        assert no.error in (Error.scratch_too_small, Error.staging_too_small), no
+        assert no.error in (Error.partials_too_small, Error.inputs_too_small), no
     else:
         _assert_close("past the box", got, *_reference(op, summed, args))
     _assert_clean(comm, "past the box")

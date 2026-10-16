@@ -280,9 +280,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
       (*pg)->getRank(), world, static_cast<int>(device), gather_over(*pg),
-      timeout_seconds, max_rows, max_cols, sizes.scratch_bytes,
-      sizes.quantized_values_bytes, sizes.quantized_scales_bytes,
-      sizes.staging_bytes, static_cast<int>(quantization),
+      timeout_seconds, max_rows, max_cols, sizes.inputs_bytes,
+      sizes.partials_bytes, static_cast<int>(quantization),
       static_cast<hip_custom_communicator::LogMode>(log_mode),
       static_cast<int>(rccl_ready));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
@@ -363,8 +362,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
 }
 
 // WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
-// `world` RANKS HOLDS, for Python's `should`: the box, its exchange's scratch
-// and staging bytes (`exchange_sizes`, what the opener allocates), then each
+// `world` RANKS HOLDS, for Python's `should`: the box, its exchange's partials
+// and inputs bytes (`exchange_sizes`, what the opener allocates), then each
 // op's most bytes on them whatever the call's shape (`max_bytes`), in kOps'
 // order. A pure function of its arguments, so a communicator that is not open
 // can be asked.
@@ -373,11 +372,11 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t world) {
   const auto sizes = hip_custom_communicator::exchange_sizes(
       max_rows, max_cols, static_cast<int>(world));
-  std::vector<int64_t> out{max_rows, max_cols, sizes.scratch_bytes,
-                           sizes.staging_bytes};
+  std::vector<int64_t> out{max_rows, max_cols, sizes.partials_bytes,
+                           sizes.inputs_bytes};
   for (const auto& o : hip_custom_communicator::kOps)
     out.push_back(hip_custom_communicator::max_bytes(
-        o.type, sizes.scratch_bytes, sizes.staging_bytes));
+        o.type, sizes.partials_bytes, sizes.inputs_bytes));
   return out;
 }
 
