@@ -16,9 +16,9 @@ all or none) are the one way to force one, for the sweep and the tests. Every on
 passed through as it came: C++ builds the config, checks it, and answers.
 
 ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, copies its input
-into its inputs region the communicator owns, which every rank mapped at open (HIP
-virtual memory), before its first barrier; peers read only that, never the caller's
-tensor, so nothing is registered.
+into its inputs region of the communicator's arena (one allocation per rank, which
+every rank opened at open over legacy HIP IPC), before its first barrier; peers read
+only that, never the caller's tensor, so nothing is registered.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -209,11 +209,11 @@ class OpenPhase(IntEnum):
     exchange_allocated = 3  # retired: one arena; kept so the numbers hold
     zeroed = 4
     exported = 5
-    socket_exchange_begun = 6
-    socket_exchange_done = 7
-    imported = 8
-    mapped = 9
-    access_set = 10
+    handle_exchange_begun = 6
+    handle_exchange_done = 7
+    opened = 8
+    mapped = 9  # retired: VMM's map; IPC opens in one step
+    access_set = 10  # retired: VMM's access
     tables_written = 11  # retired: no peer tables; kept so the numbers hold
     checked = 12
     open_done = 13
@@ -238,9 +238,9 @@ class ClosePhase(IntEnum):
 class OpenCheck(IntEnum):
     none = 0
     current_device = 1
-    peer_imported = 2
-    access_rw = 3
-    geometry = 4
+    peer_opened = 2
+    pointer_sane = 3
+    geometry = 4  # retired: VMM's granule and stride
     can_access_peer = 5
     signals_zero = 6
 
@@ -252,9 +252,9 @@ class OpenWarning(IntEnum):
     other_processes = 3
     duplicate_device = 4
     host_mismatch = 5
-    granularity_mismatch = 6
+    granularity_mismatch = 6  # retired: VMM's granularity
     low_memory = 7
-    pointer_device = 8  # retired: never written (noise on imported VMM slices)
+    pointer_device = 8
     peer_not_visible = 9
 
 
@@ -301,7 +301,7 @@ class LogRecord:
             case OpenWarning.rccl_not_ready:
                 return (
                     "RCCL for this group is not set up yet; its lazy setup will "
-                    "run after our VMM mapping (on 2026-10-16 that hung)"
+                    "run after our open (on 2026-10-16, under VMM, that hung)"
                 )
             case OpenWarning.rccl_unknown:
                 return "whether RCCL for this group is set up could not be told"
@@ -317,10 +317,10 @@ class LogRecord:
                 )
             case OpenWarning.host_mismatch:
                 return f"rank {self.peer} is on another host"
-            case OpenWarning.granularity_mismatch:
+            case OpenWarning.pointer_device:
                 return (
-                    f"rank {self.peer}'s VMM granularity {self.seen} differs from "
-                    f"this rank's {self.want}"
+                    f"rank {self.peer}'s opened arena reports device {self.seen}, "
+                    f"its GPU here is {self.want}"
                 )
             case OpenWarning.low_memory:
                 return f"{self.seen} MiB free, open allocates {self.want} MiB"
@@ -490,14 +490,12 @@ def last_log() -> Log | None:
     return Log.of(torch.ops._rocm_C.hip_custom_communicator_log(0))
 
 
-# ---- ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"). On 2026-10-16
-# n11's GPU driver wedged (a kfd_restore_wq kworker in D state; every later GPU process
-# hung until a reboot) after EVERY abnormal exit of a process holding peers' VMM memory,
-# never with legacy IPC. The suspect: a process dying with live mappings of its peers'
-# memory, and theirs of its. So an exit, SIGTERM and SIGINT tear every open
-# communicator down ALONE (C++'s `Handle::abandon`): every wait told to leave, the
-# device given a bounded wait, every BORROWED peer mapping unmapped and its handle
-# released, then our own memory once the device finished, each step in the state log.
+# ---- ABNORMAL EXIT (STANDARDS 3.5, "abnormal exit is designed for"): a process should
+# not die holding its peers' memory open, nor free its own while they read it. So an
+# exit, SIGTERM and SIGINT tear every open communicator down ALONE (C++'s
+# `Handle::abandon`): every wait told to leave, the device given a bounded wait, every
+# BORROWED peer IPC mapping closed, then our own arena freed once the device finished,
+# each step in the state log.
 # It never waits on a peer: one may be dead. C++ also runs it from its own process-exit
 # hook; it is idempotent. ----
 
@@ -1330,7 +1328,7 @@ class HipCustomCommunicator:
 
         A COLLECTIVE, every rank calls it (STANDARDS 3.5: lifetimes are collective):
         every rank's device finishes, a handshake over the CPU group, every rank
-        unmaps its peers' memory, a second handshake, then every rank releases its own
+        closes its peers' IPC mappings, a second handshake, then each frees its own
         (C++'s `Handle::close`; each step a `ClosePhase` in `log()`). Each handshake
         is bounded by `timeout_seconds`, so a rank closing alone, or a dead peer,
         costs at most that, never a hang: the failed handshake is logged and the
@@ -1541,7 +1539,7 @@ class HipCustomCommunicator:
     def _on_capture(self) -> Iterator[None]:
         """Wrap a cudagraph capture. Nothing is registered: every kernel copies its
         input into our inputs itself (no copy node in the graph), so a captured
-        launch reads only memory every rank mapped at open."""
+        launch reads only memory every rank opened at open."""
         yield
 
     def _all_reduce(
@@ -1698,7 +1696,7 @@ class HipCustomCommunicator:
     def _on_close(self) -> None:
         """Release the peer memory now, collectively (`close`), then the handle; the
         log as it stood is kept for `log()`. Idempotent. Dropping the object does not
-        release what the C++ side mapped; this does."""
+        release what the C++ side opened; this does."""
         if self._handle is None:
             return
         failed = ClosePhase(
