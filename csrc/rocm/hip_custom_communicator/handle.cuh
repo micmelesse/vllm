@@ -999,8 +999,8 @@ class Handle {
     // here: the kernels take each region's as its own array with its size, the
     // world (`signals_ptr_array`, ...), and never an arena base or an offset.
     // The arena's own array (`arena_ptr_array`) is the last kernel use of the
-    // arena's bases: the RMSNorm and AttnRes kernels', until they take the
-    // staging's and the partials' too (the plain all-reduce already does).
+    // arena's bases: the AttnRes kernels', until they take the staging's and
+    // the partials' too (the plain all-reduce and the RMSNorm kernels do).
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&region_ptr_arrays_),
                         kRegionPtrArrays * kMaxRanks * sizeof(char*)));
     {

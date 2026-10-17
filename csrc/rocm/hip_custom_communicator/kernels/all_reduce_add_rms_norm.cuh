@@ -35,14 +35,14 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
-    const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+    const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
     int64_t output_stride_n, DTYPE* residual_output_ptr,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
@@ -53,7 +53,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
   // 1. Wait until every peer has launched: its input, the caller's tensor (a
-  // captured call's, registered) or the host's copy in its inputs (an eager
+  // captured call's, registered) or the host's copy in its staging (an eager
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
   barrier<Until::launched, 0, WORLD>(
@@ -79,7 +79,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][K][P];
     peers_load<1, THREADS_PER_BLOCK>(
-        inputs_ptr_array, inputs_ptr_array_size, inputs_stride_m, inputs_stride_n,
+        input_ptr_array, input_ptr_array_size, staging_stride_m, staging_stride_n,
                                      input_size_m, input_size_n, peers, row,
                                      0);
     DTYPE res[1][K][P];
@@ -139,12 +139,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        int output_size_n, char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
@@ -155,10 +155,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
-      output_stride_n, nullptr, 0, 0, arena_ptr_array, arena_ptr_array_size, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      output_stride_n, nullptr, 0, 0, staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
       signals_size_block, signals_size_writer, status_ptr, status_stride_field,
       status_size_field, rank, timeout_ticks, eps);
@@ -173,7 +173,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -182,8 +182,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ residual_output_ptr,
         int64_t residual_output_stride_m, int64_t residual_output_stride_n,
         int residual_output_size_m, int residual_output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
@@ -194,12 +194,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-      arena_ptr_array, arena_ptr_array_size, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);
@@ -236,27 +236,16 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
-    const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+    const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
     int64_t output_stride_n, DTYPE* residual_output_ptr,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
-    int64_t partials_stride_n, int64_t partials_values_offset,
-    int64_t partials_values_stride_m, int64_t partials_values_stride_n,
-    int partials_values_size_m, int partials_values_size_n,
-    int64_t partials_scales_offset,
-    int64_t partials_scales_stride_m, int64_t partials_scales_stride_n,
-    int partials_scales_size_m, int partials_scales_size_n,
-    int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t inputs_values_offset,
-    int64_t inputs_values_stride_m, int64_t inputs_values_stride_n,
-    int inputs_values_size_m, int inputs_values_size_n,
-    int64_t inputs_scales_offset,
-    int64_t inputs_scales_stride_m, int64_t inputs_scales_stride_n,
-    int inputs_scales_size_m, int inputs_scales_size_n,
+    char* const* partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
+    int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
@@ -272,28 +261,32 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // 1. none: nothing staged, every rank's input read in place where the
   // input table says (a captured call's tensor, or an eager call's host copy
-  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
   // payload (an encoding: what crosses the links is quantized by its owner),
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
   if constexpr (QUANTIZATION == Quantization::int4)
     stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, inputs_offset), inputs_stride_m,
-        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, inputs_values_offset), inputs_values_stride_m,
-        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-        peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, inputs_scales_offset), inputs_scales_stride_m,
-        inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-        slice_m);
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, slice_m, rank);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  DTYPE* const own_partials = peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
-  uint8_t* const own_partials_values = peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset);
-  __fp16* const own_partials_scales = peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset);
+  // THE PARTIALS' INT4 PAYLOAD (an encoding of what they hold, common.cuh's
+  // INT4 payload layout): its values from the region's start, its scales at
+  // the offset the partials' own sizes give, each a dense row.
+  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
+  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
+  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
+  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
+  DTYPE* const own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  uint8_t* const own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  __fp16* const own_partials_scales = peer_ptr<__fp16>(
+      partials_ptr_array, partials_ptr_array_size, rank, int4_scales_offset(partials_size_m, partials_size_n));
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -309,11 +302,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // Row `row` from every rank.
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
     peers_load<1, THREADS_PER_BLOCK, QUANTIZATION, DTYPE>(
-        inputs_ptr_array, inputs_ptr_array_size, arena_ptr_array, arena_ptr_array_size, inputs_stride_m, inputs_stride_n, input_size_m, input_size_n,
-        inputs_values_offset, inputs_values_stride_m,
-        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-        inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
-        inputs_scales_size_n, got, row, 0);
+        input_ptr_array, input_ptr_array_size, staging_stride_m, staging_stride_n, input_size_m,
+        input_size_n, staging_ptr_array, staging_ptr_array_size, staging_stride_m,
+        staging_stride_n, staging_size_m, staging_size_n, got, row, 0);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete
   // in issue order, so waiting on one issued after the peers' would wait on the
@@ -422,25 +413,21 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // A PACK A THREAD, stepping across the row (THREADS_PER_BLOCK packs a step,
   // K = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
-  // THE PARTIALS'S POINTERS are computed where they are read, from the arena's
-  // array (read through the constant address space: invariant, so reloadable
-  // rather than held) and the region's offset, so nothing held across the
+  // THE PARTIALS'S POINTERS are computed where they are read, from the
+  // partials' array (read through the constant address space: invariant, so
+  // reloadable rather than held), so nothing held across the
   // reduce (a table read after the first barrier, held, ran the int4
   // 8192-column build out of SGPRs: 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL)
-      peers_load_row_scalars<WORLD>(arena_ptr_array, arena_ptr_array_size, partials_offset, sc,
+      peers_load_row_scalars<WORLD>(partials_ptr_array, partials_ptr_array_size, sc,
                                     scale_at * int64_t{sizeof(DTYPE)}, l);
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
       DTYPE got[WORLD][1][1][P];
       peers_load<1, THREADS_PER_BLOCK, QUANTIZATION, DTYPE>(
-          arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n, slice_m,
-          input_size_n, partials_values_offset,
-          partials_values_stride_m, partials_values_stride_n, partials_values_size_m,
-          partials_values_size_n, partials_scales_offset,
-          partials_scales_stride_m, partials_scales_stride_n, partials_scales_size_m,
-          partials_scales_size_n, got, l, c);
+          partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c);
       WEIGHT_DTYPE w_step[1][1][P];
       if constexpr (ADD_RESIDUAL)
         load<1, THREADS_PER_BLOCK>(weight_ptr, 0, weight_stride_n, 1,
@@ -486,51 +473,31 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
+        int output_size_n, char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size,
         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
         int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
-      output_stride_n, nullptr, 0, 0, arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m,
-      partials_stride_n,
-      partials_values_offset, partials_values_stride_m, partials_values_stride_n,
-      partials_values_size_m, partials_values_size_n, partials_scales_offset,
-      partials_scales_stride_m, partials_scales_stride_n, partials_scales_size_m,
-      partials_scales_size_n, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      output_stride_n, nullptr, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
       signals_size_block, signals_size_writer, status_ptr, status_stride_field,
       status_size_field, rank, timeout_ticks, eps);
@@ -546,7 +513,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -555,47 +522,28 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ residual_output_ptr,
         int64_t residual_output_stride_m, int64_t residual_output_stride_n,
         int residual_output_size_m, int residual_output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n,
-      partials_values_offset, partials_values_stride_m, partials_values_stride_n,
-      partials_values_size_m, partials_values_size_n, partials_scales_offset,
-      partials_scales_stride_m, partials_scales_stride_n, partials_scales_size_m,
-      partials_scales_size_n, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size,
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, signals_ptr_array, signals_ptr_array_size,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
       signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
       status_stride_field, status_size_field, rank, timeout_ticks, eps);
@@ -632,28 +580,16 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
-    const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+    const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
     int64_t output_stride_n, DTYPE* residual_output_ptr,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+    char* const* partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
     int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-    int64_t partials_values_offset,
-    int64_t partials_values_stride_m, int64_t partials_values_stride_n,
-    int partials_values_size_m, int partials_values_size_n,
-    int64_t partials_scales_offset,
-    int64_t partials_scales_stride_m, int64_t partials_scales_stride_n,
-    int partials_scales_size_m, int partials_scales_size_n,
-    int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t inputs_values_offset,
-    int64_t inputs_values_stride_m, int64_t inputs_values_stride_n,
-    int inputs_values_size_m, int inputs_values_size_n,
-    int64_t inputs_scales_offset,
-    int64_t inputs_scales_stride_m, int64_t inputs_scales_stride_n,
-    int inputs_scales_size_m, int inputs_scales_size_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
@@ -676,19 +612,15 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 
   // 1. none: nothing staged, every rank's input read in place where the
   // input table says (a captured call's tensor, or an eager call's host copy
-  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
   // payload (an encoding: what crosses the links is quantized by its owner),
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
   if constexpr (QUANTIZATION == Quantization::int4)
     stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, inputs_offset), inputs_stride_m,
-        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, inputs_values_offset), inputs_values_stride_m,
-        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-        peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, inputs_scales_offset), inputs_scales_stride_m,
-        inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-        input_size_m);
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, input_size_m, rank);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -704,16 +636,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION, DTYPE>(
-      inputs_ptr_array, inputs_ptr_array_size, arena_ptr_array, arena_ptr_array_size, inputs_stride_m, inputs_stride_n,
-      input_size_m, input_size_n, inputs_values_offset, inputs_values_stride_m, inputs_values_stride_n,
-      inputs_values_size_m, inputs_values_size_n, inputs_scales_offset,
-      inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
-      inputs_scales_size_n, partials_offset, partials_stride_m, partials_stride_n,
-      partials_size_m, partials_size_n, partials_values_offset,
-      partials_values_stride_m, partials_values_stride_n, partials_values_size_m,
-      partials_values_size_n, partials_scales_offset, partials_scales_stride_m,
-      partials_scales_stride_n, partials_scales_size_m, partials_scales_size_n,
-      col0, own_n, my_m, rank);
+      input_ptr_array, input_ptr_array_size, staging_stride_m, staging_stride_n, input_size_m,
+      input_size_n, staging_ptr_array, staging_ptr_array_size, staging_stride_m,
+      staging_stride_n, staging_size_m, staging_size_n, partials_ptr_array,
+      partials_ptr_array_size, partials_stride_m, partials_stride_n, partials_size_m,
+      partials_size_n, col0, own_n, my_m, rank);
 
   // 3. Every rank's sums are in this rank's partials.
   barrier<Until::visible, 1, WORLD>(
@@ -728,9 +655,17 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    next call's first sync keeps a peer from pushing into this partials while
   //    it is read (a peer's next kernel starts only once this one has
   //    finished).
-  const DTYPE* const own_partials = peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
-  const uint8_t* const own_partials_values = peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset);
-  const __fp16* const own_partials_scales = peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset);
+  // THE PARTIALS' INT4 PAYLOAD (an encoding of what they hold, common.cuh's
+  // INT4 payload layout): its values from the region's start, its scales at
+  // the offset the partials' own sizes give, each a dense row.
+  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
+  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
+  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
+  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
+  const DTYPE* const own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  const uint8_t* const own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  const __fp16* const own_partials_scales = peer_ptr<__fp16>(
+      partials_ptr_array, partials_ptr_array_size, rank, int4_scales_offset(partials_size_m, partials_size_n));
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
@@ -790,51 +725,31 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-        int output_size_n, char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
+        int output_size_n, char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size,
         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
         int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
-      output_stride_n, nullptr, 0, 0, arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n,
-      partials_values_offset, partials_values_stride_m, partials_values_stride_n,
-      partials_values_size_m, partials_values_size_n, partials_scales_offset,
-      partials_scales_stride_m, partials_scales_stride_n, partials_scales_size_m,
-      partials_scales_size_n, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size,
+      output_stride_n, nullptr, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, signals_ptr_array, signals_ptr_array_size,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
       signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
       status_stride_field, status_size_field, rank, timeout_ticks, eps);
@@ -850,7 +765,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -859,48 +774,28 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ residual_output_ptr,
         int64_t residual_output_stride_m, int64_t residual_output_stride_n,
         int residual_output_size_m, int residual_output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr_array, inputs_ptr_array_size,
+      input_ptr_array, input_ptr_array_size,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
-      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n, partials_size_m,
-      partials_size_n,
-      partials_values_offset, partials_values_stride_m, partials_values_stride_n,
-      partials_values_size_m, partials_values_size_n, partials_scales_offset,
-      partials_scales_stride_m, partials_scales_stride_n, partials_scales_size_m,
-      partials_scales_size_n, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);

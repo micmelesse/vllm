@@ -37,8 +37,9 @@ struct Call<void (*)(PARAMS...)> {
 // input (its own pointer) and its INPUT TABLE (the plain all-reduce's in-place
 // pull: the table only), each a device array of pointers with its size, the
 // outputs, the partials and the staging where the kernel uses them (the plain
-// all-reduce: each region's own device array of every rank's address, with
-// its size, strides and sizes; the fused kernels: the arena's device array of
+// all-reduce and the RMSNorm kernels: each region's own device array of every
+// rank's address, with its size, strides and sizes; the AttnRes kernels: the
+// arena's device array of
 // every rank's base, `arena_ptr_array`, with its size, and each region's
 // offset), then the signals, this rank's status, its rank and the
 // wait limit; then the kernel's own arguments. Our regions (handle.cuh's arena
@@ -170,7 +171,7 @@ inline void launch_all_reduce_rms_norm(Handle& h,
         static_cast<int>(l.input_size_n), t.ptr_array, t.ptr_array_size, l.weight, l.weight_stride_n,
         static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.arena_ptr_array(), h.arena_ptr_array_size(), h.inputs_offset(), t.stride_m,
+        static_cast<int>(l.output_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(), t.stride_m,
         t.stride_n, static_cast<int>(l.inputs_size_m),
         static_cast<int>(l.inputs_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(),
@@ -184,10 +185,10 @@ inline void launch_all_reduce_rms_norm(Handle& h,
         static_cast<int>(l.input_size_n), t.ptr_array, t.ptr_array_size, l.weight, l.weight_stride_n,
         static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.arena_ptr_array(), h.arena_ptr_array_size(),
-        h.partials_offset(), l.partials_stride_m,
+        static_cast<int>(l.output_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
+         l.partials_stride_m,
         l.partials_stride_n, static_cast<int>(l.partials_size_m),
-        static_cast<int>(l.partials_size_n), h.inputs_offset(), t.stride_m,
+        static_cast<int>(l.partials_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(), t.stride_m,
         t.stride_n, static_cast<int>(l.inputs_size_m),
         static_cast<int>(l.inputs_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(),
@@ -213,7 +214,7 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         static_cast<int>(l.output_size_n), l.residual_output,
         l.residual_output_stride_m, l.residual_output_stride_n,
         static_cast<int>(l.residual_output_size_m),
-        static_cast<int>(l.residual_output_size_n), h.arena_ptr_array(), h.arena_ptr_array_size(), h.inputs_offset(), t.stride_m,
+        static_cast<int>(l.residual_output_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(), t.stride_m,
         t.stride_n, static_cast<int>(l.inputs_size_m),
         static_cast<int>(l.inputs_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(),
@@ -232,10 +233,10 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         static_cast<int>(l.output_size_n), l.residual_output,
         l.residual_output_stride_m, l.residual_output_stride_n,
         static_cast<int>(l.residual_output_size_m),
-        static_cast<int>(l.residual_output_size_n), h.arena_ptr_array(), h.arena_ptr_array_size(),
-        h.partials_offset(), l.partials_stride_m,
+        static_cast<int>(l.residual_output_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
+         l.partials_stride_m,
         l.partials_stride_n, static_cast<int>(l.partials_size_m),
-        static_cast<int>(l.partials_size_n), h.inputs_offset(), t.stride_m,
+        static_cast<int>(l.partials_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(), t.stride_m,
         t.stride_n, static_cast<int>(l.inputs_size_m),
         static_cast<int>(l.inputs_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(), h.signals_stride_parity(),
         h.signals_stride_block(), h.signals_stride_writer(),

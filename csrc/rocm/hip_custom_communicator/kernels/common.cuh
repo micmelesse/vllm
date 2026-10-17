@@ -1301,11 +1301,12 @@ DINLINE void peers_load_row_scalars(const T* const (&input)[WORLD],
   issued();
 }
 template <int WORLD>
-DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
-                                    float (&output)[WORLD], int64_t offset_bytes,
-                                    int row) {
+DINLINE void peers_load_row_scalars(char* const* input_ptr_array, int input_ptr_array_size,
+                                    float (&output)[WORLD], int64_t offset_bytes, int row) {
   const char* input[WORLD];
-  peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r)
+    input[r] = rank_of<const char>(input_ptr_array, input_ptr_array_size, r, 0);
   peers_load_row_scalars<WORLD>(input, output, offset_bytes, row);
 }
 }  // namespace impl
@@ -3077,13 +3078,13 @@ DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   impl::store_row_scalar(value, output_ptr, row);
 }
 
-// Every rank's scalar for `row`, `offset_bytes` into each rank's region (one of ours, the arena's array
-// and the region's offset).
+// Every rank's scalar for `row`, from each rank's region (`input_ptr_array`, one of ours: the
+// partials), the scalars `offset_bytes` into it (where the region's own layout puts them, worked
+// out from its sizes by the caller).
 template <int WORLD>
-DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
-                                    float (&output)[WORLD], int64_t offset_bytes,
-                                    int row) {
-  impl::peers_load_row_scalars<WORLD>(arena_ptr_array, arena_ptr_array_size, input_offset, output, offset_bytes,
+DINLINE void peers_load_row_scalars(char* const* input_ptr_array, int input_ptr_array_size,
+                                    float (&output)[WORLD], int64_t offset_bytes, int row) {
+  impl::peers_load_row_scalars<WORLD>(input_ptr_array, input_ptr_array_size, output, offset_bytes,
                                       row);
 }
 
