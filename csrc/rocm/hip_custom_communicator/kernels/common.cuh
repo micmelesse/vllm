@@ -2800,22 +2800,6 @@ DINLINE T* peer_ptr(char* const* arena_ptr_array, int arena_ptr_array_size, int 
   return impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, offset_bytes);
 }
 
-// Every rank's, in rank order, all in flight together: rank r's region `input_offset` into its
-// arena (one of ours: the inputs, the partials).
-template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
-          int P>
-DINLINE void peers_load(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
-                        int64_t input_stride_m, int64_t input_stride_n,
-                        int input_size_m, int input_size_n,
-                        T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step = 1) {
-  const T* input[WORLD];
-  impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
-  impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
-                                         input_size_n, output, offs_m, offs_n,
-                                         row_step);
-}
-
 // Every rank's input through the INPUT TABLE (rank r's at inputs_ptr_array[r], at the table's
 // strides), in rank order, all in flight together: the in-place pull's one-shot.
 template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
@@ -2932,60 +2916,6 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
       input, output_ptr, output_stride_m, output_values_ptr, output_values_stride_m,
       output_scales_ptr, output_scales_stride_m, output_size_m, output_size_n, offs_m,
       offs_n, row_step);
-}
-
-// THE PEERS' INPUTS IN QUANTIZATION'S FORM, the input's every rank's from the INPUT TABLE
-// (none: read in place), its quantized form ours (int4: the staged values and scales, the arena's array
-// and the regions' offsets; the table unused).
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
-                        int64_t input_values_stride_n, int input_values_size_m,
-                        int input_values_size_n, int64_t input_scales_offset, int64_t input_scales_stride_m,
-                        int64_t input_scales_stride_n, int input_scales_size_m,
-                        int input_scales_size_n, U (&output)[WORLD][ROWS][K][P],
-                        int offs_m, int offs_n, int row_step = 1) {
-  const T* input[WORLD];
-  const uint8_t* values[WORLD];
-  const __fp16* scales[WORLD];
-  if constexpr (QUANTIZATION == Quantization::none) {
-    impl::peers_of(inputs_ptr_array, inputs_ptr_array_size, input);
-  } else {
-    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_values_offset, values);
-    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_scales_offset, scales);
-  }
-  impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
-      input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
-      input_size_m, input_size_n, output, offs_m, offs_n, row_step);
-}
-
-// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (our regions, the arena's array
-// and the region's offset: the partials), its quantized form ours (the summed values and
-// scales).
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
-                        int64_t input_values_stride_n, int input_values_size_m,
-                        int input_values_size_n, int64_t input_scales_offset, int64_t input_scales_stride_m,
-                        int64_t input_scales_stride_n, int input_scales_size_m,
-                        int input_scales_size_n, U (&output)[WORLD][ROWS][K][P],
-                        int offs_m, int offs_n, int row_step = 1) {
-  const T* input[WORLD];
-  const uint8_t* values[WORLD];
-  const __fp16* scales[WORLD];
-  if constexpr (QUANTIZATION == Quantization::none) {
-    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
-  } else {
-    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_values_offset, values);
-    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_scales_offset, scales);
-  }
-  impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
-      input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
-      input_size_m, input_size_n, output, offs_m, offs_n, row_step);
 }
 
 // THE PEERS' INPUTS IN QUANTIZATION'S FORM, each buffer its own region: none, every rank's input
