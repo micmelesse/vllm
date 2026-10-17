@@ -86,15 +86,25 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
       load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
     WEIGHT_DTYPE w[1][K][P];
     load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
+    // The peers' sum in rank order in fp32, so every rank's agrees bitwise, rounded to DTYPE as
+    // the reference's all-reduce is; ADD_RESIDUAL adds the residual in fp32, the new residual that
+    // sum rounded to DTYPE (the norm reads the fp32 sum).
     float s[1][K][P];
-    peers_sum(peers, s);
-    round<DTYPE>(s);
+    [[maybe_unused]] DTYPE added[1][K][P];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        float acc = static_cast<float>(peers[0][0][k][j]);
+#pragma unroll
+        for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
+        s[0][k][j] = static_cast<float>(static_cast<DTYPE>(acc));
+        if constexpr (ADD_RESIDUAL) {
+          s[0][k][j] += static_cast<float>(res[0][k][j]);
+          added[0][k][j] = static_cast<DTYPE>(s[0][k][j]);
+        }
+      }
     if constexpr (ADD_RESIDUAL) {
-      float res_f[1][K][P];
-      convert(res, res_f);
-      add(s, res_f, s);
-      DTYPE added[1][K][P];
-      convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
@@ -319,16 +329,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // row: 2026-10-01T01-07-56Z).
     if (row + static_cast<int>(gridDim.x) < last)
       load_peers(row + gridDim.x, next);
+    // The sum and the residual, rounding as the reference does (see the one-shot kernel):
     float s[1][K][P];
-    peers_sum(cur, s);
-    round<DTYPE>(s);
-    // The norm, rounding as the reference does (see the one-shot kernel):
+    [[maybe_unused]] DTYPE added[1][K][P];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        float acc = static_cast<float>(cur[0][0][k][j]);
+#pragma unroll
+        for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(cur[r][0][k][j]);
+        s[0][k][j] = static_cast<float>(static_cast<DTYPE>(acc));
+        if constexpr (ADD_RESIDUAL) {
+          s[0][k][j] += static_cast<float>(res[0][k][j]);
+          added[0][k][j] = static_cast<DTYPE>(s[0][k][j]);
+        }
+      }
     if constexpr (ADD_RESIDUAL) {
-      float res_f[1][K][P];
-      convert(res, res_f);
-      add(s, res_f, s);
-      DTYPE added[1][K][P];
-      convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
     }
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
@@ -341,8 +358,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     if constexpr (ADD_RESIDUAL) {
       rms_norm<THREADS_PER_BLOCK, NormPart::scale, true>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0);
-      store_row_scalar(scale[0], reinterpret_cast<float*>(own_partials + scale_at),
-                       row - first);
+      // The row's scale, one float a row in this rank's partials: thread 0 stores it.
+      if (threadIdx.x == 0)
+        *(__attribute__((address_space(1))) float*)(reinterpret_cast<float*>(own_partials +
+                                                                             scale_at) +
+                                                    (row - first)) = scale[0];
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
@@ -392,9 +412,19 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // 8192-column build out of SGPRs: 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
-    if constexpr (ADD_RESIDUAL)
-      peers_load_row_scalars<WORLD>(partials_ptr_array, partials_ptr_array_size, sc,
-                                    scale_at * int64_t{sizeof(DTYPE)}, l);
+    if constexpr (ADD_RESIDUAL) {
+      // Every owner's scale for row l, scale_at elements into its partials, all in flight before
+      // the rows' loads (issued: no load or instruction crosses the barrier below).
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        sc[r] = *(const __attribute__((address_space(1))) float*)(
+            reinterpret_cast<const float*>(
+                ptr_array_at<const char>(partials_ptr_array, partials_ptr_array_size, r) +
+                scale_at * int64_t{sizeof(DTYPE)}) +
+            l);
+      asm volatile("" ::: "memory");
+      __builtin_amdgcn_sched_barrier(0);
+    }
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
       DTYPE got[WORLD][1][1][P];
       load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
@@ -410,7 +440,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         if constexpr (ADD_RESIDUAL) {
           store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
           float got_f[1][1][P];
-          convert(got[r], got_f);
+#pragma unroll
+          for (int j = 0; j < P; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
           float scale[1] = {sc[r]};
           DTYPE normed[1][1][P];
           rms_norm<THREADS_PER_BLOCK, NormPart::apply, true>(got_f, scale, w_step, normed, eps,
@@ -590,14 +621,21 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
     WEIGHT_DTYPE w[1][K][P];
     load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
+    // The owner's sum in fp32; ADD_RESIDUAL adds the residual in fp32, the new residual that sum
+    // rounded to DTYPE (as the one-shot kernel's).
     float s[1][K][P];
-    convert(own, s);
+    [[maybe_unused]] DTYPE added[1][K][P];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        s[0][k][j] = static_cast<float>(own[0][k][j]);
+        if constexpr (ADD_RESIDUAL) {
+          s[0][k][j] += static_cast<float>(res[0][k][j]);
+          added[0][k][j] = static_cast<DTYPE>(s[0][k][j]);
+        }
+      }
     if constexpr (ADD_RESIDUAL) {
-      float res_f[1][K][P];
-      convert(res, res_f);
-      add(s, res_f, s);
-      DTYPE added[1][K][P];
-      convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)

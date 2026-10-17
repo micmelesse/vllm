@@ -85,10 +85,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][ROWS][K][P];
     load<THREADS_M, THREADS_N, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
-    float sum[ROWS][K][P];
-    peers_sum(peers, sum);
+    // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
+    // same order, so every rank's sums agree bitwise.
     DTYPE rounded[ROWS][K][P];
-    convert(sum, rounded);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) {
+          float acc = static_cast<float>(peers[0][i][k][j]);
+#pragma unroll
+          for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
+          rounded[i][k][j] = static_cast<DTYPE>(acc);
+        }
     store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
@@ -225,10 +235,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][ROWS][K][P];
       load<THREADS_M, THREADS_N, Ranks::every_slot>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
-      float sum[ROWS][K][P];
-      peers_sum(peers, sum);
-      DTYPE rounded[ROWS][K][P];
-      convert(sum, rounded);
+      DTYPE rounded[ROWS][K][P];  // summed in rank order in fp32, rounded once (as above)
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j) {
+            float acc = static_cast<float>(peers[0][i][k][j]);
+#pragma unroll
+            for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
+            rounded[i][k][j] = static_cast<DTYPE>(acc);
+          }
       store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     // 3. No rank may push its next band (this launch's or the next's) until

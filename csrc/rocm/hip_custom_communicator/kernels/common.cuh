@@ -2,12 +2,12 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // COMMON: everything a kernel may call and the machine under it, in sections,
-// each built on those above it: HARDWARE, BUILD, UTILS, TILES, MEMORY,
-// ELEMENTWISE, REDUCE, DOT, PEERS, BARRIER, QUANTIZATION, COLLECTIVES,
-// then THE INTERFACE, last because it passes to them all. Every function is at file scope
-// (no helper namespace): the four ops (load, store, barrier, block_reduce), the INT4 codec
-// (encode, decode), the two address functions (ptr_array_at, lane_ptr_array_at) and, until
-// the kernel refactor's I1 and I3 remove them, the transitional helpers lint_kernels.sh lists.
+// each built on those above it: HARDWARE, BUILD, UTILS, MEMORY, REDUCE, PEERS, BARRIER,
+// QUANTIZATION, LOAD AND STORE, COLLECTIVES. Every function is at file scope (no helper
+// namespace) and is one of the API: the four ops (load, store, barrier, block_reduce), the INT4
+// codec (encode, decode) and the two address functions (ptr_array_at, lane_ptr_array_at)
+// (lint_kernels.sh checks it). A kernel writes its register math, its walks and its addresses
+// inline, at its use.
 //
 // THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs,
 // then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer,
@@ -24,10 +24,11 @@
 // `x_ptr_array_size`, never a struct around it, and no function takes one
 // without the other. THE CALLER'S INPUT, exact, is read by every rank IN
 // PLACE through the INPUT TABLE (below); INT4, a kernel first quantizes it into this rank's
-// inputs' INT4 values (`stage_rows`, an encoding) and its peers read them there; the plain
-// all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or each rank's
-// share of it) into the peers' inputs, each rank's INBOX, at its own slot (`store`'s every rank,
-// `push_shares`), and sums its own inbox locally (`load`'s every slot, `reduce_slots`). Either way the
+// inputs' INT4 values (reduce_scatter's int4 staging: `store` quantizing) and its peers read them
+// there; the plain all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or
+// each rank's share of it) into the peers' inputs, each rank's INBOX, at its own slot (`store`'s
+// every rank, or reduce_scatter's pushed flat walk), and sums its own inbox locally (`load`'s every
+// slot, or that walk's sum). Either way the
 // first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_ptr_array` with
 // `inputs_ptr_array_size` (the world), a device array of every rank's input address (aiter's
 // RankData*), rank r's input at inputs_ptr_array[r] at the inputs' strides. The kernel reads every rank's input where the table says, in place, and never
@@ -412,41 +413,10 @@ struct traits {
 };
 
 // =================================================================================================
-// TILES
-//
-// WHICH TILES A BLOCK WORKS ON: a kernel cuts its work in Triton's terms (TILE_M x TILE_N tiles
-// of an M x N tensor, the last one masked), and each block walks its share of them.
-// =================================================================================================
-
-// THIS BLOCK'S TILES, grid-strided in row-major order over `tiles_m` x
-// `tiles_n` tiles: `body(row, col)` for each, in tiles. The row and column are
-// kept as the walk advances, each step an add, a compare and a carry, where
-// dividing them out of the work item's index cost a 32-bit division a tile (ISA
-// 2026-10-11, the plain all-reduce against the flat walk); the division is
-// once, here.
-template <typename BODY>
-DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
-  const int step_rows = static_cast<int>(gridDim.x) / tiles_n;
-  const int step_cols = static_cast<int>(gridDim.x) % tiles_n;
-  int row = static_cast<int>(blockIdx.x) / tiles_n;
-  int col = static_cast<int>(blockIdx.x) % tiles_n;
-  while (row < tiles_m) {
-    body(row, col);
-    row += step_rows;
-    col += step_cols;
-    if (col >= tiles_n) {
-      col -= tiles_n;
-      ++row;
-    }
-  }
-}
-
-// =================================================================================================
 // MEMORY
 //
-// THE READS AND WRITES, a thread's registers from and to buffers: a load and a store (one round
-// trip), every rank's at once, the all-gather into registers, a row's scalar. How a pack is
-// loaded (one 16-byte global instruction, issued together) is MEMORY's own (pack_load, pack_store).
+// THE READS AND WRITES' TYPES: a pack moves as one 16-byte global instruction (global_u32x4), the
+// form load and store (LOAD AND STORE) and the collectives' walks write their accesses in.
 // =================================================================================================
 
 // PEER MEMORY THROUGH GLOBAL INSTRUCTIONS. A pointer read out of a struct has
@@ -456,221 +426,15 @@ DINLINE void block_for_each_tile(int tiles_m, int tiles_n, BODY body) {
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 
-// ISSUED HERE, NOT WHERE THE COMPILER LIKES: no memory operation moves across
-// this point (the empty asm's memory clobber) and no instruction is scheduled
-// across it (sched_barrier), so every load above it is in flight before
-// anything below it runs. The scheduler alone sank a reduce's peer loads past
-// the adds of the first ones (ISA 2026-10-01T00-39-51Z); with sched_barrier
-// alone, a tile's weight loads were sunk to their uses, one register quad and
-// one round trip each (ISA 2026-10-03T21-00-27Z).
-DINLINE void issued() {
-  asm volatile("" ::: "memory");
-  __builtin_amdgcn_sched_barrier(0);
-}
-
-template <typename PACK>
-DINLINE PACK pack_load(const PACK* p) {
-  if constexpr (sizeof(PACK) == 16) {
-    const u32x4 raw = *(const global_u32x4*)(p);
-    PACK v;
-    __builtin_memcpy(&v, &raw, 16);
-    return v;
-  } else {
-    return *p;
-  }
-}
-
-// A THREAD'S REGISTERS AND THEIR PLACE: `T v[ROWS][K][P]`, P a pack's elements; the place in a
-// buffer as ints (its sizes, offs_m, offs_n, row_step) and the layout as template ints
-// THREADS_M x THREADS_N. Thread t holds rows offs_m + (t / THREADS_N + i * THREADS_M) *
-// row_step and packs offs_n / P + t % THREADS_N + k * THREADS_N.
-// Thread-row i's row of the block's rows, a row past size_m reading row size_m - 1.
-template <int THREADS_M, int THREADS_N>
-DINLINE int thread_row(int i) {
-  // One row of threads: the row is the block's, so its address stays scalar.
-  if constexpr (THREADS_M == 1)
-    return i;
-  else
-    return static_cast<int>(threadIdx.x) / THREADS_N + i * THREADS_M;
-}
-template <int THREADS_M, int THREADS_N>
-DINLINE bool row_live(int size_m, int offs_m, int row_step, int i) {
-  return offs_m + thread_row<THREADS_M, THREADS_N>(i) * row_step < size_m;
-}
-template <int THREADS_M, int THREADS_N>
-DINLINE int row_of(int size_m, int offs_m, int row_step, int i) {
-  return row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)
-             ? offs_m + thread_row<THREADS_M, THREADS_N>(i) * row_step
-             : size_m - 1;
-}
-// This thread's pack k of a row, in packs from the row's start, past size_n clamped to the last,
-// so every load stays in bounds (partial_dot masks past size_n with a float multiplied in, so
-// nothing reading it branches (a load under a runtime `if` cannot be hoisted past the branch,
-// and loads meant to be in flight together then wait one at a time).
-template <int P, int THREADS_N>
-DINLINE int pack_of(int size_n, int offs_n, int k) {
-  const int n =
-      offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N + k * THREADS_N;
-  return n < size_n / P ? n : size_n / P - 1;
-}
-// WHETHER A LOAD SKIPS ROW i: only several rows a thread or rows of threads, whose rows past
-// size_m would re-read the last over the links. One row's is real wherever a kernel makes one,
-// and a branch around its loads cost registers (126 -> 178 VGPRs, spilling at 16384: 23-46-07Z).
-template <int ROWS, int THREADS_M, int THREADS_N>
-DINLINE bool skips(int size_m, int offs_m, int row_step, int i) {
-  if constexpr (ROWS == 1 && THREADS_M == 1) return false;
-  return !row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
-}
-// A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form global_load
-// and global_store take with the base in scalar registers (saddr), so every tensor sharing the
-// columns shares one offset register. A signed column added to the pointer was a 64-bit vector
-// address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness, 2026-10-04T15-28-51Z).
-// THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so the 64-bit sum is not
-// hoisted and held a tensor a pack (an add a load; AttnRes 90 -> 70 VGPRs, 2026-10-04 compile).
-template <int P, int THREADS_N, typename PACK>
-DINLINE PACK* at_col(PACK* row, int size_n, int offs_n, int k) {
-  using Byte = std::conditional_t<std::is_const_v<PACK>, const char, char>;
-  uint32_t offset = static_cast<uint32_t>(pack_of<P, THREADS_N>(size_n, offs_n, k)) *
-                    uint32_t{sizeof(PACK)};
-  asm volatile("" : "+v"(offset));
-  return reinterpret_cast<PACK*>(reinterpret_cast<Byte*>(row) + offset);
-}
-template <typename T, int P>
-DINLINE void held(T (&v)[P], const vec<T, P>& p) {
-  __builtin_memcpy(v, &p, sizeof(p));
-}
-template <typename T, int P>
-DINLINE vec<T, P> pack(const T (&v)[P]) {
-  vec<T, P> p;
-  __builtin_memcpy(&p, v, sizeof(p));
-  return p;
-}
-template <typename PACK>
-DINLINE void pack_store(PACK* p, const PACK& v) {
-  if constexpr (sizeof(PACK) == 16) {
-    u32x4 raw;
-    __builtin_memcpy(&raw, &v, 16);
-    *(global_u32x4*)(p) = raw;
-  } else {
-    *p = v;
-  }
-}
-
-// A ROW'S SCALAR (a norm's scale), one float a row: thread 0 stores it.
-DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
-  if (threadIdx.x == 0)
-    *(__attribute__((address_space(1))) float*)(output_ptr + row) = value;
-}
-
-
-// =================================================================================================
-// ELEMENTWISE
-//
-// THE ELEMENTWISE OPS, at thread scope, on float registers (a fused op spells each rounding its
-// reference does as a round<U> or convert between them).
-// =================================================================================================
-
-// ELEMENT BY ELEMENT: b of a's rows or one row (a weight, every row's); a scale a row or one.
-// fma is a x a_row_scale + b x b_row_scale as fused multiply-adds (a softmax's fold), b in any
-// dtype, converted here: two multiplies and an add were three VALU an element and, vectorized,
-// packed multiplies with a chain of adds (ISA 2026-10-04T02-22-41Z).
-template <typename T, typename U, int ROWS, int K, int P>
-DINLINE void convert(const T (&input)[ROWS][K][P], U (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = static_cast<U>(input[i][k][j]);
-}
-
-template <typename U, int ROWS, int K, int P>
-DINLINE void round(float (&values)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        values[i][k][j] = static_cast<float>(static_cast<U>(values[i][k][j]));
-}
-
-template <int ROWS, int ROWS_B, int K, int P, typename OP>
-DINLINE void zip(const float (&a)[ROWS][K][P], const float (&b)[ROWS_B][K][P],
-                 float (&output)[ROWS][K][P], OP op) {
-  static_assert(ROWS_B == ROWS || ROWS_B == 1, "b is a's shape or one row");
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        output[i][k][j] = op(a[i][k][j], b[ROWS_B == 1 ? 0 : i][k][j]);
-}
-
-template <int ROWS, int ROWS_B, int K, int P>
-DINLINE void add(const float (&a)[ROWS][K][P], const float (&b)[ROWS_B][K][P],
-                 float (&output)[ROWS][K][P]) {
-  zip(a, b, output, [](float x, float y) { return x + y; });
-}
-
-template <int ROWS, int ROWS_B, int K, int P>
-DINLINE void mul(const float (&a)[ROWS][K][P], const float (&b)[ROWS_B][K][P],
-                 float (&output)[ROWS][K][P]) {
-  zip(a, b, output, [](float x, float y) { return x * y; });
-}
-
-template <int ROWS, int K, int P>
-DINLINE void mul(const float (&a)[ROWS][K][P], const float (&row_scale)[ROWS],
-                 float (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = a[i][k][j] * row_scale[i];
-}
-
-template <int ROWS, int K, int P>
-DINLINE void mul(const float (&a)[ROWS][K][P], float scale,
-                 float (&output)[ROWS][K][P]) {
-  float row_scale[ROWS];
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) row_scale[i] = scale;
-  mul(a, row_scale, output);
-}
-
-
 // =================================================================================================
 // REDUCE
 //
-// THE REDUCTIONS, by scope, each built on the one below: over the PEERS (every
-// rank's registers summed elementwise in fp32, in rank order),
-// over a WAVE (shuffles), over a BLOCK (a wave's result, then one LDS pass). N
+// THE BLOCK REDUCTION, over a WAVE (shuffles), then over the BLOCK (a wave's result, then one
+// LDS pass); the peers' sum (every rank's registers elementwise in fp32, in rank order) is
+// written inline by each kernel that sums them. N
 // values at once at every scope: each block pass is two barriers and an LDS
 // round trip, so a kernel with several reductions takes them together.
 // =================================================================================================
-
-// EVERY RANK'S REGISTERS SUMMED, in rank order in fp32, left in fp32 (a convert rounds them,
-// once): callers whose sources are the ranks agree bitwise. Waits on the loads only here.
-template <typename T, int WORLD, int ROWS, int K, int P>
-DINLINE void peers_sum(const T (&input)[WORLD][ROWS][K][P],
-                       float (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      float acc[P];
-#pragma unroll
-      for (int j = 0; j < P; ++j) acc[j] = static_cast<float>(input[0][i][k][j]);
-#pragma unroll
-      for (int r = 1; r < WORLD; ++r)
-#pragma unroll
-        for (int j = 0; j < P; ++j) acc[j] += static_cast<float>(input[r][i][k][j]);
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = acc[j];
-    }
-}
 
 // THE OPERATIONS a wave or block reduction combines with.
 struct Sum {
@@ -774,7 +538,7 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
     const int mine = static_cast<int>(threadIdx.x) % THREADS_N;
 #pragma unroll
     for (int k = 0; k < K; ++k)
-      part[static_cast<int>(threadIdx.x) / THREADS_N][k][mine] = pack(input[k]);
+      __builtin_memcpy(&part[static_cast<int>(threadIdx.x) / THREADS_N][k][mine], input[k], sizeof(V));
     __syncthreads();
     // THE FIRST ROW OF THREADS HOLDS THE SUM: a compare only when there are several (threadIdx.x <
     // THREADS_N is not folded from the launch bounds: a compare and a branch around every store,
@@ -798,39 +562,6 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
       }
     }
     __syncthreads();  // before the next reduction writes `part`
-  }
-}
-
-// =================================================================================================
-// DOT
-//
-// THE DOT: a thread's share of a row's dot (a block_reduce finishes it).
-// =================================================================================================
-
-// This thread's share of dot(a, b) over each row, packs past size_n counting zero: the
-// partials a block_reduce turns into the rows' dots (a sum of squares is partial_dot(x, x)). A
-// one-row b (a weight) is every row's; a and b in any dtype, converted. A row of threads is
-// THREADS_N wide (the block's, or a wave's).
-template <int THREADS_N, typename A, typename B, int ROWS, int ROWS_B, int K,
-          int P>
-DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
-                         float (&output)[ROWS], int size_n, int offs_n) {
-  static_assert(ROWS_B == ROWS || ROWS_B == 1, "b is a's shape or one row");
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    const int ib = ROWS_B == 1 ? 0 : i;
-    output[i] = 0.0f;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      float dk = 0.0f;
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        dk = fmaf(static_cast<float>(a[i][k][j]), static_cast<float>(b[ib][k][j]),
-                  dk);
-      // Its mask 1 below size_n and 0 past it, multiplied in so nothing branches (pack_of).
-      const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N + k * THREADS_N;
-      output[i] += (n < size_n / P ? 1.0f : 0.0f) * dk;
-    }
   }
 }
 
@@ -932,13 +663,10 @@ constexpr int kStatusFields = 10;
 #ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
   #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
 #endif
-// AN INDEX INSIDE ITS BUFFER'S SIZE, checked in debug builds only (a release
-// build passes the sizes and reads none): one outside is a programming error,
-// not a peer's fault, so it traps.
-DINLINE void debug_in_bounds(int64_t index, int64_t size) {
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size))
-    __builtin_trap();
-}
+// AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
+// (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size)) __builtin_trap();` at each
+// index, compiled out of a release build, which passes the sizes and reads none): one outside is a
+// programming error, not a peer's fault, so it traps.
 
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
 // addresses, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
@@ -953,7 +681,7 @@ template <typename U = void, typename T>
 DINLINE std::conditional_t<std::is_void_v<U>, T, U>* ptr_array_at(T* const* x_ptr_array,
                                                                   int x_ptr_array_size, int r) {
   r = __builtin_amdgcn_readfirstlane(r);
-  debug_in_bounds(r, x_ptr_array_size);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (r < 0 || r >= x_ptr_array_size)) __builtin_trap();
   typedef T* Entry;
   return reinterpret_cast<std::conditional_t<std::is_void_v<U>, T, U>*>(
       ((const __attribute__((address_space(4))) Entry*)x_ptr_array)[r]);
@@ -971,7 +699,7 @@ template <int WORLD, typename U = void, typename T>
 DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const* x_ptr_array,
                                                                        int x_ptr_array_size, int r) {
   static_assert(WORLD >= 1, "a world has a rank");
-  debug_in_bounds(WORLD - 1, x_ptr_array_size);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (WORLD - 1 < 0 || WORLD - 1 >= x_ptr_array_size)) __builtin_trap();
   const auto scalar = [](T* p) {
     const auto u = reinterpret_cast<uint64_t>(p);
     const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u));
@@ -1127,10 +855,13 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
     // this rank's, written by this lane's peer.
     const auto flag = [&](auto owner, unsigned block, auto writer) {
-      debug_in_bounds(static_cast<int64_t>(owner), WORLD);
-      debug_in_bounds(parity, signals_size_parity);
-      debug_in_bounds(block, signals_size_block);
-      debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+          (static_cast<int64_t>(owner) < 0 || static_cast<int64_t>(owner) >= WORLD ||
+           static_cast<int64_t>(parity) >= signals_size_parity ||
+           static_cast<int64_t>(block) >= signals_size_block ||
+           static_cast<int64_t>(writer) < 0 ||
+           static_cast<int64_t>(writer) >= signals_size_writer))
+        __builtin_trap();
       return lane_ptr_array_at<WORLD>(signals_ptr_array, signals_ptr_array_size,
                                             static_cast<int>(owner)) +
              parity * signals_stride_parity + block * signals_stride_block +
@@ -1155,7 +886,9 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     const uint32_t want = static_cast<uint32_t>(FlagState::arrived);
     // One word of this rank's status, by its field, at the buffer's stride.
     const auto word = [&](StatusField f) {
-      debug_in_bounds(static_cast<int64_t>(f), status_size_field);
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+          (static_cast<int64_t>(f) < 0 || static_cast<int64_t>(f) >= status_size_field))
+        __builtin_trap();
       return status_ptr + static_cast<int64_t>(f) * status_stride_field;
     };
     const uint64_t t0 = wall_clock64();
@@ -1278,7 +1011,7 @@ template <typename U>
 constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 
 // DECODE: a word's 8 values at their group's scale. Its own function because load lands them in
-// U and the INT4 sum adds them in fp32 from the words (int4_peers_sum, never a decoded tile).
+// U and the INT4 sum adds them in fp32 from the words (reduce_scatter's, never a decoded tile).
 // U float: the exact terms, (q - 8) * scale. U a 16-bit dtype: each rounded once to U, made as a
 // loaded pack is, four 32-bit words copied in whole: element by element, each 16-bit value held a
 // register of its own and the pull norms' two rows of every peer's packs spilled 188 VGPRs (256
@@ -1289,7 +1022,7 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 // 16) plus bias (-1032 * scale, or -72 * scale): a 22-bit product, then an exact difference. 13
 // instructions a word, in one asm block: left to the compiler, each half was converted and fed to
 // packed fmas (1.5 a value, a gfx950 probe compile, 2026-10-16). VOLATILE, so the blocks keep their
-// order (int4_peers_sum pins what consumes them between).
+// order (reduce_scatter's int4 sum pins what consumes them between).
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
 // conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
 // 2026-10-16T02-01-12Z).
@@ -1412,116 +1145,6 @@ DINLINE void encode(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_
 typedef __attribute__((address_space(1))) uint32_t global_u32;
 typedef __attribute__((address_space(1))) __fp16 global_f16;
 
-// `offset` bytes past `base`, the offset opaque so the address is built at its access (at_col's).
-template <typename E>
-DINLINE E* at_offset(E* base, uint32_t offset) {
-  using Byte = std::conditional_t<std::is_const_v<E>, const char, char>;
-  asm volatile("" : "+v"(offset));
-  return reinterpret_cast<E*>(reinterpret_cast<Byte*>(base) + offset);
-}
-
-
-template <typename U, int ROWS, int K, int P>
-DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
-                         U (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k) decode(words[i][k], scales[i][k], output[i][k]);
-}
-
-
-// Every peer's words and scales (kept with int4_peers_sum: the push kernels' int4 sum from the
-// words, where a decoded tile of every peer held 172 VGPRs; inlined in reduce_scatter it was 2% more
-// instructions, ISA I3), the position once a pack in a vector register (load's every rank),
-// each rank's word and scale an add of it; all in flight, none waited on.
-template <int THREADS_M, int THREADS_N, int P, int WORLD, int ROWS, int K>
-DINLINE void int4_peers_issue(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
-                              const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
-                              int size_m, int size_n, uint32_t (&words)[WORLD][ROWS][K],
-                              float (&group_scales)[WORLD][ROWS][K], int offs_m, int offs_n,
-                              int row_step) {
-  static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
-      const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
-      // 32-BIT BYTE OFFSETS: a quantized buffer is ours, at most the box's (select's
-      // exchange_sizes), so each rank's address is its base plus one offset register.
-      uint32_t value_at = static_cast<uint32_t>(row * values_stride_m) +
-                          static_cast<uint32_t>(pack) * kInt4WordBytes;
-      uint32_t scale_at = static_cast<uint32_t>(
-          (row * scales_stride_m + pack / kInt4GroupPacks) * kInt4ScaleBytes);
-      asm volatile("" : "+v"(value_at));
-      asm volatile("" : "+v"(scale_at));
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        words[r][i][k] = *(const global_u32*)(values[r] + value_at);
-        group_scales[r][i][k] = *(const global_f16*)(
-            reinterpret_cast<const char*>(scales[r]) + scale_at);
-      }
-    }
-  }
-  issued();
-}
-// EVERY PEER'S QUANTIZED PACKS SUMMED, peers_sum's: each element (q - 8) * scale landed in T, as a
-// quantized load lands it, then added in fp32 in rank order. From the words, no pack of every
-// peer made first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
-// 2026-10-15T22-47-01Z). WITH BF16, TWO RANKS' TERMS A STEP: landed together (one
-// v_cvt_pk_bf16_f32) and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
-// conversion, a shift and an add.
-template <typename T, int WORLD, int ROWS, int K, int P>
-DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
-                            const float (&group_scales)[WORLD][ROWS][K],
-                            float (&output)[ROWS][K][P]) {
-  [[maybe_unused]] const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      float acc[P];
-#pragma unroll
-      for (int j = 0; j < P; ++j) acc[j] = 0.0f;
-      int r = 0;
-      // v_dot2_f32_bf16 IS GFX950'S (dot12-insts): gfx942 sums every rank by the loop
-      // below. The image builds both targets, the dev loop one, so this broke only the
-      // image (2026-10-16, e2e 04-18-33Z's test step).
-#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
-      if constexpr (kBf16<T>) {
-#pragma unroll
-        for (; r + 1 < WORLD; r += 2) {
-          float a[P], b[P];
-          decode(words[r][i][k], group_scales[r][i][k], a);
-          decode(words[r + 1][i][k], group_scales[r + 1][i][k], b);
-#pragma unroll
-          for (int j = 0; j < P; ++j)
-            acc[j] = __builtin_amdgcn_fdot2_f32_bf16(
-                __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, acc[j], false);
-          // THE SUMS DONE BEFORE THE NEXT DECODE'S VOLATILE ASM: the scheduler, free to use 256
-          // VGPRs at 512 threads, decoded every peer's words of a group ahead of the first sum
-          // and spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
-#pragma unroll
-          for (int j = 0; j < P; ++j) asm volatile("" ::"v"(acc[j]));
-        }
-      }
-#endif
-#pragma unroll
-      for (; r < WORLD; ++r) {
-        float a[P];
-        decode(words[r][i][k], group_scales[r][i][k], a);
-#pragma unroll
-        for (int j = 0; j < P; ++j) acc[j] += static_cast<float>(static_cast<T>(a[j]));
-#pragma unroll
-        for (int j = 0; j < P; ++j) asm volatile("" ::"v"(acc[j]));  // as above
-      }
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = acc[j];
-    }
-}
-
 // =================================================================================================
 // LOAD AND STORE: A THREAD'S REGISTERS FROM AND TO A BUFFER, the one load and the one store
 //
@@ -1584,7 +1207,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   const auto base = [&](int c) -> E* {
     const int entry = RANKS == Ranks::every ? c : input_rank;
     const int slot = RANKS == Ranks::every_slot ? c : input_slot;
-    debug_in_bounds(slot, input_size_slot);
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (slot < 0 || slot >= input_size_slot)) __builtin_trap();
     // The entries as plain pointers (a kernel's own pointer is __restrict__).
     const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
     E* at;
@@ -1714,12 +1337,17 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     }
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
-    if constexpr (kEvery) {
 #pragma unroll
-      for (int c = 0; c < COPIES; ++c) int4_decode(words[c], group_scales[c], output[c]);
-    } else {
-      int4_decode(words[0], group_scales[0], output);
-    }
+    for (int c = 0; c < COPIES; ++c)
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+          if constexpr (kEvery)
+            decode(words[c][i][k], group_scales[c][i][k], output[c][i][k]);
+          else
+            decode(words[0][i][k], group_scales[0][i][k], output[i][k]);
+        }
   }
 }
 
@@ -1746,7 +1374,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
   using E = std::conditional_t<QUANTIZATION == Quantization::none, U, uint8_t>;
   const auto base = [&](int c) -> E* {
     const int entry = RANKS == Ranks::every ? c : output_rank;
-    debug_in_bounds(output_slot, output_size_slot);
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (output_slot < 0 || output_slot >= output_size_slot)) __builtin_trap();
     const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
     E* at;
     if (__builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1)
@@ -1865,7 +1493,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 // THE FLAT WALK (the plain two-shot): an elementwise [R, M, N] problem -- R
 // ranks' copies of an [M, N] buffer, each at its own strides -- WALKED AS
 // [R, 1, M*N]: the rows are only the buffer's layout, so the elements are
-// numbered row-major (e = row * N + col, flat_at) and each rank's SHARE is one
+// numbered row-major (e = row * N + col, reduce_scatter's element_at) and each rank's SHARE is one
 // contiguous range of them, a TILE_N chunk a step. WHY: the links and HBM
 // reward long reads from each peer. Cut a row at a time, a rank's share was its
 // slice of every row -- 1.8 KB runs at N = 7168, the plain all-reduce +2%
@@ -1894,36 +1522,4 @@ enum class Direction : int { pull = 0, push = 1 };
 // of every row. And where reduce_scatter sums a rank's copies: through LDS or in registers.
 enum class Walk : int { flat = 0, rows = 1 };
 enum class Accumulate : int { lds = 0, registers = 1 };
-// =================================================================================================
-// INTERFACE
-//
-// THE INTERFACE: the primitives a kernel may call that take its buffers as pointer arrays, strides
-// and sizes (the overview is this file's head), passing them to their section's `_body` (a
-// transitional name: I3 splits the file). load and store, the register math, the tiles, barrier,
-// block_reduce and the codec are defined at file scope in their sections above.
-// =================================================================================================
-
-// ===============================================================================================
-// MEMORY: REGISTERS FROM AND TO BUFFERS
-// ===============================================================================================
-
-// Every rank's scalar for `row`, from each rank's region (`input_ptr_array`, one of ours: the
-// partials), the scalars `offset_bytes` into it (where the region's own layout puts them, worked
-// out from its sizes by the caller).
-template <int WORLD>
-DINLINE void peers_load_row_scalars(char* const* input_ptr_array, int input_ptr_array_size,
-                                    float (&output)[WORLD], int64_t offset_bytes, int row) {
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    output[r] = *(const __attribute__((address_space(1))) float*)(
-        reinterpret_cast<const float*>(
-            ptr_array_at<const char>(input_ptr_array, input_ptr_array_size, r) + offset_bytes) +
-        row);
-  issued();
-}
-
-// ===============================================================================================
-// UTILS
-// ===============================================================================================
-
 }  // namespace hip_custom_communicator

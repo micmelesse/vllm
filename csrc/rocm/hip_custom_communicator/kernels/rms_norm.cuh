@@ -26,26 +26,59 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
                       float inv_hidden, int size_n, int offs_n) {
   if constexpr (PART != NormPart::apply) {
+    // This thread's share of each row's sum of squares, packs past size_n counting zero: its mask,
+    // 1 below size_n and 0 past it, is multiplied in so nothing branches (load clamps a pack past
+    // the clip to the last in bounds, and a load under a runtime `if` cannot be hoisted past it).
     float ss[1][ROWS];
-    partial_dot<THREADS>(input, input, ss[0], size_n, offs_n);
+#pragma unroll
+    for (int m = 0; m < ROWS; ++m) {
+      ss[0][m] = 0.0f;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        float ss_k = 0.0f;
+#pragma unroll
+        for (int j = 0; j < P; ++j) ss_k = fmaf(input[m][k][j], input[m][k][j], ss_k);
+        const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+        ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
+      }
+    }
     block_reduce<Sum, ReduceAxis::all, 1, THREADS>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }
   if constexpr (PART != NormPart::scale) {
-    float normed_f[ROWS][K][P];
-    mul(input, scale, normed_f);
-    if constexpr (ROUND_SCALED) round<W>(normed_f);
-    float weight_f[1][K][P];
-    convert(weight, weight_f);
-    mul(normed_f, weight_f, normed_f);
+    // Each rounding the reference does a pass of its own over the tile (one fused pass's
+    // conversions were not paired: +100 instructions in AttnRes, ISA I4).
+    float normed[ROWS][K][P];
+#pragma unroll
+    for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) normed[m][k][j] = input[m][k][j] * scale[m];
     if constexpr (ROUND_SCALED) {
-      W normed_w[ROWS][K][P];
-      convert(normed_f, normed_w);
-      convert(normed_w, output);
-    } else {
-      convert(normed_f, output);
+#pragma unroll
+      for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j)
+            normed[m][k][j] = static_cast<float>(static_cast<W>(normed[m][k][j]));
     }
+#pragma unroll
+    for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) normed[m][k][j] *= static_cast<float>(weight[0][k][j]);
+#pragma unroll
+    for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j)
+          output[m][k][j] = ROUND_SCALED ? static_cast<T>(static_cast<W>(normed[m][k][j]))
+                                         : static_cast<T>(normed[m][k][j]);
   }
 }
 

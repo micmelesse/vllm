@@ -97,7 +97,7 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // written at that place (rows at its own row stride: the prefix, its output,
 // the output, `blocks` [m, sources, n] at its row and source strides in
 // elements, its columns contiguous, the host checks), so every tensor sharing
-// the columns shares one clamped column (one offset register, at_col's).
+// the columns shares one clamped column (one offset register, load's).
 // `block_output_ptr` is the one block written, null when none is. An input is
 // only read and an output only written (STANDARDS): the old prefix is read from
 // `prefix_ptr`, the new one written to `prefix_output_ptr`, never the same
@@ -124,13 +124,21 @@ DINLINE void block_attn_res_tile(
   if constexpr (HAS_PREFIX) {
     DTYPE old_prefix[ROWS][K][P];
     load<1, THREADS>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n);
-    float old_f[ROWS][K][P], sum_f[ROWS][K][P], new_f[ROWS][K][P];
-    convert(old_prefix, old_f);
-    convert(sum, sum_f);
-    add(old_f, sum_f, new_f);
-    convert(new_f, new_prefix);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j)
+          new_prefix[i][k][j] = static_cast<DTYPE>(static_cast<float>(old_prefix[i][k][j]) +
+                                                   static_cast<float>(sum[i][k][j]));
   } else {
-    convert(sum, new_prefix);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
   }
   store<1, THREADS, THREADS>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
   if (block_output_ptr != nullptr)
@@ -139,16 +147,23 @@ DINLINE void block_attn_res_tile(
   // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
   float acc[ROWS][K][P];
-  convert(new_prefix, acc);
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) acc[i][k][j] = static_cast<float>(new_prefix[i][k][j]);
   if (num_blocks != 0) {
     // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
     load<1, THREADS>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n);
     load<1, THREADS>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n);
-    float norm_weight_f[1][K][P], qk_weight_f[1][K][P], w[1][K][P];
-    convert(norm_weight, norm_weight_f);
-    convert(qk_weight, qk_weight_f);
-    mul(norm_weight_f, qk_weight_f, w);
+    float w[1][K][P];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j)
+        w[0][k][j] = static_cast<float>(norm_weight[0][k][j]) * static_cast<float>(qk_weight[0][k][j]);
     // THE SUM STARTS AT ZERO, here: registers start unset (a zeroed default
     // was 32 moves a source in the loop, ISA 2026-10-04T02-22-41Z).
     zeros(acc);
@@ -177,9 +192,35 @@ DINLINE void block_attn_res_tile(
         const bool block = !decltype(last)::value || src < num_blocks;
         const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
         load<1, THREADS>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n);
+        // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
+        // mask: packs past input_size_n count zero, multiplied in so nothing branches).
         float ss[ROWS], dw[ROWS];
-        partial_dot<THREADS>(v[s], v[s], ss, input_size_n, offs_n);
-        partial_dot<THREADS>(v[s], w, dw, input_size_n, offs_n);
+#pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+          ss[m] = 0.0f;
+#pragma unroll
+          for (int k = 0; k < K; ++k) {
+            float ss_k = 0.0f;
+#pragma unroll
+            for (int j = 0; j < P; ++j)
+              ss_k = fmaf(static_cast<float>(v[s][m][k][j]), static_cast<float>(v[s][m][k][j]), ss_k);
+            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+            ss[m] += (n < input_size_n / P ? 1.0f : 0.0f) * ss_k;
+          }
+        }
+#pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+          dw[m] = 0.0f;
+#pragma unroll
+          for (int k = 0; k < K; ++k) {
+            float dw_k = 0.0f;
+#pragma unroll
+            for (int j = 0; j < P; ++j)
+              dw_k = fmaf(static_cast<float>(v[s][m][k][j]), w[0][k][j], dw_k);
+            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+            dw[m] += (n < input_size_n / P ? 1.0f : 0.0f) * dw_k;
+          }
+        }
 #pragma unroll
         for (int m = 0; m < ROWS; ++m) {
           sums[0][(m * TILE_K + s) * 2] = ss[m];
@@ -218,7 +259,12 @@ DINLINE void block_attn_res_tile(
     float inv_den[ROWS];
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) inv_den[m] = 1.0f / softmax_denominator[m];
-    mul(acc, inv_den, acc);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) acc[i][k][j] *= inv_den[i];
   }
 
   // The output, normed when out_norm_w is given: its weight in flight under the
@@ -231,7 +277,12 @@ DINLINE void block_attn_res_tile(
     rms_norm<THREADS, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
                                             inv_hidden, input_size_n, offs_n);
   } else {
-    convert(acc, result);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
   }
   store<1, THREADS, THREADS>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
 }
@@ -298,10 +349,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
     load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
-    float sum_f[1][K][P];
-    peers_sum(peers, sum_f);
+    // Summed in rank order in fp32, so every rank's sum agrees bitwise, rounded to DTYPE once.
     DTYPE sum[1][K][P];
-    convert(sum_f, sum);
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) {
+        float acc = static_cast<float>(peers[0][0][k][j]);
+#pragma unroll
+        for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
+        sum[0][k][j] = static_cast<DTYPE>(acc);
+      }
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
