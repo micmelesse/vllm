@@ -8,9 +8,10 @@
 // exports its arena's base (hipIpcGetMemHandle), the handles go round over the
 // caller's CPU group (`Gather`), and each rank opens every peer's
 // (hipIpcOpenMemHandle). A peer's arena is at whatever address its opening
-// gave, so a kernel takes every rank's base from a DEVICE ARRAY written once at
-// open, `arena_ptr_array` with `arena_ptr_array_size` (the world), and each
-// region as its offset in the arena. AN
+// gave, so a kernel takes each region as its own DEVICE ARRAY of every rank's
+// address of it, written once at open (`signals_ptr_array`, `staging_ptr_array`,
+// `partials_ptr_array`, each with its size, the world); the arena stays the
+// host's, for the regions' lifetimes and IPC. AN
 // EXACT CALL'S INPUT is read by its peers IN PLACE (aiter's gfx950 pattern),
 // through an INPUT TABLE in device memory (INPUT TABLES, below): a captured
 // call's table points at every rank's own tensor, registered when the capture
@@ -134,8 +135,8 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
 //
-// Rank r's region is at its arena's base (arena_ptr_array[r], wherever its
-// IPC opening put it) plus the region's offset. INT4 IS AN ENCODING, NOT A
+// Rank r's region is at its arena's base (wherever its IPC opening put it)
+// plus the region's offset, written into the region's device array at open. INT4 IS AN ENCODING, NOT A
 // REGION: each region is sized for the largest encoding it may hold
 // (select.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
 // values plus scales at the largest problem), and the encoding lays out the
@@ -666,14 +667,6 @@ class Handle {
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
 
-  // EVERY RANK'S ARENA, as the kernels take it: a device array of every
-  // rank's base where this process reaches it (`arena_ptr_array`, this rank's
-  // device memory, written once at open, fixed for the handle's life) and its
-  // size, the world.
-  char* const* arena_ptr_array() const {
-    return region_ptr_arrays_ + kArenaArray * kMaxRanks;
-  }
-  int arena_ptr_array_size() const { return world_size_; }
   // EVERY RANK'S SIGNALS, a device array of every rank's signals region with
   // its size, the world (written at open, with the others in
   // `region_ptr_arrays_`).
@@ -695,10 +688,6 @@ class Handle {
     return region_ptr_arrays_ + kPartialsArray * kMaxRanks;
   }
   int partials_ptr_array_size() const { return world_size_; }
-  // EACH REGION'S OFFSET in every rank's arena, in bytes (`arena_layout`):
-  // rank r's region is at arena_ptr_array()[r] + its offset.
-  int64_t inputs_offset() const { return layout_.inputs; }
-  int64_t partials_offset() const { return layout_.partials; }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
   // kMaxRanks] (parity, block, writer) at signals_ptr_array()[r]: the
@@ -998,15 +987,14 @@ class Handle {
     // entries each (null past the world), all in one allocation, written once,
     // here: the kernels take each region's as its own array with its size, the
     // world (`signals_ptr_array`, ...), and never an arena base or an offset.
-    // No kernel takes the arena's own array (`arena_ptr_array`): it is the
-    // host's, for the regions' lifetimes.
+    // The arena's own bases never reach the device: they are the host's, for
+    // the regions' lifetimes and IPC.
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&region_ptr_arrays_),
                         kRegionPtrArrays * kMaxRanks * sizeof(char*)));
     {
       std::vector<char*> at(kRegionPtrArrays * kMaxRanks, nullptr);
       for (int r = 0; r < world_size_; ++r) {
         char* const base = arena_->base(r);
-        at[kArenaArray * kMaxRanks + r] = base;
         at[kSignalsArray * kMaxRanks + r] = base + layout_.signals;
         at[kStagingArray * kMaxRanks + r] = base + layout_.inputs;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
@@ -1039,8 +1027,6 @@ class Handle {
     // own argument, a buffer of kStatusFields words.
     status_ = log.status_host();
     device_status_ = log.status_device();
-    // EACH RANK'S ARENA has the one layout (`arena_layout`), so each region is
-    // its offset from every rank's base (arena_ptr_array(), inputs_offset(), ...).
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -1266,10 +1252,9 @@ class Handle {
   // allocation opened for one, by its IPC handle's bytes.
   void** tables_ = nullptr;
   // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
-  // allocation: the arena's bases (interim), the signals, the inputs, the
-  // partials.
-  static constexpr int kArenaArray = 0, kSignalsArray = 1, kStagingArray = 2,
-                       kPartialsArray = 3, kRegionPtrArrays = 4;
+  // allocation: the signals, the inputs, the partials.
+  static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2,
+                       kRegionPtrArrays = 3;
   char** region_ptr_arrays_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;

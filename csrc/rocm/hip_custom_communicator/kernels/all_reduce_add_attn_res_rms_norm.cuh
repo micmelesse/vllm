@@ -553,10 +553,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    peer's next kernel starts only once this one has finished).
   //    int4: its INT4 payload, the scales at the offset the partials' own
   //    sizes give.
-  const DTYPE* own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  const uint8_t* own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  const __fp16* own_partials_scales = peer_ptr<__fp16>(
-      partials_ptr_array, partials_ptr_array_size, rank,
+  const DTYPE* own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
+  const uint8_t* own_partials_values = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank);
+  const __fp16* own_partials_scales = reinterpret_cast<const __fp16*>(
+      ptr_array_at(partials_ptr_array, partials_ptr_array_size, rank) +
       int4_scales_offset(partials_size_m, partials_size_n));
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];

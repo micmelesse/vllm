@@ -218,7 +218,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int band_rows = staging_size_m / WORLD;  // a slot's rows
   const int64_t slot = int64_t{band_rows} * staging_stride_m;  // a slot's elements
   // This rank's own inbox (its slot in every inbox is slot [rank]).
-  const DTYPE* const inbox = peer_ptr<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank, 0);
+  const DTYPE* const inbox = ptr_array_at<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank);
 
   for (int r0 = 0; r0 < input_size_m; r0 += band_rows) {
     const int band =

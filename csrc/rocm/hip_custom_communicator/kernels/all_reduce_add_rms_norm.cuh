@@ -283,10 +283,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
   const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
   const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
-  DTYPE* const own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  uint8_t* const own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  __fp16* const own_partials_scales = peer_ptr<__fp16>(
-      partials_ptr_array, partials_ptr_array_size, rank, int4_scales_offset(partials_size_m, partials_size_n));
+  DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
+  uint8_t* const own_partials_values = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank);
+  __fp16* const own_partials_scales = reinterpret_cast<__fp16*>(
+      ptr_array_at(partials_ptr_array, partials_ptr_array_size, rank) +
+      int4_scales_offset(partials_size_m, partials_size_n));
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -662,10 +663,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
   const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
   const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
-  const DTYPE* const own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  const uint8_t* const own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
-  const __fp16* const own_partials_scales = peer_ptr<__fp16>(
-      partials_ptr_array, partials_ptr_array_size, rank, int4_scales_offset(partials_size_m, partials_size_n));
+  const DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
+  const uint8_t* const own_partials_values = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank);
+  const __fp16* const own_partials_scales = reinterpret_cast<const __fp16*>(
+      ptr_array_at(partials_ptr_array, partials_ptr_array_size, rank) +
+      int4_scales_offset(partials_size_m, partials_size_n));
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
