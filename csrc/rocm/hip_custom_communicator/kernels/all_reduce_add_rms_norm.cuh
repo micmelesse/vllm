@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include "all_gather.cuh"
 #include "common.cuh"
 #include "reduce_scatter.cuh"
 #include "rms_norm.cuh"
@@ -404,33 +403,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // first barrier, held, ran the int4 8192-column build out of SGPRs:
   // 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
-    float sc[WORLD];
-    if constexpr (ADD_RESIDUAL) {
-      // Every owner's scale for row l, scale_at elements into its partials, all in flight before
-      // the rows' loads (issued: no load or instruction crosses the barrier below).
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= partials_ptr_array_size) __builtin_trap();
-        sc[r] = *(const __attribute__((address_space(1))) float*)(
-            reinterpret_cast<const float*>(partials_ptr_array[r] +
-                                           scale_at * int64_t{sizeof(DTYPE)}) +
-            l);
-      }
-      asm volatile("" ::: "memory");
-      __builtin_amdgcn_sched_barrier(0);
-    }
+    // Every owner's scale for row l, all in flight before the rows' loads (load issues them): the
+    // scales are a float buffer [slice_m] in each owner's partials, scale_at elements in, read as
+    // the partials' slot 1 (slot stride: that offset in floats), a row of one float, every thread
+    // the same one.
+    float sc[WORLD][1][1][1];
+    if constexpr (ADD_RESIDUAL)
+      load<1, THREADS_PER_BLOCK, Ranks::every>(
+          partials_ptr_array, partials_ptr_array_size, 0, 1,
+          scale_at * int64_t{sizeof(DTYPE)} / int64_t{sizeof(float)}, 1, 1, 2, slice_m, 1,
+          slice_m, 1, sc, l, 0);
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
-      // THE GATHER: owner r's row l, all_gather's rows walk over the one-entry array of owner r's
-      // partials (a world of one, owning every column), every owner's issued before any is used.
-      // ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
+      // THE GATHER: row l of every owner's partials (owner r's is row r * slice_m + l), one load
+      // of every rank's; ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
       DTYPE got[WORLD][1][1][P];
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r) {
-        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= partials_ptr_array_size) __builtin_trap();
-        all_gather<1, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, true, DTYPE>(
-            partials_ptr_array + r, 1, partials_stride_m, partials_stride_n, partials_size_m,
-            partials_size_n, got[r], 0, 0, slice_m, input_size_n, l, c, input_size_n, 0);
-      }
+      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
+          partials_ptr_array, partials_ptr_array_size, 0, 0, 0, partials_stride_m, partials_stride_n, 1,
+          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c);
       WEIGHT_DTYPE w_step[1][1][P];
       if constexpr (ADD_RESIDUAL)
         load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c);
@@ -443,7 +432,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
           float got_f[1][1][P];
 #pragma unroll
           for (int j = 0; j < P; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
-          float scale[1] = {sc[r]};
+          float scale[1] = {sc[r][0][0][0]};
           DTYPE normed[1][1][P];
           rms_norm<THREADS_PER_BLOCK, NormPart::apply, true>(got_f, scale, w_step, normed, eps,
                                                              inv_hidden, input_size_n, c);
