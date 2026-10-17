@@ -10,11 +10,14 @@
 // (hipIpcOpenMemHandle). A peer's arena is at whatever address its opening
 // gave, so a kernel takes every rank's base BY VALUE in its arguments
 // (common.cuh's PeerBases) and each region as its offset in the arena. THE
-// CALLER'S INPUT is never read by a peer where it is: every kernel copies this
-// rank's input into this rank's inputs itself (INT4: quantized into the
-// inputs' INT4 values), before its first barrier, which is ordered; the peers
-// then read the inputs in this rank's arena. One path, eager and captured
-// alike: no host copy, no pointer table, nothing registered. The collective
+// PLAIN ALL-REDUCE'S INPUT is read by its peers IN PLACE (aiter's gfx950
+// pattern), through an INPUT TABLE in device memory (INPUT TABLES, below): a
+// captured call's table points at every rank's own tensor, registered when the
+// capture exits (`register_captured`, one batched exchange over the CPU
+// group); an eager call's input is copied by the host into this rank's inputs
+// region on the launch's stream and its table, fixed at open, points at every
+// rank's inputs region. The fused kernels copy their input into the inputs
+// themselves (INT4: quantized), before their first barrier. The collective
 // that exchanges the handles is the caller's (`Gather`), so this names no
 // process group.
 
@@ -121,8 +124,11 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //                                         flags (torch SymmetricMemory's
 //                                         "signal pad")
 //   inputs     signals end                what this rank publishes of its
-//                                         input: one-shot peers read all of it,
-//                                         two-shot peers their slice
+//                                         input: an eager plain all-reduce's
+//                                         host copy (read through the eager
+//                                         input table), a fused kernel's own
+//                                         copy, the INT4 payload, or the
+//                                         pushed variant's inbox
 //   partials   inputs end                 what this rank publishes of its
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
@@ -152,9 +158,12 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // the one that orders it. So the previous call's readers are done whichever
 // encoding either call used.
 // Every fused kernel copies its input into its inputs (or, INT4, their
-// payload), and the plain all-reduce pushes it into its peers' inputs (each
+// payload), and the pushed all-reduce pushes it into its peers' inputs (each
 // rank's inbox, a slot a writer), before its first barrier, which is ordered,
-// every rank's at its base and the region's offset: no table in memory.
+// every rank's at its base and the region's offset. The in-place all-reduce's
+// eager copy is the host's, before its launch; its peers read it through the
+// eager input table only after its first barrier, and its launch ends only
+// after every peer's last read (INPUT TABLES).
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
@@ -428,6 +437,40 @@ inline OtherProcesses other_processes_on(int device) {
   return out;
 }
 
+// INPUT TABLES: the plain all-reduce's view of every rank's input, a TABLE of
+// kMaxRanks addresses (rank r's input at [r], null past the world) in this
+// rank's device memory, the one pointer its kernel takes (aiter's RankData*).
+// The tables live in one SLAB (hipMalloc: read by this rank's kernels only),
+// kInputTableSlots of them:
+//   - slot 0, THE EAGER TABLE, written at open: every rank's inputs region
+//     (its arena base, as this process opened it, plus the region's offset).
+//     An eager call copies its input there first (hipMemcpy2DAsync on the
+//     launch's stream, dense rows), so its kernel, stream-ordered after the
+//     copy, finds every rank's at the table, each rank having copied its own.
+//   - every later slot, A CAPTURED LAUNCH'S: reserved at capture (the launch
+//     records the slot's address, fixed for the graph's life) with the input's
+//     address remembered; filled when the capture exits, before any replay,
+//     by `register_captured`: one batched exchange of every recorded input's
+//     IPC handle and offset over the CPU group, each peer's allocation opened
+//     once (cached by its handle: the caching allocator hands every graph the
+//     same few segments) and the slots written.
+// A slot is never reused: a graph's addresses die with it, and the count each
+// rank records must match for the exchange (a collective) to pair them.
+// THE ORDER THAT LETS AN INPUT BE OVERWRITTEN: every peer's last read of this
+// rank's input precedes a barrier this rank's launch waits on before it ends
+// (the one-shot's `read`, the two-shot's second), so the next eager copy, or
+// the caller's next write, comes after every read.
+constexpr int64_t kInputTableSlots = 16384;
+
+// A LAUNCH'S INPUT TABLE: the table's address and the strides every rank's
+// input has there (the caller's for a captured call; dense rows, its copy's,
+// for an eager one).
+struct InputTable {
+  const void* table;
+  int64_t stride_m;
+  int64_t stride_n;
+};
+
 class Handle {
  public:
   // OPENED on every rank together: this rank's arena allocated (the signals,
@@ -485,10 +528,12 @@ class Handle {
     std::lock_guard<std::mutex> g(teardown_);
     if (!arena_ || arena_->released()) return;
     (void)hipDeviceSynchronize();
-    const Arena::Released peers = arena_->release_peers();
+    Arena::Released peers = arena_->release_peers();
+    add(peers, release_inputs());
     log_->close_phase(ClosePhase::peers_released, false, peers.closed, 0,
                       static_cast<uint32_t>(peers.error));
-    const Arena::Released own = arena_->release_own();
+    Arena::Released own = arena_->release_own();
+    add(own, release_tables());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
   }
@@ -526,8 +571,9 @@ class Handle {
     const bool stopped = barrier();
     log_->close_phase(ClosePhase::stopped, true, 0, 0, stopped ? 0 : 1);
     if (!stopped) fail(ClosePhase::stopped);
-    // (c)
-    const Arena::Released peers = arena_->release_peers();
+    // (c) The arenas and every registered input opened from a peer.
+    Arena::Released peers = arena_->release_peers();
+    add(peers, release_inputs());
     log_->close_phase(ClosePhase::peers_released, true, peers.closed, 0,
                       static_cast<uint32_t>(peers.error));
     if (peers.error != hipSuccess) fail(ClosePhase::peers_released);
@@ -536,8 +582,9 @@ class Handle {
     const bool done = stopped && barrier();
     log_->close_phase(ClosePhase::peers_done, true, 0, 0, done ? 0 : 1);
     if (!done) fail(ClosePhase::peers_done);
-    // (e)
-    const Arena::Released own = arena_->release_own();
+    // (e) Our arena, and the slab of input tables.
+    Arena::Released own = arena_->release_own();
+    add(own, release_tables());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
     if (own.error != hipSuccess) fail(ClosePhase::released);
@@ -568,13 +615,15 @@ class Handle {
     log_->close_phase(ClosePhase::synchronized, false, finished ? 1 : 0, 0,
                       finished ? 0 : 1);
     if (!finished) failed = static_cast<int>(ClosePhase::synchronized);
-    const Arena::Released peers = arena_->release_peers();
+    Arena::Released peers = arena_->release_peers();
+    add(peers, release_inputs());
     log_->close_phase(ClosePhase::peers_released, false, peers.closed, 0,
                       static_cast<uint32_t>(peers.error));
     if (peers.error != hipSuccess && failed == 0)
       failed = static_cast<int>(ClosePhase::peers_released);
     if (finished) {
-      const Arena::Released own = arena_->release_own();
+      Arena::Released own = arena_->release_own();
+      add(own, release_tables());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
       if (own.error != hipSuccess && failed == 0)
@@ -701,6 +750,108 @@ class Handle {
     return launch;
   }
 
+  // THE INPUT TABLE FOR A LAUNCH over `input` ([m, n] of `elem_bytes`
+  // elements, rows `stride_m` apart, dense within) on `stream` (INPUT TABLES):
+  // capturing, a fresh slot, filled at capture exit (`register_captured`);
+  // eager, the input copied into this rank's inputs region on the stream
+  // (logged: copy_in_issued) and the eager table. Select refuses an eager call
+  // the inputs region does not hold, so the throw is never a call's answer.
+  InputTable input_table(const void* input, int64_t stride_m, int64_t m,
+                         int64_t n, int64_t elem_bytes, hipStream_t stream) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+    if (capture == hipStreamCaptureStatusActive) {
+      // A FRESH SLOT ALWAYS, even for an address seen before: a graph's
+      // buffers die with it and the allocator hands the address back, and the
+      // exchange at capture exit pairs the ranks' records by count.
+      if (next_slot_ >= kInputTableSlots)
+        throw std::runtime_error(
+            "hip_custom_communicator: the input-table slab is full (" +
+            std::to_string(kInputTableSlots) + " captured launches)");
+      void** slot = tables_ + next_slot_ * kMaxRanks;
+      ++next_slot_;
+      pending_.push_back(input);
+      pending_slots_.push_back(slot);
+      return {slot, stride_m, 1};
+    }
+    const int64_t row = n * elem_bytes;
+    if (m * row > inputs_bytes_)
+      throw std::runtime_error(
+          "hip_custom_communicator: an eager " + std::to_string(m * row) +
+          "-byte input exceeds the " + std::to_string(inputs_bytes_) +
+          "-byte inputs region");
+    HIP_CHECK(hipMemcpy2DAsync(arena_->base(rank_) + layout_.inputs,
+                               static_cast<size_t>(row), input,
+                               static_cast<size_t>(stride_m * elem_bytes),
+                               static_cast<size_t>(row),
+                               static_cast<size_t>(m), hipMemcpyDeviceToDevice,
+                               stream));
+    if (log_->everything()) {
+      const auto bytes = static_cast<uint64_t>(m * row);
+      log_->write({static_cast<uint8_t>(LogKind::copy_in_issued), 0,
+                   stream_index(stream), log_->launches(), 0, 0,
+                   static_cast<uint32_t>(bytes),
+                   static_cast<uint32_t>(bytes >> 32), 0, host_ns()});
+    }
+    return {tables_, n, 1};
+  }
+
+  // THE INPUTS A CAPTURE RECORDED, registered, every rank together (a
+  // collective over `gather`, even with none recorded, or the other ranks wait
+  // in it): the ranks' counts compared, then one exchange of every recorded
+  // input's IPC handle and offset, each peer's allocation opened (once: cached
+  // by its handle) and every slot written. Sound because a captured address is
+  // fixed for the graph's life and the slots are filled before any replay.
+  // False, nothing registered, when the ranks recorded different counts (every
+  // rank must capture the same launches). Logged: registration, begun and done.
+  bool register_captured(const Gather& gather) {
+    const auto count = static_cast<int64_t>(pending_.size());
+    if (log_->everything())
+      log_->write({static_cast<uint8_t>(LogKind::registration), 0, 0,
+                   log_->launches(), 0, 0, static_cast<uint32_t>(count), 0, 0,
+                   host_ns()});
+    for (const std::string& c : gather(std::string(
+             reinterpret_cast<const char*>(&count), sizeof(count)))) {
+      int64_t theirs = -1;
+      if (c.size() == sizeof(theirs)) std::memcpy(&theirs, c.data(), sizeof(theirs));
+      if (theirs != count) {
+        log_->write({static_cast<uint8_t>(LogKind::registration), 2, 0,
+                     log_->launches(), 0, 0, static_cast<uint32_t>(count),
+                     static_cast<uint32_t>(theirs), 1, host_ns()});
+        pending_.clear();
+        pending_slots_.clear();
+        return false;
+      }
+    }
+    const size_t opened_before = opened_.size();
+    if (count > 0) {
+      std::string mine;
+      for (const void* p : pending_) mine += ipc_bytes(p);
+      const size_t each = mine.size() / pending_.size();
+      const std::vector<std::string> all = gather(mine);
+      std::vector<void*> host(kMaxRanks, nullptr);
+      for (size_t i = 0; i < pending_.size(); ++i) {
+        for (int r = 0; r < world_size_; ++r)
+          host[r] = r == rank_ ? const_cast<void*>(pending_[i])
+                               : open_input(all[r].substr(i * each, each));
+        HIP_CHECK(hipMemcpy(pending_slots_[i], host.data(),
+                            kMaxRanks * sizeof(void*), hipMemcpyHostToDevice));
+      }
+    }
+    if (log_->everything())
+      log_->write({static_cast<uint8_t>(LogKind::registration), 1, 0,
+                   log_->launches(), 0, 0, static_cast<uint32_t>(count),
+                   static_cast<uint32_t>(opened_.size() - opened_before), 0,
+                   host_ns()});
+    pending_.clear();
+    pending_slots_.clear();
+    return true;
+  }
+  // How many captured launches await registration, and how many slots are
+  // taken (the eager table's included).
+  int64_t pending_inputs() const { return static_cast<int64_t>(pending_.size()); }
+  int64_t table_slots_used() const { return next_slot_; }
+
   // Every wait on this rank leaves at its next check: for a communicator the
   // host has given up on.
   // The log's words, not `status_`: an open that failed is abandoned before
@@ -812,6 +963,24 @@ class Handle {
     if (!arena_->verify(log, peer_devices))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
            "the peers' arenas");
+    // THE INPUT TABLES' SLAB (INPUT TABLES), zeroed, and its slot 0, the
+    // eager table: every rank's inputs region.
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&tables_),
+                        static_cast<size_t>(kInputTableSlots) * kMaxRanks *
+                            sizeof(void*)));
+    HIP_CHECK(hipMemset(tables_, 0,
+                        static_cast<size_t>(kInputTableSlots) * kMaxRanks *
+                            sizeof(void*)));
+    {
+      std::vector<void*> eager(kMaxRanks, nullptr);
+      for (int r = 0; r < world_size_; ++r)
+        eager[r] = arena_->base(r) + layout_.inputs;
+      HIP_CHECK(hipMemcpy(tables_, eager.data(), kMaxRanks * sizeof(void*),
+                          hipMemcpyHostToDevice));
+      next_slot_ = 1;
+    }
+    log.phase(OpenPhase::tables_written,
+              static_cast<uint32_t>(kInputTableSlots));
     // THE STATUS, host-mapped and coherent: the log's first words
     // (log.cuh). A wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort`
@@ -830,6 +999,80 @@ class Handle {
     log.set_timeout(timeout_ticks_, khz);
     log.phase(OpenPhase::checked);
     log.phase(OpenPhase::open_done);
+  }
+
+  // AN INPUT AS THE GATHER CARRIES IT: its allocation's IPC handle, then its
+  // offset in that allocation (hipIpcGetMemHandle takes an allocation's BASE,
+  // and a torch tensor sits at an offset inside one).
+  static std::string ipc_bytes(const void* ptr) {
+    void* base = nullptr;
+    HIP_CHECK(hipPointerGetAttribute(
+        &base, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+        reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(ptr))));
+    hipIpcMemHandle_t h;
+    HIP_CHECK(hipIpcGetMemHandle(&h, base));
+    const int64_t offset =
+        static_cast<const char*>(ptr) - static_cast<char*>(base);
+    return std::string(reinterpret_cast<const char*>(&h), sizeof(h)) +
+           std::string(reinterpret_cast<const char*>(&offset), sizeof(offset));
+  }
+
+  // A PEER'S INPUT (its `ipc_bytes`) as this process reaches it: its
+  // allocation opened once (cached by its handle, as vLLM's CustomAllreduce
+  // does), plus the offset. BORROWED: closed by `release_inputs`.
+  void* open_input(const std::string& bytes) {
+    constexpr size_t kIpc = sizeof(hipIpcMemHandle_t);
+    if (bytes.size() != kIpc + sizeof(int64_t))
+      throw std::runtime_error(
+          "hip_custom_communicator: a gathered input is an IPC handle and an "
+          "offset");
+    const std::string handle = bytes.substr(0, kIpc);
+    int64_t offset = 0;
+    std::memcpy(&offset, bytes.data() + kIpc, sizeof(offset));
+    auto it = opened_.find(handle);
+    if (it == opened_.end()) {
+      hipIpcMemHandle_t h;
+      std::memcpy(&h, handle.data(), kIpc);
+      void* base = nullptr;
+      HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
+      it = opened_.emplace(handle, static_cast<char*>(base)).first;
+    }
+    return it->second + offset;
+  }
+
+  // EVERY PEER INPUT OPENED AT REGISTRATION closed (borrowed, as a peer's
+  // arena is): with the peers' arenas, in teardown's first half. Idempotent.
+  Arena::Released release_inputs() {
+    Arena::Released out;
+    for (auto& kv : opened_) {
+      const hipError_t e = hipIpcCloseMemHandle(kv.second);
+      if (e != hipSuccess) {
+        (void)hipGetLastError();
+        if (out.error == hipSuccess) out.error = e;
+      }
+      ++out.closed;
+    }
+    opened_.clear();
+    return out;
+  }
+  // THE SLAB OF INPUT TABLES freed (ours, local): with our arena, in
+  // teardown's second half. Idempotent.
+  Arena::Released release_tables() {
+    Arena::Released out;
+    if (tables_ != nullptr) {
+      const hipError_t e = hipFree(tables_);
+      if (e != hipSuccess) {
+        (void)hipGetLastError();
+        out.error = e;
+      }
+      tables_ = nullptr;
+    }
+    return out;
+  }
+  static void add(Arena::Released& into, const Arena::Released& more) {
+    into.closed += more.closed;
+    into.freed += more.freed;
+    if (into.error == hipSuccess) into.error = more.error;
   }
 
   // WHAT THE RANKS SAID ABOUT THEMSELVES, compared: two ranks on one GPU, a
@@ -953,6 +1196,14 @@ class Handle {
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
   mutable std::unordered_map<const void*, Resources> resources_;
+  // THE INPUT TABLES (INPUT TABLES): the slab, the next free slot, the
+  // captured launches awaiting registration (input, slot), and every peer
+  // allocation opened for one, by its IPC handle's bytes.
+  void** tables_ = nullptr;
+  int64_t next_slot_ = 0;
+  std::vector<const void*> pending_;
+  std::vector<void**> pending_slots_;
+  std::unordered_map<std::string, char*> opened_;
 };
 
 // =================================================================================================
@@ -984,7 +1235,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   hipFuncAttributes attrs;
   const hipError_t found = hipFuncGetAttributes(
       &attrs, reinterpret_cast<const void*>(
-                  all_reduce_pull_one_shot_pushed<
+                  all_reduce_pull_one_shot<
                       c10::BFloat16, 2, 1, kWaveSize * traits<c10::BFloat16>::N,
                       kWaveSize, 1>));
   (void)hipGetLastError();

@@ -173,6 +173,8 @@ enum class Template : int {
   all_reduce_push_two_shot_rms_norm = 8,
   all_reduce_push_two_shot_add_rms_norm = 9,
   all_reduce_push_two_shot_add_attn_res_rms_norm = 10,
+  all_reduce_push_one_shot = 11,
+  all_reduce_push_two_shot = 12,
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's
@@ -304,10 +306,12 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // (common.cuh). THE INPUT IS THIS RANK'S POINTER only: a fused kernel copies
 // it into this rank's inputs (INT4: quantized into the INT4 payload the kernel
 // finds inside the inputs, common.cuh's `int4_payload`) before its first
-// barrier, and the peers read the inputs there; the plain all-reduce pushes it
-// into the peers' inputs (their inboxes) and sums its own. No kernel takes a pointer
-// table in device memory, nor an INT4 payload's offsets: they are the
-// region's.
+// barrier, and the peers read the inputs there; the plain all-reduce's pushed
+// variant pushes it into the peers' inputs (their inboxes) and sums its own.
+// THE PLAIN ALL-REDUCE'S DEFAULT, the in-place pull, takes no input pointer:
+// its INPUT TABLE, one pointer to kMaxRanks addresses in device memory
+// (handle.cuh's INPUT TABLES), the one table a kernel takes. No kernel takes an
+// INT4 payload's offsets: they are the region's.
 // =================================================================================================
 
 // The kernels' signatures, written out by hand (one alias a signature; the
@@ -326,6 +330,34 @@ using AllReduceTwoShotKernel = void (*)(
     int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
+    int64_t /*signals_offset*/,
+    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+    int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+    int /*signals_size_block*/, int /*signals_size_writer*/,
+    void* /*status_ptr*/, int64_t /*status_stride_field*/,
+    int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
+// THE IN-PLACE PULL: every rank's input through the input table (one pointer,
+// device memory, kMaxRanks addresses: handle.cuh's INPUT TABLES) at the
+// table's strides; no input pointer of its own, no inputs region.
+using AllReduceOneShotInPlaceKernel = void (*)(
+    const void* /*inputs_table*/, int64_t /*inputs_stride_m*/,
+    int64_t /*inputs_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    void* /*output_ptr*/, int64_t /*output_stride_m*/,
+    int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
+    PeerBases /*bases*/, int64_t /*signals_offset*/,
+    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+    int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
+    int /*signals_size_block*/, int /*signals_size_writer*/,
+    void* /*status_ptr*/, int64_t /*status_stride_field*/,
+    int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
+using AllReduceTwoShotInPlaceKernel = void (*)(
+    const void* /*inputs_table*/, int64_t /*inputs_stride_m*/,
+    int64_t /*inputs_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    void* /*output_ptr*/, int64_t /*output_stride_m*/,
+    int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/,
+    int64_t /*partials_stride_m*/, int64_t /*partials_stride_n*/,
+    int /*partials_size_m*/, int /*partials_size_n*/,
     int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,

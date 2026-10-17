@@ -27,7 +27,12 @@
 // plain all-reduce PUSHES it, each rank storing its input (or each rank's share of it) into the
 // peers' inputs, each rank's INBOX, at its own slot (`peers_store`, `push_shares`), and sums its
 // own inbox locally (`slots_load`, `reduce_slots`). Either way the first barrier is ordered and
-// every read of another rank's input after it is of our regions. NO KERNEL TAKES A POINTER TABLE.
+// every read of another rank's input after it is of our regions. THE PULL ALL-REDUCE IS THE ONE
+// KERNEL THAT TAKES A POINTER TABLE, its INPUT TABLE: `const T* const* inputs_table`, kMaxRanks
+// addresses in device memory (aiter's RankData*), rank r's input at inputs_table[r] at the
+// table's strides. The kernel reads every rank's input where the table says, in place, and never
+// knows whether it points at callers' tensors (a captured call's, registered at capture exit) or
+// at every rank's inputs region (an eager call's, the host's copy): handle.cuh's INPUT TABLES.
 // A thread's registers are a plain array the caller declares,
 // `T v[ROWS][K][P]`, an input or an output like a buffer: P a pack's elements
 // (16 bytes of the kernel's dtype; an fp32 array holds the same P), thread t
@@ -2911,6 +2916,22 @@ DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
                                          row_step);
 }
 
+// Every rank's input through the INPUT TABLE (rank r's at inputs_table[r], at the table's
+// strides), in rank order, all in flight together: the in-place pull's one-shot.
+template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
+          int P>
+DINLINE void peers_load(const T* const* inputs_table, int64_t input_stride_m,
+                        int64_t input_stride_n, int input_size_m, int input_size_n,
+                        T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
+                        int row_step = 1) {
+  const T* input[WORLD];
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) input[r] = impl::rank_of(inputs_table, r);
+  impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
+                                         input_size_n, output, offs_m, offs_n,
+                                         row_step);
+}
+
 // THE PUSH, peers_load's other way: these registers stored at the same place of every rank's
 // region `output_offset` into its arena (one of ours: a pushed collective's inbox, at the writer's
 // slot), every rank's store issued together. Visible to each rank's same block after the next
@@ -3222,6 +3243,22 @@ DINLINE void reduce_slots(const PeerBases& bases, int64_t inbox_offset,
   impl::reduce_slots<WORLD, THREADS, TILE_N, true, Quantization::none, T>(
       [&](int w) { return inbox + w * inbox_stride_m; }, inbox_stride_m, inbox_stride_n,
       size_m, size_n, 0, bases, 0, 0, partials_offset, 0, 0, rank);
+}
+// THE IN-PLACE PULL'S REDUCE-SCATTER (the exact two-shot's): this rank's range of the band of
+// size_m rows from `first_row` of every rank's input, read through the INPUT TABLE where it is
+// (rank r's at inputs_table[r] at the table's strides), summed into this rank's partials. The
+// flat walk's body (reduce_slots'): rank r rotated as rank + r, this rank's range from its first
+// element in each rank's input.
+template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
+DINLINE void reduce_scatter(const T* const* inputs_table, int64_t input_stride_m,
+                            int64_t input_stride_n, int first_row, int size_m, int size_n,
+                            const PeerBases& bases, int64_t partials_offset, int rank) {
+  constexpr int P = traits<T>::N;
+  const int slice = impl::share_slice<WORLD, P>(int64_t{size_m} * size_n);
+  impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none, T>(
+      [&](int r) { return impl::rank_of(inputs_table, r) + first_row * input_stride_m; },
+      input_stride_m, input_stride_n, size_m, size_n, impl::share_first(slice, rank), bases,
+      0, 0, partials_offset, 0, 0, rank);
 }
 // All-gather: every rank's summed range, from its partials (int4: its values, dequantized), at its
 // place in the output.

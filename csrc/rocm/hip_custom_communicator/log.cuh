@@ -84,8 +84,10 @@ enum class LogKind : uint8_t {
                        // block: the OpType; barrier: bit 0 capturing;
                        // peer: the stream's index (stream_seen);
                        // seen, want: m, n; extra: the DType
-  copy_in_issued = 5,  // retired (the kernels copy their input into the
-                       // inputs themselves); kept so the numbers hold
+  copy_in_issued = 5,  // an eager plain all-reduce's host copy of its input
+                       // into the inputs region; launch: the one it feeds;
+                       // peer: the stream's index; seen, want: its bytes'
+                       // low and high words
   stream_seen = 6,     // peer: the stream's index; seen, want: its handle's
                        // low and high words
   kernel_seen = 7,     // kernel: its index; seen, want: its address's words
@@ -94,6 +96,12 @@ enum class LogKind : uint8_t {
                          // 0 alone (abandon: an error, a signal, exit);
                          // seen, want: the phase's numbers; extra: 0, or what
                          // it failed with (a hipError_t, or 1)
+  registration = 10,     // the captured inputs registered at capture exit
+                         // (Handle::register_captured); barrier: 0 begun,
+                         // 1 done, 2 refused (the ranks' counts differ);
+                         // seen: inputs recorded; want: peer allocations
+                         // opened (done), or a peer's count (refused);
+                         // extra: 1 refused
   // Kernel kinds, the next cycle's.
   entered = 16,
   barrier_signal = 17,
@@ -117,7 +125,8 @@ enum class OpenPhase : uint8_t {
   opened,                 // seen: peers' handles opened (hipIpcOpenMemHandle)
   mapped,          // retired (VMM's map; IPC opens in one step)
   access_set,      // retired (VMM's access; IPC's is the lazy peer flag)
-  tables_written,  // retired (no peer tables); kept so the numbers hold
+  tables_written,  // the input tables' slab allocated and its eager table
+                   // (every rank's inputs region) written; seen: its slots
   checked,  // every OpenCheck passed; seen: warnings
   open_done,
 };
@@ -128,8 +137,7 @@ constexpr OpenPhase next_open_phase(OpenPhase p) {
   auto n = static_cast<uint8_t>(static_cast<uint8_t>(p) + 1);
   while (n == static_cast<uint8_t>(OpenPhase::exchange_allocated) ||
          n == static_cast<uint8_t>(OpenPhase::mapped) ||
-         n == static_cast<uint8_t>(OpenPhase::access_set) ||
-         n == static_cast<uint8_t>(OpenPhase::tables_written))
+         n == static_cast<uint8_t>(OpenPhase::access_set))
     ++n;
   return static_cast<OpenPhase>(n);
 }

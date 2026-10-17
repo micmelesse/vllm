@@ -1,8 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE PLAIN ALL-REDUCE: its kernels, one section each (one-shot and two-shot),
-// each PUSHED: a rank reads only its own input (the caller's tensor, which no
+// THE PLAIN ALL-REDUCE: its kernels, one section each. THE DEFAULT, PULLED IN
+// PLACE (all_reduce_pull_one_shot, all_reduce_pull_two_shot;
+// aiter's gfx950 cross_device_reduce_1stage / 2stage): ONE kernel a shape
+// reads every rank's input where the INPUT TABLE says (common.cuh's INTERFACE:
+// a captured call's registered tensors, or an eager call's copies in every
+// rank's inputs region, handle.cuh's INPUT TABLES), no copy inside the kernel.
+// Its inputs are never written while it runs: the one-shot ends with a `read`
+// barrier and the two-shot's second barrier follows its every read of them, so
+// when a rank's launch ends every peer is done reading its input, and the next
+// call's host copy (stream-ordered after it) or the caller may overwrite it.
+// The INT4 two-shot (all_reduce_pull_two_shot_int4, either two-shot template's INT4 build) encodes its
+// input itself: what crosses the links is quantized by its owner, so it cannot
+// be read in place; it pushes the quantized shares (below).
+//
+// THE PUSHED VARIANT (all_reduce_push_one_shot, all_reduce_push_two_shot; a
+// caller forces it by its direction, select never picks it), each PUSHED: a rank reads only its own input (the caller's tensor, which no
 // peer reads) and stores it, or each rank's share of it, into the peers'
 // receive areas (the arena's `inputs` region, the INBOX: [writer slot, ...]),
 // a band of rows a pass; after the ordered barrier each rank sums the WORLD
@@ -27,7 +41,144 @@ namespace hip_custom_communicator {
 // =============================================================================
 // all_reduce_pull_one_shot
 //
-// One-shot all-reduce: every rank sums every rank's input over the whole
+// One-shot all-reduce, PULLED IN PLACE: sync (every rank's input ready and
+// visible), read every rank's input through the input table, sum, sync (every
+// peer done reading this rank's). aiter's `cross_device_reduce_1stage`. No band
+// loop: nothing is staged, so any size runs in one pass.
+// =============================================================================
+
+// THE BUFFER AS [m, n], every rank's at the table's strides (inputs_stride_m,
+// inputs_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
+// the tiles row-major.
+template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+    all_reduce_pull_one_shot(
+        const DTYPE* const* __restrict__ inputs_table, int64_t inputs_stride_m,
+        int64_t inputs_stride_n, int input_size_m, int input_size_n,
+        DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
+        int64_t output_stride_n, int output_size_m, int output_size_n,
+        PeerBases bases, int64_t signals_offset,
+        int64_t signals_stride_parity, int64_t signals_stride_block,
+        int64_t signals_stride_writer, int signals_size_parity,
+        int signals_size_block, int signals_size_writer,
+        uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+        int status_size_field, int rank, uint64_t timeout_ticks) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
+  constexpr int THREADS_M = TILE_M;
+  constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
+  constexpr int ROWS = TILE_M / THREADS_M;
+  constexpr int P = traits<DTYPE>::N;
+  constexpr int K = TILE_N / (P * THREADS_N);
+  const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
+  const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
+  // 1. Every rank's input is ready (written before its launch: the caller's,
+  // or the host's copy) and visible.
+  barrier<Until::visible, 0, WORLD>(
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
+  // 2. Every rank's input, in rank order, through the table, summed.
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+    DTYPE peers[WORLD][ROWS][K][P];
+    peers_load<THREADS_M, THREADS_N>(inputs_table, inputs_stride_m,
+                                     inputs_stride_n, input_size_m,
+                                     input_size_n, peers, t / tiles_n * TILE_M,
+                                     t % tiles_n * TILE_N);
+    float sum[ROWS][K][P];
+    peers_sum(peers, sum);
+    DTYPE rounded[ROWS][K][P];
+    convert(sum, rounded);
+    store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(
+        rounded, output_ptr, output_stride_m, output_stride_n, input_size_m,
+        input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+  }
+  // 3. Every peer is done reading this rank's input: the launch may end and
+  // the input be overwritten.
+  barrier<Until::read, 1, WORLD>(
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks);
+#else
+  __builtin_trap();
+#endif
+}
+
+// =============================================================================
+// all_reduce_pull_two_shot
+//
+// Two-shot all-reduce, PULLED IN PLACE (exact): a band of `partials_size_m`
+// rows a pass (what the partials hold): sync, this rank's share of the band
+// read from every rank's input through the table and summed into its
+// partials, sync, every rank's summed share pulled out of its partials. aiter's
+// `cross_device_reduce_2stage`.
+// =============================================================================
+
+// THE PROBLEM as the pushed two-shot's (the flat walk, each rank's share one
+// contiguous range of the band's elements), every rank's input at the table's
+// strides. CONTIGUOUS: the table's rows and the output's back to back.
+template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+    all_reduce_pull_two_shot(
+        const DTYPE* const* __restrict__ inputs_table, int64_t inputs_stride_m,
+        int64_t inputs_stride_n, int input_size_m, int input_size_n,
+        DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
+        int64_t output_stride_n, int output_size_m, int output_size_n,
+        PeerBases bases, int64_t partials_offset, int64_t partials_stride_m,
+        int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        int64_t signals_offset,
+        int64_t signals_stride_parity, int64_t signals_stride_block,
+        int64_t signals_stride_writer, int signals_size_parity,
+        int signals_size_block, int signals_size_writer,
+        uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
+        int status_size_field, int rank, uint64_t timeout_ticks) {
+#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
+  for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
+    const int band =
+        min(partials_size_m, input_size_m - r0);  // this pass's rows
+    DTYPE* const band_output = output_ptr + r0 * output_stride_m;
+    // 1. Every rank's input ready and visible (and, past the first pass,
+    //    every peer has read this rank's partials).
+    barrier<Until::visible, 0, WORLD>(
+        bases, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks);
+
+    // 2. Reduce-scatter, pulled: this rank's share of the band from every
+    //    rank's input, where the table says, into its partials.
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+        inputs_table, inputs_stride_m, inputs_stride_n, r0, band,
+        input_size_n, bases, partials_offset, rank);
+
+    // 3. Every rank's sums are visible to its peers, and every peer is done
+    //    reading this band of this rank's input (past the last pass: all of
+    //    it, so the launch may end and the input be overwritten).
+    barrier<Until::visible, 1, WORLD>(
+        bases, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field,
+        rank, timeout_ticks);
+
+    // 4. All-gather: every rank's summed share out of its partials, at its
+    //    place in the output.
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
+        bases, partials_offset, partials_stride_m, partials_stride_n,
+        partials_size_m, partials_size_n, band_output, output_stride_m,
+        output_stride_n, band, input_size_n, rank);
+  }
+#else
+  __builtin_trap();
+#endif
+}
+
+// =============================================================================
+// all_reduce_push_one_shot
+//
+// One-shot all-reduce (the pushed variant, forced only): every rank sums every rank's input over the whole
 // buffer. PUSHED: each rank stores its own band into slot [rank] of every
 // rank's inbox (itself too), sync (ordered), each rank sums the WORLD slots of
 // its own inbox, sync. One kernel; no peer reads the caller's input.
@@ -44,7 +195,7 @@ namespace hip_custom_communicator {
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_one_shot_pushed(
+    all_reduce_push_one_shot(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
@@ -124,7 +275,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 // =============================================================================
-// all_reduce_pull_two_shot
+// all_reduce_pull_two_shot_int4 and all_reduce_push_two_shot (exact, the
+// pushed variant, forced only)
 //
 // Two-shot all-reduce: reduce-scatter, then all-gather, the sum kept in this
 // rank's partials and pulled by the peers (its Direction, pull). THE
@@ -155,7 +307,7 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_two_shot(
+    all_reduce_pull_two_shot_int4(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
@@ -175,7 +327,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const Int4Payload inputs_int4 = int4_payload(inputs_offset, inputs_size_m, inputs_size_n);
   const Int4Payload partials_int4 = int4_payload(partials_offset, partials_size_m, partials_size_n);
   static_assert(QUANTIZATION == Quantization::int4,
-                "none is all_reduce_pull_two_shot_pushed");
+                "none is all_reduce_pull_two_shot (or all_reduce_push_two_shot)");
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   // 1. Every rank's share of this rank's input, quantized here, into that
   // rank's inbox payload at slot [rank]; then wait until every peer has
@@ -240,7 +392,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    all_reduce_pull_two_shot_pushed(
+    all_reduce_push_two_shot(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,

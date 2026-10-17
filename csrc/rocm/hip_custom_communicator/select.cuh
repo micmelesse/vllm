@@ -215,6 +215,16 @@ constexpr TemplateInfo kTemplates[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_push_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, true, true, kAttnResPushConfigs},
+    // THE PLAIN ALL-REDUCE PUSHED (kernels/all_reduce.cuh): a variant a caller
+    // forces by its direction; no tuned entry names it (the in-place pull is
+    // faster: 262.5 against 333 us at 4096 x 7168 bf16, n11, 2026-10-17). The
+    // pull's builds. Their INT4 builds run the one INT4 kernel either
+    // template's does (all_reduce_pull_two_shot_int4: the shares quantized by
+    // their owner and pushed).
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_one_shot),
+     OpType::all_reduce, false, true, kAllReduceOneShotConfigs},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot),
+     OpType::all_reduce, true, true, kAllReduceTwoShotConfigs},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -931,7 +941,8 @@ constexpr bool slices_columns(Template k) {
 // and the column splits. It needs a 16-byte pack for every rank; with fewer, a
 // rank's slice is empty.
 constexpr bool slices_a_row(Template k) {
-  return k == Template::all_reduce_pull_two_shot || slices_columns(k);
+  return k == Template::all_reduce_pull_two_shot ||
+         k == Template::all_reduce_push_two_shot || slices_columns(k);
 }
 
 // WHETHER EVERY RANK GETS COLUMNS: a template that slices a row needs a load's
@@ -1281,9 +1292,13 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 // =================================================================================================
 
 // all_reduce: the sum of every rank's `inp` ([rows, cols] of `dtype` at its
-// strides) into `out`. The kernel pushes its input (or each rank's share of
-// it) into the peers' inboxes itself, nothing copied in first: a band of rows a
-// pass (none), or quantized whole (INT4's two-shot).
+// strides) into `out`. PULLED IN PLACE (the default, exact): the kernel reads
+// every rank's input through the input table (handle.cuh's INPUT TABLES), a
+// captured call's tensors where they are, an eager call's host copies in the
+// inputs region, which must hold it whole; the two-shot a band of rows a pass,
+// what its partials hold. INT4 (the pull two-shot's INT4 build): the shares
+// quantized and pushed whole. PUSHED (forced): the input pushed into the peers'
+// inboxes, a band a pass.
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
@@ -1313,8 +1328,12 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const Template fn = k.fn;
   const KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  // IN PASSES (none): a band of rows of the input pushed through the inboxes a
-  // pass. INT4 pushes its input's shares quantized, whole, instead.
+  // IN PLACE: the exact pull, every rank's input read where its table says.
+  const bool in_place = direction_of(fn) == Direction::pull &&
+                        a.quantization == Quantization::none;
+  // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
+  // the whole input). INT4 pushes its input's shares quantized, whole,
+  // instead.
   const bool in_passes = a.quantization == Quantization::none;
   // THE BAND: the rows a pass, what the inbox (the inputs region) holds in
   // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
@@ -1330,7 +1349,13 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     return (rows * packs + world - 1) / world;
   };
   int64_t band = 0;
-  if (row_bytes > 0 && !is_two_shot(fn)) {
+  if (in_place && !is_two_shot(fn)) {
+    band = m;  // nothing staged: one pass
+  } else if (in_place) {
+    // THE IN-PLACE TWO-SHOT'S BAND: what the partials hold, a row of its
+    // slice a row; the input is read where it is.
+    band = slice_bytes > 0 ? h.partials_bytes() / slice_bytes : 0;
+  } else if (row_bytes > 0 && !is_two_shot(fn)) {
     band = h.inputs_bytes() / (world * row_bytes);
   } else if (row_bytes > 0) {
     band = h.inputs_bytes() / row_bytes;
@@ -1344,7 +1369,19 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
           refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
                   std::nullopt, in_passes))
     return *e;
+  if (in_place && is_two_shot(fn) && band < 1)
+    return Error::partials_too_small;
   if (in_passes && band < 1) return Error::inputs_too_small;
+  // AN EAGER IN-PLACE CALL'S INPUT IS COPIED WHOLE into the inputs region
+  // (its table, handle.cuh's INPUT TABLES); a captured one is read where it
+  // is, registered at capture exit.
+  if (in_place) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+    if (capture != hipStreamCaptureStatusActive &&
+        m * n * elem_bytes(dtype) > h.inputs_bytes())
+      return Error::inputs_too_small;
+  }
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups
   // for every thread of
   //    a tile row (the two-shot's rows are the ranks).
@@ -1363,10 +1400,48 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                               WAVES = C.waves_per_eu;
                 constexpr int TM = C.tile_m, TN = C.tile_n;
                 if constexpr (one_shot_lays_out(C, NL))
-                  kernel = instance<AllReduceOneShotPushedKernel>(
-                      all_reduce_pull_one_shot_pushed<T, NG, TM, TN, THREADS,
-                                                      WAVES>);
+                  kernel = instance<AllReduceOneShotInPlaceKernel>(
+                      all_reduce_pull_one_shot<T, NG, TM, TN, THREADS,
+                                                        WAVES>);
               });
+          return;
+        case Template::all_reduce_push_one_shot:
+          by_build<Template::all_reduce_push_one_shot>(
+              c.build, [&](auto built) {
+                constexpr AllReduceBuildConfig C = decltype(built)::value;
+                constexpr int THREADS = C.threads_per_block,
+                              WAVES = C.waves_per_eu;
+                constexpr int TM = C.tile_m, TN = C.tile_n;
+                if constexpr (one_shot_lays_out(C, NL))
+                  kernel = instance<AllReduceOneShotPushedKernel>(
+                      all_reduce_push_one_shot<T, NG, TM, TN, THREADS, WAVES>);
+              });
+          return;
+        case Template::all_reduce_push_two_shot:
+          by_build<Template::all_reduce_push_two_shot>(c.build, [&](auto
+                                                                        built) {
+            constexpr AllReduceBuildConfig C = decltype(built)::value;
+            constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
+            constexpr int TM = C.tile_m, TN = C.tile_n;
+            const bool contiguous = input_stride_m == n * input_stride_n &&
+                                    output_stride_m == n * output_stride_n;
+            if constexpr (two_shot_lays_out(C, NG, NL)) {
+              const auto at = [&](auto layout) {
+                constexpr bool CONTIGUOUS = decltype(layout)::value;
+                if constexpr (C.quantization == Quantization::none)
+                  return instance<AllReduceTwoShotPushedKernel>(
+                      all_reduce_push_two_shot<T, NG, TM, TN, THREADS, WAVES,
+                                               CONTIGUOUS>);
+                else
+                  return instance<AllReduceTwoShotKernel>(
+                      all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS,
+                                                    WAVES, CONTIGUOUS,
+                                                    C.quantization>);
+              };
+              kernel =
+                  contiguous ? at(std::true_type{}) : at(std::false_type{});
+            }
+          });
           return;
         case Template::all_reduce_pull_two_shot:
           by_build<Template::all_reduce_pull_two_shot>(c.build, [&](auto
@@ -1376,19 +1451,23 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr int TM = C.tile_m, TN = C.tile_n;
             // THE INSTANCE FOR THE LAYOUT AS GIVEN: rows back to back read each
             // peer's share as one run, other strides the strided walk
-            // (common.cuh's COLLECTIVES); the input is not reshaped.
+            // (common.cuh's COLLECTIVES); the input is not reshaped. In
+            // place, every rank's input is read at the table's strides: a
+            // captured call's are the caller's (every rank's alike), an eager
+            // call's its copy's, dense rows, so the input's rows back to back
+            // answer for both.
             const bool contiguous = input_stride_m == n * input_stride_n &&
                                     output_stride_m == n * output_stride_n;
             if constexpr (two_shot_lays_out(C, NG, NL)) {
               const auto at = [&](auto layout) {
                 constexpr bool CONTIGUOUS = decltype(layout)::value;
                 if constexpr (C.quantization == Quantization::none)
-                  return instance<AllReduceTwoShotPushedKernel>(
-                      all_reduce_pull_two_shot_pushed<T, NG, TM, TN, THREADS,
-                                                      WAVES, CONTIGUOUS>);
+                  return instance<AllReduceTwoShotInPlaceKernel>(
+                      all_reduce_pull_two_shot<T, NG, TM, TN, THREADS,
+                                                        WAVES, CONTIGUOUS>);
                 else
                   return instance<AllReduceTwoShotKernel>(
-                      all_reduce_pull_two_shot<T, NG, TM, TN, THREADS, WAVES,
+                      all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS, WAVES,
                                                CONTIGUOUS, C.quantization>);
               };
               kernel =
@@ -1432,13 +1511,18 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       // THE INBOX: the one-shot's [WORLD * rows, n], the exact two-shot's
       // [WORLD, slot] (a slot one rank's share of a band), the INT4 two-shot's
       // payload found from the problem's [m, n] (its slots where the shares lie).
-      .inputs_stride_m = !in_passes || !is_two_shot(fn)
-                             ? n
+      // IN PLACE: none (the table's strides are the launch's, handle.cuh's
+      // InputTable).
+      .inputs_stride_m = in_place                         ? 0
+                         : !in_passes || !is_two_shot(fn) ? n
                              : slot_packs(rows) * pack / elem_bytes(dtype),
-      .inputs_stride_n = 1,
-      .inputs_size_m = !in_passes ? m : is_two_shot(fn) ? world : world * rows,
-      .inputs_size_n = !in_passes || !is_two_shot(fn)
-                           ? n
+      .inputs_stride_n = in_place ? 0 : 1,
+      .inputs_size_m = in_place     ? 0
+                       : !in_passes ? m
+                       : is_two_shot(fn) ? world
+                                         : world * rows,
+      .inputs_size_n = in_place                         ? 0
+                       : !in_passes || !is_two_shot(fn) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype),
       .dtype = dtype};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
@@ -2033,9 +2117,10 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
     }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
     if (input > inputs) inputs = input;
-    // THE PLAIN ALL-REDUCE'S INBOX takes a pass of at least one row: the
-    // one-shot's WORLD slots of a row each, which covers the two-shot's WORLD
-    // shares of one row rounded up to whole packs.
+    // THE PUSHED ALL-REDUCE'S INBOX (forced) takes a pass of at least one
+    // row: the one-shot's WORLD slots of a row each, which covers the
+    // two-shot's WORLD shares of one row rounded up to whole packs. The
+    // in-place pull's eager copy is the input whole, above.
     const int64_t one_row_each = world * max_cols * elem_bytes(d);
     if (one_row_each > inputs) inputs = one_row_each;
   }
@@ -2043,8 +2128,8 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 }
 
 // THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
-// the inputs holds (a per-row kernel's input is copied in whole; the plain
-// all-reduce's a slot of its inbox, a row at the least), and what the partials
+// the inputs holds (an eager input is copied in whole: by a per-row kernel, or
+// by the host for the in-place all-reduce), and what the partials
 // holds at the most partials a byte of its input needs among its tuned kernels:
 // at one row of one pack, where rounding up is all of it (a row two-shot
 // leaving two results, two). Python admits a call by it or by the box the
@@ -2057,13 +2142,13 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
         partials_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
     if (need > per_byte) per_byte = need;
   }
-  // THE PLAIN ALL-REDUCE pushes a pass into WORLD slots of the inputs: a call
-  // whose bytes a slot holds has a row the one-shot's slot holds, at any world.
-  const int64_t inputs =
-      o == OpType::all_reduce ? inputs_bytes / kMaxRanks : inputs_bytes;
-  if (per_byte == 0) return inputs;
+  // THE PLAIN ALL-REDUCE as the fused ops: its tuned kernels (the in-place
+  // pull) copy an eager input into the inputs whole. (The pushed variant,
+  // forced, runs any call in the box: its inbox holds a row a rank,
+  // `exchange_sizes`.)
+  if (per_byte == 0) return inputs_bytes;
   const int64_t partials = partials_bytes / per_byte;
-  return partials < inputs ? partials : inputs;
+  return partials < inputs_bytes ? partials : inputs_bytes;
 }
 
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and

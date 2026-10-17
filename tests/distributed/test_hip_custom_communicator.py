@@ -34,6 +34,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Error,
     FlagState,
     HipCustomCommunicator,
+    LogKind,
     LogMode,
     Op,
     Open,
@@ -541,6 +542,14 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         _eager(comm, rank, "all_reduce", 2048, HIDDEN, bf16, {}, None, 3)
     with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay"):
         _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, {}, None)
+    with _step(rank, "the capture's inputs registered, the eager inputs copied"):
+        log = comm.log()
+        assert log is not None
+        registered = [
+            r for r in log.records if r.kind is LogKind.registration and r.barrier == 1
+        ]
+        assert registered and registered[-1].seen == GRAPH_LAYERS, registered
+        assert any(r.kind is LogKind.copy_in_issued for r in log.records)
 
 
 @on_eight_gpus

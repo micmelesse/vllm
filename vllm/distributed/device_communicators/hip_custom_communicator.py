@@ -15,12 +15,13 @@ after its own (the algorithm, the direction, every field of one build and the la
 all or none) are the one way to force one, for the sweep and the tests. Every one is
 passed through as it came: C++ builds the config, checks it, and answers.
 
-ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, moves its input
-into the inputs region of the communicator's arena (one allocation per rank, which
-every rank opened at open over legacy HIP IPC) before its first barrier: a fused
-kernel copies it into its own, the plain all-reduce pushes it into its peers' (each
-rank's inbox, a slot a writer). Peers read only the arena, never the caller's
-tensor, so nothing is registered.
+THE MEMORY (C++'s `Handle`): the communicator's arena is one allocation per rank,
+which every rank opened at open over legacy HIP IPC. The plain all-reduce reads every
+rank's input IN PLACE through an input table (aiter's gfx950 pattern): a captured
+call's tensors, registered when `capture()` exits (one exchange of their IPC handles
+over the CPU group, a collective), or an eager call's copy, which C++ makes into the
+arena's inputs region on the call's stream. A fused kernel copies its input into the
+inputs region itself.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -191,11 +192,12 @@ class LogKind(IntEnum):
     open_check = 2
     open_warning = 3
     launch_issued = 4
-    copy_in_issued = 5  # retired: the kernels copy their input in themselves
+    copy_in_issued = 5  # an eager all-reduce's host copy into the inputs
     stream_seen = 6
     kernel_seen = 7
     deadline_expired = 8
     close_phase = 9
+    registration = 10  # captured inputs registered at capture exit
     entered = 16
     barrier_signal = 17
     barrier_passed = 18
@@ -216,7 +218,7 @@ class OpenPhase(IntEnum):
     opened = 8
     mapped = 9  # retired: VMM's map; IPC opens in one step
     access_set = 10  # retired: VMM's access
-    tables_written = 11  # retired: no peer tables; kept so the numbers hold
+    tables_written = 11  # the input tables' slab and its eager table
     checked = 12
     open_done = 13
 
@@ -1539,10 +1541,23 @@ class HipCustomCommunicator:
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture. Nothing is registered: every kernel moves its
-        input into the arena's inputs itself (no copy node in the graph), so a
-        captured launch reads only memory every rank opened at open."""
+        """Wrap a cudagraph capture. Each captured all-reduce reserves an input
+        table, filled on exit: every rank exchanges the IPC handles of the inputs
+        its capture recorded over the CPU group (a collective, so every rank exits
+        its capture together) and opens its peers'. Before any replay."""
         yield
+        failed = torch.ops._rocm_C.hip_custom_communicator_register_captured(
+            self._handle, self.cpu_group.group_name
+        )
+        if failed:
+            raise RuntimeError(
+                "hip_custom_communicator: registering the captured inputs failed "
+                + (
+                    "(the ranks captured different numbers of all-reduces)"
+                    if failed == 1
+                    else "(the CPU group no longer resolves)"
+                )
+            )
 
     def _all_reduce(
         self,

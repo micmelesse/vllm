@@ -392,6 +392,17 @@ int64_t hip_custom_communicator_close(fptr_t handle_ptr,
   return handle_of(handle_ptr).close(pg ? barrier_over(*pg, timeout_seconds)
                                         : none);
 }
+// THE INPUTS A CAPTURE RECORDED REGISTERED (Handle::register_captured), a
+// collective over the process group named `cpu_group`: every rank calls it
+// when its capture exits. 0, or 1 when the ranks recorded different counts
+// (nothing registered), or 2 when the group no longer resolves.
+int64_t hip_custom_communicator_register_captured(fptr_t handle_ptr,
+                                                  const std::string& cpu_group) {
+  const auto pg = resolved(cpu_group);
+  if (!pg) return 2;
+  return handle_of(handle_ptr).register_captured(gather_over(*pg)) ? 0 : 1;
+}
+
 // EVERY COMMUNICATOR STILL OPEN IN THIS PROCESS ABANDONED (Handle::abandon):
 // for an exit, a signal, an error path. Never waits on a peer; waits at most
 // `wait_seconds` a handle for its device.

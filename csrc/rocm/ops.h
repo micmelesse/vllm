@@ -79,6 +79,10 @@ int64_t hip_custom_communicator_wall_clock_khz(int64_t device);
 int64_t hip_custom_communicator_close(fptr_t handle_ptr,
                                       const std::string& cpu_group,
                                       double timeout_seconds);
+// The inputs a capture recorded, registered over `cpu_group` (a collective,
+// at capture exit): 0, 1 the ranks' counts differ, 2 no such group.
+int64_t hip_custom_communicator_register_captured(fptr_t handle_ptr,
+                                                  const std::string& cpu_group);
 // Every open communicator torn down alone (exit, a signal): never waits on a
 // peer.
 void hip_custom_communicator_abandon_all(double wait_seconds);

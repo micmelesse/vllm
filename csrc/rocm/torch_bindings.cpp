@@ -107,6 +107,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("hip_custom_communicator_capacity",
                &hip_custom_communicator_capacity);
   rocm_ops.def("hip_custom_communicator_close", &hip_custom_communicator_close);
+  rocm_ops.def("hip_custom_communicator_register_captured",
+               &hip_custom_communicator_register_captured);
   rocm_ops.def("hip_custom_communicator_abandon_all",
                &hip_custom_communicator_abandon_all);
   rocm_ops.def("hip_custom_communicator_dispose",
