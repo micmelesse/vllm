@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    this rank's partials); this rank's share of the band from every rank's input, where the
     //    table says, summed into its partials; every rank's sums visible and every peer done
     //    reading this band of this rank's input.
-    reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::lds,
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
                    Direction::pull, Quantization::none, CONTIGUOUS, Until::visible>(
         static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
         input_ptr_array_size, input_stride_m, input_stride_n, nullptr, 0, 0, 1, 0, 0,
@@ -306,7 +306,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // at slot [rank]; every peer launched and pushed its own into ours (ordered); this rank's share,
   // every writer's slot summed, into its partials; every rank's sums visible and every peer done
   // with its inbox (the next launch's push may overwrite it).
-  reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::registers,
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::registers,
                  Direction::push, QUANTIZATION, CONTIGUOUS, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
@@ -360,7 +360,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    has read this rank's partials); this rank's share, every writer's slot of its inbox
     //    summed, into its partials; every rank's sums visible and every peer done with its inbox,
     //    so the next band's (or launch's) push may overwrite it.
-    reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::lds,
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
                    Direction::push, Quantization::none, CONTIGUOUS, Until::visible>(
         input_ptr, input_stride_m, input_stride_n, band, input_size_n,
         static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,

@@ -277,8 +277,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // THE PARTIALS, this rank's: with int4 their INT4 payload, worked out from their own sizes where
   // load and store read and write it.
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && rank >= partials_ptr_array_size) __builtin_trap();
-  DTYPE* const own_partials = reinterpret_cast<DTYPE*>(partials_ptr_array[rank]);
+  DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the

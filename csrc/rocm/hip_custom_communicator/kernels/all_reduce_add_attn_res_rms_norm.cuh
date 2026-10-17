@@ -92,7 +92,7 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 //   of sources at a time; out = T(m), or T(m * rsqrt(mean(m^2) + out_eps) *
 //   out_w)
 // `sum` is this thread's registers of the tile's rows summed over the ranks, a
-// row the block's (THREADS threads along it). THE TILE'S PLACE IS THE SUM'S:
+// row the block's (THREADS_PER_BLOCK threads along it). THE TILE'S PLACE IS THE SUM'S:
 // rows offs_m.. of an input_size_m x input_size_n tensor, every buffer read and
 // written at that place (rows at its own row stride: the prefix, its output,
 // the output, `blocks` [m, sources, n] at its row and source strides in
@@ -103,7 +103,7 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // `prefix_ptr`, the new one written to `prefix_output_ptr`, never the same
 // memory. A row past input_size_m (the last tile's) reads row input_size_m - 1
 // and writes nothing, so every thread still reaches every reduction.
-template <bool HAS_PREFIX, int TILE_K, int THREADS, typename DTYPE, int ROWS,
+template <bool HAS_PREFIX, int TILE_K, int THREADS_PER_BLOCK, typename DTYPE, int ROWS,
           int K, int P>
 DINLINE void block_attn_res_tile(
     const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
@@ -123,7 +123,7 @@ DINLINE void block_attn_res_tile(
   DTYPE new_prefix[ROWS][K][P];
   if constexpr (HAS_PREFIX) {
     DTYPE old_prefix[ROWS][K][P];
-    load<1, THREADS>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n);
+    load<1, THREADS_PER_BLOCK>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n);
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -140,9 +140,9 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
   }
-  store<1, THREADS, THREADS>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+  store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
   if (block_output_ptr != nullptr)
-    store<1, THREADS, THREADS>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
   // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
@@ -156,8 +156,8 @@ DINLINE void block_attn_res_tile(
   if (num_blocks != 0) {
     // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-    load<1, THREADS>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n);
-    load<1, THREADS>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n);
+    load<1, THREADS_PER_BLOCK>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n);
+    load<1, THREADS_PER_BLOCK>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n);
     float w[1][K][P];
 #pragma unroll
     for (int k = 0; k < K; ++k)
@@ -191,7 +191,7 @@ DINLINE void block_attn_res_tile(
         // padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
         const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-        load<1, THREADS>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n);
+        load<1, THREADS_PER_BLOCK>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n);
         // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
         // mask: packs past input_size_n count zero, multiplied in so nothing branches).
         float ss[ROWS], dw[ROWS];
@@ -204,7 +204,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
             for (int j = 0; j < P; ++j)
               ss_k = fmaf(static_cast<float>(v[s][m][k][j]), static_cast<float>(v[s][m][k][j]), ss_k);
-            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
             ss[m] += (n < input_size_n / P ? 1.0f : 0.0f) * ss_k;
           }
         }
@@ -217,7 +217,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
             for (int j = 0; j < P; ++j)
               dw_k = fmaf(static_cast<float>(v[s][m][k][j]), w[0][k][j], dw_k);
-            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
             dw[m] += (n < input_size_n / P ? 1.0f : 0.0f) * dw_k;
           }
         }
@@ -227,7 +227,7 @@ DINLINE void block_attn_res_tile(
           sums[0][(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      block_reduce<Sum, ReduceAxis::all, 1, THREADS>(sums, sums);
+      block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(sums, sums);
       float old_scale[ROWS], scale[TILE_K][ROWS];
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) {
@@ -272,9 +272,9 @@ DINLINE void block_attn_res_tile(
   DTYPE result[ROWS][K][P];
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
-    load<1, THREADS>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n);
+    load<1, THREADS_PER_BLOCK>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n);
     float scale[ROWS];
-    rms_norm<THREADS, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
+    rms_norm<THREADS_PER_BLOCK, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
                                             inv_hidden, input_size_n, offs_n);
   } else {
 #pragma unroll
@@ -284,7 +284,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
   }
-  store<1, THREADS, THREADS>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+  store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
 }
 
 // =============================================================================

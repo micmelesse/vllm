@@ -20,7 +20,7 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2 };
 //   output   = T(input * scale * float(weight))            AttnRes's output norm (its reference)
 // The variance is of `input` before any further rounding. A block's threads call it together
 // (scale's block_reduce).
-template <int THREADS, NormPart PART, bool ROUND_SCALED, typename W, typename T, int ROWS, int K,
+template <int THREADS_PER_BLOCK, NormPart PART, bool ROUND_SCALED, typename W, typename T, int ROWS, int K,
           int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
@@ -38,11 +38,11 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
         float ss_k = 0.0f;
 #pragma unroll
         for (int j = 0; j < P; ++j) ss_k = fmaf(input[m][k][j], input[m][k][j], ss_k);
-        const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+        const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
         ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
       }
     }
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS>(ss, ss);
+    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }

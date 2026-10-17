@@ -16,7 +16,7 @@ namespace hip_custom_communicator {
 
 // WALK::flat (the plain two-shot): `output` a buffer, T*, of output_size_m x output_size_n at its
 // strides; every rank's share (reduce_scatter's flat walk: rows numbered row-major, a rank's share
-// one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy LANES = THREADS /
+// one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy LANES = THREADS_PER_BLOCK /
 // WORLD threads (rotated, rank + w). int4: a group a thread, each block the contiguous range of
 // groups reduce_scatter's same block summed, every rank's group in flight, decoded and stored.
 //
@@ -25,7 +25,7 @@ namespace hip_custom_communicator {
 // from the rank owning its columns, slice_n columns a rank (the last rank's to the end), the
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
-template <int WORLD, int THREADS, int TILE_N, Walk WALK, int QUANTIZATION, bool CONTIGUOUS,
+template <int WORLD, int THREADS_PER_BLOCK, int TILE_N, Walk WALK, int QUANTIZATION, bool CONTIGUOUS,
           typename T, typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
@@ -58,10 +58,8 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const __fp16* scales[WORLD];
 #pragma unroll
       for (int w = 0; w < WORLD; ++w) {
-        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (rank + w) % WORLD >= partials_ptr_array_size)
-          __builtin_trap();
-        values[w] = reinterpret_cast<uint8_t*>(partials_ptr_array[(rank + w) % WORLD]);
-        scales[w] = reinterpret_cast<__fp16*>(partials_ptr_array[(rank + w) % WORLD] +
+        values[w] = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD);
+        scales[w] = reinterpret_cast<__fp16*>(ptr_array_at(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD) +
                                               int4_scales_offset(partials_size_m, partials_size_n));
       }
       const int groups_all = slice / kInt4Group;
@@ -69,7 +67,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const int per_block = (groups_all + grid - 1) / grid;
       const int g_first = static_cast<int>(blockIdx.x) * per_block;
       const int g_end = min(g_first + per_block, groups_all);
-      for (int g0 = g_first; g0 < g_end; g0 += THREADS) {
+      for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
         const int g = g0 + static_cast<int>(threadIdx.x);
         u32x4 words[WORLD];
         float group_scales[WORLD];
@@ -116,9 +114,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         }
       }
     } else {
-      constexpr int LANES = THREADS / WORLD;
+      constexpr int LANES = THREADS_PER_BLOCK / WORLD;
       constexpr int K = TILE_N / (P * LANES);
-      static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
+      static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
       static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
       const int chunks = (slice + TILE_N - 1) / TILE_N;
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
@@ -168,7 +166,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       return offs_m + i < output_size_m ? offs_m + i : output_size_m - 1;
     };
     const auto col_of = [&](int k) {
-      const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS + k * THREADS;
+      const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
       return n < output_size_n / P ? n : output_size_n / P - 1;
     };
     if constexpr (!kInt4) {
@@ -179,9 +177,8 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         for (int k = 0; k < K; ++k) {
           const int col = col_of(k);
           const int owner = min(col / (slice_n / P), WORLD - 1);
-          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && owner >= partials_ptr_array_size) __builtin_trap();
           const u32x4 raw = *(const global_u32x4*)(
-              reinterpret_cast<const V*>(partials_ptr_array[owner]) +
+              reinterpret_cast<const V*>(lane_ptr_array_at<WORLD, const T>(partials_ptr_array, partials_ptr_array_size, owner)) +
               int64_t{row_of(i)} * (partials_stride_m / P) + col);
           __builtin_memcpy(output[i][k], &raw, sizeof(raw));
         }
@@ -190,7 +187,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       asm volatile("" ::: "memory");
       __builtin_amdgcn_sched_barrier(0);
     } else {
-      static_assert(THREADS % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
+      static_assert(THREADS_PER_BLOCK % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
       // The partials' INT4 payload, from their own sizes (the INT4 payload layout).
       const int64_t values_stride_m = partials_size_n / 2;
       const int64_t scales_stride_m = partials_size_n / kInt4Group;
@@ -211,12 +208,11 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           uint32_t scale_at = static_cast<uint32_t>(col / kInt4GroupPacks) * kInt4ScaleBytes;
           asm volatile("" : "+v"(value_at));
           asm volatile("" : "+v"(scale_at));
-          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && owner >= partials_ptr_array_size) __builtin_trap();
-          words[i][k] = *(const global_u32*)(partials_ptr_array[owner] + row * values_stride_m +
+          words[i][k] = *(const global_u32*)(lane_ptr_array_at<WORLD, const uint8_t>(partials_ptr_array, partials_ptr_array_size, owner) + row * values_stride_m +
                                              value_at);
           scales[i][k] = *(const global_f16*)(
               reinterpret_cast<const char*>(
-                  reinterpret_cast<const __fp16*>(partials_ptr_array[owner] + scales_offset) +
+                  reinterpret_cast<const __fp16*>(lane_ptr_array_at<WORLD, const char>(partials_ptr_array, partials_ptr_array_size, owner) + scales_offset) +
                   row * scales_stride_m) +
               scale_at);
         }
