@@ -5,9 +5,17 @@
 // each built on those above it: HARDWARE, BUILD, UTILS, MEMORY, REDUCE, PEERS, BARRIER,
 // QUANTIZATION, LOAD AND STORE, COLLECTIVES. Every function is at file scope (no helper
 // namespace) and is one of the API: the four ops (load, store, barrier, block_reduce), the INT4
-// codec (encode, decode) and the two address functions (ptr_array_at, lane_ptr_array_at)
-// (lint_kernels.sh checks it). A kernel writes its register math, its walks and its addresses
-// inline, at its use.
+// codec (encode, decode) (lint_kernels.sh checks it). A kernel writes its register math, its walks
+// and its addresses inline, at its use: rank r's entry of a device array of pointers is the plain
+// `x_ptr_array[r]` (a debug build checks r against x_ptr_array_size).
+//
+// THE ADDRESS FUNCTIONS, INLINED (I6, 2026-10-17), and what they were for (the evidence a later
+// helpers pass weighs against the ISA): ptr_array_at read entry r through the constant address
+// space, a scalar s_load of a host-written invariant array, where a plain load after a barrier's
+// fence was a vector load re-issued; lane_ptr_array_at, for a rank that differs across the wave,
+// read all WORLD entries as scalar loads (each through readfirstlane) and picked the lane's by a
+// select, where an index by the lane was a per-lane global_load_dwordx2, and returned a global
+// (address_space 1) pointer, where one from an integer made its accesses flat_*.
 //
 // THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs,
 // then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer,
@@ -17,8 +25,7 @@
 // gave, no rank stride: a kernel takes each as a DEVICE ARRAY OF POINTERS of
 // every rank's address of it with its size, `char* const* x_ptr_array, int
 // x_ptr_array_size` (the world; written once at open by the Handle), and its
-// strides and sizes; rank r's is `ptr_array_at(x_ptr_array, x_ptr_array_size, r)`
-// (PEERS), one scalar load from the array. How they are allocated is the
+// strides and sizes; rank r's is `x_ptr_array[r]`. How they are allocated is the
 // host's business (STANDARDS 3.2). EVERY ARRAY IS DATA WITH ITS SIZE (STANDARDS
 // 3.2): a device array of pointers `x_ptr_array` (`T* const*`) with
 // `x_ptr_array_size`, never a struct around it, and no function takes one
@@ -522,7 +529,7 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
 //       partials: a two-shot's sums, which its peers read (or push into)
 //   each handed to a kernel as its own device array of every rank's address
 //   of it (`x_ptr_array`, `x_ptr_array_size`) with its strides and its sizes
-//   (rank r's is `ptr_array_at(x_ptr_array, x_ptr_array_size, r)`); the
+//   (rank r's is `x_ptr_array[r]`); the
 //   caller's, one tensor a call:
 //     [ input ]   never read by a peer: a fused kernel copies it into this
 //                 rank's inputs (or, int4, quantized into the inputs' INT4
@@ -610,54 +617,6 @@ constexpr int kStatusFields = 10;
 // index, compiled out of a release build, which passes the sizes and reads none): one outside is a
 // programming error, not a peer's fault, so it traps.
 
-// ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
-// addresses, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
-// from the first lane, the compiler knows it). The array is written by the host before the launch
-// and never during one, so it is read through the CONSTANT address space: a scalar load (s_load),
-// invariant, so neither a barrier's fences nor a store keeps the compiler from reusing or
-// rematerializing it, as it did the bases when they were by value in the kernel arguments (a plain
-// global load of it after a fence is a vector load, re-issued).
-// As a U* when U is given (a region's bytes as its elements). Survives: the one way a uniform rank
-// reaches a buffer's address (the scalar load).
-template <typename U = void, typename T>
-DINLINE std::conditional_t<std::is_void_v<U>, T, U>* ptr_array_at(T* const* x_ptr_array,
-                                                                  int x_ptr_array_size, int r) {
-  r = __builtin_amdgcn_readfirstlane(r);
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (r < 0 || r >= x_ptr_array_size)) __builtin_trap();
-  typedef T* Entry;
-  return reinterpret_cast<std::conditional_t<std::is_void_v<U>, T, U>*>(
-      ((const __attribute__((address_space(4))) Entry*)x_ptr_array)[r]);
-}
-
-// ENTRY r OF A DEVICE ARRAY OF POINTERS FOR AN r THAT DIFFERS ACROSS THE WAVE (a lane's owner: the
-// barrier's peer, an all-gather pack's owner, a row of threads narrower than a wave), as an
-// address: every one of the WORLD entries read (scalar) and the lane's picked by a select, never
-// an index by the lane (a per-lane load). Each entry passes through readfirstlane first: a select
-// of two loads is otherwise folded into a load from a selected address, the per-lane load (ISA
-// 2026-10-16: the barrier's peer base was a global_load_dwordx2 off the kernarg pointer).
-// Returned as a GLOBAL pointer (U* when U is given), so its accesses stay global_* (from an
-// integer they were flat_*). Survives: the one way a per-lane rank reaches a buffer's address.
-template <int WORLD, typename U = void, typename T>
-DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const* x_ptr_array,
-                                                                       int x_ptr_array_size, int r) {
-  static_assert(WORLD >= 1, "a world has a rank");
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (WORLD - 1 < 0 || WORLD - 1 >= x_ptr_array_size)) __builtin_trap();
-  const auto scalar = [](T* p) {
-    const auto u = reinterpret_cast<uint64_t>(p);
-    const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u));
-    const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u >> 32));
-    return (uint64_t{hi} << 32) | lo;
-  };
-  uint64_t at = scalar(ptr_array_at(x_ptr_array, x_ptr_array_size, 0));
-#pragma unroll
-  for (int k = 1; k < WORLD; ++k) {
-    const uint64_t p = scalar(ptr_array_at(x_ptr_array, x_ptr_array_size, k));
-    at = r == k ? p : at;
-  }
-  auto* const global = reinterpret_cast<__attribute__((address_space(1))) char*>(at);
-  return reinterpret_cast<std::conditional_t<std::is_void_v<U>, T, U>*>((char*)global);
-}
-
 // =================================================================================================
 // BARRIER
 //
@@ -665,7 +624,7 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const*
 // `signals[owner][parity][block] [writer]` is the flag block `block` on rank
 // `writer` sets in rank `owner`'s memory, at a barrier of that parity. Every
 // dimension is a stride but the outer R's: owner r's signals are
-// signals_ptr_array's entry r (PEERS' `lane_ptr_array_at`).
+// signals_ptr_array[r].
 //
 // THE MEMORY ORDERING: the textbook one for cacheable memory shared across
 // GPUs, nothing that depends on the signals bypassing a cache, so it is correct
@@ -804,8 +763,9 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
            static_cast<int64_t>(writer) < 0 ||
            static_cast<int64_t>(writer) >= signals_size_writer))
         __builtin_trap();
-      return lane_ptr_array_at<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                                            static_cast<int>(owner)) +
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int64_t>(owner) >= signals_ptr_array_size)
+        __builtin_trap();
+      return signals_ptr_array[owner] +
              parity * signals_stride_parity + block * signals_stride_block +
              writer * signals_stride_writer;
     };
@@ -938,7 +898,7 @@ __host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 }
 
 // AN [m, n] INT4 PAYLOAD IN A REGION: its values and its scales, each a buffer of its own (inside
-// the region, from its own address, PEERS' `ptr_array_at`, its strides and its sizes, in its own elements:
+// the region, from its own address, `x_ptr_array[r]`, its strides and its sizes, in its own elements:
 // bytes, fp16), both dense rows. From the region's byte offset and the call's [m, n]: the values at
 // the region's offset, [m, int4_values_size_n(n)]; the scales at the region's offset plus
 // int4_scales_offset(m, n), [m, int4_scales_size_n(n)]; each row's stride its size_n, the column's
@@ -1109,16 +1069,13 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     together; a store's same registers to every rank's copy, issued together, posted: the next
 //     ordered barrier's release completes and publishes them, BARRIER); every_slot, every slot of
 //     entry x_rank (a load's registers U[WORLD][ROWS][K][P], writer order: the inbox's WORLD
-//     writers); lane, entry x_rank where x_rank differs across the wave (each lane's rank, the
-//     select over the WORLD entries, lane_ptr_array_at).
+//     writers); lane, entry x_rank where x_rank differs across the wave (each lane's rank).
 //   QUANTIZATION: none, the buffer holds the registers' dtype; int4, it holds their INT4 payload
 //     (QUANTIZATION), its values from the slot's start and its scales at the offset its own sizes
 //     give (int4_scales_offset), a load dequantizing into its registers' dtype, a store quantizing
 //     its registers once whichever ranks it stores them in.
-// ENTRY r, A SCALAR LOAD OF THE ARRAY (ptr_array_at): the host writes a buffer's array before the
-// launch. A ONE-ENTRY ARRAY (its size the literal 1) may be a pointer's own address, `&x_ptr`, so
-// it is read as memory, which folds to the pointer (the constant address space's load of a
-// pointer's stack copy is not one).
+// ENTRY r IS `x_ptr_array[r]`. A ONE-ENTRY ARRAY (its size the literal 1) may be a pointer's own
+// address, `&x_ptr`, so it is read as entry 0, which folds to the pointer.
 // =================================================================================================
 
 enum class Ranks { own, every, every_slot, lane };
@@ -1152,13 +1109,12 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (slot < 0 || slot >= input_size_slot)) __builtin_trap();
     // The entries as plain pointers (a kernel's own pointer is __restrict__).
     const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (entry < 0 || entry >= input_ptr_array_size)) __builtin_trap();
     E* at;
-    if constexpr (RANKS == Ranks::lane)
-      at = lane_ptr_array_at<WORLD, E>(entries, input_ptr_array_size, entry);
-    else if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
+    if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       at = reinterpret_cast<E*>(entries[0]);
     else
-      at = ptr_array_at<E>(entries, input_ptr_array_size, entry);
+      at = reinterpret_cast<E*>(entries[entry]);
     return at + slot * input_stride_slot;
   };
   const int tid = static_cast<int>(threadIdx.x);
@@ -1318,11 +1274,12 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     const int entry = RANKS == Ranks::every ? c : output_rank;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (output_slot < 0 || output_slot >= output_size_slot)) __builtin_trap();
     const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (entry < 0 || entry >= output_ptr_array_size)) __builtin_trap();
     E* at;
     if (__builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1)
       at = reinterpret_cast<E*>(entries[0]);
     else
-      at = ptr_array_at<E>(entries, output_ptr_array_size, entry);
+      at = reinterpret_cast<E*>(entries[entry]);
     return at + output_slot * output_stride_slot;
   };
   const int tid = static_cast<int>(threadIdx.x);

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "all_gather.cuh"
 #include "common.cuh"
 #include "reduce_scatter.cuh"
 #include "rms_norm.cuh"
@@ -277,7 +278,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // THE PARTIALS, this rank's: with int4 their INT4 payload, worked out from their own sizes where
   // load and store read and write it.
-  DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && rank >= partials_ptr_array_size) __builtin_trap();
+  DTYPE* const own_partials = reinterpret_cast<DTYPE*>(partials_ptr_array[rank]);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -398,30 +400,37 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // K = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
   // THE PARTIALS'S POINTERS are computed where they are read, from the
-  // partials' array (read through the constant address space: invariant, so
-  // reloadable rather than held), so nothing held across the
-  // reduce (a table read after the first barrier, held, ran the int4
-  // 8192-column build out of SGPRs: 2026-10-15T22-28-01Z).
+  // partials' array, so nothing held across the reduce (a table read after the
+  // first barrier, held, ran the int4 8192-column build out of SGPRs:
+  // 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
     float sc[WORLD];
     if constexpr (ADD_RESIDUAL) {
       // Every owner's scale for row l, scale_at elements into its partials, all in flight before
       // the rows' loads (issued: no load or instruction crosses the barrier below).
 #pragma unroll
-      for (int r = 0; r < WORLD; ++r)
+      for (int r = 0; r < WORLD; ++r) {
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= partials_ptr_array_size) __builtin_trap();
         sc[r] = *(const __attribute__((address_space(1))) float*)(
-            reinterpret_cast<const float*>(
-                ptr_array_at<const char>(partials_ptr_array, partials_ptr_array_size, r) +
-                scale_at * int64_t{sizeof(DTYPE)}) +
+            reinterpret_cast<const float*>(partials_ptr_array[r] +
+                                           scale_at * int64_t{sizeof(DTYPE)}) +
             l);
+      }
       asm volatile("" ::: "memory");
       __builtin_amdgcn_sched_barrier(0);
     }
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
+      // THE GATHER: owner r's row l, all_gather's rows walk over the one-entry array of owner r's
+      // partials (a world of one, owning every column), every owner's issued before any is used.
+      // ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
       DTYPE got[WORLD][1][1][P];
-      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
-          partials_ptr_array, partials_ptr_array_size, 0, 0, 0, partials_stride_m, partials_stride_n, 1,
-          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) {
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= partials_ptr_array_size) __builtin_trap();
+        all_gather<1, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, true, DTYPE>(
+            partials_ptr_array + r, 1, partials_stride_m, partials_stride_n, partials_size_m,
+            partials_size_n, got[r], 0, 0, slice_m, input_size_n, l, c, input_size_n, 0);
+      }
       WEIGHT_DTYPE w_step[1][1][P];
       if constexpr (ADD_RESIDUAL)
         load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c);

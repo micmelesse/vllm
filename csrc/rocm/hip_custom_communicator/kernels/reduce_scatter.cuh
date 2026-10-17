@@ -122,9 +122,10 @@ DINLINE void reduce_scatter(
           float scale;
           encode<kInt4GroupPacks>(x, words, scale);
           if (g < g_end && g < groups) {
-            uint8_t* const values = ptr_array_at<uint8_t>(staging_ptr_array, staging_ptr_array_size, r) + mine / 2;
+            if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= staging_ptr_array_size) __builtin_trap();
+            uint8_t* const values = reinterpret_cast<uint8_t*>(staging_ptr_array[r]) + mine / 2;
             __fp16* const scales =
-                reinterpret_cast<__fp16*>(ptr_array_at(staging_ptr_array, staging_ptr_array_size, r) +
+                reinterpret_cast<__fp16*>(staging_ptr_array[r] +
                                           int4_scales_offset(staging_size_m, staging_size_n)) +
                 mine / kInt4Group;
             uint32_t value_at = static_cast<uint32_t>(g) * 16;
@@ -150,14 +151,16 @@ DINLINE void reduce_scatter(
 #pragma unroll
         for (int w = 0; w < WORLD; ++w) {
           const int64_t slot = int64_t{(rank + w) % WORLD} * slice;
-          values[w] = ptr_array_at<uint8_t>(staging_ptr_array, staging_ptr_array_size, rank) + slot / 2;
-          scales[w] = reinterpret_cast<__fp16*>(ptr_array_at(staging_ptr_array, staging_ptr_array_size, rank) +
+          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && rank >= staging_ptr_array_size) __builtin_trap();
+          values[w] = reinterpret_cast<uint8_t*>(staging_ptr_array[rank]) + slot / 2;
+          scales[w] = reinterpret_cast<__fp16*>(staging_ptr_array[rank] +
                                                 int4_scales_offset(staging_size_m, staging_size_n)) +
                       slot / kInt4Group;
         }
-        uint8_t* const own_values = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank);
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && rank >= partials_ptr_array_size) __builtin_trap();
+        uint8_t* const own_values = reinterpret_cast<uint8_t*>(partials_ptr_array[rank]);
         __fp16* const own_scales = reinterpret_cast<__fp16*>(
-            ptr_array_at(partials_ptr_array, partials_ptr_array_size, rank) +
+            partials_ptr_array[rank] +
             int4_scales_offset(partials_size_m, partials_size_n));
         for (int g0 = g_first; g0 < g_end; g0 += THREADS) {
           const int g = g0 + static_cast<int>(threadIdx.x);
@@ -288,8 +291,9 @@ DINLINE void reduce_scatter(
           // scheduler alone sank peer loads past the first adds: ISA 2026-10-01T00-39-51Z).
           asm volatile("" ::: "memory");
           __builtin_amdgcn_sched_barrier(0);
-          V* const inbox = reinterpret_cast<V*>(
-              ptr_array_at<T>(staging_ptr_array, staging_ptr_array_size, r) + rank * staging_stride_m);
+          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= staging_ptr_array_size) __builtin_trap();
+          V* const inbox = reinterpret_cast<V*>(reinterpret_cast<T*>(staging_ptr_array[r]) +
+                                                rank * staging_stride_m);
 #pragma unroll
           for (int k = 0; k < K; ++k) {
             const int c = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
@@ -312,8 +316,8 @@ DINLINE void reduce_scatter(
       // to T, stored in this rank's partials.
       const int len = share_len(rank);
       if (len != 0) {  // a late rank's share is empty at few packs (every block alike)
-        [[maybe_unused]] const T* const inbox =
-            ptr_array_at<T>(staging_ptr_array, staging_ptr_array_size, rank);
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && rank >= staging_ptr_array_size) __builtin_trap();
+        [[maybe_unused]] const T* const inbox = reinterpret_cast<T*>(staging_ptr_array[rank]);
         constexpr bool kRun = DIRECTION == Direction::push || CONTIGUOUS;
         const int64_t stride_m = DIRECTION == Direction::push ? staging_stride_m : input_ptr_array_stride_m;
         const int64_t stride_n = DIRECTION == Direction::push ? staging_stride_n : input_ptr_array_stride_n;
@@ -323,9 +327,10 @@ DINLINE void reduce_scatter(
           const T* from;
           if constexpr (DIRECTION == Direction::push)
             from = inbox + w * staging_stride_m;
-          else
-            from = ptr_array_at(input_ptr_array, input_ptr_array_size, w) +
-                   offs_m * input_ptr_array_stride_m;
+          else {
+            if (HIP_CUSTOM_COMMUNICATOR_DEBUG && w >= input_ptr_array_size) __builtin_trap();
+            from = input_ptr_array[w] + offs_m * input_ptr_array_stride_m;
+          }
           T got[1][K][P];
           if constexpr (kRun) {
 #pragma unroll
@@ -448,8 +453,10 @@ DINLINE void reduce_scatter(
       [[maybe_unused]] const int64_t scales_stride_m = int4_scales_size_n(staging_size_n);
       if constexpr (kInt4) {
 #pragma unroll
-        for (int r = 0; r < WORLD; ++r)
-          input_values[r] = ptr_array_at<const uint8_t>(staging_ptr_array, staging_ptr_array_size, r);
+        for (int r = 0; r < WORLD; ++r) {
+          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && r >= staging_ptr_array_size) __builtin_trap();
+          input_values[r] = reinterpret_cast<const uint8_t*>(staging_ptr_array[r]);
+        }
 #pragma unroll
         for (int r = 0; r < WORLD; ++r)
           input_scales[r] = reinterpret_cast<const __fp16*>(

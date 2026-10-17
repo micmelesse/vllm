@@ -57,10 +57,11 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const __fp16* scales[WORLD];
 #pragma unroll
       for (int w = 0; w < WORLD; ++w) {
-        values[w] = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD);
-        scales[w] = reinterpret_cast<__fp16*>(
-            ptr_array_at(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD) +
-            int4_scales_offset(partials_size_m, partials_size_n));
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (rank + w) % WORLD >= partials_ptr_array_size)
+          __builtin_trap();
+        values[w] = reinterpret_cast<uint8_t*>(partials_ptr_array[(rank + w) % WORLD]);
+        scales[w] = reinterpret_cast<__fp16*>(partials_ptr_array[(rank + w) % WORLD] +
+                                              int4_scales_offset(partials_size_m, partials_size_n));
       }
       const int groups_all = slice / kInt4Group;
       const int grid = static_cast<int>(gridDim.x);
@@ -177,9 +178,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         for (int k = 0; k < K; ++k) {
           const int col = col_of(k);
           const int owner = min(col / (slice_n / P), WORLD - 1);
+          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && owner >= partials_ptr_array_size) __builtin_trap();
           const u32x4 raw = *(const global_u32x4*)(
-              reinterpret_cast<const V*>(lane_ptr_array_at<WORLD, const T>(
-                  partials_ptr_array, partials_ptr_array_size, owner)) +
+              reinterpret_cast<const V*>(partials_ptr_array[owner]) +
               int64_t{row_of(i)} * (partials_stride_m / P) + col);
           __builtin_memcpy(output[i][k], &raw, sizeof(raw));
         }
@@ -209,16 +210,12 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           uint32_t scale_at = static_cast<uint32_t>(col / kInt4GroupPacks) * kInt4ScaleBytes;
           asm volatile("" : "+v"(value_at));
           asm volatile("" : "+v"(scale_at));
-          words[i][k] = *(const global_u32*)(
-              lane_ptr_array_at<WORLD, const uint8_t>(partials_ptr_array, partials_ptr_array_size,
-                                                      owner) +
-              row * values_stride_m + value_at);
+          if (HIP_CUSTOM_COMMUNICATOR_DEBUG && owner >= partials_ptr_array_size) __builtin_trap();
+          words[i][k] = *(const global_u32*)(partials_ptr_array[owner] + row * values_stride_m +
+                                             value_at);
           scales[i][k] = *(const global_f16*)(
               reinterpret_cast<const char*>(
-                  reinterpret_cast<const __fp16*>(
-                      lane_ptr_array_at<WORLD, const char>(partials_ptr_array,
-                                                           partials_ptr_array_size, owner) +
-                      scales_offset) +
+                  reinterpret_cast<const __fp16*>(partials_ptr_array[owner] + scales_offset) +
                   row * scales_stride_m) +
               scale_at);
         }
