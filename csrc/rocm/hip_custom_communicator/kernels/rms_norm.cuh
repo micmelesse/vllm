@@ -19,7 +19,7 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2 };
 //   output   = T(W(W(input * scale) * float(weight)))      vLLM's rounding (ROUND_SCALED)
 //   output   = T(input * scale * float(weight))            AttnRes's output norm (its reference)
 // The variance is of `input` before any further rounding. A block's threads call it together
-// (scale's block_reduce).
+// (scale's reduce).
 template <int THREADS_PER_BLOCK, NormPart PART, bool ROUND_SCALED, typename W, typename T, int ROWS, int K,
           int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
@@ -42,7 +42,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
         ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
       }
     }
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
+    reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }

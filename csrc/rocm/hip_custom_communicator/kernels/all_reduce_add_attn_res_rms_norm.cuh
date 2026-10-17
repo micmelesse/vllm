@@ -227,7 +227,7 @@ DINLINE void block_attn_res_tile(
           sums[0][(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(sums, sums);
+      reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(sums, sums);
       float old_scale[ROWS], scale[TILE_K][ROWS];
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) {

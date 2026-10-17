@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// THE REDUCE-SCATTER, written once with the common ops (load, store, barrier, block_reduce, the
+// THE REDUCE-SCATTER, written once with the common ops (load, store, barrier, reduce, the
 // codec): from every rank's input to every rank's sums in the partials, visible to its peers. Its
 // variations are template parameters, its walks written inline (the head of this file says why
 // each walk is the one it is).
@@ -399,7 +399,7 @@ DINLINE void reduce_scatter(
           asm volatile("" ::: "memory");  // issued (above)
           __builtin_amdgcn_sched_barrier(0);
           T rounded[1][K][P];
-          block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
+          reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
           store<1, LANES, THREADS_PER_BLOCK>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
@@ -471,7 +471,7 @@ DINLINE void reduce_scatter(
                   row, c, 1);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
             Summed rounded[1][1][P];
-            block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
+            reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
             store<1, LANES, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,

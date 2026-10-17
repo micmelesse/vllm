@@ -4,7 +4,7 @@
 // THE MACHINE AND THE BUILD, host facts (comms.md's DECIDED, H8): the target's documented
 // facts (HARDWARE), what the build compiles for it (BUILD), and the limits the host sizes the
 // peers' buffers by (kMaxRanks, kMaxBlocks). Device code reads two of them through
-// kernels/common.cuh: kWaveSize (block_reduce's DPP sequence) and the pack's bytes (traits).
+// kernels/common.cuh: kWaveSize (reduce's DPP sequence) and the pack's bytes (traits).
 
 #pragma once
 

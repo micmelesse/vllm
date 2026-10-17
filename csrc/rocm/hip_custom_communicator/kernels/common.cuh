@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// COMMON: THE API, and only it: the four ops (load, store, barrier, block_reduce) and the INT4
+// COMMON: THE API, and only it: the four ops (load, store, barrier, reduce) and the INT4
 // codec (quantize, dequantize), each at file scope (lint_kernels.sh checks it), with the vocabulary
 // their signatures and bodies need, each item next to the function that needs it, and the memory
 // ops' two INTERNALS, ptr_array_at and lane_ptr_array_at: how load, store and barrier read a
@@ -34,7 +34,7 @@
 //   every op     DINLINE; vec<T, P> (a pack in a register); traits<T>::N (a pack's elements, P)
 //   load, store  u32x4, global_u32x4, global_u32, global_f16 (the global-instruction forms);
 //                Ranks; HIP_CUSTOM_COMMUNICATOR_DEBUG (the index checks)
-//   block_reduce Sum, Max (OP); ReduceAxis (AXIS); kWaveSize
+//   reduce Sum, Max (OP); ReduceAxis (AXIS); kWaveSize
 //   internals    ptr_array_at, lane_ptr_array_at (load, store and barrier only)
 //   barrier      Until; the status buffer's StatusField, kStatusFields, Where, FlagState,
 //                FaultState (its protocol, which the host reads)
@@ -97,14 +97,14 @@ struct Max {
   static constexpr float kIdentity = -INFINITY;
 };
 
-// THE AXIS a block_reduce reduces over (template ints, as Quantization): `all`, the whole block;
+// THE AXIS a reduce reduces over (template ints, as Quantization): `all`, the whole block;
 // `m`, the THREADS_M rows of THREADS_N threads, elementwise a lane.
 namespace ReduceAxis {
 constexpr int all = 0;
 constexpr int m = 1;
 }  // namespace ReduceAxis
 
-// THE BLOCK REDUCTION, one for every case: block_reduce<OP, AXIS, THREADS_M, THREADS_N>(input,
+// THE BLOCK REDUCTION, one for every case: reduce<OP, AXIS, THREADS_M, THREADS_N>(input,
 // output), OP Sum or Max, every value of [K][P] reduced on its own, in fp32. Input and output may
 // be the same array (in place).
 //
@@ -125,7 +125,7 @@ constexpr int m = 1;
 // ISA 2026-10-15).
 template <typename OP, int AXIS, int THREADS_M, int THREADS_N, typename T, typename U, int K,
           int P>
-DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
+DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
   if constexpr (AXIS == ReduceAxis::all) {
     static_assert(THREADS_M == 1, "AXIS all is one row of the block's threads");
@@ -140,7 +140,7 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
     // 1. OVER THE WAVE, every lane left holding the results, by DPP, as rocPRIM's and Composable
     // Kernel's wave reductions do: each step is a VALU operand from another lane. The butterfly
     // __shfl_xor it replaced compiled to ds_bpermute, an LDS round trip a step, six of them
-    // waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for one block_reduce).
+    // waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for one reduce).
     //   swap neighbours, swap pairs (quad_perm [1,0,3,2], [2,3,0,1]): each quad holds its sum
     //   mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror): each row holds its sum
     //   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
