@@ -42,6 +42,18 @@
 
 namespace hip_custom_communicator {
 
+// THE FAULT SITES' NAMES (common.cuh's Where, the status's `where`), for the host's reports.
+constexpr int kWhereCount = 2;  // numbered from 1
+constexpr const char* to_string(Where w) {
+  switch (w) {
+    case Where::start:
+      return "start";
+    case Where::peer_barrier:
+      return "peer_barrier";
+  }
+  return "?";
+}
+
 enum class LogMode : uint32_t { errors = 0, everything = 1 };
 
 constexpr uint32_t kLogMagic = 0x474F4C48;  // "HLOG", little-endian

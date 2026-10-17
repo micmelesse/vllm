@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// COMMON: everything a kernel may call and the machine under it, in sections,
-// each built on those above it: HARDWARE, BUILD, UTILS, MEMORY, REDUCE, PEERS, BARRIER,
-// QUANTIZATION, LOAD AND STORE, COLLECTIVES. Every function is at file scope (no helper
-// namespace) and is one of the API: the four ops (load, store, barrier, block_reduce), the INT4
-// codec (encode, decode) (lint_kernels.sh checks it). A kernel writes its register math, its walks
-// and its addresses inline, at its use: rank r's entry of a device array of pointers is the plain
-// `x_ptr_array[r]` (a debug build checks r against x_ptr_array_size).
+// COMMON: THE API, and only it: the four ops (load, store, barrier, block_reduce) and the INT4
+// codec (encode, decode), each at file scope (lint_kernels.sh checks it), with the vocabulary
+// their signatures and bodies need, each item next to the function that needs it. A kernel
+// writes its register math, its walks and its addresses inline, at its use: rank r's entry of a
+// device array of pointers is the plain `x_ptr_array[r]` (a debug build checks r against
+// x_ptr_array_size). The machine and the build are the host's (../hardware.cuh); device code
+// reads two facts of them here, kWaveSize and the pack's bytes.
 //
 // THE ADDRESS FUNCTIONS, INLINED (I6, 2026-10-17), and what they were for (the evidence a later
 // helpers pass weighs against the ISA): ptr_array_at read entry r through the constant address
@@ -17,360 +17,66 @@
 // select, where an index by the lane was a per-lane global_load_dwordx2, and returned a global
 // (address_space 1) pointer, where one from an integer made its accesses flat_*.
 //
-// THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs,
-// then the scalars (offs_m, offs_n, row_step, rank, ...). A buffer is a pointer,
-// its strides, its sizes, in elements; stride_n is 1 (the host checks it; the
-// packed loads need it). OUR PEER BUFFERS (the staging, the partials, the
-// signals) are each a buffer of its own, at whatever address a peer's opening
-// gave, no rank stride: a kernel takes each as a DEVICE ARRAY OF POINTERS of
-// every rank's address of it with its size, `char* const* x_ptr_array, int
-// x_ptr_array_size` (the world; written once at open by the Handle), and its
-// strides and sizes; rank r's is `x_ptr_array[r]`. How they are allocated is the
-// host's business (STANDARDS 3.2). EVERY ARRAY IS DATA WITH ITS SIZE (STANDARDS
-// 3.2): a device array of pointers `x_ptr_array` (`T* const*`) with
-// `x_ptr_array_size`, never a struct around it, and no function takes one
-// without the other. THE CALLER'S INPUT, exact, is read by every rank IN
-// PLACE through the INPUT TABLE (below); INT4, a kernel first quantizes it into this rank's
-// inputs' INT4 values (reduce_scatter's int4 staging: `store` quantizing) and its peers read them
-// there; the plain all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or
-// each rank's share of it) into the peers' inputs, each rank's INBOX, at its own slot (`store`'s
-// every rank, or reduce_scatter's pushed flat walk), and sums its own inbox locally (`load`'s every
-// slot, or that walk's sum). Either way the
-// first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_ptr_array` with
-// `inputs_ptr_array_size` (the world), a device array of every rank's input address (aiter's
-// RankData*), rank r's input at inputs_ptr_array[r] at the inputs' strides. The kernel reads every rank's input where the table says, in place, and never
-// knows whether it points at callers' tensors (a captured call's, registered at capture exit) or
-// at every rank's inputs region (an eager call's, the host's copy): handle.cuh's INPUT TABLES.
-// A thread's registers are a plain array the caller declares,
-// `T v[ROWS][K][P]`, an input or an output like a buffer: P a pack's elements
-// (16 bytes of the kernel's dtype; an fp32 array holds the same P), thread t
-// lane t % THREADS_N of thread-row t / THREADS_N, holding rows offs_m +
-// (t / THREADS_N + i * THREADS_M) * row_step and packs offs_n / P +
-// t % THREADS_N + k * THREADS_N. Every rank's is `T v[WORLD][ROWS][K][P]`. The
-// shape is template ints only (WORLD, THREADS, THREADS_M, THREADS_N, TILE_N,
-// ...), THREADS_M * THREADS_N <= THREADS the block's; array extents are
-// deduced. A row past size_m loads the last row and a pack past size_n the last
-// pack; stores and column reductions skip them.
+// THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs, then the
+// scalars. A buffer is its pointer array with its size (a buffer only this rank has is a
+// one-entry array, `&x_ptr, 1`), its strides and its sizes, in elements; stride_n is 1 (the host
+// checks it; the packed loads need it). How a buffer is allocated is the host's (STANDARDS 3.2).
+// A thread's registers are a plain array the caller declares, `T v[ROWS][K][P]`, an input or an
+// output like a buffer: P a pack's elements (traits<T>::N), thread t lane t % THREADS_N of
+// thread-row t / THREADS_N, holding rows offs_m + (t / THREADS_N + i * THREADS_M) * row_step and
+// packs offs_n / P + t % THREADS_N + k * THREADS_N; every rank's is `T v[WORLD][ROWS][K][P]`.
+// The extents are deduced from the array: the array's shape is what the caller drills.
 //
-// CONCURRENCY IS PART OF EACH PRIMITIVE'S CONTRACT, so a kernel keeps it by
-// using them:
-//   1. Global memory only through the loads and stores here: a kernel never
-//      indexes a row.
-//   2. A thread's registers are loaded whole (load, every rank's or own: one round
-//      trip) before anything is stored; a pack loaded between stores waits a
-//      round trip, since a store may alias it.
-//   3. A load that does not depend on a reduction is issued before it
-//      (weights, the next row or source), so its round trip runs under the
-//      reduction.
+// CONCURRENCY IS PART OF EACH OP'S CONTRACT, so a kernel keeps it by using them:
+//   1. Global memory only through the loads and stores here: a kernel never indexes a row.
+//   2. A thread's registers are loaded whole (load, every rank's or own: one round trip) before
+//      anything is stored; a pack loaded between stores waits a round trip, since a store may
+//      alias it.
+//   3. A load that does not depend on a reduction is issued before it (weights, the next row or
+//      source), so its round trip runs under the reduction.
 //
-// THE TYPES a kernel names, by the section that defines them:
-//   HARDWARE    Hardware, kTarget, kWaveSize: the device's documented facts
-//   BUILD       kBuild: what is compiled for the device
-//   UTILS       traits<DTYPE>::N: a pack's elements, the P of an array
-//   REDUCE      Sum, Max (a reduction's operation)
-//   PEERS       StatusField, kStatusFields, kMaxRanks, kMaxBlocks (no type
-//               for the peers' memory: device arrays of pointers, each with
-//               its size)
-//   BARRIER     Until: what a barrier waits for (launched, visible, read)
-//   QUANTIZATION Quantization: what crosses the links (none, int4), kInt4Group
-//   COLLECTIVES Direction: where a reduce-scatter's sum goes (pull, push)
+// THE VOCABULARY, by the op that needs it:
+//   every op     DINLINE; vec<T, P> (a pack in a register); traits<T>::N (a pack's elements, P)
+//   load, store  u32x4, global_u32x4, global_u32, global_f16 (the global-instruction forms);
+//                Ranks; HIP_CUSTOM_COMMUNICATOR_DEBUG (the index checks)
+//   block_reduce Sum, Max (OP); ReduceAxis (AXIS); kWaveSize
+//   barrier      Until; the status buffer's StatusField, kStatusFields, Where, FlagState,
+//                FaultState (its protocol, which the host reads)
+//   the codec    Quantization; kInt4Group, kInt4GroupPacks, kInt4WordBytes, kInt4ScaleBytes;
+//                int4_scales_offset (where an encoded buffer keeps its scales, from its own
+//                sizes: the one address function); f32x2, bf16x2, kBf16
 
 #pragma once
 
 #include <hip/hip_runtime.h>
 
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
 
+#include "../hardware.cuh"
+
 namespace hip_custom_communicator {
-
-// =================================================================================================
-// HARDWARE
-//
-// THE HARDWARE: each target's facts, as the device and AMD's docs report them.
-// No decision lives here: BUILD derives what a build is from them,
-// select.cuh a launch from them, the input and each op's tuned kernels
-// (measured, each citing its sweep). A new target is one more `Hardware`;
-// `kTarget` is the one the host tunes for.
-// =================================================================================================
-
-constexpr int64_t kKiB = 1024;
-constexpr int64_t kMiB = 1024 * kKiB;
-constexpr int64_t kGiB = 1024 * kMiB;
-
-struct Hardware {
-  // The compute units.
-  int wave_size;         // lanes per wave
-  int max_workgroup;     // threads per block the device allows
-  int compute_units;     // across the device
-  int max_waves_per_cu;  // resident at once
-  int xcds;              // compute dies; each has its own L2
-  int simds_per_cu;      // a wave runs on one SIMD
-  // Per CU.
-  int64_t vgpr_file_bytes;  // vector registers, split over the SIMDs (4-byte
-                            // registers, per lane)
-  int64_t sgpr_file_bytes;  // scalar registers
-  int64_t lds_bytes;        // shared memory
-  int64_t l1_bytes;         // vector L1
-  // The memory system.
-  int cache_line_bytes;
-  int64_t l2_bytes_per_xcd;  // not shared across XCDs: a release to peers
-                             // writes it back
-  int64_t infinity_cache_bytes;
-  int64_t hbm_bytes;
-  double hbm_gbytes_per_s;  // peak
-  // The fabric to the peers.
-  int xgmi_links;                  // one to each peer in an 8-GPU node
-  double xgmi_gbytes_per_s_a_way;  // peak, one link, one direction
-  // The instruction set.
-  int max_load_bytes;  // the widest vector load or store a lane issues
-  int arch_vgprs;      // vector registers an instruction names (v0 up)
-  int acc_vgprs;       // accumulation registers beside them (a0 up), where the
-                       // compiler spills first
-  int vgpr_granule;  // a wave's vector registers are allocated in multiples of
-                     // it
-};
-
-// gfx950, AMD Instinct MI355X (MI350X is the same). Sources: `rocminfo` on n11
-// (2026-09-29, all 8 GPUs) for the compute units; ROCm's GPU hardware
-// specifications table (gpu-arch-specs) for the register files, caches and LDS;
-// ROCm's MI350 architecture page (gpu-arch/mi350) for the XCDs, HBM and fabric.
-// A link is 16 lanes at 38.4 Gbps: 76.8 GB/s a way, 7 of them "over 1 TB/s".
-constexpr Hardware kGfx950 = {
-    64,             // wave_size (gfx9 runs 64-lane waves only)
-    1024,           // max_workgroup
-    256,            // compute_units (32 active per XCD)
-    32,             // max_waves_per_cu
-    8,              // xcds
-    4,              // simds_per_cu
-    512 * kKiB,     // vgpr_file_bytes
-    12800,          // sgpr_file_bytes (12.5 KiB)
-    160 * kKiB,     // lds_bytes
-    32 * kKiB,      // l1_bytes
-    128,            // cache_line_bytes
-    4 * kMiB,       // l2_bytes_per_xcd
-    256 * kMiB,     // infinity_cache_bytes
-    288 * kGiB,     // hbm_bytes (8 stacks of 36)
-    8000.0,         // hbm_gbytes_per_s
-    7,              // xgmi_links
-    16 * 38.4 / 8,  // xgmi_gbytes_per_s_a_way
-    16,             // max_load_bytes (global_load_dwordx4; CDNA4 ISA guide)
-    256,            // arch_vgprs
-    256,            // acc_vgprs
-    8,              // vgpr_granule (LLVM AMDGPUUsage, gfx90a and later, wave64)
-};
-static_assert(kGfx950.compute_units % kGfx950.xcds == 0,
-              "every XCD has the same CUs");
-
-// THE TARGET: the one arch the build compiles device code for (gfx950,
-// CMakeLists.txt) and the host tunes for; `supported` refuses every other.
-constexpr const Hardware& kTarget = kGfx950;
-constexpr const char* kTargetArch = "gfx950";
-
-constexpr int kWaveSize = kTarget.wave_size;
-
-// THE MOST COMPUTE UNITS ON THE TARGET: for a layout host and device share
-// (the peers' signal block).
-constexpr int kMaxComputeUnits = kTarget.compute_units;
-
-// THE MOST BLOCKS RESIDENT AT ONCE ON THE TARGET: every CU full of
-// one-wave blocks, so the peers' signal block never rules out a grid. Whether
-// one kernel's grid is resident is its occupancy, which only the compiled
-// kernel knows (resident_blocks below, checked by select).
-constexpr int resident_waves(const Hardware& hw) {
-  return hw.compute_units * hw.max_waves_per_cu;
-}
-constexpr int kMaxResidentBlocks = resident_waves(kTarget);
-
-// THE MOST GPUS THAT CAN READ EACH OTHER'S MEMORY DIRECTLY: a link to every
-// peer (the full xGMI mesh of one node), so a peer group is at most the links
-// plus one. Beyond it there is no load path, only a network collective.
-constexpr int kMaxPeers = kTarget.xgmi_links + 1;
-
-// THE MACHINE MODEL: what the device holds, from its `Hardware`.
-
-// Vector registers a thread may use when a block of `threads` must fit on one
-// CU (a kernel's
-// __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block
-// puts there, and at most the architectural and accumulation registers
-// together.
-constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
-  const int waves = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane =
-      hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int64_t v = per_lane / waves_on_simd;
-  const int64_t cap = hw.arch_vgprs + hw.acc_vgprs;
-  return static_cast<int>(v < cap ? v : cap);
-}
-
-// WHAT ONE COMPILED KERNEL USES, as the code object records it: a thread's
-// vector registers and a block's LDS. Only the compiler knows them, so they are
-// read at run time (Handle::resources_of).
-struct Resources {
-  int vgprs;
-  int64_t lds_bytes;
-};
-
-// THE MOST BLOCKS OF A KERNEL RESIDENT AT ONCE ON THE DEVICE: on each CU, as
-// many as its wave slots, its SIMDs' register files and its LDS hold. A peer
-// barrier spins until the same block on every peer arrives, so a grid past it
-// can hang.
-constexpr int resident_blocks(const Hardware& hw, Resources r, int threads) {
-  const int waves = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane =
-      hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int used = r.vgprs < 1 ? 1 : r.vgprs;
-  const int vgprs =
-      (used + hw.vgpr_granule - 1) / hw.vgpr_granule * hw.vgpr_granule;
-  int64_t per_cu = hw.max_waves_per_cu / waves;
-  const int64_t by_registers = per_lane / vgprs / waves_on_simd;
-  if (by_registers < per_cu) per_cu = by_registers;
-  if (r.lds_bytes > 0 && hw.lds_bytes / r.lds_bytes < per_cu)
-    per_cu = hw.lds_bytes / r.lds_bytes;
-  return static_cast<int>(per_cu * hw.compute_units);
-}
-
-// THE COMPILER'S WAVE SIZE AGREES with the target's, or the in-wave shuffles
-// are wrong.
-#if defined(__AMDGCN_WAVEFRONT_SIZE)
-static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize,
-              "HARDWARE's wave size is not the compiler's");
-#endif
-
-// =================================================================================================
-// BUILD
-//
-// THE BUILD: every number fixed at compile time, derived from the device's
-// `Hardware` (HARDWARE) and nothing else; what depends on the input is
-// select's (select.cuh), at run time. A number neither gives is a policy: one
-// named line in `derive`.
-// =================================================================================================
-
-// A TENSOR'S ELEMENT TYPE, as the build names it. f32 is a norm weight's, not a
-// call's.
-enum class DType { f16, bf16, f32 };
-
-constexpr const char* to_string(DType d) {
-  switch (d) {
-    case DType::f16:
-      return "f16";
-    case DType::bf16:
-      return "bf16";
-    case DType::f32:
-      return "f32";
-  }
-  return "unknown";
-}
-
-// EVERYTHING THE BUILD FIXES, in one value: what is compiled, the memory and
-// its unit, and the kernels' launch geometry. Python reads a projection of it
-// (`build_info`).
-struct BuildInfo {
-  struct Supports {
-    std::array<DType, 2>
-        dtypes;  // a call's; dispatch instantiates exactly these
-    std::array<int, 3> worlds;
-  };
-  struct Memory {
-    int pack_bytes;  // a pack: the unit every kernel loads, sums and stores in
-  };
-  struct Kernels {
-    int max_threads;  // the widest block, and every kernel's __launch_bounds__
-    int max_waves;    // its waves
-  };
-  Supports supports;
-  Memory memory;
-  Kernels kernels;
-};
-
-constexpr BuildInfo derive(const Hardware& hw) {
-  BuildInfo info{};
-  // WHAT IS COMPILED, one list each: dispatch instantiates exactly these, check
-  // refuses the rest.
-  info.supports = {{DType::f16, DType::bf16}, {2, 4, 8}};
-
-  BuildInfo::Memory& m = info.memory;
-  // A PACK IS THE WIDEST LOAD, as in vLLM's and aiter's custom all-reduce and
-  // NCCL.
-  m.pack_bytes = hw.max_load_bytes;
-  // THE EXCHANGE (partials and inputs) IS NOT HERE: it is sized at open from
-  // the largest call the communicator serves (select.cuh's `exchange_sizes`),
-  // never a constant.
-
-  BuildInfo::Kernels& b = info.kernels;
-
-  // THE WIDEST BLOCK WHOSE THREADS KEEP EVERY ARCHITECTURAL REGISTER. A bound
-  // is a register trade: at 1024 threads a gfx950 thread gets 128 and the row
-  // kernels spill (AttnRes at 2 packs; ISA 2026-09-29T23-48-40Z).
-  b.max_threads = hw.wave_size;
-  for (int t = hw.wave_size; t <= hw.max_workgroup; t += hw.wave_size)
-    if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
-  b.max_waves = b.max_threads / hw.wave_size;
-
-  return info;
-}
-
-// THIS COMPILE PASS'S BUILD: the device code for its own target, the host for
-// the tuning target.
-constexpr BuildInfo kBuild = derive(kTarget);
-
-// WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly
-// these.
-template <typename ELEMENT, size_t NUM_BUILT>
-constexpr bool built_in(const std::array<ELEMENT, NUM_BUILT>& built,
-                        ELEMENT x) {
-  for (const ELEMENT& b : built)
-    if (b == x) return true;
-  return false;
-}
-constexpr bool dtype_built(DType d) {
-  return built_in(kBuild.supports.dtypes, d);
-}
-constexpr bool world_built(int world) {
-  return built_in(kBuild.supports.worlds, world);
-}
-
-static_assert(kBuild.kernels.max_threads <= kTarget.max_workgroup &&
-                  kBuild.kernels.max_threads % kWaveSize == 0,
-              "the block limit must be whole waves the device can launch");
-
-// =================================================================================================
-// UTILS
-//
-// THE HELPERS every op and kernel uses: the pack (16 bytes, the unit everything
-// loads, sums and stores in), and every source's packs in registers.
-// =================================================================================================
 
 #define DINLINE __device__ __forceinline__
 
+// A PACK IN A REGISTER, the unit load and store move and every op sums in.
 template <typename DTYPE, int VEC_SIZE>
 struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {
   DTYPE d[VEC_SIZE];
 };
 
-// A PACK: kBuild.memory.pack_bytes (BUILD: the widest load, 8 bf16), the unit
-// every kernel loads, sums and stores in; traits<DTYPE>::N its elements, the P
-// of a thread's registers.
+// A PACK: kBuild.memory.pack_bytes (hardware.cuh's BUILD: the widest load, 8 bf16);
+// traits<DTYPE>::N its elements, the P of a thread's registers.
 template <typename DTYPE>
 struct traits {
   static constexpr int N = kBuild.memory.pack_bytes / sizeof(DTYPE);
 };
 
-// =================================================================================================
-// MEMORY
-//
-// THE READS AND WRITES' TYPES: a pack moves as one 16-byte global instruction (global_u32x4), the
-// form load and store (LOAD AND STORE) and the collectives' walks write their accesses in.
-// =================================================================================================
-
-// PEER MEMORY THROUGH GLOBAL INSTRUCTIONS. A pointer read out of a struct has
-// no address space the compiler can prove, so it emits `flat_load`, which
-// checks the aperture and waits on both counters; casting to address space 1
+// PEER MEMORY THROUGH GLOBAL INSTRUCTIONS (load, store, and the collectives' inline walks). A
+// pointer read out of an array has no address space the compiler can prove, so it emits
+// `flat_load`, which checks the aperture and waits on both counters; casting to address space 1
 // gives `global_load_dwordx4` / `global_store_dwordx4`.
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) u32x4 global_u32x4;
@@ -514,37 +220,17 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
   }
 }
 
-// =================================================================================================
-// PEERS
-//
-// THE RANKS' MEMORY: every rank's buffers as plain tensors the reads and writes
-// take, and the types a kernel takes them in. A RANK'S MEMORY, two places:
-//   ours, ONE allocation a rank, its ARENA (handle.cuh), exchanged over legacy
-//   HIP IPC at open, so every peer's is opened in this process at an address
-//   of the runtime's choosing:
-//     [ signals | inputs | partials ]  at the same offsets on every rank
-//       inputs: a fused kernel's copied-in input, which its peers read; the
-//         plain all-reduce's INBOX, [writer slot, ...], which its peers push
-//         into and it sums locally
-//       partials: a two-shot's sums, which its peers read (or push into)
-//   each handed to a kernel as its own device array of every rank's address
-//   of it (`x_ptr_array`, `x_ptr_array_size`) with its strides and its sizes
-//   (rank r's is `x_ptr_array[r]`); the
-//   caller's, one tensor a call:
-//     [ input ]   never read by a peer: a fused kernel copies it into this
-//                 rank's inputs (or, int4, quantized into the inputs' INT4
-//                 values), the plain all-reduce pushes it into the peers'
-//                 inboxes, before the first barrier, which is ordered
-// A buffer is read or written by load / store, ordered
-// only by BARRIER's `barrier`. The signals are BARRIER's, never read as
-// data.
-// =================================================================================================
+// AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
+// (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size)) __builtin_trap();` at each
+// index, compiled out of a release build, which passes the sizes and reads none): one outside is a
+// programming error, not a peer's fault, so it traps. load, store and barrier check their indices.
+#ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
+  #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
+#endif
 
-constexpr int kMaxRanks = kMaxPeers;
-// ONE SIGNAL SLOT PER BLOCK THE HARDWARE CAN HOLD RESIDENT, on any target
-// built: the signal block never rules out a grid. Which grid is fast is
-// select's (select.cuh).
-constexpr int kMaxBlocks = kMaxResidentBlocks;
+// =================================================================================================
+// THE STATUS: barrier's fault protocol, which the host reads (handle.cuh, log.cuh)
+// =================================================================================================
 
 // WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's
 // `Where`, number for number. 0 is no fault.
@@ -552,16 +238,6 @@ enum class Where : uint32_t {
   start = 1,     // a launch's first barrier: the peer had not launched
   peer_barrier,  // a later barrier
 };
-constexpr int kWhereCount = 2;  // numbered from 1
-constexpr const char* to_string(Where w) {
-  switch (w) {
-    case Where::start:
-      return "start";
-    case Where::peer_barrier:
-      return "peer_barrier";
-  }
-  return "?";
-}
 
 // A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it
 // and sets `abort` while a kernel still runs, and a graph replay, which runs
@@ -609,14 +285,6 @@ enum class StatusField : int {
 };
 constexpr int kStatusFields = 10;
 
-#ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
-  #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
-#endif
-// AN INDEX INSIDE ITS BUFFER'S SIZE is checked in debug builds only (`if
-// (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size)) __builtin_trap();` at each
-// index, compiled out of a release build, which passes the sizes and reads none): one outside is a
-// programming error, not a peer's fault, so it traps.
-
 // =================================================================================================
 // BARRIER
 //
@@ -663,7 +331,7 @@ constexpr int kStatusFields = 10;
 // torch.distributed's across back-to-back calls on the same buffers, and the
 // signals' return to clear after every launch. Each flag is touched only
 // atomically (the `__scoped_atomic` builtins), all of it in the one function `barrier`. A rank's
-// data buffers are PEERS's.
+// data buffers are the kernels' (load, store).
 //
 // NOTHING SURVIVES A LAUNCH: every flag is 0 between launches. A barrier sets 1
 // in each peer's slot for it, waits for 1 in each of its own, and sets those
@@ -678,7 +346,7 @@ constexpr int kStatusFields = 10;
 // A WAIT NEVER HANGS AND NEVER TRAPS: past the timeout it writes the rank's
 // fault record (where, which peer, the count against the one wanted) and leaves
 // the kernel, and every wait leaves once the status's `abort` is set; the host
-// reads the status (PEERS's `StatusField`). HIP_CUSTOM_COMMUNICATOR_DEBUG=1
+// reads the status (THE STATUS's `StatusField`). HIP_CUSTOM_COMMUNICATOR_DEBUG=1
 // skews every wait by a random per-block delay, so a race shows on every run.
 // =================================================================================================
 
@@ -853,7 +521,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
 // ARE, so each is rounded against the scale stored; an element is (q - 8) * scale. A quantized buffer is two
 // buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32] fp16), each a pointer, its
 // strides and its sizes. Every function that moves the exchange takes a QUANTIZATION and both forms
-// of each buffer it moves (the COLLECTIVES, all_gather); load and store
+// of each buffer it moves (reduce_scatter, all_gather); load and store
 // take QUANTIZATION and work out the INT4 payload's layout from the region's own sizes. A LOAD DEQUANTIZES INTO
 // ITS REGISTERS' DTYPE, each element rounded once, as quick reduce lands its values in its dtype; a
 // sum is fp32 and quantized from fp32.
@@ -861,7 +529,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
 // of 4 consecutive lanes: a layout's THREADS_N and offs_n are whole groups, and its scale is the
 // lanes' largest magnitude, two DPP steps with every lane of the quad active. One thread holding a
 // whole group of every peer was 46-62 registers and spilled (the int4-wip prototype); the flat
-// walk's (COLLECTIVES) holds one, a group a thread: the plain kernel 135 VGPRs, none spilled (ISA
+// walk's (reduce_scatter.cuh) holds one, a group a thread: the plain kernel 135 VGPRs, none spilled (ISA
 // 2026-10-16T03-10-32Z).
 // =================================================================================================
 
@@ -878,33 +546,17 @@ constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's valu
 constexpr int kInt4WordBytes = 4;        // a pack's values
 constexpr int kInt4ScaleBytes = 2;       // a group's scale
 
-// INT4 IS AN ENCODING OF A PAYLOAD, NOT A REGION (handle.cuh's region layout): an [m, n] payload
-// published INT4 lies inside the region that holds it exact (inputs, partials), its values from
-// the region's start ([m, n / 2] bytes, rows back to back), its scales at kInt4ScalesAlign past
-// them ([m, n / 32] fp16). The offset is the call's m and n alone, so every rank computes the
-// same one; `int4_payload_bytes` is what the region must hold (select.cuh sizes it).
+// AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
+// (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a
+// row's stride n / 2); its scales at int4_scales_offset(m, n) bytes past it, [m, n / kInt4Group]
+// fp16 (a row's stride n / kInt4Group). The offset is the buffer's own m and n alone (STANDARDS
+// 3.2: where an encoded buffer keeps its scales is worked out from its own sizes), so every rank
+// computes the same one. What a buffer must hold for it is the host's (select.cuh's
+// int4_payload_bytes).
 constexpr int64_t kInt4ScalesAlign = 256;
-__host__ __device__ constexpr int64_t int4_values_bytes(int64_t m, int64_t n) {
-  return m * n / 2;
-}
-__host__ __device__ constexpr int64_t int4_scales_bytes(int64_t m, int64_t n) {
-  return m * (n / kInt4Group) * kInt4ScaleBytes;
-}
 __host__ __device__ constexpr int64_t int4_scales_offset(int64_t m, int64_t n) {
-  return (int4_values_bytes(m, n) + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
+  return (m * n / 2 + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
 }
-__host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
-  return int4_scales_offset(m, n) + int4_scales_bytes(m, n);
-}
-
-// AN [m, n] INT4 PAYLOAD IN A REGION: its values and its scales, each a buffer of its own (inside
-// the region, from its own address, `x_ptr_array[r]`, its strides and its sizes, in its own elements:
-// bytes, fp16), both dense rows. From the region's byte offset and the call's [m, n]: the values at
-// the region's offset, [m, int4_values_size_n(n)]; the scales at the region's offset plus
-// int4_scales_offset(m, n), [m, int4_scales_size_n(n)]; each row's stride its size_n, the column's
-// 1. A kernel computes them where it starts.
-__host__ __device__ constexpr int int4_values_size_n(int n) { return n / 2; }
-__host__ __device__ constexpr int int4_scales_size_n(int n) { return n / kInt4Group; }
 
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
@@ -1199,8 +851,8 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   } else {
     static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
     // The buffer's INT4 payload, from its own sizes (the INT4 payload layout).
-    const int64_t values_stride_m = int4_values_size_n(input_size_n);
-    const int64_t scales_stride_m = int4_scales_size_n(input_size_n);
+    const int64_t values_stride_m = input_size_n / 2;
+    const int64_t scales_stride_m = input_size_n / kInt4Group;
     const int64_t scales_at = int4_scales_offset(input_size_m, input_size_n);
     // Every copy's words and scales, the position once a pack in a vector register (32-BIT BYTE
     // OFFSETS: a quantized buffer is ours, at most the box's, select's exchange_sizes), each
@@ -1344,8 +996,8 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
       for (int k = 0; k < K; ++k)
         encode<1>(reinterpret_cast<const U(&)[1][P]>(input[i][k]),
                   reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
-    const int64_t values_stride_m = int4_values_size_n(output_size_n);
-    const int64_t scales_stride_m = int4_scales_size_n(output_size_n);
+    const int64_t values_stride_m = output_size_n / 2;
+    const int64_t scales_stride_m = output_size_n / kInt4Group;
     const int64_t scales_at = int4_scales_offset(output_size_m, output_size_n);
 #pragma unroll
     for (int i = 0; i < ROWS; ++i) {
@@ -1372,53 +1024,4 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
   }
 }
 
-// =================================================================================================
-// COLLECTIVES
-//
-// THE COLLECTIVES' STEPS, buffers to buffers: one tested and tuned way to do
-// each, which the kernels call rather than write again (the fused AttnRes
-// pull's own reduce-scatter took 1.6x the plain two-shot's cycles for its
-// bytes, thread traces 2026-10-04T21-03-09Z and 21-26-11Z).
-// =================================================================================================
-
-// THE LOADS ARE THE COMMUNICATION: a rank's pointer points into its memory,
-// opened in this process over IPC (PEERS), so loading reads it over the links; the sum
-// and the store are local. The kernel syncs around these calls (the barriers):
-// before, every peer's data is ready; between the reduce-scatter and the
-// all-gather, every rank's sums are visible. RANKS ARE READ ROTATED, rank + w's
-// w-th, so at any moment the GPUs read different peers; each range or slice is
-// summed by one rank, so the order differing by rank is harmless.
-//
-// THE FLAT WALK (the plain two-shot): an elementwise [R, M, N] problem -- R
-// ranks' copies of an [M, N] buffer, each at its own strides -- WALKED AS
-// [R, 1, M*N]: the rows are only the buffer's layout, so the elements are
-// numbered row-major (e = row * N + col, reduce_scatter's element_at) and each rank's SHARE is one
-// contiguous range of them, a TILE_N chunk a step. WHY: the links and HBM
-// reward long reads from each peer. Cut a row at a time, a rank's share was its
-// slice of every row -- 1.8 KB runs at N = 7168, the plain all-reduce +2%
-// against the flat walk; 128-column tiles, 256 B runs, +3-7% (2026-10-11) --
-// while a contiguous buffer's range is one run of the whole share. IT SERVES
-// BADLY a strided buffer: its runs are its rows wherever it has them, and each
-// pack's row and column are divided out. The walk is the same for every step
-// and every rank, so a block reads in the all-gather what the same block on
-// each rank wrote in the reduce-scatter. A RANK'S COPY OF A CHUNK IS LANES =
-// THREADS / WORLD threads, whole waves (its rank's pointer one scalar select;
-// every rank's held up front was ~20 scalar loads before the first barrier).
-//
-// CONTIGUOUS, whether an [*, n] buffer's rows are back to back so its range is
-// one run, is a template parameter of the kernel, its instance chosen on the
-// host from the strides as given. A compile-time choice, not a branch in the
-// kernel: both paths in one kernel cost ~0.1 us a call at 128-512 tokens
-// against the contiguous path alone (the strided code and its registers,
-// 2026-10-12T01-17-18Z).
-
-// WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
-// reads its peers and keeps the sum in its partials; push, the sum is stored in every rank's
-// (itself too), so after the sync each rank holds the whole sum locally.
-enum class Direction : int { pull = 0, push = 1 };
-// HOW reduce_scatter AND all_gather WALK THE DATA (reduce_scatter.cuh, all_gather.cuh): flat, the
-// elements numbered row-major and a rank's share a contiguous range (above); rows, a rank's columns
-// of every row. And where reduce_scatter sums a rank's copies: through LDS or in registers.
-enum class Walk : int { flat = 0, rows = 1 };
-enum class Accumulate : int { lds = 0, registers = 1 };
 }  // namespace hip_custom_communicator

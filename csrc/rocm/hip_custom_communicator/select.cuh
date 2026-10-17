@@ -38,6 +38,12 @@
 
 namespace hip_custom_communicator {
 
+// WHAT A BUFFER MUST HOLD FOR AN [m, n] INT4 PAYLOAD (kernels/common.cuh's layout): the values,
+// then the scales at int4_scales_offset.
+constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
+  return int4_scales_offset(m, n) + m * (n / kInt4Group) * kInt4ScaleBytes;
+}
+
 // =================================================================================================
 // THE CATALOG: each template, and the BuildConfigs it is built for.
 // =================================================================================================

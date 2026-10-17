@@ -18,6 +18,7 @@
 #include <variant>
 
 #include "kernels/common.cuh"
+#include "kernels/reduce_scatter.cuh"
 
 namespace hip_custom_communicator {
 

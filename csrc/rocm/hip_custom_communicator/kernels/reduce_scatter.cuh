@@ -3,7 +3,7 @@
 //
 // THE REDUCE-SCATTER, written once with the common ops (load, store, barrier, block_reduce, the
 // codec): from every rank's input to every rank's sums in the partials, visible to its peers. Its
-// variations are template parameters, its walks written inline (common.cuh's COLLECTIVES says why
+// variations are template parameters, its walks written inline (the head of this file says why
 // each walk is the one it is).
 
 #pragma once
@@ -11,6 +11,53 @@
 #include "common.cuh"
 
 namespace hip_custom_communicator {
+
+// THE COLLECTIVES (reduce_scatter here, all_gather in all_gather.cuh, which walks the same
+// walk): one tested and tuned way to do each, which the kernels call rather than write again
+// (the fused AttnRes pull's own reduce-scatter took 1.6x the plain two-shot's cycles for its
+// bytes, thread traces 2026-10-04T21-03-09Z and 21-26-11Z). Their vocabulary (Direction, Walk,
+// Accumulate) is theirs, here; types.cuh's forcing names Direction too.
+
+// THE LOADS ARE THE COMMUNICATION: a rank's pointer points into its memory,
+// opened in this process over IPC (handle.cuh), so loading reads it over the links; the sum
+// and the store are local. The kernel syncs around these calls (the barriers):
+// before, every peer's data is ready; between the reduce-scatter and the
+// all-gather, every rank's sums are visible. RANKS ARE READ ROTATED, rank + w's
+// w-th, so at any moment the GPUs read different peers; each range or slice is
+// summed by one rank, so the order differing by rank is harmless.
+//
+// THE FLAT WALK (the plain two-shot): an elementwise [R, M, N] problem -- R
+// ranks' copies of an [M, N] buffer, each at its own strides -- WALKED AS
+// [R, 1, M*N]: the rows are only the buffer's layout, so the elements are
+// numbered row-major (e = row * N + col, reduce_scatter's element_at) and each rank's SHARE is one
+// contiguous range of them, a TILE_N chunk a step. WHY: the links and HBM
+// reward long reads from each peer. Cut a row at a time, a rank's share was its
+// slice of every row -- 1.8 KB runs at N = 7168, the plain all-reduce +2%
+// against the flat walk; 128-column tiles, 256 B runs, +3-7% (2026-10-11) --
+// while a contiguous buffer's range is one run of the whole share. IT SERVES
+// BADLY a strided buffer: its runs are its rows wherever it has them, and each
+// pack's row and column are divided out. The walk is the same for every step
+// and every rank, so a block reads in the all-gather what the same block on
+// each rank wrote in the reduce-scatter. A RANK'S COPY OF A CHUNK IS LANES =
+// THREADS / WORLD threads, whole waves (its rank's pointer one scalar select;
+// every rank's held up front was ~20 scalar loads before the first barrier).
+//
+// CONTIGUOUS, whether an [*, n] buffer's rows are back to back so its range is
+// one run, is a template parameter of the kernel, its instance chosen on the
+// host from the strides as given. A compile-time choice, not a branch in the
+// kernel: both paths in one kernel cost ~0.1 us a call at 128-512 tokens
+// against the contiguous path alone (the strided code and its registers,
+// 2026-10-12T01-17-18Z).
+
+// WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
+// reads its peers and keeps the sum in its partials; push, the sum is stored in every rank's
+// (itself too), so after the sync each rank holds the whole sum locally.
+enum class Direction : int { pull = 0, push = 1 };
+// HOW reduce_scatter AND all_gather WALK THE DATA (reduce_scatter.cuh, all_gather.cuh): flat, the
+// elements numbered row-major and a rank's share a contiguous range (above); rows, a rank's columns
+// of every row. And where reduce_scatter sums a rank's copies: through LDS or in registers.
+enum class Walk : int { flat = 0, rows = 1 };
+enum class Accumulate : int { lds = 0, registers = 1 };
 
 // [PUSH OR STAGE] BARRIER(UNTIL, 0) SUM BARRIER(visible, 1): before the first barrier, a pushed
 // walk stores every rank's share of this rank's input in that rank's staging at this rank's slot,
@@ -449,8 +496,8 @@ DINLINE void reduce_scatter(
       // VGPRs), so its loads are the words and scales, every rank's at its staging's place.
       const uint8_t* input_values[WORLD];
       const __fp16* input_scales[WORLD];
-      [[maybe_unused]] const int64_t values_stride_m = int4_values_size_n(staging_size_n);
-      [[maybe_unused]] const int64_t scales_stride_m = int4_scales_size_n(staging_size_n);
+      [[maybe_unused]] const int64_t values_stride_m = staging_size_n / 2;
+      [[maybe_unused]] const int64_t scales_stride_m = staging_size_n / kInt4Group;
       if constexpr (kInt4) {
 #pragma unroll
         for (int r = 0; r < WORLD; ++r) {

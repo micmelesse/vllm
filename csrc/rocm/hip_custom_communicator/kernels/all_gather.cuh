@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "common.cuh"
+#include "reduce_scatter.cuh"  // the walk all_gather walks (a block reads what its twin wrote)
 
 namespace hip_custom_communicator {
 
@@ -191,8 +192,8 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     } else {
       static_assert(THREADS % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
       // The partials' INT4 payload, from their own sizes (the INT4 payload layout).
-      const int64_t values_stride_m = int4_values_size_n(partials_size_n);
-      const int64_t scales_stride_m = int4_scales_size_n(partials_size_n);
+      const int64_t values_stride_m = partials_size_n / 2;
+      const int64_t scales_stride_m = partials_size_n / kInt4Group;
       const int64_t scales_offset = int4_scales_offset(partials_size_m, partials_size_n);
       uint32_t words[ROWS][K];
       float scales[ROWS][K];
