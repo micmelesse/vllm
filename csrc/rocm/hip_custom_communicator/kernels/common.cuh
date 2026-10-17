@@ -26,8 +26,8 @@
 // PLACE through the INPUT TABLE (below); INT4, a kernel first quantizes it into this rank's
 // inputs' INT4 values (`stage_rows`, an encoding) and its peers read them there; the plain
 // all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or each rank's
-// share of it) into the peers' inputs, each rank's INBOX, at its own slot (`peers_store`,
-// `push_shares`), and sums its own inbox locally (`slots_load`, `reduce_slots`). Either way the
+// share of it) into the peers' inputs, each rank's INBOX, at its own slot (`store`'s every rank,
+// `push_shares`), and sums its own inbox locally (`load`'s every slot, `reduce_slots`). Either way the
 // first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_ptr_array` with
 // `inputs_ptr_array_size` (the world), a device array of every rank's input address (aiter's
 // RankData*), rank r's input at inputs_ptr_array[r] at the inputs' strides. The kernel reads every rank's input where the table says, in place, and never
@@ -48,7 +48,7 @@
 // using them:
 //   1. Global memory only through the loads and stores here: a kernel never
 //      indexes a row.
-//   2. A thread's registers are loaded whole (load, peers_load: one round
+//   2. A thread's registers are loaded whole (load, every rank's or own: one round
 //      trip) before anything is stored; a pack loaded between stores waits a
 //      round trip, since a store may alias it.
 //   3. A load that does not depend on a reduction is issued before it
@@ -585,124 +585,6 @@ DINLINE void pack_store(PACK* p, const PACK& v) {
     *p = v;
 }
 
-// A LOAD NEVER BRANCHES: a thread outside a narrow layout loads its clamped, in-bounds place and
-// its values go unused. Under a thread compare the load was an exec branch, so every array's
-// old registers stayed live across AttnRes's loops (ISA 2026-10-04T16-39-15Z).
-template <int THREADS_M, int THREADS_N, typename T, int ROWS, int K, int P>
-DINLINE void load_body(const T* input_ptr, int64_t input_stride_m, int input_size_m,
-                  int input_size_n, T (&output)[ROWS][K][P], int offs_m,
-                  int offs_n, int row_step) {
-  using V = vec<T, P>;
-  const V* at = reinterpret_cast<const V*>(input_ptr);
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (skips<ROWS, THREADS_M, THREADS_N>(input_size_m, offs_m, row_step, i))
-      continue;
-    const V* row =
-        at + int64_t{row_of<THREADS_M, THREADS_N>(input_size_m, offs_m,
-                                                   row_step, i)} *
-                 (input_stride_m / P);
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-      held(output[i][k],
-           pack_load(at_col<P, THREADS_N>(row, input_size_n, offs_n, k)));
-  }
-  issued();
-}
-
-template <int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS,
-          int K, int P>
-DINLINE void store_body(const T (&input)[ROWS][K][P], T* output_ptr,
-                   int64_t output_stride_m, int output_size_m,
-                   int output_size_n, int offs_m, int offs_n, int row_step) {
-  using V = vec<T, P>;
-  if (!holds<THREADS_M, THREADS_N, THREADS>()) return;
-  V* at = reinterpret_cast<V*>(output_ptr);
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (!row_live<THREADS_M, THREADS_N>(output_size_m, offs_m, row_step, i))
-      continue;
-    V* row = at + int64_t{row_of<THREADS_M, THREADS_N>(output_size_m, offs_m,
-                                                        row_step, i)} *
-                      (output_stride_m / P);
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      if (pack_mask<P, THREADS_N>(output_size_n, offs_n, k) == 0.0f) continue;
-      if constexpr (sizeof(V) == 16)
-        global_store(at_col<P, THREADS_N>(row, output_size_n, offs_n, k),
-                     pack(input[i][k]));
-      else
-        *at_col<P, THREADS_N>(row, output_size_n, offs_n, k) = pack(input[i][k]);
-    }
-  }
-}
-
-// EVERY PEER'S, all in flight together, rank r's buffer at input[r] (computed once). A
-// pack position at a time, every rank's for it, so the address is computed once a position (the
-// other way round cost 16 scalar instructions at two packs: ISA 2026-10-01T00-31-14Z). Nothing
-// waits until the registers are used, so loads issued here run under other work.
-template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
-          int P>
-DINLINE void peers_load_body(const T* const (&input)[WORLD], int64_t input_stride_m,
-                        int input_size_m, int input_size_n,
-                        T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step) {
-  using V = vec<T, P>;
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (skips<ROWS, THREADS_M, THREADS_N>(input_size_m, offs_m, row_step, i))
-      continue;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the
-      // row's uniform part was added to every rank's base in scalar registers,
-      // an add and a carry a rank (16 instructions a tile at eight ranks, the
-      // plain all-reduce against the flat walk: ISA 2026-10-11); held in a
-      // VGPR, each rank's address is one shift-and-add of it.
-      const int64_t stride = input_stride_m / P;
-      int64_t at = int64_t{row_of<THREADS_M, THREADS_N>(input_size_m, offs_m,
-                                                         row_step, i)} *
-                       stride +
-                   pack_of<P, THREADS_N>(input_size_n, offs_n, k);
-      asm volatile("" : "+v"(at));
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        held(output[r][i][k],
-             pack_load(reinterpret_cast<const V*>(input[r]) + at));
-    }
-  }
-  issued();
-}
-
-// EVERY PEER'S, THE PUSH: the same registers stored at the same place of every rank's buffer
-// (rank r's at output[r]), a pack position at a time, every rank's store for it issued together
-// (the position once, as peers_load's). A store into a peer's memory is posted: nothing here
-// waits; the next ordered barrier's release completes and publishes them (BARRIER).
-template <int THREADS_M, int THREADS_N, int THREADS, typename T, int WORLD, int ROWS,
-          int K, int P>
-DINLINE void peers_store_body(const T (&input)[ROWS][K][P], T* const (&output)[WORLD],
-                         int64_t output_stride_m, int output_size_m, int output_size_n,
-                         int offs_m, int offs_n, int row_step) {
-  using V = vec<T, P>;
-  if (!holds<THREADS_M, THREADS_N, THREADS>()) return;
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (!row_live<THREADS_M, THREADS_N>(output_size_m, offs_m, row_step, i)) continue;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      if (pack_mask<P, THREADS_N>(output_size_n, offs_n, k) == 0.0f) continue;
-      int64_t at = int64_t{row_of<THREADS_M, THREADS_N>(output_size_m, offs_m, row_step,
-                                                         i)} *
-                       (output_stride_m / P) +
-                   pack_of<P, THREADS_N>(output_size_n, offs_n, k);
-      asm volatile("" : "+v"(at));
-#pragma unroll
-      for (int r = 0; r < WORLD; ++r)
-        pack_store(reinterpret_cast<V*>(output[r]) + at, pack(input[i][k]));
-    }
-  }
-}
-
 // A ROW'S SCALAR (a norm's scale), one float a row: thread 0 stores it.
 DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   if (threadIdx.x == 0)
@@ -1051,8 +933,7 @@ DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator
 //                 rank's inputs (or, int4, quantized into the inputs' INT4
 //                 values), the plain all-reduce pushes it into the peers'
 //                 inboxes, before the first barrier, which is ordered
-// A buffer is read or written by load / store / peers_load / peers_store /
-// slots_load, ordered
+// A buffer is read or written by load / store, ordered
 // only by BARRIER's `barrier`. The signals are BARRIER's, never read as
 // data.
 // =================================================================================================
@@ -1445,8 +1326,8 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
 // ARE, so each is rounded against the scale stored; an element is (q - 8) * scale. A quantized buffer is two
 // buffers, its values ([m, n / 2] bytes) and its scales ([m, n / 32] fp16), each a pointer, its
 // strides and its sizes. Every function that moves the exchange takes a QUANTIZATION and both forms
-// of each buffer it moves (MEMORY's load, store, peers_load and all_gather; the COLLECTIVES), and
-// with none is the function it was, the quantized form's arguments unread. A LOAD DEQUANTIZES INTO
+// of each buffer it moves (the COLLECTIVES, all_gather); load and store
+// take QUANTIZATION and work out the INT4 payload's layout from the region's own sizes. A LOAD DEQUANTIZES INTO
 // ITS REGISTERS' DTYPE, each element rounded once, as quick reduce lands its values in its dtype; a
 // sum is fp32 and quantized from fp32.
 // A THREAD'S PACK IS ONE WORD OF ITS GROUP (8 elements of a 16-bit dtype), so a group is the packs
@@ -1686,34 +1567,6 @@ DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)
     for (int k = 0; k < K; ++k) decode(words[i][k], scales[i][k], output[i][k]);
 }
 
-// load, store, peers_load and all_gather (MEMORY's) on a quantized buffer: the same places, a word
-// and a scale a pack, the sizes the tensor's in elements. Every word and scale in flight before the
-// first is decoded.
-template <int THREADS_M, int THREADS_N, typename U, int ROWS, int K, int P>
-DINLINE void int4_load(const uint8_t* values_ptr, int64_t values_stride_m,
-                       const __fp16* scales_ptr, int64_t scales_stride_m, int size_m,
-                       int size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
-                       int row_step) {
-  static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-  uint32_t words[ROWS][K];
-  float scales[ROWS][K];
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i) {
-    if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
-    const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
-    const uint8_t* values_row = values_ptr + row * values_stride_m;
-    const __fp16* scales_row = scales_ptr + row * scales_stride_m;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
-      words[i][k] = int4_word_load(values_row, pack);
-      scales[i][k] = int4_scale_load(scales_row, pack);
-    }
-  }
-  issued();
-  int4_decode(words, scales, output);
-}
-
 template <int THREADS_M, int THREADS_N, int THREADS, int ROWS, int K>
 DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
                         uint8_t* values_ptr, int64_t values_stride_m, __fp16* scales_ptr,
@@ -1738,7 +1591,7 @@ DINLINE void int4_store(const uint32_t (&words)[ROWS][K], const float (&scales)[
   }
 }
 
-// Every peer's words and scales, the position once a pack in a vector register (peers_load's),
+// Every peer's words and scales, the position once a pack in a vector register (load's every rank),
 // each rank's word and scale an add of it; all in flight, none waited on.
 template <int THREADS_M, int THREADS_N, int P, int WORLD, int ROWS, int K>
 DINLINE void int4_peers_issue(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
@@ -1772,20 +1625,6 @@ DINLINE void int4_peers_issue(const uint8_t* const (&values)[WORLD], int64_t val
   }
   issued();
 }
-template <int THREADS_M, int THREADS_N, typename U, int WORLD, int ROWS, int K, int P>
-DINLINE void int4_peers_load(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
-                             const __fp16* const (&scales)[WORLD], int64_t scales_stride_m,
-                             int size_m, int size_n, U (&output)[WORLD][ROWS][K][P],
-                             int offs_m, int offs_n, int row_step) {
-  uint32_t words[WORLD][ROWS][K];
-  float group_scales[WORLD][ROWS][K];
-  int4_peers_issue<THREADS_M, THREADS_N, P>(values, values_stride_m, scales, scales_stride_m,
-                                            size_m, size_n, words, group_scales, offs_m,
-                                            offs_n, row_step);
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) int4_decode(words[r], group_scales[r], output[r]);
-}
-
 // EVERY PEER'S QUANTIZED PACKS SUMMED, peers_sum's: each element (q - 8) * scale landed in T, as a
 // quantized load lands it, then added in fp32 in rank order. From the words, no pack of every
 // peer made first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
@@ -1873,63 +1712,7 @@ DINLINE void int4_all_gather(char* const* partials_ptr_array, int partials_ptr_a
   int4_decode(words, scales, output);
 }
 
-// THE EXCHANGE'S MEMORY IN QUANTIZATION'S FORM, what the COLLECTIVES and the INTERFACE call: with
-// none MEMORY's own function on the plain buffer (the quantized form's arguments unread), with int4
-// the one above on its values and scales.
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int ROWS, int K, int P>
-DINLINE void exchanged_load(const T* input_ptr, int64_t input_stride_m,
-                            const uint8_t* values_ptr, int64_t values_stride_m,
-                            const __fp16* scales_ptr, int64_t scales_stride_m, int size_m,
-                            int size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
-                            int row_step) {
-  if constexpr (QUANTIZATION == Quantization::none)
-    load_body<THREADS_M, THREADS_N>(input_ptr, input_stride_m, size_m, size_n, output, offs_m,
-                               offs_n, row_step);
-  else
-    int4_load<THREADS_M, THREADS_N>(values_ptr, values_stride_m, scales_ptr,
-                                    scales_stride_m, size_m, size_n, output, offs_m,
-                                    offs_n, row_step);
-}
-
-template <int THREADS_M, int THREADS_N, int THREADS, int QUANTIZATION, typename T,
-          typename U, int ROWS, int K, int P>
-DINLINE void exchanged_store(const U (&input)[ROWS][K][P], T* output_ptr,
-                             int64_t output_stride_m, uint8_t* values_ptr,
-                             int64_t values_stride_m, __fp16* scales_ptr,
-                             int64_t scales_stride_m, int size_m, int size_n, int offs_m,
-                             int offs_n, int row_step) {
-  if constexpr (QUANTIZATION == Quantization::none) {
-    store_body<THREADS_M, THREADS_N, THREADS>(input, output_ptr, output_stride_m, size_m, size_n,
-                                         offs_m, offs_n, row_step);
-  } else {
-    uint32_t words[ROWS][K];
-    float scales[ROWS][K];
-    int4_encode(input, words, scales);
-    int4_store<THREADS_M, THREADS_N, THREADS>(words, scales, values_ptr, values_stride_m,
-                                              scales_ptr, scales_stride_m, size_m, size_n,
-                                              offs_m, offs_n, row_step);
-  }
-}
-
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int WORLD, int ROWS, int K, int P>
-DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
-                                  const uint8_t* const (&values)[WORLD],
-                                  int64_t values_stride_m,
-                                  const __fp16* const (&scales)[WORLD],
-                                  int64_t scales_stride_m, int size_m, int size_n,
-                                  U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                                  int row_step) {
-  if constexpr (QUANTIZATION == Quantization::none)
-    peers_load_body<THREADS_M, THREADS_N>(input, input_stride_m, size_m, size_n, output, offs_m,
-                                     offs_n, row_step);
-  else
-    int4_peers_load<THREADS_M, THREADS_N>(values, values_stride_m, scales, scales_stride_m,
-                                          size_m, size_n, output, offs_m, offs_n,
-                                          row_step);
-}
-
+// THE ALL-GATHER IN QUANTIZATION'S FORM: with none the plain all-gather, with int4 the one above.
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
 DINLINE void exchanged_all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
@@ -1945,6 +1728,222 @@ DINLINE void exchanged_all_gather(char* const* partials_ptr_array, int partials_
     int4_all_gather<WORLD, THREADS_M, THREADS_N>(
         partials_ptr_array, partials_ptr_array_size, partials_size_m, partials_size_n, size_m,
         size_n, output, offs_m, offs_n, slice_n);
+}
+
+// =================================================================================================
+// LOAD AND STORE: A THREAD'S REGISTERS FROM AND TO A REGION, the one load and the one store
+//
+// A THREAD'S REGISTERS `U v[ROWS][K][P]` (P a pack, 16 bytes of the kernel's dtype), the place as
+// ints: thread t holds rows offs_m + (t / THREADS_N + i * THREADS_M) * row_step and packs
+// offs_n / P + t % THREADS_N + k * THREADS_N; stride_n must be 1. One round trip; a row past
+// size_m reads the last row, a store skips it.
+// THE REGION (`input` / `output`) is the buffer, its data and its metadata, in one of three forms:
+//   - its pointer (this rank's buffer; with Ranks::every, rank r's copy at slot r of it, its slots
+//     *_stride_slot elements apart: a pushed collective's inbox, [writer, m, n]);
+//   - its pointer array (`*_ptr_array_size` entries, one of ours or the INPUT TABLE: rank r's at
+//     entry r, plus slot `*_slot` of it, a push's writer);
+//   - a thread's WORLD bases already read (a collective's `T* x[WORLD]`), rank r's at x[r];
+// with its strides and sizes (*_size_m, *_size_n: what it holds, its INT4 payload's layout).
+// THE CLAMP SIZES (size_m, size_n) are the tensor's: a region holding part of a tensor at the
+// tensor's places (the partials, a band of inputs) clamps and masks at the tensor's (or the band's)
+// sizes, not its own allocation's.
+// THE VARIATIONS, template parameters:
+//   RANKS: own, the region's one copy (registers U[ROWS][K][P]); every, every rank's copy at once
+//     (a load's registers U[WORLD][ROWS][K][P], in rank order, all in flight together; a store's
+//     same registers to every rank's copy, issued together, posted: the next ordered barrier's
+//     release completes and publishes them, BARRIER).
+//   QUANTIZATION: none, the region holds the registers' dtype; int4, it holds their INT4 payload
+//     (QUANTIZATION), its values from the region's start and its scales at the offset its own
+//     sizes give (int4_scales_offset), a load dequantizing into its registers' dtype, a store
+//     quantizing its registers once whichever ranks it stores them in.
+// =================================================================================================
+
+enum class Ranks { own, every };
+
+// A LOAD NEVER BRANCHES: a thread outside a narrow layout loads its clamped, in-bounds place and
+// its values go unused. Under a thread compare the load was an exec branch, so every array's
+// old registers stayed live across AttnRes's loops (ISA 2026-10-04T16-39-15Z).
+// EVERY RANK'S: a pack position at a time, every rank's for it, so the address is computed once a
+// position (the other way round cost 16 scalar instructions at two packs: ISA
+// 2026-10-01T00-31-14Z). Nothing waits until the registers are used, so loads issued here run
+// under other work.
+template <int THREADS_M, int THREADS_N, Ranks RANKS = Ranks::own,
+          int QUANTIZATION = Quantization::none, typename REGION, typename OUTPUT>
+DINLINE void load(const REGION& input, int input_ptr_array_size, int input_slot,
+                  int64_t input_stride_slot, int64_t input_stride_m, int64_t input_stride_n,
+                  int input_size_m, int input_size_n, int size_m, int size_n, OUTPUT& output,
+                  int offs_m, int offs_n, int row_step = 1) {
+  constexpr bool kEvery = RANKS == Ranks::every;
+  constexpr int WORLD = kEvery ? std::extent_v<OUTPUT, 0> : 1;
+  constexpr int ROWS = std::extent_v<OUTPUT, kEvery ? 1 : 0>;
+  constexpr int K = std::extent_v<OUTPUT, kEvery ? 2 : 1>;
+  constexpr int P = std::extent_v<OUTPUT, kEvery ? 3 : 2>;
+  using U = std::remove_all_extents_t<OUTPUT>;
+  using V = vec<U, P>;
+  // Rank r's copy of the region, as its elements (none) or its bytes (int4). A pointer array is told
+  // by what it points at: a __restrict__ pointer is not a pointer to remove_pointer.
+  using E = std::conditional_t<QUANTIZATION == Quantization::none, const U, const uint8_t>;
+  const auto base = [&](int r) -> E* {
+    if constexpr (std::is_array_v<REGION>)
+      return reinterpret_cast<E*>(input[r]);
+    else if constexpr (std::is_pointer_v<std::remove_reference_t<decltype(*input)>>)
+      return ptr_array_at<E>(input, input_ptr_array_size, r) + input_slot * input_stride_slot;
+    else
+      return reinterpret_cast<E*>(input) + (kEvery ? r : input_slot) * input_stride_slot;
+  };
+  if constexpr (QUANTIZATION == Quantization::none && !kEvery) {
+    const V* at = reinterpret_cast<const V*>(base(0));
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+      if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
+      const V* row =
+          at + int64_t{row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)} *
+                   (input_stride_m / P);
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+        held(output[i][k], pack_load(at_col<P, THREADS_N>(row, size_n, offs_n, k)));
+    }
+    issued();
+  } else if constexpr (QUANTIZATION == Quantization::none) {
+    const U* at_rank[WORLD];
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) at_rank[r] = base(r);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+      if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the row's uniform part
+        // was added to every rank's base in scalar registers, an add and a carry a rank (16
+        // instructions a tile at eight ranks, the plain all-reduce against the flat walk: ISA
+        // 2026-10-11); held in a VGPR, each rank's address is one shift-and-add of it.
+        const int64_t stride = input_stride_m / P;
+        int64_t at =
+            int64_t{row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)} * stride +
+            pack_of<P, THREADS_N>(size_n, offs_n, k);
+        asm volatile("" : "+v"(at));
+#pragma unroll
+        for (int r = 0; r < WORLD; ++r)
+          held(output[r][i][k], pack_load(reinterpret_cast<const V*>(at_rank[r]) + at));
+      }
+    }
+    issued();
+  } else {
+    static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
+    // The region's INT4 payload, from its own sizes (the INT4 payload layout).
+    const int64_t values_stride_m = int4_values_size_n(input_size_n);
+    const int64_t scales_stride_m = int4_scales_size_n(input_size_n);
+    const int64_t scales_at = int4_scales_offset(input_size_m, input_size_n);
+    if constexpr (!kEvery) {
+      // Every word and scale in flight before the first is decoded.
+      const uint8_t* values_ptr = base(0);
+      const __fp16* scales_ptr = reinterpret_cast<const __fp16*>(base(0) + scales_at);
+      uint32_t words[ROWS][K];
+      float scales[ROWS][K];
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i) {
+        if (skips<ROWS, THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
+        const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i);
+        const uint8_t* values_row = values_ptr + row * values_stride_m;
+        const __fp16* scales_row = scales_ptr + row * scales_stride_m;
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+          const int pack = pack_of<P, THREADS_N>(size_n, offs_n, k);
+          words[i][k] = int4_word_load(values_row, pack);
+          scales[i][k] = int4_scale_load(scales_row, pack);
+        }
+      }
+      issued();
+      int4_decode(words, scales, output);
+    } else {
+      const uint8_t* values[WORLD];
+      const __fp16* scales[WORLD];
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) values[r] = base(r);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        scales[r] = reinterpret_cast<const __fp16*>(base(r) + scales_at);
+      uint32_t words[WORLD][ROWS][K];
+      float group_scales[WORLD][ROWS][K];
+      int4_peers_issue<THREADS_M, THREADS_N, P>(values, values_stride_m, scales,
+                                                scales_stride_m, size_m, size_n, words,
+                                                group_scales, offs_m, offs_n, row_step);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r) int4_decode(words[r], group_scales[r], output[r]);
+    }
+  }
+}
+
+// Stores only the rows below size_m and the packs below size_n, from the threads of the layout
+// (THREADS the block's, so a layout of all of it compares nothing). EVERY RANK'S (WORLD of them): a pack position
+// at a time, every rank's store for it issued together (the position once, as load's).
+template <int THREADS_M, int THREADS_N, int THREADS, Ranks RANKS = Ranks::own,
+          int QUANTIZATION = Quantization::none, int WORLD = 1, typename INPUT, typename REGION>
+DINLINE void store(const INPUT& input, const REGION& output, int output_ptr_array_size,
+                   int output_slot, int64_t output_stride_slot, int64_t output_stride_m,
+                   int64_t output_stride_n, int output_size_m, int output_size_n, int size_m,
+                   int size_n, int offs_m, int offs_n, int row_step = 1) {
+  constexpr bool kEvery = RANKS == Ranks::every;
+  constexpr int ROWS = std::extent_v<INPUT, 0>;
+  constexpr int K = std::extent_v<INPUT, 1>;
+  constexpr int P = std::extent_v<INPUT, 2>;
+  using U = std::remove_all_extents_t<INPUT>;
+  using V = vec<U, P>;
+  using E = std::conditional_t<QUANTIZATION == Quantization::none, U, uint8_t>;
+  const auto base = [&](int r) -> E* {
+    if constexpr (std::is_array_v<REGION>)
+      return reinterpret_cast<E*>(output[r]);
+    else if constexpr (std::is_pointer_v<std::remove_reference_t<decltype(*output)>>)
+      return ptr_array_at<E>(output, output_ptr_array_size, r) + output_slot * output_stride_slot;
+    else
+      return reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
+  };
+  if (!holds<THREADS_M, THREADS_N, THREADS>()) return;
+  if constexpr (QUANTIZATION == Quantization::none && !kEvery) {
+    V* at = reinterpret_cast<V*>(base(0));
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+      if (!row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
+      V* row = at + int64_t{row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)} *
+                        (output_stride_m / P);
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        if (pack_mask<P, THREADS_N>(size_n, offs_n, k) == 0.0f) continue;
+        pack_store(at_col<P, THREADS_N>(row, size_n, offs_n, k), pack(input[i][k]));
+      }
+    }
+  } else if constexpr (QUANTIZATION == Quantization::none) {
+    U* at_rank[WORLD];
+#pragma unroll
+    for (int r = 0; r < WORLD; ++r) at_rank[r] = base(r);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+      if (!row_live<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)) continue;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        if (pack_mask<P, THREADS_N>(size_n, offs_n, k) == 0.0f) continue;
+        int64_t at =
+            int64_t{row_of<THREADS_M, THREADS_N>(size_m, offs_m, row_step, i)} *
+                (output_stride_m / P) +
+            pack_of<P, THREADS_N>(size_n, offs_n, k);
+        asm volatile("" : "+v"(at));
+#pragma unroll
+        for (int r = 0; r < WORLD; ++r)
+          pack_store(reinterpret_cast<V*>(at_rank[r]) + at, pack(input[i][k]));
+      }
+    }
+  } else {
+    static_assert(!kEvery, "INT4's every-rank store is the push's (int4_store), I3's");
+    uint32_t words[ROWS][K];
+    float scales[ROWS][K];
+    int4_encode(input, words, scales);
+    uint8_t* const values_ptr = base(0);
+    __fp16* const scales_ptr = reinterpret_cast<__fp16*>(
+        base(0) + int4_scales_offset(output_size_m, output_size_n));
+    int4_store<THREADS_M, THREADS_N, THREADS>(
+        words, scales, values_ptr, int4_values_size_n(output_size_n), scales_ptr,
+        int4_scales_size_n(output_size_n), size_m, size_n, offs_m, offs_n, row_step);
+  }
 }
 
 // =================================================================================================
@@ -2307,7 +2306,7 @@ DINLINE void reduce_slots_body(INPUT_OF input_of, int64_t input_stride_m,
       T rounded[1][K][P];
       block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
       // 3. Stored in this rank's partials.
-      store_body<1, LANES, THREADS>(rounded, partials, 0, 1, len, 0, chunk * TILE_N, 1);
+      store<1, LANES, THREADS>(rounded, partials, 1, 0, 0, 0, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
     });
   }
 }
@@ -2338,8 +2337,8 @@ DINLINE void all_gather_body(char* const* partials_ptr_array, int partials_ptr_a
       const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
       // 1. Rank r's summed chunk, in one round trip.
-      load_body<1, LANES>(ptr_array_at<T>(partials_ptr_array, partials_ptr_array_size, r), 0, 1, slice, got, 0,
-                     chunk * TILE_N, 1);
+      load<1, LANES>(ptr_array_at<T>(partials_ptr_array, partials_ptr_array_size, r), 1, 0, 0, 0, 1, 1,
+                     slice, 1, slice, got, 0, chunk * TILE_N, 1);
       // 2. Stored where rank r's share goes.
       range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m, output_stride_n,
                                      output_size_n, share_first(slice, r), slice,
@@ -2419,7 +2418,8 @@ DINLINE void stage_rows_body(const T* input_ptr, int64_t input_stride_m, int inp
         T x[kTiles][TILE_M][K][P];
 #pragma unroll
         for (int s = 0; s < kTiles; ++s)
-          load_body<1, THREADS>(band_input, input_stride_m, rows, input_size_n, x[s],
+          load<1, THREADS>(band_input, 1, 0, 0, input_stride_m, 1, rows, input_size_n, rows,
+                           input_size_n, x[s],
                            (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
         for (int s = 0; s < kTiles; ++s) {
@@ -2433,8 +2433,9 @@ DINLINE void stage_rows_body(const T* input_ptr, int64_t input_stride_m, int inp
                 scales_ptr + int64_t{band} * scales_stride_m, scales_stride_m, rows,
                 input_size_n, offs_m, c, 1);
           } else {
-            store_body<1, THREADS, THREADS>(x[s], inputs_ptr + int64_t{band} * inputs_stride_m,
-                                       inputs_stride_m, rows, input_size_n, offs_m, c, 1);
+            store<1, THREADS, THREADS>(x[s], inputs_ptr + int64_t{band} * inputs_stride_m, 1, 0, 0,
+                                       inputs_stride_m, 1, rows, input_size_n, rows,
+                                       input_size_n, offs_m, c, 1);
           }
         }
       }
@@ -2469,20 +2470,7 @@ DINLINE void reduce_scatter_lds_body(const T* const* input_ptr_array, int input_
   const int col0 = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));
   const int64_t input_values_stride_m = int4_values_size_n(staging_size_n);
-  const int64_t input_scales_stride_m = int4_scales_size_n(staging_size_n);
-  const int64_t input_scales_offset = int4_scales_offset(staging_size_m, staging_size_n);
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n);
   T* const own_partials = ptr_array_at<T>(partials_ptr_array, partials_ptr_array_size, rank);
-  // The quantized forms, null with none (their bases unread).
-  uint8_t* own_values = nullptr;
-  __fp16* own_scales = nullptr;
-  if constexpr (QUANTIZATION != Quantization::none) {
-    own_values = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank);
-    own_scales = reinterpret_cast<__fp16*>(
-        ptr_array_at(partials_ptr_array, partials_ptr_array_size, rank) +
-        int4_scales_offset(partials_size_m, partials_size_n));
-  }
   const int end = (col0 + own_packs) * P;  // this rank's columns end, in elements
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
@@ -2498,22 +2486,18 @@ DINLINE void reduce_scatter_lds_body(const T* const* input_ptr_array, int input_
           held(got[0][0], pack_load(at_col<P, LANES>(at, end, c, 0)));
           issued();
         } else {
-          int4_load<1, LANES>(lane_ptr_array_at<WORLD, const uint8_t>(staging_ptr_array, staging_ptr_array_size, r),
-                              input_values_stride_m,
-                              reinterpret_cast<const __fp16*>(lane_ptr_array_at<WORLD, const char>(staging_ptr_array, staging_ptr_array_size, r) + input_scales_offset),
-                              input_scales_stride_m, input_size_m,
-                              end, got, row, c, 1);
+          load<1, LANES, Ranks::own, QUANTIZATION>(
+              lane_ptr_array_at<WORLD, const uint8_t>(staging_ptr_array, staging_ptr_array_size, r),
+              1, 0, 0, input_values_stride_m, 1, staging_size_m, staging_size_n, input_size_m, end,
+              got, row, c, 1);
         }
         // 2. Summed over the rows (the ranks), in row order, through LDS, rounded once.
         Summed rounded[1][1][P];
         block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
         // 3. Stored in this rank's slice.
-        constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
-        exchanged_store<1, LANES, THREADS, QUANTIZATION>(
-            rounded, own_partials + row * partials_stride_m, end,
-            kInt4 ? own_values + row * partials_values_stride_m : nullptr, 0,
-            kInt4 ? own_scales + row * partials_scales_stride_m : nullptr, 0, 1, end, 0, c,
-            1);
+        store<1, LANES, THREADS, Ranks::own, QUANTIZATION>(
+            rounded, own_partials, 1, 0, 0, partials_stride_m, 1, partials_size_m,
+            partials_size_n, row + 1, end, row, c, 1);
       }
 }
 
@@ -2577,9 +2561,9 @@ DINLINE void reduce_scatter_registers_body(
       float sum[1][1][P];
       if constexpr (!kInt4) {
         T peers[WORLD][1][1][P];
-        peers_load_body<ROWS, LANES>(input, input_stride_m, input_size_m,
-                                offs_n + size_n, peers, offs_m, c,
-                                static_cast<int>(gridDim.x));
+        load<ROWS, LANES, Ranks::every>(input, WORLD, 0, 0, input_stride_m, 1, input_size_m,
+                                        offs_n + size_n, input_size_m, offs_n + size_n, peers,
+                                        offs_m, c, static_cast<int>(gridDim.x));
         peers_sum(peers, sum);
       } else {
         uint32_t peer_words[WORLD][1][1];
@@ -2596,14 +2580,13 @@ DINLINE void reduce_scatter_registers_body(
         if constexpr (DIRECTION == Direction::push) {
 #pragma unroll
           for (int r = 0; r < WORLD; ++r)
-            store_body<ROWS, LANES, THREADS>(rounded, partials[r], partials_stride_m,
-                                        input_size_m, offs_n + size_n, offs_m, c,
-                                        static_cast<int>(gridDim.x));
+            store<ROWS, LANES, THREADS>(rounded, partials[r], 1, 0, 0, partials_stride_m, 1,
+                                        input_size_m, offs_n + size_n, input_size_m,
+                                        offs_n + size_n, offs_m, c, static_cast<int>(gridDim.x));
         } else {
-          store_body<ROWS, LANES, THREADS>(rounded, partials_of(rank),
-                                      partials_stride_m, input_size_m,
-                                      offs_n + size_n, offs_m, c,
-                                      static_cast<int>(gridDim.x));
+          store<ROWS, LANES, THREADS>(rounded, partials_of(rank), 1, 0, 0, partials_stride_m, 1,
+                                      input_size_m, offs_n + size_n, input_size_m,
+                                      offs_n + size_n, offs_m, c, static_cast<int>(gridDim.x));
         }
       } else {
         // INT4 QUANTIZES THE SUM ONCE, whichever ranks it is stored in.
@@ -2631,112 +2614,13 @@ DINLINE void reduce_scatter_registers_body(
 //
 // THE INTERFACE: the primitives a kernel may call that take its buffers as pointer arrays, strides
 // and sizes (the overview is this file's head), passing them to their section's `_body` (a
-// transitional name: I1 unifies load and store, I3 splits the file). The register math, the tiles,
-// barrier, block_reduce and the codec are defined at file scope in their sections above.
+// transitional name: I3 splits the file). load and store, the register math, the tiles, barrier,
+// block_reduce and the codec are defined at file scope in their sections above.
 // =================================================================================================
 
 // ===============================================================================================
 // MEMORY: REGISTERS FROM AND TO BUFFERS
 // ===============================================================================================
-
-// A THREAD'S REGISTERS `T v[ROWS][K][P]` (P a pack, 16 bytes of the kernel's
-// dtype), the buffer as pointer, strides and sizes, the place as ints. Thread t holds rows
-// offs_m + (t / THREADS_N + i * THREADS_M) * row_step and packs offs_n / P + t % THREADS_N +
-// k * THREADS_N; stride_n must be 1. One round trip; a row past size_m reads the last row.
-// THE SIZES ARE WHERE ROWS AND PACKS CLAMP AND MASK, the tensor's: a buffer holding part of
-// a tensor at the tensor's places (the partials, a band of inputs) passes the tensor's (or the
-// band's) sizes, not its own allocation's.
-template <int THREADS_M, int THREADS_N, typename T, int ROWS, int K, int P>
-DINLINE void load(const T* input_ptr, int64_t input_stride_m,
-                  int64_t input_stride_n, int input_size_m, int input_size_n,
-                  T (&output)[ROWS][K][P], int offs_m, int offs_n,
-                  int row_step = 1) {
-  load_body<THREADS_M, THREADS_N>(input_ptr, input_stride_m, input_size_m,
-                                   input_size_n, output, offs_m, offs_n,
-                                   row_step);
-}
-
-// Stores only the rows below output_size_m and the packs below output_size_n, from the threads
-// of the layout (THREADS the block's, so a layout of all of it compares nothing).
-template <int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS,
-          int K, int P>
-DINLINE void store(const T (&input)[ROWS][K][P], T* output_ptr,
-                   int64_t output_stride_m, int64_t output_stride_n,
-                   int output_size_m, int output_size_n, int offs_m, int offs_n,
-                   int row_step = 1) {
-  store_body<THREADS_M, THREADS_N, THREADS>(input, output_ptr, output_stride_m,
-                                    output_size_m, output_size_n, offs_m,
-                                    offs_n, row_step);
-}
-
-// Every rank's input through the INPUT TABLE (rank r's at inputs_ptr_array[r], at the table's
-// strides), in rank order, all in flight together: the in-place pull's one-shot.
-template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
-          int P>
-DINLINE void peers_load(const T* const* inputs_ptr_array, int inputs_ptr_array_size, int64_t input_stride_m,
-                        int64_t input_stride_n, int input_size_m, int input_size_n,
-                        T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step = 1) {
-  const T* input[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r) input[r] = ptr_array_at(inputs_ptr_array, inputs_ptr_array_size, r);
-  peers_load_body<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
-                                         input_size_n, output, offs_m, offs_n,
-                                         row_step);
-}
-
-// Every rank's region (one of ours: the staging, the partials) through its pointer array (rank r's
-// at input_ptr_array[r]), at its strides and sizes, in rank order, all in flight together.
-template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
-          int P>
-DINLINE void peers_load(char* const* input_ptr_array, int input_ptr_array_size,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step = 1) {
-  const T* input[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    input[r] = ptr_array_at<const T>(input_ptr_array, input_ptr_array_size, r);
-  peers_load_body<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
-                                         input_size_n, output, offs_m, offs_n,
-                                         row_step);
-}
-
-// THE PUSH, peers_load's other way: these registers stored at the same place of every rank's
-// region (`output_ptr_array`, one of ours: a pushed collective's inbox, [writer, m, n], at slot
-// `writer`, output_stride_writer elements a slot), every rank's store issued together. Visible to
-// each rank's same block after the next ordered barrier.
-template <int WORLD, int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS, int K,
-          int P>
-DINLINE void peers_store(const T (&input)[ROWS][K][P], char* const* output_ptr_array,
-                         int output_ptr_array_size, int writer, int64_t output_stride_writer,
-                         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-                         int output_size_n, int offs_m, int offs_n, int row_step = 1) {
-  T* output[WORLD];
-#pragma unroll
-  for (int r = 0; r < WORLD; ++r)
-    output[r] = ptr_array_at<T>(output_ptr_array, output_ptr_array_size, r) +
-                writer * output_stride_writer;
-  peers_store_body<THREADS_M, THREADS_N, THREADS>(input, output, output_stride_m,
-                                                   output_size_m, output_size_n, offs_m,
-                                                   offs_n, row_step);
-}
-
-// EVERY WRITER'S SLOT of this rank's inbox, what the peers pushed (writer w's at w *
-// input_stride_slot elements from input_ptr, each slot at the input's strides and sizes), all in
-// flight together: peers_load's registers, read locally.
-template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K, int P>
-DINLINE void slots_load(const T* input_ptr, int64_t input_stride_slot,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, T (&output)[WORLD][ROWS][K][P], int offs_m,
-                        int offs_n, int row_step = 1) {
-  const T* input[WORLD];
-#pragma unroll
-  for (int w = 0; w < WORLD; ++w) input[w] = input_ptr + w * input_stride_slot;
-  peers_load_body<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
-                                         input_size_n, output, offs_m, offs_n,
-                                         row_step);
-}
 
 // THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n columns a
 // rank (the last rank's to the end), the owner's partials (`partials_ptr_array`) picked in each
@@ -2751,109 +2635,6 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
   all_gather_body<WORLD, THREADS_M, THREADS_N>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, size_m, size_n,
       output, offs_m, offs_n, slice_n);
-}
-
-// A BUFFER OF THE EXCHANGE, in QUANTIZATION's form (the QUANTIZATION section): each function
-// above with the buffer's quantized form after it, its values and its scales. With none it is that
-// function on the plain buffer, the quantized form unread; with int4 the values and scales at the
-// same places, a load dequantizing into its registers' dtype and a store quantizing its registers.
-// The sizes that clamp and mask are the plain buffer's (the tensor's, in elements).
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int ROWS, int K, int P>
-DINLINE void load(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                  int input_size_m, int input_size_n, const uint8_t* input_values_ptr,
-                  int64_t input_values_stride_m, int64_t input_values_stride_n,
-                  int input_values_size_m, int input_values_size_n,
-                  const __fp16* input_scales_ptr, int64_t input_scales_stride_m,
-                  int64_t input_scales_stride_n, int input_scales_size_m,
-                  int input_scales_size_n, U (&output)[ROWS][K][P], int offs_m, int offs_n,
-                  int row_step = 1) {
-  exchanged_load<THREADS_M, THREADS_N, QUANTIZATION>(
-      input_ptr, input_stride_m, input_values_ptr, input_values_stride_m, input_scales_ptr,
-      input_scales_stride_m, input_size_m, input_size_n, output, offs_m, offs_n, row_step);
-}
-
-template <int THREADS_M, int THREADS_N, int THREADS, int QUANTIZATION, typename T,
-          typename U, int ROWS, int K, int P>
-DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_stride_m,
-                   int64_t output_stride_n, int output_size_m, int output_size_n,
-                   uint8_t* output_values_ptr, int64_t output_values_stride_m,
-                   int64_t output_values_stride_n, int output_values_size_m,
-                   int output_values_size_n, __fp16* output_scales_ptr,
-                   int64_t output_scales_stride_m, int64_t output_scales_stride_n,
-                   int output_scales_size_m, int output_scales_size_n, int offs_m,
-                   int offs_n, int row_step = 1) {
-  exchanged_store<THREADS_M, THREADS_N, THREADS, QUANTIZATION>(
-      input, output_ptr, output_stride_m, output_values_ptr, output_values_stride_m,
-      output_scales_ptr, output_scales_stride_m, output_size_m, output_size_n, offs_m,
-      offs_n, row_step);
-}
-
-// THE PEERS' INPUTS IN QUANTIZATION'S FORM, each buffer its own region: none, every rank's input
-// read in place through the INPUT TABLE (`input_ptr_array`, at the input's strides; input_size_m
-// and input_size_n clamp); int4, every rank's staging (`staging_ptr_array`), the INT4 payload of
-// an [staging_size_m, staging_size_n] call staged there (stage_rows'), its values from the
-// region's start and its scales at the offset its own sizes give.
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(const T* const* input_ptr_array, int input_ptr_array_size,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, char* const* staging_ptr_array,
-                        int staging_ptr_array_size, int64_t staging_stride_m,
-                        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
-                        U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step = 1) {
-  const T* input[WORLD];
-  const uint8_t* values[WORLD];
-  const __fp16* scales[WORLD];
-  if constexpr (QUANTIZATION == Quantization::none) {
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r) input[r] = ptr_array_at(input_ptr_array, input_ptr_array_size, r);
-  } else {
-    const int64_t scales_at = int4_scales_offset(staging_size_m, staging_size_n);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      values[r] = ptr_array_at<const uint8_t>(staging_ptr_array, staging_ptr_array_size, r);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      scales[r] = reinterpret_cast<const __fp16*>(ptr_array_at(staging_ptr_array, staging_ptr_array_size, r) + scales_at);
-  }
-  exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
-      input, input_stride_m, values, int4_values_size_n(staging_size_n), scales,
-      int4_scales_size_n(staging_size_n), input_size_m, input_size_n, output, offs_m, offs_n,
-      row_step);
-}
-
-// THE PEERS' COPIES IN QUANTIZATION'S FORM, one region (`input_ptr_array`, one of ours: the
-// partials) with its strides and sizes (input_size_m, input_size_n: what it holds, its INT4
-// payload's layout); size_m and size_n clamp. int4: its values from the region's start, its scales
-// at the offset its own sizes give.
-template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
-          int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(char* const* input_ptr_array, int input_ptr_array_size,
-                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-                        int input_size_n, int size_m, int size_n,
-                        U (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
-                        int row_step = 1) {
-  const T* input[WORLD];
-  const uint8_t* values[WORLD];
-  const __fp16* scales[WORLD];
-  if constexpr (QUANTIZATION == Quantization::none) {
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      input[r] = ptr_array_at<const T>(input_ptr_array, input_ptr_array_size, r);
-  } else {
-    const int64_t scales_at = int4_scales_offset(input_size_m, input_size_n);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      values[r] = ptr_array_at<const uint8_t>(input_ptr_array, input_ptr_array_size, r);
-#pragma unroll
-    for (int r = 0; r < WORLD; ++r)
-      scales[r] = reinterpret_cast<const __fp16*>(ptr_array_at(input_ptr_array, input_ptr_array_size, r) + scales_at);
-  }
-  exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
-      input, input_stride_m, values, int4_values_size_n(input_size_n), scales,
-      int4_scales_size_n(input_size_n), size_m, size_n, output, offs_m, offs_n, row_step);
 }
 
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
