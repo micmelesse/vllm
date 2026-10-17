@@ -15,10 +15,12 @@ after its own (the algorithm, the direction, every field of one build and the la
 all or none) are the one way to force one, for the sweep and the tests. Every one is
 passed through as it came: C++ builds the config, checks it, and answers.
 
-ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, copies its input
-into its inputs region of the communicator's arena (one allocation per rank, which
-every rank opened at open over legacy HIP IPC), before its first barrier; peers read
-only that, never the caller's tensor, so nothing is registered.
+ONE MEMORY PATH (C++'s `Handle`): every kernel, eager or captured, moves its input
+into the inputs region of the communicator's arena (one allocation per rank, which
+every rank opened at open over legacy HIP IPC) before its first barrier: a fused
+kernel copies it into its own, the plain all-reduce pushes it into its peers' (each
+rank's inbox, a slot a writer). Peers read only the arena, never the caller's
+tensor, so nothing is registered.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -1537,9 +1539,9 @@ class HipCustomCommunicator:
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture. Nothing is registered: every kernel copies its
-        input into our inputs itself (no copy node in the graph), so a captured
-        launch reads only memory every rank opened at open."""
+        """Wrap a cudagraph capture. Nothing is registered: every kernel moves its
+        input into the arena's inputs itself (no copy node in the graph), so a
+        captured launch reads only memory every rank opened at open."""
         yield
 
     def _all_reduce(

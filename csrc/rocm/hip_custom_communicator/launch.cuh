@@ -39,22 +39,23 @@ struct Call<void (*)(PARAMS...)> {
 // where the kernel uses them, then the signals, this rank's status, its rank
 // and the wait limit; then the kernel's own arguments. Our regions (handle.cuh's
 // arena layout) are each its byte offset in the arena, the same on every rank.
-// THE ONE MEMORY PATH: every kernel copies this rank's input into this rank's
-// inputs (INT4: quantized into their INT4 payload, which the kernel finds
-// itself from the region and the call's sizes: common.cuh's `int4_payload`)
-// inside the kernel, before its first barrier, which is ordered, so the peers
-// read only our arena, never the caller's tensor; eager and captured alike, no
-// host copy. A ONE-SHOT reads every rank's inputs; a TWO-SHOT its slice of them
-// and every rank's partials.
+// THE ONE MEMORY PATH: every fused kernel copies this rank's input into this
+// rank's inputs (INT4: quantized into their INT4 payload, which the kernel
+// finds itself from the region and the call's sizes: common.cuh's
+// `int4_payload`) inside the kernel, before its first barrier, which is
+// ordered, so the peers read only our arena, never the caller's tensor; eager
+// and captured alike, no host copy. A ONE-SHOT reads every rank's inputs; a
+// TWO-SHOT its slice of them and every rank's partials.
 
-// THE PLAIN ALL-REDUCE: the kernel copies its input through its inputs a band
-// of rows a pass (none); the INT4 two-shot quantizes it whole into the inputs's
-// INT4 payload.
+// THE PLAIN ALL-REDUCE: no copy-in; the kernel pushes its input (one-shot), or
+// every rank's share of it (two-shot), into the peers' inputs, each rank's
+// inbox, at its own slot, a band of rows a pass (none); the INT4 two-shot
+// pushes the shares quantized, whole. Each rank sums its inbox locally.
 inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
   h.begin_launch(OpType::all_reduce, l.kernel, l.input_size_m, l.input_size_n,
                  l.dtype, l.stream);
   if (l.algorithm == Algorithm::one_shot)
-    Call<AllReduceOneShotStagedKernel>::run(
+    Call<AllReduceOneShotPushedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input,
         l.input_stride_m, l.input_stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
@@ -68,7 +69,7 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks());
   else if (l.quantization == Quantization::none)
-    Call<AllReduceTwoShotStagedKernel>::run(
+    Call<AllReduceTwoShotPushedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input,
         l.input_stride_m, l.input_stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,

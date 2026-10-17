@@ -139,19 +139,22 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // INT4, never both, and its sums exact or INT4, never both (the one exact word
 // beside an INT4 payload, the add-RMS-norm row two-shot's row scalars, starts
 // at its exact slice's end, 2 bytes a slice element in, while the payload, over
-// the region's rows, twice the slice, ends at 9/8). Across calls: a rank writes its inputs before its first
-// barrier, and a peer reads them only before its barrier that every peer's
-// sums are visible (or, a one-shot, its last), which this rank passed in the
-// previous call only once every peer arrived, done reading; partials are
+// the region's rows, twice the slice, ends at 9/8). Across calls: a rank writes inputs (its own,
+// or, the plain all-reduce, its slot of every peer's inbox) before its first
+// barrier, and any rank reads inputs (a peer's, or its own inbox) only before
+// its barrier that every peer's sums are visible (or, a one-shot, its last),
+// which this rank passed in the previous call only once every peer arrived,
+// done reading; partials are
 // written (by their rank, or a push kernel's peers) only after the writer's
 // first barrier, which every peer reaches only once it finished the previous
 // call, its all-gather's reads included. Not every launch ENDS with a barrier
 // (a two-shot ends with its all-gather): the next launch's first barrier is
 // the one that orders it. So the previous call's readers are done whichever
 // encoding either call used.
-// Every kernel copies its input into its inputs (or, INT4, their payload)
-// before its first barrier, which is ordered, and its peers read it there, at
-// their base for this rank and the region's offset: no table in memory.
+// Every fused kernel copies its input into its inputs (or, INT4, their
+// payload), and the plain all-reduce pushes it into its peers' inputs (each
+// rank's inbox, a slot a writer), before its first barrier, which is ordered,
+// every rank's at its base and the region's offset: no table in memory.
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
@@ -981,7 +984,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
   hipFuncAttributes attrs;
   const hipError_t found = hipFuncGetAttributes(
       &attrs, reinterpret_cast<const void*>(
-                  all_reduce_pull_one_shot_staged<
+                  all_reduce_pull_one_shot_pushed<
                       c10::BFloat16, 2, 1, kWaveSize * traits<c10::BFloat16>::N,
                       kWaveSize, 1>));
   (void)hipGetLastError();

@@ -1249,7 +1249,8 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (!in_passes && partials > h->partials_bytes())
     return Error::partials_too_small;
   // A BUILD THAT DOES NOT RUN IN PASSES copies its input into the inputs
-  // whole, inside the kernel, before its first barrier.
+  // whole (the INT4 all-reduce: pushes it), inside the kernel, before its
+  // first barrier.
   const int64_t bytes = m * n * elem_bytes(dtype);
   if (!in_passes && bytes > h->inputs_bytes())
     return Error::inputs_too_small;
@@ -1280,8 +1281,9 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 // =================================================================================================
 
 // all_reduce: the sum of every rank's `inp` ([rows, cols] of `dtype` at its
-// strides) into `out`. The kernel copies its input into its inputs itself: a
-// band of rows a pass (none), or quantized whole (INT4's two-shot).
+// strides) into `out`. The kernel pushes its input (or each rank's share of
+// it) into the peers' inboxes itself, nothing copied in first: a band of rows a
+// pass (none), or quantized whole (INT4's two-shot).
 inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     const Handle& h, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
@@ -1311,19 +1313,32 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   const Template fn = k.fn;
   const KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
-  // IN PASSES (none): a band of rows of the input through the inputs a pass.
-  // INT4 quantizes its input into its inputs' INT4 values whole instead.
+  // IN PASSES (none): a band of rows of the input pushed through the inboxes a
+  // pass. INT4 pushes its input's shares quantized, whole, instead.
   const bool in_passes = a.quantization == Quantization::none;
-  // THE STAGED BAND: the rows a pass, what the inputs holds (and the
-  // two-shot's partials, a row of its slice a row).
+  // THE BAND: the rows a pass, what the inbox (the inputs region) holds in
+  // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
+  // the two-shot's is one rank's share of the band (the flat walk's, whole
+  // packs, rounded up), [WORLD, slot], whose band the partials also hold (a
+  // row of its slice a row). Rounding up costs a two-shot at most one pack a
+  // slot, so the band one row less than the inputs' rows always fits.
   const int64_t row_bytes = n * elem_bytes(dtype);
-  const int64_t packs = n * elem_bytes(dtype) / kBuild.memory.pack_bytes;
-  const int64_t slice_bytes =
-      (packs + world - 1) / world * kBuild.memory.pack_bytes;
-  int64_t band = row_bytes > 0 ? h.inputs_bytes() / row_bytes : 0;
-  if (is_two_shot(fn) && slice_bytes > 0 &&
-      h.partials_bytes() / slice_bytes < band)
-    band = h.partials_bytes() / slice_bytes;
+  const int64_t pack = kBuild.memory.pack_bytes;
+  const int64_t packs = n * elem_bytes(dtype) / pack;
+  const int64_t slice_bytes = (packs + world - 1) / world * pack;
+  const auto slot_packs = [&](int64_t rows) {
+    return (rows * packs + world - 1) / world;
+  };
+  int64_t band = 0;
+  if (row_bytes > 0 && !is_two_shot(fn)) {
+    band = h.inputs_bytes() / (world * row_bytes);
+  } else if (row_bytes > 0) {
+    band = h.inputs_bytes() / row_bytes;
+    if (band > 0 && world * slot_packs(band) * pack > h.inputs_bytes()) --band;
+    if (slice_bytes > 0 && h.partials_bytes() / slice_bytes < band)
+      band = h.partials_bytes() / slice_bytes;
+  }
+  const int64_t rows = band < m ? band : m;  // a pass's rows
   // 2.
   if (const std::optional<Error> e =
           refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
@@ -1348,8 +1363,8 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
                               WAVES = C.waves_per_eu;
                 constexpr int TM = C.tile_m, TN = C.tile_n;
                 if constexpr (one_shot_lays_out(C, NL))
-                  kernel = instance<AllReduceOneShotStagedKernel>(
-                      all_reduce_pull_one_shot_staged<T, NG, TM, TN, THREADS,
+                  kernel = instance<AllReduceOneShotPushedKernel>(
+                      all_reduce_pull_one_shot_pushed<T, NG, TM, TN, THREADS,
                                                       WAVES>);
               });
           return;
@@ -1368,8 +1383,8 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
               const auto at = [&](auto layout) {
                 constexpr bool CONTIGUOUS = decltype(layout)::value;
                 if constexpr (C.quantization == Quantization::none)
-                  return instance<AllReduceTwoShotStagedKernel>(
-                      all_reduce_pull_two_shot_staged<T, NG, TM, TN, THREADS,
+                  return instance<AllReduceTwoShotPushedKernel>(
+                      all_reduce_pull_two_shot_pushed<T, NG, TM, TN, THREADS,
                                                       WAVES, CONTIGUOUS>);
                 else
                   return instance<AllReduceTwoShotKernel>(
@@ -1412,12 +1427,19 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       .output_size_n = output_size_n,
       .partials_stride_m = slice_bytes / elem_bytes(dtype),
       .partials_stride_n = 1,
-      .partials_size_m = in_passes ? (band < m ? band : m) : m,
+      .partials_size_m = in_passes ? rows : m,
       .partials_size_n = slice_bytes / elem_bytes(dtype),
-      .inputs_stride_m = n,
+      // THE INBOX: the one-shot's [WORLD * rows, n], the exact two-shot's
+      // [WORLD, slot] (a slot one rank's share of a band), the INT4 two-shot's
+      // payload found from the problem's [m, n] (its slots where the shares lie).
+      .inputs_stride_m = !in_passes || !is_two_shot(fn)
+                             ? n
+                             : slot_packs(rows) * pack / elem_bytes(dtype),
       .inputs_stride_n = 1,
-      .inputs_size_m = in_passes ? (band < m ? band : m) : m,
-      .inputs_size_n = n,
+      .inputs_size_m = !in_passes ? m : is_two_shot(fn) ? world : world * rows,
+      .inputs_size_n = !in_passes || !is_two_shot(fn)
+                           ? n
+                           : slot_packs(rows) * pack / elem_bytes(dtype),
       .dtype = dtype};
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
@@ -1984,8 +2006,9 @@ constexpr int64_t widest_row(OpType o) {
 // tokens a batch by its hidden size), and each region holds its largest
 // payload at that call, in every built dtype and in either encoding (exact or
 // INT4: common.cuh's `int4_payload`): the inputs the whole input (every
-// per-row kernel copies its input into it whole; the plain all-reduce in
-// bands), or its INT4 payload; the partials the most any two-shot keeps
+// per-row kernel copies its input into it whole; the plain all-reduce pushes
+// into it as an inbox of WORLD slots, a band of rows a pass, so at least a row
+// a slot), or its INT4 payload; the partials the most any two-shot keeps
 // (`partials_need`), or its INT4 payload (bounded as one row of its elements).
 // Each need grows with the rows and the row's width, so a call inside the box
 // fits by construction. Each rounded to a whole pack, and at least one.
@@ -2010,12 +2033,18 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
     }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
     if (input > inputs) inputs = input;
+    // THE PLAIN ALL-REDUCE'S INBOX takes a pass of at least one row: the
+    // one-shot's WORLD slots of a row each, which covers the two-shot's WORLD
+    // shares of one row rounded up to whole packs.
+    const int64_t one_row_each = world * max_cols * elem_bytes(d);
+    if (one_row_each > inputs) inputs = one_row_each;
   }
   return {whole(partials), whole(inputs)};
 }
 
 // THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
-// the inputs holds (an eager input is copied in whole), and what the partials
+// the inputs holds (a per-row kernel's input is copied in whole; the plain
+// all-reduce's a slot of its inbox, a row at the least), and what the partials
 // holds at the most partials a byte of its input needs among its tuned kernels:
 // at one row of one pack, where rounding up is all of it (a row two-shot
 // leaving two results, two). Python admits a call by it or by the box the
@@ -2028,9 +2057,13 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
         partials_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
     if (need > per_byte) per_byte = need;
   }
-  if (per_byte == 0) return inputs_bytes;
+  // THE PLAIN ALL-REDUCE pushes a pass into WORLD slots of the inputs: a call
+  // whose bytes a slot holds has a row the one-shot's slot holds, at any world.
+  const int64_t inputs =
+      o == OpType::all_reduce ? inputs_bytes / kMaxRanks : inputs_bytes;
+  if (per_byte == 0) return inputs;
   const int64_t partials = partials_bytes / per_byte;
-  return partials < inputs_bytes ? partials : inputs_bytes;
+  return partials < inputs ? partials : inputs;
 }
 
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and

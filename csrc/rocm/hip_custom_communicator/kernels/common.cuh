@@ -22,10 +22,12 @@
 // each region as its byte offset in the arena, its strides and its sizes,
 // `bases, x_offset, x_stride_m, ...`; rank r's is `peer_ptr<T>(bases, r,
 // x_offset)` (PEERS), one scalar load. THE CALLER'S INPUT is this rank's pointer only and
-// no peer reads it: every kernel first copies it into this rank's inputs (one
-// of ours; `stage_rows`, the staged all-reduce's passes, or int4 quantized into
-// the inputs' INT4 values), its first barrier is ordered, and every read of a peer's
-// input after it is of the peer's inputs. NO KERNEL TAKES A POINTER TABLE.
+// no peer reads it: a fused kernel first copies it into this rank's inputs (one of ours;
+// `stage_rows`, or int4 quantized into the inputs' INT4 values) and its peers read it there; the
+// plain all-reduce PUSHES it, each rank storing its input (or each rank's share of it) into the
+// peers' inputs, each rank's INBOX, at its own slot (`peers_store`, `push_shares`), and sums its
+// own inbox locally (`slots_load`, `reduce_slots`). Either way the first barrier is ordered and
+// every read of another rank's input after it is of our regions. NO KERNEL TAKES A POINTER TABLE.
 // A thread's registers are a plain array the caller declares,
 // `T v[ROWS][K][P]`, an input or an output like a buffer: P a pack's elements
 // (16 bytes of the kernel's dtype; an fp32 array holds the same P), thread t
@@ -672,6 +674,35 @@ DINLINE void peers_load(const T* const (&input)[WORLD], int64_t input_stride_m,
   issued();
 }
 
+// EVERY PEER'S, THE PUSH: the same registers stored at the same place of every rank's buffer
+// (rank r's at output[r]), a pack position at a time, every rank's store for it issued together
+// (the position once, as peers_load's). A store into a peer's memory is posted: nothing here
+// waits; the next ordered barrier's release completes and publishes them (BARRIER).
+template <int THREADS_M, int THREADS_N, int THREADS, typename T, int WORLD, int ROWS,
+          int K, int P>
+DINLINE void peers_store(const T (&input)[ROWS][K][P], T* const (&output)[WORLD],
+                         int64_t output_stride_m, int output_size_m, int output_size_n,
+                         int offs_m, int offs_n, int row_step) {
+  using V = vec<T, P>;
+  if (!holds<THREADS_M, THREADS_N, THREADS>()) return;
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i) {
+    if (!row_live<THREADS_M, THREADS_N>(output_size_m, offs_m, row_step, i)) continue;
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      if (pack_mask<P, THREADS_N>(output_size_n, offs_n, k) == 0.0f) continue;
+      int64_t at = int64_t{row_of<THREADS_M, THREADS_N>(output_size_m, offs_m, row_step,
+                                                         i)} *
+                       (output_stride_m / P) +
+                   pack_of<P, THREADS_N>(output_size_n, offs_n, k);
+      asm volatile("" : "+v"(at));
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+        pack_store(reinterpret_cast<V*>(output[r]) + at, pack(input[i][k]));
+    }
+  }
+}
+
 // A ROW'S SCALAR (a norm's scale), one float a row: thread 0 stores it.
 DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   if (threadIdx.x == 0)
@@ -995,15 +1026,20 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s,
 //   HIP IPC at open, so every peer's is opened in this process at an address
 //   of the runtime's choosing:
 //     [ signals | inputs | partials ]  at the same offsets on every rank
+//       inputs: a fused kernel's copied-in input, which its peers read; the
+//         plain all-reduce's INBOX, [writer slot, ...], which its peers push
+//         into and it sums locally
+//       partials: a two-shot's sums, which its peers read (or push into)
 //   handed to a kernel as every rank's arena base BY VALUE (`PeerBases`, in
 //   the kernel arguments: no table in device memory) and each region as its
 //   byte offset in the arena, its strides and its sizes (rank r's region is
 //   `peer_ptr<T>(bases, r, offset)`); the caller's, one tensor a call:
-//     [ input ]   never read by a peer: every kernel copies this rank's
-//                 input into this rank's inputs (or, int4, quantized into
-//                 the inputs' INT4 values) before its first barrier, which is
-//                 ordered, and the peers read the inputs
-// A buffer is read or written by load / store / peers_load, ordered
+//     [ input ]   never read by a peer: a fused kernel copies it into this
+//                 rank's inputs (or, int4, quantized into the inputs' INT4
+//                 values), the plain all-reduce pushes it into the peers'
+//                 inboxes, before the first barrier, which is ordered
+// A buffer is read or written by load / store / peers_load / peers_store /
+// slots_load, ordered
 // only by BARRIER's `barrier`. The signals are BARRIER's, never read as
 // data.
 // =================================================================================================
@@ -1138,6 +1174,14 @@ DINLINE void peers_of(const PeerBases& bases, int64_t offset_bytes, U* (&output)
     output[r] = rank_of<std::remove_const_t<U>>(bases, r, offset_bytes);
 }
 
+// EVERY WRITER'S SLOT of one of this rank's receive areas, writer w's at w * stride_slot elements
+// from its first (a pushed collective's inbox: PEERS reads it locally).
+template <int WORLD, typename U>
+DINLINE void slots_of(U* ptr, int64_t stride_slot, U* (&output)[WORLD]) {
+#pragma unroll
+  for (int w = 0; w < WORLD; ++w) output[w] = ptr + w * stride_slot;
+}
+
 // THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n a rank (the
 // last rank's to the end), its owner's address computed in each lane (a wave's packs may have two
 // owners).
@@ -1230,9 +1274,10 @@ DINLINE void peers_load_row_scalars(const PeerBases& bases, int64_t input_offset
 //   before this lane's next flag store by that barrier's own release or
 //   wait_stores (below).
 // The caller's input is never read by a peer: its owner copies it into its
-// inputs (ours) before the launch's first barrier, which is ordered (release
-// before the flag, acquire after it), so the peers' reads of the inputs after
-// it see the copy.
+// inputs (ours), or pushes it into the peers' inputs (the plain all-reduce's
+// inboxes: remote stores, which the release's wait and write-back complete),
+// before the launch's first barrier, which is ordered (release before the
+// flag, acquire after it), so the reads of the inputs after it see them.
 // The tests that would catch a stale line: every op's output against
 // torch.distributed's across back-to-back calls on the same buffers, and the
 // signals' return to clear after every launch. Each flag is touched only
@@ -1405,7 +1450,7 @@ DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
 // =================================================================================
 
 // WHAT HOLDS ONCE A BARRIER IS PASSED: every peer has launched and what it
-// wrote before (its staged input) is visible to this side (a launch's first
+// wrote before (its staged or pushed input) is visible to this side (a launch's first
 // barrier, ordered; it differs from `visible` only in naming its fault
 // `start`); what this side wrote before is
 // visible to the other side after; every peer is done reading this rank (so its
@@ -2296,21 +2341,27 @@ DINLINE T* int4_group_at(T* ptr, int64_t stride_m, int64_t stride_n, int size_n,
     return flat_at(ptr, stride_m, stride_n, first + int64_t{g} * kInt4Group, size_n);
 }
 
-// THE INT4 STAGE: every rank's share of this rank's input, a group a thread, quantized into its
-// staged values and scales (ours, rows back to back); the first barrier, ordered, publishes them.
+// THE INT4 PUSH: every rank's share of this rank's input, a group a thread, quantized here (the
+// caller's input is read by this rank only) and stored in THAT rank's inbox payload at this rank's
+// slot: rank r's values and scales at share_first(slice, rank), the same place the share's own
+// groups take in an [m, n] payload, so the WORLD slots fill the payload exactly (int4_takes_row:
+// WORLD * slice is the total). Ranks rotated, rank + w's w-th, so the GPUs push to different peers
+// at once. The first barrier, ordered, publishes them.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
-DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                             int input_size_m, int input_size_n, uint8_t* inputs_values_ptr,
-                             __fp16* inputs_scales_ptr) {
+DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+                            int input_size_m, int input_size_n, const PeerBases& bases,
+                            int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
   constexpr int P = traits<T>::N;
   using V = vec<T, P>;
   const int64_t total = int64_t{input_size_m} * input_size_n;
   const int slice = share_slice<WORLD, kInt4Group>(total);
+  const int64_t mine = share_first(slice, rank);  // this rank's slot in every inbox
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     // TWO RANKS' GROUPS IN FLIGHT: unrolled whole, every rank's 4 loads were hoisted together,
     // 128 VGPRs of input, 256 in all, spilling.
 #pragma unroll 2
-    for (int r = 0; r < WORLD; ++r) {
+    for (int w = 0; w < WORLD; ++w) {
+      const int r = (rank + w) % WORLD;
       const int groups = share_len(total, slice, r) / kInt4Group;
       if (groups == 0) continue;  // a late rank's empty share (every block alike)
       const int64_t first = share_first(slice, r);
@@ -2323,36 +2374,37 @@ DINLINE void int4_flat_stage(const T* input_ptr, int64_t input_stride_m, int64_t
       float scale;
       int4_encode_group(x, words, scale);
       if (g < end && g < groups)
-        int4_group_store(words, scale, inputs_values_ptr + first / 2,
-                         inputs_scales_ptr + first / kInt4Group, g);
+        int4_group_store(words, scale,
+                         rank_of<uint8_t>(bases, r, inbox_values_offset) + mine / 2,
+                         rank_of<__fp16>(bases, r, inbox_scales_offset) + mine / kInt4Group, g);
     }
   });
 }
 
-// THE INT4 REDUCE-SCATTER: this rank's share, a group a thread, every rank's staged group in
-// flight at once (rotated rank order), summed in fp32 in registers (int4_peers_sum: each term
-// landed in T), quantized and stored in this rank's partials (the share's own run). Through LDS, a
-// rank's copy a wave, one wave in 8 summed and quantized while the others waited at the barrier.
+// THE INT4 REDUCE-SCATTER, LOCAL: this rank's share, a group a thread, every writer's pushed group
+// read from this rank's own inbox (writer w's slot at share_first(slice, w): int4_flat_push's),
+// all in flight at once (rotated writer order, the sum's order as when it was read over the
+// links), summed in fp32 in registers (int4_peers_sum: each term landed in T), quantized and stored
+// in this rank's partials (the share's own run). Through LDS, a rank's copy a wave, one wave in 8
+// summed and quantized while the others waited at the barrier.
 template <int WORLD, int THREADS, typename T>
-DINLINE void int4_flat_reduce_scatter(const PeerBases& bases,
-                                      int64_t input_values_offset,
-                                      int64_t input_scales_offset,
-                                      int64_t partials_values_offset,
-                                      int64_t partials_scales_offset, int64_t total,
-                                      int rank) {
+DINLINE void int4_flat_reduce_slots(const PeerBases& bases,
+                                    int64_t inbox_values_offset,
+                                    int64_t inbox_scales_offset,
+                                    int64_t partials_values_offset,
+                                    int64_t partials_scales_offset, int64_t total,
+                                    int rank) {
   constexpr int P = traits<T>::N;
   const int slice = share_slice<WORLD, kInt4Group>(total);
   const int groups = share_len(total, slice, rank) / kInt4Group;
   if (groups == 0) return;  // a late rank's share is empty at few groups (every block alike)
-  const int64_t first = share_first(slice, rank);
   const uint8_t* values[WORLD];
   const __fp16* scales[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
-    values[w] =
-        rank_of<uint8_t>(bases, (rank + w) % WORLD, input_values_offset) + first / 2;
-    scales[w] = rank_of<__fp16>(bases, (rank + w) % WORLD, input_scales_offset) +
-                first / kInt4Group;
+    const int64_t slot = share_first(slice, (rank + w) % WORLD);
+    values[w] = rank_of<uint8_t>(bases, rank, inbox_values_offset) + slot / 2;
+    scales[w] = rank_of<__fp16>(bases, rank, inbox_scales_offset) + slot / kInt4Group;
   }
   uint8_t* const own_values = rank_of<uint8_t>(bases, rank, partials_values_offset);
   __fp16* const own_scales = rank_of<__fp16>(bases, rank, partials_scales_offset);
@@ -2428,20 +2480,22 @@ DINLINE void int4_flat_all_gather(const PeerBases& bases,
   });
 }
 
-// THE FLAT WALK'S REDUCE-SCATTER: this rank's share, a TILE_N chunk a step, every rank's copy in
-// one round trip, summed over the ranks through LDS, rounded once to T, stored in this rank's
-// partials; with int4 the int4 walk's above. THE INPUT IS OUR INPUTS (a pointer and a rank
-// stride): `input_of(r)` is rank r's, r the same across the wave, which the interface's two
-// overloads write (with and without the quantized forms), so one body serves both.
+// THE FLAT WALK'S REDUCE-SCATTER, LOCAL (the pushed two-shot's): this rank's share, a TILE_N
+// chunk a step, every writer's pushed copy read from this rank's own inbox in one round trip,
+// summed over the writers through LDS, rounded once to T, stored in this rank's partials; with
+// int4 the int4 walk's above. `input_of(w)` is writer w's copy of this rank's share (its slot), w
+// the same across the wave, the share's first element `input_first` in it (0: a slot holds the
+// share alone). WRITERS ARE READ ROTATED, rank + w's w-th: the reads are local now, but the sum's
+// order stays the one the pulled walk had.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T, typename INPUT_OF>
-DINLINE void reduce_scatter(INPUT_OF input_of, int64_t input_stride_m,
-                            int64_t input_stride_n, int input_size_m,
-                            int input_size_n, const PeerBases& bases,
-                            int64_t input_values_offset,
-                            int64_t input_scales_offset, int64_t partials_offset, int64_t partials_values_offset, int64_t partials_scales_offset, int rank) {
+DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
+                          int64_t input_stride_n, int input_size_m,
+                          int input_size_n, int64_t input_first, const PeerBases& bases,
+                          int64_t input_values_offset,
+                          int64_t input_scales_offset, int64_t partials_offset, int64_t partials_values_offset, int64_t partials_scales_offset, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
-    int4_flat_reduce_scatter<WORLD, THREADS, T>(
+    int4_flat_reduce_slots<WORLD, THREADS, T>(
         bases, input_values_offset, input_scales_offset, partials_values_offset,
         partials_scales_offset,
         int64_t{input_size_m} * input_size_n, rank);
@@ -2460,13 +2514,13 @@ DINLINE void reduce_scatter(INPUT_OF input_of, int64_t input_stride_m,
       return;  // a late rank's share is empty at few packs (every block alike)
     block_for_each_tile(1, chunks, [&](int, int chunk) {
       const int len = share_len(total, slice, rank);
-      const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+      const int w = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
-      // 1. Every rank's copy of this chunk of this rank's share, in one round trip.
-      range_load<CONTIGUOUS, LANES>(input_of(r), input_stride_m, input_stride_n,
-                                    input_size_n, got, share_first(slice, rank), len,
+      // 1. Every writer's copy of this chunk of this rank's share, in one round trip.
+      range_load<CONTIGUOUS, LANES>(input_of(w), input_stride_m, input_stride_n,
+                                    input_size_n, got, input_first, len,
                                     chunk * TILE_N);
-      // 2. Summed over the ranks, in rotated rank order, through LDS, rounded once.
+      // 2. Summed over the writers, in rotated order, through LDS, rounded once.
       T rounded[1][K][P];
       block_sum_ranks<WORLD, LANES>(got, rounded);
       // 3. Stored in this rank's partials.
@@ -2513,18 +2567,23 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
   }
 }
 
-// STAGED, BEFORE THE REDUCE-SCATTER: this rank's input, every rank's share of it, into its
-// inputs (ours, rows back to back), each block the chunks that rank's same block reads.
+// THE PUSH, BEFORE THE REDUCE-SCATTER (the pushed two-shot's): this rank's input, every rank's
+// share of it, read here (no peer reads the caller's input) and stored in THAT rank's inbox at this
+// rank's slot (slot `rank`, inbox_stride_m elements a slot, the share from the slot's first), each
+// block the chunks that rank's same block sums (the same walk), so the first barrier, ordered,
+// publishes them to it. A share's copy is LANES threads, whole waves, its rank rank + w (rotated:
+// the GPUs push to different peers at once), so its inbox is one scalar base.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
-                   int64_t input_stride_n, int input_size_m, int input_size_n,
-                   T* inputs_ptr, int64_t inputs_stride_m,
-                   int64_t inputs_stride_n, int inputs_size_m,
-                   int inputs_size_n, int rank) {
+DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
+                         int64_t input_stride_n, int input_size_m, int input_size_n,
+                         const PeerBases& bases, int64_t inbox_offset,
+                         int64_t inbox_stride_m, int64_t inbox_stride_n,
+                         int inbox_size_n, int rank) {
   constexpr int LANES = THREADS / WORLD;
   constexpr int P = traits<T>::N;
   constexpr int K = TILE_N / (P * LANES);
   static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
+  static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
   const int64_t total = int64_t{input_size_m} * input_size_n;
   const int slice = share_slice<WORLD, P>(total);
   block_for_each_tile(1, (slice + TILE_N - 1) / TILE_N, [&](int, int chunk) {
@@ -2535,23 +2594,23 @@ DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
     range_load<CONTIGUOUS, LANES>(input_ptr, input_stride_m, input_stride_n,
                                   input_size_n, part, share_first(slice, r), len,
                                   chunk * TILE_N);
-    range_store<true, LANES>(part, inputs_ptr, inputs_stride_m,
-                             inputs_stride_n, inputs_size_n,
-                             share_first(slice, r), len, chunk * TILE_N, len);
+    range_store<true, LANES>(part, rank_of<T>(bases, r, inbox_offset) + rank * inbox_stride_m,
+                             inbox_stride_m, inbox_stride_n, inbox_size_n, 0, len,
+                             chunk * TILE_N, len);
   });
 }
 
-// THE INT4 TWO-SHOT'S STAGE: the int4 walk's (QUANTIZATION is int4; none stages through the
-// staged build's `stage` above).
+// THE INT4 TWO-SHOT'S PUSH: the int4 walk's (QUANTIZATION is int4; none pushes through the
+// overload above).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                   int input_size_m, int input_size_n, uint8_t* inputs_values_ptr,
-                   __fp16* inputs_scales_ptr, int rank) {
-  static_assert(QUANTIZATION == Quantization::int4, "none stages through the staged build");
-  int4_flat_stage<WORLD, THREADS, CONTIGUOUS>(input_ptr, input_stride_m, input_stride_n,
-                                                input_size_m, input_size_n,
-                                                inputs_values_ptr, inputs_scales_ptr);
+DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+                         int input_size_m, int input_size_n, const PeerBases& bases,
+                         int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
+  static_assert(QUANTIZATION == Quantization::int4, "none pushes through its own overload");
+  int4_flat_push<WORLD, THREADS, CONTIGUOUS>(input_ptr, input_stride_m, input_stride_n,
+                                             input_size_m, input_size_n, bases,
+                                             inbox_values_offset, inbox_scales_offset, rank);
 }
 
 // THE COPY-IN OF EVERY PER-ROW KERNEL (the fused ops' one-shots and two-shots), before its first
@@ -2852,6 +2911,38 @@ DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
                                          row_step);
 }
 
+// THE PUSH, peers_load's other way: these registers stored at the same place of every rank's
+// region `output_offset` into its arena (one of ours: a pushed collective's inbox, at the writer's
+// slot), every rank's store issued together. Visible to each rank's same block after the next
+// ordered barrier.
+template <int WORLD, int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS, int K,
+          int P>
+DINLINE void peers_store(const T (&input)[ROWS][K][P], const PeerBases& bases,
+                         int64_t output_offset, int64_t output_stride_m,
+                         int64_t output_stride_n, int output_size_m, int output_size_n,
+                         int offs_m, int offs_n, int row_step = 1) {
+  T* output[WORLD];
+  impl::peers_of(bases, output_offset, output);
+  impl::peers_store<THREADS_M, THREADS_N, THREADS>(input, output, output_stride_m,
+                                                   output_size_m, output_size_n, offs_m,
+                                                   offs_n, row_step);
+}
+
+// EVERY WRITER'S SLOT of this rank's inbox, what the peers pushed (writer w's at w *
+// input_stride_slot elements from input_ptr, each slot at the input's strides and sizes), all in
+// flight together: peers_load's registers, read locally.
+template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K, int P>
+DINLINE void slots_load(const T* input_ptr, int64_t input_stride_slot,
+                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
+                        int input_size_n, T (&output)[WORLD][ROWS][K][P], int offs_m,
+                        int offs_n, int row_step = 1) {
+  const T* input[WORLD];
+  impl::slots_of(input_ptr, input_stride_slot, input);
+  impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
+                                         input_size_n, output, offs_m, offs_n,
+                                         row_step);
+}
+
 // THE ALL-GATHER INTO REGISTERS: each pack from the rank owning its columns, slice_n columns a
 // rank (the last rank's to the end), the owner picked in each lane. partials_size_m and
 // partials_size_n clamp as load's do: the tensor's rows and columns, not the partials's own.
@@ -3087,15 +3178,16 @@ DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
 // ===============================================================================================
 
 // THE FLAT WALK (the plain two-shot): the [m, n] tensor's elements numbered row-major and cut
-// into WORLD ranges, a TILE_N chunk a step (COLLECTIVES says why). Reduce-scatter: this rank's
-// range of every rank's input, summed in fp32, into its partials. CONTIGUOUS: the input's rows
-// back to back, the instance the host picks from its strides. QUANTIZATION: each buffer of the
-// exchange followed by its quantized form (int4: the input's staged values and scales, `stage`'s;
-// the sums' values and scales), read in place of it; the overload without them moves the buffers
-// as they are (the staged build's).
+// into WORLD ranges, a TILE_N chunk a step (COLLECTIVES says why). PUSHED: each rank pushes every
+// rank's range of its own input into that rank's INBOX at its own slot (`push_shares`), the ordered
+// barrier publishes them, and each rank sums the WORLD slots of its range LOCALLY into its partials
+// (`reduce_slots`); no peer ever reads the caller's input, and nothing is copied in first.
+// reduce_slots, int4: the inbox's INT4 payload (`push_shares`' quantized slots, writer w's at
+// the share w's place in an [m, n] payload) summed into the partials' INT4 payload. input_size_m
+// and input_size_n are the problem's (the flat total); the input region is this rank's inbox.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void reduce_scatter(
+DINLINE void reduce_slots(
     const PeerBases& bases, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
@@ -3108,24 +3200,28 @@ DINLINE void reduce_scatter(
     int partials_values_size_m, int partials_values_size_n, int64_t partials_scales_offset, int64_t partials_scales_stride_m,
     int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
     int rank) {
-  impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION, T>(
-      [&](int r) { return impl::rank_of<T>(bases, r, input_offset); }, input_stride_m,
-      input_stride_n,
-      input_size_m, input_size_n, bases, input_values_offset,
-      input_scales_offset, partials_offset,
-      partials_values_offset, partials_scales_offset, rank);
+  static_assert(QUANTIZATION == Quantization::int4,
+                "none sums its inbox through the overload below (its slots' stride)");
+  impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION, T>(
+      [&](int) { return impl::rank_of<T>(bases, rank, input_offset); }, input_stride_m,
+      input_stride_n, input_size_m, input_size_n, 0, bases, input_values_offset,
+      input_scales_offset, partials_offset, partials_values_offset, partials_scales_offset,
+      rank);
 }
-// The staged build's: its input is our inputs, every rank's at the inputs' offset.
-template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void reduce_scatter(const PeerBases& bases, int64_t input_offset,
-                            int64_t input_stride_m, int64_t input_stride_n,
-                            int input_size_m, int input_size_n, int64_t partials_offset, int64_t partials_stride_m,
-                            int64_t partials_stride_n, int partials_size_m,
-                            int partials_size_n, int rank) {
-  impl::reduce_scatter<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none, T>(
-      [&](int r) { return impl::rank_of<T>(bases, r, input_offset); },
-      input_stride_m, input_stride_n, input_size_m, input_size_n, bases, 0, 0,
-      partials_offset, 0, 0, rank);
+// The exact walk's: this rank's inbox, [WORLD, slot] (writer w's slot at row w, inbox_stride_m
+// elements a slot, each holding writer w's copy of this rank's range of the size_m x size_n
+// problem from the slot's first element), summed into this rank's partials.
+template <int WORLD, int THREADS, int TILE_N, typename T>
+DINLINE void reduce_slots(const PeerBases& bases, int64_t inbox_offset,
+                          int64_t inbox_stride_m, int64_t inbox_stride_n,
+                          int inbox_size_m, int inbox_size_n, int64_t partials_offset,
+                          int64_t partials_stride_m, int64_t partials_stride_n,
+                          int partials_size_m, int partials_size_n, int size_m, int size_n,
+                          int rank) {
+  const T* const inbox = impl::rank_of<T>(bases, rank, inbox_offset);
+  impl::reduce_slots<WORLD, THREADS, TILE_N, true, Quantization::none, T>(
+      [&](int w) { return inbox + w * inbox_stride_m; }, inbox_stride_m, inbox_stride_n,
+      size_m, size_n, 0, bases, 0, 0, partials_offset, 0, 0, rank);
 }
 // All-gather: every rank's summed range, from its partials (int4: its values, dequantized), at its
 // place in the output.
@@ -3155,33 +3251,33 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
       bases, partials_offset, 0, 0, output_ptr, output_stride_m, output_stride_n,
       output_size_m, output_size_n, rank);
 }
-// Staged, first: this rank's input, every rank's range of it, into its inputs.
+// PUSHED, FIRST: this rank's input, every rank's range of it, into that rank's inbox at this
+// rank's slot (slot `rank` of the [WORLD, slot] inbox), before the first barrier (ordered).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void stage(const T* input_ptr, int64_t input_stride_m,
-                   int64_t input_stride_n, int input_size_m, int input_size_n,
-                   T* inputs_ptr, int64_t inputs_stride_m,
-                   int64_t inputs_stride_n, int inputs_size_m,
-                   int inputs_size_n, int rank) {
-  impl::stage<WORLD, THREADS, TILE_N, CONTIGUOUS>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_ptr, inputs_stride_m, inputs_stride_n, inputs_size_m,
-      inputs_size_n, rank);
+DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
+                         int64_t input_stride_n, int input_size_m, int input_size_n,
+                         const PeerBases& bases, int64_t inbox_offset,
+                         int64_t inbox_stride_m, int64_t inbox_stride_n,
+                         int inbox_size_m, int inbox_size_n, int rank) {
+  impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, bases,
+      inbox_offset, inbox_stride_m, inbox_stride_n, inbox_size_n, rank);
 }
-// THE INT4 TWO-SHOT'S STAGE, before its first barrier (ordered): every rank's range of this
-// rank's input quantized into this rank's staged values and scales (the input's quantized form
-// the reduce-scatter reads).
+// THE INT4 TWO-SHOT'S PUSH, before its first barrier (ordered): every rank's range of this rank's
+// input quantized here and stored in that rank's inbox INT4 payload at this rank's slot (the
+// payload `reduce_slots` reads).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void stage(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                   int input_size_m, int input_size_n, uint8_t* inputs_values_ptr,
-                   int64_t inputs_values_stride_m, int64_t inputs_values_stride_n,
-                   int inputs_values_size_m, int inputs_values_size_n,
-                   __fp16* inputs_scales_ptr, int64_t inputs_scales_stride_m,
-                   int64_t inputs_scales_stride_n, int inputs_scales_size_m,
-                   int inputs_scales_size_n, int rank) {
-  impl::stage<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_values_ptr, inputs_scales_ptr, rank);
+DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+                         int input_size_m, int input_size_n, const PeerBases& bases,
+                         int64_t inbox_values_offset, int64_t inbox_values_stride_m,
+                         int64_t inbox_values_stride_n, int inbox_values_size_m,
+                         int inbox_values_size_n, int64_t inbox_scales_offset,
+                         int64_t inbox_scales_stride_m, int64_t inbox_scales_stride_n,
+                         int inbox_scales_size_m, int inbox_scales_size_n, int rank) {
+  impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, bases,
+      inbox_values_offset, inbox_scales_offset, rank);
 }
 
 // THE COPY-IN OF EVERY PER-ROW KERNEL, before its first barrier (ordered): this block's rows of
