@@ -11,8 +11,68 @@
 #include "all_gather.cuh"
 #include "common.cuh"
 #include "reduce_scatter.cuh"
+#include "rms_norm.cuh"
 
 namespace hip_custom_communicator {
+
+// ATTNRES'S OWN MATH (moved from common.cuh, I3: only AttnRes calls it): the online softmax, a
+// tile's registers zeroed, and the weighted sum's fused multiply-add.
+// -------------------------------------------------------------------------------------------------
+// SOFTMAX
+//
+// THE ONLINE SOFTMAX, at thread scope: a softmax over logits that arrive a tile
+// at a time, folded into a running weighted sum without a second pass (flash
+// attention's).
+// -------------------------------------------------------------------------------------------------
+
+// THE SOFTMAX SO FAR, two registers: the largest logit seen (`softmax_max`,
+// from -INFINITY) and the sum of exp(logit - max) (`softmax_denominator`, from
+// 0). Folds N logits into them (a -INFINITY logit is no source). Returns the
+// scale the weighted sum so far takes, and in `scale` each logit's weight; the
+// sum is final once divided by softmax_denominator.
+template <int NUM_LOGITS>
+DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator,
+                                  const float (&logit)[NUM_LOGITS],
+                                  float (&scale)[NUM_LOGITS]) {
+  float new_max = softmax_max;
+#pragma unroll
+  for (int t = 0; t < NUM_LOGITS; ++t) new_max = fmaxf(new_max, logit[t]);
+  const float old_scale = __expf(softmax_max - new_max);
+  softmax_denominator *= old_scale;
+#pragma unroll
+  for (int t = 0; t < NUM_LOGITS; ++t) {
+    scale[t] = __expf(logit[t] - new_max);
+    softmax_denominator += scale[t];
+  }
+  softmax_max = new_max;
+  return old_scale;
+}
+
+template <typename T, int ROWS, int K, int P>
+DINLINE void zeros(T (&output)[ROWS][K][P]) {
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j) output[i][k][j] = T(0);
+}
+
+// output = a * a_row_scale + b * b_row_scale, a row's scales each.
+template <typename B, int ROWS, int K, int P>
+DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
+                 const B (&b)[ROWS][K][P], const float (&b_row_scale)[ROWS],
+                 float (&output)[ROWS][K][P]) {
+#pragma unroll
+  for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+#pragma unroll
+      for (int j = 0; j < P; ++j)
+        output[i][k][j] = fmaf(static_cast<float>(b[i][k][j]), b_row_scale[i],
+                               a[i][k][j] * a_row_scale[i]);
+}
+
 
 // =============================================================================
 // attn_res
@@ -167,18 +227,9 @@ DINLINE void block_attn_res_tile(
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
     load<1, THREADS>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n);
-    float ss[1][ROWS];
-    partial_dot<THREADS>(acc, acc, ss[0], input_size_n, offs_n);
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS>(ss, ss);
     float scale[ROWS];
-#pragma unroll
-    for (int m = 0; m < ROWS; ++m)
-      scale[m] = rsqrtf(ss[0][m] * inv_hidden + output_eps);
-    float normed[ROWS][K][P], output_norm_weight_f[1][K][P];
-    mul(acc, scale, normed);
-    convert(output_norm_weight, output_norm_weight_f);
-    mul(normed, output_norm_weight_f, normed);
-    convert(normed, result);
+    rms_norm<THREADS, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
+                                            inv_hidden, input_size_n, offs_n);
   } else {
     convert(acc, result);
   }

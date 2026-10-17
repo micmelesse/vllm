@@ -9,6 +9,7 @@
 
 #include "common.cuh"
 #include "reduce_scatter.cuh"
+#include "rms_norm.cuh"
 
 namespace hip_custom_communicator {
 
@@ -96,21 +97,11 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
       convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
-    float ss[1][1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
-    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
-    // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    float normed_f[1][K][P];
-    mul(s, scale, normed_f);
-    round<WEIGHT_DTYPE>(normed_f);
-    float w_f[1][K][P];
-    convert(w, w_f);
-    mul(normed_f, w_f, normed_f);
-    WEIGHT_DTYPE normed_w[1][K][P];
-    convert(normed_f, normed_w);
+    // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
+    float scale[1];
     DTYPE normed[1][K][P];
-    convert(normed_w, normed);
+    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0);
     store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
   }
 
@@ -340,31 +331,23 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
     }
-    float ss[1][1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
-    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
     // every rank norms it while gathering, so the link carries one row a row,
     // as a plain all-reduce does (gathering both the normed row and the
     // residual was twice that: 215.9 against 155.2 us at 4096 tokens,
     // 2026-10-01T02-17-54Z).
+    float scale[1];
+    DTYPE normed[1][K][P];
     if constexpr (ADD_RESIDUAL) {
-      store_row_scalar(scale, reinterpret_cast<float*>(own_partials + scale_at),
+      rms_norm<THREADS_PER_BLOCK, NormPart::scale, true>(s, scale, w, normed, eps, inv_hidden,
+                                                         input_size_n, 0);
+      store_row_scalar(scale[0], reinterpret_cast<float*>(own_partials + scale_at),
                        row - first);
       return;
     }
-    // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    float normed_f[1][K][P];
-    mul(s, scale, normed_f);
-    round<WEIGHT_DTYPE>(normed_f);
-    float w_f[1][K][P];
-    convert(w, w_f);
-    mul(normed_f, w_f, normed_f);
-    WEIGHT_DTYPE normed_w[1][K][P];
-    convert(normed_f, normed_w);
-    DTYPE normed[1][K][P];
-    convert(normed_w, normed);
+    // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
+    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0);
     store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its
@@ -426,17 +409,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         if (row >= input_size_m) continue;
         if constexpr (ADD_RESIDUAL) {
           store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
-          float normed_f[1][1][P];
-          convert(got[r], normed_f);
-          mul(normed_f, sc[r], normed_f);
-          round<WEIGHT_DTYPE>(normed_f);
-          float w_f[1][1][P];
-          convert(w_step, w_f);
-          mul(normed_f, w_f, normed_f);
-          WEIGHT_DTYPE normed_w[1][1][P];
-          convert(normed_f, normed_w);
+          float got_f[1][1][P];
+          convert(got[r], got_f);
+          float scale[1] = {sc[r]};
           DTYPE normed[1][1][P];
-          convert(normed_w, normed);
+          rms_norm<THREADS_PER_BLOCK, NormPart::apply, true>(got_f, scale, w_step, normed, eps,
+                                                             inv_hidden, input_size_n, c);
           store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
         } else {
           store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
@@ -622,21 +600,11 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       convert(s, added);
       store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
-    float ss[1][1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
-    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
-    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
-    // out = T(W(W(s * scale) * float(w))), as the reference rounds
-    float normed_f[1][K][P];
-    mul(s, scale, normed_f);
-    round<WEIGHT_DTYPE>(normed_f);
-    float w_f[1][K][P];
-    convert(w, w_f);
-    mul(normed_f, w_f, normed_f);
-    WEIGHT_DTYPE normed_w[1][K][P];
-    convert(normed_f, normed_w);
+    // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
+    float scale[1];
     DTYPE normed[1][K][P];
-    convert(normed_w, normed);
+    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0);
     store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
   }
 }

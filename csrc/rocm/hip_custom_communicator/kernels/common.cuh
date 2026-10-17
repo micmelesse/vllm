@@ -3,7 +3,7 @@
 //
 // COMMON: everything a kernel may call and the machine under it, in sections,
 // each built on those above it: HARDWARE, BUILD, UTILS, TILES, MEMORY,
-// ELEMENTWISE, REDUCE, DOT, SOFTMAX, PEERS, BARRIER, QUANTIZATION, COLLECTIVES,
+// ELEMENTWISE, REDUCE, DOT, PEERS, BARRIER, QUANTIZATION, COLLECTIVES,
 // then THE INTERFACE, last because it passes to them all. Every function is at file scope
 // (no helper namespace): the four ops (load, store, barrier, block_reduce), the INT4 codec
 // (encode, decode), the two address functions (ptr_array_at, lane_ptr_array_at) and, until
@@ -463,23 +463,6 @@ typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 // the adds of the first ones (ISA 2026-10-01T00-39-51Z); with sched_barrier
 // alone, a tile's weight loads were sunk to their uses, one register quad and
 // one round trip each (ISA 2026-10-03T21-00-27Z).
-template <typename PACK>
-DINLINE PACK global_load(const PACK* p) {
-  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
-  const u32x4 raw = *(const global_u32x4*)(p);
-  PACK v;
-  __builtin_memcpy(&v, &raw, 16);
-  return v;
-}
-
-template <typename PACK>
-DINLINE void global_store(PACK* p, const PACK& v) {
-  static_assert(sizeof(PACK) == 16, "a pack is 16 bytes");
-  u32x4 raw;
-  __builtin_memcpy(&raw, &v, 16);
-  *(global_u32x4*)(p) = raw;
-}
-
 DINLINE void issued() {
   asm volatile("" ::: "memory");
   __builtin_amdgcn_sched_barrier(0);
@@ -487,10 +470,14 @@ DINLINE void issued() {
 
 template <typename PACK>
 DINLINE PACK pack_load(const PACK* p) {
-  if constexpr (sizeof(PACK) == 16)
-    return global_load(p);
-  else
+  if constexpr (sizeof(PACK) == 16) {
+    const u32x4 raw = *(const global_u32x4*)(p);
+    PACK v;
+    __builtin_memcpy(&v, &raw, 16);
+    return v;
+  } else {
     return *p;
+  }
 }
 
 // A THREAD'S REGISTERS AND THEIR PLACE: `T v[ROWS][K][P]`, P a pack's elements; the place in a
@@ -517,7 +504,7 @@ DINLINE int row_of(int size_m, int offs_m, int row_step, int i) {
              : size_m - 1;
 }
 // This thread's pack k of a row, in packs from the row's start, past size_n clamped to the last,
-// so every load stays in bounds; its mask 1 below size_n and 0 past it, a float multiplied in so
+// so every load stays in bounds (partial_dot masks past size_n with a float multiplied in, so
 // nothing reading it branches (a load under a runtime `if` cannot be hoisted past the branch,
 // and loads meant to be in flight together then wait one at a time).
 template <int P, int THREADS_N>
@@ -525,25 +512,6 @@ DINLINE int pack_of(int size_n, int offs_n, int k) {
   const int n =
       offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N + k * THREADS_N;
   return n < size_n / P ? n : size_n / P - 1;
-}
-template <int P, int THREADS_N>
-DINLINE float pack_mask(int size_n, int offs_n, int k) {
-  return offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N +
-                     k * THREADS_N <
-                 size_n / P
-             ? 1.0f
-             : 0.0f;
-}
-// WHETHER THIS THREAD HOLDS ANY OF THE LAYOUT: a layout narrower than the block of THREADS
-// leaves the rest out. A compare only for a narrower layout: threadIdx.x < THREADS is not
-// folded from the launch bounds (a compare and a branch around every store, ISA 2026-10-15).
-template <int THREADS_M, int THREADS_N, int THREADS>
-DINLINE bool holds() {
-  static_assert(THREADS_M * THREADS_N <= THREADS, "a layout is the block or fewer");
-  if constexpr (THREADS_M * THREADS_N == THREADS)
-    return true;
-  else
-    return static_cast<int>(threadIdx.x) < THREADS_M * THREADS_N;
 }
 // WHETHER A LOAD SKIPS ROW i: only several rows a thread or rows of threads, whose rows past
 // size_m would re-read the last over the links. One row's is real wherever a kernel makes one,
@@ -579,10 +547,13 @@ DINLINE vec<T, P> pack(const T (&v)[P]) {
 }
 template <typename PACK>
 DINLINE void pack_store(PACK* p, const PACK& v) {
-  if constexpr (sizeof(PACK) == 16)
-    global_store(p, v);
-  else
+  if constexpr (sizeof(PACK) == 16) {
+    u32x4 raw;
+    __builtin_memcpy(&raw, &v, 16);
+    *(global_u32x4*)(p) = raw;
+  } else {
     *p = v;
+  }
 }
 
 // A ROW'S SCALAR (a norm's scale), one float a row: thread 0 stores it.
@@ -611,16 +582,6 @@ DINLINE void convert(const T (&input)[ROWS][K][P], U (&output)[ROWS][K][P]) {
     for (int k = 0; k < K; ++k)
 #pragma unroll
       for (int j = 0; j < P; ++j) output[i][k][j] = static_cast<U>(input[i][k][j]);
-}
-
-template <typename T, int ROWS, int K, int P>
-DINLINE void zeros(T (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = T(0);
 }
 
 template <typename U, int ROWS, int K, int P>
@@ -679,19 +640,6 @@ DINLINE void mul(const float (&a)[ROWS][K][P], float scale,
   mul(a, row_scale, output);
 }
 
-template <typename B, int ROWS, int K, int P>
-DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
-                 const B (&b)[ROWS][K][P], const float (&b_row_scale)[ROWS],
-                 float (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        output[i][k][j] = fmaf(static_cast<float>(b[i][k][j]), b_row_scale[i],
-                               a[i][k][j] * a_row_scale[i]);
-}
 
 // =================================================================================================
 // REDUCE
@@ -828,7 +776,10 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
     for (int k = 0; k < K; ++k)
       part[static_cast<int>(threadIdx.x) / THREADS_N][k][mine] = pack(input[k]);
     __syncthreads();
-    if (holds<1, THREADS_N, THREADS_M * THREADS_N>()) {
+    // THE FIRST ROW OF THREADS HOLDS THE SUM: a compare only when there are several (threadIdx.x <
+    // THREADS_N is not folded from the launch bounds: a compare and a branch around every store,
+    // ISA 2026-10-15).
+    if (THREADS_M == 1 || static_cast<int>(threadIdx.x) < THREADS_N) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         float x[P];
@@ -876,40 +827,11 @@ DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
       for (int j = 0; j < P; ++j)
         dk = fmaf(static_cast<float>(a[i][k][j]), static_cast<float>(b[ib][k][j]),
                   dk);
-      output[i] += pack_mask<P, THREADS_N>(size_n, offs_n, k) * dk;
+      // Its mask 1 below size_n and 0 past it, multiplied in so nothing branches (pack_of).
+      const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_N + k * THREADS_N;
+      output[i] += (n < size_n / P ? 1.0f : 0.0f) * dk;
     }
   }
-}
-
-// =================================================================================================
-// SOFTMAX
-//
-// THE ONLINE SOFTMAX, at thread scope: a softmax over logits that arrive a tile
-// at a time, folded into a running weighted sum without a second pass (flash
-// attention's).
-// =================================================================================================
-
-// THE SOFTMAX SO FAR, two registers: the largest logit seen (`softmax_max`,
-// from -INFINITY) and the sum of exp(logit - max) (`softmax_denominator`, from
-// 0). Folds N logits into them (a -INFINITY logit is no source). Returns the
-// scale the weighted sum so far takes, and in `scale` each logit's weight; the
-// sum is final once divided by softmax_denominator.
-template <int NUM_LOGITS>
-DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator,
-                                  const float (&logit)[NUM_LOGITS],
-                                  float (&scale)[NUM_LOGITS]) {
-  float new_max = softmax_max;
-#pragma unroll
-  for (int t = 0; t < NUM_LOGITS; ++t) new_max = fmaxf(new_max, logit[t]);
-  const float old_scale = __expf(softmax_max - new_max);
-  softmax_denominator *= old_scale;
-#pragma unroll
-  for (int t = 0; t < NUM_LOGITS; ++t) {
-    scale[t] = __expf(logit[t] - new_max);
-    softmax_denominator += scale[t];
-  }
-  softmax_max = new_max;
-  return old_scale;
 }
 
 // =================================================================================================
@@ -1498,26 +1420,7 @@ DINLINE E* at_offset(E* base, uint32_t offset) {
   return reinterpret_cast<E*>(reinterpret_cast<Byte*>(base) + offset);
 }
 
-// PACK `pack` OF A QUANTIZED ROW: its word of values, its group's scale.
-DINLINE uint32_t int4_word_load(const uint8_t* row, int pack) {
-  return *(const global_u32*)at_offset(row, static_cast<uint32_t>(pack) * kInt4WordBytes);
-}
-DINLINE float int4_scale_load(const __fp16* row, int pack) {
-  return *(const global_f16*)at_offset(
-      row, static_cast<uint32_t>(pack / kInt4GroupPacks) * kInt4ScaleBytes);
-}
 
-// Every pack of a thread's registers, encoded or decoded.
-template <typename T, int ROWS, int K, int P>
-DINLINE void int4_encode(const T (&input)[ROWS][K][P], uint32_t (&words)[ROWS][K],
-                         float (&scales)[ROWS][K]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-      encode<1>(reinterpret_cast<const T(&)[1][P]>(input[i][k]),
-                reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
-}
 template <typename U, int ROWS, int K, int P>
 DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
                          U (&output)[ROWS][K][P]) {
@@ -1528,7 +1431,9 @@ DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)
 }
 
 
-// Every peer's words and scales, the position once a pack in a vector register (load's every rank),
+// Every peer's words and scales (kept with int4_peers_sum: the push kernels' int4 sum from the
+// words, where a decoded tile of every peer held 172 VGPRs; inlined in reduce_scatter it was 2% more
+// instructions, ISA I3), the position once a pack in a vector register (load's every rank),
 // each rank's word and scale an add of it; all in flight, none waited on.
 template <int THREADS_M, int THREADS_N, int P, int WORLD, int ROWS, int K>
 DINLINE void int4_peers_issue(const uint8_t* const (&values)[WORLD], int64_t values_stride_m,
@@ -1906,7 +1811,12 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     constexpr int QP = kInt4Group / kInt4GroupPacks;
     uint32_t words[ROWS][K];
     float scales[ROWS][K];
-    int4_encode(input, words, scales);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+        encode<1>(reinterpret_cast<const U(&)[1][P]>(input[i][k]),
+                  reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
     const int64_t values_stride_m = int4_values_size_n(output_size_n);
     const int64_t scales_stride_m = int4_scales_size_n(output_size_n);
     const int64_t scales_at = int4_scales_offset(output_size_m, output_size_n);

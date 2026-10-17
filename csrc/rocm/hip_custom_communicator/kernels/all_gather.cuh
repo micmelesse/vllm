@@ -168,16 +168,17 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           const int col = pack_of<P, THREADS>(output_size_n, offs_n, k);
           const int owner = min(col / (slice_n / P), WORLD - 1);
           const int64_t row = row_of<1, THREADS>(output_size_m, offs_m, 1, i);
-          words[i][k] = int4_word_load(
+          // The pack's word of values and its group's scale.
+          words[i][k] = *(const global_u32*)at_offset(
               lane_ptr_array_at<WORLD, const uint8_t>(partials_ptr_array, partials_ptr_array_size, owner) +
                   row * values_stride_m,
-              col);
-          scales[i][k] = int4_scale_load(
+              static_cast<uint32_t>(col) * kInt4WordBytes);
+          scales[i][k] = *(const global_f16*)at_offset(
               reinterpret_cast<const __fp16*>(
                   lane_ptr_array_at<WORLD, const char>(partials_ptr_array, partials_ptr_array_size, owner) +
                   scales_offset) +
                   row * scales_stride_m,
-              col);
+              static_cast<uint32_t>(col / kInt4GroupPacks) * kInt4ScaleBytes);
         }
       }
       issued();
