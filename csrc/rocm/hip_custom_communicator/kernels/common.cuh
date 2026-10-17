@@ -158,75 +158,30 @@ constexpr Hardware kGfx950 = {
 static_assert(kGfx950.compute_units % kGfx950.xcds == 0,
               "every XCD has the same CUs");
 
-// gfx942, AMD Instinct MI300X (MI325X is the same but for 256 GiB). Sources:
-// ROCm's GPU hardware specifications table for the compute units, register
-// files, caches and LDS; ROCm's MI300 page for the XCDs and HBM; AMD's MI300X
-// data sheet for the fabric (7 links, 896 GB/s in all).
-constexpr Hardware kGfx942 = {
-    64,          // wave_size
-    1024,        // max_workgroup
-    304,         // compute_units (38 active per XCD)
-    32,          // max_waves_per_cu
-    8,           // xcds
-    4,           // simds_per_cu
-    512 * kKiB,  // vgpr_file_bytes
-    12800,       // sgpr_file_bytes (12.5 KiB)
-    64 * kKiB,   // lds_bytes
-    32 * kKiB,   // l1_bytes
-    128,         // cache_line_bytes
-    4 * kMiB,    // l2_bytes_per_xcd
-    256 * kMiB,  // infinity_cache_bytes
-    192 * kGiB,  // hbm_bytes
-    5300.0,      // hbm_gbytes_per_s
-    7,           // xgmi_links
-    64.0,        // xgmi_gbytes_per_s_a_way
-    16,          // max_load_bytes (global_load_dwordx4; CDNA3 ISA guide)
-    256,         // arch_vgprs
-    256,         // acc_vgprs
-    8,           // vgpr_granule (LLVM AMDGPUUsage, gfx90a and later, wave64)
-};
-static_assert(kGfx942.compute_units % kGfx942.xcds == 0,
-              "every XCD has the same CUs");
-
-// THE TARGET THE HOST TUNES FOR.
+// THE TARGET: the one arch the build compiles device code for (gfx950,
+// CMakeLists.txt) and the host tunes for; `supported` refuses every other.
 constexpr const Hardware& kTarget = kGfx950;
 constexpr const char* kTargetArch = "gfx950";
 
-// THE DEVICE THIS COMPILE PASS IS FOR: a build compiles the device code once
-// per offload arch (gfx942 and gfx950), each against its own facts; the host
-// pass sees the tuning target.
-#if defined(__gfx942__)
-constexpr const Hardware& kDevice = kGfx942;
-#else
-constexpr const Hardware& kDevice = kTarget;
-#endif
-constexpr int kWaveSize = kDevice.wave_size;
+constexpr int kWaveSize = kTarget.wave_size;
 
-// THE MOST COMPUTE UNITS ON ANY TARGET BUILT: for a layout host and device
-// share (the peers' signal block), which one device pass's kDevice cannot size.
-constexpr int kMaxComputeUnits = kGfx950.compute_units > kGfx942.compute_units
-                                     ? kGfx950.compute_units
-                                     : kGfx942.compute_units;
+// THE MOST COMPUTE UNITS ON THE TARGET: for a layout host and device share
+// (the peers' signal block).
+constexpr int kMaxComputeUnits = kTarget.compute_units;
 
-// THE MOST BLOCKS RESIDENT AT ONCE ON ANY TARGET BUILT: every CU full of
+// THE MOST BLOCKS RESIDENT AT ONCE ON THE TARGET: every CU full of
 // one-wave blocks, so the peers' signal block never rules out a grid. Whether
 // one kernel's grid is resident is its occupancy, which only the compiled
 // kernel knows (resident_blocks below, checked by select).
 constexpr int resident_waves(const Hardware& hw) {
   return hw.compute_units * hw.max_waves_per_cu;
 }
-constexpr int kMaxResidentBlocks = resident_waves(kGfx950) >
-                                           resident_waves(kGfx942)
-                                       ? resident_waves(kGfx950)
-                                       : resident_waves(kGfx942);
+constexpr int kMaxResidentBlocks = resident_waves(kTarget);
 
 // THE MOST GPUS THAT CAN READ EACH OTHER'S MEMORY DIRECTLY: a link to every
 // peer (the full xGMI mesh of one node), so a peer group is at most the links
 // plus one. Beyond it there is no load path, only a network collective.
-constexpr int kMaxPeers =
-    (kGfx950.xgmi_links > kGfx942.xgmi_links ? kGfx950.xgmi_links
-                                             : kGfx942.xgmi_links) +
-    1;
+constexpr int kMaxPeers = kTarget.xgmi_links + 1;
 
 // THE MACHINE MODEL: what the device holds, from its `Hardware`.
 
@@ -355,7 +310,7 @@ constexpr BuildInfo derive(const Hardware& hw) {
 
 // THIS COMPILE PASS'S BUILD: the device code for its own target, the host for
 // the tuning target.
-constexpr BuildInfo kBuild = derive(kDevice);
+constexpr BuildInfo kBuild = derive(kTarget);
 
 // WHETHER THE BUILD HOLDS a dtype or a world: dispatch instantiates exactly
 // these.
@@ -373,7 +328,7 @@ constexpr bool world_built(int world) {
   return built_in(kBuild.supports.worlds, world);
 }
 
-static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
+static_assert(kBuild.kernels.max_threads <= kTarget.max_workgroup &&
                   kBuild.kernels.max_threads % kWaveSize == 0,
               "the block limit must be whole waves the device can launch");
 
@@ -385,19 +340,6 @@ static_assert(kBuild.kernels.max_threads <= kDevice.max_workgroup &&
 // =================================================================================================
 
 #define DINLINE __device__ __forceinline__
-
-// THE TARGETS OUR KERNELS ARE WRITTEN FOR: MI300 (gfx942) and MI355 (gfx950).
-// vLLM's ROCm build compiles every file for more (gfx90a and the Radeon
-// gfx11xx/gfx12xx), where our kernels use what does not exist (DPP row
-// broadcasts, gfx9's cache bits), so on those every kernel's body is left out
-// and traps. Nothing launches one there: `supported` refuses the device first.
-// The host pass, which generates no device code, sees the whole body.
-#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx942__) || \
-    defined(__gfx950__)
-  #define HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED 1
-#else
-  #define HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED 0
-#endif
 
 template <typename DTYPE, int VEC_SIZE>
 struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {

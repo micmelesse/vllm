@@ -1499,8 +1499,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
-    "csrc/rocm/attention.cu"
-    "csrc/rocm/hip_custom_communicator.cu")
+    "csrc/rocm/attention.cu")
   set(VLLM_ROCM_EXT_FLAGS ${VLLM_GPU_FLAGS})
 
   # skinny_gemms*.cu are built on gfx9/gfx11 ISA (MFMA, dot2/dot4, legacy
@@ -1534,6 +1533,36 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
+  # hip_custom_communicator.cu's kernels are written and tuned for gfx950 (DPP
+  # row broadcasts, gfx9 cache bits, gfx950's dot2), so its device code is built
+  # for gfx950 alone, in its own object library like skinny_gemms above; the
+  # host side (op registration, `supported`) links into _rocm_C and on any other
+  # device the communicator refuses itself with its reason. A build without
+  # gfx950 leaves the source and its registrations out
+  # (VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR).
+  set(VLLM_HCC_ARCHES ${VLLM_GPU_ARCHES})
+  list(FILTER VLLM_HCC_ARCHES INCLUDE REGEX "gfx950")
+  if(VLLM_HCC_ARCHES)
+    message(STATUS "Building hip_custom_communicator for archs: ${VLLM_HCC_ARCHES}")
+    set(VLLM_HCC_SRC "csrc/rocm/hip_custom_communicator.cu")
+    hipify_sources_target(VLLM_HCC_HIP_SRCS _rocm_C_hcc "${VLLM_HCC_SRC}")
+    unset(_VLLM_LAST_HIPIFY_TARGET)
+    add_library(_rocm_C_hcc OBJECT ${VLLM_HCC_HIP_SRCS})
+    add_dependencies(_rocm_C_hcc hipify_all)
+    set_source_files_properties(${VLLM_HCC_HIP_SRCS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
+    set_target_properties(_rocm_C_hcc PROPERTIES
+      ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_HCC_ARCHES}"
+      POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(_rocm_C_hcc PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+    target_compile_options(_rocm_C_hcc PRIVATE
+      $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>)
+    target_compile_definitions(_rocm_C_hcc PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    target_link_libraries(_rocm_C_hcc PRIVATE torch)
+  else()
+    message(STATUS "No gfx950, skipping hip_custom_communicator")
+    list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_HIP_CUSTOM_COMMUNICATOR")
+  endif()
+
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
     set(VLLM_ROCM_HAS_GFX1100 ON)
@@ -1557,6 +1586,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_link_libraries(_rocm_C PRIVATE _rocm_C_skinny)
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
+  endif()
+  if(TARGET _rocm_C_hcc)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_hcc)
+  else()
+    target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR)
   endif()
 
   if(VLLM_ROCM_HAS_GFX1100)

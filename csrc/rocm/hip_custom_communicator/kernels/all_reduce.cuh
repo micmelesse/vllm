@@ -66,7 +66,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int THREADS_M = TILE_M;
   constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
   constexpr int ROWS = TILE_M / THREADS_M;
@@ -108,9 +107,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
-#else
-  __builtin_trap();
-#endif
 }
 
 // =============================================================================
@@ -142,7 +138,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
     const int band =
         min(partials_size_m, input_size_m - r0);  // this pass's rows
@@ -167,9 +162,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }
-#else
-  __builtin_trap();
-#endif
 }
 
 // =============================================================================
@@ -205,7 +197,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int THREADS_M = TILE_M;
   constexpr int THREADS_N = THREADS_PER_BLOCK / TILE_M;
   constexpr int P = traits<DTYPE>::N;
@@ -257,9 +248,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
   }
-#else
-  __builtin_trap();
-#endif
 }
 
 // =============================================================================
@@ -314,7 +302,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // INT4 payload layout): the collectives find them from each region's sizes.
   static_assert(QUANTIZATION == Quantization::int4,
                 "none is all_reduce_pull_two_shot (or all_reduce_push_two_shot)");
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   // 1-3. Every rank's share of this rank's input, quantized here, into that rank's inbox payload
   // at slot [rank]; every peer launched and pushed its own into ours (ordered); this rank's share,
   // every writer's slot summed, into its partials; every rank's sums visible and every peer done
@@ -337,9 +324,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
       input_size_m, input_size_n, 0, 0, 0, rank);
-#else
-  __builtin_trap();
-#endif
 }
 
 // EXACT, IN PASSES: a band of `partials_size_m` rows a pass (the host's: what
@@ -367,7 +351,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
     const int band =
         min(partials_size_m, input_size_m - r0);  // this pass's rows
@@ -395,9 +378,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }
-#else
-  __builtin_trap();
-#endif
 }
 
 }  // namespace hip_custom_communicator

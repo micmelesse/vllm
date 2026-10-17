@@ -182,16 +182,14 @@ DINLINE void reduce_scatter(
           // first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
           // 2026-10-15T22-47-01Z). WITH BF16, TWO WRITERS' TERMS A STEP: landed together (one
           // v_cvt_pk_bf16_f32) and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
-          // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts): gfx942 sums every
-          // writer by the plain loop (the image builds both targets, the dev loop one, so this broke only
-          // the image: 2026-10-16, e2e 04-18-33Z's test step).
+          // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts), the
+          // one arch built (CMakeLists.txt).
           float sum[kInt4GroupPacks][P];
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k) {
 #pragma unroll
             for (int j = 0; j < P; ++j) sum[k][j] = 0.0f;
             int w = 0;
-#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
             if constexpr (kBf16<T>) {
               const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
@@ -210,7 +208,6 @@ DINLINE void reduce_scatter(
                 for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[k][j]));
               }
             }
-#endif
 #pragma unroll
             for (; w < WORLD; ++w) {
               float a[P];
@@ -513,7 +510,6 @@ DINLINE void reduce_scatter(
 #pragma unroll
               for (int j = 0; j < P; ++j) sum[j] = 0.0f;
               int w = 0;
-#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
               if constexpr (kBf16<T>) {
                 const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
@@ -529,7 +525,6 @@ DINLINE void reduce_scatter(
                   for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[j]));
                 }
               }
-#endif
 #pragma unroll
               for (; w < WORLD; ++w) {
                 float a[P];

@@ -94,6 +94,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 
+  // hip_custom_communicator.cu is built only with gfx950 in the arch list
+  // (CMakeLists.txt); without it its ops are not registered.
+#ifndef VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR
   // ROCm TP collectives. Only the ops that take tensors get a schema (the
   // collectives also a device impl). THE REST TAKE NONE, and an op with no
   // tensor argument has nothing for the dispatcher to select a backend from --
@@ -174,6 +177,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("hip_custom_communicator_all_reduce_add_attn_res_rms_norm",
                 torch::kCUDA,
                 &hip_custom_communicator_all_reduce_add_attn_res_rms_norm);
+#endif  // VLLM_SKIP_HIP_CUSTOM_COMMUNICATOR
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

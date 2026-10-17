@@ -329,7 +329,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
@@ -377,9 +376,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
-#else
-  __builtin_trap();
-#endif
 }
 
 // =============================================================================
@@ -447,7 +443,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
   // INT4 payload layout): found from each region's own sizes where read or
   // written.
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
@@ -506,9 +501,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   };
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
-#else
-  __builtin_trap();
-#endif
 }
 
 // =============================================================================
@@ -569,7 +561,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
   // INT4 payload layout): found from each region's own sizes where read or
   // written.
-#if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
@@ -610,9 +601,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         block_output_stride_m, block_output_stride_n, input_size_m,
         input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden);
   }
-#else
-  __builtin_trap();
-#endif
 }
 
 }  // namespace hip_custom_communicator

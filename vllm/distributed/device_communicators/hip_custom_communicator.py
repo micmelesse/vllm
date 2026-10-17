@@ -833,7 +833,10 @@ def configured_quantization() -> Quantization:
 
 def supported(device: torch.device, world: int) -> Supported | Error:
     """Whether our kernels run on `device` in a world of `world`, as the C++ build
-    answers it (`hip_custom_communicator::supported`): the Supported, or the Error."""
+    answers it (`hip_custom_communicator::supported`): the Supported, or the Error.
+    A build without gfx950 has no communicator: device_not_built."""
+    if not hasattr(torch.ops._rocm_C, "hip_custom_communicator_supported"):
+        return Error.device_not_built
     arch, err = torch.ops._rocm_C.hip_custom_communicator_supported(device.index, world)
     return Error(err) if err is not None else Supported(arch)
 
