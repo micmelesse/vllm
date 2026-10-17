@@ -556,32 +556,6 @@ def test_basic_correctness() -> None:
     )
 
 
-# DIAGNOSTIC (2026-10-16, remove when the driver wedge is understood): which
-# feature leaves the GPU driver degraded after a clean run? Each is run alone,
-# followed by the machine health check.
-def _diag_open_only(comm: HipCustomCommunicator, rank: int) -> None:
-    pass
-
-
-def _diag_one_eager(comm: HipCustomCommunicator, rank: int) -> None:
-    with _step(rank, f"all_reduce 1x{HIDDEN} eager"):
-        _eager(comm, rank, "all_reduce", 1, HIDDEN, torch.bfloat16, {}, None, 1)
-
-
-def _diag_one_graph(comm: HipCustomCommunicator, rank: int) -> None:
-    with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay"):
-        _graphs(comm, rank, "all_reduce", (1,), HIDDEN, torch.bfloat16, {}, None)
-
-
-@on_eight_gpus
-@pytest.mark.parametrize("what", ["open_only", "one_eager", "one_graph"])
-def test_diag_wedge(what: str) -> None:
-    target = {"open_only": _diag_open_only, "one_eager": _diag_one_eager,
-              "one_graph": _diag_one_graph}[what]
-    _on_every_rank(target, process_timeout_s=SMOKE_PROCESS_TIMEOUT_S,
-                   kernel_timeout_s=SMOKE_KERNEL_TIMEOUT_S)
-
-
 # --------------------------------------------------------------------------------
 # Every op, eager and under CUDA graphs.
 # --------------------------------------------------------------------------------
