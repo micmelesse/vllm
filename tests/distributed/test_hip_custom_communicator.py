@@ -211,6 +211,11 @@ def _rank_main(
                 max_rows=MAX_TOKENS,
                 max_cols=HIDDEN,
                 log_mode=log_mode,
+                # EXACT, whatever the image bakes: the hip image sets
+                # VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION=INT4, and a call past
+                # the crossover would then be checked, lossy, against the exact
+                # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
+                quantization="none",
             )
         _COMM = comm
         try:
