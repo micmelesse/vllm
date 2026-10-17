@@ -298,17 +298,10 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // order: the inputs, the outputs, the exchange (partials, inputs), the signals,
 // the status, then the scalars; each buffer its pointer, then its strides, then
 // its sizes, every dimension's, in elements (STANDARDS, *A kernel's arguments
-// have one format*). THE PLAIN ALL-REDUCE AND THE RMSNORM KERNELS take each
-// peer region as its own DEVICE ARRAY of every rank's address of it,
-// `signals_ptr_array`, `staging_ptr_array`, `partials_ptr_array` (written once
-// at open), each with its size (the world), strides and sizes: no arena, no
-// offset. The AttnRes kernels (until they take the same) reach the staging and the partials
-// through the arena's DEVICE ARRAY of every rank's base, `arena_ptr_array`
-// (`char* const*`, written once at open) with `arena_ptr_array_size` (the
-// world), before the first region, and each region's byte offset in the arena,
-// then its strides and sizes: the peers' arenas are opened over legacy IPC at
-// addresses of the runtime's choosing (handle.cuh), so rank r's region is
-// `peer_ptr<T>(arena_ptr_array, arena_ptr_array_size, r, offset)` (common.cuh).
+// have one format*). EVERY KERNEL takes each peer region as its own DEVICE
+// ARRAY of every rank's address of it, `signals_ptr_array`,
+// `staging_ptr_array`, `partials_ptr_array` (written once at open), each with
+// its size (the world), strides and sizes: no arena, no offset.
 // EVERY RANK'S INPUT, exact, through the inputs' DEVICE ARRAY of every rank's
 // address, `inputs_ptr_array` with `inputs_ptr_array_size` (handle.cuh's INPUT
 // TABLES), read in place at its strides (`inputs_stride_*`); the plain
@@ -531,12 +524,12 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
-    int64_t /*partials_stride_n*/, int /*partials_size_m*/,
-    int /*partials_size_n*/,
-    int64_t /*inputs_offset*/,
-    int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
-    int /*inputs_size_m*/, int /*inputs_size_n*/,
+    const void* /*partials_ptr_array*/, int /*partials_ptr_array_size*/,
+    int64_t /*partials_stride_m*/, int64_t /*partials_stride_n*/,
+    int /*partials_size_m*/, int /*partials_size_n*/,
+    const void* /*staging_ptr_array*/, int /*staging_ptr_array_size*/,
+    int64_t /*staging_stride_m*/, int64_t /*staging_stride_n*/,
+    int /*staging_size_m*/, int /*staging_size_n*/,
     const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,

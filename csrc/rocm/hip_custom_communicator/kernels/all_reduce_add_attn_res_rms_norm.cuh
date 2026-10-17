@@ -361,24 +361,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. none: nothing staged, every rank's input read in place where the
   // input table says (a captured call's tensor, or an eager call's host copy
-  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
   // payload (an encoding: what crosses the links is quantized by its owner),
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
-  // INTERIM, until stage_rows takes the staging's array: this rank's staging
-  // and its INT4 payload, from the staging's own sizes.
   if constexpr (QUANTIZATION == Quantization::int4)
     stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        peer_ptr<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank, 0),
-        staging_stride_m, staging_stride_n, staging_size_m, staging_size_n,
-        peer_ptr<uint8_t>(staging_ptr_array, staging_ptr_array_size, rank, 0),
-        int4_values_size_n(staging_size_n), 1, staging_size_m,
-        int4_values_size_n(staging_size_n),
-        peer_ptr<__fp16>(staging_ptr_array, staging_ptr_array_size, rank,
-                         int4_scales_offset(staging_size_m, staging_size_n)),
-        int4_scales_size_n(staging_size_n), 1, staging_size_m,
-        int4_scales_size_n(staging_size_n), input_size_m);
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, input_size_m, rank);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -481,31 +472,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
-        int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-    int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size,
+        int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
+        int partials_size_n, char* const* __restrict__ staging_ptr_array,
+        int staging_ptr_array_size, int64_t staging_stride_m, int64_t staging_stride_n,
+        int staging_size_m, int staging_size_n,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
+  // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
+  // INT4 payload layout): found from each region's own sizes where read or
+  // written.
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
@@ -525,19 +506,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. none: nothing staged, every rank's input read in place where the
   // input table says (a captured call's tensor, or an eager call's host copy
-  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
   // payload (an encoding: what crosses the links is quantized by its owner),
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
   if constexpr (QUANTIZATION == Quantization::int4)
     stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m,
-        input_size_n, peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, inputs_offset), inputs_stride_m,
-        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, inputs_values_offset), inputs_values_stride_m,
-        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-        peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, inputs_scales_offset), inputs_scales_stride_m,
-        inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-        input_size_m);
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, input_size_m, rank);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -555,16 +532,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION, DTYPE>(
-      input_ptr_array, input_ptr_array_size, arena_ptr_array, arena_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
-      input_size_m, input_size_n, inputs_values_offset, inputs_values_stride_m, inputs_values_stride_n,
-      inputs_values_size_m, inputs_values_size_n, inputs_scales_offset,
-      inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
-      inputs_scales_size_n, partials_offset, partials_stride_m, partials_stride_n,
-      partials_size_m, partials_size_n, partials_values_offset,
-      partials_values_stride_m, partials_values_stride_n, partials_values_size_m,
-      partials_values_size_n, partials_scales_offset, partials_scales_stride_m,
-      partials_scales_stride_n, partials_scales_size_m, partials_scales_size_n,
-      col0 * P, own_packs * P, my_rows, rank);
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
+      input_ptr_array_stride_n, input_size_m, input_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, col0 * P, own_packs * P,
+      my_rows, rank);
 
   // 3. Every rank's sums are in this rank's partials, and every peer has read
   // this rank's input.
@@ -578,17 +551,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    place in it), then AttnRes, as the one-shot does. The next call's first
   //    sync keeps a peer from pushing into this partials while it is read (a
   //    peer's next kernel starts only once this one has finished).
-  const DTYPE* own_partials = peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
-  const uint8_t* own_partials_values = peer_ptr<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset);
-  const __fp16* own_partials_scales = peer_ptr<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset);
+  //    int4: its INT4 payload, the scales at the offset the partials' own
+  //    sizes give.
+  const DTYPE* own_partials = peer_ptr<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  const uint8_t* own_partials_values = peer_ptr<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  const __fp16* own_partials_scales = peer_ptr<__fp16>(
+      partials_ptr_array, partials_ptr_array_size, rank,
+      int4_scales_offset(partials_size_m, partials_size_n));
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
     load<1, THREADS_PER_BLOCK, QUANTIZATION>(
         own_partials, partials_stride_m, partials_stride_n, input_size_m,
-        input_size_n, own_partials_values, partials_values_stride_m,
-        partials_values_stride_n, partials_values_size_m, partials_values_size_n,
-        own_partials_scales, partials_scales_stride_m, partials_scales_stride_n,
-        partials_scales_size_m, partials_scales_size_n, sum, row, 0);
+        input_size_n, own_partials_values, int4_values_size_n(partials_size_n), 1,
+        partials_size_m, int4_values_size_n(partials_size_n), own_partials_scales,
+        int4_scales_size_n(partials_size_n), 1, partials_size_m,
+        int4_scales_size_n(partials_size_n), sum, row, 0);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
