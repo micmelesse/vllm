@@ -31,6 +31,7 @@ import atexit
 import functools
 import os
 import signal
+import sys
 import threading
 import time
 import warnings
@@ -1374,11 +1375,14 @@ class HipCustomCommunicator:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def __del__(self) -> None:
+    def __del__(self, _is_finalizing=sys.is_finalizing) -> None:
         # WARNS, never releases. Doing GPU or IPC work here would run at an arbitrary
         # moment -- interpreter shutdown included, where the runtime may already be gone
         # -- so this only reports that a release was left to chance. Same bargain as an
-        # unclosed file's ResourceWarning.
+        # unclosed file's ResourceWarning. At shutdown it does nothing: module globals
+        # (`Open`, `warnings`) may already be None there.
+        if _is_finalizing():
+            return
         if isinstance(self.state, Open):
             warnings.warn(
                 f"{type(self).__name__} was never closed; its peer handles and buffers "
