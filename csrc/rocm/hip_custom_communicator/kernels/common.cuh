@@ -892,7 +892,6 @@ constexpr int m = 1;
 // the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
 // after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
 // ISA 2026-10-15).
-namespace impl {
 template <typename OP, int AXIS, int THREADS_M, int THREADS_N, typename T, typename U, int K,
           int P>
 DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
@@ -982,7 +981,6 @@ DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
     __syncthreads();  // before the next reduction writes `part`
   }
 }
-}  // namespace impl
 
 // =================================================================================================
 // DOT
@@ -1415,7 +1413,6 @@ enum class Until { launched, visible, read };
 // lose it: an ordered barrier's wait for every wave's stores covers it; an
 // unordered one waits for the lane's own stores just before it signals, after
 // the whole phase between, so the clear has long landed.
-namespace impl {
 template <Until UNTIL, int PARITY, int WORLD>
 DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
@@ -1531,7 +1528,6 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   }
   __syncthreads();
 }
-}  // namespace impl
 
 // =================================================================================================
 // QUANTIZATION
@@ -3062,15 +3058,6 @@ DINLINE void peers_sum(const T (&input)[WORLD][ROWS][K][P],
   impl::peers_sum(input, output);
 }
 
-// [K][P] values over the block, OP Sum or Max: AXIS all, the whole block's, every thread left
-// holding the results; AXIS m, over the THREADS_M rows of threads, a lane's values with the same
-// lane's of every row, the first row left holding them rounded once to U.
-template <typename OP, int AXIS, int THREADS_M, int THREADS_N, typename T, typename U, int K,
-          int P>
-DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
-  impl::block_reduce<OP, AXIS, THREADS_M, THREADS_N>(input, output);
-}
-
 // ===============================================================================================
 // DOT
 // ===============================================================================================
@@ -3094,30 +3081,6 @@ DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator
                                   const float (&logit)[NUM_LOGITS],
                                   float (&scale)[NUM_LOGITS]) {
   return impl::thread_softmax_fold<NUM_LOGITS>(softmax_max, softmax_denominator, logit, scale);
-}
-
-// ===============================================================================================
-// BARRIER: THE RANKS' SYNCHRONIZATION
-// ===============================================================================================
-
-// This block and the same block on every rank, UNTIL launched (every peer's
-// input is ready; a launch's first barrier), visible (what was written before
-// is seen after) or read (every peer is done reading this rank). A kernel's
-// barriers are even in number, its k-th taking PARITY k % 2, so its flags end
-// where they began. WORLD is the kernel's, passed on.
-template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
-                     int64_t signals_stride_parity,
-                     int64_t signals_stride_block,
-                     int64_t signals_stride_writer, int signals_size_parity,
-                     int signals_size_block, int signals_size_writer,
-                     uint32_t* status_ptr, int64_t status_stride_field,
-                     int status_size_field, int rank, uint64_t timeout_ticks) {
-  impl::barrier<UNTIL, PARITY, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
 }
 
 // ===============================================================================================
