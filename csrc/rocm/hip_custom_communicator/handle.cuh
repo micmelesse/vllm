@@ -3,17 +3,19 @@
 //
 // THE RUNTIME STATE, one `Handle` per communicator: everything the running
 // program learns, as common.cuh's `BuildInfo` is everything fixed at
-// compile time. OUR OWN MEMORY (the signals and the exchange) is HIP virtual
-// memory: each rank creates its physical memory with explicit properties,
-// exports it as a POSIX file descriptor, and every rank maps every rank's into
-// ONE reserved virtual range, rank r's at base + r * stride, so a kernel
-// reaches a peer's buffer by a pointer and a rank stride. THE CALLER'S INPUT
-// is never read by a peer where it is: every kernel copies this rank's input
-// into this rank's inputs itself (INT4: quantized into the inputs' INT4 values),
-// before its first barrier, which is ordered; the peers then read the inputs
-// at ptr + r * stride. One path, eager and captured alike: no host copy, no
-// pointer table, nothing registered or opened over IPC. The collective
-// that exchanges the socket names is the caller's (`Gather`), so this names no
+// compile time. OUR OWN MEMORY (the signals and the exchange) is ONE device
+// allocation per rank, the arena, shared over legacy HIP IPC: each rank
+// exports its arena's base (hipIpcGetMemHandle), the handles go round over the
+// caller's CPU group (`Gather`), and each rank opens every peer's
+// (hipIpcOpenMemHandle). A peer's arena is at whatever address its opening
+// gave, so a kernel takes every rank's base BY VALUE in its arguments
+// (common.cuh's PeerBases) and each region as its offset in the arena. THE
+// CALLER'S INPUT is never read by a peer where it is: every kernel copies this
+// rank's input into this rank's inputs itself (INT4: quantized into the
+// inputs' INT4 values), before its first barrier, which is ordered; the peers
+// then read the inputs in this rank's arena. One path, eager and captured
+// alike: no host copy, no pointer table, nothing registered. The collective
+// that exchanges the handles is the caller's (`Gather`), so this names no
 // process group.
 
 #pragma once
@@ -21,10 +23,6 @@
 #include <c10/util/BFloat16.h>
 #include <hip/hip_runtime.h>
 #include <dirent.h>
-#include <poll.h>
-#include <iomanip>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
@@ -40,7 +38,6 @@
 #include <mutex>
 #include <thread>
 #include <optional>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -76,31 +73,48 @@ constexpr int64_t kSignalsBytes =
     128 * 128;
 constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 
-// HOW THE ARENA IS BACKED: hipMemAllocationTypePinned, VMM's textbook type
-// (the CUDA and HIP VMM guides; torch's SymmetricMemory on CUDA and ROCm,
-// CUDASymmetricMemory.cu; aiter's vmm_allocator.py), stated here and not left
-// to how a runtime backs a malloc flag (hipDeviceMallocUncached was
-// fine-grained under ROCm 7.2 and, at 2 MiB and up, coarse-grained under HIP
-// 7.15: aiter 0.1.24's custom_all_reduce.py). Pinned device memory is
-// coarse-grained, CACHEABLE: the owner's L2 holds its lines (MTYPE RW), and a
-// peer's L2 holds the lines it reads or writes through its mapping (MTYPE NC).
-// ONE ARENA holds the signals and the exchange, both under the one memory model
-// LLVM's AMDGPUUsage gives for cacheable memory shared across agents ("Memory
-// Model GFX942"): every flag store a system-scope atomic, released (buffer_wbl2
-// sc0 sc1: this L2's dirty lines written back) when it publishes data; every
-// flag wait a system-scope load, then a system-scope acquire (buffer_inv sc0
-// sc1: the peers' lines in this L2 dropped) before the data is read. That is
-// common.cuh's BARRIER, the one place a kernel synchronizes with a peer, so no
-// kernel depends on how the arena is cached. Before 2026-10-16 the arena was
-// hipMemAllocationTypeUncached and the waits device-scope, correct only because
-// no L2 held a line of it (a departure; hip.md's VMM section).
-constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;
+// HOW THE ARENA IS BACKED: hipExtMallocWithFlags(hipDeviceMallocUncached),
+// exported with hipIpcGetMemHandle, opened by each peer with
+// hipIpcOpenMemHandle(hipIpcMemLazyEnablePeerAccess). The gfx950 convention,
+// which every IPC communicator on ROCm follows:
+//   - vLLM's custom all-reduce: allocate_shared_buffer_and_handle
+//     (csrc/libtorch_stable/custom_all_reduce.cu) backs EVERY shared buffer,
+//     the signals with the reduce's scratch (meta_size() + max_size) and the
+//     registered data buffer alike, with hipDeviceMallocUncached ("data
+//     buffers need to be uncached for signal on MI200").
+//   - vLLM's quick reduce (csrc/quickreduce/quick_reduce.h): ONE
+//     hipDeviceMallocUncached allocation per rank, its flags then its data at
+//     an offset: our arena's shape exactly.
+//   - aiter's custom all-reduce (csrc/kernels/custom_all_reduce.cu,
+//     allocate_meta_buffer; aiter/dist/.../custom_all_reduce.py): the meta
+//     buffer, its signals and the 2 * max_size it reduces through, uncached;
+//     only its input pool (what callers' tensors are copied into, read once
+//     per call) cacheable (hipMalloc or torch's allocator).
+// So signals and the data peers exchange share one uncached allocation by
+// convention; aiter's one cacheable buffer is an input pool, which our inline
+// copy-in into the inputs region replaces. ONE ARENA OF EITHER KIND IS CORRECT
+// under our kernels' memory model, LLVM's AMDGPUUsage for memory shared across
+// agents ("Memory Model GFX942"): every flag store a system-scope atomic,
+// released (buffer_wbl2 sc0 sc1) when it publishes data; every flag wait a
+// system-scope load, then a system-scope acquire (buffer_inv sc0 sc1) before
+// the data is read (common.cuh's BARRIER, the one place a kernel synchronizes
+// with a peer). Uncached is the convention, keeps peer reads off every L2 (no
+// stale line for an acquire to drop), and does not depend on how a runtime
+// backs the flag (hipDeviceMallocUncached was fine-grained under ROCm 7.2 and,
+// at 2 MiB and up, coarse-grained under HIP 7.15: aiter 0.1.24's
+// custom_all_reduce.py), since the model holds for cacheable memory too.
+// WHY NOT VMM (until 2026-10-16 the arena was hipMemCreate'd and mapped):
+// on ROCm 10.0 / amdgpu-dkms 6.16.6 (MI355X), exchanging VMM allocations
+// totalling more than ~256 MiB per process across 8 processes leaves the
+// driver in an eviction storm for every later process until a reboot (healthy
+// at 256 MiB, degraded at 288 MiB and at two 192 MiB allocations; legacy IPC
+// at 449 MiB healthy): hip.md's VMM section.
+constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 
-// THE ARENA'S LAYOUT, one rank's slice, the same offsets on every rank (bytes
-// from the slice's start; `arena_layout` computes it from the sizes open is
-// given, select.cuh's `exchange_sizes`). A signal pad, then ONE PUBLISHED
-// REGION PER PHASE, whose data peers may still read while this rank writes the
-// next phase's:
+// THE ARENA'S LAYOUT, the same offsets on every rank (bytes from the arena's
+// base; `arena_layout` computes it from the sizes open is given, select.cuh's
+// `exchange_sizes`). A signal pad, then ONE PUBLISHED REGION PER PHASE, whose
+// data peers may still read while this rank writes the next phase's:
 //
 //   region     offset                     bytes (each region kRegionAlign-aligned)
 //   signals    0                          kSignalsRegionBytes: the barrier
@@ -112,17 +126,14 @@ constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;
 //   partials   inputs end                 what this rank publishes of its
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
-//   (slice end) partials end, rounded up to the allocation granularity
-//   guard      slice end                  one granule, NEVER mapped
 //
-// Rank r's slice is at base + r * stride, stride = the slice plus the guard
-// granule: an overrun past the partials runs into unmapped memory and faults,
-// never into the next rank's signals. INT4 IS AN ENCODING, NOT A REGION: each
-// region is sized for the largest encoding it may hold (select.cuh's
-// `exchange_sizes`: the larger of the exact bytes and the INT4 values plus
-// scales at the largest problem), and the encoding lays out the inside
-// (common.cuh's `int4_payload`: values, then scales at an offset from the
-// call's m and n, the same on every rank).
+// Rank r's region is at its arena's base (PeerBases' base[r], wherever its
+// IPC opening put it) plus the region's offset. INT4 IS AN ENCODING, NOT A
+// REGION: each region is sized for the largest encoding it may hold
+// (select.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
+// values plus scales at the largest problem), and the encoding lays out the
+// inside (common.cuh's `int4_payload`: values, then scales at an offset from
+// the call's m and n, the same on every rank).
 //
 // WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
 // INT4, never both, and its sums exact or INT4, never both (the one exact word
@@ -140,7 +151,7 @@ constexpr hipMemAllocationType kArenaAllocation = hipMemAllocationTypePinned;
 // encoding either call used.
 // Every kernel copies its input into its inputs (or, INT4, their payload)
 // before its first barrier, which is ordered, and its peers read it there, at
-// rank 0's address and the rank stride: no table.
+// their base for this rank and the region's offset: no table in memory.
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
@@ -149,7 +160,7 @@ struct ArenaLayout {
   int64_t signals = 0;
   int64_t inputs = 0;
   int64_t partials = 0;
-  int64_t end = 0;  // the bytes the regions use
+  int64_t end = 0;  // the bytes the regions use: the arena's size
 };
 inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes) {
   ArenaLayout l;
@@ -160,215 +171,62 @@ inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes) {
   return l;
 }
 
-// A FILE DESCRIPTOR WE OWN, closed when it goes.
-class Fd {
-  int fd_ = -1;
-
- public:
-  Fd() = default;
-  explicit Fd(int fd) : fd_(fd) {}
-  Fd(Fd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
-  Fd& operator=(Fd&& o) noexcept {
-    if (this != &o) {
-      reset();
-      fd_ = o.fd_;
-      o.fd_ = -1;
-    }
-    return *this;
-  }
-  Fd(const Fd&) = delete;
-  Fd& operator=(const Fd&) = delete;
-  ~Fd() { reset(); }
-  int get() const { return fd_; }
-  void reset() {
-    if (fd_ >= 0) ::close(fd_);
-    fd_ = -1;
-  }
-};
-
-[[noreturn]] inline void sys_fail(const std::string& what) {
-  throw std::runtime_error("hip_custom_communicator: " + what + ": " +
-                           std::strerror(errno));
-}
-
-// WHAT EACH RANK SAYS ABOUT ITSELF, gathered with the socket names (the one
-// gather open already makes): what open compares across ranks (warnings) and
-// how a peer's GPU is found in this process (its PCI bus id). Fixed width, as
-// the gather moves equal lengths.
+// WHAT EACH RANK SAYS ABOUT ITSELF, gathered in the one gather open makes: its
+// arena's IPC handle, what open compares across ranks (warnings) and how a
+// peer's GPU is found in this process (its PCI bus id). Fixed width, as the
+// gather moves equal lengths.
 struct RankInfo {
-  char socket[64];
+  hipIpcMemHandle_t handle;
   char pci_bus_id[32];
   char host[64];
   int32_t pid;
   int32_t device;
-  int64_t granularity;
 };
 
-// EVERY RANK'S FILE DESCRIPTORS, `mine` sent to every peer and theirs received,
-// over Unix sockets (a descriptor crosses processes only as SCM_RIGHTS), a
-// collective: every rank calls it together. Each rank listens on an abstract
-// socket (no file to clean up; the ranks share a network namespace, as they
-// share the GPUs) named by its pid and a random word, the names gathered over
-// `gather`; then each connects to every peer and sends its rank and its
-// descriptors in one message, and accepts one connection from every peer. No
-// deadlock: a connection to a listening socket completes and its message is
-// buffered before the peer accepts it (the backlog holds every peer).
-// `theirs[r]` is rank r's, `mine` again at this rank. A peer that has not sent
-// within `timeout_seconds` is an error naming how many did.
-// `me` goes round with the names; `all[r]` is rank r's, `me` at this rank.
-inline std::vector<std::vector<Fd>> exchange_fds(
-    int rank, int world, const Gather& gather, const std::vector<int>& mine,
-    double timeout_seconds, RankInfo me, Log& log, std::vector<RankInfo>& all) {
-  const size_t n = mine.size();
-  Fd listener(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-  if (listener.get() < 0) sys_fail("socket");
-  std::random_device entropy;
-  std::ostringstream os;
-  // FIXED WIDTH: the gather moves a byte string the same length on every rank
-  // (all_gathered), and pids and entropy vary in digits; a ragged name breaks
-  // the CPU group's allgather (gloo: "21 vs 20", f9a8dc6f00 on n11).
-  os << "hip_custom_communicator/" << std::setfill('0') << std::setw(10)
-     << ::getpid() << "/" << std::setw(10) << entropy() << "/" << std::setw(5)
-     << rank;
-  const std::string name = os.str();
-  if (name.size() + 1 > sizeof(me.socket))
-    throw std::runtime_error("hip_custom_communicator: socket name too long");
-  std::memset(me.socket, 0, sizeof(me.socket));
-  std::memcpy(me.socket, name.data(), name.size());
-  const auto address = [](const std::string& s, sockaddr_un& a) {
-    std::memset(&a, 0, sizeof(a));
-    a.sun_family = AF_UNIX;
-    if (s.size() + 1 > sizeof(a.sun_path))
-      throw std::runtime_error("hip_custom_communicator: socket name too long");
-    std::memcpy(a.sun_path + 1, s.data(),
-                s.size());  // sun_path[0] = 0: abstract
-    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 +
-                                  s.size());
-  };
-  sockaddr_un a;
-  socklen_t len = address(name, a);
-  if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&a), len) != 0)
-    sys_fail("bind " + name);
-  if (::listen(listener.get(), world) != 0) sys_fail("listen");
-  log.phase(OpenPhase::socket_exchange_begun, static_cast<uint32_t>(world - 1));
+// EVERY RANK'S RECORD, `me` at this rank, over `gather` (a collective: every
+// rank calls it together).
+inline std::vector<RankInfo> gather_ranks(int world, const Gather& gather,
+                                          const RankInfo& me, Log& log) {
+  log.phase(OpenPhase::handle_exchange_begun,
+            static_cast<uint32_t>(world - 1));
   const std::vector<std::string> gathered =
       gather(std::string(reinterpret_cast<const char*>(&me), sizeof(me)));
-  all.assign(world, RankInfo{});
-  std::vector<std::string> names(world);
+  if (static_cast<int>(gathered.size()) != world)
+    throw std::runtime_error(
+        "hip_custom_communicator: the gather returned " +
+        std::to_string(gathered.size()) + " records for " +
+        std::to_string(world) + " ranks");
+  std::vector<RankInfo> all(world);
   for (int p = 0; p < world; ++p) {
     if (gathered[p].size() != sizeof(RankInfo))
       throw std::runtime_error(
           "hip_custom_communicator: a gathered rank record of the wrong size");
     std::memcpy(&all[p], gathered[p].data(), sizeof(RankInfo));
-    all[p].socket[sizeof(all[p].socket) - 1] = 0;
-    names[p] = all[p].socket;
+    all[p].pci_bus_id[sizeof(all[p].pci_bus_id) - 1] = 0;
+    all[p].host[sizeof(all[p].host) - 1] = 0;
   }
-  // A rank's message: its rank, then its descriptors as SCM_RIGHTS.
-  for (int p = 0; p < world; ++p) {
-    if (p == rank) continue;
-    Fd c(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    if (c.get() < 0) sys_fail("socket");
-    len = address(names[p], a);
-    if (::connect(c.get(), reinterpret_cast<sockaddr*>(&a), len) != 0)
-      sys_fail("connect to rank " + std::to_string(p));
-    int32_t payload = rank;
-    iovec io{&payload, sizeof(payload)};
-    std::vector<char> control(CMSG_SPACE(n * sizeof(int)), 0);
-    msghdr m{};
-    m.msg_iov = &io;
-    m.msg_iovlen = 1;
-    m.msg_control = control.data();
-    m.msg_controllen = control.size();
-    cmsghdr* c0 = CMSG_FIRSTHDR(&m);
-    c0->cmsg_level = SOL_SOCKET;
-    c0->cmsg_type = SCM_RIGHTS;
-    c0->cmsg_len = CMSG_LEN(n * sizeof(int));
-    std::memcpy(CMSG_DATA(c0), mine.data(), n * sizeof(int));
-    if (::sendmsg(c.get(), &m, MSG_NOSIGNAL) != sizeof(payload))
-      sys_fail("send to rank " + std::to_string(p));
-  }
-  std::vector<std::vector<Fd>> theirs(world);
-  for (int got = 0; got < world - 1; ++got) {
-    pollfd pf{listener.get(), POLLIN, 0};
-    const int ready = ::poll(&pf, 1, static_cast<int>(timeout_seconds * 1000));
-    if (ready <= 0) {
-      if (ready == 0) {
-        log.phase(OpenPhase::socket_exchange_done, static_cast<uint32_t>(got),
-                  static_cast<uint32_t>(world - 1), 1);
-        throw std::runtime_error(
-            "hip_custom_communicator: " + std::to_string(got) + " of " +
-            std::to_string(world - 1) +
-            " peers sent their memory's descriptors before the timeout");
-      }
-      sys_fail("poll");
-    }
-    Fd c(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
-    if (c.get() < 0) sys_fail("accept");
-    int32_t payload = -1;
-    iovec io{&payload, sizeof(payload)};
-    std::vector<char> control(CMSG_SPACE(n * sizeof(int)), 0);
-    msghdr m{};
-    m.msg_iov = &io;
-    m.msg_iovlen = 1;
-    m.msg_control = control.data();
-    m.msg_controllen = control.size();
-    if (::recvmsg(c.get(), &m, MSG_CMSG_CLOEXEC) != sizeof(payload))
-      sys_fail("receive");
-    cmsghdr* c0 = CMSG_FIRSTHDR(&m);
-    if (payload < 0 || payload >= world || payload == rank ||
-        !theirs[payload].empty() || c0 == nullptr ||
-        c0->cmsg_type != SCM_RIGHTS ||
-        c0->cmsg_len != CMSG_LEN(n * sizeof(int)))
-      throw std::runtime_error(
-          "hip_custom_communicator: a malformed descriptor message (rank " +
-          std::to_string(payload) + ")");
-    std::vector<int> fds(n);
-    std::memcpy(fds.data(), CMSG_DATA(c0), n * sizeof(int));
-    for (int fd : fds) theirs[payload].emplace_back(fd);
-  }
-  log.phase(OpenPhase::socket_exchange_done, static_cast<uint32_t>(world - 1),
+  log.phase(OpenPhase::handle_exchange_done, static_cast<uint32_t>(world - 1),
             static_cast<uint32_t>(world - 1));
-  return theirs;
+  return all;
 }
 
 // THE ARENA: all of this rank's communicator memory, ONE allocation made once
-// at open and freed as a unit, and every peer's mapped beside it in ONE
-// reserved virtual range of this process, rank r's slice at
-// base() + r * stride_bytes(), every local GPU given read-write access to every
-// mapped slice. The slice is `bytes` (the layout's end, `arena_layout`)
-// rounded up to the allocation granularity (the largest of the minimum and
-// recommended: 4 KiB on ROCm 7.2, 2 MiB on HIP 7.15), and the stride adds one
-// never-mapped guard granule. Built in steps around the descriptor exchange
-// (`exchange_fds`, the Handle's): the constructor makes and zeroes this rank's
-// (before any peer can see it); `exported` gives its descriptor; then
-// `import_peers`, `map_peers`, `allow_peers`.
+// at open and freed as a unit, and every peer's opened over IPC: `base(r)` is
+// rank r's arena as this process reaches it (ours at our rank). Built in steps
+// around the handle exchange (the Handle's): the constructor makes and zeroes
+// this rank's (before any peer can see it); `exported` gives its IPC handle;
+// then `open_peers`.
 //
-// OWNERSHIP (STANDARDS 3.5): this rank's physical memory (`handles_[rank]`,
-// hipMemCreate) and the reserved range are OWNED here, and released last, by
-// `release_own`. Each peer's imported handle and its mapping in our range are
-// BORROWED: ours to release (`release_peers`), never the memory behind them,
-// which its owner frees. A peer's mapping is released before our own memory
-// (the close protocol's order, and the destructor's): a mapping of a peer's
-// memory left behind when a process dies is what wedged n11's driver.
+// OWNERSHIP (STANDARDS 3.5): this rank's allocation (`bases_[rank]`,
+// hipExtMallocWithFlags) is OWNED here and freed last, by `release_own`. Each
+// peer's opened mapping is BORROWED: ours to close (`release_peers`,
+// hipIpcCloseMemHandle), never the memory behind it, which its owner frees. A
+// peer's mapping is closed before our own memory is freed (the close
+// protocol's order, and the destructor's).
 class Arena {
  public:
   Arena(int rank, int world, int64_t bytes)
-      : rank_(rank), world_(world), bytes_(bytes), handles_(world),
-        mapped_(world, false) {
-    HIP_CHECK(hipGetDevice(&device_));
-    hipMemAllocationProp& prop = prop_;
-    prop.type = kArenaAllocation;
-    prop.requestedHandleTypes = hipMemHandleTypePosixFileDescriptor;
-    prop.location.type = hipMemLocationTypeDevice;
-    prop.location.id = device_;
-    size_t minimum = 0, recommended = 0;
-    HIP_CHECK(hipMemGetAllocationGranularity(
-        &minimum, &prop, hipMemAllocationGranularityMinimum));
-    HIP_CHECK(hipMemGetAllocationGranularity(
-        &recommended, &prop, hipMemAllocationGranularityRecommended));
-    granularity_ = static_cast<int64_t>(std::max(minimum, recommended));
-    slice_ = (bytes_ + granularity_ - 1) / granularity_ * granularity_;
-    stride_ = slice_ + granularity_;  // the guard granule
+      : rank_(rank), world_(world), bytes_(bytes), bases_(world, nullptr) {
     // A constructor that throws runs no destructor: what it made goes here.
     try {
       make();
@@ -380,114 +238,102 @@ class Arena {
 
  private:
   void make() {
-    // OWNED: this rank's memory, the one hipMemCreate of the communicator.
-    HIP_CHECK(
-        hipMemCreate(&handles_[rank_], static_cast<size_t>(slice_), &prop_, 0));
-    // OWNED: the range every rank's slice is mapped into.
-    HIP_CHECK(
-        hipMemAddressReserve(&base_, static_cast<size_t>(stride_ * world_),
-                             static_cast<size_t>(granularity_), nullptr, 0));
-    map(rank_);
-    allow_access(rank_);
-    HIP_CHECK(hipMemset(at(rank_), 0, static_cast<size_t>(slice_)));
+    // OWNED: this rank's memory, the one allocation of the communicator.
+    void* own = nullptr;
+    HIP_CHECK(hipExtMallocWithFlags(&own, static_cast<size_t>(bytes_),
+                                    kArenaMallocFlags));
+    bases_[rank_] = static_cast<char*>(own);
+    HIP_CHECK(hipMemset(own, 0, static_cast<size_t>(bytes_)));
     HIP_CHECK(hipDeviceSynchronize());
   }
 
  public:
-  // This rank's memory as a descriptor its peers import (they own their copy).
-  Fd exported() const {
-    int fd = -1;
-    HIP_CHECK(hipMemExportToShareableHandle(
-        &fd, handles_[rank_], hipMemHandleTypePosixFileDescriptor, 0));
-    return Fd(fd);
+  // This rank's arena as an IPC handle its peers open.
+  hipIpcMemHandle_t exported() const {
+    hipIpcMemHandle_t h{};
+    HIP_CHECK(hipIpcGetMemHandle(&h, bases_[rank_]));
+    return h;
   }
 
-  // Every peer's memory, imported from its descriptor (`fds[r]`, rank r's),
-  // then mapped at its place, then made accessible: three steps, so open's log
-  // says which one it reached.
-  void import_peers(const std::vector<int>& fds) {
+  // Every peer's arena opened from its handle (`ranks[r].handle`, rank r's);
+  // our own is not opened. Peer access is enabled lazily, by the open.
+  void open_peers(const std::vector<RankInfo>& ranks) {
     for (int r = 0; r < world_; ++r) {
       if (r == rank_) continue;
-      HIP_CHECK(hipMemImportFromShareableHandle(
-          &handles_[r], reinterpret_cast<void*>(static_cast<intptr_t>(fds[r])),
-          hipMemHandleTypePosixFileDescriptor));
+      void* p = nullptr;
+      HIP_CHECK(hipIpcOpenMemHandle(&p, ranks[r].handle,
+                                    hipIpcMemLazyEnablePeerAccess));
+      bases_[r] = static_cast<char*>(p);
     }
   }
-  void map_peers() {
-    for (int r = 0; r < world_; ++r)
-      if (r != rank_) map(r);
-  }
-  void allow_peers() {
-    for (int r = 0; r < world_; ++r)
-      if (r != rank_) allow_access(r);
-  }
 
-  // OPEN'S ASSERTS ON THE ARENA, each logged (Log::check): every peer's
-  // imported and mapped, every slice read-write from this device, the geometry
-  // what was asked. False when one failed (the log names it).
-  bool verify(Log& log) const {
+  // OPEN'S ASSERTS ON THE ARENA, each logged (Log::check): every rank's arena
+  // present (ours allocated, every peer's opened), and hipPointerGetAttributes
+  // on each base sane (device memory, the base its own device pointer). The
+  // device it reports is an observation (OpenWarning::pointer_device), against
+  // `devices[r]`, rank r's GPU in this process (-1: not visible, not compared).
+  // False when a check failed (the log names it).
+  bool verify(Log& log, const std::vector<int>& devices) const {
     bool ok = true;
-    const bool geometry =
-        granularity_ > 0 && slice_ % granularity_ == 0 && slice_ >= bytes_ &&
-        stride_ == slice_ + granularity_ &&
-        reinterpret_cast<uintptr_t>(base_) % granularity_ == 0;
-    log.check(OpenCheck::geometry, geometry, rank_,
-              static_cast<uint32_t>(stride_ / 1024),
-              static_cast<uint32_t>(granularity_ / 1024));
-    ok = ok && geometry;
     for (int r = 0; r < world_; ++r) {
-      const bool present = handles_[r] != nullptr && mapped_[r];
-      log.check(OpenCheck::peer_imported, present, r);
+      const bool present = bases_[r] != nullptr;
+      log.check(OpenCheck::peer_opened, present, r);
       ok = ok && present;
       if (!present) continue;
-      hipMemLocation here{};
-      here.type = hipMemLocationTypeDevice;
-      here.id = device_;
-      unsigned long long flags = 0;
-      const hipError_t e = hipMemGetAccess(&flags, &here, at(r));
-      const bool rw =
-          e == hipSuccess && flags == hipMemAccessFlagsProtReadWrite;
-      log.check(OpenCheck::access_rw, rw, r, static_cast<uint32_t>(flags),
+      hipPointerAttribute_t a{};
+      const hipError_t e = hipPointerGetAttributes(&a, bases_[r]);
+      if (e != hipSuccess) (void)hipGetLastError();
+      const bool sane = e == hipSuccess && a.type == hipMemoryTypeDevice &&
+                        a.devicePointer == static_cast<void*>(bases_[r]);
+      log.check(OpenCheck::pointer_sane, sane, r, static_cast<uint32_t>(a.type),
                 static_cast<uint32_t>(e));
-      ok = ok && rw;
+      ok = ok && sane;
+      if (sane && devices[r] >= 0 && a.device != devices[r])
+        log.warn(OpenWarning::pointer_device, r,
+                 static_cast<uint32_t>(a.device),
+                 static_cast<uint32_t>(devices[r]));
     }
     return ok;
   }
 
-  // WHAT A RELEASE DID: how many slices it unmapped and handles it released,
-  // and the first error it met (it carries on past one: a release that stops
-  // half-way leaves more behind).
+  // WHAT A RELEASE DID: how many peers' handles it closed and whether it freed
+  // our arena, and the first error it met (it carries on past one: a release
+  // that stops half-way leaves more behind).
   struct Released {
-    uint32_t unmapped = 0;
-    uint32_t released = 0;
+    uint32_t closed = 0;
+    uint32_t freed = 0;
     hipError_t error = hipSuccess;
   };
 
-  // EVERY BORROWED PEER MAPPING unmapped and every imported handle released:
-  // the first half of teardown, before our own memory goes. Idempotent.
+  // EVERY BORROWED PEER MAPPING closed: the first half of teardown, before our
+  // own memory goes. Idempotent.
   Released release_peers() {
     Released out;
-    for (int r = 0; r < world_; ++r)
-      if (r != rank_) release(r, out);
+    for (int r = 0; r < world_; ++r) {
+      if (r == rank_ || bases_[r] == nullptr) continue;
+      note(out, hipIpcCloseMemHandle(bases_[r]));
+      bases_[r] = nullptr;
+      ++out.closed;
+    }
     return out;
   }
-  // OUR OWN memory unmapped and released and the range freed: the second half,
-  // once no peer maps it (the close protocol's second handshake). Idempotent.
+  // OUR OWN arena freed: the second half, once no peer has it open (the close
+  // protocol's second handshake). Idempotent.
   Released release_own() {
     Released out;
-    release(rank_, out);
-    if (base_ != nullptr) {
-      note(out, hipMemAddressFree(base_, static_cast<size_t>(stride_ * world_)));
-      base_ = nullptr;
+    if (bases_[rank_] != nullptr) {
+      note(out, hipFree(bases_[rank_]));
+      bases_[rank_] = nullptr;
+      ++out.freed;
     }
     return out;
   }
   bool peers_released() const {
     for (int r = 0; r < world_; ++r)
-      if (r != rank_ && (mapped_[r] || handles_[r] != nullptr)) return false;
+      if (r != rank_ && bases_[r] != nullptr) return false;
     return true;
   }
-  bool released() const { return base_ == nullptr; }
+  bool released() const { return bases_[rank_] == nullptr; }
 
   // Borrowed first, then owned, whatever the path that got here.
   ~Arena() {
@@ -497,61 +343,26 @@ class Arena {
   Arena(const Arena&) = delete;
   Arena& operator=(const Arena&) = delete;
 
-  // Rank 0's slice: rank r's is stride_bytes() * r past it.
-  char* base() const { return static_cast<char*>(base_); }
-  int64_t stride_bytes() const { return stride_; }
-  int64_t slice_bytes() const { return slice_; }
+  // Rank r's arena as this process reaches it.
+  char* base(int r) const { return bases_[r]; }
+  // Every rank's base, as the kernels take it (by value); null past the world.
+  PeerBases peer_bases() const {
+    PeerBases b{};
+    for (int r = 0; r < world_; ++r) b.base[r] = bases_[r];
+    return b;
+  }
   int64_t bytes() const { return bytes_; }
-  int64_t granularity() const { return granularity_; }
-  char* at(int r) const { return base() + int64_t{r} * stride_; }
 
  private:
-  void map(int r) {
-    HIP_CHECK(hipMemMap(at(r), static_cast<size_t>(slice_), 0, handles_[r], 0));
-    mapped_[r] = true;
-  }
-  void release(int r, Released& out) {
-    if (mapped_[r]) {
-      note(out, hipMemUnmap(at(r), static_cast<size_t>(slice_)));
-      mapped_[r] = false;
-      ++out.unmapped;
-    }
-    if (handles_[r] != nullptr) {
-      note(out, hipMemRelease(handles_[r]));
-      handles_[r] = nullptr;
-      ++out.released;
-    }
-  }
   static void note(Released& out, hipError_t e) {
     if (e != hipSuccess && out.error == hipSuccess) out.error = e;
     if (e != hipSuccess) (void)hipGetLastError();
   }
-  // THIS RANK'S GPU, and only it, may read and write rank r's slice through
-  // this range: our kernels run only on this rank's GPU, and a mapping no device
-  // may access faults. The textbook pattern (the CUDA guide's VMM IPC section:
-  // the importer sets access for its own device; torch SymmetricMemory's
-  // map_block, CUDA and ROCm alike: one descriptor, the local device). Granting
-  // every GPU made every process a client of all eight in the driver, which on
-  // 2026-10-16 coincided with the driver wedging after every run.
-  void allow_access(int r) {
-    hipMemAccessDesc access{};
-    access.location.type = hipMemLocationTypeDevice;
-    access.location.id = device_;
-    access.flags = hipMemAccessFlagsProtReadWrite;
-    HIP_CHECK(hipMemSetAccess(at(r), static_cast<size_t>(slice_), &access, 1));
-  }
 
   int rank_;
   int world_;
-  int device_ = 0;
   int64_t bytes_;
-  int64_t granularity_ = 0;
-  int64_t slice_ = 0;
-  int64_t stride_ = 0;
-  hipMemAllocationProp prop_{};
-  void* base_ = nullptr;
-  std::vector<hipMemGenericAllocationHandle_t> handles_;
-  std::vector<bool> mapped_;
+  std::vector<char*> bases_;
 };
 
 // OTHER PROCESSES HOLDING DEVICE MEMORY ON `device`, read from the KFD's sysfs
@@ -617,8 +428,8 @@ inline OtherProcesses other_processes_on(int device) {
 class Handle {
  public:
   // OPENED on every rank together: this rank's arena allocated (the signals,
-  // the inputs, the partials: `arena_layout`), its descriptor exchanged with
-  // every rank's, and the peers' mapped.
+  // the inputs, the partials: `arena_layout`), its IPC handle exchanged with
+  // every rank's, and the peers' opened.
   // `world_size` is one the build holds (the opener checks it).
   // `timeout_seconds`: how long a kernel waits on a peer before it records a
   // fault and leaves (common.cuh's BARRIER), the caller's: the process group's
@@ -656,7 +467,7 @@ class Handle {
       if (reached < static_cast<uint32_t>(OpenPhase::open_done))
         log_->phase(next_open_phase(static_cast<OpenPhase>(reached)), 0, 0, 1);
       // AN OPEN THAT FAILED tears down what it made, alone (its peers may
-      // never have mapped it, or may be failing too), borrowed mappings first.
+      // never have opened it, or may be failing too), borrowed mappings first.
       if (arena_) abandon(kAbandonWaitSeconds);
       throw;
     }
@@ -672,10 +483,10 @@ class Handle {
     if (!arena_ || arena_->released()) return;
     (void)hipDeviceSynchronize();
     const Arena::Released peers = arena_->release_peers();
-    log_->close_phase(ClosePhase::peers_released, false, peers.unmapped,
-                      peers.released, static_cast<uint32_t>(peers.error));
+    log_->close_phase(ClosePhase::peers_released, false, peers.closed, 0,
+                      static_cast<uint32_t>(peers.error));
     const Arena::Released own = arena_->release_own();
-    log_->close_phase(ClosePhase::released, false, own.unmapped, own.released,
+    log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
   }
 
@@ -687,10 +498,9 @@ class Handle {
   // CLOSE, A COLLECTIVE (STANDARDS 3.5, "lifetimes are collective"): every
   // rank calls it together. (a) every launch on this device finished, so
   // nothing of ours reads or writes a peer's memory; (b) handshake: every rank
-  // has stopped; (c) every peer's slice unmapped from our range and its handle
-  // released; (d) handshake: every rank has released its mappings of ours;
-  // (e) our own slice unmapped, our memory released, the range freed. No rank
-  // frees memory another still maps. A handshake that fails (a peer that did
+  // has stopped; (c) every peer's IPC mapping closed (hipIpcCloseMemHandle);
+  // (d) handshake: every rank has closed its mapping of ours; (e) our own
+  // arena freed. No rank frees memory another still has open. A handshake that fails (a peer that did
   // not arrive within the bound) is logged and the teardown carries on alone.
   // Returns 0, or the first ClosePhase that failed. Idempotent; steps an
   // abandon already ran are not run again.
@@ -715,8 +525,8 @@ class Handle {
     if (!stopped) fail(ClosePhase::stopped);
     // (c)
     const Arena::Released peers = arena_->release_peers();
-    log_->close_phase(ClosePhase::peers_released, true, peers.unmapped,
-                      peers.released, static_cast<uint32_t>(peers.error));
+    log_->close_phase(ClosePhase::peers_released, true, peers.closed, 0,
+                      static_cast<uint32_t>(peers.error));
     if (peers.error != hipSuccess) fail(ClosePhase::peers_released);
     // (d) Skipped when (b) failed: a peer that missed the first handshake
     // would pair this one with its own first.
@@ -725,7 +535,7 @@ class Handle {
     if (!done) fail(ClosePhase::peers_done);
     // (e)
     const Arena::Released own = arena_->release_own();
-    log_->close_phase(ClosePhase::released, true, own.unmapped, own.released,
+    log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
     if (own.error != hipSuccess) fail(ClosePhase::released);
     log_->close_phase(ClosePhase::close_done, true, 0, 0,
@@ -734,16 +544,13 @@ class Handle {
   }
 
   // ABANDON: the teardown ALONE, for an error path, a signal or process exit
-  // (STANDARDS 3.5, "abnormal exit is designed for"). On 2026-10-16 n11's GPU
-  // driver wedged (a kfd_restore_wq kworker in D state, every later GPU
-  // process hung until a reboot) after every abnormal exit of a process
-  // holding peers' VMM memory, never with legacy IPC: the suspect is a
-  // process dying with live mappings of peers' memory, and peers mapping its.
-  // So, as far as it can without a peer: every wait on this rank told to leave
+  // (STANDARDS 3.5, "abnormal exit is designed for"): a process should not
+  // die holding peers' memory open, nor free its own while peers read it. So,
+  // as far as it can without a peer: every wait on this rank told to leave
   // (`abort`), the device given `wait_seconds` to finish (never more: a peer
-  // may be dead), then every BORROWED peer mapping unmapped and its handle
-  // released, and, only when the device finished, our own memory released
-  // (unmapping memory a running kernel still reads would fault it). Never
+  // may be dead), then every BORROWED peer mapping closed
+  // (hipIpcCloseMemHandle), and, only when the device finished, our own arena
+  // freed (freeing memory a running kernel still reads would fault it). Never
   // waits on a peer. Returns 0, or the first ClosePhase that failed.
   // Idempotent, and a no-op while another teardown runs (it returns
   // ClosePhase::closing then).
@@ -759,14 +566,14 @@ class Handle {
                       finished ? 0 : 1);
     if (!finished) failed = static_cast<int>(ClosePhase::synchronized);
     const Arena::Released peers = arena_->release_peers();
-    log_->close_phase(ClosePhase::peers_released, false, peers.unmapped,
-                      peers.released, static_cast<uint32_t>(peers.error));
+    log_->close_phase(ClosePhase::peers_released, false, peers.closed, 0,
+                      static_cast<uint32_t>(peers.error));
     if (peers.error != hipSuccess && failed == 0)
       failed = static_cast<int>(ClosePhase::peers_released);
     if (finished) {
       const Arena::Released own = arena_->release_own();
-      log_->close_phase(ClosePhase::released, false, own.unmapped,
-                        own.released, static_cast<uint32_t>(own.error));
+      log_->close_phase(ClosePhase::released, false, own.freed, 0,
+                        static_cast<uint32_t>(own.error));
       if (own.error != hipSuccess && failed == 0)
         failed = static_cast<int>(ClosePhase::released);
     }
@@ -801,24 +608,19 @@ class Handle {
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
 
-  // EVERY RANK'S INPUTS AND PARTIALS, fixed for the handle's life: each
-  // region is rank 0's address in the arena (its offset in the layout,
-  // `arena_layout`), rank r's exchange_stride_rank_bytes() * r past it (a
-  // kernel takes the stride in its buffer's elements: the launch divides).
-  void* inputs_ptr() const { return arena_->base() + layout_.inputs; }
-  void* partials_ptr() const { return arena_->base() + layout_.partials; }
-  // The arena's rank stride, every region's: whole allocation granules.
-  int64_t exchange_stride_rank_bytes() const { return arena_->stride_bytes(); }
+  // EVERY RANK'S ARENA, as the kernels take it (common.cuh's PeerBases, by
+  // value): rank r's base where this process reaches it, fixed for the
+  // handle's life.
+  PeerBases bases() const { return arena_->peer_bases(); }
+  // EACH REGION'S OFFSET in every rank's arena, in bytes (`arena_layout`):
+  // rank r's region is at bases().base[r] + its offset.
+  int64_t signals_offset() const { return layout_.signals; }
+  int64_t inputs_offset() const { return layout_.inputs; }
+  int64_t partials_offset() const { return layout_.partials; }
   // The synchronization state: every rank's signal block and how long a wait
-  // may last before it gives up. Every rank's signals, [R, 2, kMaxBlocks,
-  // kMaxRanks] (owner, parity, block, writer): rank 0's address, then the
-  // strides and the inner sizes, in elements (R is the kernel's WORLD).
-  uint32_t* signals_ptr() const {
-    return reinterpret_cast<uint32_t*>(arena_->base() + layout_.signals);
-  }
-  int64_t signals_stride_rank() const {
-    return arena_->stride_bytes() / static_cast<int64_t>(sizeof(uint32_t));
-  }
+  // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
+  // kMaxRanks] (parity, block, writer) at signals_offset() in its arena: the
+  // strides and the sizes, in elements.
   static constexpr int64_t signals_stride_parity() {
     return int64_t{kMaxBlocks} * kMaxRanks;
   }
@@ -858,7 +660,7 @@ class Handle {
     // non-blocking, so the copy below would not wait for them. A hung launch
     // hangs this query too: status() is the one readable while a kernel waits.
     HIP_CHECK(hipDeviceSynchronize());
-    HIP_CHECK(hipMemcpy(flags.data(), arena_->at(rank_) + layout_.signals,
+    HIP_CHECK(hipMemcpy(flags.data(), arena_->base(rank_) + layout_.signals,
                         static_cast<size_t>(kSignalsBytes),
                         hipMemcpyDeviceToHost));
     std::vector<std::array<int64_t, 4>> all;
@@ -920,7 +722,7 @@ class Handle {
   // OPEN, every phase logged (log.cuh's OpenPhase), each internal assert a
   // logged OpenCheck that fails open naming it, each observation of the
   // broader state a logged OpenWarning. No collective beyond the CPU group's
-  // gather the descriptor exchange already makes.
+  // gather the handle exchange already makes.
   void open(const Gather& gather, double timeout_seconds, int rccl_ready) {
     Log& log = *log_;
     log.phase(OpenPhase::log_ready, static_cast<uint32_t>(kLogCapacity));
@@ -950,19 +752,17 @@ class Handle {
                  static_cast<uint32_t>(needed >> 20));
     }
     // THE ARENA, the one allocation (its layout: `arena_layout`), made and
-    // zeroed here, then every rank's descriptor exchanged (one collective) and
-    // every peer's slice mapped beside this rank's.
+    // zeroed here, then every rank's IPC handle exchanged (one collective) and
+    // every peer's opened.
     arena_.emplace(rank_, world_size_, layout_.end);
     log.phase(OpenPhase::arena_allocated,
-              static_cast<uint32_t>(arena_->bytes() >> 10),
-              static_cast<uint32_t>(arena_->stride_bytes() >> 10));
+              static_cast<uint32_t>(arena_->bytes() >> 10));
     {
       // THIS RANK'S SIGNALS READ ZERO after the memset, before any peer can
       // write them: a few words, host-side.
       std::array<uint32_t, 64> words{};
-      HIP_CHECK(hipMemcpy(words.data(), arena_->at(rank_) + layout_.signals,
-                          sizeof(words),
-                          hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(words.data(), arena_->base(rank_) + layout_.signals,
+                          sizeof(words), hipMemcpyDeviceToHost));
       uint32_t nonzero = 0;
       for (uint32_t w : words) nonzero += w != 0;
       log.check(OpenCheck::signals_zero, nonzero == 0, rank_, nonzero, 0);
@@ -972,31 +772,19 @@ class Handle {
                                           "not zero after the memset");
       log.phase(OpenPhase::zeroed);
     }
-    std::vector<RankInfo> ranks;
-    {
-      const Fd arena_fd = arena_->exported();
-      log.phase(OpenPhase::exported);
-      RankInfo me{};
-      HIP_CHECK(
-          hipDeviceGetPCIBusId(me.pci_bus_id, sizeof(me.pci_bus_id), device_));
-      (void)::gethostname(me.host, sizeof(me.host) - 1);
-      me.pid = static_cast<int32_t>(::getpid());
-      me.device = device_;
-      me.granularity = arena_->granularity();
-      const std::vector<std::vector<Fd>> theirs =
-          exchange_fds(rank_, world_size_, gather, {arena_fd.get()},
-                       timeout_seconds, me, log, ranks);
-      observe_peers(ranks);
-      std::vector<int> fds(world_size_, -1);
-      for (int r = 0; r < world_size_; ++r)
-        if (r != rank_) fds[r] = theirs[r][0].get();
-      arena_->import_peers(fds);
-      log.phase(OpenPhase::imported, static_cast<uint32_t>(world_size_ - 1), 1);
-    }
-    arena_->map_peers();
-    log.phase(OpenPhase::mapped);
-    arena_->allow_peers();
-    log.phase(OpenPhase::access_set);
+    RankInfo me{};
+    me.handle = arena_->exported();
+    log.phase(OpenPhase::exported);
+    HIP_CHECK(
+        hipDeviceGetPCIBusId(me.pci_bus_id, sizeof(me.pci_bus_id), device_));
+    (void)::gethostname(me.host, sizeof(me.host) - 1);
+    me.pid = static_cast<int32_t>(::getpid());
+    me.device = device_;
+    const std::vector<RankInfo> ranks =
+        gather_ranks(world_size_, gather, me, log);
+    observe_peers(ranks);
+    arena_->open_peers(ranks);
+    log.phase(OpenPhase::opened, static_cast<uint32_t>(world_size_ - 1));
     // EVERY PEER'S GPU in this process (by its PCI bus id), and whether this
     // device reaches it: a peer that cannot be reached is a definite error.
     std::vector<int> peer_devices(world_size_, -1);
@@ -1018,9 +806,9 @@ class Handle {
              "device " + std::to_string(device_) + " cannot access rank " +
                  std::to_string(r) + "'s device " + std::to_string(d));
     }
-    if (!arena_->verify(log))
+    if (!arena_->verify(log, peer_devices))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
-           "the arena's mapping");
+           "the peers' arenas");
     // THE STATUS, host-mapped and coherent: the log's first words
     // (log.cuh). A wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort`
@@ -1028,9 +816,8 @@ class Handle {
     // own argument, a buffer of kStatusFields words.
     status_ = log.status_host();
     device_status_ = log.status_device();
-    // EACH RANK'S SLICE is the arena's layout (`arena_layout`), at the same
-    // offsets on every rank, so each region is rank 0's address and the
-    // arena's rank stride (partials_ptr(), exchange_stride_rank_bytes()).
+    // EACH RANK'S ARENA has the one layout (`arena_layout`), so each region is
+    // its offset from every rank's base (bases(), inputs_offset(), ...).
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -1042,8 +829,8 @@ class Handle {
     log.phase(OpenPhase::open_done);
   }
 
-  // WHAT THE RANKS SAID ABOUT THEMSELVES, compared: two ranks on one GPU,
-  // a rank on another host, granularities that differ. Warnings only.
+  // WHAT THE RANKS SAID ABOUT THEMSELVES, compared: two ranks on one GPU, a
+  // rank on another host. Warnings only.
   void observe_peers(const std::vector<RankInfo>& ranks) {
     const RankInfo& me = ranks[rank_];
     for (int r = 0; r < world_size_; ++r) {
@@ -1056,10 +843,6 @@ class Handle {
           std::strncmp(p.pci_bus_id, me.pci_bus_id, sizeof(me.pci_bus_id)) == 0)
         log_->warn(OpenWarning::duplicate_device, r,
                    static_cast<uint32_t>(p.pid), static_cast<uint32_t>(me.pid));
-      if (p.granularity != me.granularity)
-        log_->warn(OpenWarning::granularity_mismatch, r,
-                   static_cast<uint32_t>(p.granularity),
-                   static_cast<uint32_t>(me.granularity));
     }
   }
 

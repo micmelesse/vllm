@@ -222,9 +222,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        DTYPE* __restrict__ inputs_ptr, int64_t inputs_stride_rank, int64_t inputs_stride_m,
+        PeerBases bases, int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+    int64_t signals_offset,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -241,12 +241,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // launched and copied its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, 1, Quantization::none>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      peer_ptr(inputs_ptr, inputs_stride_rank, rank), inputs_stride_m,
+      peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
       inputs_stride_n, inputs_size_m, inputs_size_n,
       static_cast<uint8_t*>(nullptr), 0, 0, 0, 0, static_cast<__fp16*>(nullptr), 0, 0, 0,
       0, input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -256,7 +256,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
     peers_load<1, THREADS_PER_BLOCK>(
-        inputs_ptr, inputs_stride_rank, inputs_stride_m, inputs_stride_n,
+        bases, inputs_offset, inputs_stride_m, inputs_stride_n,
                                      input_size_m, input_size_n, peers, row, 0);
     float sum_f[1][K][P];
     peers_sum(peers, sum_f);
@@ -275,7 +275,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read, 1, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -332,11 +332,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        DTYPE* __restrict__ partials_ptr, int64_t partials_stride_rank, int64_t partials_stride_m,
+        PeerBases bases, int64_t partials_offset, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        DTYPE* __restrict__ inputs_ptr, int64_t inputs_stride_rank, int64_t inputs_stride_m,
+        int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+    int64_t signals_offset,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -345,10 +345,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float eps, float output_eps, int reduce_scatter_blocks) {
   // THE INT4 PAYLOADS, inside the regions (common.cuh's `int4_payload`):
   // the same offsets on every rank, from the call's sizes.
-  const Int4Payload inputs_int4 = int4_payload(
-      inputs_ptr, inputs_stride_rank, inputs_size_m, inputs_size_n);
-  const Int4Payload partials_int4 = int4_payload(
-      partials_ptr, partials_stride_rank, partials_size_m, partials_size_n);
+  const Int4Payload inputs_int4 = int4_payload(inputs_offset, inputs_size_m, inputs_size_n);
+  const Int4Payload partials_int4 = int4_payload(partials_offset, partials_size_m, partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
@@ -364,14 +362,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(inputs_ptr, inputs_stride_rank, rank), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr(inputs_int4.values_ptr, inputs_int4.values_stride_rank, rank), inputs_int4.values_stride_m,
+      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
       inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
-      peer_ptr(inputs_int4.scales_ptr, inputs_int4.scales_stride_rank, rank), inputs_int4.scales_stride_m,
+      peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
       inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
       input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -384,40 +382,40 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    two-shot's cycles for its bytes: thread traces 2026-10-04T21-03-09Z,
   //    21-26-11Z), summed through LDS (reduce_scatter_lds).
   (void)reduce_scatter_blocks;
-  reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
-      inputs_ptr, inputs_stride_rank, inputs_stride_m, inputs_stride_n,
-      input_size_m, input_size_n, inputs_int4.values_ptr, inputs_int4.values_stride_rank, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
-      inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_ptr, inputs_int4.scales_stride_rank,
+  reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION, DTYPE>(
+      bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+      input_size_m, input_size_n, inputs_int4.values_offset, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
+      inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_offset,
       inputs_int4.scales_stride_m, inputs_int4.scales_stride_n, inputs_int4.scales_size_m,
-      inputs_int4.scales_size_n, partials_ptr, partials_stride_rank, partials_stride_m, partials_stride_n,
-      partials_size_m, partials_size_n, partials_int4.values_ptr, partials_int4.values_stride_rank,
+      inputs_int4.scales_size_n, partials_offset, partials_stride_m, partials_stride_n,
+      partials_size_m, partials_size_n, partials_int4.values_offset,
       partials_int4.values_stride_m, partials_int4.values_stride_n, partials_int4.values_size_m,
-      partials_int4.values_size_n, partials_int4.scales_ptr, partials_int4.scales_stride_rank, partials_int4.scales_stride_m,
+      partials_int4.values_size_n, partials_int4.scales_offset, partials_int4.scales_stride_m,
       partials_int4.scales_stride_n, partials_int4.scales_size_m, partials_int4.scales_size_n,
       rank);
 
   // 3. Every rank's sums are in its partials: this block's twin on every rank
   //    has reduced the same rows.
   barrier<Until::visible, 1, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
   // 4. Each of this block's tiles: its packs from the ranks that own them (A
   //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's partials
-  //    at its rank stride), at the input's place in the partials, then AttnRes. A
+  //    from its base, picked per lane), at the input's place in the partials, then AttnRes. A
   //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
   //    body, a row past input_size_m (never loaded) kept the last tile's
   //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
   //    (150 -> 166; ISA harness 2026-10-15).
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][K][P];
-    all_gather<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION>(
-        partials_ptr, partials_stride_rank, partials_stride_m, partials_stride_n, input_size_m,
-        input_size_n, partials_int4.values_ptr, partials_int4.values_stride_rank, partials_int4.values_stride_m,
+    all_gather<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, DTYPE>(
+        bases, partials_offset, partials_stride_m, partials_stride_n, input_size_m,
+        input_size_n, partials_int4.values_offset, partials_int4.values_stride_m,
         partials_int4.values_stride_n, partials_int4.values_size_m, partials_int4.values_size_n,
-        partials_int4.scales_ptr, partials_int4.scales_stride_rank, partials_int4.scales_stride_m, partials_int4.scales_stride_n,
+        partials_int4.scales_offset, partials_int4.scales_stride_m, partials_int4.scales_stride_n,
         partials_int4.scales_size_m, partials_int4.scales_size_n, sum, offs_m, 0, slice_n);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
@@ -477,11 +475,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int output_size_n, DTYPE* __restrict__ block_output_ptr,
         int64_t block_output_stride_m, int64_t block_output_stride_n,
         int block_output_size_m, int block_output_size_n,
-        DTYPE* __restrict__ partials_ptr, int64_t partials_stride_rank, int64_t partials_stride_m,
+        PeerBases bases, int64_t partials_offset, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        DTYPE* __restrict__ inputs_ptr, int64_t inputs_stride_rank, int64_t inputs_stride_m,
+        int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    uint32_t* __restrict__ signals_ptr, int64_t signals_stride_rank,
+    int64_t signals_offset,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -490,10 +488,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         float eps, float output_eps) {
   // THE INT4 PAYLOADS, inside the regions (common.cuh's `int4_payload`):
   // the same offsets on every rank, from the call's sizes.
-  const Int4Payload inputs_int4 = int4_payload(
-      inputs_ptr, inputs_stride_rank, inputs_size_m, inputs_size_n);
-  const Int4Payload partials_int4 = int4_payload(
-      partials_ptr, partials_stride_rank, partials_size_m, partials_size_n);
+  const Int4Payload inputs_int4 = int4_payload(inputs_offset, inputs_size_m, inputs_size_n);
+  const Int4Payload partials_int4 = int4_payload(partials_offset, partials_size_m, partials_size_n);
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
@@ -517,14 +513,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // launched and staged its own (the first barrier is ordered).
   stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr(inputs_ptr, inputs_stride_rank, rank), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr(inputs_int4.values_ptr, inputs_int4.values_stride_rank, rank), inputs_int4.values_stride_m,
+      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
       inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
-      peer_ptr(inputs_int4.scales_ptr, inputs_int4.scales_stride_rank, rank), inputs_int4.scales_stride_m,
+      peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
       inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
       input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -539,22 +535,22 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    16384, spilling). The ranks' pointers are read after the barrier (held
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
-                           QUANTIZATION>(
-      inputs_ptr, inputs_stride_rank, inputs_stride_m, inputs_stride_n,
-      input_size_m, input_size_n, inputs_int4.values_ptr, inputs_int4.values_stride_rank, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
-      inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_ptr, inputs_int4.scales_stride_rank,
+                           QUANTIZATION, DTYPE>(
+      bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+      input_size_m, input_size_n, inputs_int4.values_offset, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
+      inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_offset,
       inputs_int4.scales_stride_m, inputs_int4.scales_stride_n, inputs_int4.scales_size_m,
-      inputs_int4.scales_size_n, partials_ptr, partials_stride_rank, partials_stride_m, partials_stride_n,
-      partials_size_m, partials_size_n, partials_int4.values_ptr, partials_int4.values_stride_rank,
+      inputs_int4.scales_size_n, partials_offset, partials_stride_m, partials_stride_n,
+      partials_size_m, partials_size_n, partials_int4.values_offset,
       partials_int4.values_stride_m, partials_int4.values_stride_n, partials_int4.values_size_m,
-      partials_int4.values_size_n, partials_int4.scales_ptr, partials_int4.scales_stride_rank, partials_int4.scales_stride_m,
+      partials_int4.values_size_n, partials_int4.scales_offset, partials_int4.scales_stride_m,
       partials_int4.scales_stride_n, partials_int4.scales_size_m, partials_int4.scales_size_n,
       col0 * P, own_packs * P, my_rows, rank);
 
   // 3. Every rank's sums are in this rank's partials, and every peer has read
   // this rank's input.
   barrier<Until::visible, 1, WORLD>(
-      signals_ptr, signals_stride_rank, signals_stride_parity, signals_stride_block,
+      bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -563,9 +559,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    place in it), then AttnRes, as the one-shot does. The next call's first
   //    sync keeps a peer from pushing into this partials while it is read (a
   //    peer's next kernel starts only once this one has finished).
-  const DTYPE* own_partials = peer_ptr(partials_ptr, partials_stride_rank, rank);
-  const uint8_t* own_partials_values = peer_ptr(partials_int4.values_ptr, partials_int4.values_stride_rank, rank);
-  const __fp16* own_partials_scales = peer_ptr(partials_int4.scales_ptr, partials_int4.scales_stride_rank, rank);
+  const DTYPE* own_partials = peer_ptr<DTYPE>(bases, rank, partials_offset);
+  const uint8_t* own_partials_values = peer_ptr<uint8_t>(bases, rank, partials_int4.values_offset);
+  const __fp16* own_partials_scales = peer_ptr<__fp16>(bases, rank, partials_int4.scales_offset);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
     load<1, THREADS_PER_BLOCK, QUANTIZATION>(

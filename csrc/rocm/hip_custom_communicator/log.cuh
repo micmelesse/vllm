@@ -107,16 +107,16 @@ enum class LogKind : uint8_t {
 enum class OpenPhase : uint8_t {
   none = 0,
   log_ready,           // seen: the ring's capacity
-  arena_allocated,     // the one allocation, this rank's slice mapped; seen,
-                       // want: bytes requested (KiB), rank stride (KiB)
+  arena_allocated,     // the one allocation (hipExtMallocWithFlags); seen:
+                       // its KiB
   exchange_allocated,  // retired (one arena); kept so the numbers hold
   zeroed,              // this rank's signals read back zero
-  exported,
-  socket_exchange_begun,  // seen: peers expected
-  socket_exchange_done,   // seen: peers that sent
-  imported,               // seen: peers imported, a buffer each
-  mapped,
-  access_set,
+  exported,            // hipIpcGetMemHandle on the arena's base
+  handle_exchange_begun,  // seen: peers expected
+  handle_exchange_done,   // seen: peers' records gathered
+  opened,                 // seen: peers' handles opened (hipIpcOpenMemHandle)
+  mapped,          // retired (VMM's map; IPC opens in one step)
+  access_set,      // retired (VMM's access; IPC's is the lazy peer flag)
   tables_written,  // retired (no peer tables); kept so the numbers hold
   checked,  // every OpenCheck passed; seen: warnings
   open_done,
@@ -126,8 +126,10 @@ enum class OpenPhase : uint8_t {
 // stopped.
 constexpr OpenPhase next_open_phase(OpenPhase p) {
   auto n = static_cast<uint8_t>(static_cast<uint8_t>(p) + 1);
-  if (n == static_cast<uint8_t>(OpenPhase::exchange_allocated) ||
-      n == static_cast<uint8_t>(OpenPhase::tables_written))
+  while (n == static_cast<uint8_t>(OpenPhase::exchange_allocated) ||
+         n == static_cast<uint8_t>(OpenPhase::mapped) ||
+         n == static_cast<uint8_t>(OpenPhase::access_set) ||
+         n == static_cast<uint8_t>(OpenPhase::tables_written))
     ++n;
   return static_cast<OpenPhase>(n);
 }
@@ -136,8 +138,8 @@ constexpr OpenPhase next_open_phase(OpenPhase p) {
 // holds the last reached. CLOSE (collective, every rank): closing ->
 // synchronized -> stopped (handshake 1: every rank has stopped using the
 // memory) -> peers_released (our mappings of peers gone) -> peers_done
-// (handshake 2: every rank's are) -> released (our own memory and the range
-// freed) -> close_done. ABANDON (alone: an error path, a signal, process exit;
+// (handshake 2: every rank's are) -> released (our own memory freed) ->
+// close_done. ABANDON (alone: an error path, a signal, process exit;
 // never waits on a peer): closing -> synchronized (bounded; failed when the
 // device did not finish) -> peers_released -> released (only when the device
 // finished) -> close_done. A failed handshake (a peer that did not come within
@@ -148,11 +150,11 @@ enum class ClosePhase : uint8_t {
   synchronized,    // every launch on this device finished; failed: it did not
                    // within the bounded wait (abandon)
   stopped,         // handshake 1 passed; failed: a peer did not arrive
-  peers_released,  // seen: peer slices unmapped, want: handles released;
+  peers_released,  // seen: peers' handles closed (hipIpcCloseMemHandle);
                    // extra: the first hipError_t
   peers_done,      // handshake 2 passed; failed: a peer did not arrive
-  released,        // our slice unmapped, our memory released, the range
-                   // freed; extra: the first hipError_t
+  released,        // seen: 1 when our arena was freed (hipFree); extra: the
+                   // first hipError_t
   close_done,
 };
 
@@ -162,10 +164,13 @@ enum class OpenCheck : uint8_t {
   none = 0,
   current_device,   // the current device is the one the communicator was
                     // given (seen: current, want: given)
-  peer_imported,    // every peer's descriptor imported and mapped
-  access_rw,        // hipMemGetAccess from this device: read-write, every slice
-  geometry,         // stride a granule multiple, at least the bytes asked;
-                    // base granule-aligned
+  peer_opened,      // every rank's arena present: ours allocated, every
+                    // peer's IPC handle opened
+  pointer_sane,     // hipPointerGetAttributes on every rank's base: device
+                    // memory, the base its device pointer (seen: the type,
+                    // want: the hipError_t)
+  geometry,         // retired (VMM's granule and stride); kept so the
+                    // numbers hold
   can_access_peer,  // hipDeviceCanAccessPeer(this device, the peer's)
   signals_zero,     // this rank's signals read zero after the memset
 };
@@ -178,11 +183,11 @@ enum class OpenWarning : uint8_t {
   other_processes,       // seen: other processes holding this GPU
   duplicate_device,      // peer: a rank on the same GPU as this one
   host_mismatch,         // peer: a rank on another host
-  granularity_mismatch,  // peer; seen: its granularity, want: ours
+  granularity_mismatch,  // retired (VMM's granularity); kept so the
+                         // numbering holds
   low_memory,            // seen: free MiB, want: MiB open allocates
-  pointer_device,        // retired: hipPointerGetAttributes on an imported
-                         // VMM slice reports the importing device, on every
-                         // slice, so it was noise; kept so the numbering holds
+  pointer_device,        // peer; seen: the device hipPointerGetAttributes
+                         // reports for its opened arena, want: its GPU here
   peer_not_visible,      // peer: its GPU (by PCI bus id) is not visible here,
                          // so its device checks are skipped
 };
@@ -193,10 +198,10 @@ constexpr const char* to_string(OpenCheck c) {
       return "none";
     case OpenCheck::current_device:
       return "current_device";
-    case OpenCheck::peer_imported:
-      return "peer_imported";
-    case OpenCheck::access_rw:
-      return "access_rw";
+    case OpenCheck::peer_opened:
+      return "peer_opened";
+    case OpenCheck::pointer_sane:
+      return "pointer_sane";
     case OpenCheck::geometry:
       return "geometry";
     case OpenCheck::can_access_peer:

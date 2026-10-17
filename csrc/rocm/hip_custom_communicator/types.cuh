@@ -296,14 +296,17 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // order: the inputs, the outputs, the exchange (partials, inputs), the signals,
 // the status, then the scalars; each buffer its pointer, then its strides, then
 // its sizes, every dimension's, in elements (STANDARDS, *A kernel's arguments
-// have one format*). Our peer buffers (the exchange's, the signals) are rank
-// 0's pointer and a rank stride, every rank's mapped into one range
-// (handle.cuh's SymmetricMemory). THE INPUT IS THIS RANK'S POINTER only: the
-// kernel copies it into this rank's inputs (INT4: quantized into the INT4
-// payload the kernel finds inside the inputs, common.cuh's `int4_payload`)
-// before its first barrier, and the peers read the inputs at inputs_ptr +
-// r * inputs_stride_rank. No kernel takes a pointer table, nor an INT4
-// payload's pointers: they are the region's.
+// have one format*). Our peer regions (the exchange's, the signals) are every
+// rank's arena base, BY VALUE (`PeerBases`, before the first region), and each
+// region's byte offset in the arena, then its strides and sizes: the peers'
+// arenas are opened over legacy IPC at addresses of the runtime's choosing
+// (handle.cuh), so rank r's region is `peer_ptr<T>(bases, r, offset)`
+// (common.cuh). THE INPUT IS THIS RANK'S POINTER only: the kernel copies it
+// into this rank's inputs (INT4: quantized into the INT4 payload the kernel
+// finds inside the inputs, common.cuh's `int4_payload`) before its first
+// barrier, and the peers read the inputs there. No kernel takes a pointer
+// table in device memory, nor an INT4 payload's offsets: they are the
+// region's.
 // =================================================================================================
 
 // The kernels' signatures, written out by hand (one alias a signature; the
@@ -316,13 +319,13 @@ using AllReduceTwoShotKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -333,9 +336,9 @@ using AllReduceOneShotStagedKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/, int64_t /*inputs_stride_m*/,
+    PeerBases /*bases*/, int64_t /*inputs_offset*/, int64_t /*inputs_stride_m*/,
     int64_t /*inputs_stride_n*/, int /*inputs_size_m*/,
-    int /*inputs_size_n*/, void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int /*inputs_size_n*/, int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -346,12 +349,12 @@ using AllReduceTwoShotStagedKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
-    int /*partials_size_n*/, void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int /*partials_size_n*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/, int64_t /*signals_stride_parity*/,
+    int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
     int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
     int /*signals_size_parity*/, int /*signals_size_block*/,
     int /*signals_size_writer*/, void* /*status_ptr*/,
@@ -363,10 +366,10 @@ using AllReduceRmsNormOneShotKernel = void (*)(
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    PeerBases /*bases*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/, int64_t /*signals_stride_parity*/,
+    int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
     int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
     int /*signals_size_parity*/, int /*signals_size_block*/,
     int /*signals_size_writer*/, void* /*status_ptr*/,
@@ -378,13 +381,13 @@ using AllReduceRmsNormTwoShotKernel = void (*)(
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -402,10 +405,10 @@ using AllReduceAddRmsNormOneShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
     int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
     int /*residual_output_size_m*/, int /*residual_output_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    PeerBases /*bases*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/, int64_t /*signals_stride_parity*/,
+    int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
     int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
     int /*signals_size_parity*/, int /*signals_size_block*/,
     int /*signals_size_writer*/, void* /*status_ptr*/,
@@ -422,13 +425,13 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
     int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
     int /*residual_output_size_m*/, int /*residual_output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -455,10 +458,10 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    PeerBases /*bases*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/, int64_t /*signals_stride_parity*/,
+    int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
     int64_t /*signals_stride_block*/, int64_t /*signals_stride_writer*/,
     int /*signals_size_parity*/, int /*signals_size_block*/,
     int /*signals_size_writer*/, void* /*status_ptr*/,
@@ -485,13 +488,13 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
@@ -518,13 +521,13 @@ using AllReduceAddAttnResRmsNormPullKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    void* /*partials_ptr*/, int64_t /*partials_stride_rank*/, int64_t /*partials_stride_m*/,
+    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
-    void* /*inputs_ptr*/, int64_t /*inputs_stride_rank*/,
+    int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
-    void* /*signals_ptr*/, int64_t /*signals_stride_rank*/,
+    int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
