@@ -61,7 +61,7 @@ DINLINE void block_attn_res_tile(
   DTYPE new_prefix[ROWS][K][P];
   if constexpr (HAS_PREFIX) {
     DTYPE old_prefix[ROWS][K][P];
-    load<1, THREADS>(prefix_ptr, 1, 0, 0, prefix_stride_m, prefix_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n);
+    load<1, THREADS>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n);
     float old_f[ROWS][K][P], sum_f[ROWS][K][P], new_f[ROWS][K][P];
     convert(old_prefix, old_f);
     convert(sum, sum_f);
@@ -70,9 +70,9 @@ DINLINE void block_attn_res_tile(
   } else {
     convert(sum, new_prefix);
   }
-  store<1, THREADS, THREADS>(new_prefix, prefix_output_ptr, 1, 0, 0, prefix_output_stride_m, prefix_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+  store<1, THREADS, THREADS>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
   if (block_output_ptr != nullptr)
-    store<1, THREADS, THREADS>(new_prefix, block_output_ptr, 1, 0, 0, block_output_stride_m, block_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+    store<1, THREADS, THREADS>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
   // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
@@ -81,8 +81,8 @@ DINLINE void block_attn_res_tile(
   if (num_blocks != 0) {
     // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-    load<1, THREADS>(norm_weight_ptr, 1, 0, 0, 0, norm_weight_stride_n, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n);
-    load<1, THREADS>(qk_weight_ptr, 1, 0, 0, 0, qk_weight_stride_n, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n);
+    load<1, THREADS>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n);
+    load<1, THREADS>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n);
     float norm_weight_f[1][K][P], qk_weight_f[1][K][P], w[1][K][P];
     convert(norm_weight, norm_weight_f);
     convert(qk_weight, qk_weight_f);
@@ -113,7 +113,8 @@ DINLINE void block_attn_res_tile(
         // held 16 VGPRs at the kernel's peak (ISA 2026-10-04T16-26-29Z). A
         // padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
-        load<1, THREADS>(block ? blocks_ptr + src * blocks_stride_r : prefix_output_ptr, 1, 0, 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n);
+        const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
+        load<1, THREADS>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n);
         float ss[ROWS], dw[ROWS];
         partial_dot<THREADS>(v[s], v[s], ss, input_size_n, offs_n);
         partial_dot<THREADS>(v[s], w, dw, input_size_n, offs_n);
@@ -163,7 +164,7 @@ DINLINE void block_attn_res_tile(
   DTYPE result[ROWS][K][P];
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
-    load<1, THREADS>(output_norm_weight_ptr, 1, 0, 0, 0, output_norm_weight_stride_n, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n);
+    load<1, THREADS>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n);
     float ss[1][ROWS];
     partial_dot<THREADS>(acc, acc, ss[0], input_size_n, offs_n);
     block_reduce<Sum, ReduceAxis::all, 1, THREADS>(ss, ss);
@@ -179,7 +180,7 @@ DINLINE void block_attn_res_tile(
   } else {
     convert(acc, result);
   }
-  store<1, THREADS, THREADS>(result, output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
+  store<1, THREADS, THREADS>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n);
 }
 
 // =============================================================================
@@ -243,7 +244,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
+    load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
     float sum_f[1][K][P];
     peers_sum(peers, sum_f);
     DTYPE sum[1][K][P];
@@ -537,12 +538,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    sync keeps a peer from pushing into this partials while it is read (a
   //    peer's next kernel starts only once this one has finished).
   //    int4: its INT4 payload, worked out from the partials' own sizes by load.
-  const DTYPE* own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
-        own_partials, 1, 0, 0, partials_stride_m, partials_stride_n, partials_size_m,
-        partials_size_n, input_size_m, input_size_n, sum, row, 0);
+    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,

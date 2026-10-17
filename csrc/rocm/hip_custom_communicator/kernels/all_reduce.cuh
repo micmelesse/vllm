@@ -82,12 +82,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][ROWS][K][P];
-    load<THREADS_M, THREADS_N, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, input_stride_m, input_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+    load<THREADS_M, THREADS_N, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     float sum[ROWS][K][P];
     peers_sum(peers, sum);
     DTYPE rounded[ROWS][K][P];
     convert(sum, rounded);
-    store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+    store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
@@ -212,22 +212,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int band_rows = staging_size_m / WORLD;  // a slot's rows
   const int64_t slot = int64_t{band_rows} * staging_stride_m;  // a slot's elements
-  // This rank's own inbox (its slot in every inbox is slot [rank]).
-  const DTYPE* const inbox = ptr_array_at<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank);
 
   for (int r0 = 0; r0 < input_size_m; r0 += band_rows) {
     const int band =
         min(band_rows, input_size_m - r0);  // this pass's rows
     const int tiles = (band + TILE_M - 1) / TILE_M * tiles_n;
-    // This pass's rows of the input and the output, from its first row.
-    const DTYPE* const band_input = input_ptr + r0 * input_stride_m;
-    DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-    // 1. This rank's band, read here, into slot [rank] of every rank's inbox,
+    // 1. This rank's band (the input's rows r0 to r0 + band), read here, into slot [rank] of every rank's inbox,
     // then visible to the peers (each has pushed its own into ours).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE mine[ROWS][K][P];
-      load<THREADS_M, THREADS_N>(band_input, 1, 0, 0, input_stride_m, input_stride_n, band, input_size_n, band, input_size_n, mine, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
-      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(mine, staging_ptr_array, staging_ptr_array_size, rank, slot, staging_stride_m, staging_stride_n, band, input_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+      load<THREADS_M, THREADS_N>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(mine, staging_ptr_array, staging_ptr_array_size, 0, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     barrier<Until::visible, 0, WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
@@ -237,12 +232,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Every writer's slot of this rank's inbox, local, in rank order, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][ROWS][K][P];
-      load<THREADS_M, THREADS_N, Ranks::every>(inbox, 1, 0, slot, staging_stride_m, staging_stride_n, band, input_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+      load<THREADS_M, THREADS_N, Ranks::every_slot>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
       float sum[ROWS][K][P];
       peers_sum(peers, sum);
       DTYPE rounded[ROWS][K][P];
       convert(sum, rounded);
-      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, band_output, 1, 0, 0, output_stride_m, output_stride_n, band, input_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
+      store<THREADS_M, THREADS_N, THREADS_PER_BLOCK>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     // 3. No rank may push its next band (this launch's or the next's) until
     // every peer has summed this one out of its inbox.

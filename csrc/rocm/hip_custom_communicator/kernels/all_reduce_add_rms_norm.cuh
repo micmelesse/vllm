@@ -78,12 +78,12 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, staging_stride_m, staging_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
+    load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
     DTYPE res[1][K][P];
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(residual_ptr, 1, 0, 0, residual_stride_m, residual_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
+      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
     WEIGHT_DTYPE w[1][K][P];
-    load<1, THREADS_PER_BLOCK>(weight_ptr, 1, 0, 0, 0, weight_stride_n, 1, input_size_n, 1, input_size_n, w, 0, 0);
+    load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
     float s[1][K][P];
     peers_sum(peers, s);
     round<DTYPE>(s);
@@ -93,7 +93,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, residual_output_ptr, 1, 0, 0, residual_output_stride_m, residual_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
     float ss[1][1];
     partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
@@ -110,7 +110,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
@@ -284,18 +284,18 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
     if constexpr (QUANTIZATION == Quantization::none)
       load<1, THREADS_PER_BLOCK, Ranks::every>(
-          input_ptr_array, input_ptr_array_size, 0, 0, staging_stride_m, staging_stride_n,
+          input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
           input_size_m, input_size_n, input_size_m, input_size_n, got, row, 0);
     else
       load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
-          staging_ptr_array, staging_ptr_array_size, 0, 0, staging_stride_m, staging_stride_n,
+          staging_ptr_array, staging_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
           staging_size_m, staging_size_n, input_size_m, input_size_n, got, row, 0);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete
   // in issue order, so waiting on one issued after the peers' would wait on the
   // peers' too.
   WEIGHT_DTYPE w[1][K][P];
-  load<1, THREADS_PER_BLOCK>(weight_ptr, 1, 0, 0, 0, weight_stride_n, 1, input_size_n, 1, input_size_n, w, 0, 0);
+  load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
   // ONE ROW: its residual, then the next row's peer loads into `next`, then
   // this row's sum (its wait covers only its own, older, loads), so the next
   // round trip runs under the reduction and norm. Its rows land in this rank's
@@ -304,7 +304,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
                            DTYPE(&next)[WORLD][1][K][P]) {
     DTYPE res[1][K][P];
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(residual_ptr, 1, 0, 0, residual_stride_m, residual_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
+      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform
     // branch costs nothing, where a clamped unconditional load re-read the last
     // row (a block's whole round trip again; at 256 tokens every block has one
@@ -321,9 +321,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
-          added, own_partials, 1, 0, 0, partials_stride_m, partials_stride_n, partials_size_m,
-          partials_size_n, input_size_m, input_size_n, row - first, 0);
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
     }
     float ss[1][1];
     partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
@@ -350,9 +348,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
-        normed, own_partials, 1, 0, 0, partials_stride_m, partials_stride_n, partials_size_m,
-        partials_size_n, input_size_m, input_size_n, row - first, 0);
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its
   // packs into the other (a copy cost 32 moves a row at one pack a thread: ISA
@@ -402,17 +398,17 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
       DTYPE got[WORLD][1][1][P];
       load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
-          partials_ptr_array, partials_ptr_array_size, 0, 0, partials_stride_m, partials_stride_n,
+          partials_ptr_array, partials_ptr_array_size, 0, 0, 0, partials_stride_m, partials_stride_n, 1,
           partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c);
       WEIGHT_DTYPE w_step[1][1][P];
       if constexpr (ADD_RESIDUAL)
-        load<1, THREADS_PER_BLOCK>(weight_ptr, 1, 0, 0, 0, weight_stride_n, 1, input_size_n, 1, input_size_n, w_step, 0, c);
+        load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
         const int row = r * slice_m + l;
         if (row >= input_size_m) continue;
         if constexpr (ADD_RESIDUAL) {
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], residual_output_ptr, 1, 0, 0, residual_output_stride_m, residual_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
           float normed_f[1][1][P];
           convert(got[r], normed_f);
           mul(normed_f, sc[r], normed_f);
@@ -424,9 +420,9 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
           convert(normed_f, normed_w);
           DTYPE normed[1][1][P];
           convert(normed_w, normed);
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
         } else {
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
+          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
         }
       }
     }
@@ -625,18 +621,15 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    finished).
   // THE PARTIALS, this rank's: with int4 their INT4 payload, worked out from their own sizes where
   // load and store read and write it.
-  const DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
     DTYPE own[1][K][P], res[1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
-        own_partials, 1, 0, 0, partials_stride_m, partials_stride_n, partials_size_m,
-        partials_size_n, input_size_m, input_size_n, own, row, 0);
+    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0);
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(residual_ptr, 1, 0, 0, residual_stride_m, residual_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
+      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
     WEIGHT_DTYPE w[1][K][P];
-    load<1, THREADS_PER_BLOCK>(weight_ptr, 1, 0, 0, 0, weight_stride_n, 1, input_size_n, 1, input_size_n, w, 0, 0);
+    load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
     float s[1][K][P];
     convert(own, s);
     if constexpr (ADD_RESIDUAL) {
@@ -645,7 +638,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
       add(s, res_f, s);
       DTYPE added[1][K][P];
       convert(s, added);
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, residual_output_ptr, 1, 0, 0, residual_output_stride_m, residual_output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
     }
     float ss[1][1];
     partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
@@ -662,7 +655,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     convert(normed_f, normed_w);
     DTYPE normed[1][K][P];
     convert(normed_w, normed);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, output_ptr, 1, 0, 0, output_stride_m, output_stride_n, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
   }
 }
 
