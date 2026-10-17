@@ -460,7 +460,13 @@ inline OtherProcesses other_processes_on(int device) {
 // rank's input precedes a barrier this rank's launch waits on before it ends
 // (a one-shot's `read`, a two-shot's second, after its reduce-scatter), so the
 // next eager copy, or the caller's next write, comes after every read.
-constexpr int64_t kInputTableSlots = 16384;
+// THE SLAB'S SIZE, fixed at open: a slot's address is baked into the graph that
+// captured it, and torch captures in global mode, where no allocation may
+// happen, so the slab cannot grow during a capture. 262144 slots of kMaxRanks
+// pointers is 16 MiB. 16384 was too few for Kimi-K3 at InferenceX's c48 point
+// (capture sizes to 48, a speculative drafter's layers too; run
+// 2026-10-17T03-18-18Z, hip-bench_inferencex_c48).
+constexpr int64_t kInputTableSlots = int64_t{1} << 18;
 
 // A LAUNCH'S INPUT TABLE: the table's address and the strides every rank's
 // input has there (the caller's for a captured call; dense rows, its copy's,
