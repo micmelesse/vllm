@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// COMMON: THE API, and only it: the four ops (load, store, barrier, block_reduce), the INT4
-// codec (encode, decode) and the two address functions (ptr_array_at, lane_ptr_array_at), each at
-// file scope (lint_kernels.sh checks it), with the vocabulary their signatures and bodies need,
-// each item next to the function that needs it. A kernel writes its register math and its walks
-// inline, at its use; rank r's entry of a device array of pointers is
-// `ptr_array_at(x_ptr_array, x_ptr_array_size, r)` for a rank uniform across the wave and
-// `lane_ptr_array_at<WORLD>(...)` for one per lane (their comments say why, with the ISA evidence
-// that brought them back in I7). The machine and the build are the host's (../hardware.cuh);
-// device code reads two facts of them here, kWaveSize and the pack's bytes.
+// COMMON: THE API, and only it: the four ops (load, store, barrier, block_reduce) and the INT4
+// codec (quantize, dequantize), each at file scope (lint_kernels.sh checks it), with the vocabulary
+// their signatures and bodies need, each item next to the function that needs it, and the memory
+// ops' two INTERNALS, ptr_array_at and lane_ptr_array_at: how load, store and barrier read a
+// buffer's device array of pointers (scalar for a rank uniform across the wave, a select over
+// the WORLD entries for one per lane), called by nothing else (Michael, I7, option B: "if we can
+// subsume the work in load and store we should; they are access"; their comments hold the ISA
+// evidence). A kernel writes its register math and its walks inline, at its use. The machine and
+// the build are the host's (../hardware.cuh); device code reads two facts of them here, kWaveSize
+// and the pack's bytes.
 //
 // THE ARGUMENTS ARE A KERNEL'S, in its one order: the inputs, then the outputs, then the
 // scalars. A buffer is its pointer array with its size (a buffer only this rank has is a
@@ -34,7 +35,7 @@
 //   load, store  u32x4, global_u32x4, global_u32, global_f16 (the global-instruction forms);
 //                Ranks; HIP_CUSTOM_COMMUNICATOR_DEBUG (the index checks)
 //   block_reduce Sum, Max (OP); ReduceAxis (AXIS); kWaveSize
-//   addresses    ptr_array_at, lane_ptr_array_at (load, store, barrier, the collectives)
+//   internals    ptr_array_at, lane_ptr_array_at (load, store and barrier only)
 //   barrier      Until; the status buffer's StatusField, kStatusFields, Where, FlagState,
 //                FaultState (its protocol, which the host reads)
 //   the codec    Quantization; kInt4Group, kInt4GroupPacks, kInt4WordBytes, kInt4ScaleBytes;
@@ -613,7 +614,7 @@ typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 template <typename U>
 constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 
-// DECODE: a word's 8 values at their group's scale. Its own function because load lands them in
+// DEQUANTIZE: a word's 8 values at their group's scale. Its own function because load lands them in
 // U and the INT4 sum adds them in fp32 from the words (reduce_scatter's, never a decoded tile).
 // U float: the exact terms, (q - 8) * scale. U a 16-bit dtype: each rounded once to U, made as a
 // loaded pack is, four 32-bit words copied in whole: element by element, each 16-bit value held a
@@ -630,7 +631,7 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 // conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
 // 2026-10-16T02-01-12Z).
 template <typename U, int P>
-DINLINE void decode(uint32_t word, float scale, U (&output)[P]) {
+DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2, "fp32 terms or a 16-bit dtype");
   const float scale16 = scale * 0.0625f;
@@ -674,7 +675,7 @@ DINLINE void decode(uint32_t word, float scale, U (&output)[P]) {
   }
 }
 
-// ENCODE: a group's packs to their words and the group's scale. Its own function because store
+// QUANTIZE: a group's packs to their words and the group's scale. Its own function because store
 // (a pack a thread, THREAD_PACKS 1) and the INT4 flat walk (a group a thread, THREAD_PACKS
 // kInt4GroupPacks) share it; the thread map is a parameter, not implied by the encoding (R7).
 // THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm [1,0,3,2], then
@@ -692,7 +693,7 @@ DINLINE void decode(uint32_t word, float scale, U (&output)[P]) {
 // v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word, where a
 // shift and an OR an element was 16).
 template <int THREAD_PACKS, typename T, int P>
-DINLINE void encode(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
+DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
                     float& scale) {
   static_assert(P * 4 == 32, "a pack is one word of 8 values");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
@@ -946,9 +947,9 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 #pragma unroll
         for (int k = 0; k < K; ++k) {
           if constexpr (kEvery)
-            decode(words[c][i][k], group_scales[c][i][k], output[c][i][k]);
+            dequantize(words[c][i][k], group_scales[c][i][k], output[c][i][k]);
           else
-            decode(words[0][i][k], group_scales[0][i][k], output[i][k]);
+            dequantize(words[0][i][k], group_scales[0][i][k], output[i][k]);
         }
   }
 }
@@ -1045,7 +1046,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
       for (int k = 0; k < K; ++k)
-        encode(reinterpret_cast<const U(&)[1][P]>(input[i][k]),
+        quantize(reinterpret_cast<const U(&)[1][P]>(input[i][k]),
                   reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
     const int64_t values_stride_m = output_size_n / 2;
     const int64_t scales_stride_m = output_size_n / kInt4Group;

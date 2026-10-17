@@ -167,7 +167,7 @@ DINLINE void reduce_scatter(
           }
           uint32_t words[kInt4GroupPacks];
           float scale;
-          encode(x, words, scale);
+          quantize(x, words, scale);
           if (g < g_end && g < groups) {
             uint8_t* const values = ptr_array_at<uint8_t>(staging_ptr_array, staging_ptr_array_size, r) + mine / 2;
             __fp16* const scales =
@@ -242,13 +242,13 @@ DINLINE void reduce_scatter(
 #pragma unroll
               for (; w + 1 < WORLD; w += 2) {
                 float a[P], b[P];
-                decode(words[w][k], group_scales[w], a);
-                decode(words[w + 1][k], group_scales[w + 1], b);
+                dequantize(words[w][k], group_scales[w], a);
+                dequantize(words[w + 1][k], group_scales[w + 1], b);
 #pragma unroll
                 for (int j = 0; j < P; ++j)
                   sum[k][j] = __builtin_amdgcn_fdot2_f32_bf16(
                       __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, sum[k][j], false);
-                // THE SUMS DONE BEFORE THE NEXT DECODE'S VOLATILE ASM: the scheduler, free to use 256
+                // THE SUMS DONE BEFORE THE NEXT DEQUANTIZE'S VOLATILE ASM: the scheduler, free to use 256
                 // VGPRs at 512 threads, decoded every writer's words of a group ahead of the first sum and
                 // spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
 #pragma unroll
@@ -258,7 +258,7 @@ DINLINE void reduce_scatter(
 #pragma unroll
             for (; w < WORLD; ++w) {
               float a[P];
-              decode(words[w][k], group_scales[w], a);
+              dequantize(words[w][k], group_scales[w], a);
 #pragma unroll
               for (int j = 0; j < P; ++j) sum[k][j] += static_cast<float>(static_cast<T>(a[j]));
 #pragma unroll
@@ -267,7 +267,7 @@ DINLINE void reduce_scatter(
           }
           uint32_t out[kInt4GroupPacks];
           float scale;
-          encode(sum, out, scale);
+          quantize(sum, out, scale);
           if (g < g_end && g < groups) {
             uint32_t out_value_at = static_cast<uint32_t>(g) * 16;
             uint32_t out_scale_at = static_cast<uint32_t>(g) * kInt4ScaleBytes;
@@ -562,8 +562,8 @@ DINLINE void reduce_scatter(
 #pragma unroll
                 for (; w + 1 < WORLD; w += 2) {
                   float a[P], b[P];
-                  decode(peer_words[w], peer_scales[w], a);
-                  decode(peer_words[w + 1], peer_scales[w + 1], b);
+                  dequantize(peer_words[w], peer_scales[w], a);
+                  dequantize(peer_words[w + 1], peer_scales[w + 1], b);
 #pragma unroll
                   for (int j = 0; j < P; ++j)
                     sum[j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -575,7 +575,7 @@ DINLINE void reduce_scatter(
 #pragma unroll
               for (; w < WORLD; ++w) {
                 float a[P];
-                decode(peer_words[w], peer_scales[w], a);
+                dequantize(peer_words[w], peer_scales[w], a);
 #pragma unroll
                 for (int j = 0; j < P; ++j) sum[j] += static_cast<float>(static_cast<T>(a[j]));
 #pragma unroll

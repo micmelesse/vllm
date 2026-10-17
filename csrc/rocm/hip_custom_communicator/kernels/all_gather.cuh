@@ -106,7 +106,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k) {
             T x[P];
-            decode(words[w][k], group_scales[w], x);
+            dequantize(words[w][k], group_scales[w], x);
             u32x4 raw;
             __builtin_memcpy(&raw, x, sizeof(raw));
             *(global_u32x4*)(group + k) = raw;
@@ -222,7 +222,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
 #pragma unroll
       for (int i = 0; i < ROWS; ++i)
 #pragma unroll
-        for (int k = 0; k < K; ++k) decode(words[i][k], scales[i][k], output[i][k]);
+        for (int k = 0; k < K; ++k) dequantize(words[i][k], scales[i][k], output[i][k]);
     }
   }
 }

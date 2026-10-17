@@ -1199,9 +1199,7 @@ constexpr int64_t partials_need(Template t, int64_t m, int64_t packs,
   if (o == OpType::all_reduce)
     return m * ((packs + world - 1) / world) * kBuild.memory.pack_bytes;
   if (slices_columns(t)) return m * packs * kBuild.memory.pack_bytes;
-  const bool two = o == OpType::all_reduce_add_rms_norm;
-  return (m + world - 1) / world * packs * (two ? 2 : 1) *
-         kBuild.memory.pack_bytes;
+  return (m + world - 1) / world * packs * kBuild.memory.pack_bytes;
 }
 
 // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its
@@ -1813,6 +1811,10 @@ select_all_reduce_add_rms_norm(
       .partials_stride_n = 1,
       .partials_size_m = partials_rows,
       .partials_size_n = n,
+      .scales_stride_m = 1,
+      .scales_size_m = fn == Template::all_reduce_pull_two_shot_add_rms_norm
+                           ? (m + world - 1) / world
+                           : 0,
       .inputs_stride_m = n,
       .inputs_stride_n = 1,
       .inputs_size_m = m,
@@ -1820,6 +1822,7 @@ select_all_reduce_add_rms_norm(
       .dtype = dtype,
       .weight_dtype = weight_dtype,
       .eps = eps};
+  if (l.scales_size_m > h.scales_size_m()) return Error::partials_too_small;
   if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;

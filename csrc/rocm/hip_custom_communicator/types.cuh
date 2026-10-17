@@ -464,6 +464,8 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
     const void* /*partials_ptr_array*/, int /*partials_ptr_array_size*/,  int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
+    const void* /*scales_ptr_array*/, int /*scales_ptr_array_size*/,
+    int64_t /*scales_stride_m*/, int /*scales_size_m*/,
     const void* /*staging_ptr_array*/, int /*staging_ptr_array_size*/,
     int64_t /*staging_stride_m*/, int64_t /*staging_stride_n*/,
     int /*staging_size_m*/, int /*staging_size_n*/,
@@ -677,6 +679,9 @@ struct AllReduceAddRmsNormLaunch {
   int64_t residual_output_size_m, residual_output_size_n;
   int64_t partials_stride_m, partials_stride_n;
   int64_t partials_size_m, partials_size_n;
+  // The pull two-shot's ADD_RESIDUAL row scales, [scales_size_m] floats (0 rows elsewhere).
+  int64_t scales_stride_m;
+  int64_t scales_size_m;
   int64_t inputs_stride_m, inputs_stride_n;
   int64_t inputs_size_m, inputs_size_n;
   DType dtype;

@@ -134,6 +134,8 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //   partials   inputs end                 what this rank publishes of its
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
+//   scales     partials end               the add-RMS-norm pull two-shot's row
+//                                         scales, a float a row (max_rows)
 //
 // Rank r's region is at its arena's base (wherever its IPC opening put it)
 // plus the region's offset, written into the region's device array at open. INT4 IS AN ENCODING, NOT A
@@ -144,10 +146,7 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // the call's m and n, the same on every rank).
 //
 // WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
-// INT4, never both, and its sums exact or INT4, never both (the one exact word
-// beside an INT4 payload, the add-RMS-norm row two-shot's row scalars, starts
-// at its exact slice's end, 2 bytes a slice element in, while the payload, over
-// the region's rows, twice the slice, ends at 9/8). Across calls: a rank writes inputs (its own,
+// INT4, never both, and its sums exact or INT4, never both. Across calls: a rank writes inputs (its own,
 // or, the plain all-reduce, its slot of every peer's inbox) before its first
 // barrier, and any rank reads inputs (a peer's, or its own inbox) only before
 // its barrier that every peer's sums are visible (or, a one-shot, its last),
@@ -174,14 +173,17 @@ struct ArenaLayout {
   int64_t signals = 0;
   int64_t inputs = 0;
   int64_t partials = 0;
+  int64_t scales = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
 };
-inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes) {
+inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes,
+                                int64_t scales_bytes) {
   ArenaLayout l;
   l.signals = 0;
   l.inputs = l.signals + kSignalsRegionBytes;
   l.partials = l.inputs + region_aligned(inputs_bytes);
-  l.end = l.partials + region_aligned(partials_bytes);
+  l.scales = l.partials + region_aligned(partials_bytes);
+  l.end = l.scales + region_aligned(scales_bytes);
   return l;
 }
 
@@ -505,7 +507,8 @@ class Handle {
         partials_bytes_(partials_bytes),
         quantization_(quantization),
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
-        layout_(arena_layout(inputs_bytes, partials_bytes)) {
+        layout_(arena_layout(inputs_bytes, partials_bytes,
+                             max_rows * static_cast<int64_t>(sizeof(float)))) {
     // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
     // an open that fails or hangs is read there.
     set_last_log(log_);
@@ -688,6 +691,14 @@ class Handle {
     return region_ptr_arrays_ + kPartialsArray * kMaxRanks;
   }
   int partials_ptr_array_size() const { return world_size_; }
+  // EVERY RANK'S ROW SCALES (the add-RMS-norm pull two-shot's ADD_RESIDUAL: a float a row it owns,
+  // which its peers read while gathering), [max_rows] floats a rank, its own region: a device array
+  // of every rank's address of it with its size, the world.
+  float* const* scales_ptr_array() const {
+    return reinterpret_cast<float* const*>(region_ptr_arrays_ + kScalesArray * kMaxRanks);
+  }
+  int scales_ptr_array_size() const { return world_size_; }
+  int64_t scales_size_m() const { return max_rows_; }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
   // kMaxRanks] (parity, block, writer) at signals_ptr_array()[r]: the
@@ -998,6 +1009,7 @@ class Handle {
         at[kSignalsArray * kMaxRanks + r] = base + layout_.signals;
         at[kStagingArray * kMaxRanks + r] = base + layout_.inputs;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
+        at[kScalesArray * kMaxRanks + r] = base + layout_.scales;
       }
       HIP_CHECK(hipMemcpy(region_ptr_arrays_, at.data(),
                           at.size() * sizeof(char*), hipMemcpyHostToDevice));
@@ -1253,8 +1265,8 @@ class Handle {
   void** tables_ = nullptr;
   // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
   // allocation: the signals, the inputs, the partials.
-  static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2,
-                       kRegionPtrArrays = 3;
+  static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
+                       kRegionPtrArrays = 4;
   char** region_ptr_arrays_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;

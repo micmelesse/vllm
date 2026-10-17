@@ -227,7 +227,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
     char* const* partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
     int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-    char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    float* const* scales_ptr_array, int scales_ptr_array_size, int64_t scales_stride_m,
+    int scales_size_m, char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
     int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
@@ -238,9 +239,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
   const int slice_m = (input_size_m + WORLD - 1) / WORLD;
-  // ADD_RESIDUAL: each owned row's RMS scale, a float a row, after the rows in
-  // partials.
-  const int64_t scale_at = int64_t{slice_m} * partials_stride_m;  // in elements
 
   // 1. none: nothing staged, every rank's input read in place where the
   // input table says (a captured call's tensor, or an eager call's host copy
@@ -275,9 +273,6 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
 
-  // THE PARTIALS, this rank's: with int4 their INT4 payload, worked out from their own sizes where
-  // load and store read and write it.
-  DTYPE* const own_partials = ptr_array_at<DTYPE>(partials_ptr_array, partials_ptr_array_size, rank);
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
   // (ADD_RESIDUAL) add the
@@ -350,11 +345,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     if constexpr (ADD_RESIDUAL) {
       rms_norm<THREADS_PER_BLOCK, NormPart::scale, true>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0);
-      // The row's scale, one float a row in this rank's partials: thread 0 stores it.
-      if (threadIdx.x == 0)
-        *(__attribute__((address_space(1))) float*)(reinterpret_cast<float*>(own_partials +
-                                                                             scale_at) +
-                                                    (row - first)) = scale[0];
+      // The row's scale into this rank's scales, [slice_m] floats (ADD_RESIDUAL's own buffer): a
+      // row of one element, so its one pack is thread 0's.
+      float scale_row[1][1][1] = {{{scale[0]}}};
+      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(
+          scale_row, scales_ptr_array, scales_ptr_array_size, rank, 0, 0, scales_stride_m, 1, 1,
+          scales_size_m, 1, scales_size_m, 1, row - first, 0);
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
@@ -402,16 +398,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // first barrier, held, ran the int4 8192-column build out of SGPRs:
   // 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
-    // Every owner's scale for row l, all in flight before the rows' loads (load issues them): the
-    // scales are a float buffer [slice_m] in each owner's partials, scale_at elements in, read as
-    // the partials' slot 1 (slot stride: that offset in floats), a row of one float, every thread
-    // the same one.
+    // Every owner's scale for row l, all in flight before the rows' loads (load issues them): row
+    // l of every owner's scales, a row of one float, every thread the same one.
     float sc[WORLD][1][1][1];
     if constexpr (ADD_RESIDUAL)
       load<1, THREADS_PER_BLOCK, Ranks::every>(
-          partials_ptr_array, partials_ptr_array_size, 0, 1,
-          scale_at * int64_t{sizeof(DTYPE)} / int64_t{sizeof(float)}, 1, 1, 2, slice_m, 1,
-          slice_m, 1, sc, l, 0);
+          scales_ptr_array, scales_ptr_array_size, 0, 0, 0, scales_stride_m, 1, 1, scales_size_m,
+          1, scales_size_m, 1, sc, l, 0);
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
       // THE GATHER: row l of every owner's partials (owner r's is row r * slice_m + l), one load
       // of every rank's; ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
@@ -473,7 +466,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       input_ptr_array, input_ptr_array_size,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      partials_stride_n, partials_size_m, partials_size_n, nullptr, 0, 0, 0, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
       staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
@@ -499,6 +492,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int residual_output_size_m, int residual_output_size_n,
         char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        float* const* __restrict__ scales_ptr_array, int scales_ptr_array_size,
+        int64_t scales_stride_m, int scales_size_m,
         char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
     int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
@@ -515,7 +510,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
       partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+      partials_stride_n, partials_size_m, partials_size_n, scales_ptr_array,
+      scales_ptr_array_size, scales_stride_m, scales_size_m, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
       staging_size_n, signals_ptr_array, signals_ptr_array_size,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
@@ -683,6 +679,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int residual_output_size_m, int residual_output_size_n,
         char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        // The pull twin's row scales (their kernel type is one): unused here, never touched.
+        float* const* __restrict__ scales_ptr_array, int scales_ptr_array_size,
+        int64_t scales_stride_m, int scales_size_m,
         char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
     int64_t staging_stride_n, int staging_size_m, int staging_size_n,
     uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
