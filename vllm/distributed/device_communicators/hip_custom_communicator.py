@@ -31,10 +31,10 @@ import atexit
 import functools
 import os
 import signal
-import sys
 import threading
 import time
 import warnings
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -518,6 +518,8 @@ def abandon_open(wait_s: float = ABANDON_WAIT_S) -> None:
     Never waits on a peer; waits at most `wait_s` a communicator for its device. A
     communicator abandoned here can still be `close()`d (it does what is left)."""
     torch.ops._rocm_C.hip_custom_communicator_abandon_all(wait_s)
+    for communicator in list(_open_communicators):
+        communicator._abandoned()
 
 
 def _on_exit_signal(
@@ -874,35 +876,53 @@ def _as_device(device: int | str | torch.device) -> torch.device:
 
 # A COMMUNICATOR'S LIFE, each state holding what is true in it alone: `__init__` -> Open
 # | Disabled(why); Open <-> Capturing; Capturing -> Broken(cause) when a capture raises,
-# and Open or Capturing -> Broken(cause) when the watchdog finds a fault; any -> Closed.
+# and Open or Capturing -> Broken(cause) when the watchdog finds a fault; Open,
+# Capturing or Broken -> Abandoned when the process exits (`abandon_open`); any ->
+# Closed.
 # Only `HipCustomCommunicator` moves it, under its lock (the watchdog is another
-# thread).
+# thread). `holds` is whether the communicator still holds peer mappings and buffers
+# that only `close()` releases: what `__del__` warns about, read without a global
+# lookup since collection can run at interpreter shutdown, when globals are None.
 @dataclass(frozen=True)
 class Disabled:
     why: str  # the backend's reason it cannot run here (not an error)
+    holds: ClassVar[bool] = False
 
 
 @dataclass(frozen=True)
 class Open:
-    pass
+    holds: ClassVar[bool] = True
 
 
 @dataclass(frozen=True)
 class Capturing:
-    pass
+    holds: ClassVar[bool] = True
 
 
 @dataclass(frozen=True)
 class Broken:
     cause: str  # what left the peers' state half-done
+    holds: ClassVar[bool] = True
+
+
+@dataclass(frozen=True)
+class Abandoned:
+    """The process is exiting: the exit hook tore its peer mappings down alone, without
+    the peers. Every call is refused; `close()` still does what is left."""
+
+    holds: ClassVar[bool] = False
 
 
 @dataclass(frozen=True)
 class Closed:
-    pass
+    holds: ClassVar[bool] = False
 
 
-State = Disabled | Open | Capturing | Broken | Closed
+State = Disabled | Open | Capturing | Broken | Abandoned | Closed
+
+# EVERY COMMUNICATOR OPENED IN THIS PROCESS AND NOT YET COLLECTED, for the exit hook to
+# move to Abandoned.
+_open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet()
 
 
 # AN OP'S ANSWER, C++'s wire (`hip_custom_communicator.cu`'s Answer): the Error's
@@ -1014,7 +1034,7 @@ class HipCustomCommunicator:
                     f"{type(self).__name__} is broken: {cause}. Close it and build "
                     f"a new one on every rank."
                 )
-            case Disabled() | Closed():
+            case Disabled() | Abandoned() | Closed():
                 return True
             case Open() | Capturing():
                 return False
@@ -1078,6 +1098,7 @@ class HipCustomCommunicator:
         why = self._open()
         if why is None:
             self.state = Open()
+            _open_communicators.add(self)
             if self._faults:
                 self._watchdog = threading.Thread(
                     target=self._watch,
@@ -1375,15 +1396,13 @@ class HipCustomCommunicator:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def __del__(self, _is_finalizing=sys.is_finalizing) -> None:
+    def __del__(self) -> None:
         # WARNS, never releases. Doing GPU or IPC work here would run at an arbitrary
         # moment -- interpreter shutdown included, where the runtime may already be gone
         # -- so this only reports that a release was left to chance. Same bargain as an
-        # unclosed file's ResourceWarning. At shutdown it does nothing: module globals
-        # (`Open`, `warnings`) may already be None there.
-        if _is_finalizing():
-            return
-        if isinstance(self.state, Open):
+        # unclosed file's ResourceWarning. At shutdown the exit hook has already moved
+        # it to Abandoned, which holds nothing.
+        if self.state.holds:
             warnings.warn(
                 f"{type(self).__name__} was never closed; its peer handles and buffers "
                 f"were left to garbage collection. Use `with make_communicator(...) as "
@@ -1417,6 +1436,16 @@ class HipCustomCommunicator:
             if isinstance(self.state, Capturing):
                 self.state = Open()
 
+    @final
+    def _abandoned(self) -> None:
+        """Abandoned, from the exit hook once C++ has torn its mappings down: the
+        watchdog told to stop (not joined: a signal handler may be running this)."""
+        with self._lock:
+            if not self.state.holds:
+                return
+            self.state = Abandoned()
+        self._stop_watching.set()
+
     # ---- A FAULT, AND WHAT IS LOGGED WHEN ONE BREAKS IT. ----
 
     def _watch(self) -> None:
@@ -1434,7 +1463,7 @@ class HipCustomCommunicator:
         """Broken, once: every later call raises (`disabled`), every wait still on the
         device leaves (`_abort`), and the cause and the last launches go to the log."""
         with self._lock:
-            if isinstance(self.state, Broken | Closed):
+            if isinstance(self.state, Broken | Abandoned | Closed):
                 return
             self.state = Broken(cause)
         self._abort()
