@@ -43,7 +43,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
     char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset, int64_t signals_stride_parity,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
@@ -57,7 +57,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -126,7 +126,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
         int output_size_n, char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -158,7 +158,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_ptr_array, inputs_ptr_array_size,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, arena_ptr_array, arena_ptr_array_size, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, signals_offset, signals_stride_parity,
+      inputs_size_m, inputs_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
       signals_size_block, signals_size_writer, status_ptr, status_stride_field,
       status_size_field, rank, timeout_ticks, eps);
@@ -184,7 +184,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int residual_output_size_m, int residual_output_size_n,
         char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
       arena_ptr_array, arena_ptr_array_size, inputs_offset, inputs_stride_m, inputs_stride_n,
-      inputs_size_m, inputs_size_n, signals_offset, signals_stride_parity, signals_stride_block,
+      inputs_size_m, inputs_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);
@@ -257,7 +257,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     int64_t inputs_scales_offset,
     int64_t inputs_scales_stride_m, int64_t inputs_scales_stride_n,
     int inputs_scales_size_m, int inputs_scales_size_n,
-    int64_t signals_offset, int64_t signals_stride_parity,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
@@ -286,7 +286,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
         slice_m);
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -401,7 +401,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
 
   // 3. Every rank's rows are visible to its peers.
   barrier<Until::visible, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -495,7 +495,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -530,7 +530,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
       inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
       inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_offset, signals_stride_parity,
+      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
       signals_stride_block, signals_stride_writer, signals_size_parity,
       signals_size_block, signals_size_writer, status_ptr, status_stride_field,
       status_size_field, rank, timeout_ticks, eps);
@@ -559,7 +559,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -595,7 +595,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
       inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
       inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_offset,
+      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
       signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
       status_stride_field, status_size_field, rank, timeout_ticks, eps);
@@ -654,7 +654,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     int64_t inputs_scales_offset,
     int64_t inputs_scales_stride_m, int64_t inputs_scales_stride_n,
     int inputs_scales_size_m, int inputs_scales_size_n,
-    int64_t signals_offset, int64_t signals_stride_parity,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
@@ -690,7 +690,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
         inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
         input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -717,7 +717,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
 
   // 3. Every rank's sums are in this rank's partials.
   barrier<Until::visible, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -799,7 +799,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -834,7 +834,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
       inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
       inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_offset,
+      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size,
       signals_stride_parity, signals_stride_block, signals_stride_writer,
       signals_size_parity, signals_size_block, signals_size_writer, status_ptr,
       status_stride_field, status_size_field, rank, timeout_ticks, eps);
@@ -863,7 +863,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -900,7 +900,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_size_m, inputs_size_n, inputs_values_offset, inputs_values_stride_m,
       inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
       inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n,
-      inputs_scales_size_m, inputs_scales_size_n, signals_offset, signals_stride_parity, signals_stride_block,
+      inputs_scales_size_m, inputs_scales_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);

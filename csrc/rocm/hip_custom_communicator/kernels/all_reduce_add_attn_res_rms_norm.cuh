@@ -231,7 +231,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int block_output_size_m, int block_output_size_n,
         char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -248,7 +248,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -277,7 +277,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 3. No rank may overwrite its input until every peer has read it.
   barrier<Until::read, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -339,7 +339,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -385,7 +385,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
         input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -413,7 +413,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every rank's sums are in its partials: this block's twin on every rank
   //    has reduced the same rows.
   barrier<Until::visible, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -496,7 +496,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
     int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-    int64_t signals_offset,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -550,7 +550,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
         input_size_m);
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -580,7 +580,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every rank's sums are in this rank's partials, and every peer has read
   // this rank's input.
   barrier<Until::visible, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);

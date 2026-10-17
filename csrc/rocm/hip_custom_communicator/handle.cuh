@@ -537,7 +537,7 @@ class Handle {
                       static_cast<uint32_t>(peers.error));
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_arena_ptr_array());
+    add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
   }
@@ -589,7 +589,7 @@ class Handle {
     // (e) Our arena, the slab of input tables and the arena's device array.
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_arena_ptr_array());
+    add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
     if (own.error != hipSuccess) fail(ClosePhase::released);
@@ -629,7 +629,7 @@ class Handle {
     if (finished) {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
-      add(own, release_arena_ptr_array());
+      add(own, release_region_ptr_arrays());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
       if (own.error != hipSuccess && failed == 0)
@@ -670,16 +670,25 @@ class Handle {
   // rank's base where this process reaches it (`arena_ptr_array`, this rank's
   // device memory, written once at open, fixed for the handle's life) and its
   // size, the world.
-  char* const* arena_ptr_array() const { return arena_ptr_array_; }
+  char* const* arena_ptr_array() const {
+    return region_ptr_arrays_ + kArenaArray * kMaxRanks;
+  }
   int arena_ptr_array_size() const { return world_size_; }
+  // EVERY RANK'S SIGNALS, a device array of every rank's signals region with
+  // its size, the world (written at open, with the others in
+  // `region_ptr_arrays_`).
+  uint32_t* const* signals_ptr_array() const {
+    return reinterpret_cast<uint32_t* const*>(region_ptr_arrays_ +
+                                              kSignalsArray * kMaxRanks);
+  }
+  int signals_ptr_array_size() const { return world_size_; }
   // EACH REGION'S OFFSET in every rank's arena, in bytes (`arena_layout`):
   // rank r's region is at arena_ptr_array()[r] + its offset.
-  int64_t signals_offset() const { return layout_.signals; }
   int64_t inputs_offset() const { return layout_.inputs; }
   int64_t partials_offset() const { return layout_.partials; }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
-  // kMaxRanks] (parity, block, writer) at signals_offset() in its arena: the
+  // kMaxRanks] (parity, block, writer) at signals_ptr_array()[r]: the
   // strides and the sizes, in elements.
   static constexpr int64_t signals_stride_parity() {
     return int64_t{kMaxBlocks} * kMaxRanks;
@@ -971,16 +980,26 @@ class Handle {
     if (!arena_->verify(log, peer_devices))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
            "the peers' arenas");
-    // THE ARENA'S DEVICE ARRAY: every rank's base where this process reaches
-    // it, kMaxRanks entries (null past the world), written once, here; the
-    // kernels take it with its size, the world (`arena_ptr_array`).
-    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&arena_ptr_array_),
-                        kMaxRanks * sizeof(char*)));
+    // EACH REGION'S DEVICE ARRAY of every rank's address of it (its arena's
+    // base, where this process reaches it, plus the region's offset), kMaxRanks
+    // entries each (null past the world), all in one allocation, written once,
+    // here: the kernels take each region's as its own array with its size, the
+    // world (`signals_ptr_array`, ...), and never an arena base or an offset.
+    // The arena's own array (`arena_ptr_array`) is the last kernel use of the
+    // arena's bases, until the partials and inputs take theirs.
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&region_ptr_arrays_),
+                        kRegionPtrArrays * kMaxRanks * sizeof(char*)));
     {
-      std::vector<char*> bases(kMaxRanks, nullptr);
-      for (int r = 0; r < world_size_; ++r) bases[r] = arena_->base(r);
-      HIP_CHECK(hipMemcpy(arena_ptr_array_, bases.data(),
-                          kMaxRanks * sizeof(char*), hipMemcpyHostToDevice));
+      std::vector<char*> at(kRegionPtrArrays * kMaxRanks, nullptr);
+      for (int r = 0; r < world_size_; ++r) {
+        char* const base = arena_->base(r);
+        at[kArenaArray * kMaxRanks + r] = base;
+        at[kSignalsArray * kMaxRanks + r] = base + layout_.signals;
+        at[kInputsArray * kMaxRanks + r] = base + layout_.inputs;
+        at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
+      }
+      HIP_CHECK(hipMemcpy(region_ptr_arrays_, at.data(),
+                          at.size() * sizeof(char*), hipMemcpyHostToDevice));
     }
     // THE INPUT TABLES' SLAB (INPUT TABLES), zeroed, and its slot 0, the
     // eager table: every rank's inputs region.
@@ -1074,17 +1093,17 @@ class Handle {
     opened_.clear();
     return out;
   }
-  // THE ARENA'S DEVICE ARRAY freed (ours, local): with our arena, in
+  // THE REGIONS' DEVICE ARRAYS freed (ours, local): with our arena, in
   // teardown's second half. Idempotent.
-  Arena::Released release_arena_ptr_array() {
+  Arena::Released release_region_ptr_arrays() {
     Arena::Released out;
-    if (arena_ptr_array_ != nullptr) {
-      const hipError_t e = hipFree(arena_ptr_array_);
+    if (region_ptr_arrays_ != nullptr) {
+      const hipError_t e = hipFree(region_ptr_arrays_);
       if (e != hipSuccess) {
         (void)hipGetLastError();
         out.error = e;
       }
-      arena_ptr_array_ = nullptr;
+      region_ptr_arrays_ = nullptr;
     }
     return out;
   }
@@ -1233,7 +1252,12 @@ class Handle {
   // captured launches awaiting registration (input, slot), and every peer
   // allocation opened for one, by its IPC handle's bytes.
   void** tables_ = nullptr;
-  char** arena_ptr_array_ = nullptr;
+  // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
+  // allocation: the arena's bases (interim), the signals, the inputs, the
+  // partials.
+  static constexpr int kArenaArray = 0, kSignalsArray = 1, kInputsArray = 2,
+                       kPartialsArray = 3, kRegionPtrArrays = 4;
+  char** region_ptr_arrays_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;
   std::vector<void**> pending_slots_;

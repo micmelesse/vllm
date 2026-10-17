@@ -1499,7 +1499,7 @@ enum class Until { launched, visible, read };
 namespace impl {
 template <int WORLD, typename OWNER_TYPE, typename WRITER_TYPE>
 DINLINE uint32_t* signal_flag(
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset, int64_t signals_stride_parity,
+    uint32_t* const* signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     OWNER_TYPE owner, uint32_t parity, unsigned block, WRITER_TYPE writer) {
@@ -1507,8 +1507,8 @@ DINLINE uint32_t* signal_flag(
   debug_in_bounds(parity, signals_size_parity);
   debug_in_bounds(block, signals_size_block);
   debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
-  return lane_peer_ptr<WORLD, uint32_t>(arena_ptr_array, arena_ptr_array_size,
-                                        static_cast<int>(owner), signals_offset) +
+  return global_at<uint32_t>(lane_ptr_array_at<WORLD>(signals_ptr_array, signals_ptr_array_size,
+                                                      static_cast<int>(owner))) +
          parity * signals_stride_parity + block * signals_stride_block +
          writer * signals_stride_writer;
 }
@@ -1540,7 +1540,7 @@ DINLINE uint32_t* signal_flag(
 // between, so the clear has long landed.
 namespace impl {
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset,
+DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -1558,7 +1558,7 @@ DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int
     if constexpr (!kOrdered) wait_stores();
     const auto flag = [&](auto owner, unsigned block, auto writer) {
       return signal_flag<WORLD>(
-          arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+          signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
           signals_stride_writer, signals_size_parity, signals_size_block,
           signals_size_writer, owner, parity, block, writer);
     };
@@ -3220,7 +3220,7 @@ DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator
 // barriers are even in number, its k-th taking PARITY k % 2, so its flags end
 // where they began. WORLD is the kernel's, passed on.
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset,
+DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -3228,7 +3228,7 @@ DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, int rank, uint64_t timeout_ticks) {
   impl::barrier<UNTIL, PARITY, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);

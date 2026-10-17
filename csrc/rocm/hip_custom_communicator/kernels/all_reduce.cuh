@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t inputs_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset,
+        uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 1. Every rank's input is ready (written before its launch: the caller's,
   // or the host's copy) and visible (the first barrier is ordered).
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
   barrier<Until::read, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -129,7 +129,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t output_stride_n, int output_size_m, int output_size_n,
         char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t signals_offset,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -143,7 +143,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 1. Every rank's input ready and visible (and, past the first pass,
     //    every peer has read this rank's partials).
     barrier<Until::visible, 0, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
@@ -158,7 +158,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    reading this band of this rank's input (past the last pass: all of
     //    it, so the launch may end and the input be overwritten).
     barrier<Until::visible, 1, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t output_stride_n, int output_size_m, int output_size_n,
         char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
         int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-        int64_t signals_offset,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -241,7 +241,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     barrier<Until::visible, 0, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 3. No rank may push its next band (this launch's or the next's) until
     // every peer has summed this one out of its inbox.
     barrier<Until::read, 1, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
@@ -316,7 +316,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
         int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-        int64_t signals_offset,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -350,7 +350,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
       rank);
   barrier<Until::launched, 0, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -372,7 +372,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every rank's sums are visible to its peers, and every peer has summed
   // its inbox (the next launch's push may overwrite it).
   barrier<Until::visible, 1, WORLD>(
-      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -411,7 +411,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         int64_t inputs_offset, int64_t inputs_stride_m,
         int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
-        int64_t signals_offset,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         inputs_offset, inputs_stride_m, inputs_stride_n, inputs_size_m,
         inputs_size_n, rank);
     barrier<Until::visible, 0, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
@@ -447,7 +447,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 3. Every rank's sums are visible to its peers, and every peer has summed
     //    its inbox, so the next band's (or launch's) push may overwrite it.
     barrier<Until::visible, 1, WORLD>(
-        arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
+        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks);
