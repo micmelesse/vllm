@@ -1593,6 +1593,145 @@ __host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 __host__ __device__ constexpr int int4_values_size_n(int n) { return n / 2; }
 __host__ __device__ constexpr int int4_scales_size_n(int n) { return n / kInt4Group; }
 
+typedef float f32x2 __attribute__((ext_vector_type(2)));
+typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
+// A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
+template <typename U>
+constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
+
+// DECODE: a word's 8 values at their group's scale. Its own function because load lands them in
+// U and the INT4 sum adds them in fp32 from the words (int4_peers_sum, never a decoded tile).
+// U float: the exact terms, (q - 8) * scale. U a 16-bit dtype: each rounded once to U, made as a
+// loaded pack is, four 32-bit words copied in whole: element by element, each 16-bit value held a
+// register of its own and the pull norms' two rows of every peer's packs spilled 188 VGPRs (256
+// VGPRs, 592 B of partials; 2026-10-15T22-21-26Z).
+// THE TERMS, EXACT in fp32, by quick reduce's 0x6400 magic: a mask puts elements 2i and 2i + 1 in
+// an fp16 pair, each 1024 + q (i = 0, 2) or 1024 + 16q (i = 1, 3: their nibbles masked in place,
+// no shift), OR'd with 0x6400; then one v_fma_mix_f32 a value takes a half at scale (or scale /
+// 16) plus bias (-1032 * scale, or -72 * scale): a 22-bit product, then an exact difference. 13
+// instructions a word, in one asm block: left to the compiler, each half was converted and fed to
+// packed fmas (1.5 a value, a gfx950 probe compile, 2026-10-16). VOLATILE, so the blocks keep their
+// order (int4_peers_sum pins what consumes them between).
+// LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
+// conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
+// 2026-10-16T02-01-12Z).
+template <typename U, int P>
+DINLINE void decode(uint32_t word, float scale, U (&output)[P]) {
+  static_assert(P == 8, "a word is 8 values");
+  static_assert(std::is_same_v<U, float> || sizeof(U) == 2, "fp32 terms or a 16-bit dtype");
+  const float scale16 = scale * 0.0625f;
+  const float bias = scale * -1032.0f;
+  const float bias16 = scale * -72.0f;
+  float term[P];
+  uint32_t p0, p1, p2, p3;
+  asm volatile("v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
+      "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
+      "v_lshrrev_b32 %[p2], 8, %[w]\n\t"
+      "v_and_or_b32 %[p3], %[p2], %[m1], %[magic]\n\t"
+      "v_and_or_b32 %[p2], %[p2], %[m0], %[magic]\n\t"
+      "v_fma_mix_f32 %[t0], %[p0], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t1], %[p0], %[s], %[b] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t2], %[p1], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t3], %[p1], %[s16], %[b16] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t4], %[p2], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t5], %[p2], %[s], %[b] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t6], %[p3], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
+      "v_fma_mix_f32 %[t7], %[p3], %[s16], %[b16] op_sel:[1,0,0] op_sel_hi:[1,0,0]"
+      : [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2), [p3] "=&v"(p3), [t0] "=&v"(term[0]),
+        [t1] "=&v"(term[1]), [t2] "=&v"(term[2]), [t3] "=&v"(term[3]), [t4] "=&v"(term[4]),
+        [t5] "=&v"(term[5]), [t6] "=&v"(term[6]), [t7] "=&v"(term[7])
+      : [w] "v"(word), [m0] "s"(0x000F000Fu), [m1] "s"(0x00F000F0u), [magic] "v"(0x64006400u),
+        [s] "v"(scale), [b] "v"(bias), [s16] "v"(scale16), [b16] "v"(bias16));
+  if constexpr (std::is_same_v<U, float>) {
+#pragma unroll
+    for (int j = 0; j < P; ++j) output[j] = term[j];
+  } else {
+    u32x4 packed;
+#pragma unroll
+    for (int w = 0; w < P / 2; ++w) {
+      const float a = term[2 * w], b = term[2 * w + 1];
+      if constexpr (kBf16<U>)
+        packed[w] = __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
+      else
+        packed[w] = static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(a))) |
+                    static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(b))) << 16;
+    }
+    __builtin_memcpy(output, &packed, sizeof(packed));
+  }
+}
+
+// ENCODE: a group's packs to their words and the group's scale. Its own function because store
+// (a pack a thread, THREAD_PACKS 1) and the INT4 flat walk (a group a thread, THREAD_PACKS
+// kInt4GroupPacks) share it; the thread map is a parameter, not implied by the encoding (R7).
+// THE GROUP'S LARGEST MAGNITUDE: a pack a thread, over its 4 lanes (quad_perm [1,0,3,2], then
+// [2,3,0,1], as unsigned bits: a float max canonicalized each step); a group a thread, the
+// thread's own. THE SCALE from it: / 7, to fp16 (past its largest, clamped to it). THE INVERSE the
+// values are rounded at, CORRECTLY ROUNDED as the format's 1 / scale (v_rcp_f32's ulp flipped 0.6%
+// of a two-shot's elements a step against it: torch emulation of the 2048 x 7168 test,
+// 2026-10-16); a group of zeros: 0, so all 8s at scale 0.
+// A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale stored, BY THE MAGIC
+// NUMBER: x * inv, rounded to fp32 as the format's product is, plus 1.5 * 2^23 + 8 rounds it to an
+// integer (the sum's ulp is 1) and leaves q + 8 in the low 4 bits, the rest of its low byte 0;
+// clamped by med3 (two elements a packed mul and add). NOT AN FMA: the exact product rounded once
+// flipped 0.8% of the elements (the emulation's double rounding, 2026-10-16). Then packed by
+// bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word, and two
+// v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word, where a
+// shift and an OR an element was 16).
+template <int THREAD_PACKS, typename T, int P>
+DINLINE void encode(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
+                    float& scale) {
+  static_assert(P * 4 == 32, "a pack is one word of 8 values");
+  static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
+                "a pack a thread (its quad's group) or a group a thread");
+  float x[THREAD_PACKS][P];
+  float amax = 0.0f;
+#pragma unroll
+  for (int k = 0; k < THREAD_PACKS; ++k)
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+      x[k][j] = static_cast<float>(input[k][j]);
+      amax = fmaxf(amax, fabsf(x[k][j]));
+    }
+  if constexpr (THREAD_PACKS == 1) {
+    uint32_t bits = __builtin_bit_cast(uint32_t, amax);
+    bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                         static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
+    bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
+                         static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
+    amax = __builtin_bit_cast(float, bits);
+  }
+  scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
+  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+  // A PACK'S WORD from its 8 values at the inverse.
+  const auto word = [](const float (&v)[P], float inverse) {
+    constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
+    uint32_t q[P];
+#pragma unroll
+    for (int p = 0; p < P / 2; ++p) {
+#pragma clang fp contract(off)
+      const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
+                      f32x2{kLowest + 8.0f, kLowest + 8.0f};
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+        q[2 * p + e] = __builtin_bit_cast(
+            uint32_t, __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + 15.0f));
+    }
+    // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2 (QUANTIZATION's layout)
+    const auto nibbles = [](uint32_t high, uint32_t low) {
+      uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift and an or)
+      asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
+      return byte;
+    };
+    const uint32_t even_low = nibbles(q[2], q[0]), even_high = nibbles(q[6], q[4]);
+    const uint32_t odd_low = nibbles(q[3], q[1]), odd_high = nibbles(q[7], q[5]);
+    return __builtin_amdgcn_perm(__builtin_amdgcn_perm(odd_high, odd_low, 0x0c0c0400u),
+                                 __builtin_amdgcn_perm(even_high, even_low, 0x0c0c0400u),
+                                 0x05040100u);
+  };
+#pragma unroll
+  for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
+}
+
 namespace impl {
 typedef __attribute__((address_space(1))) uint32_t global_u32;
 typedef __attribute__((address_space(1))) __fp16 global_f16;
@@ -1624,167 +1763,6 @@ DINLINE void int4_scale_store(__fp16* row, int pack, float scale) {
         static_cast<__fp16>(scale);
 }
 
-// A WORD'S 8 ELEMENTS AT THEIR GROUP'S SCALE, (q - 8) * scale, EXACT in fp32, by quick reduce's
-// 0x6400 magic: a mask puts elements 2i and 2i + 1 in an fp16 pair, each 1024 + q (i = 0, 2) or
-// 1024 + 16q (i = 1, 3: their nibbles masked in place, no shift), OR'd with 0x6400; then one
-// v_fma_mix_f32 a value takes a half at scale (or scale / 16) plus bias (-1032 * scale, or -72 *
-// scale): a 22-bit product, then an exact difference. 13 instructions a word, in one asm block:
-// left to the compiler, each half was converted and fed to packed fmas (1.5 a value, a gfx950
-// probe compile, 2026-10-16). VOLATILE, so the blocks keep their order (int4_used_by pins what
-// consumes them between).
-DINLINE void int4_terms(uint32_t word, float scale, float (&term)[8]) {
-  const float scale16 = scale * 0.0625f;
-  const float bias = scale * -1032.0f;
-  const float bias16 = scale * -72.0f;
-  uint32_t p0, p1, p2, p3;
-  asm volatile("v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
-      "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
-      "v_lshrrev_b32 %[p2], 8, %[w]\n\t"
-      "v_and_or_b32 %[p3], %[p2], %[m1], %[magic]\n\t"
-      "v_and_or_b32 %[p2], %[p2], %[m0], %[magic]\n\t"
-      "v_fma_mix_f32 %[t0], %[p0], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t1], %[p0], %[s], %[b] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t2], %[p1], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t3], %[p1], %[s16], %[b16] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t4], %[p2], %[s], %[b] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t5], %[p2], %[s], %[b] op_sel:[1,0,0] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t6], %[p3], %[s16], %[b16] op_sel_hi:[1,0,0]\n\t"
-      "v_fma_mix_f32 %[t7], %[p3], %[s16], %[b16] op_sel:[1,0,0] op_sel_hi:[1,0,0]"
-      : [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2), [p3] "=&v"(p3), [t0] "=&v"(term[0]),
-        [t1] "=&v"(term[1]), [t2] "=&v"(term[2]), [t3] "=&v"(term[3]), [t4] "=&v"(term[4]),
-        [t5] "=&v"(term[5]), [t6] "=&v"(term[6]), [t7] "=&v"(term[7])
-      : [w] "v"(word), [m0] "s"(0x000F000Fu), [m1] "s"(0x00F000F0u), [magic] "v"(0x64006400u),
-        [s] "v"(scale), [b] "v"(bias), [s16] "v"(scale16), [b16] "v"(bias16));
-}
-
-typedef float f32x2 __attribute__((ext_vector_type(2)));
-typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
-// A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
-template <typename U>
-constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
-
-// THE VALUES DONE BEFORE THE NEXT VOLATILE ASM (int4_terms): the scheduler, free to use 256
-// VGPRs at 512 threads, decoded every peer's words of a group ahead of the first sum and spilled
-// (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
-template <int N>
-DINLINE void int4_used_by(const float (&values)[N]) {
-#pragma unroll
-  for (int j = 0; j < N; ++j) asm volatile("" ::"v"(values[j]));
-}
-
-// TWO VALUES LANDED IN U, a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
-// conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
-// 2026-10-16T02-01-12Z).
-template <typename U>
-DINLINE uint32_t int4_landed(float a, float b) {
-  if constexpr (kBf16<U>) {
-    return __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
-  } else {
-    return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(a))) |
-           static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<U>(b))) << 16;
-  }
-}
-
-// A PACK'S WORD AT ITS GROUP'S SCALE, each element rounded once to U, a 16-bit dtype. MADE AS A
-// LOADED PACK IS, four 32-bit words copied in whole: element by element, each 16-bit value held a
-// register of its own and the pull norms' two rows of every peer's packs spilled 188 VGPRs (256
-// VGPRs, 592 B of partials; 2026-10-15T22-21-26Z).
-template <typename U, int P>
-DINLINE void int4_decode(uint32_t word, float scale, U (&output)[P]) {
-  static_assert(P * 4 == 32 && sizeof(U) == 2, "a pack is one word of 8 16-bit values");
-  float term[P];
-  int4_terms(word, scale, term);
-  u32x4 packed;
-#pragma unroll
-  for (int w = 0; w < P / 2; ++w) packed[w] = int4_landed<U>(term[2 * w], term[2 * w + 1]);
-  __builtin_memcpy(output, &packed, sizeof(packed));
-}
-
-// A GROUP'S SCALE from its largest magnitude: / 7, to fp16 (past its largest, clamped to it);
-// and the inverse its values are rounded at (a group of zeros: 0, so all 8s at scale 0).
-DINLINE float int4_scale(float amax) {
-  return static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
-}
-// CORRECTLY ROUNDED, as the format's 1 / scale: v_rcp_f32's ulp flipped 0.6% of a two-shot's
-// elements a step against it (torch emulation of the 2048 x 7168 test, 2026-10-16).
-DINLINE float int4_inverse(float scale) { return scale > 0.0f ? 1.0f / scale : 0.0f; }
-
-// A PACK'S WORD: each value rounded to the nearest of -8..7 times the scale stored, BY THE MAGIC
-// NUMBER: x * inv, rounded to fp32 as the format's product is, plus 1.5 * 2^23 + 8 rounds it to an
-// integer (the sum's ulp is 1) and leaves q + 8 in the low 4 bits, the rest of its low byte 0;
-// clamped by med3 (two elements a packed mul and add). NOT AN FMA: the exact product rounded once
-// flipped 0.8% of the elements (the emulation's double rounding, 2026-10-16).
-// Then packed by bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the
-// word, and two v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word,
-// where a shift and an OR an element was 16).
-template <int P>
-DINLINE uint32_t int4_word(const float (&x)[P], float inv) {
-  static_assert(P * 4 == 32, "a pack is one word of 8 values");
-  constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
-  uint32_t q[P];
-#pragma unroll
-  for (int p = 0; p < P / 2; ++p) {
-#pragma clang fp contract(off)
-    const f32x2 y = f32x2{x[2 * p], x[2 * p + 1]} * f32x2{inv, inv} +
-                    f32x2{kLowest + 8.0f, kLowest + 8.0f};
-#pragma unroll
-    for (int e = 0; e < 2; ++e)
-      q[2 * p + e] = __builtin_bit_cast(
-          uint32_t, __builtin_amdgcn_fmed3f(y[e], kLowest, kLowest + 15.0f));
-  }
-  // byte b of the word: elements 4 * (b % 2) + (b / 2) and that + 2 (QUANTIZATION's layout)
-  const auto nibbles = [](uint32_t high, uint32_t low) {
-    uint32_t byte;  // one v_lshl_or_b32 (the compiler split it into a shift and an or)
-    asm("v_lshl_or_b32 %0, %1, 4, %2" : "=v"(byte) : "v"(high), "v"(low));
-    return byte;
-  };
-  const uint32_t even_low = nibbles(q[2], q[0]), even_high = nibbles(q[6], q[4]);
-  const uint32_t odd_low = nibbles(q[3], q[1]), odd_high = nibbles(q[7], q[5]);
-  return __builtin_amdgcn_perm(__builtin_amdgcn_perm(odd_high, odd_low, 0x0c0c0400u),
-                               __builtin_amdgcn_perm(even_high, even_low, 0x0c0c0400u),
-                               0x05040100u);
-}
-
-// A PACK TO ITS WORD AND ITS GROUP'S SCALE: the group's largest magnitude over its 4 lanes
-// (quad_perm [1,0,3,2], then [2,3,0,1], as unsigned bits: a float max canonicalized each step).
-template <typename T, int P>
-DINLINE void int4_encode(const T (&input)[P], uint32_t& word, float& scale) {
-  float x[P];
-  float amax = 0.0f;
-#pragma unroll
-  for (int j = 0; j < P; ++j) {
-    x[j] = static_cast<float>(input[j]);
-    amax = fmaxf(amax, fabsf(x[j]));
-  }
-  uint32_t bits = __builtin_bit_cast(uint32_t, amax);
-  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(bits), 0xb1, 0xf, 0xf, false)));
-  bits = max(bits, static_cast<uint32_t>(__builtin_amdgcn_mov_dpp(
-                       static_cast<int>(bits), 0x4e, 0xf, 0xf, false)));
-  scale = int4_scale(__builtin_bit_cast(float, bits));
-  word = int4_word(x, int4_inverse(scale));
-}
-
-// A WHOLE GROUP IN ONE THREAD (the flat walk's): its 4 packs to their words and its scale, the
-// largest magnitude the thread's own.
-template <typename T, int P>
-DINLINE void int4_encode_group(const T (&input)[kInt4GroupPacks][P], u32x4& words,
-                               float& scale) {
-  float x[kInt4GroupPacks][P];
-  float amax = 0.0f;
-#pragma unroll
-  for (int k = 0; k < kInt4GroupPacks; ++k)
-#pragma unroll
-    for (int j = 0; j < P; ++j) {
-      x[k][j] = static_cast<float>(input[k][j]);
-      amax = fmaxf(amax, fabsf(x[k][j]));
-    }
-  scale = int4_scale(amax);
-  const float inv = int4_inverse(scale);
-#pragma unroll
-  for (int k = 0; k < kInt4GroupPacks; ++k) words[k] = int4_word(x[k], inv);
-}
-
 // Every pack of a thread's registers, encoded or decoded.
 template <typename T, int ROWS, int K, int P>
 DINLINE void int4_encode(const T (&input)[ROWS][K][P], uint32_t (&words)[ROWS][K],
@@ -1792,7 +1770,9 @@ DINLINE void int4_encode(const T (&input)[ROWS][K][P], uint32_t (&words)[ROWS][K
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
 #pragma unroll
-    for (int k = 0; k < K; ++k) int4_encode(input[i][k], words[i][k], scales[i][k]);
+    for (int k = 0; k < K; ++k)
+      encode<1>(reinterpret_cast<const T(&)[1][P]>(input[i][k]),
+                reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
 }
 template <typename U, int ROWS, int K, int P>
 DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)[ROWS][K],
@@ -1800,7 +1780,7 @@ DINLINE void int4_decode(const uint32_t (&words)[ROWS][K], const float (&scales)
 #pragma unroll
   for (int i = 0; i < ROWS; ++i)
 #pragma unroll
-    for (int k = 0; k < K; ++k) int4_decode(words[i][k], scales[i][k], output[i][k]);
+    for (int k = 0; k < K; ++k) decode(words[i][k], scales[i][k], output[i][k]);
 }
 
 // load, store, peers_load and all_gather (MEMORY's) on a quantized buffer: the same places, a word
@@ -1930,23 +1910,28 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 #pragma unroll
         for (; r + 1 < WORLD; r += 2) {
           float a[P], b[P];
-          int4_terms(words[r][i][k], group_scales[r][i][k], a);
-          int4_terms(words[r + 1][i][k], group_scales[r + 1][i][k], b);
+          decode(words[r][i][k], group_scales[r][i][k], a);
+          decode(words[r + 1][i][k], group_scales[r + 1][i][k], b);
 #pragma unroll
           for (int j = 0; j < P; ++j)
             acc[j] = __builtin_amdgcn_fdot2_f32_bf16(
                 __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, acc[j], false);
-          int4_used_by(acc);
+          // THE SUMS DONE BEFORE THE NEXT DECODE'S VOLATILE ASM: the scheduler, free to use 256
+          // VGPRs at 512 threads, decoded every peer's words of a group ahead of the first sum
+          // and spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
+#pragma unroll
+          for (int j = 0; j < P; ++j) asm volatile("" ::"v"(acc[j]));
         }
       }
 #endif
 #pragma unroll
       for (; r < WORLD; ++r) {
         float a[P];
-        int4_terms(words[r][i][k], group_scales[r][i][k], a);
+        decode(words[r][i][k], group_scales[r][i][k], a);
 #pragma unroll
         for (int j = 0; j < P; ++j) acc[j] += static_cast<float>(static_cast<T>(a[j]));
-        int4_used_by(acc);
+#pragma unroll
+        for (int j = 0; j < P; ++j) asm volatile("" ::"v"(acc[j]));  // as above
       }
 #pragma unroll
       for (int j = 0; j < P; ++j) output[i][k][j] = acc[j];
@@ -2225,9 +2210,10 @@ DINLINE u32x4 int4_group_words_load(const uint8_t* values_run, int g) {
 DINLINE float int4_group_scale_load(const __fp16* scales_run, int g) {
   return *(const global_f16*)at_offset(scales_run, static_cast<uint32_t>(g) * kInt4ScaleBytes);
 }
-DINLINE void int4_group_store(const u32x4& words, float scale, uint8_t* values_run,
-                              __fp16* scales_run, int g) {
-  *(global_u32x4*)at_offset(values_run, static_cast<uint32_t>(g) * 16) = words;
+DINLINE void int4_group_store(const uint32_t (&words)[kInt4GroupPacks], float scale,
+                              uint8_t* values_run, __fp16* scales_run, int g) {
+  *(global_u32x4*)at_offset(values_run, static_cast<uint32_t>(g) * 16) =
+      u32x4{words[0], words[1], words[2], words[3]};
   *(global_f16*)at_offset(scales_run, static_cast<uint32_t>(g) * kInt4ScaleBytes) =
       static_cast<__fp16>(scale);
 }
@@ -2273,9 +2259,9 @@ DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t 
       T x[kInt4GroupPacks][P];
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k) held(x[k], pack_load(group + k));
-      u32x4 words;
+      uint32_t words[kInt4GroupPacks];
       float scale;
-      int4_encode_group(x, words, scale);
+      encode<kInt4GroupPacks>(x, words, scale);
       if (g < end && g < groups)
         int4_group_store(words, scale,
                          rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, r, inbox_values_offset) + mine / 2,
@@ -2328,9 +2314,9 @@ DINLINE void int4_flat_reduce_slots(char* const* arena_ptr_array, int arena_ptr_
     issued();
     float sum[1][kInt4GroupPacks][P];
     int4_peers_sum<T>(words, group_scales, sum);
-    u32x4 out;
+    uint32_t out[kInt4GroupPacks];
     float scale;
-    int4_encode_group(sum[0], out, scale);
+    encode<kInt4GroupPacks>(sum[0], out, scale);
     if (g < end && g < groups) int4_group_store(out, scale, own_values, own_scales, g);
   });
 }
@@ -2376,7 +2362,7 @@ DINLINE void int4_flat_all_gather(char* const* arena_ptr_array, int arena_ptr_ar
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k) {
         T x[P];
-        int4_decode(words[w][k], group_scales[w], x);
+        decode(words[w][k], group_scales[w], x);
         pack_store(group + k, pack(x));
       }
     }
