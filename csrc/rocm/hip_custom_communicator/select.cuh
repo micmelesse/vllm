@@ -1249,7 +1249,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // forced call meets here).
   if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
   // An INT4 payload lies in the region that holds it exact (common.cuh's
-  // `int4_payload`): the input's in the inputs, the sums' in the partials, at
+  // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
   // most one row of the partials's elements (its every view's bound).
   if (int4 && int4_payload_bytes(m, n) > h->inputs_bytes())
     return Error::inputs_too_small;
@@ -2091,7 +2091,7 @@ constexpr int64_t widest_row(OpType o) {
 // `max_rows` rows of at most `max_cols` columns (for a model, the server's
 // tokens a batch by its hidden size), and each region holds its largest
 // payload at that call, in every built dtype and in either encoding (exact or
-// INT4: common.cuh's `int4_payload`): the inputs the whole input (an eager
+// INT4: common.cuh's INT4 payload layout): the inputs the whole input (an eager
 // exact call's host copy, read through the eager input table; the pushed
 // all-reduce's inbox of WORLD slots, a band of rows a pass, so at least a row
 // a slot), or its INT4 payload; the partials the most any two-shot keeps

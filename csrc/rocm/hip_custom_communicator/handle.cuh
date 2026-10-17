@@ -8,8 +8,9 @@
 // exports its arena's base (hipIpcGetMemHandle), the handles go round over the
 // caller's CPU group (`Gather`), and each rank opens every peer's
 // (hipIpcOpenMemHandle). A peer's arena is at whatever address its opening
-// gave, so a kernel takes every rank's base BY VALUE in its arguments
-// (common.cuh's PeerBases) and each region as its offset in the arena. AN
+// gave, so a kernel takes every rank's base from a DEVICE ARRAY written once at
+// open, `arena_ptr_array` with `arena_ptr_array_size` (the world), and each
+// region as its offset in the arena. AN
 // EXACT CALL'S INPUT is read by its peers IN PLACE (aiter's gfx950 pattern),
 // through an INPUT TABLE in device memory (INPUT TABLES, below): a captured
 // call's table points at every rank's own tensor, registered when the capture
@@ -133,12 +134,12 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
 //
-// Rank r's region is at its arena's base (PeerBases' base[r], wherever its
+// Rank r's region is at its arena's base (arena_ptr_array[r], wherever its
 // IPC opening put it) plus the region's offset. INT4 IS AN ENCODING, NOT A
 // REGION: each region is sized for the largest encoding it may hold
 // (select.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
 // values plus scales at the largest problem), and the encoding lays out the
-// inside (common.cuh's `int4_payload`: values, then scales at an offset from
+// inside (common.cuh's INT4 payload layout: values, then scales at an offset from
 // the call's m and n, the same on every rank).
 //
 // WHY ONE REGION SERVES EITHER ENCODING: a call publishes its input exact or
@@ -357,12 +358,6 @@ class Arena {
 
   // Rank r's arena as this process reaches it.
   char* base(int r) const { return bases_[r]; }
-  // Every rank's base, as the kernels take it (by value); null past the world.
-  PeerBases peer_bases() const {
-    PeerBases b{};
-    for (int r = 0; r < world_; ++r) b.base[r] = bases_[r];
-    return b;
-  }
   int64_t bytes() const { return bytes_; }
 
  private:
@@ -468,11 +463,13 @@ inline OtherProcesses other_processes_on(int device) {
 // 2026-10-17T03-18-18Z, hip-bench_inferencex_c48).
 constexpr int64_t kInputTableSlots = int64_t{1} << 18;
 
-// A LAUNCH'S INPUT TABLE: the table's address and the strides every rank's
-// input has there (the caller's for a captured call; dense rows, its copy's,
-// for an eager one).
+// A LAUNCH'S INPUT TABLE: the device array of every rank's input address
+// (`ptr_array`, the kernels' `inputs_ptr_array`) with its size (the world; 0
+// with no array), and the strides every rank's input has there (the caller's
+// for a captured call; dense rows, its copy's, for an eager one).
 struct InputTable {
-  const void* table;
+  const void* ptr_array;
+  int ptr_array_size;
   int64_t stride_m;
   int64_t stride_n;
 };
@@ -540,6 +537,7 @@ class Handle {
                       static_cast<uint32_t>(peers.error));
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
+    add(own, release_arena_ptr_array());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
   }
@@ -588,9 +586,10 @@ class Handle {
     const bool done = stopped && barrier();
     log_->close_phase(ClosePhase::peers_done, true, 0, 0, done ? 0 : 1);
     if (!done) fail(ClosePhase::peers_done);
-    // (e) Our arena, and the slab of input tables.
+    // (e) Our arena, the slab of input tables and the arena's device array.
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
+    add(own, release_arena_ptr_array());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
     if (own.error != hipSuccess) fail(ClosePhase::released);
@@ -630,6 +629,7 @@ class Handle {
     if (finished) {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
+      add(own, release_arena_ptr_array());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
       if (own.error != hipSuccess && failed == 0)
@@ -666,12 +666,14 @@ class Handle {
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
 
-  // EVERY RANK'S ARENA, as the kernels take it (common.cuh's PeerBases, by
-  // value): rank r's base where this process reaches it, fixed for the
-  // handle's life.
-  PeerBases bases() const { return arena_->peer_bases(); }
+  // EVERY RANK'S ARENA, as the kernels take it: a device array of every
+  // rank's base where this process reaches it (`arena_ptr_array`, this rank's
+  // device memory, written once at open, fixed for the handle's life) and its
+  // size, the world.
+  char* const* arena_ptr_array() const { return arena_ptr_array_; }
+  int arena_ptr_array_size() const { return world_size_; }
   // EACH REGION'S OFFSET in every rank's arena, in bytes (`arena_layout`):
-  // rank r's region is at bases().base[r] + its offset.
+  // rank r's region is at arena_ptr_array()[r] + its offset.
   int64_t signals_offset() const { return layout_.signals; }
   int64_t inputs_offset() const { return layout_.inputs; }
   int64_t partials_offset() const { return layout_.partials; }
@@ -778,7 +780,7 @@ class Handle {
       ++next_slot_;
       pending_.push_back(input);
       pending_slots_.push_back(slot);
-      return {slot, stride_m, 1};
+      return {slot, world_size_, stride_m, 1};
     }
     const int64_t row = n * elem_bytes;
     if (m * row > inputs_bytes_)
@@ -799,7 +801,7 @@ class Handle {
                    static_cast<uint32_t>(bytes),
                    static_cast<uint32_t>(bytes >> 32), 0, host_ns()});
     }
-    return {tables_, n, 1};
+    return {tables_, world_size_, n, 1};
   }
 
   // THE INPUTS A CAPTURE RECORDED, registered, every rank together (a
@@ -969,6 +971,17 @@ class Handle {
     if (!arena_->verify(log, peer_devices))
       fail(static_cast<OpenCheck>(log.get(LogHeader::failed)),
            "the peers' arenas");
+    // THE ARENA'S DEVICE ARRAY: every rank's base where this process reaches
+    // it, kMaxRanks entries (null past the world), written once, here; the
+    // kernels take it with its size, the world (`arena_ptr_array`).
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&arena_ptr_array_),
+                        kMaxRanks * sizeof(char*)));
+    {
+      std::vector<char*> bases(kMaxRanks, nullptr);
+      for (int r = 0; r < world_size_; ++r) bases[r] = arena_->base(r);
+      HIP_CHECK(hipMemcpy(arena_ptr_array_, bases.data(),
+                          kMaxRanks * sizeof(char*), hipMemcpyHostToDevice));
+    }
     // THE INPUT TABLES' SLAB (INPUT TABLES), zeroed, and its slot 0, the
     // eager table: every rank's inputs region.
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&tables_),
@@ -995,7 +1008,7 @@ class Handle {
     status_ = log.status_host();
     device_status_ = log.status_device();
     // EACH RANK'S ARENA has the one layout (`arena_layout`), so each region is
-    // its offset from every rank's base (bases(), inputs_offset(), ...).
+    // its offset from every rank's base (arena_ptr_array(), inputs_offset(), ...).
     // The device wall clock is fixed-rate, in kHz; the kernels count the
     // timeout in it.
     int khz = 0;
@@ -1059,6 +1072,20 @@ class Handle {
       ++out.closed;
     }
     opened_.clear();
+    return out;
+  }
+  // THE ARENA'S DEVICE ARRAY freed (ours, local): with our arena, in
+  // teardown's second half. Idempotent.
+  Arena::Released release_arena_ptr_array() {
+    Arena::Released out;
+    if (arena_ptr_array_ != nullptr) {
+      const hipError_t e = hipFree(arena_ptr_array_);
+      if (e != hipSuccess) {
+        (void)hipGetLastError();
+        out.error = e;
+      }
+      arena_ptr_array_ = nullptr;
+    }
     return out;
   }
   // THE SLAB OF INPUT TABLES freed (ours, local): with our arena, in
@@ -1206,6 +1233,7 @@ class Handle {
   // captured launches awaiting registration (input, slot), and every peer
   // allocation opened for one, by its IPC handle's bytes.
   void** tables_ = nullptr;
+  char** arena_ptr_array_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;
   std::vector<void**> pending_slots_;

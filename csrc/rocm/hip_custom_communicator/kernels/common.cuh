@@ -17,19 +17,24 @@
 // packed loads need it). OUR PEER BUFFERS (the exchange's, the signals) are
 // regions of every rank's arena (handle.cuh), one allocation a rank exchanged
 // over legacy HIP IPC, so a peer's is at whatever address its handle opened
-// at, no rank stride: a kernel takes every rank's arena base BY VALUE once,
-// `PeerBases bases` (in the kernel arguments: no table in device memory), and
+// at, no rank stride: a kernel takes every rank's arena base as a DEVICE ARRAY
+// OF POINTERS with its size, `char* const* arena_ptr_array, int
+// arena_ptr_array_size` (the world; written once at open by the Handle), and
 // each region as its byte offset in the arena, its strides and its sizes,
-// `bases, x_offset, x_stride_m, ...`; rank r's is `peer_ptr<T>(bases, r,
-// x_offset)` (PEERS), one scalar load. THE CALLER'S INPUT, exact, is read by every rank IN
+// `arena_ptr_array, arena_ptr_array_size, x_offset, x_stride_m, ...`; rank r's
+// is `peer_ptr<T>(arena_ptr_array, arena_ptr_array_size, r, x_offset)` (PEERS),
+// one scalar load from the array. EVERY ARRAY IS DATA WITH ITS SIZE (STANDARDS
+// 3.2): a device array of pointers `x_ptr_array` (`T* const*`) with
+// `x_ptr_array_size`, never a struct around it, and no function takes one
+// without the other. THE CALLER'S INPUT, exact, is read by every rank IN
 // PLACE through the INPUT TABLE (below); INT4, a kernel first quantizes it into this rank's
 // inputs' INT4 values (`stage_rows`, an encoding) and its peers read them there; the plain
 // all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or each rank's
 // share of it) into the peers' inputs, each rank's INBOX, at its own slot (`peers_store`,
 // `push_shares`), and sums its own inbox locally (`slots_load`, `reduce_slots`). Either way the
-// first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_table`, kMaxRanks
-// addresses in device memory (aiter's RankData*), rank r's input at inputs_table[r] at the
-// table's strides. The kernel reads every rank's input where the table says, in place, and never
+// first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_ptr_array` with
+// `inputs_ptr_array_size` (the world), a device array of every rank's input address (aiter's
+// RankData*), rank r's input at inputs_ptr_array[r] at the inputs' strides. The kernel reads every rank's input where the table says, in place, and never
 // knows whether it points at callers' tensors (a captured call's, registered at capture exit) or
 // at every rank's inputs region (an eager call's, the host's copy): handle.cuh's INPUT TABLES.
 // A thread's registers are a plain array the caller declares,
@@ -59,9 +64,9 @@
 //   BUILD       kBuild: what is compiled for the device
 //   UTILS       traits<DTYPE>::N: a pack's elements, the P of an array
 //   REDUCE      Sum, Max (a reduction's operation)
-//   SOFTMAX     OnlineSoftmax
-//   PEERS       PeerBases (every rank's arena base, by value), StatusField,
-//               kStatusFields, kMaxRanks, kMaxBlocks
+//   PEERS       StatusField, kStatusFields, kMaxRanks, kMaxBlocks (no type
+//               for the peers' memory: device arrays of pointers, each with
+//               its size)
 //   BARRIER     Until: what a barrier waits for (launched, visible, read)
 //   QUANTIZATION Quantization: what crosses the links (none, int4), kInt4Group
 //   COLLECTIVES Direction: where a reduce-scatter's sum goes (pull, push)
@@ -992,31 +997,27 @@ DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
 // attention's).
 // =================================================================================================
 
-// The softmax so far: the largest logit seen and the sum of exp(logit - max).
-struct OnlineSoftmax {
-  float max = -INFINITY;
-  float denominator = 0.0f;
-};
-
-// Folds N logits into `s` (a -INFINITY logit is no source). Returns the scale
-// the weighted sum so far takes, and in `scale` each logit's weight; the sum is
-// final once divided by s.denominator.
+// THE SOFTMAX SO FAR, two registers: the largest logit seen (`softmax_max`,
+// from -INFINITY) and the sum of exp(logit - max) (`softmax_denominator`, from
+// 0). Folds N logits into them (a -INFINITY logit is no source). Returns the
+// scale the weighted sum so far takes, and in `scale` each logit's weight; the
+// sum is final once divided by softmax_denominator.
 namespace impl {
 template <int NUM_LOGITS>
-DINLINE float thread_softmax_fold(OnlineSoftmax& s,
+DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator,
                                   const float (&logit)[NUM_LOGITS],
                                   float (&scale)[NUM_LOGITS]) {
-  float new_max = s.max;
+  float new_max = softmax_max;
 #pragma unroll
   for (int t = 0; t < NUM_LOGITS; ++t) new_max = fmaxf(new_max, logit[t]);
-  const float old_scale = __expf(s.max - new_max);
-  s.denominator *= old_scale;
+  const float old_scale = __expf(softmax_max - new_max);
+  softmax_denominator *= old_scale;
 #pragma unroll
   for (int t = 0; t < NUM_LOGITS; ++t) {
     scale[t] = __expf(logit[t] - new_max);
-    s.denominator += scale[t];
+    softmax_denominator += scale[t];
   }
-  s.max = new_max;
+  softmax_max = new_max;
   return old_scale;
 }
 }  // namespace impl
@@ -1034,10 +1035,11 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& s,
 //         plain all-reduce's INBOX, [writer slot, ...], which its peers push
 //         into and it sums locally
 //       partials: a two-shot's sums, which its peers read (or push into)
-//   handed to a kernel as every rank's arena base BY VALUE (`PeerBases`, in
-//   the kernel arguments: no table in device memory) and each region as its
-//   byte offset in the arena, its strides and its sizes (rank r's region is
-//   `peer_ptr<T>(bases, r, offset)`); the caller's, one tensor a call:
+//   handed to a kernel as the arena's device array of every rank's base
+//   (`arena_ptr_array`, `arena_ptr_array_size`) and each region as its byte
+//   offset in the arena, its strides and its sizes (rank r's region is
+//   `peer_ptr<T>(arena_ptr_array, arena_ptr_array_size, r, offset)`); the
+//   caller's, one tensor a call:
 //     [ input ]   never read by a peer: a fused kernel copies it into this
 //                 rank's inputs (or, int4, quantized into the inputs' INT4
 //                 values), the plain all-reduce pushes it into the peers'
@@ -1117,93 +1119,107 @@ enum class StatusField : int {
 };
 constexpr int kStatusFields = 10;
 
-// EVERY RANK'S ARENA BASE, rank r's at base[r] (this rank's its own allocation,
-// a peer's where hipIpcOpenMemHandle opened it; past the world null). A kernel
-// takes it BY VALUE, so it lives in the kernel arguments and a rank's base is
-// one scalar load from them.
-struct PeerBases {
-  char* base[kMaxRanks];
-};
+#ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
+  #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
+#endif
 
 namespace impl {
-// RANK r'S REGION, its first element: the region `offset_bytes` into rank r's
-// arena. `r` IS THE SAME ACROSS THE WAVE (a constant, or a per-wave rank): read
-// from the first lane, the compiler knows it, and the base is one scalar load
-// from the kernel arguments. The one way a kernel reaches a peer's memory (the
-// INTERFACE's `peer_ptr`).
+// AN INDEX INSIDE ITS BUFFER'S SIZE, checked in debug builds only (a release
+// build passes the sizes and reads none): one outside is a programming error,
+// not a peer's fault, so it traps.
+DINLINE void debug_in_bounds(int64_t index, int64_t size) {
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size))
+    __builtin_trap();
+}
+
+// ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: the arena's
+// bases, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
+// from the first lane, the compiler knows it). The array is written by the host before the launch
+// and never during one, so it is read through the CONSTANT address space: a scalar load (s_load),
+// invariant, so neither a barrier's fences nor a store keeps the compiler from reusing or
+// rematerializing it, as it did the bases when they were by value in the kernel arguments (a plain
+// global load of it after a fence is a vector load, re-issued).
 template <typename T>
-DINLINE T* rank_of(const PeerBases& bases, int r, int64_t offset_bytes) {
-  return reinterpret_cast<T*>(bases.base[__builtin_amdgcn_readfirstlane(r)] + offset_bytes);
+DINLINE T* ptr_array_at(T* const* x_ptr_array, int x_ptr_array_size, int r) {
+  r = __builtin_amdgcn_readfirstlane(r);
+  debug_in_bounds(r, x_ptr_array_size);
+  typedef T* Entry;
+  return ((const __attribute__((address_space(4))) Entry*)x_ptr_array)[r];
 }
 
-// RANK r'S REGION FOR A RANK THAT DIFFERS ACROSS THE WAVE (a lane's owner: the
-// barrier's peer, an all-gather pack's owner, a row of threads narrower than a
-// wave): every base read (scalar) and the lane's picked by a select over the
-// WORLD ranks, never an index into the arguments (a per-lane load). Each base
-// passes through readfirstlane first: a select of two loads is otherwise
-// folded into a load from a selected address, the per-lane load from the
-// kernel arguments (ISA 2026-10-16: the barrier's peer base was a
-// global_load_dwordx2 off the kernarg pointer). The address is rebuilt as a
-// GLOBAL pointer, so its accesses stay global_* (from an integer they were
-// flat_*).
+// ENTRY r OF A DEVICE ARRAY OF POINTERS FOR AN r THAT DIFFERS ACROSS THE WAVE (a lane's owner: the
+// barrier's peer, an all-gather pack's owner, a row of threads narrower than a wave), as an
+// address: every one of the WORLD entries read (scalar) and the lane's picked by a select, never
+// an index by the lane (a per-lane load). Each entry passes through readfirstlane first: a select
+// of two loads is otherwise folded into a load from a selected address, the per-lane load (ISA
+// 2026-10-16: the barrier's peer base was a global_load_dwordx2 off the kernarg pointer).
 template <int WORLD, typename T>
-DINLINE T* lane_peer_ptr(const PeerBases& bases, int r, int64_t offset_bytes) {
-  const auto scalar = [](const char* p) {
-    const auto u = reinterpret_cast<uint64_t>(p);
-    const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u));
-    const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u >> 32));
-    return (uint64_t{hi} << 32) | lo;
-  };
-  uint64_t base = scalar(bases.base[0]);
-#pragma unroll
-  for (int k = 1; k < WORLD; ++k) {
-    const uint64_t b = scalar(bases.base[k]);
-    base = r == k ? b : base;
-  }
-  auto* const global = reinterpret_cast<__attribute__((address_space(1))) char*>(base + offset_bytes);
-  return reinterpret_cast<T*>((char*)global);
-}
-
-// AN ARRAY OF EVERY RANK'S held in registers (`ptrs`), rank r's.
-template <typename T>
-DINLINE T* rank_of(T* const* ptrs, int r) {
-  return ptrs[__builtin_amdgcn_readfirstlane(r)];
-}
-
-// RANK r'S INPUT FROM THE INPUT TABLE FOR A RANK THAT DIFFERS ACROSS THE WAVE:
-// lane_peer_ptr's select, over the table's WORLD entries (each a uniform load)
-// instead of the bases.
-template <int WORLD, typename T>
-DINLINE T* lane_table_ptr(T* const* table, int r) {
+DINLINE uint64_t lane_ptr_array_at(T* const* x_ptr_array, int x_ptr_array_size, int r) {
+  static_assert(WORLD >= 1, "a world has a rank");
+  debug_in_bounds(WORLD - 1, x_ptr_array_size);
   const auto scalar = [](T* p) {
     const auto u = reinterpret_cast<uint64_t>(p);
     const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u));
     const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u >> 32));
     return (uint64_t{hi} << 32) | lo;
   };
-  uint64_t at = scalar(table[0]);
+  uint64_t at = scalar(ptr_array_at(x_ptr_array, x_ptr_array_size, 0));
 #pragma unroll
   for (int k = 1; k < WORLD; ++k) {
-    const uint64_t p = scalar(table[k]);
+    const uint64_t p = scalar(ptr_array_at(x_ptr_array, x_ptr_array_size, k));
     at = r == k ? p : at;
   }
+  return at;
+}
+
+// AN ADDRESS AS A GLOBAL POINTER, so its accesses stay global_* (from an integer they were flat_*).
+template <typename T>
+DINLINE T* global_at(uint64_t at) {
   auto* const global = reinterpret_cast<__attribute__((address_space(1))) char*>(at);
   return reinterpret_cast<T*>((char*)global);
 }
 
-// Every rank's input from the INPUT TABLE, rank r's at r (rank_of: one uniform load each).
+// RANK r'S REGION, its first element: the region `offset_bytes` into rank r's arena, from the
+// arena's device array of every rank's base (`arena_ptr_array`). `r` uniform (ptr_array_at). The
+// one way a kernel reaches a peer's memory (the INTERFACE's `peer_ptr`).
+template <typename T>
+DINLINE T* rank_of(char* const* arena_ptr_array, int arena_ptr_array_size, int r,
+                   int64_t offset_bytes) {
+  return reinterpret_cast<T*>(ptr_array_at(arena_ptr_array, arena_ptr_array_size, r) +
+                              offset_bytes);
+}
+
+// RANK r'S REGION FOR A RANK THAT DIFFERS ACROSS THE WAVE (lane_ptr_array_at's select over the
+// arena's bases).
+template <int WORLD, typename T>
+DINLINE T* lane_peer_ptr(char* const* arena_ptr_array, int arena_ptr_array_size, int r,
+                         int64_t offset_bytes) {
+  return global_at<T>(lane_ptr_array_at<WORLD>(arena_ptr_array, arena_ptr_array_size, r) +
+                      offset_bytes);
+}
+
+// RANK r'S INPUT FROM THE INPUTS' DEVICE ARRAY FOR A RANK THAT DIFFERS ACROSS THE WAVE
+// (lane_ptr_array_at's select over its WORLD entries).
+template <int WORLD, typename T>
+DINLINE T* lane_input_ptr(T* const* inputs_ptr_array, int inputs_ptr_array_size, int r) {
+  return global_at<T>(lane_ptr_array_at<WORLD>(inputs_ptr_array, inputs_ptr_array_size, r));
+}
+
+// Every rank's input from the inputs' device array, rank r's at r (one scalar load each).
 template <int WORLD, typename T, typename U>
-DINLINE void peers_of(T* const* table, U* (&output)[WORLD]) {
+DINLINE void peers_of(T* const* inputs_ptr_array, int inputs_ptr_array_size,
+                      U* (&output)[WORLD]) {
 #pragma unroll
-  for (int r = 0; r < WORLD; ++r) output[r] = rank_of(table, r);
+  for (int r = 0; r < WORLD; ++r)
+    output[r] = ptr_array_at(inputs_ptr_array, inputs_ptr_array_size, r);
 }
 
 // Every rank's region, rank r's at r (rank_of: one scalar load each).
 template <int WORLD, typename U>
-DINLINE void peers_of(const PeerBases& bases, int64_t offset_bytes, U* (&output)[WORLD]) {
+DINLINE void peers_of(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t offset_bytes, U* (&output)[WORLD]) {
 #pragma unroll
   for (int r = 0; r < WORLD; ++r)
-    output[r] = rank_of<std::remove_const_t<U>>(bases, r, offset_bytes);
+    output[r] = rank_of<std::remove_const_t<U>>(arena_ptr_array, arena_ptr_array_size, r, offset_bytes);
 }
 
 // EVERY WRITER'S SLOT of one of this rank's receive areas, writer w's at w * stride_slot elements
@@ -1219,7 +1235,7 @@ DINLINE void slots_of(U* ptr, int64_t stride_slot, U* (&output)[WORLD]) {
 // owners).
 template <int WORLD, int THREADS_M, int THREADS_N, typename T, int ROWS, int K,
           int P>
-DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                         int64_t partials_stride_m, int partials_size_m, int partials_size_n,
                         T (&output)[ROWS][K][P], int offs_m, int offs_n,
                         int slice_n) {
@@ -1234,7 +1250,7 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
       const int owner = min(col / (slice_n / P), WORLD - 1);
       held(output[i][k],
            pack_load(reinterpret_cast<const V*>(
-                         lane_peer_ptr<WORLD, const T>(bases, owner, partials_offset)) +
+                         lane_peer_ptr<WORLD, const T>(arena_ptr_array, arena_ptr_array_size, owner, partials_offset)) +
                      int64_t{row_of<THREADS_M, THREADS_N>(partials_size_m,
                                                           offs_m, 1, i)} *
                          (partials_stride_m / P) +
@@ -1253,17 +1269,17 @@ DINLINE void peers_load_row_scalars(const T* const (&input)[WORLD],
   for (int r = 0; r < WORLD; ++r)
     output[r] = *(const __attribute__((address_space(1))) float*)(
         reinterpret_cast<const float*>(
-            reinterpret_cast<const char*>(rank_of(input, r)) +
+            reinterpret_cast<const char*>(input[r]) +
             offset_bytes) +
         row);
   issued();
 }
 template <int WORLD>
-DINLINE void peers_load_row_scalars(const PeerBases& bases, int64_t input_offset,
+DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
                                     float (&output)[WORLD], int64_t offset_bytes,
                                     int row) {
   const char* input[WORLD];
-  peers_of(bases, input_offset, input);
+  peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
   peers_load_row_scalars<WORLD>(input, output, offset_bytes, row);
 }
 }  // namespace impl
@@ -1313,7 +1329,7 @@ DINLINE void peers_load_row_scalars(const PeerBases& bases, int64_t input_offset
 // The tests that would catch a stale line: every op's output against
 // torch.distributed's across back-to-back calls on the same buffers, and the
 // signals' return to clear after every launch. Each flag is touched only
-// atomically (`Counter`); `barrier`, and in `impl` what it is made of. A rank's
+// atomically (`flag_store`, `flag_load`); `barrier`, and in `impl` what it is made of. A rank's
 // data buffers are PEERS's.
 //
 // NOTHING SURVIVES A LAUNCH: every flag is 0 between launches. A barrier sets 1
@@ -1333,26 +1349,19 @@ DINLINE void peers_load_row_scalars(const PeerBases& bases, int64_t input_offset
 // skews every wait by a random per-block delay, so a race shows on every run.
 // =================================================================================================
 
-// ONE FLAG: only atomic operations, each with its order and scope spelled at
-// the call. A plain load or store of a flag cannot be written.
-class Counter {
-  uint32_t* at_;
-
- public:
-  explicit DINLINE Counter(uint32_t* at) : at_(at) {}
-  template <int MEMORY_ORDER, int MEMORY_SCOPE>
-  DINLINE void store(uint32_t v) const {
-    __scoped_atomic_store_n(at_, v, MEMORY_ORDER, MEMORY_SCOPE);
-  }
-  template <int MEMORY_ORDER, int MEMORY_SCOPE>
-  DINLINE uint32_t load() const {
-    return __scoped_atomic_load_n(at_, MEMORY_ORDER, MEMORY_SCOPE);
-  }
-};
-
-#ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
-  #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
-#endif
+// ONE FLAG, `flag_ptr`: only atomic operations, each with its order and scope
+// spelled at the call (flag_store, flag_load). A barrier touches a flag only
+// through these.
+namespace impl {
+template <int MEMORY_ORDER, int MEMORY_SCOPE>
+DINLINE void flag_store(uint32_t* flag_ptr, uint32_t v) {
+  __scoped_atomic_store_n(flag_ptr, v, MEMORY_ORDER, MEMORY_SCOPE);
+}
+template <int MEMORY_ORDER, int MEMORY_SCOPE>
+DINLINE uint32_t flag_load(uint32_t* flag_ptr) {
+  return __scoped_atomic_load_n(flag_ptr, MEMORY_ORDER, MEMORY_SCOPE);
+}
+}  // namespace impl
 
 namespace impl {
 
@@ -1390,14 +1399,6 @@ DINLINE void fence() {
     else
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   }
-}
-
-// AN INDEX INSIDE ITS BUFFER'S SIZE, checked in debug builds only (a release
-// build passes the sizes and reads none): one outside is a programming error,
-// not a peer's fault, so it traps.
-DINLINE void debug_in_bounds(int64_t index, int64_t size) {
-  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (index < 0 || index >= size))
-    __builtin_trap();
 }
 
 // One word of this rank's status, by its field, at the buffer's stride.
@@ -1452,9 +1453,9 @@ DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
 template <bool ACQUIRE>
 DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
                   int64_t status_stride_field, int status_size_field, int rank,
-                  const Counter& flag, uint32_t want, Where where, int peer) {
+                  uint32_t* flag_ptr, uint32_t want, Where where, int peer) {
   const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1; flag.load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>() < want;
+  for (uint32_t n = 1; flag_load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(flag_ptr) < want;
        ++n) {
     __builtin_amdgcn_s_sleep(1);
     if ((n & 255u) != 0) continue;
@@ -1466,7 +1467,7 @@ DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
     if (!aborted && waited <= timeout_ticks) continue;
     if (!aborted)
       record_fault(status_ptr, status_stride_field, status_size_field, where,
-                   rank, peer, flag.load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(),
+                   rank, peer, flag_load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(flag_ptr),
                    want, waited);
     __builtin_amdgcn_endpgm();
   }
@@ -1497,8 +1498,8 @@ enum class Until { launched, visible, read };
 // where the caller had an unsigned costs a sign extension in every kernel.
 namespace impl {
 template <int WORLD, typename OWNER_TYPE, typename WRITER_TYPE>
-DINLINE Counter signal_flag(
-    const PeerBases& bases, int64_t signals_offset, int64_t signals_stride_parity,
+DINLINE uint32_t* signal_flag(
+    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset, int64_t signals_stride_parity,
     int64_t signals_stride_block, int64_t signals_stride_writer,
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     OWNER_TYPE owner, uint32_t parity, unsigned block, WRITER_TYPE writer) {
@@ -1506,9 +1507,10 @@ DINLINE Counter signal_flag(
   debug_in_bounds(parity, signals_size_parity);
   debug_in_bounds(block, signals_size_block);
   debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
-  return Counter(lane_peer_ptr<WORLD, uint32_t>(bases, static_cast<int>(owner), signals_offset) +
-                 parity * signals_stride_parity +
-                 block * signals_stride_block + writer * signals_stride_writer);
+  return lane_peer_ptr<WORLD, uint32_t>(arena_ptr_array, arena_ptr_array_size,
+                                        static_cast<int>(owner), signals_offset) +
+         parity * signals_stride_parity + block * signals_stride_block +
+         writer * signals_stride_writer;
 }
 }  // namespace impl
 
@@ -1538,7 +1540,7 @@ DINLINE Counter signal_flag(
 // between, so the clear has long landed.
 namespace impl {
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
+DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -1556,22 +1558,21 @@ DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
     if constexpr (!kOrdered) wait_stores();
     const auto flag = [&](auto owner, unsigned block, auto writer) {
       return signal_flag<WORLD>(
-          bases, signals_offset, signals_stride_parity, signals_stride_block,
+          arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
           signals_stride_writer, signals_size_parity, signals_size_block,
           signals_size_writer, owner, parity, block, writer);
     };
-    const Counter theirs = flag(threadIdx.x, blockIdx.x, rank);
-    const Counter mine = flag(rank, blockIdx.x, threadIdx.x);
-    theirs.template store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
-                          __MEMORY_SCOPE_SYSTEM>(
-        static_cast<uint32_t>(FlagState::arrived));
+    uint32_t* const theirs_ptr = flag(threadIdx.x, blockIdx.x, rank);
+    uint32_t* const mine_ptr = flag(rank, blockIdx.x, threadIdx.x);
+    flag_store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
+        theirs_ptr, static_cast<uint32_t>(FlagState::arrived));
     wait<kOrdered>(
         timeout_ticks, status_ptr, status_stride_field, status_size_field, rank,
-        mine, static_cast<uint32_t>(FlagState::arrived),
+        mine_ptr, static_cast<uint32_t>(FlagState::arrived),
         kFirst ? Where::start : Where::peer_barrier,
         static_cast<int>(threadIdx.x));
-    mine.template store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
-        static_cast<uint32_t>(FlagState::clear));
+    flag_store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
+        mine_ptr, static_cast<uint32_t>(FlagState::clear));
   }
   __syncthreads();
 }
@@ -1632,29 +1633,14 @@ __host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
   return int4_scales_offset(m, n) + int4_scales_bytes(m, n);
 }
 
-// AN [m, n] INT4 PAYLOAD IN A REGION, as the INT4 functions take it: its values and its scales,
-// each its byte offset in the arena (PEERS' `rank_of`), its strides and its sizes (in its own
-// elements: bytes, fp16). From the region's byte offset in the arena.
-struct Int4Payload {
-  int64_t values_offset;
-  int64_t values_stride_m, values_stride_n;
-  int values_size_m, values_size_n;
-  int64_t scales_offset;
-  int64_t scales_stride_m, scales_stride_n;
-  int scales_size_m, scales_size_n;
-};
-__host__ __device__ inline Int4Payload int4_payload(int64_t region_offset, int m, int n) {
-  return {region_offset,
-          n / 2,
-          1,
-          m,
-          n / 2,
-          region_offset + int4_scales_offset(m, n),
-          n / kInt4Group,
-          1,
-          m,
-          n / kInt4Group};
-}
+// AN [m, n] INT4 PAYLOAD IN A REGION: its values and its scales, each a buffer of its own (its
+// byte offset in the arena, PEERS' `rank_of`, its strides and its sizes, in its own elements:
+// bytes, fp16), both dense rows. From the region's byte offset and the call's [m, n]: the values at
+// the region's offset, [m, int4_values_size_n(n)]; the scales at the region's offset plus
+// int4_scales_offset(m, n), [m, int4_scales_size_n(n)]; each row's stride its size_n, the column's
+// 1. A kernel computes them where it starts.
+__host__ __device__ constexpr int int4_values_size_n(int n) { return n / 2; }
+__host__ __device__ constexpr int int4_scales_size_n(int n) { return n / kInt4Group; }
 
 namespace impl {
 typedef __attribute__((address_space(1))) uint32_t global_u32;
@@ -2018,7 +2004,7 @@ DINLINE void int4_peers_sum(const uint32_t (&words)[WORLD][ROWS][K],
 
 // Each pack from the rank owning its columns, slice_n a rank (all_gather's).
 template <int WORLD, int THREADS_M, int THREADS_N, typename U, int ROWS, int K, int P>
-DINLINE void int4_all_gather(const PeerBases& bases, int64_t values_offset,
+DINLINE void int4_all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t values_offset,
                              int64_t values_stride_m, int64_t scales_offset, int64_t scales_stride_m,
                              int size_m, int size_n, U (&output)[ROWS][K][P], int offs_m,
                              int offs_n, int slice_n) {
@@ -2034,10 +2020,10 @@ DINLINE void int4_all_gather(const PeerBases& bases, int64_t values_offset,
       const int owner = min(col / (slice_n / P), WORLD - 1);
       const int64_t row = row_of<THREADS_M, THREADS_N>(size_m, offs_m, 1, i);
       words[i][k] = int4_word_load(
-          lane_peer_ptr<WORLD, const uint8_t>(bases, owner, values_offset) + row * values_stride_m,
+          lane_peer_ptr<WORLD, const uint8_t>(arena_ptr_array, arena_ptr_array_size, owner, values_offset) + row * values_stride_m,
           col);
       scales[i][k] = int4_scale_load(
-          lane_peer_ptr<WORLD, const __fp16>(bases, owner, scales_offset) + row * scales_stride_m,
+          lane_peer_ptr<WORLD, const __fp16>(arena_ptr_array, arena_ptr_array_size, owner, scales_offset) + row * scales_stride_m,
           col);
     }
   }
@@ -2047,11 +2033,11 @@ DINLINE void int4_all_gather(const PeerBases& bases, int64_t values_offset,
 
 // RANK r'S REGION OF A QUANTIZED FORM (rank_of), or null with none, its base unread.
 template <int QUANTIZATION, typename E>
-DINLINE E* quantized_rank_of(const PeerBases& bases, int64_t offset_bytes, int r) {
+DINLINE E* quantized_rank_of(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t offset_bytes, int r) {
   if constexpr (QUANTIZATION == Quantization::none)
     return nullptr;
   else
-    return rank_of<E>(bases, r, offset_bytes);
+    return rank_of<E>(arena_ptr_array, arena_ptr_array_size, r, offset_bytes);
 }
 
 // THE EXCHANGE'S MEMORY IN QUANTIZATION'S FORM, what the COLLECTIVES and the INTERFACE call: with
@@ -2113,19 +2099,19 @@ DINLINE void exchanged_peers_load(const T* const (&input)[WORLD], int64_t input_
 
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
-DINLINE void exchanged_all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void exchanged_all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                                   int64_t partials_stride_m, int64_t values_offset, int64_t values_stride_m,
                                   int64_t scales_offset,
                                   int64_t scales_stride_m, int size_m, int size_n,
                                   U (&output)[ROWS][K][P], int offs_m, int offs_n,
                                   int slice_n) {
   if constexpr (QUANTIZATION == Quantization::none)
-    all_gather<WORLD, THREADS_M, THREADS_N>(bases, partials_offset,
+    all_gather<WORLD, THREADS_M, THREADS_N>(arena_ptr_array, arena_ptr_array_size, partials_offset,
                                             partials_stride_m, size_m, size_n, output,
                                             offs_m, offs_n, slice_n);
   else
     int4_all_gather<WORLD, THREADS_M, THREADS_N>(
-        bases, values_offset, values_stride_m, scales_offset,
+        arena_ptr_array, arena_ptr_array_size, values_offset, values_stride_m, scales_offset,
         scales_stride_m, size_m, size_n, output, offs_m, offs_n, slice_n);
 }
 }  // namespace impl
@@ -2381,7 +2367,7 @@ DINLINE T* int4_group_at(T* ptr, int64_t stride_m, int64_t stride_n, int size_n,
 // at once. The first barrier, ordered, publishes them.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
 DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                            int input_size_m, int input_size_n, const PeerBases& bases,
+                            int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
                             int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
   constexpr int P = traits<T>::N;
   using V = vec<T, P>;
@@ -2407,8 +2393,8 @@ DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t 
       int4_encode_group(x, words, scale);
       if (g < end && g < groups)
         int4_group_store(words, scale,
-                         rank_of<uint8_t>(bases, r, inbox_values_offset) + mine / 2,
-                         rank_of<__fp16>(bases, r, inbox_scales_offset) + mine / kInt4Group, g);
+                         rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, r, inbox_values_offset) + mine / 2,
+                         rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, r, inbox_scales_offset) + mine / kInt4Group, g);
     }
   });
 }
@@ -2420,7 +2406,7 @@ DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t 
 // in this rank's partials (the share's own run). Through LDS, a rank's copy a wave, one wave in 8
 // summed and quantized while the others waited at the barrier.
 template <int WORLD, int THREADS, typename T>
-DINLINE void int4_flat_reduce_slots(const PeerBases& bases,
+DINLINE void int4_flat_reduce_slots(char* const* arena_ptr_array, int arena_ptr_array_size,
                                     int64_t inbox_values_offset,
                                     int64_t inbox_scales_offset,
                                     int64_t partials_values_offset,
@@ -2435,11 +2421,11 @@ DINLINE void int4_flat_reduce_slots(const PeerBases& bases,
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
     const int64_t slot = share_first(slice, (rank + w) % WORLD);
-    values[w] = rank_of<uint8_t>(bases, rank, inbox_values_offset) + slot / 2;
-    scales[w] = rank_of<__fp16>(bases, rank, inbox_scales_offset) + slot / kInt4Group;
+    values[w] = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, inbox_values_offset) + slot / 2;
+    scales[w] = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, inbox_scales_offset) + slot / kInt4Group;
   }
-  uint8_t* const own_values = rank_of<uint8_t>(bases, rank, partials_values_offset);
-  __fp16* const own_scales = rank_of<__fp16>(bases, rank, partials_scales_offset);
+  uint8_t* const own_values = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset);
+  __fp16* const own_scales = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset);
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     const int at = min(g, groups - 1);
     uint32_t words[WORLD][1][kInt4GroupPacks];
@@ -2467,7 +2453,7 @@ DINLINE void int4_flat_reduce_slots(const PeerBases& bases,
 // THE INT4 ALL-GATHER: every rank's group g of its summed share, all in flight, dequantized to T
 // and stored at its place in the output.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
-DINLINE void int4_flat_all_gather(const PeerBases& bases,
+DINLINE void int4_flat_all_gather(char* const* arena_ptr_array, int arena_ptr_array_size,
                                   int64_t partials_values_offset,
                                   int64_t partials_scales_offset, T* output_ptr,
                                   int64_t output_stride_m, int64_t output_stride_n,
@@ -2480,8 +2466,8 @@ DINLINE void int4_flat_all_gather(const PeerBases& bases,
   const __fp16* scales[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
-    values[w] = rank_of<uint8_t>(bases, (rank + w) % WORLD, partials_values_offset);
-    scales[w] = rank_of<__fp16>(bases, (rank + w) % WORLD, partials_scales_offset);
+    values[w] = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, (rank + w) % WORLD, partials_values_offset);
+    scales[w] = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, (rank + w) % WORLD, partials_scales_offset);
   }
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     u32x4 words[WORLD];
@@ -2523,12 +2509,12 @@ template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T, typename INPUT_OF>
 DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
                           int64_t input_stride_n, int input_size_m,
-                          int input_size_n, int64_t input_first, const PeerBases& bases,
+                          int input_size_n, int64_t input_first, char* const* arena_ptr_array, int arena_ptr_array_size,
                           int64_t input_values_offset,
                           int64_t input_scales_offset, int64_t partials_offset, int64_t partials_values_offset, int64_t partials_scales_offset, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
     int4_flat_reduce_slots<WORLD, THREADS, T>(
-        bases, input_values_offset, input_scales_offset, partials_values_offset,
+        arena_ptr_array, arena_ptr_array_size, input_values_offset, input_scales_offset, partials_values_offset,
         partials_scales_offset,
         int64_t{input_size_m} * input_size_n, rank);
   } else {
@@ -2538,7 +2524,7 @@ DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
     static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
     static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
     static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
-    T* const partials = rank_of<T>(bases, rank, partials_offset);
+    T* const partials = rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
     const int64_t total = int64_t{input_size_m} * input_size_n;
     const int slice = share_slice<WORLD, P>(total);
     const int chunks = (slice + TILE_N - 1) / TILE_N;
@@ -2565,13 +2551,13 @@ DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
 // output, a TILE_N chunk a step; with int4 the int4 walk's above.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                         int64_t partials_values_offset,
                         int64_t partials_scales_offset,
                         T* output_ptr, int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
-    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(bases,
+    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(arena_ptr_array, arena_ptr_array_size,
                                                      partials_values_offset,
                                                      partials_scales_offset,
                                                      output_ptr, output_stride_m,
@@ -2589,7 +2575,7 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
       const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
       // 1. Rank r's summed chunk, in one round trip.
-      load<1, LANES>(rank_of<T>(bases, r, partials_offset), 0, 1, slice, got, 0,
+      load<1, LANES>(rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, partials_offset), 0, 1, slice, got, 0,
                      chunk * TILE_N, 1);
       // 2. Stored where rank r's share goes.
       range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m, output_stride_n,
@@ -2608,7 +2594,7 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
                          int64_t input_stride_n, int input_size_m, int input_size_n,
-                         const PeerBases& bases, int64_t inbox_offset,
+                         char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
                          int64_t inbox_stride_m, int64_t inbox_stride_n,
                          int inbox_size_n, int rank) {
   constexpr int LANES = THREADS / WORLD;
@@ -2626,7 +2612,7 @@ DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
     range_load<CONTIGUOUS, LANES>(input_ptr, input_stride_m, input_stride_n,
                                   input_size_n, part, share_first(slice, r), len,
                                   chunk * TILE_N);
-    range_store<true, LANES>(part, rank_of<T>(bases, r, inbox_offset) + rank * inbox_stride_m,
+    range_store<true, LANES>(part, rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, inbox_offset) + rank * inbox_stride_m,
                              inbox_stride_m, inbox_stride_n, inbox_size_n, 0, len,
                              chunk * TILE_N, len);
   });
@@ -2637,11 +2623,11 @@ DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                         int input_size_m, int input_size_n, const PeerBases& bases,
+                         int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
                          int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
   static_assert(QUANTIZATION == Quantization::int4, "none pushes through its own overload");
   int4_flat_push<WORLD, THREADS, CONTIGUOUS>(input_ptr, input_stride_m, input_stride_n,
-                                             input_size_m, input_size_n, bases,
+                                             input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
                                              inbox_values_offset, inbox_scales_offset, rank);
 }
 
@@ -2698,11 +2684,11 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
 // LANES threads, row w rank rank + w's copy (ROTATED: in rank order every GPU read rank 0 first,
 // and the reduce-scatter took 1.6x the plain two-shot's cycles for its bytes, thread traces
 // 2026-10-04T21-03-09Z, 21-26-11Z). A ROW OF THREADS' RANK DIFFERS ACROSS THE WAVE (LANES may be
-// half one), so each lane picks its own base (`lane_peer_ptr`: a select over the bases, every
+// half one), so each lane picks its own base (`lane_peer_ptr`: a select over the arena's array, every
 // one a scalar; an array of every rank's, indexed at run time, was partials: 136 B). Summed over the rows through LDS into this
 // rank's partials.
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
-DINLINE void reduce_scatter_lds(const T* const* inputs_table, const PeerBases& bases,
+DINLINE void reduce_scatter_lds(const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size,
                                 int64_t input_stride_m, int input_size_m, int input_size_n,
                                 int64_t input_values_offset,
                                 int64_t input_values_stride_m,
@@ -2721,11 +2707,11 @@ DINLINE void reduce_scatter_lds(const T* const* inputs_table, const PeerBases& b
   const int slice = (packs + WORLD - 1) / WORLD;
   const int col0 = min(rank * slice, packs);
   const int own_packs = max(0, min(slice, packs - col0));
-  T* const own_partials = rank_of<T>(bases, rank, partials_offset);
+  T* const own_partials = rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
   uint8_t* const own_values = quantized_rank_of<QUANTIZATION, uint8_t>(
-      bases, partials_values_offset, rank);
+      arena_ptr_array, arena_ptr_array_size, partials_values_offset, rank);
   __fp16* const own_scales = quantized_rank_of<QUANTIZATION, __fp16>(
-      bases, partials_scales_offset, rank);
+      arena_ptr_array, arena_ptr_array_size, partials_scales_offset, rank);
   const int end = (col0 + own_packs) * P;  // this rank's columns end, in elements
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x)
@@ -2736,14 +2722,14 @@ DINLINE void reduce_scatter_lds(const T* const* inputs_table, const PeerBases& b
         const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
         T got[1][1][P];
         if constexpr (QUANTIZATION == Quantization::none) {
-          const V* at = reinterpret_cast<const V*>(lane_table_ptr<WORLD>(inputs_table, r) +
+          const V* at = reinterpret_cast<const V*>(lane_input_ptr<WORLD>(inputs_ptr_array, inputs_ptr_array_size, r) +
                                                    row * input_stride_m);
           held(got[0][0], pack_load(at_col<P, LANES>(at, end, c, 0)));
           issued();
         } else {
-          int4_load<1, LANES>(lane_peer_ptr<WORLD, const uint8_t>(bases, r, input_values_offset),
+          int4_load<1, LANES>(lane_peer_ptr<WORLD, const uint8_t>(arena_ptr_array, arena_ptr_array_size, r, input_values_offset),
                               input_values_stride_m,
-                              lane_peer_ptr<WORLD, const __fp16>(bases, r, input_scales_offset),
+                              lane_peer_ptr<WORLD, const __fp16>(arena_ptr_array, arena_ptr_array_size, r, input_scales_offset),
                               input_scales_stride_m, input_size_m,
                               end, got, row, c, 1);
         }
@@ -2771,7 +2757,7 @@ DINLINE void reduce_scatter_lds(const T* const* inputs_table, const PeerBases& b
 template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
-    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_stride_m,
     int input_size_m, int64_t input_values_offset,
     int64_t input_values_stride_m, int64_t input_scales_offset, int64_t input_scales_stride_m, int64_t partials_offset, int64_t partials_stride_m, int64_t partials_values_offset, int64_t partials_values_stride_m,
     int64_t partials_scales_offset,
@@ -2784,21 +2770,21 @@ DINLINE void reduce_scatter_registers(
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
   using Summed = std::conditional_t<kInt4, float, T>;
   const T* input[WORLD];
-  if constexpr (!kInt4) peers_of(inputs_table, input);
+  if constexpr (!kInt4) peers_of(inputs_ptr_array, inputs_ptr_array_size, input);
   const uint8_t* input_values[WORLD];
   const __fp16* input_scales[WORLD];
   if constexpr (kInt4) {
-    peers_of(bases, input_values_offset, input_values);
-    peers_of(bases, input_scales_offset, input_scales);
+    peers_of(arena_ptr_array, arena_ptr_array_size, input_values_offset, input_values);
+    peers_of(arena_ptr_array, arena_ptr_array_size, input_scales_offset, input_scales);
   }
   T* partials[WORLD];
   uint8_t* partials_values[WORLD];
   __fp16* partials_scales[WORLD];
   if constexpr (DIRECTION == Direction::push) {
-    peers_of(bases, partials_offset, partials);
+    peers_of(arena_ptr_array, arena_ptr_array_size, partials_offset, partials);
     if constexpr (kInt4) {
-      peers_of(bases, partials_values_offset, partials_values);
-      peers_of(bases, partials_scales_offset, partials_scales);
+      peers_of(arena_ptr_array, arena_ptr_array_size, partials_values_offset, partials_values);
+      peers_of(arena_ptr_array, arena_ptr_array_size, partials_scales_offset, partials_scales);
     }
   }
   if (size_n <= 0) return;  // a late rank owns no columns
@@ -2831,7 +2817,7 @@ DINLINE void reduce_scatter_registers(
                                         input_size_m, offs_n + size_n, offs_m, c,
                                         static_cast<int>(gridDim.x));
         } else {
-          store<ROWS, LANES, THREADS>(rounded, rank_of<T>(bases, rank, partials_offset),
+          store<ROWS, LANES, THREADS>(rounded, rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset),
                                       partials_stride_m, input_size_m,
                                       offs_n + size_n, offs_m, c,
                                       static_cast<int>(gridDim.x));
@@ -2851,8 +2837,8 @@ DINLINE void reduce_scatter_registers(
 #pragma unroll
           for (int r = 0; r < WORLD; ++r) store_in(partials_values[r], partials_scales[r]);
         } else {
-          store_in(rank_of<uint8_t>(bases, rank, partials_values_offset),
-                   rank_of<__fp16>(bases, rank, partials_scales_offset));
+          store_in(rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset),
+                   rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset));
         }
       }
     }
@@ -2911,49 +2897,49 @@ DINLINE void store(const T (&input)[ROWS][K][P], T* output_ptr,
                                     offs_n, row_step);
 }
 
-// EVERY RANK'S POINTER of a region where the kernel wants them, from the bases and the region's
+// EVERY RANK'S POINTER of a region where the kernel wants them, from the arena's array and the region's
 // offset (rank r's: `peer_ptr`, below). Before the first barrier they are held in
 // scalar registers and every tile's loads issue at once (the one-shot); held across a barrier the
 // norm kernels spilled (the 8-pack build, 68 B: ISA 2026-09-30), so there they are read after it.
 template <int WORLD, typename U>
-DINLINE void peers_ptrs(const PeerBases& bases, int64_t offset_bytes, U* (&output)[WORLD]) {
-  impl::peers_of(bases, offset_bytes, output);
+DINLINE void peers_ptrs(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t offset_bytes, U* (&output)[WORLD]) {
+  impl::peers_of(arena_ptr_array, arena_ptr_array_size, offset_bytes, output);
 }
 
 // ONE RANK'S POINTER of a region (this rank's own, most often): rank r's arena base, one scalar
 // load from the kernel arguments, plus the region's offset. `r` the same across the wave.
 template <typename T>
-DINLINE T* peer_ptr(const PeerBases& bases, int r, int64_t offset_bytes) {
-  return impl::rank_of<T>(bases, r, offset_bytes);
+DINLINE T* peer_ptr(char* const* arena_ptr_array, int arena_ptr_array_size, int r, int64_t offset_bytes) {
+  return impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, offset_bytes);
 }
 
 // Every rank's, in rank order, all in flight together: rank r's region `input_offset` into its
 // arena (one of ours: the inputs, the partials).
 template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
           int P>
-DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
+DINLINE void peers_load(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
                         int64_t input_stride_m, int64_t input_stride_n,
                         int input_size_m, int input_size_n,
                         T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
                         int row_step = 1) {
   const T* input[WORLD];
-  impl::peers_of(bases, input_offset, input);
+  impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
   impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
                                          input_size_n, output, offs_m, offs_n,
                                          row_step);
 }
 
-// Every rank's input through the INPUT TABLE (rank r's at inputs_table[r], at the table's
+// Every rank's input through the INPUT TABLE (rank r's at inputs_ptr_array[r], at the table's
 // strides), in rank order, all in flight together: the in-place pull's one-shot.
 template <int THREADS_M, int THREADS_N, typename T, int WORLD, int ROWS, int K,
           int P>
-DINLINE void peers_load(const T* const* inputs_table, int64_t input_stride_m,
+DINLINE void peers_load(const T* const* inputs_ptr_array, int inputs_ptr_array_size, int64_t input_stride_m,
                         int64_t input_stride_n, int input_size_m, int input_size_n,
                         T (&output)[WORLD][ROWS][K][P], int offs_m, int offs_n,
                         int row_step = 1) {
   const T* input[WORLD];
 #pragma unroll
-  for (int r = 0; r < WORLD; ++r) input[r] = impl::rank_of(inputs_table, r);
+  for (int r = 0; r < WORLD; ++r) input[r] = impl::ptr_array_at(inputs_ptr_array, inputs_ptr_array_size, r);
   impl::peers_load<THREADS_M, THREADS_N>(input, input_stride_m, input_size_m,
                                          input_size_n, output, offs_m, offs_n,
                                          row_step);
@@ -2965,12 +2951,12 @@ DINLINE void peers_load(const T* const* inputs_table, int64_t input_stride_m,
 // ordered barrier.
 template <int WORLD, int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS, int K,
           int P>
-DINLINE void peers_store(const T (&input)[ROWS][K][P], const PeerBases& bases,
+DINLINE void peers_store(const T (&input)[ROWS][K][P], char* const* arena_ptr_array, int arena_ptr_array_size,
                          int64_t output_offset, int64_t output_stride_m,
                          int64_t output_stride_n, int output_size_m, int output_size_n,
                          int offs_m, int offs_n, int row_step = 1) {
   T* output[WORLD];
-  impl::peers_of(bases, output_offset, output);
+  impl::peers_of(arena_ptr_array, arena_ptr_array_size, output_offset, output);
   impl::peers_store<THREADS_M, THREADS_N, THREADS>(input, output, output_stride_m,
                                                    output_size_m, output_size_n, offs_m,
                                                    offs_n, row_step);
@@ -2996,12 +2982,12 @@ DINLINE void slots_load(const T* input_ptr, int64_t input_stride_slot,
 // partials_size_n clamp as load's do: the tensor's rows and columns, not the partials's own.
 template <int WORLD, int THREADS_M, int THREADS_N, typename T, int ROWS, int K,
           int P>
-DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                         int64_t partials_stride_m, int64_t partials_stride_n,
                         int partials_size_m, int partials_size_n,
                         T (&output)[ROWS][K][P], int offs_m, int offs_n, int slice_n) {
   impl::all_gather<WORLD, THREADS_M, THREADS_N>(
-      bases, partials_offset, partials_stride_m, partials_size_m, partials_size_n,
+      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_size_m, partials_size_n,
       output, offs_m, offs_n, slice_n);
 }
 
@@ -3042,11 +3028,11 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
 }
 
 // THE PEERS' INPUTS IN QUANTIZATION'S FORM, the input's every rank's from the INPUT TABLE
-// (none: read in place), its quantized form ours (int4: the staged values and scales, the bases
+// (none: read in place), its quantized form ours (int4: the staged values and scales, the arena's array
 // and the regions' offsets; the table unused).
 template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(const T* const* inputs_table, const PeerBases& bases,
+DINLINE void peers_load(const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size,
                         int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
                         int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
                         int64_t input_values_stride_n, int input_values_size_m,
@@ -3058,22 +3044,22 @@ DINLINE void peers_load(const T* const* inputs_table, const PeerBases& bases,
   const uint8_t* values[WORLD];
   const __fp16* scales[WORLD];
   if constexpr (QUANTIZATION == Quantization::none) {
-    impl::peers_of(inputs_table, input);
+    impl::peers_of(inputs_ptr_array, inputs_ptr_array_size, input);
   } else {
-    impl::peers_of(bases, input_values_offset, values);
-    impl::peers_of(bases, input_scales_offset, scales);
+    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_values_offset, values);
+    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_scales_offset, scales);
   }
   impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
       input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
       input_size_m, input_size_n, output, offs_m, offs_n, row_step);
 }
 
-// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (our regions, the bases
+// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (our regions, the arena's array
 // and the region's offset: the partials), its quantized form ours (the summed values and
 // scales).
 template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
-DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
+DINLINE void peers_load(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
                         int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
                         int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
                         int64_t input_values_stride_n, int input_values_size_m,
@@ -3085,10 +3071,10 @@ DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
   const uint8_t* values[WORLD];
   const __fp16* scales[WORLD];
   if constexpr (QUANTIZATION == Quantization::none) {
-    impl::peers_of(bases, input_offset, input);
+    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_offset, input);
   } else {
-    impl::peers_of(bases, input_values_offset, values);
-    impl::peers_of(bases, input_scales_offset, scales);
+    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_values_offset, values);
+    impl::peers_of(arena_ptr_array, arena_ptr_array_size, input_scales_offset, scales);
   }
   impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
       input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
@@ -3097,7 +3083,7 @@ DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
 
 template <int WORLD, int THREADS_M, int THREADS_N, int QUANTIZATION, typename T,
           typename U, int ROWS, int K, int P>
-DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                         int64_t partials_stride_m, int64_t partials_stride_n,
                         int partials_size_m, int partials_size_n,
                         int64_t partials_values_offset,
@@ -3108,7 +3094,7 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
                         int partials_scales_size_m, int partials_scales_size_n,
                         U (&output)[ROWS][K][P], int offs_m, int offs_n, int slice_n) {
   impl::exchanged_all_gather<WORLD, THREADS_M, THREADS_N, QUANTIZATION, T>(
-      bases, partials_offset, partials_stride_m, partials_values_offset, partials_values_stride_m, partials_scales_offset, partials_scales_stride_m, partials_size_m, partials_size_n,
+      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_values_offset, partials_values_stride_m, partials_scales_offset, partials_scales_stride_m, partials_size_m, partials_size_n,
       output, offs_m, offs_n, slice_n);
 }
 
@@ -3117,13 +3103,13 @@ DINLINE void store_row_scalar(float value, float* output_ptr, int row) {
   impl::store_row_scalar(value, output_ptr, row);
 }
 
-// Every rank's scalar for `row`, `offset_bytes` into each rank's region (one of ours, the bases
+// Every rank's scalar for `row`, `offset_bytes` into each rank's region (one of ours, the arena's array
 // and the region's offset).
 template <int WORLD>
-DINLINE void peers_load_row_scalars(const PeerBases& bases, int64_t input_offset,
+DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset,
                                     float (&output)[WORLD], int64_t offset_bytes,
                                     int row) {
-  impl::peers_load_row_scalars<WORLD>(bases, input_offset, output, offset_bytes,
+  impl::peers_load_row_scalars<WORLD>(arena_ptr_array, arena_ptr_array_size, input_offset, output, offset_bytes,
                                       row);
 }
 
@@ -3218,10 +3204,10 @@ DINLINE void partial_dot(const A (&a)[ROWS][K][P], const B (&b)[ROWS_B][K][P],
 
 // Logits folded into a running softmax: each logit's scale, and the old sum's.
 template <int NUM_LOGITS>
-DINLINE float thread_softmax_fold(OnlineSoftmax& softmax,
+DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator,
                                   const float (&logit)[NUM_LOGITS],
                                   float (&scale)[NUM_LOGITS]) {
-  return impl::thread_softmax_fold<NUM_LOGITS>(softmax, logit, scale);
+  return impl::thread_softmax_fold<NUM_LOGITS>(softmax_max, softmax_denominator, logit, scale);
 }
 
 // ===============================================================================================
@@ -3234,7 +3220,7 @@ DINLINE float thread_softmax_fold(OnlineSoftmax& softmax,
 // barriers are even in number, its k-th taking PARITY k % 2, so its flags end
 // where they began. WORLD is the kernel's, passed on.
 template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
+DINLINE void barrier(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t signals_offset,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
@@ -3242,7 +3228,7 @@ DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
                      uint32_t* status_ptr, int64_t status_stride_field,
                      int status_size_field, int rank, uint64_t timeout_ticks) {
   impl::barrier<UNTIL, PARITY, WORLD>(
-      bases, signals_offset, signals_stride_parity, signals_stride_block,
+      arena_ptr_array, arena_ptr_array_size, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks);
@@ -3263,7 +3249,7 @@ DINLINE void barrier(const PeerBases& bases, int64_t signals_offset,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void reduce_slots(
-    const PeerBases& bases, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
+    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
     int64_t input_scales_offset,
@@ -3278,8 +3264,8 @@ DINLINE void reduce_slots(
   static_assert(QUANTIZATION == Quantization::int4,
                 "none sums its inbox through the overload below (its slots' stride)");
   impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION, T>(
-      [&](int) { return impl::rank_of<T>(bases, rank, input_offset); }, input_stride_m,
-      input_stride_n, input_size_m, input_size_n, 0, bases, input_values_offset,
+      [&](int) { return impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, input_offset); }, input_stride_m,
+      input_stride_n, input_size_m, input_size_n, 0, arena_ptr_array, arena_ptr_array_size, input_values_offset,
       input_scales_offset, partials_offset, partials_values_offset, partials_scales_offset,
       rank);
 }
@@ -3287,31 +3273,31 @@ DINLINE void reduce_slots(
 // elements a slot, each holding writer w's copy of this rank's range of the size_m x size_n
 // problem from the slot's first element), summed into this rank's partials.
 template <int WORLD, int THREADS, int TILE_N, typename T>
-DINLINE void reduce_slots(const PeerBases& bases, int64_t inbox_offset,
+DINLINE void reduce_slots(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
                           int64_t inbox_stride_m, int64_t inbox_stride_n,
                           int inbox_size_m, int inbox_size_n, int64_t partials_offset,
                           int64_t partials_stride_m, int64_t partials_stride_n,
                           int partials_size_m, int partials_size_n, int size_m, int size_n,
                           int rank) {
-  const T* const inbox = impl::rank_of<T>(bases, rank, inbox_offset);
+  const T* const inbox = impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, inbox_offset);
   impl::reduce_slots<WORLD, THREADS, TILE_N, true, Quantization::none, T>(
       [&](int w) { return inbox + w * inbox_stride_m; }, inbox_stride_m, inbox_stride_n,
-      size_m, size_n, 0, bases, 0, 0, partials_offset, 0, 0, rank);
+      size_m, size_n, 0, arena_ptr_array, arena_ptr_array_size, 0, 0, partials_offset, 0, 0, rank);
 }
 // THE IN-PLACE PULL'S REDUCE-SCATTER (the exact two-shot's): this rank's range of the band of
 // size_m rows from `first_row` of every rank's input, read through the INPUT TABLE where it is
-// (rank r's at inputs_table[r] at the table's strides), summed into this rank's partials. The
+// (rank r's at inputs_ptr_array[r] at the table's strides), summed into this rank's partials. The
 // flat walk's body (reduce_slots'): rank r rotated as rank + r, this rank's range from its first
 // element in each rank's input.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void reduce_scatter(const T* const* inputs_table, int64_t input_stride_m,
+DINLINE void reduce_scatter(const T* const* inputs_ptr_array, int inputs_ptr_array_size, int64_t input_stride_m,
                             int64_t input_stride_n, int first_row, int size_m, int size_n,
-                            const PeerBases& bases, int64_t partials_offset, int rank) {
+                            char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int rank) {
   constexpr int P = traits<T>::N;
   const int slice = impl::share_slice<WORLD, P>(int64_t{size_m} * size_n);
   impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none, T>(
-      [&](int r) { return impl::rank_of(inputs_table, r) + first_row * input_stride_m; },
-      input_stride_m, input_stride_n, size_m, size_n, impl::share_first(slice, rank), bases,
+      [&](int r) { return impl::ptr_array_at(inputs_ptr_array, inputs_ptr_array_size, r) + first_row * input_stride_m; },
+      input_stride_m, input_stride_n, size_m, size_n, impl::share_first(slice, rank), arena_ptr_array, arena_ptr_array_size,
       0, 0, partials_offset, 0, 0, rank);
 }
 // All-gather: every rank's summed range, from its partials (int4: its values, dequantized), at its
@@ -3319,7 +3305,7 @@ DINLINE void reduce_scatter(const T* const* inputs_table, int64_t input_stride_m
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void all_gather(
-    const PeerBases& bases, int64_t partials_offset, int64_t partials_stride_m,
+    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
     int64_t partials_stride_n, int partials_size_m, int partials_size_n,
     int64_t partials_values_offset,
     int64_t partials_values_stride_m, int64_t partials_values_stride_n,
@@ -3328,18 +3314,18 @@ DINLINE void all_gather(
     T* output_ptr, int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
     int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      bases, partials_offset, partials_values_offset,
+      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_values_offset,
       partials_scales_offset, output_ptr, output_stride_m,
       output_stride_n, output_size_m, output_size_n, rank);
 }
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
+DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
                         int64_t partials_stride_m, int64_t partials_stride_n,
                         int partials_size_m, int partials_size_n, T* output_ptr,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
-      bases, partials_offset, 0, 0, output_ptr, output_stride_m, output_stride_n,
+      arena_ptr_array, arena_ptr_array_size, partials_offset, 0, 0, output_ptr, output_stride_m, output_stride_n,
       output_size_m, output_size_n, rank);
 }
 // PUSHED, FIRST: this rank's input, every rank's range of it, into that rank's inbox at this
@@ -3347,11 +3333,11 @@ DINLINE void all_gather(const PeerBases& bases, int64_t partials_offset,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
                          int64_t input_stride_n, int input_size_m, int input_size_n,
-                         const PeerBases& bases, int64_t inbox_offset,
+                         char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
                          int64_t inbox_stride_m, int64_t inbox_stride_n,
                          int inbox_size_m, int inbox_size_n, int rank) {
   impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, bases,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
       inbox_offset, inbox_stride_m, inbox_stride_n, inbox_size_n, rank);
 }
 // THE INT4 TWO-SHOT'S PUSH, before its first barrier (ordered): every rank's range of this rank's
@@ -3360,14 +3346,14 @@ DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                         int input_size_m, int input_size_n, const PeerBases& bases,
+                         int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
                          int64_t inbox_values_offset, int64_t inbox_values_stride_m,
                          int64_t inbox_values_stride_n, int inbox_values_size_m,
                          int inbox_values_size_n, int64_t inbox_scales_offset,
                          int64_t inbox_scales_stride_m, int64_t inbox_scales_stride_n,
                          int inbox_scales_size_m, int inbox_scales_size_n, int rank) {
   impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, bases,
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
       inbox_values_offset, inbox_scales_offset, rank);
 }
 
@@ -3399,7 +3385,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t inpu
 // the sums' values and scales.
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(
-    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_stride_m,
     int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
@@ -3413,7 +3399,7 @@ DINLINE void reduce_scatter_lds(
     int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
     int rank) {
   impl::reduce_scatter_lds<WORLD, THREADS, TILE_M, QUANTIZATION, T>(
-      inputs_table, bases, input_stride_m, input_size_m, input_size_n, input_values_offset, input_values_stride_m, input_scales_offset, input_scales_stride_m, partials_offset,
+      inputs_ptr_array, inputs_ptr_array_size, arena_ptr_array, arena_ptr_array_size, input_stride_m, input_size_m, input_size_n, input_values_offset, input_values_stride_m, input_scales_offset, input_scales_stride_m, partials_offset,
       partials_stride_m, partials_values_offset,
       partials_values_stride_m, partials_scales_offset,
       partials_scales_stride_m, rank);
@@ -3425,7 +3411,7 @@ DINLINE void reduce_scatter_lds(
 template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
-    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    const T* const* inputs_ptr_array, int inputs_ptr_array_size, char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_stride_m,
     int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
@@ -3439,7 +3425,7 @@ DINLINE void reduce_scatter_registers(
     int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
     int offs_n, int size_n, int block_size_m, int rank) {
   impl::reduce_scatter_registers<WORLD, THREADS, TILE_N, DIRECTION, QUANTIZATION, T>(
-      inputs_table, bases, input_stride_m, input_size_m, input_values_offset,
+      inputs_ptr_array, inputs_ptr_array_size, arena_ptr_array, arena_ptr_array_size, input_stride_m, input_size_m, input_values_offset,
       input_values_stride_m, input_scales_offset,
       input_scales_stride_m, partials_offset, partials_stride_m,
       partials_values_offset, partials_values_stride_m,

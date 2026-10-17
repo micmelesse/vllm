@@ -298,20 +298,22 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // order: the inputs, the outputs, the exchange (partials, inputs), the signals,
 // the status, then the scalars; each buffer its pointer, then its strides, then
 // its sizes, every dimension's, in elements (STANDARDS, *A kernel's arguments
-// have one format*). Our peer regions (the exchange's, the signals) are every
-// rank's arena base, BY VALUE (`PeerBases`, before the first region), and each
-// region's byte offset in the arena, then its strides and sizes: the peers'
-// arenas are opened over legacy IPC at addresses of the runtime's choosing
-// (handle.cuh), so rank r's region is `peer_ptr<T>(bases, r, offset)`
-// (common.cuh). EVERY RANK'S INPUT, exact, through the INPUT TABLE, one
-// pointer to kMaxRanks addresses in device memory (handle.cuh's INPUT TABLES),
-// read in place at the table's strides (`inputs_stride_*`); the plain
-// all-reduce's pull takes the table alone, a fused kernel this rank's input
+// have one format*). Our peer regions (the exchange's, the signals) are reached
+// through the arena's DEVICE ARRAY of every rank's base, `arena_ptr_array`
+// (`char* const*`, written once at open) with `arena_ptr_array_size` (the
+// world), before the first region, and each region's byte offset in the arena,
+// then its strides and sizes: the peers' arenas are opened over legacy IPC at
+// addresses of the runtime's choosing (handle.cuh), so rank r's region is
+// `peer_ptr<T>(arena_ptr_array, arena_ptr_array_size, r, offset)` (common.cuh).
+// EVERY RANK'S INPUT, exact, through the inputs' DEVICE ARRAY of every rank's
+// address, `inputs_ptr_array` with `inputs_ptr_array_size` (handle.cuh's INPUT
+// TABLES), read in place at its strides (`inputs_stride_*`); the plain
+// all-reduce's pull takes the array alone, a fused kernel this rank's input
 // pointer too, which INT4 quantizes into the INT4 payload the kernel finds
-// inside the inputs (common.cuh's `int4_payload`) before its first barrier.
-// The plain all-reduce's pushed variant pushes its input into the peers'
-// inputs (their inboxes) and sums its own. No kernel takes an INT4 payload's
-// offsets: they are the region's.
+// inside the inputs (common.cuh's INT4 payload layout) before its first
+// barrier. The plain all-reduce's pushed variant pushes its input into the
+// peers' inputs (their inboxes) and sums its own. No kernel takes an INT4
+// payload's offsets: they are the region's.
 // =================================================================================================
 
 // The kernels' signatures, written out by hand (one alias a signature; the
@@ -324,7 +326,7 @@ using AllReduceTwoShotKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
     int64_t /*inputs_offset*/,
@@ -336,26 +338,25 @@ using AllReduceTwoShotKernel = void (*)(
     int /*signals_size_block*/, int /*signals_size_writer*/,
     void* /*status_ptr*/, int64_t /*status_stride_field*/,
     int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
-// THE IN-PLACE PULL: every rank's input through the input table (one pointer,
-// device memory, kMaxRanks addresses: handle.cuh's INPUT TABLES) at the
-// table's strides; no input pointer of its own, no inputs region.
+// THE IN-PLACE PULL: every rank's input through the inputs' device array (one
+// pointer and its size, the world: handle.cuh's INPUT TABLES) at its strides; no input pointer of its own, no inputs region.
 using AllReduceOneShotInPlaceKernel = void (*)(
-    const void* /*inputs_table*/, int64_t /*inputs_stride_m*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/, int64_t /*inputs_stride_m*/,
     int64_t /*inputs_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*signals_offset*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
     void* /*status_ptr*/, int64_t /*status_stride_field*/,
     int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotInPlaceKernel = void (*)(
-    const void* /*inputs_table*/, int64_t /*inputs_stride_m*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/, int64_t /*inputs_stride_m*/,
     int64_t /*inputs_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/,
     int64_t /*partials_stride_m*/, int64_t /*partials_stride_n*/,
     int /*partials_size_m*/, int /*partials_size_n*/,
     int64_t /*signals_offset*/,
@@ -369,7 +370,7 @@ using AllReduceOneShotPushedKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*inputs_offset*/, int64_t /*inputs_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*inputs_offset*/, int64_t /*inputs_stride_m*/,
     int64_t /*inputs_stride_n*/, int /*inputs_size_m*/,
     int /*inputs_size_n*/, int64_t /*signals_offset*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
@@ -382,7 +383,7 @@ using AllReduceTwoShotPushedKernel = void (*)(
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
@@ -396,11 +397,11 @@ using AllReduceTwoShotPushedKernel = void (*)(
 using AllReduceRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*inputs_offset*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
     int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
@@ -412,11 +413,11 @@ using AllReduceRmsNormOneShotKernel = void (*)(
 using AllReduceRmsNormTwoShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
     int64_t /*inputs_offset*/,
@@ -432,7 +433,7 @@ using AllReduceRmsNormTwoShotKernel = void (*)(
 using AllReduceAddRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
     int64_t /*residual_stride_n*/, int /*residual_size_m*/,
     int /*residual_size_n*/, const void* /*weight_ptr*/,
@@ -441,7 +442,7 @@ using AllReduceAddRmsNormOneShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
     int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
     int /*residual_output_size_m*/, int /*residual_output_size_n*/,
-    PeerBases /*bases*/, int64_t /*inputs_offset*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
     int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
@@ -453,7 +454,7 @@ using AllReduceAddRmsNormOneShotKernel = void (*)(
 using AllReduceAddRmsNormTwoShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
     int64_t /*residual_stride_n*/, int /*residual_size_m*/,
     int /*residual_size_n*/, const void* /*weight_ptr*/,
@@ -462,7 +463,7 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*residual_output_ptr*/,
     int64_t /*residual_output_stride_m*/, int64_t /*residual_output_stride_n*/,
     int /*residual_output_size_m*/, int /*residual_output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
     int64_t /*inputs_offset*/,
@@ -478,7 +479,7 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
 using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -496,7 +497,7 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    PeerBases /*bases*/, int64_t /*inputs_offset*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*inputs_offset*/,
     int64_t /*inputs_stride_m*/, int64_t /*inputs_stride_n*/,
     int /*inputs_size_m*/, int /*inputs_size_n*/,
     int64_t /*signals_offset*/, int64_t /*signals_stride_parity*/,
@@ -509,7 +510,7 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
 using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -527,7 +528,7 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
     int64_t /*inputs_offset*/,
@@ -543,7 +544,7 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
 using AllReduceAddAttnResRmsNormPullKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
-    const void* /*inputs_table*/,
+    const void* /*inputs_ptr_array*/, int /*inputs_ptr_array_size*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -561,7 +562,7 @@ using AllReduceAddAttnResRmsNormPullKernel = void (*)(
     int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
     int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
     int /*block_output_size_m*/, int /*block_output_size_n*/,
-    PeerBases /*bases*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
+    const void* /*arena_ptr_array*/, int /*arena_ptr_array_size*/, int64_t /*partials_offset*/, int64_t /*partials_stride_m*/,
     int64_t /*partials_stride_n*/, int /*partials_size_m*/,
     int /*partials_size_n*/,
     int64_t /*inputs_offset*/,
