@@ -21,14 +21,13 @@
 // `PeerBases bases` (in the kernel arguments: no table in device memory), and
 // each region as its byte offset in the arena, its strides and its sizes,
 // `bases, x_offset, x_stride_m, ...`; rank r's is `peer_ptr<T>(bases, r,
-// x_offset)` (PEERS), one scalar load. THE CALLER'S INPUT is this rank's pointer only and
-// no peer reads it: a fused kernel first copies it into this rank's inputs (one of ours;
-// `stage_rows`, or int4 quantized into the inputs' INT4 values) and its peers read it there; the
-// plain all-reduce PUSHES it, each rank storing its input (or each rank's share of it) into the
-// peers' inputs, each rank's INBOX, at its own slot (`peers_store`, `push_shares`), and sums its
-// own inbox locally (`slots_load`, `reduce_slots`). Either way the first barrier is ordered and
-// every read of another rank's input after it is of our regions. THE PULL ALL-REDUCE IS THE ONE
-// KERNEL THAT TAKES A POINTER TABLE, its INPUT TABLE: `const T* const* inputs_table`, kMaxRanks
+// x_offset)` (PEERS), one scalar load. THE CALLER'S INPUT, exact, is read by every rank IN
+// PLACE through the INPUT TABLE (below); INT4, a kernel first quantizes it into this rank's
+// inputs' INT4 values (`stage_rows`, an encoding) and its peers read them there; the plain
+// all-reduce's pushed variant (forced) PUSHES it, each rank storing its input (or each rank's
+// share of it) into the peers' inputs, each rank's INBOX, at its own slot (`peers_store`,
+// `push_shares`), and sums its own inbox locally (`slots_load`, `reduce_slots`). Either way the
+// first barrier is ordered. THE INPUT TABLE: `const T* const* inputs_table`, kMaxRanks
 // addresses in device memory (aiter's RankData*), rank r's input at inputs_table[r] at the
 // table's strides. The kernel reads every rank's input where the table says, in place, and never
 // knows whether it points at callers' tensors (a captured call's, registered at capture exit) or
@@ -1169,6 +1168,34 @@ DINLINE T* lane_peer_ptr(const PeerBases& bases, int r, int64_t offset_bytes) {
 template <typename T>
 DINLINE T* rank_of(T* const* ptrs, int r) {
   return ptrs[__builtin_amdgcn_readfirstlane(r)];
+}
+
+// RANK r'S INPUT FROM THE INPUT TABLE FOR A RANK THAT DIFFERS ACROSS THE WAVE:
+// lane_peer_ptr's select, over the table's WORLD entries (each a uniform load)
+// instead of the bases.
+template <int WORLD, typename T>
+DINLINE T* lane_table_ptr(T* const* table, int r) {
+  const auto scalar = [](T* p) {
+    const auto u = reinterpret_cast<uint64_t>(p);
+    const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u));
+    const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(u >> 32));
+    return (uint64_t{hi} << 32) | lo;
+  };
+  uint64_t at = scalar(table[0]);
+#pragma unroll
+  for (int k = 1; k < WORLD; ++k) {
+    const uint64_t p = scalar(table[k]);
+    at = r == k ? p : at;
+  }
+  auto* const global = reinterpret_cast<__attribute__((address_space(1))) char*>(at);
+  return reinterpret_cast<T*>((char*)global);
+}
+
+// Every rank's input from the INPUT TABLE, rank r's at r (rank_of: one uniform load each).
+template <int WORLD, typename T, typename U>
+DINLINE void peers_of(T* const* table, U* (&output)[WORLD]) {
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) output[r] = rank_of(table, r);
 }
 
 // Every rank's region, rank r's at r (rank_of: one scalar load each).
@@ -2675,7 +2702,7 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int input_si
 // one a scalar; an array of every rank's, indexed at run time, was partials: 136 B). Summed over the rows through LDS into this
 // rank's partials.
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
-DINLINE void reduce_scatter_lds(const PeerBases& bases, int64_t input_offset,
+DINLINE void reduce_scatter_lds(const T* const* inputs_table, const PeerBases& bases,
                                 int64_t input_stride_m, int input_size_m, int input_size_n,
                                 int64_t input_values_offset,
                                 int64_t input_values_stride_m,
@@ -2709,7 +2736,7 @@ DINLINE void reduce_scatter_lds(const PeerBases& bases, int64_t input_offset,
         const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
         T got[1][1][P];
         if constexpr (QUANTIZATION == Quantization::none) {
-          const V* at = reinterpret_cast<const V*>(lane_peer_ptr<WORLD, const T>(bases, r, input_offset) +
+          const V* at = reinterpret_cast<const V*>(lane_table_ptr<WORLD>(inputs_table, r) +
                                                    row * input_stride_m);
           held(got[0][0], pack_load(at_col<P, LANES>(at, end, c, 0)));
           issued();
@@ -2744,8 +2771,8 @@ DINLINE void reduce_scatter_lds(const PeerBases& bases, int64_t input_offset,
 template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
-    const PeerBases& bases, int64_t input_offset, int64_t input_stride_m, int input_size_m,
-    int64_t input_values_offset,
+    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    int input_size_m, int64_t input_values_offset,
     int64_t input_values_stride_m, int64_t input_scales_offset, int64_t input_scales_stride_m, int64_t partials_offset, int64_t partials_stride_m, int64_t partials_values_offset, int64_t partials_values_stride_m,
     int64_t partials_scales_offset,
     int64_t partials_scales_stride_m, int offs_n, int size_n, int block_size_m, int rank) {
@@ -2757,7 +2784,7 @@ DINLINE void reduce_scatter_registers(
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
   using Summed = std::conditional_t<kInt4, float, T>;
   const T* input[WORLD];
-  peers_of(bases, input_offset, input);
+  if constexpr (!kInt4) peers_of(inputs_table, input);
   const uint8_t* input_values[WORLD];
   const __fp16* input_scales[WORLD];
   if constexpr (kInt4) {
@@ -3014,9 +3041,36 @@ DINLINE void store(const U (&input)[ROWS][K][P], T* output_ptr, int64_t output_s
       offs_n, row_step);
 }
 
-// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (our inputs, the bases
-// and the region's offset), its quantized form ours (the staged or summed
-// values and scales).
+// THE PEERS' INPUTS IN QUANTIZATION'S FORM, the input's every rank's from the INPUT TABLE
+// (none: read in place), its quantized form ours (int4: the staged values and scales, the bases
+// and the regions' offsets; the table unused).
+template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
+          int WORLD, int ROWS, int K, int P>
+DINLINE void peers_load(const T* const* inputs_table, const PeerBases& bases,
+                        int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
+                        int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
+                        int64_t input_values_stride_n, int input_values_size_m,
+                        int input_values_size_n, int64_t input_scales_offset, int64_t input_scales_stride_m,
+                        int64_t input_scales_stride_n, int input_scales_size_m,
+                        int input_scales_size_n, U (&output)[WORLD][ROWS][K][P],
+                        int offs_m, int offs_n, int row_step = 1) {
+  const T* input[WORLD];
+  const uint8_t* values[WORLD];
+  const __fp16* scales[WORLD];
+  if constexpr (QUANTIZATION == Quantization::none) {
+    impl::peers_of(inputs_table, input);
+  } else {
+    impl::peers_of(bases, input_values_offset, values);
+    impl::peers_of(bases, input_scales_offset, scales);
+  }
+  impl::exchanged_peers_load<THREADS_M, THREADS_N, QUANTIZATION>(
+      input, input_stride_m, values, input_values_stride_m, scales, input_scales_stride_m,
+      input_size_m, input_size_n, output, offs_m, offs_n, row_step);
+}
+
+// THE PEERS' COPIES IN QUANTIZATION'S FORM: the input's every rank's (our regions, the bases
+// and the region's offset: the partials), its quantized form ours (the summed values and
+// scales).
 template <int THREADS_M, int THREADS_N, int QUANTIZATION, typename T, typename U,
           int WORLD, int ROWS, int K, int P>
 DINLINE void peers_load(const PeerBases& bases, int64_t input_offset,
@@ -3345,7 +3399,8 @@ DINLINE void stage_rows(const T* input_ptr, int64_t input_stride_m, int64_t inpu
 // the sums' values and scales.
 template <int WORLD, int THREADS, int TILE_M, int QUANTIZATION, typename T>
 DINLINE void reduce_scatter_lds(
-    const PeerBases& bases, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
+    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
     int64_t input_scales_offset,
@@ -3358,7 +3413,7 @@ DINLINE void reduce_scatter_lds(
     int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
     int rank) {
   impl::reduce_scatter_lds<WORLD, THREADS, TILE_M, QUANTIZATION, T>(
-      bases, input_offset, input_stride_m, input_size_m, input_size_n, input_values_offset, input_values_stride_m, input_scales_offset, input_scales_stride_m, partials_offset,
+      inputs_table, bases, input_stride_m, input_size_m, input_size_n, input_values_offset, input_values_stride_m, input_scales_offset, input_scales_stride_m, partials_offset,
       partials_stride_m, partials_values_offset,
       partials_values_stride_m, partials_scales_offset,
       partials_scales_stride_m, rank);
@@ -3370,7 +3425,8 @@ DINLINE void reduce_scatter_lds(
 template <int WORLD, int THREADS, int TILE_N, Direction DIRECTION, int QUANTIZATION,
           typename T>
 DINLINE void reduce_scatter_registers(
-    const PeerBases& bases, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
+    const T* const* inputs_table, const PeerBases& bases, int64_t input_stride_m,
+    int64_t input_stride_n,
     int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
     int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
     int64_t input_scales_offset,
@@ -3383,7 +3439,7 @@ DINLINE void reduce_scatter_registers(
     int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
     int offs_n, int size_n, int block_size_m, int rank) {
   impl::reduce_scatter_registers<WORLD, THREADS, TILE_N, DIRECTION, QUANTIZATION, T>(
-      bases, input_offset, input_stride_m, input_size_m, input_values_offset,
+      inputs_table, bases, input_stride_m, input_size_m, input_values_offset,
       input_values_stride_m, input_scales_offset,
       input_scales_stride_m, partials_offset, partials_stride_m,
       partials_values_offset, partials_values_stride_m,

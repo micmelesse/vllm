@@ -303,15 +303,15 @@ constexpr int64_t packs_of(int64_t elems, DType dtype) {
 // region's byte offset in the arena, then its strides and sizes: the peers'
 // arenas are opened over legacy IPC at addresses of the runtime's choosing
 // (handle.cuh), so rank r's region is `peer_ptr<T>(bases, r, offset)`
-// (common.cuh). THE INPUT IS THIS RANK'S POINTER only: a fused kernel copies
-// it into this rank's inputs (INT4: quantized into the INT4 payload the kernel
-// finds inside the inputs, common.cuh's `int4_payload`) before its first
-// barrier, and the peers read the inputs there; the plain all-reduce's pushed
-// variant pushes it into the peers' inputs (their inboxes) and sums its own.
-// THE PLAIN ALL-REDUCE'S DEFAULT, the in-place pull, takes no input pointer:
-// its INPUT TABLE, one pointer to kMaxRanks addresses in device memory
-// (handle.cuh's INPUT TABLES), the one table a kernel takes. No kernel takes an
-// INT4 payload's offsets: they are the region's.
+// (common.cuh). EVERY RANK'S INPUT, exact, through the INPUT TABLE, one
+// pointer to kMaxRanks addresses in device memory (handle.cuh's INPUT TABLES),
+// read in place at the table's strides (`inputs_stride_*`); the plain
+// all-reduce's pull takes the table alone, a fused kernel this rank's input
+// pointer too, which INT4 quantizes into the INT4 payload the kernel finds
+// inside the inputs (common.cuh's `int4_payload`) before its first barrier.
+// The plain all-reduce's pushed variant pushes its input into the peers'
+// inputs (their inboxes) and sums its own. No kernel takes an INT4 payload's
+// offsets: they are the region's.
 // =================================================================================================
 
 // The kernels' signatures, written out by hand (one alias a signature; the
@@ -396,6 +396,7 @@ using AllReduceTwoShotPushedKernel = void (*)(
 using AllReduceRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
@@ -411,6 +412,7 @@ using AllReduceRmsNormOneShotKernel = void (*)(
 using AllReduceRmsNormTwoShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
     int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
@@ -430,6 +432,7 @@ using AllReduceRmsNormTwoShotKernel = void (*)(
 using AllReduceAddRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
     int64_t /*residual_stride_n*/, int /*residual_size_m*/,
     int /*residual_size_n*/, const void* /*weight_ptr*/,
@@ -450,6 +453,7 @@ using AllReduceAddRmsNormOneShotKernel = void (*)(
 using AllReduceAddRmsNormTwoShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
     int64_t /*residual_stride_n*/, int /*residual_size_m*/,
     int /*residual_size_n*/, const void* /*weight_ptr*/,
@@ -474,6 +478,7 @@ using AllReduceAddRmsNormTwoShotKernel = void (*)(
 using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -504,6 +509,7 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
 using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -537,6 +543,7 @@ using AllReduceAddAttnResRmsNormPushKernel = void (*)(
 using AllReduceAddAttnResRmsNormPullKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*inputs_table*/,
     const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
     int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
     const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
@@ -577,10 +584,12 @@ using AllReduceAddAttnResRmsNormPullKernel = void (*)(
 // reduce_scatter_blocks), the stream, then the kernel's arguments.
 // =================================================================================================
 
-// Every fused kernel copies its input into the inputs itself; the plain
-// all-reduce pushes it into the peers' inputs, its inbox: [WORLD * band, n]
-// (one-shot), [WORLD, slot] (exact two-shot, a band of `partials_size_m` rows a
-// pass), the problem's [m, n] INT4 payload (int4). The regions (partials, inputs; with
+// An exact call's input is read in place through its input table (its strides
+// the table's, the launch's `inputs_stride_*` unused: 0 for the plain
+// all-reduce); an INT4 call's quantized into the inputs' payload, the
+// problem's [m, n]; the pushed all-reduce's (forced) pushed into the peers'
+// inbox: [WORLD * band, n] (one-shot), [WORLD, slot] (exact two-shot, a band
+// of `partials_size_m` rows a pass). The regions (partials, inputs; with
 // `quantization` int4 each holds its INT4 payload, which the kernel finds from
 // the region and these sizes) are the handle's, so a launch holds only their
 // strides and sizes.

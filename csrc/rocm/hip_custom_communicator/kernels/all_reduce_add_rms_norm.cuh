@@ -35,6 +35,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
+    const DTYPE* const* __restrict__ inputs_table,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -51,15 +52,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. This rank's input copied into its inputs, this block's rows (the ones
-  // this block's twin on every rank reads), then wait until every peer has
-  // launched and copied its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, 1, Quantization::none>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n,
-      static_cast<uint8_t*>(nullptr), 0, 0, 0, 0, static_cast<__fp16*>(nullptr), 0, 0, 0,
-      0, input_size_m);
+  // 1. Wait until every peer has launched: its input, the caller's tensor (a
+  // captured call's, registered) or the host's copy in its inputs (an eager
+  // call's), is ready before it, and the first barrier is ordered. Read where
+  // the input table says, in place.
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -83,7 +79,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][K][P];
     peers_load<1, THREADS_PER_BLOCK>(
-        bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+        inputs_table, inputs_stride_m, inputs_stride_n,
                                      input_size_m, input_size_n, peers, row,
                                      0);
     DTYPE res[1][K][P];
@@ -143,6 +139,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -158,6 +155,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, bases, inputs_offset, inputs_stride_m, inputs_stride_n,
       inputs_size_m, inputs_size_n, signals_offset, signals_stride_parity,
@@ -175,6 +173,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -195,6 +194,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -236,6 +236,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
+    const DTYPE* const* __restrict__ inputs_table,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -269,18 +270,21 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // partials.
   const int64_t scale_at = int64_t{slice_m} * partials_stride_m;  // in elements
 
-  // 1. This rank's input copied into its inputs in QUANTIZATION's form (none:
-  // as it is; int4: quantized into the inputs' INT4 payload), the rows
-  // this block's twin on every rank reads, then wait until every peer has
-  // launched and staged its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_values_offset), inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      peer_ptr<__fp16>(bases, rank, inputs_scales_offset), inputs_scales_stride_m,
-      inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-      slice_m);
+  // 1. none: nothing staged, every rank's input read in place where the
+  // input table says (a captured call's tensor, or an eager call's host copy
+  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // payload (an encoding: what crosses the links is quantized by its owner),
+  // the rows this block's twin on every rank reads. Then wait until every
+  // peer has launched (and staged its own; the first barrier is ordered).
+  if constexpr (QUANTIZATION == Quantization::int4)
+    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m,
+        input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_values_offset), inputs_values_stride_m,
+        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
+        peer_ptr<__fp16>(bases, rank, inputs_scales_offset), inputs_scales_stride_m,
+        inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
+        slice_m);
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -305,7 +309,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // Row `row` from every rank.
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
     peers_load<1, THREADS_PER_BLOCK, QUANTIZATION, DTYPE>(
-        bases, inputs_offset, inputs_stride_m, inputs_stride_n, input_size_m, input_size_n,
+        inputs_table, bases, inputs_stride_m, inputs_stride_n, input_size_m, input_size_n,
         inputs_values_offset, inputs_values_stride_m,
         inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
         inputs_scales_offset, inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
@@ -481,6 +485,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -503,6 +508,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, bases, partials_offset, partials_stride_m,
       partials_stride_n,
@@ -529,6 +535,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -555,6 +562,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -603,6 +611,7 @@ template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, bool ADD_RESIDUAL,
 DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
+    const DTYPE* const* __restrict__ inputs_table,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -644,18 +653,21 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                        ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
                        : 0;
 
-  // 1. This rank's input copied into its inputs in QUANTIZATION's form (none:
-  // as it is; int4: quantized into the inputs' INT4 payload), the rows
-  // this block's twin on every rank reads, then wait until every peer has
-  // launched and staged its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_values_offset), inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      peer_ptr<__fp16>(bases, rank, inputs_scales_offset), inputs_scales_stride_m,
-      inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-      input_size_m);
+  // 1. none: nothing staged, every rank's input read in place where the
+  // input table says (a captured call's tensor, or an eager call's host copy
+  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // payload (an encoding: what crosses the links is quantized by its owner),
+  // the rows this block's twin on every rank reads. Then wait until every
+  // peer has launched (and staged its own; the first barrier is ordered).
+  if constexpr (QUANTIZATION == Quantization::int4)
+    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m,
+        input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_values_offset), inputs_values_stride_m,
+        inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
+        peer_ptr<__fp16>(bases, rank, inputs_scales_offset), inputs_scales_stride_m,
+        inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
+        input_size_m);
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -671,7 +683,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION, DTYPE>(
-      bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+      inputs_table, bases, inputs_stride_m, inputs_stride_n,
       input_size_m, input_size_n, inputs_values_offset, inputs_values_stride_m, inputs_values_stride_n,
       inputs_values_size_m, inputs_values_size_n, inputs_scales_offset,
       inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
@@ -757,6 +769,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -779,6 +792,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, false,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, bases, partials_offset, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n,
@@ -805,6 +819,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -831,6 +846,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, true,
                                              TILE_N, THREADS_PER_BLOCK, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
+      inputs_table,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,

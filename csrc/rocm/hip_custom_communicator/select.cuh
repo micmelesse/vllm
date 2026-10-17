@@ -1259,9 +1259,11 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
     return Error::partials_too_small;
   if (!in_passes && partials > h->partials_bytes())
     return Error::partials_too_small;
-  // A BUILD THAT DOES NOT RUN IN PASSES copies its input into the inputs
-  // whole (the INT4 all-reduce: pushes it), inside the kernel, before its
-  // first barrier.
+  // A BUILD THAT DOES NOT RUN IN PASSES has its input in the inputs whole:
+  // an eager exact call's host copy (handle.cuh's INPUT TABLES; a captured
+  // one's is read where it is, refused here alike, so the eager and captured
+  // calls of one shape agree), or an INT4 call's quantized payload (the INT4
+  // all-reduce: pushed).
   const int64_t bytes = m * n * elem_bytes(dtype);
   if (!in_passes && bytes > h->inputs_bytes())
     return Error::inputs_too_small;
@@ -2089,9 +2091,9 @@ constexpr int64_t widest_row(OpType o) {
 // `max_rows` rows of at most `max_cols` columns (for a model, the server's
 // tokens a batch by its hidden size), and each region holds its largest
 // payload at that call, in every built dtype and in either encoding (exact or
-// INT4: common.cuh's `int4_payload`): the inputs the whole input (every
-// per-row kernel copies its input into it whole; the plain all-reduce pushes
-// into it as an inbox of WORLD slots, a band of rows a pass, so at least a row
+// INT4: common.cuh's `int4_payload`): the inputs the whole input (an eager
+// exact call's host copy, read through the eager input table; the pushed
+// all-reduce's inbox of WORLD slots, a band of rows a pass, so at least a row
 // a slot), or its INT4 payload; the partials the most any two-shot keeps
 // (`partials_need`), or its INT4 payload (bounded as one row of its elements).
 // Each need grows with the rows and the row's width, so a call inside the box

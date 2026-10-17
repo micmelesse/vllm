@@ -205,6 +205,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
         const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
@@ -236,15 +237,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
-  // 1. This rank's input copied into its inputs, this block's rows (the ones
-  // this block's twin on every rank reads), then wait until every peer has
-  // launched and copied its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, 1, Quantization::none>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n,
-      static_cast<uint8_t*>(nullptr), 0, 0, 0, 0, static_cast<__fp16*>(nullptr), 0, 0, 0,
-      0, input_size_m);
+  // 1. Wait until every peer has launched: its input, the caller's tensor (a
+  // captured call's, registered) or the host's copy in its inputs (an eager
+  // call's), is ready before it, and the first barrier is ordered. Read where
+  // the input table says, in place.
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -256,7 +252,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][K][P];
     peers_load<1, THREADS_PER_BLOCK>(
-        bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+        inputs_table, inputs_stride_m, inputs_stride_n,
                                      input_size_m, input_size_n, peers, row, 0);
     float sum_f[1][K][P];
     peers_sum(peers, sum_f);
@@ -315,6 +311,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
         const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
@@ -356,18 +353,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 7168 and the others reduce-scattered 8/7 of the row.
   const int slice_n = (input_size_n / P + WORLD - 1) / WORLD * P;
 
-  // 1. This rank's input copied into its inputs in QUANTIZATION's form (none:
-  // as it is; int4: quantized into the inputs' INT4 payload), the rows
-  // this block's twin on every rank reads, then wait until every peer has
-  // launched and staged its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
-      inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
-      peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
-      inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
-      input_size_m);
+  // 1. none: nothing staged, every rank's input read in place where the
+  // input table says (a captured call's tensor, or an eager call's host copy
+  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // payload (an encoding: what crosses the links is quantized by its owner),
+  // the rows this block's twin on every rank reads. Then wait until every
+  // peer has launched (and staged its own; the first barrier is ordered).
+  if constexpr (QUANTIZATION == Quantization::int4)
+    stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m,
+        input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
+        inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
+        peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
+        inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
+        input_size_m);
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -383,7 +383,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    21-26-11Z), summed through LDS (reduce_scatter_lds).
   (void)reduce_scatter_blocks;
   reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION, DTYPE>(
-      bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+      inputs_table, bases, inputs_stride_m, inputs_stride_n,
       input_size_m, input_size_n, inputs_int4.values_offset, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
       inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_offset,
       inputs_int4.scales_stride_m, inputs_int4.scales_stride_n, inputs_int4.scales_size_m,
@@ -458,6 +458,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ inputs_table,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,
         int64_t prefix_stride_n, int prefix_size_m, int prefix_size_n,
         const DTYPE* __restrict__ blocks_ptr, int64_t blocks_stride_m,
@@ -507,18 +508,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
           : 0;
 
-  // 1. This rank's input copied into its inputs in QUANTIZATION's form (none:
-  // as it is; int4: quantized into the inputs' INT4 payload), the rows
-  // this block's twin on every rank reads, then wait until every peer has
-  // launched and staged its own (the first barrier is ordered).
-  stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m,
-      input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
-      inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
-      inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
-      peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
-      inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
-      input_size_m);
+  // 1. none: nothing staged, every rank's input read in place where the
+  // input table says (a captured call's tensor, or an eager call's host copy
+  // in its inputs). int4: this rank's input QUANTIZED into its inputs' INT4
+  // payload (an encoding: what crosses the links is quantized by its owner),
+  // the rows this block's twin on every rank reads. Then wait until every
+  // peer has launched (and staged its own; the first barrier is ordered).
+  if constexpr (QUANTIZATION == Quantization::int4)
+    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m,
+        input_size_n, peer_ptr<DTYPE>(bases, rank, inputs_offset), inputs_stride_m,
+        inputs_stride_n, inputs_size_m, inputs_size_n, peer_ptr<uint8_t>(bases, rank, inputs_int4.values_offset), inputs_int4.values_stride_m,
+        inputs_int4.values_stride_n, inputs_int4.values_size_m, inputs_int4.values_size_n,
+        peer_ptr<__fp16>(bases, rank, inputs_int4.scales_offset), inputs_int4.scales_stride_m,
+        inputs_int4.scales_stride_n, inputs_int4.scales_size_m, inputs_int4.scales_size_n,
+        input_size_m);
   barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -536,7 +540,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    across it they spilled).
   reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
                            QUANTIZATION, DTYPE>(
-      bases, inputs_offset, inputs_stride_m, inputs_stride_n,
+      inputs_table, bases, inputs_stride_m, inputs_stride_n,
       input_size_m, input_size_n, inputs_int4.values_offset, inputs_int4.values_stride_m, inputs_int4.values_stride_n,
       inputs_int4.values_size_m, inputs_int4.values_size_n, inputs_int4.scales_offset,
       inputs_int4.scales_stride_m, inputs_int4.scales_stride_n, inputs_int4.scales_size_m,

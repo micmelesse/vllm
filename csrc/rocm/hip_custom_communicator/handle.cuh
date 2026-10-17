@@ -9,15 +9,16 @@
 // caller's CPU group (`Gather`), and each rank opens every peer's
 // (hipIpcOpenMemHandle). A peer's arena is at whatever address its opening
 // gave, so a kernel takes every rank's base BY VALUE in its arguments
-// (common.cuh's PeerBases) and each region as its offset in the arena. THE
-// PLAIN ALL-REDUCE'S INPUT is read by its peers IN PLACE (aiter's gfx950
-// pattern), through an INPUT TABLE in device memory (INPUT TABLES, below): a
-// captured call's table points at every rank's own tensor, registered when the
-// capture exits (`register_captured`, one batched exchange over the CPU
-// group); an eager call's input is copied by the host into this rank's inputs
-// region on the launch's stream and its table, fixed at open, points at every
-// rank's inputs region. The fused kernels copy their input into the inputs
-// themselves (INT4: quantized), before their first barrier. The collective
+// (common.cuh's PeerBases) and each region as its offset in the arena. AN
+// EXACT CALL'S INPUT is read by its peers IN PLACE (aiter's gfx950 pattern),
+// through an INPUT TABLE in device memory (INPUT TABLES, below): a captured
+// call's table points at every rank's own tensor, registered when the capture
+// exits (`register_captured`, one batched exchange over the CPU group); an
+// eager call's input is copied by the host into this rank's inputs region on
+// the launch's stream and its table, fixed at open, points at every rank's
+// inputs region. An INT4 call's kernel quantizes its input into the inputs'
+// INT4 payload itself (an encoding, not a copy), before its first barrier.
+// The collective
 // that exchanges the handles is the caller's (`Gather`), so this names no
 // process group.
 
@@ -124,11 +125,10 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //                                         flags (torch SymmetricMemory's
 //                                         "signal pad")
 //   inputs     signals end                what this rank publishes of its
-//                                         input: an eager plain all-reduce's
-//                                         host copy (read through the eager
-//                                         input table), a fused kernel's own
-//                                         copy, the INT4 payload, or the
-//                                         pushed variant's inbox
+//                                         input: an eager exact call's host
+//                                         copy (read through the eager input
+//                                         table), an INT4 call's payload, or
+//                                         the pushed all-reduce's inbox
 //   partials   inputs end                 what this rank publishes of its
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
@@ -157,13 +157,13 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // (a two-shot ends with its all-gather): the next launch's first barrier is
 // the one that orders it. So the previous call's readers are done whichever
 // encoding either call used.
-// Every fused kernel copies its input into its inputs (or, INT4, their
-// payload), and the pushed all-reduce pushes it into its peers' inputs (each
-// rank's inbox, a slot a writer), before its first barrier, which is ordered,
-// every rank's at its base and the region's offset. The in-place all-reduce's
-// eager copy is the host's, before its launch; its peers read it through the
-// eager input table only after its first barrier, and its launch ends only
-// after every peer's last read (INPUT TABLES).
+// An INT4 kernel quantizes its input into its inputs' payload, and the pushed
+// all-reduce pushes it into its peers' inputs (each rank's inbox, a slot a
+// writer), before its first barrier, which is ordered, every rank's at its
+// base and the region's offset. An exact call's eager copy is the host's,
+// before its launch; its peers read it through the eager input table only
+// after its first barrier, and its launch ends only after every peer's last
+// read (INPUT TABLES).
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
@@ -437,9 +437,9 @@ inline OtherProcesses other_processes_on(int device) {
   return out;
 }
 
-// INPUT TABLES: the plain all-reduce's view of every rank's input, a TABLE of
-// kMaxRanks addresses (rank r's input at [r], null past the world) in this
-// rank's device memory, the one pointer its kernel takes (aiter's RankData*).
+// INPUT TABLES: an exact call's view of every rank's input (every op's), a
+// TABLE of kMaxRanks addresses (rank r's input at [r], null past the world) in
+// this rank's device memory, one pointer its kernel takes (aiter's RankData*).
 // The tables live in one SLAB (hipMalloc: read by this rank's kernels only),
 // kInputTableSlots of them:
 //   - slot 0, THE EAGER TABLE, written at open: every rank's inputs region
@@ -458,8 +458,8 @@ inline OtherProcesses other_processes_on(int device) {
 // rank records must match for the exchange (a collective) to pair them.
 // THE ORDER THAT LETS AN INPUT BE OVERWRITTEN: every peer's last read of this
 // rank's input precedes a barrier this rank's launch waits on before it ends
-// (the one-shot's `read`, the two-shot's second), so the next eager copy, or
-// the caller's next write, comes after every read.
+// (a one-shot's `read`, a two-shot's second, after its reduce-scatter), so the
+// next eager copy, or the caller's next write, comes after every read.
 constexpr int64_t kInputTableSlots = 16384;
 
 // A LAUNCH'S INPUT TABLE: the table's address and the strides every rank's

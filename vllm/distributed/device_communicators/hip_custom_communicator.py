@@ -16,12 +16,12 @@ all or none) are the one way to force one, for the sweep and the tests. Every on
 passed through as it came: C++ builds the config, checks it, and answers.
 
 THE MEMORY (C++'s `Handle`): the communicator's arena is one allocation per rank,
-which every rank opened at open over legacy HIP IPC. The plain all-reduce reads every
+which every rank opened at open over legacy HIP IPC. Every exact call reads every
 rank's input IN PLACE through an input table (aiter's gfx950 pattern): a captured
 call's tensors, registered when `capture()` exits (one exchange of their IPC handles
 over the CPU group, a collective), or an eager call's copy, which C++ makes into the
-arena's inputs region on the call's stream. A fused kernel copies its input into the
-inputs region itself.
+arena's inputs region on the call's stream. An INT4 call's kernel quantizes its input
+into the inputs region itself.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -1541,7 +1541,7 @@ class HipCustomCommunicator:
 
     @contextmanager
     def _on_capture(self) -> Iterator[None]:
-        """Wrap a cudagraph capture. Each captured all-reduce reserves an input
+        """Wrap a cudagraph capture. Each captured exact call reserves an input
         table, filled on exit: every rank exchanges the IPC handles of the inputs
         its capture recorded over the CPU group (a collective, so every rank exits
         its capture together) and opens its peers'. Before any replay."""

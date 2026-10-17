@@ -73,8 +73,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
   // 1. Every rank's input is ready (written before its launch: the caller's,
-  // or the host's copy) and visible.
-  barrier<Until::visible, 0, WORLD>(
+  // or the host's copy) and visible (the first barrier is ordered).
+  barrier<Until::launched, 0, WORLD>(
       bases, signals_offset, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
