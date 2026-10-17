@@ -104,10 +104,10 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
                                   residual_output_stride_n, input_size_m,
                                   input_size_n, row, 0);
     }
-    float ss[1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss, input_size_n, 0);
-    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    float ss[1][1];
+    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
+    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
+    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
     float normed_f[1][K][P];
     mul(s, scale, normed_f);
@@ -355,10 +355,10 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
           own_partials_scales, partials_scales_stride_m, partials_scales_stride_n,
           partials_scales_size_m, partials_scales_size_n, row - first, 0);
     }
-    float ss[1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss, input_size_n, 0);
-    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    float ss[1][1];
+    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
+    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
+    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
     // every rank norms it while gathering, so the link carries one row a row,
     // as a plain all-reduce does (gathering both the normed row and the
@@ -761,10 +761,10 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
                                   residual_output_stride_n, input_size_m,
                                   input_size_n, row, 0);
     }
-    float ss[1];
-    partial_dot<THREADS_PER_BLOCK>(s, s, ss, input_size_n, 0);
-    block_reduce<Sum, THREADS_PER_BLOCK>(ss);
-    const float scale = rsqrtf(ss[0] * inv_hidden + eps);
+    float ss[1][1];
+    partial_dot<THREADS_PER_BLOCK>(s, s, ss[0], input_size_n, 0);
+    block_reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
+    const float scale = rsqrtf(ss[0][0] * inv_hidden + eps);
     // out = T(W(W(s * scale) * float(w))), as the reference rounds
     float normed_f[1][K][P];
     mul(s, scale, normed_f);

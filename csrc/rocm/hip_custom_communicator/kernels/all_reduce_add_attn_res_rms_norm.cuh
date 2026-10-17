@@ -111,7 +111,7 @@ DINLINE void block_attn_res_tile(
     const int full = num_blocks / TILE_K * TILE_K;
     const auto step = [&](int src0, auto last) {
       DTYPE v[TILE_K][ROWS][K][P];
-      float sums[ROWS * 2 * TILE_K];
+      float sums[1][ROWS * 2 * TILE_K];
 #pragma unroll
       for (int s = 0; s < TILE_K; ++s) {
         const int src = src0 + s;
@@ -130,11 +130,11 @@ DINLINE void block_attn_res_tile(
         partial_dot<THREADS>(v[s], w, dw, input_size_n, offs_n);
 #pragma unroll
         for (int m = 0; m < ROWS; ++m) {
-          sums[(m * TILE_K + s) * 2] = ss[m];
-          sums[(m * TILE_K + s) * 2 + 1] = dw[m];
+          sums[0][(m * TILE_K + s) * 2] = ss[m];
+          sums[0][(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      block_reduce<Sum, THREADS>(sums);
+      block_reduce<Sum, ReduceAxis::all, 1, THREADS>(sums, sums);
       float old_scale[ROWS], scale[TILE_K][ROWS];
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) {
@@ -143,8 +143,8 @@ DINLINE void block_attn_res_tile(
         for (int s = 0; s < TILE_K; ++s)
           logit[s] =
               !decltype(last)::value || src0 + s <= num_blocks
-                  ? sums[(m * TILE_K + s) * 2 + 1] *
-                        rsqrtf(sums[(m * TILE_K + s) * 2] * inv_hidden + eps)
+                  ? sums[0][(m * TILE_K + s) * 2 + 1] *
+                        rsqrtf(sums[0][(m * TILE_K + s) * 2] * inv_hidden + eps)
                   : -INFINITY;
         float row_scale[TILE_K];
         old_scale[m] = thread_softmax_fold(softmax_max[m], softmax_denominator[m], logit, row_scale);
@@ -176,13 +176,13 @@ DINLINE void block_attn_res_tile(
     DTYPE output_norm_weight[1][K][P];
     load<1, THREADS>(output_norm_weight_ptr, 0, output_norm_weight_stride_n, 1,
                      input_size_n, output_norm_weight, 0, offs_n);
-    float ss[ROWS];
-    partial_dot<THREADS>(acc, acc, ss, input_size_n, offs_n);
-    block_reduce<Sum, THREADS>(ss);
+    float ss[1][ROWS];
+    partial_dot<THREADS>(acc, acc, ss[0], input_size_n, offs_n);
+    block_reduce<Sum, ReduceAxis::all, 1, THREADS>(ss, ss);
     float scale[ROWS];
 #pragma unroll
     for (int m = 0; m < ROWS; ++m)
-      scale[m] = rsqrtf(ss[m] * inv_hidden + output_eps);
+      scale[m] = rsqrtf(ss[0][m] * inv_hidden + output_eps);
     float normed[ROWS][K][P], output_norm_weight_f[1][K][P];
     mul(acc, scale, normed);
     convert(output_norm_weight, output_norm_weight_f);

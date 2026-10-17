@@ -866,95 +866,121 @@ struct Max {
   static constexpr float kIdentity = -INFINITY;
 };
 
-// ONE DPP STEP: `v` from the lane `ctrl` names, as a VALU operand, no LDS.
-// `row_mask` picks which 16-lane rows take it; the others read `identity`,
-// which leaves them as they were. A FULL ROW MASK NEEDS NO `old`: left
-// undefined (mov_dpp), the compiler fuses the move into the add that uses it
-// (v_add_f32_dpp); an explicit identity kept a v_mov_b32_dpp and an add a step
-// (ISA 2026-10-04T03-07-41Z).
-namespace impl {
-template <int DPP_CTRL, int DPP_ROW_MASK, typename REDUCE_OP>
-DINLINE float dpp(float v) {
-  int moved;
-  if constexpr (DPP_ROW_MASK == 0xf)
-    moved = __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), DPP_CTRL, 0xf,
-                                     0xf, false);
-  else
-    moved = __builtin_amdgcn_update_dpp(
-        __builtin_bit_cast(int, REDUCE_OP::kIdentity),
-        __builtin_bit_cast(int, v), DPP_CTRL, DPP_ROW_MASK, 0xf, false);
-  return __builtin_bit_cast(float, moved);
-}
-}  // namespace impl
+// THE AXIS a block_reduce reduces over (template ints, as Quantization): `all`, the whole block;
+// `m`, the THREADS_M rows of THREADS_N threads, elementwise a lane.
+namespace ReduceAxis {
+constexpr int all = 0;
+constexpr int m = 1;
+}  // namespace ReduceAxis
 
-// N VALUES OVER THE WAVE, in place, every lane left holding the results. The
-// moved value first: only a VOP2's src0 takes DPP, so (dpp(x), x) fuses each
-// step into one v_add_f32_dpp where (x, dpp(x)) was a v_mov_b32_dpp and an add
-// (ISA 2026-10-04T02-22-41Z). DPP, as rocPRIM's and Composable Kernel's wave
-// reductions do: each step is a VALU operand from another lane. The butterfly
-// __shfl_xor it replaced compiled to ds_bpermute, an LDS round trip a step, six
-// of them waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for
-// one block_reduce).
-//   swap neighbours, swap pairs (quad_perm [1,0,3,2], [2,3,0,1]): each quad
-//   holds its sum mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror):
-//   each row holds its sum lane 15 into rows 1 and 3, lane 31 into rows 2 and 3
-//   (row_bcast15, row_bcast31): lane 63 holds the wave's, and readlane hands it
-//   to every lane.
-namespace impl {
-template <typename REDUCE_OP, int NUM_VALUES>
-DINLINE void wave_reduce(float (&v)[NUM_VALUES]) {
-  static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
+// THE BLOCK REDUCTION, one for every case: block_reduce<OP, AXIS, THREADS_M, THREADS_N>(input,
+// output), OP Sum or Max, every value of [K][P] reduced on its own, in fp32. Input and output may
+// be the same array (in place).
+//
+// AXIS all: over the whole block (THREADS_M * THREADS_N threads, THREADS_M 1), every thread left
+// holding the results. Each wave reduces its values by DPP, then every thread combines the waves'
+// partials in wave order (the same order in every thread, so every thread holds the same totals).
+// One wave reducing the partials over all 64 lanes, then broadcasting them, was a second DPP pass a
+// value, a second barrier and an LDS round trip to add 4 numbers at 256 threads: half of AttnRes's
+// loop (ISA 2026-10-04T03-31-28Z). The trailing barrier keeps the next call from overwriting
+// partials still being read. THE BLOCK'S WAVES ARE COMPILED IN: read from blockDim, every thread
+// loaded the widest block's partials and kept 12 VGPRs at AttnRes's peak (ISA 2026-10-04T16-39-15Z).
+//
+// AXIS m: over the THREADS_M rows of THREADS_N threads (a rank's copy a row, in the collectives),
+// each value of a lane with the same lane's of every row: each row's packs into LDS at its row's
+// place, consecutive threads' packs adjacent, then the first row's threads combine each pack over
+// the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
+// after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
+// ISA 2026-10-15).
+template <typename OP, int AXIS, int THREADS_M, int THREADS_N, typename T, typename U, int K,
+          int P>
+DINLINE void block_reduce(const T (&input)[K][P], U (&output)[K][P]) {
+  static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
+  if constexpr (AXIS == ReduceAxis::all) {
+    static_assert(THREADS_M == 1, "AXIS all is one row of the block's threads");
+    constexpr int kValues = K * P;
+    constexpr int kWaves = (THREADS_N + kWaveSize - 1) / kWaveSize;
+    __shared__ float partial[kValues][kWaves];
+    const int lane = threadIdx.x % kWaveSize;
+    const int wave = threadIdx.x / kWaveSize;
+    float v[kValues];
 #pragma unroll
-  for (int n = 0; n < NUM_VALUES; ++n) {
-    float x = v[n];
-    x = REDUCE_OP::apply(dpp<0xb1, 0xf, REDUCE_OP>(x),
-                         x);  // quad_perm [1,0,3,2]
-    x = REDUCE_OP::apply(dpp<0x4e, 0xf, REDUCE_OP>(x),
-                         x);  // quad_perm [2,3,0,1]
-    x = REDUCE_OP::apply(dpp<0x141, 0xf, REDUCE_OP>(x), x);  // row_half_mirror
-    x = REDUCE_OP::apply(dpp<0x140, 0xf, REDUCE_OP>(x), x);  // row_mirror
-    x = REDUCE_OP::apply(dpp<0x142, 0xa, REDUCE_OP>(x),
-                         x);  // row_bcast15 into rows 1, 3
-    x = REDUCE_OP::apply(dpp<0x143, 0xc, REDUCE_OP>(x),
-                         x);  // row_bcast31 into rows 2, 3
-    v[n] = __builtin_bit_cast(
-        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), 63));
+    for (int n = 0; n < kValues; ++n) v[n] = static_cast<float>(input[n / P][n % P]);
+    // 1. OVER THE WAVE, every lane left holding the results, by DPP, as rocPRIM's and Composable
+    // Kernel's wave reductions do: each step is a VALU operand from another lane. The butterfly
+    // __shfl_xor it replaced compiled to ds_bpermute, an LDS round trip a step, six of them
+    // waiting on each other (ISA 2026-09-30T20-43-18Z; stamps: 0.92 us for one block_reduce).
+    //   swap neighbours, swap pairs (quad_perm [1,0,3,2], [2,3,0,1]): each quad holds its sum
+    //   mirror in 8 lanes, then in 16 (row_half_mirror, row_mirror): each row holds its sum
+    //   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
+    //   holds the wave's, and readlane hands it to every lane.
+    // A DPP STEP, `x` from the lane the control names: `row_mask` picks which 16-lane rows take it;
+    // the others read OP's identity, which leaves them as they were. A FULL ROW MASK NEEDS NO
+    // `old`: left undefined (mov_dpp), the compiler fuses the move into the add that uses it
+    // (v_add_f32_dpp); an explicit identity kept a v_mov_b32_dpp and an add a step (ISA
+    // 2026-10-04T03-07-41Z). The moved value first: only a VOP2's src0 takes DPP, so (dpp(x), x)
+    // fuses each step into one v_add_f32_dpp where (x, dpp(x)) was a v_mov_b32_dpp and an add
+    // (ISA 2026-10-04T02-22-41Z).
+    static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
+    const auto bits = [](float x) { return __builtin_bit_cast(int, x); };
+    const auto real = [](int x) { return __builtin_bit_cast(float, x); };
+    constexpr int kIdentity = __builtin_bit_cast(int, OP::kIdentity);
+#pragma unroll
+    for (int n = 0; n < kValues; ++n) {
+      float x = v[n];
+      // quad_perm [1,0,3,2], quad_perm [2,3,0,1], row_half_mirror, row_mirror: every row.
+      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0xb1, 0xf, 0xf, false)), x);
+      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x4e, 0xf, 0xf, false)), x);
+      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x141, 0xf, 0xf, false)), x);
+      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x140, 0xf, 0xf, false)), x);
+      // row_bcast15 into rows 1, 3; row_bcast31 into rows 2, 3.
+      x = OP::apply(real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x142, 0xa, 0xf, false)), x);
+      x = OP::apply(real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x143, 0xc, 0xf, false)), x);
+      v[n] = real(__builtin_amdgcn_readlane(bits(x), 63));
+    }
+    // 2. OVER THE WAVES, through LDS, in wave order.
+    if (lane == 0) {
+#pragma unroll
+      for (int n = 0; n < kValues; ++n) partial[n][wave] = v[n];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int n = 0; n < kValues; ++n) {
+      float x = partial[n][0];
+#pragma unroll
+      for (int w = 1; w < kWaves; ++w) x = OP::apply(x, partial[n][w]);
+      output[n / P][n % P] = static_cast<U>(x);
+    }
+    __syncthreads();
+  } else {
+    using V = vec<T, P>;
+    __shared__ V part[THREADS_M][K][THREADS_N];
+    const int mine = static_cast<int>(threadIdx.x) % THREADS_N;
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+      part[static_cast<int>(threadIdx.x) / THREADS_N][k][mine] = impl::pack(input[k]);
+    __syncthreads();
+    if (impl::holds<1, THREADS_N, THREADS_M * THREADS_N>()) {
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        float x[P];
+        V p = part[0][k][mine];
+#pragma unroll
+        for (int j = 0; j < P; ++j) x[j] = static_cast<float>(reinterpret_cast<const T*>(&p)[j]);
+#pragma unroll
+        for (int r = 1; r < THREADS_M; ++r) {
+          p = part[r][k][mine];
+#pragma unroll
+          for (int j = 0; j < P; ++j)
+            x[j] = OP::apply(x[j], static_cast<float>(reinterpret_cast<const T*>(&p)[j]));
+        }
+#pragma unroll
+        for (int j = 0; j < P; ++j) output[k][j] = static_cast<U>(x[j]);
+      }
+    }
+    __syncthreads();  // before the next reduction writes `part`
   }
 }
-}  // namespace impl
-
-// N VALUES OVER THE BLOCK, in place: each wave reduces its N, then every thread
-// sums the waves' partials in wave order (the same order in every thread, so
-// every thread holds the same totals). One wave reducing the partials over all
-// 64 lanes, then broadcasting them, was a second DPP pass a value, a second
-// barrier and an LDS round trip to add 4 numbers at 256 threads: half of
-// AttnRes's loop (ISA 2026-10-04T03-31-28Z). The trailing barrier keeps the
-// next call from overwriting partials still being read. THE BLOCK'S WAVES ARE
-// COMPILED IN: read from blockDim, every thread loaded the widest block's
-// partials and kept 12 VGPRs at AttnRes's peak (ISA 2026-10-04T16-39-15Z).
-namespace impl {
-template <typename REDUCE_OP, int THREADS_PER_BLOCK, int NUM_VALUES>
-DINLINE void block_reduce(float (&v)[NUM_VALUES]) {
-  constexpr int kWaves = (THREADS_PER_BLOCK + kWaveSize - 1) / kWaveSize;
-  __shared__ float partial[NUM_VALUES][kWaves];
-  const int lane = threadIdx.x % kWaveSize;
-  const int wave = threadIdx.x / kWaveSize;
-  wave_reduce<REDUCE_OP>(v);
-  if (lane == 0) {
-#pragma unroll
-    for (int n = 0; n < NUM_VALUES; ++n) partial[n][wave] = v[n];
-  }
-  __syncthreads();
-#pragma unroll
-  for (int n = 0; n < NUM_VALUES; ++n) {
-    float x = partial[n][0];
-#pragma unroll
-    for (int w = 1; w < kWaves; ++w) x = REDUCE_OP::apply(x, partial[n][w]);
-    v[n] = x;
-  }
-  __syncthreads();
-}
-}  // namespace impl
 
 // =================================================================================================
 // DOT
@@ -1309,7 +1335,7 @@ DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_
 //   L2's dirty lines -- this rank's own writes the peers will read (its inputs'
 //   copy-in, its partials) and its pushes into peers' memory held as NC lines --
 //   and completes every store this wave issued, before the flag can be seen.
-//   An ordered barrier first waits for every wave's stores (wait_stores) and
+//   An ordered barrier first waits for every wave's stores (s_waitcnt vmcnt(0)) and
 //   meets the block, so the one releasing lane covers the block's stores.
 //   WAIT: relaxed SYSTEM-scope loads of this rank's own flag (load sc0 sc1),
 //   then one SYSTEM-scope acquire once the flag is seen: s_waitcnt +
@@ -1320,7 +1346,7 @@ DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_
 //   PTE C-bit, same section).
 //   CLEAR: a relaxed system-scope store into this rank's own flag, ordered
 //   before this lane's next flag store by that barrier's own release or
-//   wait_stores (below).
+//   wait for its stores (below).
 // The caller's input is never read by a peer: its owner copies it into its
 // inputs (ours), or pushes it into the peers' inputs (the plain all-reduce's
 // inboxes: remote stores, which the release's wait and write-back complete),
@@ -1329,7 +1355,7 @@ DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_
 // The tests that would catch a stale line: every op's output against
 // torch.distributed's across back-to-back calls on the same buffers, and the
 // signals' return to clear after every launch. Each flag is touched only
-// atomically (`flag_store`, `flag_load`); `barrier`, and in `impl` what it is made of. A rank's
+// atomically (the `__scoped_atomic` builtins), all of it in the one function `barrier`. A rank's
 // data buffers are PEERS's.
 //
 // NOTHING SURVIVES A LAUNCH: every flag is 0 between launches. A barrier sets 1
@@ -1349,133 +1375,6 @@ DINLINE void peers_load_row_scalars(char* const* arena_ptr_array, int arena_ptr_
 // skews every wait by a random per-block delay, so a race shows on every run.
 // =================================================================================================
 
-// ONE FLAG, `flag_ptr`: only atomic operations, each with its order and scope
-// spelled at the call (flag_store, flag_load). A barrier touches a flag only
-// through these.
-namespace impl {
-template <int MEMORY_ORDER, int MEMORY_SCOPE>
-DINLINE void flag_store(uint32_t* flag_ptr, uint32_t v) {
-  __scoped_atomic_store_n(flag_ptr, v, MEMORY_ORDER, MEMORY_SCOPE);
-}
-template <int MEMORY_ORDER, int MEMORY_SCOPE>
-DINLINE uint32_t flag_load(uint32_t* flag_ptr) {
-  return __scoped_atomic_load_n(flag_ptr, MEMORY_ORDER, MEMORY_SCOPE);
-}
-}  // namespace impl
-
-namespace impl {
-
-// Debug builds only: up to ~32 x 8K cycles, different per rank, block and
-// barrier parity.
-DINLINE void skew(int rank, uint32_t parity) {
-  if (!HIP_CUSTOM_COMMUNICATOR_DEBUG) return;
-  uint32_t h = static_cast<uint32_t>(rank) * 73856093u ^
-               blockIdx.x * 19349663u ^ parity * 83492791u;
-  h ^= h >> 13;
-  h *= 0x5bd1e995u;
-  for (uint32_t n = (h ^ (h >> 15)) % 32; n > 0; --n)
-    __builtin_amdgcn_s_sleep(127);
-}
-
-// EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
-// `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier;
-// seen in the ISA), so the releasing wave's fence would cover only its own
-// stores, and another wave's could still be in flight when the flag lands -- a
-// remote store above all.
-DINLINE void wait_stores() { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); }
-
-// The builtin takes the ordering as a literal, so each case is spelled out.
-template <int MEMORY_ORDER, int MEMORY_SCOPE>
-DINLINE void fence() {
-  constexpr bool system = MEMORY_SCOPE == __MEMORY_SCOPE_SYSTEM;
-  if constexpr (MEMORY_ORDER == __ATOMIC_RELEASE) {
-    if constexpr (system)
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-    else
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  } else {
-    if constexpr (system)
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-    else
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-  }
-}
-
-// One word of this rank's status, by its field, at the buffer's stride.
-DINLINE uint32_t* status_word(uint32_t* status_ptr, int64_t status_stride_field,
-                              int status_size_field, StatusField f) {
-  debug_in_bounds(static_cast<int64_t>(f), status_size_field);
-  return status_ptr + static_cast<int64_t>(f) * status_stride_field;
-}
-
-// THE FAULT, written once by the first wait on this rank to give up: `state`
-// claimed 0 -> 1, the fields, then 2 released, so the host reads them only
-// whole. Then `abort`, so every other wait on this rank leaves at its next
-// check rather than spinning out its own timeout.
-DINLINE void record_fault(uint32_t* status_ptr, int64_t status_stride_field,
-                          int status_size_field, Where where, int rank,
-                          int peer, uint32_t count, uint32_t want,
-                          uint64_t elapsed) {
-  const auto word = [&](StatusField f) {
-    return status_word(status_ptr, status_stride_field, status_size_field, f);
-  };
-  uint32_t none = static_cast<uint32_t>(FaultState::none);
-  if (__scoped_atomic_compare_exchange_n(
-          word(StatusField::state), &none,
-          static_cast<uint32_t>(FaultState::writing), false, __ATOMIC_RELAXED,
-          __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
-    *word(StatusField::where) = static_cast<uint32_t>(where);
-    *word(StatusField::rank) = static_cast<uint32_t>(rank);
-    *word(StatusField::block) = blockIdx.x;
-    *word(StatusField::peer) = static_cast<uint32_t>(peer);
-    *word(StatusField::count) = count;
-    *word(StatusField::want) = want;
-    *word(StatusField::elapsed_low) = static_cast<uint32_t>(elapsed);
-    *word(StatusField::elapsed_high) = static_cast<uint32_t>(elapsed >> 32);
-    __scoped_atomic_store_n(word(StatusField::state),
-                            static_cast<uint32_t>(FaultState::written),
-                            __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-  }
-  __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED,
-                          __MEMORY_SCOPE_SYSTEM);
-}
-
-// AT SYSTEM SCOPE, the flag a peer's system-scope release stored (BARRIER's
-// memory ordering). Spins relaxed and acquires once, after: an acquire per poll
-// would invalidate the caches on every iteration of every spinning block. A sleep a poll (64
-// cycles) keeps a spinning block from hammering the link. EVERY 256 POLLS, the
-// slow path: the clock, and the status's `abort` (host-mapped, so only here,
-// never in the fast path). Past the timeout the wait records the fault; timed
-// out or aborted, the WAVE ENDS (s_endpgm): an ended wave no longer counts at
-// the block's s_barrier, so the block's other waves run on to their own next
-// wait, see `abort`, and end too. The kernel's output is then garbage and the
-// communicator broken (the host's watchdog).
-template <bool ACQUIRE>
-DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
-                  int64_t status_stride_field, int status_size_field, int rank,
-                  uint32_t* flag_ptr, uint32_t want, Where where, int peer) {
-  const uint64_t t0 = wall_clock64();
-  for (uint32_t n = 1; flag_load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(flag_ptr) < want;
-       ++n) {
-    __builtin_amdgcn_s_sleep(1);
-    if ((n & 255u) != 0) continue;
-    const uint64_t waited = wall_clock64() - t0;
-    const bool aborted = __scoped_atomic_load_n(
-                             status_word(status_ptr, status_stride_field,
-                                         status_size_field, StatusField::abort),
-                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
-    if (!aborted && waited <= timeout_ticks) continue;
-    if (!aborted)
-      record_fault(status_ptr, status_stride_field, status_size_field, where,
-                   rank, peer, flag_load<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(flag_ptr),
-                   want, waited);
-    __builtin_amdgcn_endpgm();
-  }
-  if constexpr (ACQUIRE) fence<__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM>();
-}
-
-}  // namespace impl
-
 // =================================================================================
 // HOW ONE GPU SYNCHRONIZES WITH ANOTHER (listed in the INTERFACE): the
 // barriers, written against the signals buffer; a rank's data buffers are
@@ -1491,37 +1390,13 @@ DINLINE void wait(uint64_t timeout_ticks, uint32_t* status_ptr,
 // every rank.
 enum class Until { launched, visible, read };
 
-// A FLAG: rank `owner`'s for block `block` on rank `writer`, at `parity`,
-// from the signals buffer [R, 2, B, R] (every rank's address, its strides and
-// its sizes; debug builds check each index against its size). AN INDEX KEEPS
-// ITS CALLER'S TYPE (a block unsigned, as blockIdx.x; a rank as passed): an int
-// where the caller had an unsigned costs a sign extension in every kernel.
-namespace impl {
-template <int WORLD, typename OWNER_TYPE, typename WRITER_TYPE>
-DINLINE uint32_t* signal_flag(
-    uint32_t* const* signals_ptr_array, int signals_ptr_array_size, int64_t signals_stride_parity,
-    int64_t signals_stride_block, int64_t signals_stride_writer,
-    int signals_size_parity, int signals_size_block, int signals_size_writer,
-    OWNER_TYPE owner, uint32_t parity, unsigned block, WRITER_TYPE writer) {
-  debug_in_bounds(static_cast<int64_t>(owner), WORLD);
-  debug_in_bounds(parity, signals_size_parity);
-  debug_in_bounds(block, signals_size_block);
-  debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
-  return global_at<uint32_t>(lane_ptr_array_at<WORLD>(signals_ptr_array, signals_ptr_array_size,
-                                                      static_cast<int>(owner))) +
-         parity * signals_stride_parity + block * signals_stride_block +
-         writer * signals_stride_writer;
-}
-}  // namespace impl
-
-// THE BARRIER, one for every case: barrier<Until::read, 1, WORLD>(the signals
-// buffer, the status buffer, rank, timeout_ticks), each buffer its pointer,
-// strides and sizes, as the kernel took them. Nothing outlives the call. The
-// PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a
-// launch starts on parity 0 and, its barriers even in number, ends on 1
-// (dev/lint_kernels.sh checks both). A read after a barrier may see only what
-// the SAME BLOCK on the peer wrote before it, so both sides must index the same
-// data by the same block.
+// THE BARRIER, one for every case, and the whole protocol in one place:
+// barrier<Until::read, 1, WORLD>(the signals buffer, the status buffer, rank, timeout_ticks),
+// each buffer its pointer, strides and sizes, as the kernel took them. Nothing outlives the
+// call. The PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a launch
+// starts on parity 0 and, its barriers even in number, ends on 1 (dev/lint_kernels.sh checks
+// both). WORLD is the kernel's, passed on. A read after a barrier may see only what the SAME
+// BLOCK on the peer wrote before it, so both sides must index the same data by the same block.
 //
 // Block b waits for block b on every rank, and for no other block: enough at
 // the ends, where it says "every peer has launched" or "every peer is done
@@ -1535,10 +1410,9 @@ DINLINE uint32_t* signal_flag(
 // Lane i sets its slot in peer i's signals, waits for peer i's in this rank's,
 // and clears it. The clear must land before the lane's NEXT flag goes out, or a
 // peer that sees that flag could set the slot again before the clear does and
-// lose it: an ordered barrier's wait_stores covers it; an unordered one waits
-// for the lane's own stores just before it signals, after the whole phase
-// between, so the clear has long landed.
-namespace impl {
+// lose it: an ordered barrier's wait for every wave's stores covers it; an
+// unordered one waits for the lane's own stores just before it signals, after
+// the whole phase between, so the clear has long landed.
 template <Until UNTIL, int PARITY, int WORLD>
 DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
@@ -1551,32 +1425,109 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   constexpr bool kOrdered = UNTIL != Until::read;
   constexpr bool kFirst = UNTIL == Until::launched;
   constexpr uint32_t parity = PARITY;
-  impl::skew(rank, parity);
-  if constexpr (kOrdered) wait_stores();
+  // 1. SKEW, debug builds only: up to ~32 x 8K cycles, different per rank, block and parity.
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG) {
+    uint32_t h = static_cast<uint32_t>(rank) * 73856093u ^
+                 blockIdx.x * 19349663u ^ parity * 83492791u;
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    for (uint32_t n = (h ^ (h >> 15)) % 32; n > 0; --n)
+      __builtin_amdgcn_s_sleep(127);
+  }
+  // 2. EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
+  // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
+  // ISA), so the releasing wave's fence would cover only its own stores, and another wave's
+  // could still be in flight when the flag lands -- a remote store above all.
+  if constexpr (kOrdered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
   if (threadIdx.x < WORLD) {
-    if constexpr (!kOrdered) wait_stores();
+    if constexpr (!kOrdered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // 3. THE TWO FLAGS, from the signals buffer [R, 2, B, R]: rank `owner`'s for block `block`
+    // on rank `writer`, at `parity` (every rank's address, its strides and its sizes; debug
+    // builds check each index against its size). AN INDEX KEEPS ITS CALLER'S TYPE (a block
+    // unsigned, as blockIdx.x; a rank as passed): an int where the caller had an unsigned costs
+    // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
+    // this rank's, written by this lane's peer.
     const auto flag = [&](auto owner, unsigned block, auto writer) {
-      return signal_flag<WORLD>(
-          signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-          signals_stride_writer, signals_size_parity, signals_size_block,
-          signals_size_writer, owner, parity, block, writer);
+      impl::debug_in_bounds(static_cast<int64_t>(owner), WORLD);
+      impl::debug_in_bounds(parity, signals_size_parity);
+      impl::debug_in_bounds(block, signals_size_block);
+      impl::debug_in_bounds(static_cast<int64_t>(writer), signals_size_writer);
+      return impl::global_at<uint32_t>(impl::lane_ptr_array_at<WORLD>(
+                 signals_ptr_array, signals_ptr_array_size, static_cast<int>(owner))) +
+             parity * signals_stride_parity + block * signals_stride_block +
+             writer * signals_stride_writer;
     };
     uint32_t* const theirs_ptr = flag(threadIdx.x, blockIdx.x, rank);
     uint32_t* const mine_ptr = flag(rank, blockIdx.x, threadIdx.x);
-    flag_store<kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
-        theirs_ptr, static_cast<uint32_t>(FlagState::arrived));
-    wait<kOrdered>(
-        timeout_ticks, status_ptr, status_stride_field, status_size_field, rank,
-        mine_ptr, static_cast<uint32_t>(FlagState::arrived),
-        kFirst ? Where::start : Where::peer_barrier,
-        static_cast<int>(threadIdx.x));
-    flag_store<__ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM>(
-        mine_ptr, static_cast<uint32_t>(FlagState::clear));
+    // 4. SIGNAL: a SYSTEM-scope atomic store, release when ordered. A flag is touched only by
+    // the __scoped_atomic builtins, each with its order and scope spelled at the call.
+    __scoped_atomic_store_n(theirs_ptr, static_cast<uint32_t>(FlagState::arrived),
+                            kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
+                            __MEMORY_SCOPE_SYSTEM);
+    // 5. WAIT, AT SYSTEM SCOPE, for the flag a peer's system-scope release stored. Spins
+    // relaxed and acquires once, after: an acquire per poll would invalidate the caches on
+    // every iteration of every spinning block. A sleep a poll (64 cycles) keeps a spinning
+    // block from hammering the link. EVERY 256 POLLS, the slow path: the clock, and the
+    // status's `abort` (host-mapped, so only here, never in the fast path). Past the timeout
+    // the wait records the fault; timed out or aborted, the WAVE ENDS (s_endpgm): an ended wave
+    // no longer counts at the block's s_barrier, so the block's other waves run on to their own
+    // next wait, see `abort`, and end too. The kernel's output is then garbage and the
+    // communicator broken (the host's watchdog).
+    const uint32_t want = static_cast<uint32_t>(FlagState::arrived);
+    // One word of this rank's status, by its field, at the buffer's stride.
+    const auto word = [&](StatusField f) {
+      impl::debug_in_bounds(static_cast<int64_t>(f), status_size_field);
+      return status_ptr + static_cast<int64_t>(f) * status_stride_field;
+    };
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;
+         __scoped_atomic_load_n(mine_ptr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) < want;
+         ++n) {
+      __builtin_amdgcn_s_sleep(1);
+      if ((n & 255u) != 0) continue;
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted = __scoped_atomic_load_n(word(StatusField::abort), __ATOMIC_RELAXED,
+                                                  __MEMORY_SCOPE_SYSTEM) != 0;
+      if (!aborted && waited <= timeout_ticks) continue;
+      if (!aborted) {
+        // THE FAULT, written once by the first wait on this rank to give up: `state` claimed
+        // 0 -> 1, the fields, then 2 released, so the host reads them only whole. Then
+        // `abort`, so every other wait on this rank leaves at its next check rather than
+        // spinning out its own timeout.
+        const uint32_t count =
+            __scoped_atomic_load_n(mine_ptr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        uint32_t none = static_cast<uint32_t>(FaultState::none);
+        if (__scoped_atomic_compare_exchange_n(
+                word(StatusField::state), &none,
+                static_cast<uint32_t>(FaultState::writing), false, __ATOMIC_RELAXED,
+                __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
+          *word(StatusField::where) =
+              static_cast<uint32_t>(kFirst ? Where::start : Where::peer_barrier);
+          *word(StatusField::rank) = static_cast<uint32_t>(rank);
+          *word(StatusField::block) = blockIdx.x;
+          *word(StatusField::peer) = threadIdx.x;
+          *word(StatusField::count) = count;
+          *word(StatusField::want) = want;
+          *word(StatusField::elapsed_low) = static_cast<uint32_t>(waited);
+          *word(StatusField::elapsed_high) = static_cast<uint32_t>(waited >> 32);
+          __scoped_atomic_store_n(word(StatusField::state),
+                                  static_cast<uint32_t>(FaultState::written),
+                                  __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        }
+        __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_SYSTEM);
+      }
+      __builtin_amdgcn_endpgm();
+    }
+    // 6. ACQUIRE, ordered only: one SYSTEM-scope acquire once the flag is seen.
+    if constexpr (kOrdered) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    // 7. CLEAR: a relaxed system-scope store into this rank's own flag.
+    __scoped_atomic_store_n(mine_ptr, static_cast<uint32_t>(FlagState::clear),
+                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
   __syncthreads();
 }
-}  // namespace impl
 
 // =================================================================================================
 // QUANTIZATION
@@ -2247,72 +2198,6 @@ DINLINE void range_store(const T (&input)[1][K][P], T* output_ptr,
   }
 }
 
-// OVER THE RANKS, block_reduce_ranks on arrays: each LANES-thread copy's packs into LDS at its
-// rank's place, consecutive threads' packs adjacent, then the first copy's threads sum each pack
-// over the ranks in copy order, in fp32, rounded once to U there (rounded after the branch, the
-// sums were phis of fp32 vectors and the LDS reads vectorized differently: ISA 2026-10-15).
-template <int WORLD, int LANES, typename T, typename U, int K, int P>
-DINLINE void block_sum_ranks(const T (&input)[1][K][P], U (&output)[1][K][P]) {
-  using V = vec<T, P>;
-  __shared__ V part[WORLD][K][LANES];
-  const int mine = static_cast<int>(threadIdx.x) % LANES;
-#pragma unroll
-  for (int k = 0; k < K; ++k)
-    part[static_cast<int>(threadIdx.x) / LANES][k][mine] = pack(input[0][k]);
-  __syncthreads();
-  if (holds<1, LANES, WORLD * LANES>()) {
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-      float x[P];
-      V p = part[0][k][mine];
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        x[j] = static_cast<float>(reinterpret_cast<const T*>(&p)[j]);
-#pragma unroll
-      for (int r = 1; r < WORLD; ++r) {
-        p = part[r][k][mine];
-#pragma unroll
-        for (int j = 0; j < P; ++j)
-          x[j] = Sum::apply(x[j],
-                            static_cast<float>(reinterpret_cast<const T*>(&p)[j]));
-      }
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[0][k][j] = static_cast<U>(x[j]);
-    }
-  }
-  __syncthreads();  // before the next reduction writes `part`
-}
-
-// OVER THE ROWS OF THREADS, block_reduce_rows on arrays: THREADS_M rows of THREADS_N threads,
-// one row each, meet in LDS as held; the first row's threads sum each column in row order, in
-// fp32, rounded once to U there (as block_sum_ranks).
-template <int THREADS_M, int THREADS_N, typename T, typename U, int K, int P>
-DINLINE void block_sum_rows(const T (&input)[1][K][P], U (&output)[1][K][P]) {
-  __shared__ T part[THREADS_M][THREADS_N * K * P];
-  const int lane = static_cast<int>(threadIdx.x) % THREADS_N;
-  const int lane_row = static_cast<int>(threadIdx.x) / THREADS_N;
-#pragma unroll
-  for (int k = 0; k < K; ++k)
-#pragma unroll
-    for (int j = 0; j < P; ++j)
-      part[lane_row][(lane + k * THREADS_N) * P + j] = input[0][k][j];
-  __syncthreads();
-  if (holds<1, THREADS_N, THREADS_M * THREADS_N>()) {
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j) {
-        const int c = (lane + k * THREADS_N) * P + j;
-        float x = static_cast<float>(part[0][c]);
-#pragma unroll
-        for (int r = 1; r < THREADS_M; ++r)
-          x = Sum::apply(x, static_cast<float>(part[r][c]));
-        output[0][k][j] = static_cast<U>(x);
-      }
-  }
-  __syncthreads();  // before the next reduction writes `part`
-}
-
 // THE INT4 FLAT WALK: the shares in whole groups, A GROUP A THREAD, so its largest magnitude is
 // the thread's own (no DPP), its values one 16-byte load and its scale one (a word a thread loaded
 // each scale 4 times and held one 4-byte load in flight a rank). EACH BLOCK A CONTIGUOUS RANGE OF
@@ -2540,7 +2425,7 @@ DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
                                     chunk * TILE_N);
       // 2. Summed over the writers, in rotated order, through LDS, rounded once.
       T rounded[1][K][P];
-      block_sum_ranks<WORLD, LANES>(got, rounded);
+      block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
       // 3. Stored in this rank's partials.
       store<1, LANES, THREADS>(rounded, partials, 0, 1, len, 0, chunk * TILE_N, 1);
     });
@@ -2735,7 +2620,7 @@ DINLINE void reduce_scatter_lds(const T* const* inputs_ptr_array, int inputs_ptr
         }
         // 2. Summed over the rows (the ranks), in row order, through LDS, rounded once.
         Summed rounded[1][1][P];
-        block_sum_rows<WORLD, LANES>(got, rounded);
+        block_reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
         // 3. Stored in this rank's slice.
         constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
         exchanged_store<1, LANES, THREADS, QUANTIZATION>(
@@ -3173,18 +3058,6 @@ DINLINE void peers_sum(const T (&input)[WORLD][ROWS][K][P],
   impl::peers_sum(input, output);
 }
 
-// NUM_VALUES values over the wave, every lane left holding the results.
-template <typename REDUCE_OP, int NUM_VALUES>
-DINLINE void wave_reduce(float (&values)[NUM_VALUES]) {
-  impl::wave_reduce<REDUCE_OP, NUM_VALUES>(values);
-}
-
-// NUM_VALUES values over the block, every thread left holding the results.
-template <typename REDUCE_OP, int THREADS_PER_BLOCK, int NUM_VALUES>
-DINLINE void block_reduce(float (&values)[NUM_VALUES]) {
-  impl::block_reduce<REDUCE_OP, THREADS_PER_BLOCK, NUM_VALUES>(values);
-}
-
 // ===============================================================================================
 // DOT
 // ===============================================================================================
@@ -3208,30 +3081,6 @@ DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator
                                   const float (&logit)[NUM_LOGITS],
                                   float (&scale)[NUM_LOGITS]) {
   return impl::thread_softmax_fold<NUM_LOGITS>(softmax_max, softmax_denominator, logit, scale);
-}
-
-// ===============================================================================================
-// BARRIER: THE RANKS' SYNCHRONIZATION
-// ===============================================================================================
-
-// This block and the same block on every rank, UNTIL launched (every peer's
-// input is ready; a launch's first barrier), visible (what was written before
-// is seen after) or read (every peer is done reading this rank). A kernel's
-// barriers are even in number, its k-th taking PARITY k % 2, so its flags end
-// where they began. WORLD is the kernel's, passed on.
-template <Until UNTIL, int PARITY, int WORLD>
-DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
-                     int64_t signals_stride_parity,
-                     int64_t signals_stride_block,
-                     int64_t signals_stride_writer, int signals_size_parity,
-                     int signals_size_block, int signals_size_writer,
-                     uint32_t* status_ptr, int64_t status_stride_field,
-                     int status_size_field, int rank, uint64_t timeout_ticks) {
-  impl::barrier<UNTIL, PARITY, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
 }
 
 // ===============================================================================================
