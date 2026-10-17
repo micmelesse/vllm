@@ -711,21 +711,18 @@ def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
     )
 
 
-def problem_size() -> tuple[int, int]:
+def problem_size() -> tuple[int, int] | None:
     """THE LARGEST CALL A MODEL'S COMMUNICATOR SERVES, from the server's config: every
     all-reduce is at most a batch of tokens, `max_num_batched_tokens`, and a row is
     at most the hidden size, the target's or a speculative draft model's (STANDARDS,
-    *A kernel's own buffers are sized from the problem it serves*). Raises where the
-    config is not there to say it: a communicator is never sized by a guess."""
+    *A kernel's own buffers are sized from the problem it serves*). None where there
+    is no server config to say it (vLLM building its communicators in a test or a
+    tool): a communicator is never sized by a guess."""
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
     if config is None or config.model_config is None:
-        raise ValueError(
-            "HipCustomCommunicator sizes its exchange from the server's config "
-            "(max_num_batched_tokens, the hidden size) and there is none: pass "
-            "max_rows and max_cols"
-        )
+        return None
     widest = config.model_config.get_hidden_size()
     spec = config.speculative_config
     draft = getattr(spec, "draft_model_config", None) if spec is not None else None
@@ -1053,17 +1050,20 @@ class HipCustomCommunicator:
             else timeout_seconds
         )
         if max_rows is None or max_cols is None:
-            # NO SERVER CONFIG TO SIZE FROM (vLLM building its device communicators in
-            # a test or a tool, outside a server): disabled, naming why, rather than
-            # raised, so vLLM takes its own path; the e2e smoke of 2026-10-16 failed on
-            # the raise.
-            try:
-                served_rows, served_cols = problem_size()
-            except ValueError as e:
+            served = problem_size()
+            if served is None:
+                # NOTHING TO SIZE THE EXCHANGE FROM: disabled, naming why, so vLLM
+                # takes its own path.
                 self._own_fields()
-                logger.info("%s disabled: %s", type(self).__name__, e)
-                self.state = Disabled(str(e))
+                why = (
+                    "no server config to size the exchange from "
+                    "(max_num_batched_tokens, the hidden size); "
+                    "pass max_rows and max_cols"
+                )
+                logger.info("%s disabled: %s", type(self).__name__, why)
+                self.state = Disabled(why)
                 return
+            served_rows, served_cols = served
             max_rows = served_rows if max_rows is None else max_rows
             max_cols = served_cols if max_cols is None else max_cols
         self.max_rows = max_rows
