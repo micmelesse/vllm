@@ -34,7 +34,9 @@
 
 #pragma once
 
+#include "all_gather.cuh"
 #include "common.cuh"
+#include "reduce_scatter.cuh"
 
 namespace hip_custom_communicator {
 
@@ -135,35 +137,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int band =
         min(partials_size_m, input_size_m - r0);  // this pass's rows
     DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-    // 1. Every rank's input ready and visible (and, past the first pass,
-    //    every peer has read this rank's partials).
-    barrier<Until::visible, 0, WORLD>(
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+    // 1-3. Every rank's input ready and visible (and, past the first pass, every peer has read
+    //    this rank's partials); this rank's share of the band from every rank's input, where the
+    //    table says, summed into its partials; every rank's sums visible and every peer done
+    //    reading this band of this rank's input.
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::lds,
+                   Direction::pull, Quantization::none, CONTIGUOUS, Until::visible>(
+        static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
+        input_ptr_array_size, input_stride_m, input_stride_n, nullptr, 0, 0, 1, 0, 0,
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+        partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
-
-    // 2. Reduce-scatter, pulled: this rank's share of the band from every
-    //    rank's input, where the table says, into its partials.
-    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        input_ptr_array, input_ptr_array_size, input_stride_m, input_stride_n, r0, band,
-        input_size_n, partials_ptr_array, partials_ptr_array_size, rank);
-
-    // 3. Every rank's sums are visible to its peers, and every peer is done
-    //    reading this band of this rank's input (past the last pass: all of
-    //    it, so the launch may end and the input be overwritten).
-    barrier<Until::visible, 1, WORLD>(
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank, timeout_ticks);
 
     // 4. All-gather: every rank's summed share out of its partials, at its
     //    place in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, band_output, output_stride_m,
-        output_stride_n, band, input_size_n, rank);
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none, CONTIGUOUS,
+               DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+                      partials_stride_n, partials_size_m, partials_size_n, band_output,
+                      output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }
 #else
   __builtin_trap();
@@ -305,42 +297,28 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   static_assert(QUANTIZATION == Quantization::int4,
                 "none is all_reduce_pull_two_shot (or all_reduce_push_two_shot)");
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
-  // 1. Every rank's share of this rank's input, quantized here, into that
-  // rank's inbox payload at slot [rank]; then wait until every peer has
-  // launched and pushed its own into ours (ordered).
-  push_shares<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
+  // 1-3. Every rank's share of this rank's input, quantized here, into that rank's inbox payload
+  // at slot [rank]; every peer launched and pushed its own into ours (ordered); this rank's share,
+  // every writer's slot summed, into its partials; every rank's sums visible and every peer done
+  // with its inbox (the next launch's push may overwrite it).
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::registers,
+                 Direction::push, QUANTIZATION, CONTIGUOUS, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-      staging_size_m, staging_size_n, rank);
-  barrier<Until::launched, 0, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-
-  // 2. Reduce-scatter, local: this rank's share, every writer's slot of its
-  // inbox payload summed, into its partials.
-  reduce_slots<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION, DTYPE>(
+      static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
       staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
-      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n,
-      input_size_m, input_size_n, rank);
-
-  // 3. Every rank's sums are visible to its peers, and every peer has summed
-  // its inbox (the next launch's push may overwrite it).
-  barrier<Until::visible, 1, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, 0, rank,
+      timeout_ticks);
 
   // 4. All-gather: every rank's summed share out of its partials, at its place
   // in the output. The next call's first sync keeps a rank from overwriting
   // its partials while it is read (they are written only after it).
-  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
+  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, QUANTIZATION, CONTIGUOUS, DTYPE>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
-      input_size_m, input_size_n, rank);
+      input_size_m, input_size_n, 0, 0, 0, rank);
 #else
   __builtin_trap();
 #endif
@@ -375,43 +353,29 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
     const int band =
         min(partials_size_m, input_size_m - r0);  // this pass's rows
-    // This pass's rows of the input and of the output.
-    const DTYPE* const band_input = input_ptr + r0 * input_stride_m;
     DTYPE* const band_output = output_ptr + r0 * output_stride_m;
-    // 1. Every rank's share of this band, read here, into that rank's inbox at
-    //    slot [rank] (the chunks each rank's same block sums), then visible
-    //    (and, past the first pass, every peer has read this rank's partials).
-    push_shares<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        band_input, input_stride_m, input_stride_n, band, input_size_n, staging_ptr_array,
-        staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
-        staging_size_n, rank);
-    barrier<Until::visible, 0, WORLD>(
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+    // 1-3. Every rank's share of this band, read here, into that rank's inbox at slot [rank] (the
+    //    chunks each rank's same block sums), then visible (and, past the first pass, every peer
+    //    has read this rank's partials); this rank's share, every writer's slot of its inbox
+    //    summed, into its partials; every rank's sums visible and every peer done with its inbox,
+    //    so the next band's (or launch's) push may overwrite it.
+    reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::flat, Accumulate::lds,
+                   Direction::push, Quantization::none, CONTIGUOUS, Until::visible>(
+        input_ptr, input_stride_m, input_stride_n, band, input_size_n,
+        static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+        partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
-
-    // 2. Reduce-scatter, local: this rank's share of the band, every writer's
-    //    slot of its inbox summed, into its partials.
-    reduce_slots<WORLD, THREADS_PER_BLOCK, TILE_N, DTYPE>(
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
-        staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, band, input_size_n, rank);
-
-    // 3. Every rank's sums are visible to its peers, and every peer has summed
-    //    its inbox, so the next band's (or launch's) push may overwrite it.
-    barrier<Until::visible, 1, WORLD>(
-        signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-        signals_stride_writer, signals_size_parity, signals_size_block,
-        signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, r0, rank,
+        timeout_ticks);
 
     // 4. All-gather: every rank's summed share out of its partials, at its place
     // in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n, partials_size_m,
-        partials_size_n, band_output, output_stride_m,
-        output_stride_n, band, input_size_n, rank);
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none, CONTIGUOUS,
+               DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+                      partials_stride_n, partials_size_m, partials_size_n, band_output,
+                      output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }
 #else
   __builtin_trap();

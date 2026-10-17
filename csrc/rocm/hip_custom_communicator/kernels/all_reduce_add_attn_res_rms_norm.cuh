@@ -8,7 +8,9 @@
 #pragma once
 
 #include <type_traits>
+#include "all_gather.cuh"
 #include "common.cuh"
+#include "reduce_scatter.cuh"
 
 namespace hip_custom_communicator {
 
@@ -351,39 +353,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // payload (an encoding: what crosses the links is quantized by its owner),
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
-  if constexpr (QUANTIZATION == Quantization::int4)
-    stage_rows<THREADS_PER_BLOCK, TILE_M, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, input_size_m, rank);
-  barrier<Until::launched, 0, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-
-  // 2. This rank's columns of this block's rows (tiles of TILE_M, every
-  //    gridDim.x-th), summed over the ranks into this rank's partials: THE
-  //    PEERS READ ROTATED, rank + r's r-th, as the plain two-shot reads them
-  //    (in rank order every GPU read rank 0 first, a link at a time carrying
-  //    the machine's reads, and the reduce-scatter took 1.6x the plain
-  //    two-shot's cycles for its bytes: thread traces 2026-10-04T21-03-09Z,
-  //    21-26-11Z), summed through LDS (reduce_scatter_lds).
+  // 2. This rank's columns of this block's rows (tiles of TILE_M, every gridDim.x-th), summed
+  //    over the ranks into this rank's partials: THE PEERS READ ROTATED, rank + r's r-th, as the
+  //    plain two-shot reads them (in rank order every GPU read rank 0 first, a link at a time
+  //    carrying the machine's reads, and the reduce-scatter took 1.6x the plain two-shot's cycles
+  //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
+  // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
+  //    same rows.
   (void)reduce_scatter_blocks;
-  reduce_scatter_lds<WORLD, THREADS_PER_BLOCK, TILE_M, QUANTIZATION, DTYPE>(
-      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
-      input_ptr_array_stride_n, input_size_m, input_size_n, staging_ptr_array,
-      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
-      staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, rank);
-
-  // 3. Every rank's sums are in its partials: this block's twin on every rank
-  //    has reduced the same rows.
-  barrier<Until::visible, 1, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::rows, Accumulate::lds,
+                 Direction::pull, QUANTIZATION, true, Until::launched>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
+      input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
+      status_ptr, status_stride_field, status_size_field, 0, rank,
+      timeout_ticks);
 
   // 4. Each of this block's tiles: its packs from the ranks that own them (A
   //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's partials
@@ -394,10 +381,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    (150 -> 166; ISA harness 2026-10-15).
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][K][P];
-    all_gather<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, DTYPE>(
-        partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-        partials_stride_n, partials_size_m, partials_size_n, input_size_m,
-        input_size_n, sum, offs_m, 0, slice_n);
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, true, DTYPE>(
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+        partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
+        slice_n, rank);
     block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
@@ -477,61 +464,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  // THIS RANK'S COLUMNS AND THIS BLOCK'S ROWS, worked out before the first
-  // barrier, in scalar registers: after it they were vector arithmetic (a
-  // division by the grid a lane; ISA 2026-10-15T18-38-16Z).
-  const int packs = input_size_n / P;  // the row, in packs (n is whole packs)
-  const int slice = (packs + WORLD - 1) / WORLD;
-  const int col0 = rank * slice;
-  const int own_packs =
-      max(0, min(slice, packs - col0));  // the last rank's may be short
-  const int my_rows =
-      input_size_m > static_cast<int>(blockIdx.x)
-          ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
-          : 0;
-
-  // 1. none: nothing staged, every rank's input read in place where the
-  // input table says (a captured call's tensor, or an eager call's host copy
-  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
-  // payload (an encoding: what crosses the links is quantized by its owner),
-  // the rows this block's twin on every rank reads. Then wait until every
-  // peer has launched (and staged its own; the first barrier is ordered).
-  if constexpr (QUANTIZATION == Quantization::int4)
-    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, input_size_m, rank);
-  barrier<Until::launched, 0, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-
-  // 2. This rank's columns of this block's rows, summed over the ranks in rank
-  //    order and pushed to every rank (itself too), at their place in the
-  //    tensor (reduce_scatter_registers<push>): A SLICE OF LANES A ROW, as wide
-  //    as a rank's slice of a TILE_N row in whole waves, so a row's slice is
-  //    one round trip (a wave a row took two at 7168, 0.8 us at 16-32 tokens),
-  //    and as many rows at once as the block holds; a pack a thread, not a
-  //    slice's worth (every peer's packs of a whole slice were 32 packs at
-  //    16384, spilling). The ranks' pointers are read after the barrier (held
-  //    across it they spilled).
-  reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
-                           QUANTIZATION, DTYPE>(
-      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m,
-      input_ptr_array_stride_n, input_size_m, input_size_n, staging_ptr_array,
-      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
-      staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
-      partials_stride_n, partials_size_m, partials_size_n, col0 * P, own_packs * P,
-      my_rows, rank);
-
-  // 3. Every rank's sums are in this rank's partials, and every peer has read
-  // this rank's input.
-  barrier<Until::visible, 1, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+  // 2. This rank's columns of this block's rows, summed over the ranks in rank order and pushed
+  //    to every rank (itself too), at their place in the tensor: A SLICE OF LANES A ROW, as wide
+  //    as a rank's slice of a TILE_N row in whole waves, so a row's slice is one round trip (a
+  //    wave a row took two at 7168, 0.8 us at 16-32 tokens), and as many rows at once as the block
+  //    holds; a pack a thread, not a slice's worth (every peer's packs of a whole slice were 32
+  //    packs at 16384, spilling). The ranks' pointers are read after the barrier (held across it
+  //    they spilled).
+  // 3. Every rank's sums are in this rank's partials, and every peer has read this rank's input.
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::rows, Accumulate::registers,
+                 Direction::push, QUANTIZATION, true, Until::launched>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
+      input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
+      status_ptr, status_stride_field, status_size_field, 0, rank,
+      timeout_ticks);
 
   // 4. This block's rows: the sum out of this rank's partials (at the input's
   //    place in it), then AttnRes, as the one-shot does. The next call's first

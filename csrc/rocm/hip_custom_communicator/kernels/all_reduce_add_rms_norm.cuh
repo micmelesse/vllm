@@ -8,6 +8,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "reduce_scatter.cuh"
 
 namespace hip_custom_communicator {
 
@@ -255,10 +256,26 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // the rows this block's twin on every rank reads. Then wait until every
   // peer has launched (and staged its own; the first barrier is ordered).
   if constexpr (QUANTIZATION == Quantization::int4)
-    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, slice_m, rank);
+    // In bands of slice_m rows (each owner's), this block's rows of each, 4 rows a step, every
+    // load in flight before the first is stored.
+    for (int band = 0; band < input_size_m; band += slice_m) {
+      const int rows = min(slice_m, input_size_m - band);
+      for (int t = blockIdx.x; t < rows; t += 4 * gridDim.x)
+        for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
+          DTYPE x[4][1][1][P];
+#pragma unroll
+          for (int s = 0; s < 4; ++s)
+            load<1, THREADS_PER_BLOCK>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+                                       input_size_m, input_size_n, band + rows, input_size_n,
+                                       x[s], band + t + s * static_cast<int>(gridDim.x), c, 1);
+#pragma unroll
+          for (int s = 0; s < 4; ++s)
+            store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
+                x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
+                staging_stride_n, 1, staging_size_m, staging_size_n, band + rows, input_size_n,
+                band + t + s * static_cast<int>(gridDim.x), c, 1);
+        }
+    }
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -562,56 +579,21 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   constexpr int P = traits<DTYPE>::N;
   constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  // THIS RANK'S COLUMNS AND THIS BLOCK'S ROWS, AT KERNEL ENTRY: worked out after
-  // the barrier, the grid division ran in VALU and the reduce-scatter's loops
-  // were exec-masked (ISA 2026-10-15T18-36-19Z).
-  const int slice =
-      (input_size_n / P + WORLD - 1) / WORLD * P;  // a rank's, in elements
-  const int col0 = rank * slice;
-  const int own_n =
-      max(0, min(slice, input_size_n - col0));  // the last rank's may be short
-  const int my_m = input_size_m > static_cast<int>(blockIdx.x)
-                       ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
-                       : 0;
-
-  // 1. none: nothing staged, every rank's input read in place where the
-  // input table says (a captured call's tensor, or an eager call's host copy
-  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
-  // payload (an encoding: what crosses the links is quantized by its owner),
-  // the rows this block's twin on every rank reads. Then wait until every
-  // peer has launched (and staged its own; the first barrier is ordered).
-  if constexpr (QUANTIZATION == Quantization::int4)
-    stage_rows<THREADS_PER_BLOCK, 1, QUANTIZATION>(
-        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-        staging_size_m, staging_size_n, input_size_m, rank);
-  barrier<Until::launched, 0, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
-
-  // 2. This rank's columns of this block's rows, summed over the ranks in rank
-  // order and pushed
-  //    to every rank (itself too), at their place in the tensor: this block's
-  //    rows (every gridDim.x-th), A WAVE A ROW, since a rank's columns are a
-  //    narrow slice (reduce_scatter_registers says how wide, and why). The
-  //    ranks' pointers are read after the barrier, as in the pull kernels (held
-  //    across it they spilled).
-  reduce_scatter_registers<WORLD, THREADS_PER_BLOCK, TILE_N, Direction::push,
-                           QUANTIZATION, DTYPE>(
-      input_ptr_array, input_ptr_array_size, staging_stride_m, staging_stride_n, input_size_m,
-      input_size_n, staging_ptr_array, staging_ptr_array_size, staging_stride_m,
-      staging_stride_n, staging_size_m, staging_size_n, partials_ptr_array,
-      partials_ptr_array_size, partials_stride_m, partials_stride_n, partials_size_m,
-      partials_size_n, col0, own_n, my_m, rank);
-
-  // 3. Every rank's sums are in this rank's partials.
-  barrier<Until::visible, 1, WORLD>(
-      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block,
-      signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+  // 1-3. none: nothing staged, every rank's input read in place where the input table says.
+  // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
+  // on every rank reads. Then every peer launched; this rank's columns of this block's rows,
+  // summed over the ranks in rank order and pushed to every rank (itself too), at their place in
+  // the tensor, A WAVE A ROW (reduce_scatter.cuh says how wide, and why); every rank's sums in
+  // this rank's partials.
+  reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::rows, Accumulate::registers,
+                 Direction::push, QUANTIZATION, true, Until::launched>(
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
+      input_ptr_array_size, staging_stride_m, staging_stride_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+      staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+      partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
+      status_ptr, status_stride_field, status_size_field, 0, rank, timeout_ticks);
 
   // 4. This block's rows out of this rank's partials: (ADD_RESIDUAL) add the
   // residual, then RMSNorm,
