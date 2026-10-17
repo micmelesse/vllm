@@ -682,6 +682,19 @@ class Handle {
                                               kSignalsArray * kMaxRanks);
   }
   int signals_ptr_array_size() const { return world_size_; }
+  // EVERY RANK'S STAGING (the arena's `inputs` region: an eager copy, an INT4
+  // payload, the pushed all-reduce's inbox) and EVERY RANK'S PARTIALS, a device
+  // array each of every rank's address of that region with its size, the world
+  // (written at open, with the others in `region_ptr_arrays_`). A kernel that
+  // takes them never sees the arena or an offset into it.
+  char* const* staging_ptr_array() const {
+    return region_ptr_arrays_ + kStagingArray * kMaxRanks;
+  }
+  int staging_ptr_array_size() const { return world_size_; }
+  char* const* partials_ptr_array() const {
+    return region_ptr_arrays_ + kPartialsArray * kMaxRanks;
+  }
+  int partials_ptr_array_size() const { return world_size_; }
   // EACH REGION'S OFFSET in every rank's arena, in bytes (`arena_layout`):
   // rank r's region is at arena_ptr_array()[r] + its offset.
   int64_t inputs_offset() const { return layout_.inputs; }
@@ -986,7 +999,8 @@ class Handle {
     // here: the kernels take each region's as its own array with its size, the
     // world (`signals_ptr_array`, ...), and never an arena base or an offset.
     // The arena's own array (`arena_ptr_array`) is the last kernel use of the
-    // arena's bases, until the partials and inputs take theirs.
+    // arena's bases: the RMSNorm and AttnRes kernels', until they take the
+    // staging's and the partials' too (the plain all-reduce already does).
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&region_ptr_arrays_),
                         kRegionPtrArrays * kMaxRanks * sizeof(char*)));
     {
@@ -995,7 +1009,7 @@ class Handle {
         char* const base = arena_->base(r);
         at[kArenaArray * kMaxRanks + r] = base;
         at[kSignalsArray * kMaxRanks + r] = base + layout_.signals;
-        at[kInputsArray * kMaxRanks + r] = base + layout_.inputs;
+        at[kStagingArray * kMaxRanks + r] = base + layout_.inputs;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
       }
       HIP_CHECK(hipMemcpy(region_ptr_arrays_, at.data(),
@@ -1255,7 +1269,7 @@ class Handle {
   // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
   // allocation: the arena's bases (interim), the signals, the inputs, the
   // partials.
-  static constexpr int kArenaArray = 0, kSignalsArray = 1, kInputsArray = 2,
+  static constexpr int kArenaArray = 0, kSignalsArray = 1, kStagingArray = 2,
                        kPartialsArray = 3, kRegionPtrArrays = 4;
   char** region_ptr_arrays_ = nullptr;
   int64_t next_slot_ = 0;

@@ -18,7 +18,7 @@
 // THE PUSHED VARIANT (all_reduce_push_one_shot, all_reduce_push_two_shot; a
 // caller forces it by its direction, select never picks it), each PUSHED: a rank reads only its own input (the caller's tensor, which no
 // peer reads) and stores it, or each rank's share of it, into the peers'
-// receive areas (the arena's `inputs` region, the INBOX: [writer slot, ...]),
+// receive areas (their staging, the INBOX: [writer slot, ...]),
 // a band of rows a pass; after the ordered barrier each rank sums the WORLD
 // slots of its inbox LOCALLY. Nothing is copied in first. The int4 two-shot
 // pushes its shares quantized.
@@ -47,15 +47,15 @@ namespace hip_custom_communicator {
 // loop: nothing is staged, so any size runs in one pass.
 // =============================================================================
 
-// THE BUFFER AS [m, n], every rank's at the table's strides (inputs_stride_m,
-// inputs_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
+// THE BUFFER AS [m, n], every rank's at the table's strides (input_stride_m,
+// input_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
 // the tiles row-major.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size, int64_t inputs_stride_m,
-        int64_t inputs_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
+        int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
         uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
@@ -82,8 +82,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][ROWS][K][P];
-    peers_load<THREADS_M, THREADS_N>(inputs_ptr_array, inputs_ptr_array_size, inputs_stride_m,
-                                     inputs_stride_n, input_size_m,
+    peers_load<THREADS_M, THREADS_N>(input_ptr_array, input_ptr_array_size, input_stride_m,
+                                     input_stride_n, input_size_m,
                                      input_size_n, peers, t / tiles_n * TILE_M,
                                      t % tiles_n * TILE_N);
     float sum[ROWS][K][P];
@@ -123,11 +123,11 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
-        const DTYPE* const* __restrict__ inputs_ptr_array, int inputs_ptr_array_size, int64_t inputs_stride_m,
-        int64_t inputs_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
+        int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
@@ -151,8 +151,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Reduce-scatter, pulled: this rank's share of the band from every
     //    rank's input, where the table says, into its partials.
     reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        inputs_ptr_array, inputs_ptr_array_size, inputs_stride_m, inputs_stride_n, r0, band,
-        input_size_n, arena_ptr_array, arena_ptr_array_size, partials_offset, rank);
+        input_ptr_array, input_ptr_array_size, input_stride_m, input_stride_n, r0, band,
+        input_size_n, partials_ptr_array, partials_ptr_array_size, rank);
 
     // 3. Every rank's sums are visible to its peers, and every peer is done
     //    reading this band of this rank's input (past the last pass: all of
@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 4. All-gather: every rank's summed share out of its partials, at its
     //    place in the output.
     all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n,
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, band_output, output_stride_m,
         output_stride_n, band, input_size_n, rank);
   }
@@ -186,9 +186,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 // THE BUFFER AS [m, n] AT ITS STRIDES, a work item a TILE_M x TILE_N tile (a
 // row of threads a tile row), the grid striding over the tiles row-major. Both
-// tile sides are tuned (select.cuh). THE INBOX, the inputs region as [WORLD *
+// tile sides are tuned (select.cuh). THE INBOX, the staging as [WORLD *
 // band_rows, n]: writer w's band at rows [w * band_rows, (w + 1) * band_rows),
-// band_rows = inputs_size_m / WORLD (the host's: what the region holds), so any
+// band_rows = staging_size_m / WORLD (the host's: what the region holds), so any
 // size runs in one launch, a band a pass. EACH BLOCK PUSHES THE TILES ITS TWIN
 // ON EVERY RANK SUMS: what the same block on a peer pushed is what a peers
 // barrier makes visible.
@@ -200,8 +200,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t inputs_offset, int64_t inputs_stride_m,
-        int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
@@ -215,12 +215,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int ROWS = TILE_M / THREADS_M;
   constexpr int K = TILE_N / (P * THREADS_N);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
-  const int band_rows = inputs_size_m / WORLD;  // a slot's rows
-  const int64_t slot = int64_t{band_rows} * inputs_stride_m;  // a slot's elements
-  // This rank's slot in every inbox, and this rank's own inbox.
-  const int64_t mine_offset =
-      inputs_offset + int64_t{rank} * slot * static_cast<int64_t>(sizeof(DTYPE));
-  const DTYPE* const inbox = peer_ptr<DTYPE>(arena_ptr_array, arena_ptr_array_size, rank, inputs_offset);
+  const int band_rows = staging_size_m / WORLD;  // a slot's rows
+  const int64_t slot = int64_t{band_rows} * staging_stride_m;  // a slot's elements
+  // This rank's own inbox (its slot in every inbox is slot [rank]).
+  const DTYPE* const inbox = peer_ptr<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank, 0);
 
   for (int r0 = 0; r0 < input_size_m; r0 += band_rows) {
     const int band =
@@ -237,7 +235,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                  input_stride_n, band, input_size_n, mine,
                                  t / tiles_n * TILE_M, t % tiles_n * TILE_N);
       peers_store<WORLD, THREADS_M, THREADS_N, THREADS_PER_BLOCK>(
-          mine, arena_ptr_array, arena_ptr_array_size, mine_offset, inputs_stride_m, inputs_stride_n, band,
+          mine, staging_ptr_array, staging_ptr_array_size, rank, slot, staging_stride_m, staging_stride_n, band,
           input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N);
     }
     barrier<Until::visible, 0, WORLD>(
@@ -248,8 +246,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Every writer's slot of this rank's inbox, local, in rank order, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][ROWS][K][P];
-      slots_load<THREADS_M, THREADS_N>(inbox, slot, inputs_stride_m,
-                                       inputs_stride_n, band, input_size_n,
+      slots_load<THREADS_M, THREADS_N>(inbox, slot, staging_stride_m,
+                                       staging_stride_n, band, input_size_n,
                                        peers, t / tiles_n * TILE_M,
                                        t % tiles_n * TILE_N);
       float sum[ROWS][K][P];
@@ -312,30 +310,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-        int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-  // THE INT4 PAYLOADS, inside the regions (common.cuh's INT4 payload layout):
-  // the same offsets on every rank, from the call's sizes.
-  const int64_t inputs_values_offset = inputs_offset;
-  const int64_t inputs_values_stride_m = int4_values_size_n(inputs_size_n), inputs_values_stride_n = 1;
-  const int inputs_values_size_m = inputs_size_m, inputs_values_size_n = int4_values_size_n(inputs_size_n);
-  const int64_t inputs_scales_offset = inputs_offset + int4_scales_offset(inputs_size_m, inputs_size_n);
-  const int64_t inputs_scales_stride_m = int4_scales_size_n(inputs_size_n), inputs_scales_stride_n = 1;
-  const int inputs_scales_size_m = inputs_size_m, inputs_scales_size_n = int4_scales_size_n(inputs_size_n);
-  const int64_t partials_values_offset = partials_offset;
-  const int64_t partials_values_stride_m = int4_values_size_n(partials_size_n), partials_values_stride_n = 1;
-  const int partials_values_size_m = partials_size_m, partials_values_size_n = int4_values_size_n(partials_size_n);
-  const int64_t partials_scales_offset = partials_offset + int4_scales_offset(partials_size_m, partials_size_n);
-  const int64_t partials_scales_stride_m = int4_scales_size_n(partials_size_n), partials_scales_stride_n = 1;
-  const int partials_scales_size_m = partials_size_m, partials_scales_size_n = int4_scales_size_n(partials_size_n);
+  // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
+  // INT4 payload layout): the collectives find them from each region's sizes.
   static_assert(QUANTIZATION == Quantization::int4,
                 "none is all_reduce_pull_two_shot (or all_reduce_push_two_shot)");
 #if HIP_CUSTOM_COMMUNICATOR_ARCH_SUPPORTED
@@ -344,11 +330,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // launched and pushed its own into ours (ordered).
   push_shares<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      arena_ptr_array, arena_ptr_array_size, inputs_values_offset, inputs_values_stride_m,
-      inputs_values_stride_n, inputs_values_size_m, inputs_values_size_n,
-      inputs_scales_offset, inputs_scales_stride_m,
-      inputs_scales_stride_n, inputs_scales_size_m, inputs_scales_size_n,
-      rank);
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, rank);
   barrier<Until::launched, 0, WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
@@ -358,16 +341,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Reduce-scatter, local: this rank's share, every writer's slot of its
   // inbox payload summed, into its partials.
   reduce_slots<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION, DTYPE>(
-      arena_ptr_array, arena_ptr_array_size, inputs_offset, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      inputs_values_offset, inputs_values_stride_m, inputs_values_stride_n,
-      inputs_values_size_m, inputs_values_size_n, inputs_scales_offset,
-      inputs_scales_stride_m, inputs_scales_stride_n, inputs_scales_size_m,
-      inputs_scales_size_n, partials_offset, partials_stride_m, partials_stride_n,
-      partials_size_m, partials_size_n, partials_values_offset,
-      partials_values_stride_m, partials_values_stride_n, partials_values_size_m,
-      partials_values_size_n, partials_scales_offset, partials_scales_stride_m,
-      partials_scales_stride_n, partials_scales_size_m, partials_scales_size_n,
-      rank);
+      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+      staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n,
+      input_size_m, input_size_n, rank);
 
   // 3. Every rank's sums are visible to its peers, and every peer has summed
   // its inbox (the next launch's push may overwrite it).
@@ -381,12 +358,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // in the output. The next call's first sync keeps a rank from overwriting
   // its partials while it is read (they are written only after it).
   all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n, partials_size_m,
-      partials_size_n, partials_values_offset, partials_values_stride_m,
-      partials_values_stride_n, partials_values_size_m, partials_values_size_n,
-      partials_scales_offset, partials_scales_stride_m, partials_scales_stride_n,
-      partials_scales_size_m, partials_scales_size_n, output_ptr, output_stride_m,
-      output_stride_n, input_size_m, input_size_n, rank);
+      partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+      partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
+      input_size_m, input_size_n, rank);
 #else
   __builtin_trap();
 #endif
@@ -394,8 +368,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 // EXACT, IN PASSES: a band of `partials_size_m` rows a pass (the host's: what
 // the inbox and the partials hold), so any size runs in one launch. A band is
-// the problem's rows [r0, r0 + band) at their strides. THE INBOX, the inputs
-// region as [WORLD, slot]: writer w's slot at row w, inputs_stride_m elements
+// the problem's rows [r0, r0 + band) at their strides. THE INBOX, the staging
+// region as [WORLD, slot]: writer w's slot at row w, staging_stride_m elements
 // a slot, holding writer w's copy of this rank's share of the band from the
 // slot's first element. EACH BLOCK PUSHES, OF EVERY RANK'S SHARE, THE CHUNKS
 // THAT RANK'S SAME BLOCK SUMS, so a peers barrier makes them visible.
@@ -407,10 +381,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int64_t inputs_offset, int64_t inputs_stride_m,
-        int64_t inputs_stride_n, int inputs_size_m, int inputs_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
@@ -428,9 +402,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    slot [rank] (the chunks each rank's same block sums), then visible
     //    (and, past the first pass, every peer has read this rank's partials).
     push_shares<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        band_input, input_stride_m, input_stride_n, band, input_size_n, arena_ptr_array, arena_ptr_array_size,
-        inputs_offset, inputs_stride_m, inputs_stride_n, inputs_size_m,
-        inputs_size_n, rank);
+        band_input, input_stride_m, input_stride_n, band, input_size_n, staging_ptr_array,
+        staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+        staging_size_n, rank);
     barrier<Until::visible, 0, WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
@@ -440,8 +414,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Reduce-scatter, local: this rank's share of the band, every writer's
     //    slot of its inbox summed, into its partials.
     reduce_slots<WORLD, THREADS_PER_BLOCK, TILE_N, DTYPE>(
-        arena_ptr_array, arena_ptr_array_size, inputs_offset, inputs_stride_m, inputs_stride_n, inputs_size_m,
-        inputs_size_n, partials_offset, partials_stride_m, partials_stride_n,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+        staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, band, input_size_n, rank);
 
     // 3. Every rank's sums are visible to its peers, and every peer has summed
@@ -455,7 +429,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 4. All-gather: every rank's summed share out of its partials, at its place
     // in the output.
     all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, CONTIGUOUS>(
-        arena_ptr_array, arena_ptr_array_size, partials_offset, partials_stride_m, partials_stride_n, partials_size_m,
+        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n, partials_size_m,
         partials_size_n, band_output, output_stride_m,
         output_stride_n, band, input_size_n, rank);
   }

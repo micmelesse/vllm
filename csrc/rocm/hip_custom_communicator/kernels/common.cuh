@@ -2238,8 +2238,8 @@ DINLINE T* int4_group_at(T* ptr, int64_t stride_m, int64_t stride_n, int size_n,
 // at once. The first barrier, ordered, publishes them.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
 DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                            int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
-                            int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
+                            int input_size_m, int input_size_n, char* const* staging_ptr_array, int staging_ptr_array_size,
+                            int staging_size_m, int staging_size_n, int rank) {
   constexpr int P = traits<T>::N;
   using V = vec<T, P>;
   const int64_t total = int64_t{input_size_m} * input_size_n;
@@ -2264,8 +2264,11 @@ DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t 
       encode<kInt4GroupPacks>(x, words, scale);
       if (g < end && g < groups)
         int4_group_store(words, scale,
-                         rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, r, inbox_values_offset) + mine / 2,
-                         rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, r, inbox_scales_offset) + mine / kInt4Group, g);
+                         rank_of<uint8_t>(staging_ptr_array, staging_ptr_array_size, r, 0) + mine / 2,
+                         rank_of<__fp16>(staging_ptr_array, staging_ptr_array_size, r,
+                                         int4_scales_offset(staging_size_m, staging_size_n)) +
+                             mine / kInt4Group,
+                         g);
     }
   });
 }
@@ -2277,11 +2280,10 @@ DINLINE void int4_flat_push(const T* input_ptr, int64_t input_stride_m, int64_t 
 // in this rank's partials (the share's own run). Through LDS, a rank's copy a wave, one wave in 8
 // summed and quantized while the others waited at the barrier.
 template <int WORLD, int THREADS, typename T>
-DINLINE void int4_flat_reduce_slots(char* const* arena_ptr_array, int arena_ptr_array_size,
-                                    int64_t inbox_values_offset,
-                                    int64_t inbox_scales_offset,
-                                    int64_t partials_values_offset,
-                                    int64_t partials_scales_offset, int64_t total,
+DINLINE void int4_flat_reduce_slots(char* const* staging_ptr_array, int staging_ptr_array_size,
+                                    int staging_size_m, int staging_size_n,
+                                    char* const* partials_ptr_array, int partials_ptr_array_size,
+                                    int partials_size_m, int partials_size_n, int64_t total,
                                     int rank) {
   constexpr int P = traits<T>::N;
   const int slice = share_slice<WORLD, kInt4Group>(total);
@@ -2292,11 +2294,14 @@ DINLINE void int4_flat_reduce_slots(char* const* arena_ptr_array, int arena_ptr_
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
     const int64_t slot = share_first(slice, (rank + w) % WORLD);
-    values[w] = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, inbox_values_offset) + slot / 2;
-    scales[w] = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, inbox_scales_offset) + slot / kInt4Group;
+    values[w] = rank_of<uint8_t>(staging_ptr_array, staging_ptr_array_size, rank, 0) + slot / 2;
+    scales[w] = rank_of<__fp16>(staging_ptr_array, staging_ptr_array_size, rank,
+                                int4_scales_offset(staging_size_m, staging_size_n)) +
+                slot / kInt4Group;
   }
-  uint8_t* const own_values = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, rank, partials_values_offset);
-  __fp16* const own_scales = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, rank, partials_scales_offset);
+  uint8_t* const own_values = rank_of<uint8_t>(partials_ptr_array, partials_ptr_array_size, rank, 0);
+  __fp16* const own_scales = rank_of<__fp16>(partials_ptr_array, partials_ptr_array_size, rank,
+                                             int4_scales_offset(partials_size_m, partials_size_n));
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     const int at = min(g, groups - 1);
     uint32_t words[WORLD][1][kInt4GroupPacks];
@@ -2324,9 +2329,8 @@ DINLINE void int4_flat_reduce_slots(char* const* arena_ptr_array, int arena_ptr_
 // THE INT4 ALL-GATHER: every rank's group g of its summed share, all in flight, dequantized to T
 // and stored at its place in the output.
 template <int WORLD, int THREADS, bool CONTIGUOUS, typename T>
-DINLINE void int4_flat_all_gather(char* const* arena_ptr_array, int arena_ptr_array_size,
-                                  int64_t partials_values_offset,
-                                  int64_t partials_scales_offset, T* output_ptr,
+DINLINE void int4_flat_all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
+                                  int partials_size_m, int partials_size_n, T* output_ptr,
                                   int64_t output_stride_m, int64_t output_stride_n,
                                   int output_size_m, int output_size_n, int rank) {
   constexpr int P = traits<T>::N;
@@ -2337,8 +2341,9 @@ DINLINE void int4_flat_all_gather(char* const* arena_ptr_array, int arena_ptr_ar
   const __fp16* scales[WORLD];
 #pragma unroll
   for (int w = 0; w < WORLD; ++w) {
-    values[w] = rank_of<uint8_t>(arena_ptr_array, arena_ptr_array_size, (rank + w) % WORLD, partials_values_offset);
-    scales[w] = rank_of<__fp16>(arena_ptr_array, arena_ptr_array_size, (rank + w) % WORLD, partials_scales_offset);
+    values[w] = rank_of<uint8_t>(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD, 0);
+    scales[w] = rank_of<__fp16>(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD,
+                                int4_scales_offset(partials_size_m, partials_size_n));
   }
   int4_for_each_group<THREADS>(slice, [&](int g, int end) {
     u32x4 words[WORLD];
@@ -2380,13 +2385,13 @@ template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T, typename INPUT_OF>
 DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
                           int64_t input_stride_n, int input_size_m,
-                          int input_size_n, int64_t input_first, char* const* arena_ptr_array, int arena_ptr_array_size,
-                          int64_t input_values_offset,
-                          int64_t input_scales_offset, int64_t partials_offset, int64_t partials_values_offset, int64_t partials_scales_offset, int rank) {
+                          int input_size_n, int64_t input_first, char* const* staging_ptr_array, int staging_ptr_array_size,
+                          int staging_size_m, int staging_size_n, char* const* partials_ptr_array,
+                          int partials_ptr_array_size, int partials_size_m, int partials_size_n, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
     int4_flat_reduce_slots<WORLD, THREADS, T>(
-        arena_ptr_array, arena_ptr_array_size, input_values_offset, input_scales_offset, partials_values_offset,
-        partials_scales_offset,
+        staging_ptr_array, staging_ptr_array_size, staging_size_m, staging_size_n, partials_ptr_array,
+        partials_ptr_array_size, partials_size_m, partials_size_n,
         int64_t{input_size_m} * input_size_n, rank);
   } else {
     constexpr int LANES = THREADS / WORLD;
@@ -2395,7 +2400,7 @@ DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
     static_assert(LANES * WORLD == THREADS, "a block is a group of threads a rank");
     static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
     static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
-    T* const partials = rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, partials_offset);
+    T* const partials = rank_of<T>(partials_ptr_array, partials_ptr_array_size, rank, 0);
     const int64_t total = int64_t{input_size_m} * input_size_n;
     const int slice = share_slice<WORLD, P>(total);
     const int chunks = (slice + TILE_N - 1) / TILE_N;
@@ -2422,15 +2427,13 @@ DINLINE void reduce_slots(INPUT_OF input_of, int64_t input_stride_m,
 // output, a TILE_N chunk a step; with int4 the int4 walk's above.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
-                        int64_t partials_values_offset,
-                        int64_t partials_scales_offset,
+DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
+                        int partials_size_m, int partials_size_n,
                         T* output_ptr, int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   if constexpr (QUANTIZATION == Quantization::int4) {
-    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(arena_ptr_array, arena_ptr_array_size,
-                                                     partials_values_offset,
-                                                     partials_scales_offset,
+    int4_flat_all_gather<WORLD, THREADS, CONTIGUOUS>(partials_ptr_array, partials_ptr_array_size,
+                                                     partials_size_m, partials_size_n,
                                                      output_ptr, output_stride_m,
                                                      output_stride_n, output_size_m,
                                                      output_size_n, rank);
@@ -2446,7 +2449,7 @@ DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, 
       const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
       T got[1][K][P];
       // 1. Rank r's summed chunk, in one round trip.
-      load<1, LANES>(rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, partials_offset), 0, 1, slice, got, 0,
+      load<1, LANES>(rank_of<T>(partials_ptr_array, partials_ptr_array_size, r, 0), 0, 1, slice, got, 0,
                      chunk * TILE_N, 1);
       // 2. Stored where rank r's share goes.
       range_store<CONTIGUOUS, LANES>(got, output_ptr, output_stride_m, output_stride_n,
@@ -2465,7 +2468,7 @@ DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, 
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
                          int64_t input_stride_n, int input_size_m, int input_size_n,
-                         char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
+                         char* const* staging_ptr_array, int staging_ptr_array_size,
                          int64_t inbox_stride_m, int64_t inbox_stride_n,
                          int inbox_size_n, int rank) {
   constexpr int LANES = THREADS / WORLD;
@@ -2483,7 +2486,7 @@ DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
     range_load<CONTIGUOUS, LANES>(input_ptr, input_stride_m, input_stride_n,
                                   input_size_n, part, share_first(slice, r), len,
                                   chunk * TILE_N);
-    range_store<true, LANES>(part, rank_of<T>(arena_ptr_array, arena_ptr_array_size, r, inbox_offset) + rank * inbox_stride_m,
+    range_store<true, LANES>(part, rank_of<T>(staging_ptr_array, staging_ptr_array_size, r, 0) + rank * inbox_stride_m,
                              inbox_stride_m, inbox_stride_n, inbox_size_n, 0, len,
                              chunk * TILE_N, len);
   });
@@ -2494,12 +2497,12 @@ DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                         int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
-                         int64_t inbox_values_offset, int64_t inbox_scales_offset, int rank) {
+                         int input_size_m, int input_size_n, char* const* staging_ptr_array, int staging_ptr_array_size,
+                         int staging_size_m, int staging_size_n, int rank) {
   static_assert(QUANTIZATION == Quantization::int4, "none pushes through its own overload");
   int4_flat_push<WORLD, THREADS, CONTIGUOUS>(input_ptr, input_stride_m, input_stride_n,
-                                             input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
-                                             inbox_values_offset, inbox_scales_offset, rank);
+                                             input_size_m, input_size_n, staging_ptr_array, staging_ptr_array_size,
+                                             staging_size_m, staging_size_n, rank);
 }
 
 // THE COPY-IN OF EVERY PER-ROW KERNEL (the fused ops' one-shots and two-shots), before its first
@@ -2817,17 +2820,20 @@ DINLINE void peers_load(const T* const* inputs_ptr_array, int inputs_ptr_array_s
 }
 
 // THE PUSH, peers_load's other way: these registers stored at the same place of every rank's
-// region `output_offset` into its arena (one of ours: a pushed collective's inbox, at the writer's
-// slot), every rank's store issued together. Visible to each rank's same block after the next
-// ordered barrier.
+// region (`output_ptr_array`, one of ours: a pushed collective's inbox, [writer, m, n], at slot
+// `writer`, output_stride_writer elements a slot), every rank's store issued together. Visible to
+// each rank's same block after the next ordered barrier.
 template <int WORLD, int THREADS_M, int THREADS_N, int THREADS, typename T, int ROWS, int K,
           int P>
-DINLINE void peers_store(const T (&input)[ROWS][K][P], char* const* arena_ptr_array, int arena_ptr_array_size,
-                         int64_t output_offset, int64_t output_stride_m,
-                         int64_t output_stride_n, int output_size_m, int output_size_n,
-                         int offs_m, int offs_n, int row_step = 1) {
+DINLINE void peers_store(const T (&input)[ROWS][K][P], char* const* output_ptr_array,
+                         int output_ptr_array_size, int writer, int64_t output_stride_writer,
+                         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
+                         int output_size_n, int offs_m, int offs_n, int row_step = 1) {
   T* output[WORLD];
-  impl::peers_of(arena_ptr_array, arena_ptr_array_size, output_offset, output);
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r)
+    output[r] = impl::rank_of<T>(output_ptr_array, output_ptr_array_size, r, 0) +
+                writer * output_stride_writer;
   impl::peers_store<THREADS_M, THREADS_N, THREADS>(input, output, output_stride_m,
                                                    output_size_m, output_size_n, offs_m,
                                                    offs_n, row_step);
@@ -3078,118 +3084,106 @@ DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator
 // rank's range of its own input into that rank's INBOX at its own slot (`push_shares`), the ordered
 // barrier publishes them, and each rank sums the WORLD slots of its range LOCALLY into its partials
 // (`reduce_slots`); no peer ever reads the caller's input, and nothing is copied in first.
-// reduce_slots, int4: the inbox's INT4 payload (`push_shares`' quantized slots, writer w's at
-// the share w's place in an [m, n] payload) summed into the partials' INT4 payload. input_size_m
-// and input_size_n are the problem's (the flat total); the input region is this rank's inbox.
+// reduce_slots, int4: the staging's INT4 payload (`push_shares`' quantized slots, writer w's at
+// the share w's place in an [m, n] payload) summed into the partials' INT4 payload. size_m and
+// size_n are the problem's (the flat total). Each region is every rank's address of it
+// (`x_ptr_array`, the world) with its strides and sizes; INT4 is an encoding of what it holds,
+// its scales inside it at the offset its own sizes give (int4_scales_offset).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void reduce_slots(
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t input_offset, int64_t input_stride_m, int64_t input_stride_n,
-    int input_size_m, int input_size_n, int64_t input_values_offset, int64_t input_values_stride_m,
-    int64_t input_values_stride_n, int input_values_size_m, int input_values_size_n,
-    int64_t input_scales_offset,
-    int64_t input_scales_stride_m, int64_t input_scales_stride_n, int input_scales_size_m,
-    int input_scales_size_n, int64_t partials_offset,
-    int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
-    int partials_size_n, int64_t partials_values_offset,
-    int64_t partials_values_stride_m, int64_t partials_values_stride_n,
-    int partials_values_size_m, int partials_values_size_n, int64_t partials_scales_offset, int64_t partials_scales_stride_m,
-    int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
-    int rank) {
+DINLINE void reduce_slots(char* const* staging_ptr_array, int staging_ptr_array_size,
+                          int64_t staging_stride_m, int64_t staging_stride_n, int staging_size_m,
+                          int staging_size_n, char* const* partials_ptr_array,
+                          int partials_ptr_array_size, int64_t partials_stride_m,
+                          int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+                          int size_m, int size_n, int rank) {
   static_assert(QUANTIZATION == Quantization::int4,
                 "none sums its inbox through the overload below (its slots' stride)");
   impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION, T>(
-      [&](int) { return impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, input_offset); }, input_stride_m,
-      input_stride_n, input_size_m, input_size_n, 0, arena_ptr_array, arena_ptr_array_size, input_values_offset,
-      input_scales_offset, partials_offset, partials_values_offset, partials_scales_offset,
-      rank);
+      [&](int) { return static_cast<const T*>(nullptr); }, 0, 1, size_m, size_n, 0,
+      staging_ptr_array, staging_ptr_array_size, staging_size_m, staging_size_n,
+      partials_ptr_array, partials_ptr_array_size, partials_size_m, partials_size_n, rank);
 }
-// The exact walk's: this rank's inbox, [WORLD, slot] (writer w's slot at row w, inbox_stride_m
-// elements a slot, each holding writer w's copy of this rank's range of the size_m x size_n
-// problem from the slot's first element), summed into this rank's partials.
+// The exact walk's: this rank's staging, its inbox, [WORLD, slot] (writer w's slot at row w,
+// staging_stride_m elements a slot, each holding writer w's copy of this rank's range of the
+// size_m x size_n problem from the slot's first element), summed into this rank's partials.
 template <int WORLD, int THREADS, int TILE_N, typename T>
-DINLINE void reduce_slots(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
-                          int64_t inbox_stride_m, int64_t inbox_stride_n,
-                          int inbox_size_m, int inbox_size_n, int64_t partials_offset,
+DINLINE void reduce_slots(char* const* staging_ptr_array, int staging_ptr_array_size,
+                          int64_t staging_stride_m, int64_t staging_stride_n,
+                          int staging_size_m, int staging_size_n,
+                          char* const* partials_ptr_array, int partials_ptr_array_size,
                           int64_t partials_stride_m, int64_t partials_stride_n,
                           int partials_size_m, int partials_size_n, int size_m, int size_n,
                           int rank) {
-  const T* const inbox = impl::rank_of<T>(arena_ptr_array, arena_ptr_array_size, rank, inbox_offset);
+  const T* const inbox = impl::rank_of<T>(staging_ptr_array, staging_ptr_array_size, rank, 0);
   impl::reduce_slots<WORLD, THREADS, TILE_N, true, Quantization::none, T>(
-      [&](int w) { return inbox + w * inbox_stride_m; }, inbox_stride_m, inbox_stride_n,
-      size_m, size_n, 0, arena_ptr_array, arena_ptr_array_size, 0, 0, partials_offset, 0, 0, rank);
+      [&](int w) { return inbox + w * staging_stride_m; }, staging_stride_m, staging_stride_n,
+      size_m, size_n, 0, nullptr, 0, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_size_m,
+      partials_size_n, rank);
 }
 // THE IN-PLACE PULL'S REDUCE-SCATTER (the exact two-shot's): this rank's range of the band of
 // size_m rows from `first_row` of every rank's input, read through the INPUT TABLE where it is
-// (rank r's at inputs_ptr_array[r] at the table's strides), summed into this rank's partials. The
+// (rank r's at input_ptr_array[r] at the table's strides), summed into this rank's partials. The
 // flat walk's body (reduce_slots'): rank r rotated as rank + r, this rank's range from its first
 // element in each rank's input.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void reduce_scatter(const T* const* inputs_ptr_array, int inputs_ptr_array_size, int64_t input_stride_m,
+DINLINE void reduce_scatter(const T* const* input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
                             int64_t input_stride_n, int first_row, int size_m, int size_n,
-                            char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int rank) {
+                            char* const* partials_ptr_array, int partials_ptr_array_size, int rank) {
   constexpr int P = traits<T>::N;
   const int slice = impl::share_slice<WORLD, P>(int64_t{size_m} * size_n);
   impl::reduce_slots<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none, T>(
-      [&](int r) { return impl::ptr_array_at(inputs_ptr_array, inputs_ptr_array_size, r) + first_row * input_stride_m; },
-      input_stride_m, input_stride_n, size_m, size_n, impl::share_first(slice, rank), arena_ptr_array, arena_ptr_array_size,
-      0, 0, partials_offset, 0, 0, rank);
+      [&](int r) { return impl::ptr_array_at(input_ptr_array, input_ptr_array_size, r) + first_row * input_stride_m; },
+      input_stride_m, input_stride_n, size_m, size_n, impl::share_first(slice, rank), nullptr, 0, 0, 0,
+      partials_ptr_array, partials_ptr_array_size, 0, 0, rank);
 }
 // All-gather: every rank's summed range, from its partials (int4: its values, dequantized), at its
 // place in the output.
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
-DINLINE void all_gather(
-    char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset, int64_t partials_stride_m,
-    int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-    int64_t partials_values_offset,
-    int64_t partials_values_stride_m, int64_t partials_values_stride_n,
-    int partials_values_size_m, int partials_values_size_n, int64_t partials_scales_offset, int64_t partials_scales_stride_m,
-    int64_t partials_scales_stride_n, int partials_scales_size_m, int partials_scales_size_n,
-    T* output_ptr, int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-    int output_size_n, int rank) {
+DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
+                        int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
+                        int partials_size_n, T* output_ptr, int64_t output_stride_m,
+                        int64_t output_stride_n, int output_size_m, int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      arena_ptr_array, arena_ptr_array_size, partials_offset, partials_values_offset,
-      partials_scales_offset, output_ptr, output_stride_m,
-      output_stride_n, output_size_m, output_size_n, rank);
+      partials_ptr_array, partials_ptr_array_size, partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n, output_size_m, output_size_n, rank);
 }
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
-DINLINE void all_gather(char* const* arena_ptr_array, int arena_ptr_array_size, int64_t partials_offset,
+DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n,
                         int partials_size_m, int partials_size_n, T* output_ptr,
                         int64_t output_stride_m, int64_t output_stride_n,
                         int output_size_m, int output_size_n, int rank) {
   impl::all_gather<WORLD, THREADS, TILE_N, CONTIGUOUS, Quantization::none>(
-      arena_ptr_array, arena_ptr_array_size, partials_offset, 0, 0, output_ptr, output_stride_m, output_stride_n,
+      partials_ptr_array, partials_ptr_array_size, partials_size_m, partials_size_n, output_ptr,
+      output_stride_m, output_stride_n,
       output_size_m, output_size_n, rank);
 }
-// PUSHED, FIRST: this rank's input, every rank's range of it, into that rank's inbox at this
-// rank's slot (slot `rank` of the [WORLD, slot] inbox), before the first barrier (ordered).
+// PUSHED, FIRST: this rank's input, every rank's range of it, into that rank's staging (its inbox)
+// at this rank's slot (slot `rank` of the [WORLD, slot] inbox), before the first barrier (ordered).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m,
                          int64_t input_stride_n, int input_size_m, int input_size_n,
-                         char* const* arena_ptr_array, int arena_ptr_array_size, int64_t inbox_offset,
-                         int64_t inbox_stride_m, int64_t inbox_stride_n,
-                         int inbox_size_m, int inbox_size_n, int rank) {
+                         char* const* staging_ptr_array, int staging_ptr_array_size,
+                         int64_t staging_stride_m, int64_t staging_stride_n,
+                         int staging_size_m, int staging_size_n, int rank) {
   impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
-      inbox_offset, inbox_stride_m, inbox_stride_n, inbox_size_n, rank);
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_n, rank);
 }
 // THE INT4 TWO-SHOT'S PUSH, before its first barrier (ordered): every rank's range of this rank's
-// input quantized here and stored in that rank's inbox INT4 payload at this rank's slot (the
-// payload `reduce_slots` reads).
+// input quantized here and stored in that rank's staging INT4 payload at this rank's slot (the
+// payload `reduce_slots` reads; its scales at the offset the staging's own sizes give).
 template <int WORLD, int THREADS, int TILE_N, bool CONTIGUOUS, int QUANTIZATION,
           typename T>
 DINLINE void push_shares(const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n,
-                         int input_size_m, int input_size_n, char* const* arena_ptr_array, int arena_ptr_array_size,
-                         int64_t inbox_values_offset, int64_t inbox_values_stride_m,
-                         int64_t inbox_values_stride_n, int inbox_values_size_m,
-                         int inbox_values_size_n, int64_t inbox_scales_offset,
-                         int64_t inbox_scales_stride_m, int64_t inbox_scales_stride_n,
-                         int inbox_scales_size_m, int inbox_scales_size_n, int rank) {
+                         int input_size_m, int input_size_n, char* const* staging_ptr_array,
+                         int staging_ptr_array_size, int64_t staging_stride_m,
+                         int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+                         int rank) {
   impl::push_shares<WORLD, THREADS, TILE_N, CONTIGUOUS, QUANTIZATION>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, arena_ptr_array, arena_ptr_array_size,
-      inbox_values_offset, inbox_scales_offset, rank);
+      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, staging_ptr_array,
+      staging_ptr_array_size, staging_size_m, staging_size_n, rank);
 }
 
 // THE COPY-IN OF EVERY PER-ROW KERNEL, before its first barrier (ordered): this block's rows of
