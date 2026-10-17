@@ -1053,7 +1053,17 @@ class HipCustomCommunicator:
             else timeout_seconds
         )
         if max_rows is None or max_cols is None:
-            served_rows, served_cols = problem_size()
+            # NO SERVER CONFIG TO SIZE FROM (vLLM building its device communicators in
+            # a test or a tool, outside a server): disabled, naming why, rather than
+            # raised, so vLLM takes its own path; the e2e smoke of 2026-10-16 failed on
+            # the raise.
+            try:
+                served_rows, served_cols = problem_size()
+            except ValueError as e:
+                self._own_fields()
+                logger.info("%s disabled: %s", type(self).__name__, e)
+                self.state = Disabled(str(e))
+                return
             max_rows = served_rows if max_rows is None else max_rows
             max_cols = served_cols if max_cols is None else max_cols
         self.max_rows = max_rows
