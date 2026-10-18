@@ -426,9 +426,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 //   3. THE GATHER AND ATTNRES: every owner's rows out of its partials, decoded into DTYPE (the sum
 //      every rank's AttnRes starts from, as the column split's gather lands it), then AttnRes on
 //      each, a group a thread, by every rank (its two outputs are never gathered).
-// THE WORK IS UNITS, a row l of the owners of one class (owner % kClasses), the class's unit
+// THE WORK IS UNITS, a row l of the owners of one class (owner % classes), the class's unit
 // u = class * slice_m + l, block u % gridDim.x's in all three phases, so a block reads after a
-// barrier only what its twins wrote before it. kClasses = gridDim.x / slice_m (1 to WORLD): with
+// barrier only what its twins wrote before it. classes: the most of 1, 2, 4 .. WORLD with
+// classes * slice_m <= gridDim.x: with
 // one class a block took every owner's row l, so no more than slice_m blocks worked and each
 // AttnRes'd WORLD rows in turn (1024 x 3584: 84 us on 128 blocks or more, QuickReduce INT4 +
 // attn_res 58; 2026-10-18T07-09-39Z).
@@ -461,17 +462,25 @@ DINLINE void all_reduce_pull_two_shot_add_attn_res_rms_norm_int4_body(
   const int slice = slice_m * n;  // a rank's rows, flat: its slot of an inbox
   const auto rows_of = [&](int r) { return max(0, min(slice_m, input_size_m - r * slice_m)); };
   const int grid = static_cast<int>(gridDim.x);
-  const int classes = max(1, min(WORLD, grid / max(slice_m, 1)));
-  const int units = classes * slice_m;
+  // THE CLASSES, a power of two (an owner's class its low bits), and this block's: with one, its
+  // rows l = blockIdx.x, + gridDim.x, ...; with more, every block one unit at most (units <=
+  // gridDim.x), its row and class divided out once, here.
+  int classes = 1;
+  while (classes * 2 <= WORLD && classes * 2 * slice_m <= grid) classes *= 2;
+  const int mask = classes - 1;
+  const int c = classes == 1 ? 0 : static_cast<int>(blockIdx.x) / slice_m;
+  const int first = classes == 1 || static_cast<int>(blockIdx.x) < classes * slice_m
+                        ? static_cast<int>(blockIdx.x) - c * slice_m
+                        : slice_m;
+  const int step = classes == 1 ? grid : slice_m;
 
   // 1. THE PUSH, owners rotated (rank + w), a row of each a step, two owners' rows in flight.
-  for (int u = blockIdx.x; u < units; u += grid) {
-    const int l = u % slice_m, c = u / slice_m;
+  for (int l = first; l < slice_m; l += step) {
 #pragma unroll 2
     for (int w = 0; w < WORLD; ++w) {
       const int r = (rank + w) % WORLD;
       // Another class's owner, or a late owner's short slice (every thread alike).
-      if (r % classes != c || l >= rows_of(r)) continue;
+      if ((r & mask) != c || l >= rows_of(r)) continue;
       DTYPE x[1][kInt4GroupPacks][kPackElems];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
           &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, n,
@@ -499,9 +508,8 @@ DINLINE void all_reduce_pull_two_shot_add_attn_res_rms_norm_int4_body(
 
   // 2. THIS RANK'S ROWS: every writer's group of the row from this rank's inbox (slots rotated
   // from this rank's), summed in fp32 and left INT4 in this rank's partials.
-  for (int u = blockIdx.x; u < units; u += grid) {
-    const int l = u % slice_m;
-    if (rank % classes != u / slice_m || l >= rows_of(rank)) continue;
+  for (int l = first; l < slice_m; l += step) {
+    if ((rank & mask) != c || l >= rows_of(rank)) continue;
     uint32_t got[WORLD][1][kInt4GroupPacks][2];
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
         staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
@@ -523,11 +531,10 @@ DINLINE void all_reduce_pull_two_shot_add_attn_res_rms_norm_int4_body(
   // 4. EVERY OWNER'S ROW l, owners rotated (rank + v): the row's group from its owner, decoded,
   // then AttnRes on it. The next call's first sync keeps an owner from overwriting its partials
   // while they are read.
-  for (int u = blockIdx.x; u < units; u += grid) {
-    const int l = u % slice_m, c = u / slice_m;
+  for (int l = first; l < slice_m; l += step) {
     for (int v = 0; v < WORLD; ++v) {
       const int owner = (rank + v) % WORLD;
-      if (owner % classes != c || l >= rows_of(owner)) continue;
+      if ((owner & mask) != c || l >= rows_of(owner)) continue;
       uint32_t raw[1][kInt4GroupPacks][2];
       recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
           partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
