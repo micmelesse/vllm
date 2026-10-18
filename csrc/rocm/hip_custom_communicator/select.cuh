@@ -764,7 +764,8 @@ constexpr TunedKernel kAttnResKernels[] = {
 //   AttnRes    57.7 / 92.9 / 643.1 exact, 51.3 / 105.5 / 762.5 INT4: NEVER for now
 //     (its reduce-scatter is still the LDS one, a word a thread, one wave summing;
 //     the plain path's register sum, a group a thread, is what made INT4 win there)
-// So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never.
+// So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never; the norms'
+// since 7 MiB (below).
 constexpr int64_t kInt4Never = int64_t{1} << 62;
 struct Int4Crossover {
   OpType op;
@@ -772,8 +773,12 @@ struct Int4Crossover {
 };
 constexpr Int4Crossover kInt4Crossovers[] = {
     {OpType::all_reduce, 14 * 1024 * 1024},
-    {OpType::all_reduce_rms_norm, 14 * 1024 * 1024},
-    {OpType::all_reduce_add_rms_norm, 14 * 1024 * 1024},
+    // The norms from 7 MiB since their INT4 is a group a thread (forced INT4
+    // against the exact pick at 1024 x 3584 and 512 x 7168: rms 39.0 / 40.4
+    // against 44.8 / 54.5 us, add 44.0 / 45.9 against 63.0 / 59.3; at 3.5 MiB a
+    // tie, 30.3 / 31.3 against 28.5 / 32.6; 2026-10-18T05-49-21Z).
+    {OpType::all_reduce_rms_norm, 7 * 1024 * 1024},
+    {OpType::all_reduce_add_rms_norm, 7 * 1024 * 1024},
     {OpType::all_reduce_add_attn_res_rms_norm, kInt4Never},
 };
 // EACH OP'S INT4 KERNELS: ITS EXACT KERNELS, EVERY TWO-SHOT ONE MOVING INT4, at
