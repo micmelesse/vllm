@@ -916,8 +916,10 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
 // units of a row and a class of owners (its INT4 body), TILE_K 3 (the best at every prefill size,
 // 1-15% under 1). Grids from the sweep (forced, 256-512 blocks, 1024-8192 tokens;
 // 2026-10-18T07-50-18Z): 512 where the units are few (an owner's slice <= 256 rows: two classes
-// or more) and at 8192 x 3584, 256 at 4096 x 3584 and from 4096 x 7168 (172 against 187 us at 512,
-// 309 against 339). 384 lost everywhere (one class, uneven).
+// or more) and at 8192 x 3584, 256 from 4096 x 7168 (309 against 339 us at 512). 384 lost
+// everywhere (one class, uneven). At 3584 the 2-wave blocks hold 4 a CU (resident_blocks), so 1024
+// at 2048-4096 tokens, a wave a SIMD more under AttnRes (2048: 82.5 against 95.1 us at 512; 4096:
+// 161.7 against 171.8 at 256; 8192 341.7 against 302.6 at 512; 2026-10-18T13-15-40Z).
 constexpr TunedKernel kAttnResInt4Kernels[] = {
     {8,
      1,
@@ -925,10 +927,10 @@ constexpr TunedKernel kAttnResInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
     {8,
-     4096,
+     2048,
      3584,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {256, 0}}},
+     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {1024, 0}}},
     {8,
      8192,
      3584,
