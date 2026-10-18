@@ -500,7 +500,10 @@ struct TunedKernel {
 // (2026-10-12T01-27-40Z, 01-45-53Z; one run a point): 80-120 blocks at mid
 // sizes, 72 from 1 MB-ish shares up, where the flat walk beats be0e1f4e9c (7168
 // x 4096: 262.4 against 263.9 us). Equal bytes measure alike (the walk is over
-// the flat range), so the two widths share grids.
+// the flat range), so the two widths share grids. At 48 tokens a chunk a block
+// (48 and 84 blocks: 48x3584 10.2 -> 9.0 us, 48x7168 11.2 -> 10.4;
+// 2026-10-18T08-56-55Z); 8 tokens of 7168 the one-shot on 56 blocks (8.5 ->
+// 8.1, 09-02-30Z; the same bytes at 16 of 3584 lost, 8.4 -> 9.0).
 constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      1,
@@ -517,6 +520,11 @@ constexpr TunedKernel kAllReduceKernels[] = {
      3584,
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {32, 0}}},
+    {8,
+     48,
+     3584,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {48, 0}}},
     {8,
      64,
      3584,
@@ -550,8 +558,8 @@ constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      8,
      7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {16, 0}}},
+     Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {56, 0}}},
     {8,
      16,
      7168,
@@ -562,6 +570,11 @@ constexpr TunedKernel kAllReduceKernels[] = {
      7168,
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
+    {8,
+     48,
+     7168,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {84, 0}}},
     {8,
      64,
      7168,

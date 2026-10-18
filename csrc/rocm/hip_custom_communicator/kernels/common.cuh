@@ -372,7 +372,9 @@ constexpr int kStatusFields = 10;
 // inputs (ours), or pushes it into the peers' inputs (the plain all-reduce's
 // inboxes: remote stores, which the release's wait and write-back complete),
 // before the launch's first barrier, which is ordered (release before the
-// flag, acquire after it), so the reads of the inputs after it see them.
+// flag, acquire after it), so the reads of the inputs after it see them;
+// the pulls' first barrier (`started`) is not: what they read was written
+// before the launches, which the launch boundaries order (Until, below).
 // The tests that would catch a stale line: every op's output against
 // torch.distributed's across back-to-back calls on the same buffers, and the
 // signals' return to clear after every launch. Each flag is touched only
@@ -409,7 +411,14 @@ constexpr int kStatusFields = 10;
 // visible to the other side after; every peer is done reading this rank (so its
 // buffers may be reused). Every barrier pairs this block with the same block on
 // every rank.
-enum class Until { launched, visible, read };
+// STARTED (the pulls' first barrier: nothing written in the launch before it, every read after it
+// of what a peer wrote BEFORE its launch) is unordered, as aiter's `start_sync` (relaxed store,
+// relaxed polls, no fence): the launch boundaries order it. The writer's kernel end releases at
+// agent scope at least, `buffer_wbl2 sc1`, which LLVM's GFX942 model says is what makes local
+// writes coherent for another agent's CUs; this launch's start acquires, and nothing in it read a
+// peer's input before the barrier, so no stale line of one can be held. Its release and acquire
+// cost 0.3-0.5 us each a call at decode (2026-10-18T08-48-34Z, 08-52-54Z against 08-44-19Z).
+enum class Until { launched, visible, read, started };
 
 // THE BARRIER, one for every case, and the whole protocol in one place:
 // barrier<WORLD>(the signals buffer, the status buffer, rank, timeout_ticks, Until::read, 1),
@@ -446,8 +455,8 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // UNTIL AND PARITY ARE PLAIN ARGUMENTS: barrier is force-inlined and every call passes literals,
   // so they fold as template parameters would (I8, ISA summary).
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && parity > 1) __builtin_trap();
-  const bool ordered = until != Until::read;
-  const bool first = until == Until::launched;
+  const bool ordered = until == Until::launched || until == Until::visible;
+  const bool first = until == Until::launched || until == Until::started;
   // 1. SKEW, debug builds only: up to ~32 x 8K cycles, different per rank, block and parity.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG) {
     uint32_t h = static_cast<uint32_t>(rank) * 73856093u ^
