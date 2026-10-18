@@ -466,7 +466,35 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     for (uint32_t n = (h ^ (h >> 15)) % 32; n > 0; --n)
       __builtin_amdgcn_s_sleep(127);
   }
-  // 2. EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
+  // 2. THE TWO FLAGS, from the signals buffer [R, 2, B, R]: rank `owner`'s for block `block`
+  // on rank `writer`, at `parity` (every rank's address, its strides and its sizes; debug
+  // builds check each index against its size). AN INDEX KEEPS ITS CALLER'S TYPE (a block
+  // unsigned, as blockIdx.x; a rank as passed): an int where the caller had an unsigned costs
+  // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
+  // this rank's, written by this lane's peer.
+  const auto flag = [&](auto owner, unsigned block, auto writer) {
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (static_cast<int64_t>(owner) < 0 || static_cast<int64_t>(owner) >= WORLD ||
+         static_cast<int64_t>(parity) >= signals_size_parity ||
+         static_cast<int64_t>(block) >= signals_size_block ||
+         static_cast<int64_t>(writer) < 0 ||
+         static_cast<int64_t>(writer) >= signals_size_writer))
+      __builtin_trap();
+    return lane_ptr_array_at<uint32_t, WORLD>(signals_ptr_array, signals_ptr_array_size,
+                                    static_cast<int>(owner)) +
+           parity * signals_stride_parity + block * signals_stride_block +
+           writer * signals_stride_writer;
+  };
+  // THEIR ADDRESSES FIRST, before the block barrier: the signals table is fixed at open, so its
+  // read (a cold scalar load, ~1500 cycles at decode: ATT 2026-10-18T15-45-22Z) overlaps the
+  // kernel's argument loads and the other waves' arrival instead of following them.
+  uint32_t* theirs_ptr = nullptr;
+  uint32_t* mine_ptr = nullptr;
+  if (threadIdx.x < WORLD) {
+    theirs_ptr = flag(threadIdx.x, blockIdx.x, rank);
+    mine_ptr = flag(rank, blockIdx.x, threadIdx.x);
+  }
+  // 3. EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
   // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
   // ISA), so the releasing wave's fence would cover only its own stores, and another wave's
   // could still be in flight when the flag lands -- a remote store above all.
@@ -474,27 +502,6 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   __syncthreads();
   if (threadIdx.x < WORLD) {
     if (!ordered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    // 3. THE TWO FLAGS, from the signals buffer [R, 2, B, R]: rank `owner`'s for block `block`
-    // on rank `writer`, at `parity` (every rank's address, its strides and its sizes; debug
-    // builds check each index against its size). AN INDEX KEEPS ITS CALLER'S TYPE (a block
-    // unsigned, as blockIdx.x; a rank as passed): an int where the caller had an unsigned costs
-    // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
-    // this rank's, written by this lane's peer.
-    const auto flag = [&](auto owner, unsigned block, auto writer) {
-      if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
-          (static_cast<int64_t>(owner) < 0 || static_cast<int64_t>(owner) >= WORLD ||
-           static_cast<int64_t>(parity) >= signals_size_parity ||
-           static_cast<int64_t>(block) >= signals_size_block ||
-           static_cast<int64_t>(writer) < 0 ||
-           static_cast<int64_t>(writer) >= signals_size_writer))
-        __builtin_trap();
-      return lane_ptr_array_at<uint32_t, WORLD>(signals_ptr_array, signals_ptr_array_size,
-                                      static_cast<int>(owner)) +
-             parity * signals_stride_parity + block * signals_stride_block +
-             writer * signals_stride_writer;
-    };
-    uint32_t* const theirs_ptr = flag(threadIdx.x, blockIdx.x, rank);
-    uint32_t* const mine_ptr = flag(rank, blockIdx.x, threadIdx.x);
     // 4. SIGNAL: a SYSTEM-scope atomic store, release when ordered. A flag is touched only by
     // the __scoped_atomic builtins, each with its order and scope spelled at the call.
     __scoped_atomic_store_n(theirs_ptr, static_cast<uint32_t>(FlagState::arrived),
