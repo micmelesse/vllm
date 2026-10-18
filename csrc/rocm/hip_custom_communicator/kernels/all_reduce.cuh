@@ -75,11 +75,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
   // 1. Every rank's input is ready (written before its launch: the caller's,
   // or the host's copy) and visible (the first barrier is ordered).
-  barrier<WORLD, Until::launched, 0>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::launched, 0);
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
@@ -102,11 +102,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
-  barrier<WORLD, Until::read, 1>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::read, 1);
 }
 
 // =============================================================================
@@ -215,11 +215,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
       store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(mine, staging_ptr_array, staging_ptr_array_size, 0, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     }
-    barrier<WORLD, Until::visible, 0>(
+    barrier<WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        rank, timeout_ticks, Until::visible, 0);
     // 2. Every writer's slot of this rank's inbox, local, in rank order, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
@@ -240,11 +240,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     // 3. No rank may push its next band (this launch's or the next's) until
     // every peer has summed this one out of its inbox.
-    barrier<WORLD, Until::read, 1>(
+    barrier<WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
-        rank, timeout_ticks);
+        rank, timeout_ticks, Until::read, 1);
   }
 }
 

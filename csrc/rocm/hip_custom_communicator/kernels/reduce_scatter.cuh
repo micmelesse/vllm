@@ -188,10 +188,10 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
       // 2. THE SUM, LOCAL: this rank's share, every writer's pushed group read from this rank's own
       // inbox, all in flight (rotated writer order), summed in fp32 from the words, quantized and
       // stored in this rank's partials.
@@ -284,10 +284,10 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, Until::visible, 1);
     } else {
       static_assert(ACCUMULATE == Accumulate::lds, "the exact flat walk sums through LDS");
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
@@ -354,10 +354,10 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
       // 2. THE SUM: this rank's share, a TILE_N chunk a step, every rank's copy (pull: its input
       // through the table, from this rank's first element; push: writer w's slot of this rank's
       // inbox) in one round trip, summed over the ranks in rotated order through LDS, rounded once
@@ -409,10 +409,10 @@ DINLINE void reduce_scatter(
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
-      barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, Until::visible, 1);
     }
   } else {
     // THIS RANK'S COLUMNS, in whole packs (a late rank's short or empty), and this block's rows,
@@ -448,10 +448,10 @@ DINLINE void reduce_scatter(
                 (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
         }
     }
-    barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+    barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, UNTIL, 0);
     if constexpr (ACCUMULATE == Accumulate::lds) {
       static_assert(DIRECTION == Direction::pull, "the rows walk through LDS pulls");
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
@@ -598,10 +598,10 @@ DINLINE void reduce_scatter(
                 input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
           }
     }
-    barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+    barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
-                              status_stride_field, status_size_field, rank, timeout_ticks);
+                              status_stride_field, status_size_field, rank, timeout_ticks, Until::visible, 1);
   }
 }
 

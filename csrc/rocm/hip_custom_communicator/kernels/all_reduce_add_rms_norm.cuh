@@ -58,11 +58,11 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
   // captured call's, registered) or the host's copy in its staging (an eager
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
-  barrier<WORLD, Until::launched, 0>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::launched, 0);
 
   // 2. Each of this block's rows: read it from every rank in rank order and
   // sum, then (ADD_RESIDUAL) add
@@ -110,17 +110,17 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
     float scale[1];
     DTYPE normed[1][kPacks][kPackElems];
-    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
-                                                     input_size_n, 0);
+    rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0, NormPart::row, true);
     store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Until::read, 1>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::read, 1);
 }
 
 // THE KERNELS, one per op, both the body above.
@@ -265,11 +265,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
                 band + t + s * static_cast<int>(gridDim.x), c, 1);
         }
     }
-  barrier<WORLD, Until::launched, 0>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::launched, 0);
 
 
   // 2. This rank's rows: read each from every rank in rank order and sum, then
@@ -341,8 +341,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     float scale[1];
     DTYPE normed[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL) {
-      rms_norm<THREADS_PER_BLOCK, NormPart::scale, true>(s, scale, w, normed, eps, inv_hidden,
-                                                         input_size_n, 0);
+      rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden,
+                                                         input_size_n, 0, NormPart::scale, true);
       // The row's scale into this rank's scales, [slice_m] floats (ADD_RESIDUAL's own buffer): a
       // row of one element, so its one pack is thread 0's.
       float scale_row[1][1][1] = {{{scale[0]}}};
@@ -352,8 +352,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
-    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
-                                                     input_size_n, 0);
+    rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0, NormPart::row, true);
     store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::own>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its
@@ -369,11 +369,11 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   }
 
   // 3. Every rank's rows are visible to its peers.
-  barrier<WORLD, Until::visible, 1>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::visible, 1);
 
   // 4. Every owner's rows out of its partials, at their place in the output. The
   // next call's
@@ -424,8 +424,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
           for (int j = 0; j < kPackElems; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
           float scale[1] = {sc[r][0][0][0]};
           DTYPE normed[1][1][kPackElems];
-          rms_norm<THREADS_PER_BLOCK, NormPart::apply, true>(got_f, scale, w_step, normed, eps,
-                                                             inv_hidden, input_size_n, c);
+          rms_norm<THREADS_PER_BLOCK>(got_f, scale, w_step, normed, eps,
+                                                             inv_hidden, input_size_n, c, NormPart::apply, true);
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         } else {
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
@@ -613,8 +613,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
     float scale[1];
     DTYPE normed[1][kPacks][kPackElems];
-    rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
-                                                     input_size_n, 0);
+    rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden,
+                                                     input_size_n, 0, NormPart::row, true);
     store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
   }
 }

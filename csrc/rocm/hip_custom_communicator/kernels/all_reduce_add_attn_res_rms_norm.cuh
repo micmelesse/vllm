@@ -274,8 +274,8 @@ DINLINE void block_attn_res_tile(
     DTYPE output_norm_weight[1][K][P];
     load<1, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
-    rms_norm<THREADS_PER_BLOCK, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
-                                            inv_hidden, input_size_n, offs_n);
+    rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps,
+                                            inv_hidden, input_size_n, offs_n, NormPart::row, false);
   } else {
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
@@ -337,11 +337,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // captured call's, registered) or the host's copy in its staging (an eager
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
-  barrier<WORLD, Until::launched, 0>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::launched, 0);
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum,
   //    AttnRes.
@@ -371,11 +371,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<WORLD, Until::read, 1>(
+  barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks);
+      rank, timeout_ticks, Until::read, 1);
 }
 
 // =============================================================================

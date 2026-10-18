@@ -20,12 +20,13 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2 };
 //   output   = T(input * scale * float(weight))            AttnRes's output norm (its reference)
 // The variance is of `input` before any further rounding. A block's threads call it together
 // (scale's reduce).
-template <int THREADS_PER_BLOCK, NormPart PART, bool ROUND_SCALED, typename W, typename T, int ROWS, int K,
+template <int THREADS_PER_BLOCK, typename W, typename T, int ROWS, int K,
           int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
-                      float inv_hidden, int size_n, int offs_n) {
-  if constexpr (PART != NormPart::apply) {
+                      float inv_hidden, int size_n, int offs_n, NormPart part,
+                      bool round_scaled) {
+  if (part != NormPart::apply) {
     // This thread's share of each row's sum of squares, packs past size_n counting zero: its mask,
     // 1 below size_n and 0 past it, is multiplied in so nothing branches (load clamps a pack past
     // the clip to the last in bounds, and a load under a runtime `if` cannot be hoisted past it).
@@ -46,7 +47,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }
-  if constexpr (PART != NormPart::scale) {
+  if (part != NormPart::scale) {
     // Each rounding the reference does a pass of its own over the tile (one fused pass's
     // conversions were not paired: +100 instructions in AttnRes, ISA I4).
     float normed[ROWS][K][P];
@@ -56,7 +57,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
       for (int k = 0; k < K; ++k)
 #pragma unroll
         for (int j = 0; j < P; ++j) normed[m][k][j] = input[m][k][j] * scale[m];
-    if constexpr (ROUND_SCALED) {
+    if (round_scaled) {
 #pragma unroll
       for (int m = 0; m < ROWS; ++m)
 #pragma unroll
@@ -77,7 +78,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
       for (int k = 0; k < K; ++k)
 #pragma unroll
         for (int j = 0; j < P; ++j)
-          output[m][k][j] = ROUND_SCALED ? static_cast<T>(static_cast<W>(normed[m][k][j]))
+          output[m][k][j] = round_scaled ? static_cast<T>(static_cast<W>(normed[m][k][j]))
                                          : static_cast<T>(normed[m][k][j]);
   }
 }
