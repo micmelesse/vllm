@@ -187,8 +187,6 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4},
     AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{128, 3, 1, 4096, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 3, 1, 8192, 1, Quantization::int4},
 };
 
 // What each template is, in Template's order: its op, its shot, and its builds.
@@ -772,8 +770,7 @@ constexpr TunedKernel kAttnResKernels[] = {
 //     (its reduce-scatter is still the LDS one, a word a thread, one wave summing;
 //     the plain path's register sum, a group a thread, is what made INT4 win there)
 // So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never; the norms'
-// since 7 MiB (below).
-constexpr int64_t kInt4Never = int64_t{1} << 62;
+// and AttnRes since 7 MiB, their INT4 a group a thread (below).
 struct Int4Crossover {
   OpType op;
   int64_t min_bytes;
@@ -786,7 +783,9 @@ constexpr Int4Crossover kInt4Crossovers[] = {
     // tie, 30.3 / 31.3 against 28.5 / 32.6; 2026-10-18T05-49-21Z).
     {OpType::all_reduce_rms_norm, 7 * 1024 * 1024},
     {OpType::all_reduce_add_rms_norm, 7 * 1024 * 1024},
-    {OpType::all_reduce_add_attn_res_rms_norm, kInt4Never},
+    // AttnRes from 7 MiB since its INT4 is a group a thread (1024 x 3584: 47.4 us against the
+    // exact pick's 54.8; 2026-10-18T07-50-18Z, 04-52-25Z).
+    {OpType::all_reduce_add_attn_res_rms_norm, 7 * 1024 * 1024},
 };
 // EACH OP'S INT4 KERNELS: ITS EXACT KERNELS, EVERY TWO-SHOT ONE MOVING INT4, at
 // the same template, tile, threads and grid. INT4 AT THE BASELINE'S OWN CONFIG,
@@ -863,19 +862,38 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
 };
-// AttnRes's INT4 kernels, its own (not int4_of's): the pull, a group a thread, a row split (its
-// INT4 body), as the norms'.
+// AttnRes's INT4 kernels, its own (not int4_of's): the pull, a group a thread, a row split in
+// units of a row and a class of owners (its INT4 body), TILE_K 3 (the best at every prefill size,
+// 1-15% under 1). Grids from the sweep (forced, 256-512 blocks, 1024-8192 tokens;
+// 2026-10-18T07-50-18Z): 512 where the units are few (an owner's slice <= 256 rows: two classes
+// or more) and at 8192 x 3584, 256 at 4096 x 3584 and from 4096 x 7168 (172 against 187 us at 512,
+// 309 against 339). 384 lost everywhere (one class, uneven).
 constexpr TunedKernel kAttnResInt4Kernels[] = {
     {8,
      1,
      3584,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {256, 0}}},
+     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {256, 0}}},
+    {8,
+     8192,
+     3584,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
     {8,
      1,
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {256, 0}}},
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4}, {512, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4}, {256, 0}}},
 };
 
 constexpr int64_t int4_min_bytes(OpType o) {
