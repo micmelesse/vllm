@@ -466,7 +466,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    same rows.
   (void)reduce_scatter_blocks;
   reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::rows, Accumulate::lds,
-                 Direction::pull, QUANTIZATION, true, Until::launched>(
+                 Direction::pull, QUANTIZATION, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -485,7 +485,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    (150 -> 166; ISA harness 2026-10-15).
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][kPacks][kPackElems];
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, true, DTYPE>(
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, DTYPE>(
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
         slice_n, rank);
@@ -573,7 +573,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    they spilled).
   // 3. Every rank's sums are in this rank's partials, and every peer has read this rank's input.
   reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::rows, Accumulate::registers,
-                 Direction::push, QUANTIZATION, true, Until::launched>(
+                 Direction::push, QUANTIZATION, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,

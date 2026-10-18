@@ -43,11 +43,10 @@ namespace hip_custom_communicator {
 // every rank's held up front was ~20 scalar loads before the first barrier).
 //
 // CONTIGUOUS, whether an [*, n] buffer's rows are back to back so its range is
-// one run, is a template parameter of the kernel, its instance chosen on the
-// host from the strides as given. A compile-time choice, not a branch in the
-// kernel: both paths in one kernel cost ~0.1 us a call at 128-512 tokens
-// against the contiguous path alone (the strided code and its registers,
-// 2026-10-12T01-17-18Z).
+// one run, is read from the strides in the kernel (I8: a scalar branch, uniform
+// across the launch; it was a template parameter, both paths in one kernel
+// measured ~0.1 us a call at 128-512 tokens on 2026-10-12T01-17-18Z, before
+// the walk's rewrite; I8's ISA summary is the new evidence).
 
 // WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
 // reads its peers and keeps the sum in its partials; push, the sum is stored in every rank's
@@ -87,7 +86,7 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 // rank's partials, pull in this rank's. none reads every rank's input in place; int4 every rank's
 // staged INT4 payload, an INT4 payload's layout from its own buffer's sizes.
 template <int WORLD, int THREADS_PER_BLOCK, int TILE_M, int TILE_N, Walk WALK, Accumulate ACCUMULATE,
-          Direction DIRECTION, int QUANTIZATION, bool CONTIGUOUS, Until UNTIL, typename DTYPE>
+          Direction DIRECTION, int QUANTIZATION, Until UNTIL, typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
     int input_size_n, const DTYPE* const* input_ptr_array, int input_ptr_array_size,
@@ -102,6 +101,12 @@ DINLINE void reduce_scatter(
     int64_t status_stride_field, int status_size_field, int offs_m, int rank,
     uint64_t timeout_ticks) {
   constexpr int kPackElems = traits<DTYPE>::N;
+  // THE INPUT'S ROWS BACK TO BACK (the flat walk reads a share as one run, else element by
+  // element), from the strides it reads by: uniform across the launch, a scalar branch.
+  [[maybe_unused]] const bool contiguous =
+      DIRECTION == Direction::push
+          ? input_stride_m == int64_t{input_size_n} * input_stride_n
+          : input_ptr_array_stride_m == int64_t{input_size_n} * input_ptr_array_stride_n;
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
   using V = vec<DTYPE, kPackElems>;
   // A PACK IS ONE 16-BYTE GLOBAL INSTRUCTION: loaded and stored as a global u32x4 (global_load_dwordx4
@@ -147,7 +152,7 @@ DINLINE void reduce_scatter(
           const int64_t first = int64_t{r} * slice;
           const int at = min(g, groups - 1);
           const V* group;
-          if constexpr (CONTIGUOUS) {
+          if (contiguous) {
             // A UNIFORM BASE PLUS A 32-BIT BYTE OFFSET, the offset opaque so the address is built
             // at its load (saddr), not hoisted and held as a 64-bit vector address.
             uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(DTYPE));
@@ -302,7 +307,7 @@ DINLINE void reduce_scatter(
           if (len == 0) continue;
           const int64_t first = int64_t{r} * slice;
           DTYPE part[kPacks][kPackElems];
-          if constexpr (CONTIGUOUS) {
+          if (contiguous) {
             // The last pack, the run's start, then the column: the order the two-shot's
             // instructions came out in (ISA 2026-10-15).
 #pragma unroll
@@ -360,7 +365,7 @@ DINLINE void reduce_scatter(
       const int len = share_len(rank);
       if (len != 0) {  // a late rank's share is empty at few packs (every block alike)
         [[maybe_unused]] const DTYPE* const inbox = ptr_array_at<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank);
-        constexpr bool kRun = DIRECTION == Direction::push || CONTIGUOUS;
+        const bool run = DIRECTION == Direction::push || contiguous;
         const int64_t stride_m = DIRECTION == Direction::push ? staging_stride_m : input_ptr_array_stride_m;
         const int64_t stride_n = DIRECTION == Direction::push ? staging_stride_n : input_ptr_array_stride_n;
         const int64_t first = DIRECTION == Direction::push ? 0 : int64_t{rank} * slice;
@@ -373,7 +378,7 @@ DINLINE void reduce_scatter(
             from = ptr_array_at(input_ptr_array, input_ptr_array_size, w) + offs_m * input_ptr_array_stride_m;
           }
           DTYPE got[1][kPacks][kPackElems];
-          if constexpr (kRun) {
+          if (run) {
 #pragma unroll
             for (int k = 0; k < kPacks; ++k) {
               const int last = len / kPackElems - 1;

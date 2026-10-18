@@ -25,7 +25,7 @@ namespace hip_custom_communicator {
 // from the rank owning its columns, slice_n columns a rank (the last rank's to the end), the
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
-template <int WORLD, int THREADS_PER_BLOCK, int TILE_N, Walk WALK, int QUANTIZATION, bool CONTIGUOUS,
+template <int WORLD, int THREADS_PER_BLOCK, int TILE_N, Walk WALK, int QUANTIZATION,
           typename DTYPE, typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
@@ -33,6 +33,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
                         int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int slice_n, int rank) {
   constexpr int kPackElems = traits<DTYPE>::N;
+  // THE OUTPUT'S ROWS BACK TO BACK (a share stored as one run), from its strides: uniform across
+  // the launch, a scalar branch.
+  [[maybe_unused]] const bool contiguous = output_stride_m == int64_t{output_size_n} * output_stride_n;
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
   using V = vec<DTYPE, kPackElems>;
   // A PACK IS ONE 16-BYTE GLOBAL INSTRUCTION (reduce_scatter.cuh's).
@@ -95,7 +98,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           if (!(g < g_end && g < groups)) continue;
           const int64_t first = int64_t{r} * slice;
           V* group;
-          if constexpr (CONTIGUOUS) {
+          if (contiguous) {
             uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(DTYPE));
             asm volatile("" : "+v"(offset));
             group = reinterpret_cast<V*>(
@@ -134,7 +137,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           const int c = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
           if (c >= len / kPackElems) continue;
           V* at;
-          if constexpr (CONTIGUOUS) {
+          if (contiguous) {
             // A uniform base plus a 32-bit byte offset, opaque so the address is built at its
             // store (c is below the share, so no clamp).
             uint32_t offset = static_cast<uint32_t>(c) * uint32_t{sizeof(V)};

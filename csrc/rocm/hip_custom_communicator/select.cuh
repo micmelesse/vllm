@@ -1429,23 +1429,14 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            const bool contiguous = input_stride_m == n * input_stride_n &&
-                                    output_stride_m == n * output_stride_n;
             if constexpr (two_shot_lays_out(C, NG, NL)) {
-              const auto at = [&](auto layout) {
-                constexpr bool CONTIGUOUS = decltype(layout)::value;
-                if constexpr (C.quantization == Quantization::none)
-                  return instance<AllReduceTwoShotPushedKernel>(
-                      all_reduce_push_two_shot<T, NG, TM, TN, THREADS, WAVES,
-                                               CONTIGUOUS>);
-                else
-                  return instance<AllReduceTwoShotKernel>(
-                      all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS,
-                                                    WAVES, CONTIGUOUS,
-                                                    C.quantization>);
-              };
-              kernel =
-                  contiguous ? at(std::true_type{}) : at(std::false_type{});
+              if constexpr (C.quantization == Quantization::none)
+                kernel = instance<AllReduceTwoShotPushedKernel>(
+                    all_reduce_push_two_shot<T, NG, TM, TN, THREADS, WAVES>);
+              else
+                kernel = instance<AllReduceTwoShotKernel>(
+                    all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS,
+                                                  WAVES, C.quantization>);
             }
           });
           return;
@@ -1455,29 +1446,20 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
             constexpr AllReduceBuildConfig C = decltype(built)::value;
             constexpr int THREADS = C.threads_per_block, WAVES = C.waves_per_eu;
             constexpr int TM = C.tile_m, TN = C.tile_n;
-            // THE INSTANCE FOR THE LAYOUT AS GIVEN: rows back to back read each
-            // peer's share as one run, other strides the strided walk
-            // (common.cuh's COLLECTIVES); the input is not reshaped. In
-            // place, every rank's input is read at the table's strides: a
-            // captured call's are the caller's (every rank's alike), an eager
-            // call's its copy's, dense rows, so the input's rows back to back
-            // answer for both.
-            const bool contiguous = input_stride_m == n * input_stride_n &&
-                                    output_stride_m == n * output_stride_n;
+            // THE LAYOUT AS GIVEN, read by the kernel from the strides (rows
+            // back to back: each peer's share one run; reduce_scatter.cuh's
+            // CONTIGUOUS); the input is not reshaped. In place, every rank's
+            // input is read at the table's strides: a captured call's are the
+            // caller's (every rank's alike), an eager call's its copy's.
             if constexpr (two_shot_lays_out(C, NG, NL)) {
-              const auto at = [&](auto layout) {
-                constexpr bool CONTIGUOUS = decltype(layout)::value;
-                if constexpr (C.quantization == Quantization::none)
-                  return instance<AllReduceTwoShotInPlaceKernel>(
-                      all_reduce_pull_two_shot<T, NG, TM, TN, THREADS,
-                                                        WAVES, CONTIGUOUS>);
-                else
-                  return instance<AllReduceTwoShotKernel>(
-                      all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS, WAVES,
-                                               CONTIGUOUS, C.quantization>);
-              };
-              kernel =
-                  contiguous ? at(std::true_type{}) : at(std::false_type{});
+              if constexpr (C.quantization == Quantization::none)
+                kernel = instance<AllReduceTwoShotInPlaceKernel>(
+                    all_reduce_pull_two_shot<T, NG, TM, TN, THREADS,
+                                                      WAVES>);
+              else
+                kernel = instance<AllReduceTwoShotKernel>(
+                    all_reduce_pull_two_shot_int4<T, NG, TM, TN, THREADS, WAVES,
+                                             C.quantization>);
             }
           });
           return;

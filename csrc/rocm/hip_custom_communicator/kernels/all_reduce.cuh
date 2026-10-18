@@ -121,9 +121,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 // THE PROBLEM as the pushed two-shot's (the flat walk, each rank's share one
 // contiguous range of the band's elements), every rank's input at the table's
-// strides. CONTIGUOUS: the table's rows and the output's back to back.
+// strides (each read as one run when its rows are back to back: reduce_scatter.cuh's CONTIGUOUS).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    table says, summed into its partials; every rank's sums visible and every peer done
     //    reading this band of this rank's input.
     reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
-                   Direction::pull, Quantization::none, CONTIGUOUS, Until::visible>(
+                   Direction::pull, Quantization::none, Until::visible>(
         static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
         input_ptr_array_size, input_stride_m, input_stride_n, nullptr, 0, 0, 1, 0, 0,
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 4. All-gather: every rank's summed share out of its partials, at its
     //    place in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none, CONTIGUOUS,
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none,
                DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
@@ -272,15 +272,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // common.cuh's flat walk cuts it as [R, 1, M*N], each rank's share one
 // contiguous range of the elements, for long runs (its comment says why and
 // what it serves badly), a TILE_N chunk a step (TILE_M is the build's, 1:
-// select's two_shot_lays_out). CONTIGUOUS: the input's and the output's rows
-// are back to back, the instance the host picks from their strides.
+// select's two_shot_lays_out). A buffer whose rows are back to back is read or
+// written as one run (reduce_scatter.cuh's CONTIGUOUS).
 // QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION); with int4
 // each share is quantized by this rank, from its own input, and pushed into the share's rank's inbox INT4 payload at this rank's slot
 // (the payload as an [m, n] one, writer w's slot where share w's groups lie),
 // and the sums' are the partials' INT4 payload, a group a thread (the INT4 flat
 // walk's). INT4 ONLY: none is the exact build below.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS,
+          int THREADS_PER_BLOCK, int WAVES_PER_EU,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_int4(
@@ -307,7 +307,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // every writer's slot summed, into its partials; every rank's sums visible and every peer done
   // with its inbox (the next launch's push may overwrite it).
   reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::registers,
-                 Direction::push, QUANTIZATION, CONTIGUOUS, Until::launched>(
+                 Direction::push, QUANTIZATION, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -320,7 +320,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. All-gather: every rank's summed share out of its partials, at its place
   // in the output. The next call's first sync keeps a rank from overwriting
   // its partials while it is read (they are written only after it).
-  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, QUANTIZATION, CONTIGUOUS, DTYPE>(
+  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, QUANTIZATION, DTYPE>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
       input_size_m, input_size_n, 0, 0, 0, rank);
@@ -334,7 +334,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // slot's first element. EACH BLOCK PUSHES, OF EVERY RANK'S SHARE, THE CHUNKS
 // THAT RANK'S SAME BLOCK SUMS, so a peers barrier makes them visible.
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -361,7 +361,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    summed, into its partials; every rank's sums visible and every peer done with its inbox,
     //    so the next band's (or launch's) push may overwrite it.
     reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
-                   Direction::push, Quantization::none, CONTIGUOUS, Until::visible>(
+                   Direction::push, Quantization::none, Until::visible>(
         input_ptr, input_stride_m, input_stride_n, band, input_size_n,
         static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -373,7 +373,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 4. All-gather: every rank's summed share out of its partials, at its place
     // in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none, CONTIGUOUS,
+    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none,
                DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
