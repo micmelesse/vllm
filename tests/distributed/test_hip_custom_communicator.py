@@ -739,13 +739,15 @@ def _int4_sum(terms: Sequence[torch.Tensor], owner: torch.Tensor) -> torch.Tenso
 
 def _int4_owner(op: Op, template: str, shape: tuple[int, int]) -> torch.Tensor:
     """Which rank sums each element: the plain two-shot's flat share, the AttnRes
-    pull's column slice, or rank order (the push kernels and the pull norms)."""
+    pull's row slice (its INT4 build a group a thread, each owner's rows summed from
+    its inbox), or rank order (the push kernels and the pull norms)."""
     rows, hidden = shape
     if op == "all_reduce":
         flat = torch.arange(rows * hidden).reshape(rows, hidden)
         return flat // (rows * hidden // WORLD_SIZE)
     if template.startswith("all_reduce_pull_two_shot") and "attn_res" in op:
-        return (torch.arange(hidden) // (hidden // WORLD_SIZE)).expand(rows, hidden)
+        slice_m = -(-rows // WORLD_SIZE)
+        return (torch.arange(rows) // slice_m).unsqueeze(1).expand(rows, hidden)
     return torch.zeros(rows, hidden, dtype=torch.long)
 
 
@@ -1073,7 +1075,9 @@ def test_python_names_match_the_build() -> None:
 
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
-    launch; a two-shot lists each exact build again moving INT4."""
+    launch; a two-shot lists each exact build again moving INT4, but the pulls with
+    a row a block (the norms and AttnRes), whose INT4 builds are a group a thread:
+    TILE_N / 32 threads, one row high."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
@@ -1088,7 +1092,12 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         exact = [b for b in t.builds if b["quantization"] == "none"]
         int4 = [b for b in t.builds if b["quantization"] == "int4"]
         assert exact, name
-        if "two_shot" in name:
+        if name.startswith("all_reduce_pull_two_shot_") and int4:
+            assert all(
+                b["threads_per_block"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
+                for b in int4
+            ), name
+        elif "two_shot" in name:
             assert [b | {"quantization": "none"} for b in int4] == exact, name
         else:
             assert not int4, name

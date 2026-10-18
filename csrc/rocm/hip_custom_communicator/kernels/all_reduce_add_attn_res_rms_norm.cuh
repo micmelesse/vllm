@@ -103,7 +103,10 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // `prefix_ptr`, the new one written to `prefix_output_ptr`, never the same
 // memory. A row past input_size_m (the last tile's) reads row input_size_m - 1
 // and writes nothing, so every thread still reaches every reduction.
-template <int TILE_K, int THREADS_PER_BLOCK, typename DTYPE, int ROWS,
+// LAYOUT: how the thread's packs lie in the row, every access's (common.cuh's Layout): tile (pack
+// k of thread t at t + k * THREADS_PER_BLOCK, the exact kernels'), or group_run (a group a thread,
+// its K packs consecutive at t * K + k, the INT4 pull's: its sum lands a group a thread).
+template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, typename DTYPE, int ROWS,
           int K, int P>
 DINLINE void block_attn_res_tile(
     const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
@@ -118,12 +121,17 @@ DINLINE void block_attn_res_tile(
     int64_t block_output_stride_m, int64_t block_output_stride_n,
     int input_size_m, int input_size_n, int offs_m, int offs_n, int num_blocks,
     float eps, float output_eps, float inv_hidden) {
+  // Pack k's column in packs, LAYOUT's: the mask of the packs past input_size_n.
+  [[maybe_unused]] const auto pack_at = [&](int k) {
+    const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
+    return LAYOUT == Layout::tile ? offs_n / P + t + k * THREADS_PER_BLOCK : offs_n / P + t * K + k;
+  };
   // The new prefix: the sum over the ranks added to the old one, rounded once
   // to DTYPE; the old prefix loaded whole before anything is stored.
   DTYPE new_prefix[ROWS][K][P];
   if (prefix_ptr != nullptr) {  // a scalar branch: the pointer is the launch's
     DTYPE old_prefix[ROWS][K][P];
-    load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
+    load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -140,9 +148,9 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
   }
-  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   if (block_output_ptr != nullptr)
-    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
   // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
@@ -156,8 +164,8 @@ DINLINE void block_attn_res_tile(
   if (num_blocks != 0) {
     // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
-    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
     float w[1][K][P];
 #pragma unroll
     for (int k = 0; k < K; ++k)
@@ -191,7 +199,7 @@ DINLINE void block_attn_res_tile(
         // padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
         const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-        load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
+        load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
         // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
         // mask: packs past input_size_n count zero, multiplied in so nothing branches).
         float ss[ROWS], dw[ROWS];
@@ -204,7 +212,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
             for (int j = 0; j < P; ++j)
               ss_k = fmaf(static_cast<float>(v[s][m][k][j]), static_cast<float>(v[s][m][k][j]), ss_k);
-            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
+            const int n = pack_at(k);
             ss[m] += (n < input_size_n / P ? 1.0f : 0.0f) * ss_k;
           }
         }
@@ -217,7 +225,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
             for (int j = 0; j < P; ++j)
               dw_k = fmaf(static_cast<float>(v[s][m][k][j]), w[0][k][j], dw_k);
-            const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
+            const int n = pack_at(k);
             dw[m] += (n < input_size_n / P ? 1.0f : 0.0f) * dw_k;
           }
         }
@@ -272,10 +280,10 @@ DINLINE void block_attn_res_tile(
   DTYPE result[ROWS][K][P];
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
-    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
     rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps,
-                                            inv_hidden, input_size_n, offs_n, NormPart::row, false, Layout::tile);
+                                            inv_hidden, input_size_n, offs_n, NormPart::row, false, LAYOUT);
   } else {
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
@@ -284,7 +292,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
   }
-  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
 }
 
 // =============================================================================
@@ -360,7 +368,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
         sum[0][k][j] = static_cast<DTYPE>(acc);
       }
-    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
+    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -400,9 +408,135 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // then computed, on a grid the barrier capped at the 192 blocks resident
 // (thread trace 2026-10-04T20-14-36Z). `blocks` is [m, num_sources, n] with row
 // and source strides in elements; `write_idx` < 0 writes no block.
-// QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION): with int4
-// the inputs are read from every rank's staged values and scales, and the sums
-// stored in and gathered from the partials' INT4 payload.
+// QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION), one body
+// each: none (THE EXACT BUILD, in the kernel) reads every rank's input in
+// place, a column slice a rank; int4 (THE INT4 BUILD, below) pushes it
+// quantized, a group a thread, a row slice a rank.
+
+// THE INT4 BUILD, A GROUP A THREAD (TILE_N = kInt4Group * THREADS_PER_BLOCK: a block's threads are
+// one row's groups, thread t group t), the pulled norms' INT4 shape (all_reduce_add_rms_norm.cuh)
+// with AttnRes in place of the norm: the column split's INT4 read a 4-byte word and a 2-byte scale
+// a pack (as many requests as the exact build for a quarter of the bytes) and summed through LDS,
+// 762.5 against exact 643.1 us at 8192 x 7168 (2026-10-16T03-50-18Z).
+//   1. THE PUSH: every owner's rows of this rank's input, quantized here and sent to that owner's
+//      staging inbox at this rank's slot ([WORLD slots of slice_m rows] INT4; the host passes the
+//      staging as [WORLD * slice_m, n]).
+//   2. THE SUM, LOCAL: this rank's rows, every writer's group from its own inbox, summed from the
+//      words (dequantize's slot form), left INT4 in this rank's partials.
+//   3. THE GATHER AND ATTNRES: every owner's rows out of its partials, decoded into DTYPE (the sum
+//      every rank's AttnRes starts from, as the column split's gather lands it), then AttnRes on
+//      each, a group a thread, by every rank (its two outputs are never gathered).
+// A block's rows are l = blockIdx.x, + gridDim.x, ... of each owner's slice in all three, so a
+// block reads after a barrier only what its twins wrote before it.
+template <typename DTYPE, int WORLD, int TILE_N, int TILE_K, int THREADS_PER_BLOCK>
+DINLINE void all_reduce_pull_two_shot_add_attn_res_rms_norm_int4_body(
+    const DTYPE* __restrict__ input_ptr, int64_t input_stride_m, int64_t input_stride_n,
+    int input_size_m, int input_size_n, const DTYPE* prefix_ptr, int64_t prefix_stride_m,
+    int64_t prefix_stride_n, const DTYPE* blocks_ptr, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n, const DTYPE* norm_weight_ptr,
+    int64_t norm_weight_stride_n, const DTYPE* qk_weight_ptr, int64_t qk_weight_stride_n,
+    const DTYPE* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
+    DTYPE* prefix_output_ptr, int64_t prefix_output_stride_m, int64_t prefix_output_stride_n,
+    DTYPE* output_ptr, int64_t output_stride_m, int64_t output_stride_n, DTYPE* block_output_ptr,
+    int64_t block_output_stride_m, int64_t block_output_stride_n,
+    char* const* partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
+    int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+    char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+    int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+    uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+    int64_t signals_stride_parity, int64_t signals_stride_block, int64_t signals_stride_writer,
+    int signals_size_parity, int signals_size_block, int signals_size_writer,
+    uint32_t* __restrict__ status_ptr, int64_t status_stride_field, int status_size_field,
+    int rank, uint64_t timeout_ticks, int num_blocks, float eps, float output_eps) {
+  constexpr int kPackElems = traits<DTYPE>::N;
+  static_assert(kPackElems * kInt4GroupPacks == kInt4Group, "a pack is a word of its group");
+  static_assert(TILE_N == kInt4Group * THREADS_PER_BLOCK, "a group a thread: the block one row's groups");
+  const int n = input_size_n;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  const int slice_m = (input_size_m + WORLD - 1) / WORLD;
+  const int slice = slice_m * n;  // a rank's rows, flat: its slot of an inbox
+  const auto rows_of = [&](int r) { return max(0, min(slice_m, input_size_m - r * slice_m)); };
+  const int grid = static_cast<int>(gridDim.x);
+
+  // 1. THE PUSH, owners rotated (rank + w), a row of each a step, two owners' rows in flight.
+  for (int l = blockIdx.x; l < slice_m; l += grid) {
+#pragma unroll 2
+    for (int w = 0; w < WORLD; ++w) {
+      const int r = (rank + w) % WORLD;
+      if (l >= rows_of(r)) continue;  // a late owner's short slice (every thread alike)
+      DTYPE x[1][kInt4GroupPacks][kPackElems];
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, n,
+          input_size_m, n, x, r * slice_m + l, 0, 1);
+      // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
+      uint32_t words[kInt4GroupPacks];
+      float scale;
+      quantize(x[0], words, scale);
+      uint32_t payload[1][kInt4GroupPacks][2];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k) {
+        payload[0][k][0] = words[k];
+        payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
+      }
+      send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+          payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
+          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, 0, l * n, 1);
+    }
+  }
+  barrier<WORLD>(
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks, Until::launched, 0);
+
+  // 2. THIS RANK'S ROWS: every writer's group of the row from this rank's inbox (slots rotated
+  // from this rank's), summed in fp32 and left INT4 in this rank's partials.
+  for (int l = blockIdx.x; l < rows_of(rank); l += grid) {
+    uint32_t got[WORLD][1][kInt4GroupPacks][2];
+    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
+        staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, got, 0, l * n, 1);
+    float sum[1][kInt4GroupPacks][kPackElems];
+    dequantize<DTYPE>(got, sum);
+    store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
+        partials_stride_n, 1, partials_size_m, partials_size_n, 1, (l + 1) * n, 0, l * n, 1);
+  }
+
+  // 3. Every rank's rows are visible to its peers.
+  barrier<WORLD>(
+      signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+      signals_stride_writer, signals_size_parity, signals_size_block,
+      signals_size_writer, status_ptr, status_stride_field, status_size_field,
+      rank, timeout_ticks, Until::visible, 1);
+
+  // 4. EVERY OWNER'S ROW l, owners rotated (rank + v): the row's group from its owner, decoded,
+  // then AttnRes on it. The next call's first sync keeps an owner from overwriting its partials
+  // while they are read.
+  for (int l = blockIdx.x; l < slice_m; l += grid) {
+    for (int v = 0; v < WORLD; ++v) {
+      const int owner = (rank + v) % WORLD;
+      if (l >= rows_of(owner)) continue;  // a late owner's short slice
+      uint32_t raw[1][kInt4GroupPacks][2];
+      recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+          partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
+          partials_stride_n, 1, partials_size_m, partials_size_n, 1, (l + 1) * n, raw, 0, l * n, 1);
+      DTYPE sum[1][kInt4GroupPacks][kPackElems];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k)
+        dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
+      block_attn_res_tile<TILE_K, THREADS_PER_BLOCK, Layout::group_run>(
+          sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+          qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
+          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+          output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
+          block_output_stride_n, input_size_m, n, owner * slice_m + l, 0, num_blocks, eps,
+          output_eps, inv_hidden);
+    }
+  }
+}
+
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int TILE_K, int THREADS_PER_BLOCK, int WAVES_PER_EU,
           int QUANTIZATION>
@@ -441,66 +575,81 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps, int reduce_scatter_blocks) {
-  // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
-  // INT4 payload layout): found from each region's own sizes where read or
-  // written.
-  constexpr int kPackElems = traits<DTYPE>::N;
-  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
-  const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
-  // EVERY RANK AN EQUAL SLICE OF THE ROW, in elements: rounded up to whole
-  // waves (so a wave's packs had one owner), rank 7 owned nothing at 3584 and
-  // 7168 and the others reduce-scattered 8/7 of the row.
-  const int slice_n = (input_size_n / kPackElems + WORLD - 1) / WORLD * kPackElems;
+  if constexpr (QUANTIZATION == Quantization::int4) {
+    static_assert(TILE_M == 1, "the INT4 build is a row a block");
+    (void)reduce_scatter_blocks;
+    all_reduce_pull_two_shot_add_attn_res_rms_norm_int4_body<DTYPE, WORLD, TILE_N, TILE_K,
+                                                             THREADS_PER_BLOCK>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, prefix_ptr,
+        prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m, blocks_stride_r,
+        blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
+        qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
+        prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+        output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
+        block_output_stride_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+        partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
+        staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
+        staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+        signals_stride_block, signals_stride_writer, signals_size_parity, signals_size_block,
+        signals_size_writer, status_ptr, status_stride_field, status_size_field, rank,
+        timeout_ticks, num_blocks, eps, output_eps);
+  } else {
+    // THE EXACT BUILD.
+    constexpr int kPackElems = traits<DTYPE>::N;
+    constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+    const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
+    // EVERY RANK AN EQUAL SLICE OF THE ROW, in elements: rounded up to whole
+    // waves (so a wave's packs had one owner), rank 7 owned nothing at 3584 and
+    // 7168 and the others reduce-scattered 8/7 of the row.
+    const int slice_n = (input_size_n / kPackElems + WORLD - 1) / WORLD * kPackElems;
 
-  // 1. none: nothing staged, every rank's input read in place where the
-  // input table says (a captured call's tensor, or an eager call's host copy
-  // in its staging). int4: this rank's input QUANTIZED into its staging's INT4
-  // payload (an encoding: what crosses the links is quantized by its owner),
-  // the rows this block's twin on every rank reads. Then wait until every
-  // peer has launched (and staged its own; the first barrier is ordered).
-  // 2. This rank's columns of this block's rows (tiles of TILE_M, every gridDim.x-th), summed
-  //    over the ranks into this rank's partials: THE PEERS READ ROTATED, rank + r's r-th, as the
-  //    plain two-shot reads them (in rank order every GPU read rank 0 first, a link at a time
-  //    carrying the machine's reads, and the reduce-scatter took 1.6x the plain two-shot's cycles
-  //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
-  // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
-  //    same rows.
-  (void)reduce_scatter_blocks;
-  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
-      input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
-      input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
-      staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
-      staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
-      partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
-      signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
-      status_ptr, status_stride_field, status_size_field, 0, rank,
-      timeout_ticks);
+    // 1. Nothing staged, every rank's input read in place where the input table
+    // says (a captured call's tensor, or an eager call's host copy in its
+    // staging). Wait until every peer has launched.
+    // 2. This rank's columns of this block's rows (tiles of TILE_M, every gridDim.x-th), summed
+    //    over the ranks into this rank's partials: THE PEERS READ ROTATED, rank + r's r-th, as the
+    //    plain two-shot reads them (in rank order every GPU read rank 0 first, a link at a time
+    //    carrying the machine's reads, and the reduce-scatter took 1.6x the plain two-shot's cycles
+    //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
+    // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
+    //    same rows.
+    (void)reduce_scatter_blocks;
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
+        input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
+        input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
+        staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
+        staging_size_m, staging_size_n, partials_ptr_array, partials_ptr_array_size,
+        partials_stride_m, partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
+        signals_stride_writer, signals_size_parity, signals_size_block, signals_size_writer,
+        status_ptr, status_stride_field, status_size_field, 0, rank,
+        timeout_ticks);
 
-  // 4. Each of this block's tiles: its packs from the ranks that own them (A
-  //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's partials
-  //    from its base, picked per lane), at the input's place in the partials, then AttnRes. A
-  //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
-  //    body, a row past input_size_m (never loaded) kept the last tile's
-  //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
-  //    (150 -> 166; ISA harness 2026-10-15).
-  const auto attn_res_tile = [&](int offs_m) {
-    DTYPE sum[TILE_M][kPacks][kPackElems];
-    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows>(
-        partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-        partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
-        slice_n, rank);
-    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
-        sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
-        blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
-        norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
-        output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
-        prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-        output_stride_m, output_stride_n, block_output_ptr,
-        block_output_stride_m, block_output_stride_n, input_size_m,
-        input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
-  };
-  const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
-  for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
+    // 4. Each of this block's tiles: its packs from the ranks that own them (A
+    //    WAVE'S PACKS MAY HAVE TWO OWNERS, so each lane reads its owner's partials
+    //    from its base, picked per lane), at the input's place in the partials, then AttnRes. A
+    //    TILE'S REGISTERS ARE A FUNCTION'S, the lambda's: declared in the loop's
+    //    body, a row past input_size_m (never loaded) kept the last tile's
+    //    values, so they were held across the whole tile, 16 VGPRs at TILE_M 2
+    //    (150 -> 166; ISA harness 2026-10-15).
+    const auto attn_res_tile = [&](int offs_m) {
+      DTYPE sum[TILE_M][kPacks][kPackElems];
+      all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows>(
+          partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+          partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
+          slice_n, rank);
+      block_attn_res_tile<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+          sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
+          blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
+          norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
+          output_norm_weight_ptr, output_norm_weight_stride_n, prefix_output_ptr,
+          prefix_output_stride_m, prefix_output_stride_n, output_ptr,
+          output_stride_m, output_stride_n, block_output_ptr,
+          block_output_stride_m, block_output_stride_n, input_size_m,
+          input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
+    };
+    const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
+    for (int t = blockIdx.x; t < tiles; t += gridDim.x) attn_res_tile(t * TILE_M);
+  }
 }
 
 // =============================================================================
@@ -590,7 +739,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0, 1);
-    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
+    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,

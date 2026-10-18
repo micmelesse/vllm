@@ -170,7 +170,7 @@ constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4
 // are no longer built: they lost at every grid, and 4 spilled 25-30 VGPRs.
-constexpr BuildConfig kAttnResPullExactConfigs[] = {
+constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
@@ -181,8 +181,13 @@ constexpr BuildConfig kAttnResPullExactConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 4},
+    // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32
+    // threads, a row a tile (kAttnResInt4Kernels).
+    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
 };
-constexpr auto kAttnResPullConfigs = and_int4(kAttnResPullExactConfigs);
 
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
@@ -795,7 +800,8 @@ constexpr Int4Crossover kInt4Crossovers[] = {
 // a block one row's groups, their lists their own (below).
 constexpr bool int4_group_a_thread(Template k) {
   return k == Template::all_reduce_pull_two_shot_rms_norm ||
-         k == Template::all_reduce_pull_two_shot_add_rms_norm;
+         k == Template::all_reduce_pull_two_shot_add_rms_norm ||
+         k == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
 }
 // THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a group-a-thread
 // INT4 norm's inbox, WORLD slots of an owner's ceil(m / WORLD) rows.
@@ -855,8 +861,20 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
 };
-constexpr auto kAttnResInt4Kernels =
-    int4_of<two_shots(kAttnResKernels)>(kAttnResKernels);
+// AttnRes's INT4 kernels, its own (not int4_of's): the pull, a group a thread, a row split (its
+// INT4 body), as the norms'.
+constexpr TunedKernel kAttnResInt4Kernels[] = {
+    {8,
+     1,
+     3584,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {256, 0}}},
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {256, 0}}},
+};
 
 constexpr int64_t int4_min_bytes(OpType o) {
   for (const Int4Crossover& c : kInt4Crossovers)
@@ -1206,7 +1224,11 @@ inline std::variant<Chosen, Error> chosen(
 // barrier (the pull norm at 32 tokens ran 36 blocks for 4 rows a rank).
 constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m,
                            int64_t grid_cols, int world) {
-  const bool row_split = is_two_shot(t) && !slices_columns(t);
+  // A group-a-thread INT4 build splits rows, whatever its exact build slices.
+  const bool row_split =
+      is_two_shot(t) &&
+      (!slices_columns(t) ||
+       (int4_group_a_thread(t) && quantization_of(c.build) == Quantization::int4));
   const int64_t mine = row_split ? (m + world - 1) / world : m;
   const int64_t tm = tile_m_of(c.build), tn = tile_n_of(c.build);
   return (mine + tm - 1) / tm * ((grid_cols + tn - 1) / tn);
@@ -2061,7 +2083,7 @@ select_all_reduce_add_attn_res_rms_norm(
       .partials_size_n = n,
       .staging_stride_m = n,
       .staging_stride_n = 1,
-      .staging_size_m = m,
+      .staging_size_m = staged_rows(fn, a.quantization, m, world),
       .staging_size_n = n,
       .dtype = dtype,
       .num_blocks = num_blocks,
