@@ -123,8 +123,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, in one round trip.
-        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
-                       slice, got, 0, chunk * TILE_N, 1);
+        recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1, slice, got, 0, chunk * TILE_N, 0);
         // 2. Stored where rank r's share goes, its first `len` elements.
         const int64_t first = int64_t{r} * slice;
         const int len = share_len(r);

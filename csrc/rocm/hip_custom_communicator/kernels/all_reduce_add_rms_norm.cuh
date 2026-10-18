@@ -81,7 +81,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][kPacks][kPackElems];
-    recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
+    for (int r = 0; r < WORLD; ++r)
+      recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], row, 0, 1);
     DTYPE res[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL)
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
@@ -290,13 +291,21 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   // Row `row` from every rank.
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][kPacks][kPackElems]) {
     if constexpr (QUANTIZATION == Quantization::none)
-      recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(
-          input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
-          input_size_m, input_size_n, input_size_m, input_size_n, got, row, 0, 1);
-    else
-      recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::every>(
-          staging_ptr_array, staging_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
-          staging_size_m, staging_size_n, input_size_m, input_size_n, got, row, 0, 1);
+      for (int r = 0; r < WORLD; ++r)
+        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, got[r], row, 0, 1);
+    else {
+      // INT4: every rank's payload raw, all in flight, then decoded.
+      uint32_t raw[WORLD][1][kPacks][2];
+      for (int r = 0; r < WORLD; ++r)
+        recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION>(
+            staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m, staging_stride_n, 1,
+            staging_size_m, staging_size_n, input_size_m, input_size_n, raw[r], row, 0, 1);
+#pragma unroll
+      for (int r = 0; r < WORLD; ++r)
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k)
+          dequantize(raw[r][0][k][0], __builtin_bit_cast(float, raw[r][0][k][1]), got[r][0][k]);
+    }
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete
   // in issue order, so waiting on one issued after the peers' would wait on the
@@ -404,16 +413,28 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // l of every owner's scales, a row of one float, every thread the same one.
     float sc[WORLD][1][1][1];
     if constexpr (ADD_RESIDUAL)
-      recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(
-          scales_ptr_array, scales_ptr_array_size, 0, 0, 0, scales_stride_m, 1, 1, scales_size_m,
-          1, scales_size_m, 1, sc, l, 0, 1);
+      for (int r = 0; r < WORLD; ++r)
+        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(scales_ptr_array, scales_ptr_array_size, r, 0, 0, scales_stride_m, 1, 1, scales_size_m, 1, scales_size_m, 1, sc[r], l, 0, 1);
     for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
       // THE GATHER: row l of every owner's partials (owner r's is row r * slice_m + l), one load
       // of every rank's; ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
       DTYPE got[WORLD][1][1][kPackElems];
-      recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::every>(
-          partials_ptr_array, partials_ptr_array_size, 0, 0, 0, partials_stride_m, partials_stride_n, 1,
-          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c, 1);
+      if constexpr (QUANTIZATION == Quantization::none) {
+        for (int r = 0; r < WORLD; ++r)
+          recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION>(
+              partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m, partials_stride_n, 1,
+              partials_size_m, partials_size_n, slice_m, input_size_n, got[r], l, c, 1);
+      } else {
+        // INT4: every owner's payload raw, all in flight, then decoded.
+        uint32_t raw[WORLD][1][1][2];
+        for (int r = 0; r < WORLD; ++r)
+          recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION>(
+              partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m, partials_stride_n, 1,
+              partials_size_m, partials_size_n, slice_m, input_size_n, raw[r], l, c, 1);
+#pragma unroll
+        for (int r = 0; r < WORLD; ++r)
+          dequantize(raw[r][0][0][0], __builtin_bit_cast(float, raw[r][0][0][1]), got[r][0][0]);
+      }
       WEIGHT_DTYPE w_step[1][1][kPackElems];
       if constexpr (ADD_RESIDUAL)
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c, 1);

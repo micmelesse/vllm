@@ -347,7 +347,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][kPacks][kPackElems];
-    recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
+    for (int r = 0; r < WORLD; ++r)
+      recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], row, 0, 1);
     // Summed in rank order in fp32, so every rank's sum agrees bitwise, rounded to DTYPE once.
     DTYPE sum[1][kPacks][kPackElems];
 #pragma unroll
