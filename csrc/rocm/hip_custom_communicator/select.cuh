@@ -667,8 +667,16 @@ constexpr TunedKernel kRmsNormKernels[] = {
      7168,
      Template::all_reduce_push_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    // 32 blocks through 2048 tokens (512 / 1024 / 2048: 52.4 / 88.9 / 160.6 against 54.9 / 91.0
+    // / 165.5 us on 48; more blocks lose, 61.4 / 137.5 at 128: 2026-10-18T10-26-41Z, 10-14-39Z),
+    // 48 from 4096 (not swept since).
     {8,
      257,
+     7168,
+     Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
+    {8,
+     4096,
      7168,
      Template::all_reduce_pull_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
@@ -713,8 +721,15 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
      7168,
      Template::all_reduce_push_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
+    // 40 blocks through 2048 tokens (512 / 1024 / 2048: 58.3 / 99.2 / 173.5 against 60.1 / 102.8
+    // / 175.8 us on 48; 2026-10-18T10-26-41Z), 48 from 4096 (not swept since).
     {8,
      257,
+     7168,
+     Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
+    {8,
+     4096,
      7168,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
