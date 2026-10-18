@@ -1015,7 +1015,9 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         // 2026-10-04T15-28-51Z). THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so
         // the 64-bit sum is not hoisted and held a tensor a pack (AttnRes 90 -> 70 VGPRs).
         uint32_t offset = row_bytes + static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
-        asm volatile("" : "+v"(offset));
+        // A lane's row's offset is the calls' one register, used as it is: made opaque, its copy
+        // a call landed in that call's load's registers (the same wait, ISA 2026-10-18T02-59-40Z).
+        if constexpr (!kLaneRow) asm volatile("" : "+v"(offset));
         const V* p = reinterpret_cast<const V*>(reinterpret_cast<const char*>(row) + offset);
         V v;
         if constexpr (sizeof(V) == 16) {
