@@ -465,7 +465,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
   //    same rows.
   (void)reduce_scatter_blocks;
-  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    (150 -> 166; ISA harness 2026-10-15).
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][kPacks][kPackElems];
-    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows>(
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows>(
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
         slice_n, rank);
@@ -571,7 +571,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    packs at 16384, spilling). The ranks' pointers are read after the barrier (held across it
   //    they spilled).
   // 3. Every rank's sums are in this rank's partials, and every peer has read this rank's input.
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,

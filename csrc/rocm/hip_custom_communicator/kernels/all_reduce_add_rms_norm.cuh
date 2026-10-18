@@ -567,7 +567,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   // summed over the ranks in rank order and pushed to every rank (itself too), at their place in
   // the tensor, A WAVE A ROW (reduce_scatter.cuh says how wide, and why); every rank's sums in
   // this rank's partials.
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, staging_stride_m, staging_stride_n, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
