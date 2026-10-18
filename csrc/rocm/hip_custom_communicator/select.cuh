@@ -1009,47 +1009,27 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      Template::all_reduce_pull_split_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
 };
-// AttnRes's INT4 kernels, its own: the pull, a group a thread, a row split in
-// units of a row and a class of owners (its INT4 body), TILE_K 3 (the best at every prefill size,
-// 1-15% under 1). Grids from the sweep (forced, 256-512 blocks, 1024-8192 tokens;
-// 2026-10-18T07-50-18Z): 512 where the units are few (an owner's slice <= 256 rows: two classes
-// or more) and at 8192 x 3584, 256 from 4096 x 7168 (309 against 339 us at 512). 384 lost
-// everywhere (one class, uneven). At 3584 the 2-wave blocks hold 4 a CU (resident_blocks), so 1024
-// at 2048-4096 tokens, a wave a SIMD more under AttnRes (2048: 82.5 against 95.1 us at 512; 4096:
-// 161.7 against 171.8 at 256; 8192 341.7 against 302.6 at 512; 2026-10-18T13-15-40Z).
+// AttnRes's INT4 kernels, its own: THE SPLIT at every size from its crossover (STANDARDS 3.2, *We
+// win at the op level*): our plain INT4 all-reduce into the local sums, then our separate AttnRes
+// kernel (256 threads, a row a block, a source a step: Triton's prefill program; a block a row,
+// 8192 blocks cut to the rows). It beat the fused INT4 pull at every size measured, 512-8192
+// tokens at both widths, and QuickReduce INT4 + attn_res everywhere (run 2026-10-18T22-22-13Z,
+// us): 3584 x 512 / 1024 / 2048 / 4096 / 8192: 27.2 / 39.5 / 61.0 / 100.3 / 188.5 against the
+// fused pull's 30.2 / 47.4 / 82.7 / 162.5 / 310.4 and QR's 44.3 / 58.1 / 92.4 / 162.6 / 289.4;
+// 7168: 39.7 / 61.5 / 100.7 / 190.4 / 364.7 against 41.2 / 76.2 / 174.0 / 306.5 / 498.7 and QR's
+// 61.1 / 98.3 / 177.7 / 326.9 / 606.7. The fused pull ran AttnRes on the communication kernel's
+// grid at 250 VGPRs, 2 waves a SIMD (TILE_K 3); the split runs it at 90 VGPRs, 5 waves. THE
+// FUSED INT4 PULL is no longer listed (a forced call runs it at its exact entry moving INT4); its
+// grids were 512 blocks of 128 threads TILE_K 3 at 3584 (1024 at 2048-4096 tokens) and 512 / 256
+// (from 4096 tokens) of 256 at 7168 (2026-10-18T07-50-18Z, 13-15-40Z).
 constexpr TunedKernel kAttnResInt4Kernels[] = {
     {8,
      1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
-    {8,
-     2048,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {1024, 0}}},
-    {8,
-     8192,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
-    {8,
-     4096,
      3584,
      Template::all_reduce_pull_split_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1, Quantization::int4}, {8192, 0}}},
     {8,
      1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4}, {512, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4}, {256, 0}}},
-    {8,
-     4096,
      7168,
      Template::all_reduce_pull_split_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {8192, 0}}},

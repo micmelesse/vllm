@@ -1078,9 +1078,10 @@ def test_python_names_match_the_build() -> None:
 
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
-    launch; a two-shot lists each exact build again moving INT4, but the pulls with
-    a row a block (the norms and AttnRes), whose INT4 builds are a group a thread:
-    TILE_N / 32 threads, one row high."""
+    launch; a two-shot or a split lists each exact build again moving INT4 (a
+    split's: what its all-reduce moves), but the pulls with a row a block (the norms
+    and AttnRes), whose INT4 builds are a group a thread: TILE_N / 32 threads, one
+    row high."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
@@ -1100,7 +1101,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
                 b["threads_per_block"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
                 for b in int4
             ), name
-        elif "two_shot" in name:
+        elif "two_shot" in name or "_split_" in name:
             assert [b | {"quantization": "none"} for b in int4] == exact, name
         else:
             assert not int4, name
@@ -1109,33 +1110,26 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
 @pytest.mark.parametrize(
     ("op", "rows", "cols", "quantization", "launch", "want"),
     [
-        # AttnRes's INT4 pull at 3584 (kAttnResInt4Kernels): 512 blocks from 1
-        # row, 1024 from 2048, 512 from 8192, each cut to the tiles there are (a
-        # row a tile, every row: the pull slices columns), here more than blocks.
+        # AttnRes's INT4 is the split at every size (kAttnResInt4Kernels): 256
+        # threads, a source a step, 8192 blocks cut to the rows (a row a tile); its
+        # fused INT4 pull is no longer listed.
         (
             "all_reduce_add_attn_res_rms_norm",
             2048,
             3584,
             "int4",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 128, 1024, 1, 3, 0, "int4"),
-        ),
-        (
-            "all_reduce_add_attn_res_rms_norm",
-            4096,
-            3584,
-            "int4",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 128, 1024, 1, 3, 0, "int4"),
+            "pull_split",
+            Ran("split", "pull", 1, 4096, 256, 2048, 1, 1, 0, "int4"),
         ),
         (
             "all_reduce_add_attn_res_rms_norm",
             8192,
-            3584,
+            7168,
             "int4",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 128, 512, 1, 3, 0, "int4"),
+            "pull_split",
+            Ran("split", "pull", 1, 8192, 256, 8192, 1, 1, 0, "int4"),
         ),
+        ("all_reduce_add_attn_res_rms_norm", 2048, 3584, "int4", "pull_two_shot", None),
         # Its exact pull from 257 rows: 256 threads, TILE_K 3, 256 blocks.
         (
             "all_reduce_add_attn_res_rms_norm",
