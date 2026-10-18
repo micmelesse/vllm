@@ -147,17 +147,19 @@ struct Resources {
 // THE MOST BLOCKS OF A KERNEL RESIDENT AT ONCE ON THE DEVICE: on each CU, as
 // many as its wave slots, its SIMDs' register files and its LDS hold. A peer
 // barrier spins until the same block on every peer arrives, so a grid past it
-// can hang.
+// can hang. THE REGISTER FILES HOLD WAVES, NOT BLOCKS: each SIMD holds
+// per_lane / vgprs waves of any block, so a block of fewer waves than SIMDs
+// leaves the others to the next block (two 2-wave blocks at 256 VGPRs a SIMD
+// pair: 4 a CU, where a block's waves each counted against every SIMD held 2).
 constexpr int resident_blocks(const Hardware& hw, Resources r, int threads) {
   const int waves = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
   const int64_t per_lane =
       hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
   const int used = r.vgprs < 1 ? 1 : r.vgprs;
   const int vgprs =
       (used + hw.vgpr_granule - 1) / hw.vgpr_granule * hw.vgpr_granule;
   int64_t per_cu = hw.max_waves_per_cu / waves;
-  const int64_t by_registers = per_lane / vgprs / waves_on_simd;
+  const int64_t by_registers = per_lane / vgprs * hw.simds_per_cu / waves;
   if (by_registers < per_cu) per_cu = by_registers;
   if (r.lds_bytes > 0 && hw.lds_bytes / r.lds_bytes < per_cu)
     per_cu = hw.lds_bytes / r.lds_bytes;
