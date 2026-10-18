@@ -989,7 +989,23 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (skips(i)) continue;
-      const V* row = at + int64_t{row_of(i)} * (input_stride_m / kPackElems);
+      // A ROW OF THE BLOCK'S (one row of threads) is uniform: its 64-bit start stays scalar. A ROW
+      // A LANE'S (rows of threads) goes in the 32-bit offset below, beside the column, so the
+      // address stays the uniform base plus the offset (saddr). As a 64-bit vector address it was
+      // built a call in the registers its load writes, after the call before had issued; a load
+      // still pending there among stores is a vmcnt(0) (a wait for every load and store), so
+      // each peer's load waited for the one before it: push two-shot rms_norm 20 -> 29
+      // vmcnt(0), I10 against I8. A row past 4 GiB of its buffer traps under debug.
+      constexpr bool kLaneRow = !(kRows == 1 && kThreadsM == 1);
+      const V* row = kLaneRow ? at : at + int64_t{row_of(i)} * (input_stride_m / kPackElems);
+      const uint32_t row_bytes =
+          kLaneRow ? static_cast<uint32_t>(row_of(i)) *
+                         static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)})
+                   : 0u;
+      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && kLaneRow &&
+          int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} + input_size_n * int64_t{sizeof(U)} >
+              (int64_t{1} << 32))
+        __builtin_trap();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         // A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form
@@ -998,7 +1014,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         // vector address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness,
         // 2026-10-04T15-28-51Z). THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so
         // the 64-bit sum is not hoisted and held a tensor a pack (AttnRes 90 -> 70 VGPRs).
-        uint32_t offset = static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+        uint32_t offset = row_bytes + static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
         asm volatile("" : "+v"(offset));
         const V* p = reinterpret_cast<const V*>(reinterpret_cast<const char*>(row) + offset);
         V v;
