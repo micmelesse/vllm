@@ -992,12 +992,17 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
       static_assert(sizeof(V) % sizeof(u32x4) == 0, "a pack is whole 16-byte loads");
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k) {
+        if constexpr (sizeof(V) == sizeof(u32x4)) {
+          const u32x4 raw = *(const global_u32x4*)(group + k);
+          __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+        } else {
 #pragma unroll
-        for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
-          const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(group + k) +
-                                                   h * sizeof(u32x4));
-          __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
-                           sizeof(raw));
+          for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
+            const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(group + k) +
+                                                     h * sizeof(u32x4));
+            __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
+                             sizeof(raw));
+          }
         }
       }
     } else {
