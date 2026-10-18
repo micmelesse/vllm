@@ -988,24 +988,34 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     const V* at = reinterpret_cast<const V*>(base(0));
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
-      if (skips(i)) continue;
       // A ROW OF THE BLOCK'S (one row of threads) is uniform: its 64-bit start stays scalar. A ROW
       // A LANE'S (rows of threads) goes in the 32-bit offset below, beside the column, so the
-      // address stays the uniform base plus the offset (saddr). As a 64-bit vector address it was
-      // built a call in the registers its load writes, after the call before had issued; a load
-      // still pending there among stores is a vmcnt(0) (a wait for every load and store), so
-      // each peer's load waited for the one before it: push two-shot rms_norm 20 -> 29
-      // vmcnt(0), I10 against I8. A row past 4 GiB of its buffer traps under debug.
+      // address is the uniform base plus the offset (saddr) and nothing is built in the registers
+      // the load writes. As a 64-bit vector address (and then as the opaque offset's copy) it was
+      // built a call in those registers, after the call before had issued; a load still pending
+      // there among stores is a vmcnt(0) (a wait for every load and store), so each peer's load
+      // waited for the one before it: push two-shot rms_norm 20 -> 29 vmcnt(0), I10 against I8.
+      // So the lane's offsets are made opaque BEFORE the skip, by a non-volatile asm: identical in
+      // every call, one register the calls share (CSE), no copy a call. A row past 4 GiB of its
+      // buffer traps under debug.
       constexpr bool kLaneRow = !(kRows == 1 && kThreadsM == 1);
+      uint32_t lane_offset[kPacks];
+      if constexpr (kLaneRow) {
+        if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+            int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} +
+                    input_size_n * int64_t{sizeof(U)} >
+                (int64_t{1} << 32))
+          __builtin_trap();
+        const uint32_t row_bytes = static_cast<uint32_t>(row_of(i)) *
+                                   static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k) {
+          lane_offset[k] = row_bytes + static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+          asm("" : "+v"(lane_offset[k]));
+        }
+      }
+      if (skips(i)) continue;
       const V* row = kLaneRow ? at : at + int64_t{row_of(i)} * (input_stride_m / kPackElems);
-      const uint32_t row_bytes =
-          kLaneRow ? static_cast<uint32_t>(row_of(i)) *
-                         static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)})
-                   : 0u;
-      if (HIP_CUSTOM_COMMUNICATOR_DEBUG && kLaneRow &&
-          int64_t{row_of(i)} * input_stride_m * int64_t{sizeof(U)} + input_size_n * int64_t{sizeof(U)} >
-              (int64_t{1} << 32))
-        __builtin_trap();
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         // A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form
@@ -1014,10 +1024,13 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         // vector address a tensor a pack, 28 VGPRs held across AttnRes's loops (liveness,
         // 2026-10-04T15-28-51Z). THE ADDRESS IS BUILT AT ITS LOAD: the offset made opaque here, so
         // the 64-bit sum is not hoisted and held a tensor a pack (AttnRes 90 -> 70 VGPRs).
-        uint32_t offset = row_bytes + static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
-        // A lane's row's offset is the calls' one register, used as it is: made opaque, its copy
-        // a call landed in that call's load's registers (the same wait, ISA 2026-10-18T02-59-40Z).
-        if constexpr (!kLaneRow) asm volatile("" : "+v"(offset));
+        uint32_t offset = 0;
+        if constexpr (kLaneRow)
+          offset = lane_offset[k];
+        else {
+          offset = static_cast<uint32_t>(pack_of(k)) * uint32_t{sizeof(V)};
+          asm volatile("" : "+v"(offset));
+        }
         const V* p = reinterpret_cast<const V*>(reinterpret_cast<const char*>(row) + offset);
         V v;
         if constexpr (sizeof(V) == 16) {
