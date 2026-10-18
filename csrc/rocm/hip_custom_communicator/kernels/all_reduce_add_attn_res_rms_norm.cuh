@@ -343,13 +343,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
   // 1. Wait until every peer has launched: its input, the caller's tensor (a
   // captured call's, registered) or the host's copy in its staging (an eager
-  // call's), is ready before it, and the first barrier is ordered. Read where
-  // the input table says, in place.
+  // call's), is ready before it. Read where the input table says, in place.
+  // UNORDERED (started, as the plain pull one-shot's): nothing is written before
+  // it, and every read after it is of what a peer wrote before its launch.
   barrier<WORLD>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
-      rank, timeout_ticks, Until::launched, 0);
+      rank, timeout_ticks, Until::started, 0);
 
   // 2. Each of this block's rows: read it from every rank in rank order, sum,
   //    AttnRes.
@@ -623,7 +624,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 1. Nothing staged, every rank's input read in place where the input table
     // says (a captured call's tensor, or an eager call's host copy in its
-    // staging). Wait until every peer has launched.
+    // staging). Wait until every peer has launched, UNORDERED (started, as the plain pull
+    // two-shot's): nothing written before it, every read after it of what a peer wrote before
+    // its launch.
     // 2. This rank's columns of this block's rows (tiles of TILE_M, every gridDim.x-th), summed
     //    over the ranks into this rank's partials: THE PEERS READ ROTATED, rank + r's r-th, as the
     //    plain two-shot reads them (in rank order every GPU read rank 0 first, a link at a time
@@ -632,7 +635,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
     //    same rows.
     (void)reduce_scatter_blocks;
-    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows, Accumulate::lds, Direction::pull, Until::started>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -739,7 +742,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    packs at 16384, spilling). The ranks' pointers are read after the barrier (held across it
   //    they spilled).
   // 3. Every rank's sums are in this rank's partials, and every peer has read this rank's input.
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
+  // THE FIRST BARRIER: exact, UNORDERED (started, as the plain pulls'): nothing written before it,
+  // every input read in place after it (written before the peers' launches), and the pushes into a
+  // peer's partials after it land where that peer finished reading in its last launch, ended before
+  // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
