@@ -853,8 +853,10 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     last below it, a write skips it. run: the buffer contiguous, a slot one run (a uniform base
 //     and a 32-bit byte offset a pack); flat: strided, a pack's row and column divided out
 //     (element_at). Registers U[1][kPacks][kPackElems].
-//   group_run, group_flat: THE INT4 FLAT WALK: the block one row, A GROUP A THREAD (thread t's group
-//     offs_n / kInt4Group + t, its kInt4GroupPacks packs consecutive, so a thread quantizes alone),
+//   group_run, group_flat: THE INT4 FLAT WALK: the block TILE_M rows of kThreadsN threads (one row,
+//     or WORLD rows a copy each: the caller's rank or slot a lane), A GROUP A THREAD (thread t's group
+//     offs_n / kInt4Group + t % kThreadsN, its kInt4GroupPacks packs consecutive, so a thread
+//     quantizes alone),
 //     slots and run / flat as above. An INT4 payload is dense (group_run): an element's word at
 //     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
 //     U[1][kInt4GroupPacks][kPackElems] (raw: U[1][kInt4GroupPacks][2]; with a slot dimension,
@@ -978,7 +980,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
     // A UNIFORM BASE PLUS A 32-BIT BYTE OFFSET, the offset opaque so the address is built at its
     // load (saddr), not hoisted and held as a 64-bit vector address.
-    const int g = offs_n / kInt4Group + tid;
+    const int g = offs_n / kInt4Group + tid % kThreadsN;
     const int at = min(g, clip_n / kInt4Group - 1);
     if constexpr (QUANTIZATION == Quantization::none) {
       // ONE COPY, exact: its group's packs. Its scheduling is the caller's (the int4 push keeps two
@@ -1286,7 +1288,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     }
   } else if constexpr (kGroup) {
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
-    const int g = offs_n / kInt4Group + tid;
+    const int g = offs_n / kInt4Group + tid % kThreadsN;
     if constexpr (QUANTIZATION == Quantization::none) {
       // EXACT: the group's packs at their place.
       if (g >= clip_n / kInt4Group) return;

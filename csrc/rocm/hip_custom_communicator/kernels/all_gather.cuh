@@ -18,7 +18,7 @@ namespace hip_custom_communicator {
 // strides; every rank's share (reduce_scatter's flat walk: rows numbered row-major, a rank's share
 // one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy kLanes = THREADS_PER_BLOCK /
 // WORLD threads (rotated, rank + w). int4: a group a thread, each block the contiguous range of
-// groups reduce_scatter's same block summed, every rank's group in flight, decoded and stored.
+// groups reduce_scatter's same block summed, a rank a row of threads, decoded and stored.
 //
 // WALK::rows (the fused ops' pull): `output` a thread's tile, ROWS x K packs from row offs_m and
 // column offs_n of the output_size_m x output_size_n tensor (output's strides unused): each pack
@@ -51,28 +51,28 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const int per_block = (groups_all + grid - 1) / grid;
       const int g_first = static_cast<int>(blockIdx.x) * per_block;
       const int g_end = min(g_first + per_block, groups_all);
-      for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
-        // 1. Every rank's group of its summed share, raw, rotated (rank + w), all in flight before
-        // the first is decoded.
-        uint32_t words[WORLD][1][kInt4GroupPacks][2];
-        for (int w = 0; w < WORLD; ++w)
-          recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
-              partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD, 0, 0,
-              partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1, slice,
-              words[w], 0, g0 * kInt4Group, 1);
-        // 2. Each decoded and stored where its rank's share goes.
+      // A RANK A ROW OF THREADS (kRankLanes, whole waves, rotated rank + w), as reduce_scatter's
+      // push: every rank's group in flight at once and each thread decoding one.
+      constexpr int kRankLanes = THREADS_PER_BLOCK / WORLD;
+      static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK && kRankLanes % kWaveSize == 0,
+                    "a rank's groups are whole waves");
+      const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
+      const int end = min(g_end, share_len(r) / kInt4Group) * kInt4Group;
+      for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
+        // 1. Rank r's group of its summed share, raw.
+        uint32_t words[1][kInt4GroupPacks][2];
+        recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+            partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m,
+            partials_stride_n, 1, partials_size_m, partials_size_n, 1, slice, words, 0,
+            g0 * kInt4Group, 1);
+        // 2. Decoded and stored where rank r's share goes.
+        DTYPE x[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
-        for (int w = 0; w < WORLD; ++w) {
-          const int r = (rank + w) % WORLD;
-          DTYPE x[1][kInt4GroupPacks][kPackElems];
-#pragma unroll
-          for (int k = 0; k < kInt4GroupPacks; ++k)
-            dequantize(words[w][0][k][0], __builtin_bit_cast(float, words[w][0][k][1]), x[0][k]);
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput>(
-              x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
-              output_size_m, output_size_n, 1, min(g_end, share_len(r) / kInt4Group) * kInt4Group,
-              0, g0 * kInt4Group, 1);
-        }
+        for (int k = 0; k < kInt4GroupPacks; ++k)
+          dequantize(words[0][k][0], __builtin_bit_cast(float, words[0][k][1]), x[0][k]);
+        store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kOutput>(
+            x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
+            output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
       }
     } else {
       constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;

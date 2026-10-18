@@ -74,8 +74,9 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 // (input_ptr_array at its strides). PUSH (none, lds): this rank's input (input_ptr) pushed into
 // every rank's staging inbox, [WORLD, slot] (writer w's slot at row w, staging_stride_m elements a
 // slot), then the slots summed locally. PUSH (int4, registers): A GROUP A THREAD, each block a
-// contiguous range of every share's groups (ceil(groups / grid), THREADS_PER_BLOCK a step), quantized here
-// into every rank's staging INT4 payload at this rank's place (writer w's at share w's), the
+// contiguous range of every share's groups (ceil(groups / grid)), quantized here, a rank a row of
+// threads (THREADS_PER_BLOCK / WORLD groups a step), into every rank's staging INT4 payload at this
+// rank's place (writer w's at share w's), THREADS_PER_BLOCK groups a step, the
 // writers' groups summed from the words (no pack of every writer decoded) and quantized into this rank's partials.
 // The plain all-reduce at 72 blocks: 71.8 / 109.0 / 178.2 / 286.6 us at 1024-8192 tokens of
 // 7168, against the exact 75.5 / 142.0 / 273.3 / 535.4 (2026-10-16T03-14-06Z).
@@ -126,16 +127,19 @@ DINLINE void reduce_scatter(
       const int g_first = static_cast<int>(blockIdx.x) * per_block;
       const int g_end = min(g_first + per_block, groups_all);
       // 1. THE PUSH: every rank's share of this rank's input, a group a thread, quantized here and
-      // sent to that rank's staging payload at this rank's slot. TWO RANKS' GROUPS IN FLIGHT:
-      // unrolled whole, every rank's 4 loads were hoisted together, 128 VGPRs of input, spilling.
-      for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
-#pragma unroll 2
-        for (int w = 0; w < WORLD; ++w) {
-          const int r = (rank + w) % WORLD;
-          const int len = share_len(r);
-          if (len / kInt4Group == 0) continue;  // a late rank's empty share (every block alike)
+      // sent to that rank's staging payload at this rank's slot. A RANK A ROW OF THREADS (kRankLanes,
+      // whole waves, its rank rotated rank + w): every rank's group in flight at once and each
+      // thread quantizing one, so a block of few groups is one round trip and one group's codec
+      // (a thread all ranks in turn, two in flight, was 4 round trips and 8 codecs at 256 tokens).
+      constexpr int kRankLanes = THREADS_PER_BLOCK / WORLD;
+      static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK && kRankLanes % kWaveSize == 0,
+                    "a rank's groups are whole waves");
+      const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
+      const int len = share_len(r);
+      if (len / kInt4Group != 0)  // a late rank's empty share (wave-uniform)
+        for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
           DTYPE x[1][kInt4GroupPacks][kPackElems];
-          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput>(
+          load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kInput>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
               input_size_n, input_size_m, len, x, offs_m, g0 * kInt4Group, 1);
           // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
@@ -148,12 +152,11 @@ DINLINE void reduce_scatter(
             payload[0][k][0] = words[k];
             payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
           }
-          send<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+          send<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1,
               min(g_end, len / kInt4Group) * kInt4Group, 0, g0 * kInt4Group, 1);
         }
-      }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
@@ -161,13 +164,13 @@ DINLINE void reduce_scatter(
       // 2. THE SUM, LOCAL: this rank's share, every writer's pushed group read from this rank's own
       // inbox (its slots, rotated from this rank's), all in flight, summed in fp32 from the words,
       // quantized and stored in this rank's partials.
-      const int len = share_len(rank);
-      if (len / kInt4Group != 0) {  // a late rank's share is empty at few groups (every block alike)
+      const int own = share_len(rank);
+      if (own / kInt4Group != 0) {  // a late rank's share is empty at few groups (every block alike)
         for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
           uint32_t words[WORLD][1][kInt4GroupPacks][2];
           load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
-              staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, len, words, 0,
+              staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, own, words, 0,
               g0 * kInt4Group, 1);
           // EVERY WRITER'S GROUP SUMMED FROM THE WORDS (dequantize's slot form, common.cuh).
           float sum[1][kInt4GroupPacks][kPackElems];
@@ -175,7 +178,7 @@ DINLINE void reduce_scatter(
           store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1,
-              min(g_end, len / kInt4Group) * kInt4Group, 0, g0 * kInt4Group, 1);
+              min(g_end, own / kInt4Group) * kInt4Group, 0, g0 * kInt4Group, 1);
         }
       }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
