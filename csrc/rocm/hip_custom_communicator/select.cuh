@@ -810,13 +810,18 @@ constexpr TunedKernel kAttnResKernels[] = {
 //     (its reduce-scatter is still the LDS one, a word a thread, one wave summing;
 //     the plain path's register sum, a group a thread, is what made INT4 win there)
 // So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never; the norms'
-// and AttnRes since 7 MiB, their INT4 a group a thread (below).
+// and AttnRes since 7 MiB, their INT4 a group a thread, and the plain one since
+// 3.5 MiB (below).
 struct Int4Crossover {
   OpType op;
   int64_t min_bytes;
 };
 constexpr Int4Crossover kInt4Crossovers[] = {
-    {OpType::all_reduce, 14 * 1024 * 1024},
+    // The plain all-reduce from 3.5 MiB since its push and gather are a rank a row of threads
+    // (forced INT4 at 512 x 3584 and 256 x 7168: 19.1 us against the exact pick's 23.7 / 23.8;
+    // at 1.75 MiB a tie, 256 x 3584 15.3 against 16.1, 128 x 7168 15.3 against ~15.4;
+    // 2026-10-18T12-14-52Z, 11-55-21Z).
+    {OpType::all_reduce, 3584 * 1024},
     // The norms from 7 MiB since their INT4 is a group a thread (forced INT4
     // against the exact pick at 1024 x 3584 and 512 x 7168: rms 39.0 / 40.4
     // against 44.8 / 54.5 us, add 44.0 / 45.9 against 63.0 / 59.3; at 3.5 MiB a
@@ -827,18 +832,14 @@ constexpr Int4Crossover kInt4Crossovers[] = {
     // exact pick's 54.8; 2026-10-18T07-50-18Z, 04-52-25Z).
     {OpType::all_reduce_add_attn_res_rms_norm, 7 * 1024 * 1024},
 };
-// EACH OP'S INT4 KERNELS: ITS EXACT KERNELS, EVERY TWO-SHOT ONE MOVING INT4, at
-// the same template, tile, threads and grid. INT4 AT THE BASELINE'S OWN CONFIG,
-// by construction: with the codec cheap (quick reduce's magic numbers, a group a
-// thread), the INT4 plain all-reduce beats the exact one at the exact path's 72
-// blocks (71.8 / 109.0 / 178.2 / 286.6 against 75.5 / 142.0 / 273.3 / 535.4 us at
-// 1024-8192 tokens of 7168, and quick reduce INT4's 69.7 / 118.0 / 197.2 / 333.3;
-// 2026-10-16T03-14-06Z), and the rms_norm pull at its 48 (362.0 against 547.7 at
-// 8192; 03-31-44Z). A one-shot moves its input as it is, so it has no INT4 entry;
-// the INT4 list is consulted only from the op's crossover up (kInt4Crossovers),
-// where the exact lists pick two-shots. THE PULLED NORMS' INT4 IS A GROUP A
-// THREAD (their INT4 body, all_reduce_add_rms_norm.cuh): TILE_N / 32 threads,
-// a block one row's groups, their lists their own (below).
+// EACH OP'S INT4 KERNELS, its own list, consulted only from the op's crossover up
+// (kInt4Crossovers), where the exact lists pick two-shots (a one-shot moves its input as
+// it is, so it has no INT4 entry). They began as the exact lists' two-shots moving INT4
+// at the same grids (the plain all-reduce at 72 blocks: 71.8 / 109.0 / 178.2 / 286.6 us
+// at 1024-8192 tokens of 7168 against the exact 75.5 / 142.0 / 273.3 / 535.4;
+// 2026-10-16T03-14-06Z); each op's INT4 body and grid are now its own (below). THE
+// PULLED NORMS' INT4 IS A GROUP A THREAD (their INT4 body, all_reduce_add_rms_norm.cuh):
+// TILE_N / 32 threads, a block one row's groups.
 constexpr bool int4_group_a_thread(Template k) {
   return k == Template::all_reduce_pull_two_shot_rms_norm ||
          k == Template::all_reduce_pull_two_shot_add_rms_norm ||
@@ -851,26 +852,35 @@ constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world
              ? world * ((m + world - 1) / world)
              : m;
 }
-template <size_t N>
-constexpr size_t two_shots(const TunedKernel (&exact)[N]) {
-  size_t n = 0;
-  for (const TunedKernel& k : exact) n += is_two_shot(k.fn);
-  return n;
-}
-template <size_t M, size_t N>
-constexpr std::array<TunedKernel, M> int4_of(const TunedKernel (&exact)[N]) {
-  std::array<TunedKernel, M> int4{};
-  size_t i = 0;
-  for (const TunedKernel& k : exact)
-    if (is_two_shot(k.fn))
-      int4[i++] = TunedKernel{k.world, k.m, k.n, k.fn,
-                              {quantized(k.config.build, Quantization::int4),
-                               k.config.launch}};
-  return int4;
-}
-constexpr auto kAllReduceInt4Kernels =
-    int4_of<two_shots(kAllReduceKernels)>(kAllReduceKernels);
-// THE PULLED NORMS' INT4 KERNELS, their own (not int4_of's): from the crossover
+// THE PLAIN ALL-REDUCE'S INT4 KERNELS, its own (no longer the exact list's grids) since its
+// push and gather are a rank a row of threads (reduce_scatter.cuh). Grids from its forced sweep
+// (16-256 blocks, 128-8192 tokens; 2026-10-18T12-05-38Z, 12-14-52Z): 56 blocks through 3.5 MiB
+// (512 x 3584: 19.1 us, 64 blocks 19.4, 128 20.2), 128 from 7 MiB (8192 x 7168: 183.0 against
+// 212.7 on 96 and 229.2 on 64; 1024 x 3584 26.3 against the best, 80, 26.0). The exact
+// list's grids (72-120) had left it 1.10-1.19x QuickReduce INT4's.
+constexpr TunedKernel kAllReduceInt4Kernels[] = {
+    {8,
+     1,
+     3584,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {56, 0}}},
+    {8,
+     1024,
+     3584,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {56, 0}}},
+    {8,
+     512,
+     7168,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
+};
+// THE PULLED NORMS' INT4 KERNELS, their own: from the crossover
 // up select picks the pull, a group a thread, at the grid its sweep set
 // (forced, 64-384 blocks, 1024-8192 tokens; 2026-10-18T05-42-13Z): 256 blocks
 // of 128 threads at 3584, 128 of 256 at 7168, each within 10% of the best grid
@@ -902,7 +912,7 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
 };
-// AttnRes's INT4 kernels, its own (not int4_of's): the pull, a group a thread, a row split in
+// AttnRes's INT4 kernels, its own: the pull, a group a thread, a row split in
 // units of a row and a class of owners (its INT4 body), TILE_K 3 (the best at every prefill size,
 // 1-15% under 1). Grids from the sweep (forced, 256-512 blocks, 1024-8192 tokens;
 // 2026-10-18T07-50-18Z): 512 where the units are few (an owner's slice <= 256 rows: two classes
