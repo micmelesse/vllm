@@ -1109,14 +1109,14 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
     [
         # AttnRes's INT4 pull at 3584 (kAttnResInt4Kernels): 512 blocks from 1
         # row, 1024 from 2048, 512 from 8192, each cut to the tiles there are (a
-        # row a tile, ceil(rows / 8) rows a rank).
+        # row a tile, every row: the pull slices columns), here more than blocks.
         (
             "all_reduce_add_attn_res_rms_norm",
             2048,
             3584,
             "int4",
             "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 128, 256, 1, 3, 0, "int4"),
+            Ran("two_shot", "pull", 1, 4096, 128, 1024, 1, 3, 0, "int4"),
         ),
         (
             "all_reduce_add_attn_res_rms_norm",
@@ -1124,7 +1124,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             3584,
             "int4",
             "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 128, 512, 1, 3, 0, "int4"),
+            Ran("two_shot", "pull", 1, 4096, 128, 1024, 1, 3, 0, "int4"),
         ),
         (
             "all_reduce_add_attn_res_rms_norm",
@@ -1134,15 +1134,14 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             "pull_two_shot",
             Ran("two_shot", "pull", 1, 4096, 128, 512, 1, 3, 0, "int4"),
         ),
-        # Its exact pull from 257 rows: 256 threads, TILE_K 3, 256 blocks cut to
-        # the 64 rows a rank.
+        # Its exact pull from 257 rows: 256 threads, TILE_K 3, 256 blocks.
         (
             "all_reduce_add_attn_res_rms_norm",
             512,
             3584,
             "none",
             "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 256, 64, 1, 3, 0, "none"),
+            Ran("two_shot", "pull", 1, 4096, 256, 256, 1, 3, 0, "none"),
         ),
         # The plain all-reduce's INT4 (kAllReduceInt4Kernels), its grid as given.
         (
