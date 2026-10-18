@@ -25,8 +25,8 @@ namespace hip_custom_communicator {
 // from the rank owning its columns, slice_n columns a rank (the last rank's to the end), the
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
-template <int WORLD, int THREADS_PER_BLOCK, int TILE_N, Walk WALK, int QUANTIZATION,
-          typename DTYPE, typename OUTPUT>
+template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION, Walk WALK,
+          typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
                         int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
@@ -126,7 +126,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, in one round trip.
-        load<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
+        load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
                        slice, got, 0, chunk * TILE_N, 1);
         // 2. Stored where rank r's share goes, its first `len` elements.
         const int64_t first = int64_t{r} * slice;
@@ -181,7 +181,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           const int col = col_of(k);
           const int owner = min(col / (slice_n / kPackElems), WORLD - 1);
           const u32x4 raw = *(const global_u32x4*)(
-              reinterpret_cast<const V*>(lane_ptr_array_at<WORLD, const DTYPE>(partials_ptr_array, partials_ptr_array_size, owner)) +
+              reinterpret_cast<const V*>(lane_ptr_array_at<const DTYPE, WORLD>(partials_ptr_array, partials_ptr_array_size, owner)) +
               int64_t{row_of(i)} * (partials_stride_m / kPackElems) + col);
           __builtin_memcpy(output[i][k], &raw, sizeof(raw));
         }
@@ -211,11 +211,11 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           uint32_t scale_at = static_cast<uint32_t>(col / kInt4GroupPacks) * kInt4ScaleBytes;
           asm volatile("" : "+v"(value_at));
           asm volatile("" : "+v"(scale_at));
-          words[i][k] = *(const global_u32*)(lane_ptr_array_at<WORLD, const uint8_t>(partials_ptr_array, partials_ptr_array_size, owner) + row * values_stride_m +
+          words[i][k] = *(const global_u32*)(lane_ptr_array_at<const uint8_t, WORLD>(partials_ptr_array, partials_ptr_array_size, owner) + row * values_stride_m +
                                              value_at);
           scales[i][k] = *(const global_f16*)(
               reinterpret_cast<const char*>(
-                  reinterpret_cast<const __fp16*>(lane_ptr_array_at<WORLD, const char>(partials_ptr_array, partials_ptr_array_size, owner) + scales_offset) +
+                  reinterpret_cast<const __fp16*>(lane_ptr_array_at<const char, WORLD>(partials_ptr_array, partials_ptr_array_size, owner) + scales_offset) +
                   row * scales_stride_m) +
               scale_at);
         }

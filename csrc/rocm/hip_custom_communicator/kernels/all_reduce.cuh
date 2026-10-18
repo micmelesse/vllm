@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
   // 1. Every rank's input is ready (written before its launch: the caller's,
   // or the host's copy) and visible (the first barrier is ordered).
-  barrier<Until::launched, 0, WORLD>(
+  barrier<WORLD, Until::launched, 0>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -83,7 +83,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-    load<TILE_M, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
     // same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];
@@ -98,11 +98,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<TILE_M, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
-  barrier<Until::read, 1, WORLD>(
+  barrier<WORLD, Until::read, 1>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -146,8 +146,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    this rank's partials); this rank's share of the band from every rank's input, where the
     //    table says, summed into its partials; every rank's sums visible and every peer done
     //    reading this band of this rank's input.
-    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
-                   Direction::pull, Quantization::none, Until::visible>(
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, Walk::flat, Accumulate::lds, Direction::pull, Until::visible>(
         static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
         input_ptr_array_size, input_stride_m, input_stride_n, nullptr, 0, 0, 1, 0, 0,
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
@@ -157,8 +156,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 4. All-gather: every rank's summed share out of its partials, at its
     //    place in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none,
-               DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, Walk::flat>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }
@@ -214,10 +212,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // then visible to the peers (each has pushed its own into ours).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE mine[kRows][kPacks][kPackElems];
-      load<TILE_M, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
-      store<TILE_M, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(mine, staging_ptr_array, staging_ptr_array_size, 0, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(mine, staging_ptr_array, staging_ptr_array_size, 0, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     }
-    barrier<Until::visible, 0, WORLD>(
+    barrier<WORLD, Until::visible, 0>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -225,7 +223,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Every writer's slot of this rank's inbox, local, in rank order, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-      load<TILE_M, THREADS_PER_BLOCK, Ranks::every_slot, Quantization::none, WORLD>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::every_slot>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
       DTYPE rounded[kRows][kPacks][kPackElems];  // summed in rank order in fp32, rounded once (as above)
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
@@ -238,11 +236,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
             rounded[i][k][j] = static_cast<DTYPE>(acc);
           }
-      store<TILE_M, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     }
     // 3. No rank may push its next band (this launch's or the next's) until
     // every peer has summed this one out of its inbox.
-    barrier<Until::read, 1, WORLD>(
+    barrier<WORLD, Until::read, 1>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -306,8 +304,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // at slot [rank]; every peer launched and pushed its own into ours (ordered); this rank's share,
   // every writer's slot summed, into its partials; every rank's sums visible and every peer done
   // with its inbox (the next launch's push may overwrite it).
-  reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::registers,
-                 Direction::push, QUANTIZATION, Until::launched>(
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::flat, Accumulate::registers, Direction::push, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -320,7 +317,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 4. All-gather: every rank's summed share out of its partials, at its place
   // in the output. The next call's first sync keeps a rank from overwriting
   // its partials while it is read (they are written only after it).
-  all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, QUANTIZATION, DTYPE>(
+  all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::flat>(
       partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
       partials_size_m, partials_size_n, output_ptr, output_stride_m, output_stride_n,
       input_size_m, input_size_n, 0, 0, 0, rank);
@@ -360,8 +357,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    has read this rank's partials); this rank's share, every writer's slot of its inbox
     //    summed, into its partials; every rank's sums visible and every peer done with its inbox,
     //    so the next band's (or launch's) push may overwrite it.
-    reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::flat, Accumulate::lds,
-                   Direction::push, Quantization::none, Until::visible>(
+    reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, Walk::flat, Accumulate::lds, Direction::push, Until::visible>(
         input_ptr, input_stride_m, input_stride_n, band, input_size_n,
         static_cast<const DTYPE* const*>(nullptr), 0, 0, 1,
         staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -373,8 +369,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 4. All-gather: every rank's summed share out of its partials, at its place
     // in the output.
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::flat, Quantization::none,
-               DTYPE>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, Walk::flat>(partials_ptr_array, partials_ptr_array_size, partials_stride_m,
                       partials_stride_n, partials_size_m, partials_size_n, band_output,
                       output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
   }

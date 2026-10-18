@@ -104,7 +104,7 @@ constexpr int all = 0;
 constexpr int m = 1;
 }  // namespace ReduceAxis
 
-// THE BLOCK REDUCTION, one for every case: reduce<OP, AXIS, TILE_M, THREADS_PER_BLOCK>(input,
+// THE BLOCK REDUCTION, one for every case: reduce<TILE_M, THREADS_PER_BLOCK, OP, AXIS>(input,
 // output), OP Sum or Max, every value of [K][P] reduced on its own, in fp32. Input and output may
 // be the same array (in place).
 //
@@ -123,7 +123,7 @@ constexpr int m = 1;
 // the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
 // after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
 // ISA 2026-10-15).
-template <typename OP, int AXIS, int TILE_M, int THREADS_PER_BLOCK, typename T, typename U, int K,
+template <int TILE_M, int THREADS_PER_BLOCK, typename OP, int AXIS, typename T, typename U, int K,
           int P>
 DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
@@ -262,7 +262,7 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* ptr_array_at(T* const* x_pt
 // Returned as a GLOBAL pointer (U* when U is given), so its accesses stay global_* (from an
 // integer they were flat_*). Survives: the one way a per-lane rank reaches a buffer's address.
 // EVIDENCE: ptr_array_at's, above.
-template <int WORLD, typename U = void, typename T>
+template <typename U, int WORLD, typename T>
 DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const* x_ptr_array,
                                                                        int x_ptr_array_size, int r) {
   static_assert(WORLD >= 1, "a world has a rank");
@@ -421,7 +421,7 @@ constexpr int kStatusFields = 10;
 enum class Until { launched, visible, read };
 
 // THE BARRIER, one for every case, and the whole protocol in one place:
-// barrier<Until::read, 1, WORLD>(the signals buffer, the status buffer, rank, timeout_ticks),
+// barrier<WORLD, Until::read, 1>(the signals buffer, the status buffer, rank, timeout_ticks),
 // each buffer its pointer, strides and sizes, as the kernel took them. Nothing outlives the
 // call. The PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a launch
 // starts on parity 0 and, its barriers even in number, ends on 1 (dev/lint_kernels.sh checks
@@ -443,7 +443,7 @@ enum class Until { launched, visible, read };
 // lose it: an ordered barrier's wait for every wave's stores covers it; an
 // unordered one waits for the lane's own stores just before it signals, after
 // the whole phase between, so the clear has long landed.
-template <Until UNTIL, int PARITY, int WORLD>
+template <int WORLD, Until UNTIL, int PARITY>
 DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
@@ -486,7 +486,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
            static_cast<int64_t>(writer) < 0 ||
            static_cast<int64_t>(writer) >= signals_size_writer))
         __builtin_trap();
-      return lane_ptr_array_at<WORLD>(signals_ptr_array, signals_ptr_array_size,
+      return lane_ptr_array_at<uint32_t, WORLD>(signals_ptr_array, signals_ptr_array_size,
                                       static_cast<int>(owner)) +
              parity * signals_stride_parity + block * signals_stride_block +
              writer * signals_stride_writer;
@@ -634,14 +634,14 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
 // conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
 // 2026-10-16T02-01-12Z).
-template <typename U, int kPackElems>
-DINLINE void dequantize(uint32_t word, float scale, U (&output)[kPackElems]) {
-  static_assert(kPackElems == 8, "a word is 8 values");
+template <typename U, int P>
+DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
+  static_assert(P == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2, "fp32 terms or a 16-bit dtype");
   const float scale16 = scale * 0.0625f;
   const float bias = scale * -1032.0f;
   const float bias16 = scale * -72.0f;
-  float term[kPackElems];
+  float term[P];
   uint32_t p0, p1, p2, p3;
   asm volatile("v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
       "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
@@ -663,11 +663,11 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[kPackElems]) {
         [s] "v"(scale), [b] "v"(bias), [s16] "v"(scale16), [b16] "v"(bias16));
   if constexpr (std::is_same_v<U, float>) {
 #pragma unroll
-    for (int j = 0; j < kPackElems; ++j) output[j] = term[j];
+    for (int j = 0; j < P; ++j) output[j] = term[j];
   } else {
     u32x4 packed;
 #pragma unroll
-    for (int w = 0; w < kPackElems / 2; ++w) {
+    for (int w = 0; w < P / 2; ++w) {
       const float a = term[2 * w], b = term[2 * w + 1];
       if constexpr (kBf16<U>)
         packed[w] = __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
@@ -696,18 +696,18 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[kPackElems]) {
 // bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word, and two
 // v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word, where a
 // shift and an OR an element was 16).
-template <int THREAD_PACKS, typename T, int kPackElems>
-DINLINE void quantize(const T (&input)[THREAD_PACKS][kPackElems], uint32_t (&words)[THREAD_PACKS],
+template <int THREAD_PACKS, typename T, int P>
+DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
                     float& scale) {
-  static_assert(kPackElems * 4 == 32, "a pack is one word of 8 values");
+  static_assert(P * 4 == 32, "a pack is one word of 8 values");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
                 "a pack a thread (its quad's group) or a group a thread");
-  float x[THREAD_PACKS][kPackElems];
+  float x[THREAD_PACKS][P];
   float amax = 0.0f;
 #pragma unroll
   for (int k = 0; k < THREAD_PACKS; ++k)
 #pragma unroll
-    for (int j = 0; j < kPackElems; ++j) {
+    for (int j = 0; j < P; ++j) {
       x[k][j] = static_cast<float>(input[k][j]);
       amax = fmaxf(amax, fabsf(x[k][j]));
     }
@@ -722,11 +722,11 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][kPackElems], uint32_t (&wor
   scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
   const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
   // A PACK'S WORD from its 8 values at the inverse.
-  const auto word = [](const float (&v)[kPackElems], float inverse) {
+  const auto word = [](const float (&v)[P], float inverse) {
     constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
-    uint32_t q[kPackElems];
+    uint32_t q[P];
 #pragma unroll
-    for (int p = 0; p < kPackElems / 2; ++p) {
+    for (int p = 0; p < P / 2; ++p) {
 #pragma clang fp contract(off)
       const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
                       f32x2{kLowest + 8.0f, kLowest + 8.0f};
@@ -800,7 +800,7 @@ enum class Ranks { own, every, every_slot, lane };
 // position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until the registers are used, so loads issued here run
 // under other work.
-template <int TILE_M, int THREADS_PER_BLOCK, Ranks RANKS, int QUANTIZATION, int WORLD, typename PTR,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Ranks RANKS, typename PTR,
           typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
@@ -832,7 +832,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
     E* at;
     if constexpr (RANKS == Ranks::lane)
-      at = lane_ptr_array_at<WORLD, E>(entries, input_ptr_array_size, entry);
+      at = lane_ptr_array_at<E, WORLD>(entries, input_ptr_array_size, entry);
     else if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       at = reinterpret_cast<E*>(entries[0]);
     else
@@ -976,7 +976,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 // folded from the launch bounds, a compare and a branch around every store, ISA 2026-10-15).
 // EVERY RANK'S (WORLD of them): a pack position at a time, every rank's store for it issued together
 // (the position once, as load's); int4 quantizes once.
-template <int TILE_M, int THREADS_PER_BLOCK, Ranks RANKS, int QUANTIZATION, int WORLD, typename INPUT,
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Ranks RANKS, typename INPUT,
           typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                    int output_rank, int output_slot, int64_t output_stride_slot,

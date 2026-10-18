@@ -85,8 +85,8 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 // block holds, every rank's pack summed in registers in rank order; push stores the sum in every
 // rank's partials, pull in this rank's. none reads every rank's input in place; int4 every rank's
 // staged INT4 payload, an INT4 payload's layout from its own buffer's sizes.
-template <int WORLD, int THREADS_PER_BLOCK, int TILE_M, int TILE_N, Walk WALK, Accumulate ACCUMULATE,
-          Direction DIRECTION, int QUANTIZATION, Until UNTIL, typename DTYPE>
+template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION, Walk WALK,
+          Accumulate ACCUMULATE, Direction DIRECTION, Until UNTIL, typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
     int input_size_n, const DTYPE* const* input_ptr_array, int input_ptr_array_size,
@@ -188,7 +188,7 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<UNTIL, 0, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);
@@ -284,7 +284,7 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<Until::visible, 1, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);
@@ -354,7 +354,7 @@ DINLINE void reduce_scatter(
           }
         }
       }
-      barrier<UNTIL, 0, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);
@@ -404,12 +404,12 @@ DINLINE void reduce_scatter(
           asm volatile("" ::: "memory");  // issued (above)
           __builtin_amdgcn_sched_barrier(0);
           DTYPE rounded[1][kPacks][kPackElems];
-          reduce<Sum, ReduceAxis::m, WORLD, THREADS_PER_BLOCK>(got[0], rounded[0]);
-          store<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+          reduce<WORLD, THREADS_PER_BLOCK, Sum, ReduceAxis::m>(got[0], rounded[0]);
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
-      barrier<Until::visible, 1, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+      barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);
@@ -437,18 +437,18 @@ DINLINE void reduce_scatter(
           DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            load<TILE_M, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+            load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
                              input_size_m, input_size_n, input_size_m, input_size_n, x[s],
                              (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            store<TILE_M, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(
+            store<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, Ranks::own>(
                 x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
                 staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, input_size_n,
                 (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
         }
     }
-    barrier<UNTIL, 0, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+    barrier<WORLD, UNTIL, 0>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);
@@ -465,20 +465,20 @@ DINLINE void reduce_scatter(
             const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
             DTYPE got[1][1][kPackElems];
             if constexpr (!kInt4)
-              load<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(
+              load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(
                   input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m,
                   input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end,
                   got, row, c, 1);
             else
-              load<1, THREADS_PER_BLOCK, Ranks::lane, QUANTIZATION, WORLD>(
+              load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
                   staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m,
                   staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got,
                   row, c, 1);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
             Summed rounded[1][1][kPackElems];
-            reduce<Sum, ReduceAxis::m, WORLD, THREADS_PER_BLOCK>(got[0], rounded[0]);
+            reduce<WORLD, THREADS_PER_BLOCK, Sum, ReduceAxis::m>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
-            store<1, THREADS_PER_BLOCK, Ranks::lane, QUANTIZATION, WORLD>(
+            store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 row + 1, end, row, c, 1);
@@ -514,7 +514,7 @@ DINLINE void reduce_scatter(
             Summed rounded[1][1][kPackElems];
             if constexpr (!kInt4) {
               DTYPE peers[WORLD][1][1][kPackElems];
-              load<kThreadsM, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
+              load<WORLD, kThreadsM, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
                                               input_ptr_array_stride_m, input_ptr_array_stride_n,
                                               1, input_size_m, input_size_n, input_size_m,
                                               offs_n + size_n, peers, row, c,
@@ -592,13 +592,13 @@ DINLINE void reduce_scatter(
             }
             // Push: every rank's partials, the stores issued together (int4: quantized once);
             // pull: this rank's.
-            store<kThreadsM, THREADS_PER_BLOCK, kStoreRanks, QUANTIZATION, WORLD>(
+            store<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, kStoreRanks>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
           }
     }
-    barrier<Until::visible, 1, WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
+    barrier<WORLD, Until::visible, 1>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
                               status_stride_field, status_size_field, rank, timeout_ticks);

@@ -42,7 +42,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
         ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
       }
     }
-    reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(ss, ss);
+    reduce<1, THREADS_PER_BLOCK, Sum, ReduceAxis::all>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }

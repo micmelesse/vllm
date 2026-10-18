@@ -123,7 +123,7 @@ DINLINE void block_attn_res_tile(
   DTYPE new_prefix[ROWS][K][P];
   if (prefix_ptr != nullptr) {  // a scalar branch: the pointer is the launch's
     DTYPE old_prefix[ROWS][K][P];
-    load<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
+    load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -140,9 +140,9 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
   }
-  store<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   if (block_output_ptr != nullptr)
-    store<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
   // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
   // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
@@ -156,8 +156,8 @@ DINLINE void block_attn_res_tile(
   if (num_blocks != 0) {
     // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
     DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
-    load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
     float w[1][K][P];
 #pragma unroll
     for (int k = 0; k < K; ++k)
@@ -191,7 +191,7 @@ DINLINE void block_attn_res_tile(
         // padding source re-reads the prefix; its logit is -inf.
         const bool block = !decltype(last)::value || src < num_blocks;
         const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-        load<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
+        load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
         // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
         // mask: packs past input_size_n count zero, multiplied in so nothing branches).
         float ss[ROWS], dw[ROWS];
@@ -227,7 +227,7 @@ DINLINE void block_attn_res_tile(
           sums[0][(m * TILE_K + s) * 2 + 1] = dw[m];
         }
       }
-      reduce<Sum, ReduceAxis::all, 1, THREADS_PER_BLOCK>(sums, sums);
+      reduce<1, THREADS_PER_BLOCK, Sum, ReduceAxis::all>(sums, sums);
       float old_scale[ROWS], scale[TILE_K][ROWS];
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) {
@@ -272,7 +272,7 @@ DINLINE void block_attn_res_tile(
   DTYPE result[ROWS][K][P];
   if (output_norm_weight_ptr != nullptr) {
     DTYPE output_norm_weight[1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
+    load<1, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
     rms_norm<THREADS_PER_BLOCK, NormPart::row, false>(acc, scale, output_norm_weight, result, output_eps,
                                             inv_hidden, input_size_n, offs_n);
@@ -284,7 +284,7 @@ DINLINE void block_attn_res_tile(
 #pragma unroll
         for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
   }
-  store<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+  store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
 }
 
 // =============================================================================
@@ -337,7 +337,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // captured call's, registered) or the host's copy in its staging (an eager
   // call's), is ready before it, and the first barrier is ordered. Read where
   // the input table says, in place.
-  barrier<Until::launched, 0, WORLD>(
+  barrier<WORLD, Until::launched, 0>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -347,7 +347,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE peers[WORLD][1][kPacks][kPackElems];
-    load<1, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
+    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
     // Summed in rank order in fp32, so every rank's sum agrees bitwise, rounded to DTYPE once.
     DTYPE sum[1][kPacks][kPackElems];
 #pragma unroll
@@ -371,7 +371,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
-  barrier<Until::read, 1, WORLD>(
+  barrier<WORLD, Until::read, 1>(
       signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
@@ -465,8 +465,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
   //    same rows.
   (void)reduce_scatter_blocks;
-  reduce_scatter<WORLD, THREADS_PER_BLOCK, TILE_M, TILE_N, Walk::rows, Accumulate::lds,
-                 Direction::pull, QUANTIZATION, Until::launched>(
+  reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows, Accumulate::lds, Direction::pull, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -485,7 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    (150 -> 166; ISA harness 2026-10-15).
   const auto attn_res_tile = [&](int offs_m) {
     DTYPE sum[TILE_M][kPacks][kPackElems];
-    all_gather<WORLD, THREADS_PER_BLOCK, TILE_N, Walk::rows, QUANTIZATION, DTYPE>(
+    all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows>(
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
         slice_n, rank);
@@ -572,8 +571,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    packs at 16384, spilling). The ranks' pointers are read after the barrier (held across it
   //    they spilled).
   // 3. Every rank's sums are in this rank's partials, and every peer has read this rank's input.
-  reduce_scatter<WORLD, THREADS_PER_BLOCK, 1, TILE_N, Walk::rows, Accumulate::registers,
-                 Direction::push, QUANTIZATION, Until::launched>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -590,7 +588,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    int4: its INT4 payload, worked out from the partials' own sizes by load.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][kPacks][kPackElems];
-    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0, 1);
+    load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::own>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0, 1);
     block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
