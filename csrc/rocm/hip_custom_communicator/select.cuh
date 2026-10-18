@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "kernels/all_reduce.cuh"
 #include "kernels/all_reduce_add_attn_res_rms_norm.cuh"
@@ -1429,6 +1430,32 @@ constexpr std::optional<Error> weight_refused(OpType o, DType dtype,
 // holds it, else none.
 constexpr int64_t tile_cols(OpType o, int64_t n) {
   return op(o).tile_holds_row ? n : 0;
+}
+
+// THE TUNED KERNEL AS A QUERY (`build_info().tuned`): what select launches for
+// `m` rows of `n` at `world` ranks in `dtype`, picked as `chosen` picks (`pick`)
+// from the op's list of `quantization` (its INT4 list for int4 at any bytes; a
+// plain call reads that list only from its crossover up, `quantizes`), among the
+// entries of template `fn` where one is named (a forced launch: select's pick at
+// that template), its grid cut to the work as the op's select cuts it (every op
+// but the plain all-reduce, which runs its grid as given). None where that list
+// has no entry of `fn`. A function of its arguments alone: no handle, no device.
+inline std::variant<std::optional<Chosen>, Error> tuned(
+    OpType o, int world, int64_t m, int64_t n, DType dtype, int quantization,
+    std::optional<Template> fn) {
+  const std::span<const TunedKernel> listed =
+      quantization == Quantization::int4 ? op(o).int4_kernels : op(o).kernels;
+  std::vector<TunedKernel> of_fn;
+  for (const TunedKernel& k : listed)
+    if (!fn || k.fn == *fn) of_fn.push_back(k);
+  if (of_fn.empty()) return std::optional<Chosen>{};
+  const std::variant<TunedKernel, Error> picked =
+      pick(o, world, m, n, tile_cols(o, n), dtype, of_fn);
+  if (const Error* e = std::get_if<Error>(&picked)) return *e;
+  const TunedKernel& k = std::get<TunedKernel>(picked);
+  const Chosen c{k.fn, k.config};
+  return std::optional<Chosen>{
+      o == OpType::all_reduce ? c : cut_to_the_work(c, m, n, world)};
 }
 
 // =================================================================================================

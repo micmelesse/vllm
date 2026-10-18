@@ -39,6 +39,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Op,
     Open,
     Quantization,
+    Ran,
     Refused,
     Supported,
     Where,
@@ -1101,6 +1102,100 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert [b | {"quantization": "none"} for b in int4] == exact, name
         else:
             assert not int4, name
+
+
+@pytest.mark.parametrize(
+    ("op", "rows", "cols", "quantization", "launch", "want"),
+    [
+        # AttnRes's INT4 pull at 3584 (kAttnResInt4Kernels): 512 blocks from 1
+        # row, 1024 from 2048, 512 from 8192, each cut to the tiles there are (a
+        # row a tile, ceil(rows / 8) rows a rank).
+        (
+            "all_reduce_add_attn_res_rms_norm",
+            2048,
+            3584,
+            "int4",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 4096, 128, 256, 1, 3, 0, "int4"),
+        ),
+        (
+            "all_reduce_add_attn_res_rms_norm",
+            4096,
+            3584,
+            "int4",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 4096, 128, 512, 1, 3, 0, "int4"),
+        ),
+        (
+            "all_reduce_add_attn_res_rms_norm",
+            8192,
+            3584,
+            "int4",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 4096, 128, 512, 1, 3, 0, "int4"),
+        ),
+        # Its exact pull from 257 rows: 256 threads, TILE_K 3, 256 blocks cut to
+        # the 64 rows a rank.
+        (
+            "all_reduce_add_attn_res_rms_norm",
+            512,
+            3584,
+            "none",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 4096, 256, 64, 1, 3, 0, "none"),
+        ),
+        # The plain all-reduce's INT4 (kAllReduceInt4Kernels), its grid as given.
+        (
+            "all_reduce",
+            512,
+            3584,
+            "int4",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 512, 512, 56, 1, 0, 0, "int4"),
+        ),
+        (
+            "all_reduce",
+            1024,
+            3584,
+            "int4",
+            "pull_two_shot",
+            Ran("two_shot", "pull", 1, 512, 512, 128, 1, 0, 0, "int4"),
+        ),
+        # No INT4 entry of the AttnRes push nor of any one-shot.
+        ("all_reduce_add_attn_res_rms_norm", 256, 3584, "int4", "push_two_shot", None),
+        ("all_reduce", 8, 3584, "int4", "pull_one_shot", None),
+    ],
+)
+def test_build_info_tuned_is_selects_pick(
+    op: Op,
+    rows: int,
+    cols: int,
+    quantization: Quantization,
+    launch: str,
+    want: Ran | None,
+) -> None:
+    """`build_info().tuned` answers what select launches at a forced launch: the
+    tuned list's entry of that template for the size, its grid cut as select cuts
+    it, at 8 ranks; None where the list has no entry of the template."""
+    import vllm._rocm_C  # noqa: F401
+
+    direction, algorithm = launch.split("_", 1)
+    got = build_info().tuned(
+        op, rows, cols, 8, torch.bfloat16, quantization, algorithm, direction
+    )
+    assert got == want, got
+
+
+def test_build_info_tuned_takes_a_launch_whole() -> None:
+    """A launch is its algorithm and its direction, both or neither."""
+    import vllm._rocm_C  # noqa: F401
+
+    with pytest.raises(RuntimeError, match="both or neither"):
+        build_info().tuned(
+            "all_reduce", 512, 3584, 8, torch.bfloat16, "none", "two_shot"
+        )
+    got = build_info().tuned("all_reduce", 512, 3584, 8, torch.bfloat16)
+    assert isinstance(got, Ran) and got.quantization == "none", got
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:

@@ -107,6 +107,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // schema that disagreed with its function failed the library load,
   // 2026-10-14).
   rocm_ops.def("hip_custom_communicator_open", &hip_custom_communicator_open);
+  rocm_ops.def(
+      "hip_custom_communicator_tuned(str op_name, int world, int rows, int "
+      "cols, str dtype, str quantization, str? algorithm, str? direction) -> "
+      "int[]",
+      &hip_custom_communicator_tuned);
   rocm_ops.def("hip_custom_communicator_capacity",
                &hip_custom_communicator_capacity);
   rocm_ops.def("hip_custom_communicator_close", &hip_custom_communicator_close);

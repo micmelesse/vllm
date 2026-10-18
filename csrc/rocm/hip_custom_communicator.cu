@@ -361,6 +361,59 @@ BuildInfoWire hip_custom_communicator_build_info() {
           op_weights, op_facts};
 }
 
+// THE TUNED KERNEL, select's own pick as a query (select.cuh's `tuned`): for
+// op `op_name` at `rows` x `cols` of `dtype` (C++'s DType name) on `world`
+// ranks, from its list of `quantization`, among the entries of the template
+// `algorithm` and `direction` name (both or neither: neither is every
+// template's, the plain call's pick), what select launches, as an op's Answer
+// says what ran; or [] where that list has no entry of the template.
+std::vector<int64_t> hip_custom_communicator_tuned(
+    const std::string& op_name, int64_t world, int64_t rows, int64_t cols,
+    const std::string& dtype, const std::string& quantization,
+    std::optional<std::string> algorithm,
+    std::optional<std::string> direction) {
+  using namespace hip_custom_communicator;
+  std::optional<OpType> o;
+  for (const Op& k : kOps)
+    if (op_name == k.name) o = k.type;
+  TORCH_CHECK(o, "hip_custom_communicator: no op ", op_name);
+  std::optional<DType> d;
+  for (const DType k : {DType::f16, DType::bf16, DType::f32})
+    if (dtype == to_string(k)) d = k;
+  TORCH_CHECK(d, "hip_custom_communicator: no dtype ", dtype);
+  TORCH_CHECK(algorithm.has_value() == direction.has_value(),
+              "hip_custom_communicator: a launch is its algorithm and its "
+              "direction, both or neither");
+  std::optional<Template> fn;
+  if (algorithm) {
+    fn = template_of(*o, *algorithm_from(algorithm), *direction_from(direction));
+    if (!fn) return refusal(Error::no_such_template);
+  }
+  const auto got =
+      tuned(*o, static_cast<int>(world), rows, cols, *d,
+            *quantization_from(quantization), fn);
+  if (const Error* e = std::get_if<Error>(&got)) return refusal(*e);
+  const std::optional<Chosen>& c = std::get<std::optional<Chosen>>(got);
+  if (!c) return {};
+  return std::visit(
+      [&](const auto& b) -> Answer {
+        int64_t tile_k = 0;
+        if constexpr (requires { b.tile_k; }) tile_k = b.tile_k;
+        return {-1,
+                static_cast<int64_t>(algorithm_of(c->fn)),
+                static_cast<int64_t>(direction_of(c->fn)),
+                b.tile_m,
+                b.tile_n,
+                b.threads_per_block,
+                c->config.launch.blocks_per_grid,
+                b.waves_per_eu,
+                tile_k,
+                c->config.launch.reduce_scatter_blocks,
+                static_cast<int64_t>(b.quantization)};
+      },
+      c->config.build);
+}
+
 // WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
 // `world` RANKS HOLDS, for Python's `should`: the box, its exchange's partials
 // and inputs bytes (`exchange_sizes`, what the opener allocates), then each

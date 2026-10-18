@@ -631,6 +631,33 @@ class BuildInfo:
     # Each op by name, in C++'s `Op` order: its plain call.
     ops: dict[str, OpRecord]
 
+    def tuned(
+        self,
+        op: Op,
+        rows: int,
+        cols: int,
+        world: int,
+        dtype: torch.dtype,
+        quantization: Quantization = "none",
+        algorithm: str | None = None,
+        direction: str | None = None,
+    ) -> "Ran | Error | None":
+        """WHAT SELECT LAUNCHES for `op` on `rows` x `cols` of `dtype` at `world`
+        ranks, C++'s own pick (select.cuh's `tuned`), never a copy of its tables:
+        from the op's tuned list of `quantization` (its INT4 list for int4 at any
+        size; a plain call reads it only from the crossover up), among the entries
+        of the template `algorithm` and `direction` name (both or neither; neither,
+        the plain call's pick), the grid cut to the work as select cuts it. Forcing
+        the answer whole runs exactly it. The Error where no entry of that list
+        runs the call, None where it has no entry of that template."""
+        name = next(n for n, d in _DTYPES.items() if d == dtype)
+        answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
+            op, world, rows, cols, name, quantization, algorithm, direction
+        )
+        if not answer:
+            return None
+        return Ran.of(answer) or Error(answer[0])
+
 
 @functools.cache
 def build_info() -> BuildInfo:

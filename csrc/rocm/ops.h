@@ -67,6 +67,13 @@ hip_custom_communicator_open(const std::string& cpu_group,
                              double timeout_seconds, int64_t max_rows,
                              int64_t max_cols, int64_t quantization,
                              int64_t log_mode, int64_t rccl_ready);
+// What select launches for an op's call, from the list of a quantization and
+// among one template's entries where a launch is named (hip_custom_communicator.cu).
+std::vector<int64_t> hip_custom_communicator_tuned(
+    const std::string& op_name, int64_t world, int64_t rows, int64_t cols,
+    const std::string& dtype, const std::string& quantization,
+    std::optional<std::string> algorithm,
+    std::optional<std::string> direction);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // partials_bytes, inputs_bytes, then each op's max_bytes in kOps' order].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
