@@ -402,7 +402,7 @@ DINLINE void reduce_scatter(
           asm volatile("" ::: "memory");  // issued (above)
           __builtin_amdgcn_sched_barrier(0);
           DTYPE rounded[1][kPacks][kPackElems];
-          reduce<WORLD, THREADS_PER_BLOCK, Sum, ReduceAxis::m>(got[0], rounded[0]);
+          reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
@@ -474,7 +474,7 @@ DINLINE void reduce_scatter(
                   row, c, 1);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
             Summed rounded[1][1][kPackElems];
-            reduce<WORLD, THREADS_PER_BLOCK, Sum, ReduceAxis::m>(got[0], rounded[0]);
+            reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
             store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,

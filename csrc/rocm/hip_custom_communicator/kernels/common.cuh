@@ -34,7 +34,7 @@
 //   every op     DINLINE; vec<T, P> (a pack in a register); traits<T>::N (a pack's elements, P)
 //   load, store  u32x4, global_u32x4, global_u32, global_f16 (the global-instruction forms);
 //                Ranks; HIP_CUSTOM_COMMUNICATOR_DEBUG (the index checks)
-//   reduce Sum, Max (OP); ReduceAxis (AXIS); kWaveSize
+//   reduce       ReduceAxis (AXIS); kWaveSize
 //   internals    ptr_array_at, lane_ptr_array_at (load, store and barrier only)
 //   barrier      Until; the status buffer's StatusField, kStatusFields, Where, FlagState,
 //                FaultState (its protocol, which the host reads)
@@ -87,16 +87,6 @@ typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 // round trip, so a kernel with several reductions takes them together.
 // =================================================================================================
 
-// THE OPERATIONS a wave or block reduction combines with.
-struct Sum {
-  static DINLINE float apply(float a, float b) { return a + b; }
-  static constexpr float kIdentity = 0.0f;
-};
-struct Max {
-  static DINLINE float apply(float a, float b) { return fmaxf(a, b); }
-  static constexpr float kIdentity = -INFINITY;
-};
-
 // THE AXIS a reduce reduces over (template ints, as Quantization): `all`, the whole block;
 // `m`, the TILE_M rows of THREADS_PER_BLOCK / TILE_M threads, elementwise a lane.
 namespace ReduceAxis {
@@ -104,9 +94,9 @@ constexpr int all = 0;
 constexpr int m = 1;
 }  // namespace ReduceAxis
 
-// THE BLOCK REDUCTION, one for every case: reduce<TILE_M, THREADS_PER_BLOCK, OP, AXIS>(input,
-// output), OP Sum or Max, every value of [K][P] reduced on its own, in fp32. Input and output may
-// be the same array (in place).
+// THE BLOCK REDUCTION, one for every case: reduce<TILE_M, THREADS_PER_BLOCK, AXIS>(input,
+// output), a sum (I9: Max had no caller, so there is no operation parameter), every value of
+// [K][P] summed on its own, in fp32. Input and output may be the same array (in place).
 //
 // AXIS all: over the whole block (THREADS_PER_BLOCK threads, TILE_M 1), every thread left
 // holding the results. Each wave reduces its values by DPP, then every thread combines the waves'
@@ -123,8 +113,7 @@ constexpr int m = 1;
 // the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
 // after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
 // ISA 2026-10-15).
-template <int TILE_M, int THREADS_PER_BLOCK, typename OP, int AXIS, typename T, typename U, int K,
-          int P>
+template <int TILE_M, int THREADS_PER_BLOCK, int AXIS, typename T, typename U, int K, int P>
 DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
   // The block as TILE_M rows of kThreadsN threads.
@@ -150,7 +139,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
     //   lane 15 into rows 1 and 3, lane 31 into rows 2 and 3 (row_bcast15, row_bcast31): lane 63
     //   holds the wave's, and readlane hands it to every lane.
     // A DPP STEP, `x` from the lane the control names: `row_mask` picks which 16-lane rows take it;
-    // the others read OP's identity, which leaves them as they were. A FULL ROW MASK NEEDS NO
+    // the others read the sum's identity, 0, which leaves them as they were. A FULL ROW MASK NEEDS NO
     // `old`: left undefined (mov_dpp), the compiler fuses the move into the add that uses it
     // (v_add_f32_dpp); an explicit identity kept a v_mov_b32_dpp and an add a step (ISA
     // 2026-10-04T03-07-41Z). The moved value first: only a VOP2's src0 takes DPP, so (dpp(x), x)
@@ -159,18 +148,18 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
     static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
     const auto bits = [](float x) { return __builtin_bit_cast(int, x); };
     const auto real = [](int x) { return __builtin_bit_cast(float, x); };
-    constexpr int kIdentity = __builtin_bit_cast(int, OP::kIdentity);
+    constexpr int kIdentity = 0;  // 0.0f's bits, the sum's identity
 #pragma unroll
     for (int n = 0; n < kValues; ++n) {
       float x = v[n];
       // quad_perm [1,0,3,2], quad_perm [2,3,0,1], row_half_mirror, row_mirror: every row.
-      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0xb1, 0xf, 0xf, false)), x);
-      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x4e, 0xf, 0xf, false)), x);
-      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x141, 0xf, 0xf, false)), x);
-      x = OP::apply(real(__builtin_amdgcn_mov_dpp(bits(x), 0x140, 0xf, 0xf, false)), x);
+      x = real(__builtin_amdgcn_mov_dpp(bits(x), 0xb1, 0xf, 0xf, false)) + x;
+      x = real(__builtin_amdgcn_mov_dpp(bits(x), 0x4e, 0xf, 0xf, false)) + x;
+      x = real(__builtin_amdgcn_mov_dpp(bits(x), 0x141, 0xf, 0xf, false)) + x;
+      x = real(__builtin_amdgcn_mov_dpp(bits(x), 0x140, 0xf, 0xf, false)) + x;
       // row_bcast15 into rows 1, 3; row_bcast31 into rows 2, 3.
-      x = OP::apply(real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x142, 0xa, 0xf, false)), x);
-      x = OP::apply(real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x143, 0xc, 0xf, false)), x);
+      x = real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x142, 0xa, 0xf, false)) + x;
+      x = real(__builtin_amdgcn_update_dpp(kIdentity, bits(x), 0x143, 0xc, 0xf, false)) + x;
       v[n] = real(__builtin_amdgcn_readlane(bits(x), 63));
     }
     // 2. OVER THE WAVES, through LDS, in wave order.
@@ -183,7 +172,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
     for (int n = 0; n < kValues; ++n) {
       float x = partial[n][0];
 #pragma unroll
-      for (int w = 1; w < kWaves; ++w) x = OP::apply(x, partial[n][w]);
+      for (int w = 1; w < kWaves; ++w) x = x + partial[n][w];
       output[n / P][n % P] = static_cast<U>(x);
     }
     __syncthreads();
@@ -210,7 +199,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
           p = part[r][k][mine];
 #pragma unroll
           for (int j = 0; j < P; ++j)
-            x[j] = OP::apply(x[j], static_cast<float>(reinterpret_cast<const T*>(&p)[j]));
+            x[j] = x[j] + static_cast<float>(reinterpret_cast<const T*>(&p)[j]);
         }
 #pragma unroll
         for (int j = 0; j < P; ++j) output[k][j] = static_cast<U>(x[j]);
