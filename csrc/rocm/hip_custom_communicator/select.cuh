@@ -822,6 +822,16 @@ constexpr TunedKernel kAttnResKernels[] = {
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
 };
 
 // INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
@@ -962,6 +972,11 @@ constexpr TunedKernel kAttnResInt4Kernels[] = {
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4}, {512, 0}}},
     {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1, Quantization::int4}, {8192, 0}}},
+    {8,
      1,
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
@@ -971,6 +986,11 @@ constexpr TunedKernel kAttnResInt4Kernels[] = {
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4}, {256, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {8192, 0}}},
 };
 
 constexpr int64_t int4_min_bytes(OpType o) {
