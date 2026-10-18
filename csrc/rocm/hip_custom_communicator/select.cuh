@@ -1901,13 +1901,9 @@ select_all_reduce_add_attn_res_rms_norm(
                 constexpr int TN = C.tile_n, TK = C.tile_k,
                               TPB = C.threads_per_block, WPE = C.waves_per_eu;
                 kernel =
-                    prefix != nullptr
-                        ? instance<AllReduceAddAttnResRmsNormOneShotKernel>(
+                    instance<AllReduceAddAttnResRmsNormOneShotKernel>(
                               all_reduce_pull_one_shot_add_attn_res_rms_norm<
-                                  T, NG, true, TN, TK, TPB, WPE>)
-                        : instance<AllReduceAddAttnResRmsNormOneShotKernel>(
-                              all_reduce_pull_one_shot_add_attn_res_rms_norm<
-                                  T, NG, false, TN, TK, TPB, WPE>);
+                                  T, NG, TN, TK, TPB, WPE>);
               });
         case K::all_reduce_pull_two_shot_add_attn_res_rms_norm:
           return by_build<K::all_reduce_pull_two_shot_add_attn_res_rms_norm>(
@@ -1917,14 +1913,9 @@ select_all_reduce_add_attn_res_rms_norm(
                 constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
                               TPB = C.threads_per_block, WPE = C.waves_per_eu;
                 kernel =
-                    prefix != nullptr
-                        ? instance<AllReduceAddAttnResRmsNormPullKernel>(
+                    instance<AllReduceAddAttnResRmsNormPullKernel>(
                               all_reduce_pull_two_shot_add_attn_res_rms_norm<
-                                  T, NG, true, TM, TN, TK, TPB, WPE,
-                                  C.quantization>)
-                        : instance<AllReduceAddAttnResRmsNormPullKernel>(
-                              all_reduce_pull_two_shot_add_attn_res_rms_norm<
-                                  T, NG, false, TM, TN, TK, TPB, WPE,
+                                  T, NG, TM, TN, TK, TPB, WPE,
                                   C.quantization>);
               });
         case K::all_reduce_push_two_shot_add_attn_res_rms_norm:
@@ -1935,14 +1926,9 @@ select_all_reduce_add_attn_res_rms_norm(
                 constexpr int TN = C.tile_n, TK = C.tile_k,
                               TPB = C.threads_per_block, WPE = C.waves_per_eu;
                 kernel =
-                    prefix != nullptr
-                        ? instance<AllReduceAddAttnResRmsNormPushKernel>(
+                    instance<AllReduceAddAttnResRmsNormPushKernel>(
                               all_reduce_push_two_shot_add_attn_res_rms_norm<
-                                  T, NG, true, TN, TK, TPB, WPE,
-                                  C.quantization>)
-                        : instance<AllReduceAddAttnResRmsNormPushKernel>(
-                              all_reduce_push_two_shot_add_attn_res_rms_norm<
-                                  T, NG, false, TN, TK, TPB, WPE,
+                                  T, NG, TN, TK, TPB, WPE,
                                   C.quantization>);
               });
         default:

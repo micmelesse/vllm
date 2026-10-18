@@ -103,7 +103,7 @@ DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
 // `prefix_ptr`, the new one written to `prefix_output_ptr`, never the same
 // memory. A row past input_size_m (the last tile's) reads row input_size_m - 1
 // and writes nothing, so every thread still reaches every reduction.
-template <bool HAS_PREFIX, int TILE_K, int THREADS_PER_BLOCK, typename DTYPE, int ROWS,
+template <int TILE_K, int THREADS_PER_BLOCK, typename DTYPE, int ROWS,
           int K, int P>
 DINLINE void block_attn_res_tile(
     const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
@@ -121,7 +121,7 @@ DINLINE void block_attn_res_tile(
   // The new prefix: the sum over the ranks added to the old one, rounded once
   // to DTYPE; the old prefix loaded whole before anything is stored.
   DTYPE new_prefix[ROWS][K][P];
-  if constexpr (HAS_PREFIX) {
+  if (prefix_ptr != nullptr) {  // a scalar branch: the pointer is the launch's
     DTYPE old_prefix[ROWS][K][P];
     load<ROWS, THREADS_PER_BLOCK, Ranks::own, Quantization::none, 1>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
 #pragma unroll
@@ -297,7 +297,7 @@ DINLINE void block_attn_res_tile(
 // A block owns a row, as the fused norm does: every rank reduces every row, so
 // there is nothing to gather. `blocks` is [m, num_sources, n] at its row,
 // source and column strides in elements; `write_idx` < 0 writes no block.
-template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
+template <typename DTYPE, int WORLD, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
@@ -359,7 +359,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
         sum[0][k][j] = static_cast<DTYPE>(acc);
       }
-    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -402,7 +402,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION): with int4
 // the inputs are read from every rank's staged values and scales, and the sums
 // stored in and gathered from the partials' INT4 payload.
-template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_M, int TILE_N,
+template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int TILE_K, int THREADS_PER_BLOCK, int WAVES_PER_EU,
           int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
@@ -489,7 +489,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
         slice_n, rank);
-    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -521,7 +521,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // n] with row and source strides in elements; `write_idx` < 0 writes no block.
 // QUANTIZATION as the pull's: with int4 the sums pushed to and read from the
 // partials' INT4 payload.
-template <typename DTYPE, int WORLD, bool HAS_PREFIX, int TILE_N, int TILE_K,
+template <typename DTYPE, int WORLD, int TILE_N, int TILE_K,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
@@ -591,7 +591,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     DTYPE sum[1][kPacks][kPackElems];
     load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0, 1);
-    block_attn_res_tile<HAS_PREFIX, TILE_K, THREADS_PER_BLOCK>(
+    block_attn_res_tile<TILE_K, THREADS_PER_BLOCK>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
