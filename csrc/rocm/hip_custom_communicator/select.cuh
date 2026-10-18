@@ -105,11 +105,14 @@ constexpr BuildConfig kRmsNormPushExactConfigs[] = {
 constexpr auto kRmsNormPushConfigs = and_int4(kRmsNormPushExactConfigs);
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
 // against 81.0 and 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-constexpr BuildConfig kRmsNormPullExactConfigs[] = {
+// INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32 threads
+// (int4_build).
+constexpr BuildConfig kRmsNormPullConfigs[] = {
     AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
     AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4},
+    AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4},
 };
-constexpr auto kRmsNormPullConfigs = and_int4(kRmsNormPullExactConfigs);
 // Not swept: rms_norm's.
 constexpr BuildConfig kAddRmsNormOneShotConfigs[] = {
     AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
@@ -126,11 +129,13 @@ constexpr BuildConfig kAddRmsNormPushExactConfigs[] = {
 constexpr auto kAddRmsNormPushConfigs = and_int4(kAddRmsNormPushExactConfigs);
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us
 // at 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-constexpr BuildConfig kAddRmsNormPullExactConfigs[] = {
+// INT4 a group a thread, as rms_norm's.
+constexpr BuildConfig kAddRmsNormPullConfigs[] = {
     AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
     AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4},
+    AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4},
 };
-constexpr auto kAddRmsNormPullConfigs = and_int4(kAddRmsNormPullExactConfigs);
 
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got
 // slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096 tokens, with 100 ->
@@ -780,7 +785,26 @@ constexpr Int4Crossover kInt4Crossovers[] = {
 // 2026-10-16T03-14-06Z), and the rms_norm pull at its 48 (362.0 against 547.7 at
 // 8192; 03-31-44Z). A one-shot moves its input as it is, so it has no INT4 entry;
 // the INT4 list is consulted only from the op's crossover up (kInt4Crossovers),
-// where the exact lists pick two-shots.
+// where the exact lists pick two-shots. THE PULLED NORMS' INT4 IS A GROUP A
+// THREAD (their INT4 body, all_reduce_add_rms_norm.cuh): the same tile at
+// TILE_N / 32 threads, a block one row's groups (int4_build).
+constexpr bool int4_group_a_thread(Template k) {
+  return k == Template::all_reduce_pull_two_shot_rms_norm ||
+         k == Template::all_reduce_pull_two_shot_add_rms_norm;
+}
+constexpr BuildConfig int4_build(Template k, BuildConfig b) {
+  b = quantized(b, Quantization::int4);
+  if (int4_group_a_thread(k))
+    std::visit([](auto& f) { f.threads_per_block = f.tile_n / kInt4Group; }, b);
+  return b;
+}
+// THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a group-a-thread
+// INT4 norm's inbox, WORLD slots of an owner's ceil(m / WORLD) rows.
+constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world) {
+  return int4_group_a_thread(k) && quantization == Quantization::int4
+             ? world * ((m + world - 1) / world)
+             : m;
+}
 template <size_t N>
 constexpr size_t two_shots(const TunedKernel (&exact)[N]) {
   size_t n = 0;
@@ -794,7 +818,7 @@ constexpr std::array<TunedKernel, M> int4_of(const TunedKernel (&exact)[N]) {
   for (const TunedKernel& k : exact)
     if (is_two_shot(k.fn))
       int4[i++] = TunedKernel{k.world, k.m, k.n, k.fn,
-                              {quantized(k.config.build, Quantization::int4),
+                              {int4_build(k.fn, k.config.build),
                                k.config.launch}};
   return int4;
 }
@@ -1255,7 +1279,8 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // An INT4 payload lies in the region that holds it exact (common.cuh's
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
   // most one row of the partials's elements (its every view's bound).
-  if (int4 && int4_payload_bytes(m, n) > h->staging_bytes())
+  if (int4 && int4_payload_bytes(staged_rows(fn, Quantization::int4, m, world), n) >
+                  h->staging_bytes())
     return Error::inputs_too_small;
   const int64_t partials = partials_need(fn, m, packs, world);
   if (int4 && int4_payload_bytes(1, partials / elem_bytes(dtype)) >
@@ -1661,7 +1686,7 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .partials_size_n = n,
                                .staging_stride_m = n,
                                .staging_stride_n = 1,
-                               .staging_size_m = m,
+                               .staging_size_m = staged_rows(fn, r.quantization, m, world),
                                .staging_size_n = n,
                                  .dtype = dtype,
                                  .weight_dtype = weight_dtype,
@@ -1818,7 +1843,7 @@ select_all_reduce_add_rms_norm(
                            : 0,
       .staging_stride_m = n,
       .staging_stride_n = 1,
-      .staging_size_m = m,
+      .staging_size_m = staged_rows(fn, r.quantization, m, world),
       .staging_size_n = n,
       .dtype = dtype,
       .weight_dtype = weight_dtype,

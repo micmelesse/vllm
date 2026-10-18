@@ -169,48 +169,9 @@ DINLINE void reduce_scatter(
               staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
               staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, len, words, 0,
               g0 * kInt4Group, 1);
-          // EVERY WRITER'S GROUP SUMMED FROM THE WORDS, in fp32 in writer order: each element (q - 8) *
-          // scale landed in DTYPE, as a quantized load lands it, then added. No pack of every writer decoded
-          // first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
-          // 2026-10-15T22-47-01Z). WITH BF16, TWO WRITERS' TERMS A STEP: landed together (one
-          // v_cvt_pk_bf16_f32) and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
-          // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts), the
-          // one arch built (CMakeLists.txt).
-          const auto scale_of = [&](int w) { return __builtin_bit_cast(float, words[w][0][0][1]); };
+          // EVERY WRITER'S GROUP SUMMED FROM THE WORDS (dequantize's slot form, common.cuh).
           float sum[1][kInt4GroupPacks][kPackElems];
-#pragma unroll
-          for (int k = 0; k < kInt4GroupPacks; ++k) {
-#pragma unroll
-            for (int j = 0; j < kPackElems; ++j) sum[0][k][j] = 0.0f;
-            int w = 0;
-            if constexpr (kBf16<DTYPE>) {
-              const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
-#pragma unroll
-              for (; w + 1 < WORLD; w += 2) {
-                float a[kPackElems], b[kPackElems];
-                dequantize(words[w][0][k][0], scale_of(w), a);
-                dequantize(words[w + 1][0][k][0], scale_of(w + 1), b);
-#pragma unroll
-                for (int j = 0; j < kPackElems; ++j)
-                  sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
-                      __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, sum[0][k][j], false);
-                // THE SUMS DONE BEFORE THE NEXT DEQUANTIZE'S VOLATILE ASM: the scheduler, free to use 256
-                // VGPRs at 512 threads, decoded every writer's words of a group ahead of the first sum and
-                // spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
-#pragma unroll
-                for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[0][k][j]));
-              }
-            }
-#pragma unroll
-            for (; w < WORLD; ++w) {
-              float a[kPackElems];
-              dequantize(words[w][0][k][0], scale_of(w), a);
-#pragma unroll
-              for (int j = 0; j < kPackElems; ++j) sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
-#pragma unroll
-              for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[0][k][j]));  // as above
-            }
-          }
+          dequantize<DTYPE>(words, sum);
           store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1,

@@ -19,13 +19,15 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2 };
 //   output   = T(W(W(input * scale) * float(weight)))      vLLM's rounding (ROUND_SCALED)
 //   output   = T(input * scale * float(weight))            AttnRes's output norm (its reference)
 // The variance is of `input` before any further rounding. A block's threads call it together
-// (scale's reduce).
+// (scale's reduce). `layout` is how the thread's packs lie in the row, for the mask of the packs
+// past size_n: Layout::tile (pack k of thread t at t + k * THREADS_PER_BLOCK) or Layout::group_run
+// (a group a thread: its K packs consecutive, at t * K + k); a literal at every call.
 template <int THREADS_PER_BLOCK, typename W, typename T, int ROWS, int K,
           int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
                       float inv_hidden, int size_n, int offs_n, NormPart part,
-                      bool round_scaled) {
+                      bool round_scaled, Layout layout) {
   if (part != NormPart::apply) {
     // This thread's share of each row's sum of squares, packs past size_n counting zero: its mask,
     // 1 below size_n and 0 past it, is multiplied in so nothing branches (load clamps a pack past
@@ -39,7 +41,9 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
         float ss_k = 0.0f;
 #pragma unroll
         for (int j = 0; j < P; ++j) ss_k = fmaf(input[m][k][j], input[m][k][j], ss_k);
-        const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
+        const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
+        const int n = layout == Layout::tile ? offs_n / P + t + k * THREADS_PER_BLOCK
+                                             : offs_n / P + t * K + k;
         ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
       }
     }

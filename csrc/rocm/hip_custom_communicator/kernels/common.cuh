@@ -672,6 +672,53 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
   }
 }
 
+// DEQUANTIZE EVERY SLOT'S GROUP INTO ITS SUM: raw INT4 registers of every slot (a pushed inbox's
+// writers, or every rank's: load's or recv's uint32_t form, [0] a word and [1] its group's scale),
+// summed in fp32 in slot order, each element (q - 8) * scale landed in DTYPE first, as a quantized
+// load lands it. The reduce-scatter's INT4 sum (reduce_scatter.cuh) and the pulled norms' row sum
+// (all_reduce_add_rms_norm.cuh) are this one function. No pack of every slot decoded first:
+// decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA 2026-10-15T22-47-01Z).
+// WITH BF16, TWO SLOTS' TERMS A STEP: landed together (one v_cvt_pk_bf16_f32) and added by one
+// v_dot2c_f32_bf16 against (1, 1), where each was a conversion, a shift and an add.
+// v_dot2_f32_bf16 IS GFX950'S (dot12-insts), the one arch built (CMakeLists.txt).
+template <typename DTYPE, int SLOTS, int K, int P>
+DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2], float (&sum)[1][K][P]) {
+  const auto scale_of = [&](int w) { return __builtin_bit_cast(float, words[w][0][0][1]); };
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+#pragma unroll
+    for (int j = 0; j < P; ++j) sum[0][k][j] = 0.0f;
+    int w = 0;
+    if constexpr (kBf16<DTYPE>) {
+      const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
+#pragma unroll
+      for (; w + 1 < SLOTS; w += 2) {
+        float a[P], b[P];
+        dequantize(words[w][0][k][0], scale_of(w), a);
+        dequantize(words[w + 1][0][k][0], scale_of(w + 1), b);
+#pragma unroll
+        for (int j = 0; j < P; ++j)
+          sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
+              __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, sum[0][k][j], false);
+        // THE SUMS DONE BEFORE THE NEXT DEQUANTIZE'S VOLATILE ASM: the scheduler, free to use 256
+        // VGPRs at 512 threads, decoded every writer's words of a group ahead of the first sum and
+        // spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
+#pragma unroll
+        for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[0][k][j]));
+      }
+    }
+#pragma unroll
+    for (; w < SLOTS; ++w) {
+      float a[P];
+      dequantize(words[w][0][k][0], scale_of(w), a);
+#pragma unroll
+      for (int j = 0; j < P; ++j) sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
+#pragma unroll
+      for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[0][k][j]));  // as above
+    }
+  }
+}
+
 // QUANTIZE: a group's packs to their words and the group's scale. Its own function because store
 // (a pack a thread, THREAD_PACKS 1) and the INT4 flat walk (a group a thread, THREAD_PACKS
 // kInt4GroupPacks) share it; the thread map is a parameter, not implied by the encoding (R7).
@@ -940,10 +987,18 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         group = reinterpret_cast<const V*>(element_at(from, input_stride_m, input_stride_n,
                                                       first + int64_t{at} * kInt4Group,
                                                       input_size_n));
+      // A PACK OF A 16-BIT DTYPE one 16-byte load; of fp32 (a norm's weight, a pack of the row's
+      // dtype wide) its 16-byte halves, as the tile's wider pack is read.
+      static_assert(sizeof(V) % sizeof(u32x4) == 0, "a pack is whole 16-byte loads");
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k) {
-        const u32x4 raw = *(const global_u32x4*)(group + k);
-        __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+#pragma unroll
+        for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
+          const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(group + k) +
+                                                   h * sizeof(u32x4));
+          __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
+                           sizeof(raw));
+        }
       }
     } else {
       // EVERY SLOT'S PAYLOAD, raw: its group's four words (one 16-byte load) and its scale, the

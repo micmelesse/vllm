@@ -275,7 +275,7 @@ DINLINE void block_attn_res_tile(
     load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
     float scale[ROWS];
     rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps,
-                                            inv_hidden, input_size_n, offs_n, NormPart::row, false);
+                                            inv_hidden, input_size_n, offs_n, NormPart::row, false, Layout::tile);
   } else {
 #pragma unroll
     for (int i = 0; i < ROWS; ++i)
