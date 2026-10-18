@@ -498,21 +498,10 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
   // ISA), so the releasing wave's fence would cover only its own stores, and another wave's
   // could still be in flight when the flag lands -- a remote store above all.
-  // STARTED ORDERS NOTHING, so it takes no memory clobber and no fence: its block barriers are the
-  // bare s_barrier and it has no stores of this launch to wait for (its clear's last flag store
-  // was the previous launch's, which ended). A "memory" clobber or a workgroup fence is a wall the
-  // compiler schedules no load across, the invariant input-table reads after the barrier among
-  // them; without one they may issue under the poll (docs/ref/hip.md, the started-barrier note).
-  const auto block_barrier = [&] {
-    if (until == Until::started)
-      __builtin_amdgcn_s_barrier();
-    else
-      __syncthreads();
-  };
   if (ordered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  block_barrier();
+  __syncthreads();
   if (threadIdx.x < WORLD) {
-    if (until == Until::read) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (!ordered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     // 4. SIGNAL: a SYSTEM-scope atomic store, release when ordered. A flag is touched only by
     // the __scoped_atomic builtins, each with its order and scope spelled at the call.
     __scoped_atomic_store_n(theirs_ptr, static_cast<uint32_t>(FlagState::arrived),
@@ -581,7 +570,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     __scoped_atomic_store_n(mine_ptr, static_cast<uint32_t>(FlagState::clear),
                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
-  block_barrier();
+  __syncthreads();
 }
 
 // =================================================================================================
