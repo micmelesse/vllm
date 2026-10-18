@@ -244,6 +244,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
   constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
   const int slice_m = (input_size_m + WORLD - 1) / WORLD;
+  // A PARTIALS ROW (ADD_RESIDUAL) IS ITS SCALE THEN ITS ROW: [one pack: the row's scale, a float,
+  // and padding][input_size_n elements], partials_stride_m = input_size_n + kScaleSlot (the host
+  // sizes it: select.cuh's partials_need), so the gather's first step reads a row's scale beside
+  // its first pack, from the same row of the same buffer (the separate scales region cost the
+  // gather a round trip a row before the rows' loads: ATT 2026-10-18T10-35-18Z). The scale's view
+  // is the row as floats, its column 0. RMSNorm's rows are the normed rows alone (no slot).
+  constexpr int kScaleSlot = ADD_RESIDUAL ? kPackElems : 0;
+  [[maybe_unused]] const int64_t scale_stride_m =
+      partials_stride_m * static_cast<int64_t>(sizeof(DTYPE)) / static_cast<int64_t>(sizeof(float));
+  const int row_n = input_size_n + kScaleSlot;  // a partials row's elements
 
   // 1. Wait until every peer has launched (its input is ready before it). UNORDERED (started):
   // nothing written before it, every read after it of a peer's input, written before its launch;
@@ -309,7 +319,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
         }
       }
     if constexpr (ADD_RESIDUAL) {
-      store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
+      store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, row_n, row - first, kScaleSlot, 1);
     }
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
     // every rank norms it while gathering, so the link carries one row a row,
@@ -321,12 +331,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
     if constexpr (ADD_RESIDUAL) {
       rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0, NormPart::scale, true, Layout::tile);
-      // The row's scale into this rank's scales, [slice_m] floats (ADD_RESIDUAL's own buffer): a
-      // row of one element, so its one pack is thread 0's.
+      // The row's scale into its slot, the partials row's first float: a column of one element,
+      // so its one pack is thread 0's.
       float scale_row[1][1][1] = {{{scale[0]}}};
       store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
-          scale_row, scales_ptr_array, scales_ptr_array_size, rank, 0, 0, scales_stride_m, 1, 1,
-          scales_size_m, 1, scales_size_m, 1, row - first, 0, 1);
+          scale_row, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, scale_stride_m, 1, 1,
+          partials_size_m, scale_stride_m, partials_size_m, 1, row - first, 0, 1);
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
@@ -361,11 +371,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
   //    the last row is real): a store between two loads, or a load under an
   //    `if`, made the eight owners' round trips run one after another.
   //    ADD_RESIDUAL: the owners' rows are the new residual; each is normed here
-  //    by its owner's scale (the weight loaded once, before the loop). Every
-  //    thread loads the 8 scales after the 8 rows, all in flight before any
-  //    wait (a wave's lanes read one scale address: one request a wave). Left
-  //    to the compiler, the scales were loaded and waited on before the packs
-  //    were issued, two round trips a row (ISA 2026-10-01T02-33-11Z).
+  //    by its owner's scale, read from the slot before the row in its first
+  //    step (a wave's lanes read one scale address: one request a wave).
   // A PACK A THREAD, stepping across the row (THREADS_PER_BLOCK packs a step,
   // kPacks = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
@@ -374,20 +381,26 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
   // first barrier, held, ran the int4 8192-column build out of SGPRs:
   // 2026-10-15T22-28-01Z).
   for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
-    // Every owner's scale for row l, all in flight before the rows' loads (load issues them): row
-    // l of every owner's scales, a row of one float, every thread the same one.
-    float sc[WORLD][1][1][1];
-    if constexpr (ADD_RESIDUAL)
-      for (int r = 0; r < WORLD; ++r)
-        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(scales_ptr_array, scales_ptr_array_size, r, 0, 0, scales_stride_m, 1, 1, scales_size_m, 1, scales_size_m, 1, sc[r], l, 0, 1);
-    for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+    // ONE STEP: every owner's pack at column c, then (ADD_RESIDUAL) each normed by its owner's
+    // scale and stored. THE FIRST STEP ALSO READS THE SCALES, each from its row's slot, issued
+    // after that step's packs: one wait covers both, and the later steps hold them (loaded before
+    // the loop, they were copied into the loop's registers and waited on before the rows' loads
+    // issued: two round trips a row, ATT 2026-10-18T10-35-18Z).
+    [[maybe_unused]] float sc[WORLD][1][1][1];
+    const auto step = [&](int c, bool scales) {
       // THE GATHER: row l of every owner's partials (owner r's is row r * slice_m + l), one load
       // of every rank's; ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
       DTYPE got[WORLD][1][1][kPackElems];
       for (int r = 0; r < WORLD; ++r)
         recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
             partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m, partials_stride_n, 1,
-            partials_size_m, partials_size_n, slice_m, input_size_n, got[r], l, c, 1);
+            partials_size_m, partials_size_n, slice_m, row_n, got[r], l, c + kScaleSlot, 1);
+      if constexpr (ADD_RESIDUAL)
+        if (scales)
+          for (int r = 0; r < WORLD; ++r)
+            recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+                partials_ptr_array, partials_ptr_array_size, r, 0, 0, scale_stride_m, 1, 1,
+                partials_size_m, scale_stride_m, slice_m, 1, sc[r], l, 0, 1);
       WEIGHT_DTYPE w_step[1][1][kPackElems];
       if constexpr (ADD_RESIDUAL)
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c, 1);
@@ -409,6 +422,13 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_exact_body(
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
       }
+    };
+    constexpr int kStep = THREADS_PER_BLOCK * kPackElems;
+    if constexpr (ADD_RESIDUAL) {
+      step(0, true);
+      for (int c = kStep; c < input_size_n; c += kStep) step(c, false);
+    } else {
+      for (int c = 0; c < input_size_n; c += kStep) step(c, false);
     }
   }
 }

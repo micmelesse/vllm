@@ -1333,7 +1333,11 @@ constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols,
 // of what the partials holds): the plain two-shot its slice of every row; a
 // column two-shot the whole reduced tensor (each rank's columns at their
 // place); a row two-shot its rank's rows, twice where it leaves two results
-// (out and the residual). A one-shot reads the inputs and keeps nothing.
+// (out and the residual). A one-shot reads the inputs and keeps nothing. THE
+// ADD-RMSNORM ROW TWO-SHOT's rows each carry their scale in a pack before the
+// row (kernels/all_reduce_add_rms_norm.cuh, its exact body: a row with its
+// scale, one buffer), a pack a row more.
+constexpr int64_t kScaleSlotPacks = 1;
 constexpr int64_t partials_need(Template t, int64_t m, int64_t packs,
                                int world) {
   if (!is_two_shot(t)) return 0;
@@ -1341,7 +1345,9 @@ constexpr int64_t partials_need(Template t, int64_t m, int64_t packs,
   if (o == OpType::all_reduce)
     return m * ((packs + world - 1) / world) * kBuild.memory.pack_bytes;
   if (slices_columns(t)) return m * packs * kBuild.memory.pack_bytes;
-  return (m + world - 1) / world * packs * kBuild.memory.pack_bytes;
+  const int64_t row_packs =
+      t == Template::all_reduce_pull_two_shot_add_rms_norm ? packs + kScaleSlotPacks : packs;
+  return (m + world - 1) / world * row_packs * kBuild.memory.pack_bytes;
 }
 
 // A LAYOUT THE PACKED LOADS CAN READ: every buffer's innermost stride 1 and its
@@ -1935,12 +1941,19 @@ select_all_reduce_add_rms_norm(
   // 4.
   const AllReduceAddRmsNormBuildConfig& r =
       std::get<AllReduceAddRmsNormBuildConfig>(c.build);
-  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
+  // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none),
+  // at its row stride: the exact pull two-shot's row is its scale's pack then the
+  // row (partials_need); the INT4 build's rows are the row alone, its scales in
+  // the scales region.
+  const bool scale_slot = fn == Template::all_reduce_pull_two_shot_add_rms_norm &&
+                          r.quantization == Quantization::none;
+  const int64_t partials_stride_m =
+      n + (scale_slot ? kScaleSlotPacks * kBuild.memory.pack_bytes / elem_bytes(dtype) : 0);
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, m,
                            n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
                            world) /
-                  (n * elem_bytes(dtype))
+                  (partials_stride_m * elem_bytes(dtype))
             : 0;
   const AllReduceAddRmsNormLaunch l{
       .kernel = kernel,
@@ -1977,12 +1990,12 @@ select_all_reduce_add_rms_norm(
       .residual_output_stride_n = residual_output_stride_n,
       .residual_output_size_m = residual_output_size_m,
       .residual_output_size_n = residual_output_size_n,
-      .partials_stride_m = n,
+      .partials_stride_m = partials_stride_m,
       .partials_stride_n = 1,
       .partials_size_m = partials_rows,
-      .partials_size_n = n,
+      .partials_size_n = partials_stride_m,
       .scales_stride_m = 1,
-      .scales_size_m = fn == Template::all_reduce_pull_two_shot_add_rms_norm
+      .scales_size_m = fn == Template::all_reduce_pull_two_shot_add_rms_norm && !scale_slot
                            ? (m + world - 1) / world
                            : 0,
       .staging_stride_m = n,
