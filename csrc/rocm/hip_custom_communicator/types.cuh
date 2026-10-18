@@ -15,6 +15,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <optional>
 #include <variant>
 
 #include "kernels/common.cuh"
@@ -176,12 +177,16 @@ enum class Template : int {
   all_reduce_push_two_shot_add_attn_res_rms_norm = 10,
   all_reduce_push_one_shot = 11,
   all_reduce_push_two_shot = 12,
+  all_reduce_pull_split_add_attn_res_rms_norm = 13,
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's
-// whole input; two-shot reduce-scatters then gathers) and the direction
-// (common.cuh's `Direction`, which its reduce-scatters take too).
-enum class Algorithm : int { one_shot = 0, two_shot = 1 };
+// whole input; two-shot reduce-scatters then gathers; split launches two
+// kernels of ours, our plain all-reduce into this rank's local sums
+// (Handle::sums), then our separate kernel of the op's epilogue on them) and
+// the direction (common.cuh's `Direction`, which its reduce-scatters take too;
+// a split's all-reduce is the plain all-reduce's tuned pick, a pull).
+enum class Algorithm : int { one_shot = 0, two_shot = 1, split = 2 };
 
 // WHICH OP the caller asked for: an all-reduce, alone or with what it fuses.
 enum class OpType : int {
@@ -509,6 +514,29 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
     uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
     float /*output_eps*/);
+// THE SPLIT'S SECOND KERNEL (add_attn_res_rms_norm): AttnRes on rows already
+// all-reduced, `input` this rank's local sums; nothing over the peers.
+using AddAttnResRmsNormKernel = void (*)(
+    const void* /*input_ptr*/, int64_t /*input_stride_m*/,
+    int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*prefix_ptr*/, int64_t /*prefix_stride_m*/,
+    int64_t /*prefix_stride_n*/, int /*prefix_size_m*/, int /*prefix_size_n*/,
+    const void* /*blocks_ptr*/, int64_t /*blocks_stride_m*/,
+    int64_t /*blocks_stride_r*/, int64_t /*blocks_stride_n*/,
+    int /*blocks_size_m*/, int /*blocks_size_r*/, int /*blocks_size_n*/,
+    const void* /*norm_weight_ptr*/, int64_t /*norm_weight_stride_n*/,
+    int /*norm_weight_size_n*/, const void* /*qk_weight_ptr*/,
+    int64_t /*qk_weight_stride_n*/, int /*qk_weight_size_n*/,
+    const void* /*output_norm_weight_ptr*/,
+    int64_t /*output_norm_weight_stride_n*/, int /*output_norm_weight_size_n*/,
+    void* /*prefix_output_ptr*/, int64_t /*prefix_output_stride_m*/,
+    int64_t /*prefix_output_stride_n*/, int /*prefix_output_size_m*/,
+    int /*prefix_output_size_n*/, void* /*output_ptr*/,
+    int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+    int /*output_size_m*/, int /*output_size_n*/, void* /*block_output_ptr*/,
+    int64_t /*block_output_stride_m*/, int64_t /*block_output_stride_n*/,
+    int /*block_output_size_m*/, int /*block_output_size_n*/,
+    int /*num_blocks*/, float /*eps*/, float /*output_eps*/);
 using AllReduceAddAttnResRmsNormPushKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
@@ -747,6 +775,10 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int num_blocks;
   float eps;
   float output_eps;
+  // THE SPLIT'S ALL-REDUCE (algorithm split): the plain all-reduce's launch into
+  // this rank's local sums, run before `kernel` (our AttnRes kernel), which
+  // reads them as its input; none for a one-kernel launch.
+  std::optional<AllReduceLaunch> all_reduce;
 };
 
 }  // namespace hip_custom_communicator

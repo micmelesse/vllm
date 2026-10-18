@@ -190,12 +190,30 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
 };
 
+// OUR SEPARATE ATTNRES KERNEL (the split's second, add_attn_res_rms_norm): a row a tile, the
+// fused pull's exact tile (TILE_N a row's packs over the threads, Layout::tile), at Triton's
+// AttnRes program (256 threads, a source a step: the reference's prefill config) and the
+// neighbours a sweep picks among; each as it is and with its all-reduce moving INT4.
+constexpr BuildConfig kAttnResSplitExactConfigs[] = {
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 2, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+};
+constexpr auto kAttnResSplitConfigs = and_int4(kAttnResSplitExactConfigs);
+
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
   Template fn;
   const char* name;
   OpType op;
-  bool two_shot;
+  Algorithm algorithm;
   bool push;  // peers push into this rank (else it pulls from them)
   std::span<const BuildConfig> builds;
 };
@@ -206,32 +224,32 @@ struct TemplateInfo {
 
 constexpr TemplateInfo kTemplates[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot),
-     OpType::all_reduce, false, false, kAllReduceOneShotConfigs},
+     OpType::all_reduce, Algorithm::one_shot, false, kAllReduceOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot),
-     OpType::all_reduce, true, false, kAllReduceTwoShotConfigs},
+     OpType::all_reduce, Algorithm::two_shot, false, kAllReduceTwoShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot_rms_norm),
-     OpType::all_reduce_rms_norm, false, false, kRmsNormOneShotConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::one_shot, false, kRmsNormOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot_rms_norm),
-     OpType::all_reduce_rms_norm, true, false, kRmsNormPullConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::two_shot, false, kRmsNormPullConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, false, false, kAddRmsNormOneShotConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::one_shot, false, kAddRmsNormOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, true, false, kAddRmsNormPullConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, false, kAddRmsNormPullConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_pull_one_shot_add_attn_res_rms_norm),
-     OpType::all_reduce_add_attn_res_rms_norm, false, false,
+     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::one_shot, false,
      kAttnResOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_pull_two_shot_add_attn_res_rms_norm),
-     OpType::all_reduce_add_attn_res_rms_norm, true, false,
+     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, false,
      kAttnResPullConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot_rms_norm),
-     OpType::all_reduce_rms_norm, true, true, kRmsNormPushConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::two_shot, true, kRmsNormPushConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, true, true, kAddRmsNormPushConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, true, kAddRmsNormPushConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_push_two_shot_add_attn_res_rms_norm),
-     OpType::all_reduce_add_attn_res_rms_norm, true, true, kAttnResPushConfigs},
+     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, true, kAttnResPushConfigs},
     // THE PLAIN ALL-REDUCE PUSHED (kernels/all_reduce.cuh): a variant a caller
     // forces by its direction; no tuned entry names it (the in-place pull is
     // faster: 262.5 against 333 us at 4096 x 7168 bf16, n11, 2026-10-17). The
@@ -239,9 +257,15 @@ constexpr TemplateInfo kTemplates[] = {
     // template's does (all_reduce_pull_two_shot_int4: the shares quantized by
     // their owner and pushed).
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_one_shot),
-     OpType::all_reduce, false, true, kAllReduceOneShotConfigs},
+     OpType::all_reduce, Algorithm::one_shot, true, kAllReduceOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot),
-     OpType::all_reduce, true, true, kAllReduceTwoShotConfigs},
+     OpType::all_reduce, Algorithm::two_shot, true, kAllReduceTwoShotConfigs},
+    // THE OP AS TWO KERNELS OF OURS (Algorithm::split; STANDARDS 3.2, *We win at the op level*):
+    // the plain all-reduce, its tuned pick at the build's quantization, into this rank's local
+    // sums (Handle::sums), then our separate AttnRes kernel on them (add_attn_res_rms_norm), on
+    // its own grid at its own occupancy. Its builds are that kernel's.
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_add_attn_res_rms_norm),
+     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::split, false, kAttnResSplitConfigs},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -258,7 +282,9 @@ constexpr const TemplateInfo& info(Template k) {
   return kTemplates[static_cast<int>(k)];
 }
 constexpr const char* to_string(Template k) { return info(k).name; }
-constexpr bool is_two_shot(Template k) { return info(k).two_shot; }
+constexpr bool is_two_shot(Template k) { return info(k).algorithm == Algorithm::two_shot; }
+// A SPLIT: two kernels of ours, the plain all-reduce then the op's own (Algorithm::split).
+constexpr bool is_split(Template k) { return info(k).algorithm == Algorithm::split; }
 
 constexpr std::span<const BuildConfig> builds_of(Template k) {
   return info(k).builds;
@@ -310,9 +336,7 @@ constexpr bool same_builds(Template a, Template b) {
 }
 
 constexpr OpType op_of(Template k) { return info(k).op; }
-constexpr Algorithm algorithm_of(Template k) {
-  return info(k).two_shot ? Algorithm::two_shot : Algorithm::one_shot;
-}
+constexpr Algorithm algorithm_of(Template k) { return info(k).algorithm; }
 constexpr Direction direction_of(Template k) {
   return info(k).push ? Direction::push : Direction::pull;
 }
@@ -1051,7 +1075,7 @@ constexpr bool ops_have_int4_kernels() {
   for (const Op& o : kOps) {
     if (o.int4_kernels.empty()) return false;
     for (const TunedKernel& k : o.int4_kernels)
-      if (op_of(k.fn) != o.type || !is_two_shot(k.fn) ||
+      if (op_of(k.fn) != o.type || algorithm_of(k.fn) == Algorithm::one_shot ||
           quantization_of(k.config.build) != Quantization::int4 ||
           !built(k.fn, k.config.build) || !launch_fits(k.fn, k.config.launch))
         return false;
@@ -1314,7 +1338,7 @@ constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols,
   const int64_t tiles = tiles_of(k.fn, k.config, m, grid_cols, world);
   int& blocks = k.config.launch.blocks_per_grid;
   if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
-  if (k.fn == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm &&
+  if ((k.fn == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm || is_split(k.fn)) &&
       tiles > 0) {
     const int64_t most = (tiles + blocks - 1) / blocks;
     blocks = static_cast<int>((tiles + most - 1) / most);
@@ -1380,7 +1404,8 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // INT4 ON A ONE-SHOT, which reads its peers' inputs as they are: named before
   // the build lookup, which lists no such build.
   const bool int4 = quantization_of(c.build) == Quantization::int4;
-  if (int4 && !is_two_shot(fn)) return Error::quantization_not_two_shot;
+  if (int4 && algorithm_of(fn) == Algorithm::one_shot)
+    return Error::quantization_not_two_shot;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its threads, its
   // waves, its tile.
   const int threads = threads_of(c.build);
@@ -2114,14 +2139,46 @@ select_all_reduce_add_attn_res_rms_norm(
                                   T, NG, TN, TK, TPB, WPE,
                                   C.quantization>);
               });
+        case K::all_reduce_pull_split_add_attn_res_rms_norm:
+          // OUR SEPARATE ATTNRES KERNEL: no world, no quantization (its all-reduce's).
+          return by_build<K::all_reduce_pull_split_add_attn_res_rms_norm>(
+              c.build, [&](auto cc) {
+                constexpr AllReduceAddAttnResRmsNormBuildConfig C =
+                    decltype(cc)::value;
+                constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
+                              TPB = C.threads_per_block, WPE = C.waves_per_eu;
+                kernel = instance<AddAttnResRmsNormKernel>(
+                    add_attn_res_rms_norm<T, TM, TN, TK, TPB, WPE>);
+              });
         default:
           not_this_ops(fn);
       }
     });
   });
-  // 4.
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
+  // THE SPLIT'S ALL-REDUCE: the plain all-reduce's tuned kernel at the build's quantization (its
+  // INT4 list or its exact one), whole, into this rank's local sums, dense rows; its own select
+  // checks it (its band, its regions, its residency). The sums hold the call: refused above
+  // when the inputs region, their size, does not hold its input.
+  std::optional<AllReduceLaunch> all_reduce;
+  if (is_split(fn)) {
+    const std::variant<TunedKernel, Error> t =
+        pick(OpType::all_reduce, world, m, n, tile_cols(OpType::all_reduce, n), dtype,
+             a.quantization == Quantization::int4
+                 ? kOps[static_cast<int>(OpType::all_reduce)].int4_kernels
+                 : kOps[static_cast<int>(OpType::all_reduce)].kernels);
+    if (const Error* e = std::get_if<Error>(&t)) return *e;
+    const TunedKernel& r = std::get<TunedKernel>(t);
+    const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
+    const std::variant<AllReduceLaunch, Error> got = select_all_reduce(
+        h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n, dtype,
+        algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n, b.threads_per_block,
+        r.config.launch.blocks_per_grid, b.waves_per_eu, b.quantization, stream);
+    if (const Error* e = std::get_if<Error>(&got)) return *e;
+    all_reduce = std::get<AllReduceLaunch>(got);
+  }
+  // 4.
   const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
@@ -2196,8 +2253,10 @@ select_all_reduce_add_attn_res_rms_norm(
       .dtype = dtype,
       .num_blocks = num_blocks,
       .eps = eps,
-      .output_eps = output_eps};
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
+      .output_eps = output_eps,
+      .all_reduce = all_reduce};
+  // A SPLIT'S ATTNRES KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
+  if (!is_split(fn) && !resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }

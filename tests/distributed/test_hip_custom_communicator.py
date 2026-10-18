@@ -504,7 +504,9 @@ def _forced(
         return None
     split = {"reduce_scatter_blocks": 0} if "attn_res" in template else {}
     return {
-        "algorithm": "two_shot" if "two_shot" in template else "one_shot",
+        "algorithm": next(
+            a for a in ("two_shot", "split", "one_shot") if a in template
+        ),
         "direction": "push" if "_push_" in template else "pull",
         **build,
         "blocks_per_grid": 16,

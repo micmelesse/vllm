@@ -543,6 +543,7 @@ class Handle {
                       static_cast<uint32_t>(peers.error));
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
+    add(own, release_sums());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -595,6 +596,7 @@ class Handle {
     // (e) Our arena, the slab of input tables and the arena's device array.
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
+    add(own, release_sums());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -635,6 +637,7 @@ class Handle {
     if (finished) {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
+      add(own, release_sums());
       add(own, release_region_ptr_arrays());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
@@ -671,6 +674,14 @@ class Handle {
   int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
+  // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (select.cuh's
+  // Algorithm::split), written by its plain all-reduce and read by its own
+  // epilogue kernel after it on the stream. Never a peer's (not in the arena:
+  // hipMalloc, cacheable), so nothing orders it but the stream. Sized as the
+  // inputs region, which holds any call's whole input (select refuses one it
+  // does not), so it holds any call's sum.
+  void* sums() const { return sums_; }
+  int64_t sums_bytes() const { return staging_bytes_; }
 
   // EVERY RANK'S SIGNALS, a device array of every rank's signals region with
   // its size, the world (written at open, with the others in
@@ -1044,6 +1055,8 @@ class Handle {
     }
     log.phase(OpenPhase::tables_written,
               static_cast<uint32_t>(kInputTableSlots));
+    // THE LOCAL SUMS (`sums`): hipMalloc, cacheable, this rank's alone.
+    HIP_CHECK(hipMalloc(&sums_, static_cast<size_t>(staging_bytes_)));
     // THE STATUS, host-mapped and coherent: the log's first words
     // (log.cuh). A wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort`
@@ -1127,6 +1140,20 @@ class Handle {
         out.error = e;
       }
       region_ptr_arrays_ = nullptr;
+    }
+    return out;
+  }
+  // THE LOCAL SUMS freed (ours, local): with our arena, in teardown's second
+  // half. Idempotent.
+  Arena::Released release_sums() {
+    Arena::Released out;
+    if (sums_ != nullptr) {
+      const hipError_t e = hipFree(sums_);
+      if (e != hipSuccess) {
+        (void)hipGetLastError();
+        out.error = e;
+      }
+      sums_ = nullptr;
     }
     return out;
   }
@@ -1280,6 +1307,8 @@ class Handle {
   static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
                        kRegionPtrArrays = 4;
   char** region_ptr_arrays_ = nullptr;
+  // THE LOCAL SUMS (`sums`), staging_bytes_ of them.
+  void* sums_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;
   std::vector<void**> pending_slots_;

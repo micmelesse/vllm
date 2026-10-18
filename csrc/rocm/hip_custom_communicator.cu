@@ -132,8 +132,9 @@ std::optional<hip_custom_communicator::Algorithm> algorithm_from(
     const std::optional<std::string>& s) {
   if (!s) return std::nullopt;
   if (*s == "one_shot") return hip_custom_communicator::Algorithm::one_shot;
+  if (*s == "split") return hip_custom_communicator::Algorithm::split;
   TORCH_CHECK(*s == "two_shot",
-              "hip_custom_communicator: algorithm is one_shot or two_shot");
+              "hip_custom_communicator: algorithm is one_shot, two_shot or split");
   return hip_custom_communicator::Algorithm::two_shot;
 }
 std::optional<hip_custom_communicator::Direction> direction_from(

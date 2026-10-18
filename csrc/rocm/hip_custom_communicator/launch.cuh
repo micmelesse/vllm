@@ -243,9 +243,40 @@ inline void launch_all_reduce_add_rms_norm(Handle& h,
         h.status_size_field(), h.rank(), h.timeout_ticks(), l.eps);
 }
 
-// THE PULL TWO-SHOT takes its reduce-scatter blocks last.
+// THE PULL TWO-SHOT takes its reduce-scatter blocks last. THE SPLIT (its
+// `all_reduce` set): that launch first, into this rank's local sums, then our
+// AttnRes kernel on them, stream-ordered after it, nothing over the peers.
 inline void launch_all_reduce_add_attn_res_rms_norm(
     Handle& h, const AllReduceAddAttnResRmsNormLaunch& l) {
+  if (l.all_reduce) {
+    const AllReduceLaunch& r = *l.all_reduce;
+    launch_all_reduce(h, r);
+    h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, l.kernel,
+                   l.input_size_m, l.input_size_n, l.dtype, l.stream);
+    Call<AddAttnResRmsNormKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, r.output,
+        r.output_stride_m, r.output_stride_n, static_cast<int>(r.output_size_m),
+        static_cast<int>(r.output_size_n), l.prefix, l.prefix_stride_m,
+        l.prefix_stride_n, static_cast<int>(l.prefix_size_m),
+        static_cast<int>(l.prefix_size_n), l.blocks, l.blocks_stride_m,
+        l.blocks_stride_r, l.blocks_stride_n, static_cast<int>(l.blocks_size_m),
+        static_cast<int>(l.blocks_size_r), static_cast<int>(l.blocks_size_n),
+        l.norm_weight, l.norm_weight_stride_n,
+        static_cast<int>(l.norm_weight_size_n), l.qk_weight,
+        l.qk_weight_stride_n, static_cast<int>(l.qk_weight_size_n),
+        l.output_norm_weight, l.output_norm_weight_stride_n,
+        static_cast<int>(l.output_norm_weight_size_n), l.prefix_output,
+        l.prefix_output_stride_m, l.prefix_output_stride_n,
+        static_cast<int>(l.prefix_output_size_m),
+        static_cast<int>(l.prefix_output_size_n), l.output, l.output_stride_m,
+        l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), l.block_output,
+        l.block_output_stride_m, l.block_output_stride_n,
+        static_cast<int>(l.block_output_size_m),
+        static_cast<int>(l.block_output_size_n), l.num_blocks, l.eps,
+        l.output_eps);
+    return;
+  }
   h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, l.kernel,
                  l.input_size_m, l.input_size_n, l.dtype, l.stream);
   const InputTable t = fused_input(h, l);

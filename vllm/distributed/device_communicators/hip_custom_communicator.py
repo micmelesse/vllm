@@ -959,7 +959,7 @@ _open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet(
 # number it was refused for, or -1 when it ran, then what ran.
 Answer = list[int]
 # C++'s `Algorithm`, `Direction` and `Quantization`, number for number.
-_ALGORITHMS = ("one_shot", "two_shot")
+_ALGORITHMS = ("one_shot", "two_shot", "split")
 _DIRECTIONS = ("pull", "push")
 _QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
 
@@ -1159,11 +1159,11 @@ class HipCustomCommunicator:
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
     # Each op takes its own tensors and values, then, keyword-only, what the sweep and
-    # the tests force: ALL OR NOTHING, the algorithm (`one_shot` or `two_shot`) and the
-    # direction (`pull` or `push`) where the op has more than one template, every field
-    # of one of its builds (`build_info().templates`), and the launch (blocks_per_grid,
-    # and the AttnRes op's reduce_scatter_blocks); some but not all is
-    # `forced_incomplete`. The build's `quantization` alone may be left out, and is
+    # the tests force: ALL OR NOTHING, the algorithm (`one_shot`, `two_shot` or
+    # `split`) and the direction (`pull` or `push`) where the op has more than one
+    # template, every field of one of its builds (`build_info().templates`), and the
+    # launch (blocks_per_grid, and the AttnRes op's reduce_scatter_blocks); some but
+    # not all is `forced_incomplete`. The build's `quantization` alone may be left out, and is
     # then none, never the communicator's: a forced call runs what it names. All None
     # is the backend's choice; the model forces none. A forced call asks no `should_`:
     # C++ answers it. An op raises Refused with the Error C++ refused it for; a call
