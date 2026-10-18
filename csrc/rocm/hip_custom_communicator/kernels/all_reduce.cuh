@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
     for (int r = 0; r < WORLD; ++r)
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
     // same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];
@@ -99,7 +99,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
@@ -213,9 +213,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // then visible to the peers (each has pushed its own into ours).
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE mine[kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, mine, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
       for (int r = 0; r < WORLD; ++r)
-        send<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(mine, staging_ptr_array, staging_ptr_array_size, r, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+        send<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(mine, staging_ptr_array, staging_ptr_array_size, r, rank, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     }
     barrier<WORLD>(
         signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
@@ -225,7 +225,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 2. Every writer's slot of this rank's inbox, local, in rank order, summed.
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(staging_ptr_array, staging_ptr_array_size, rank, 0, slot, staging_stride_m, staging_stride_n, WORLD, band_rows, staging_size_n, band, input_size_n, peers, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
       DTYPE rounded[kRows][kPacks][kPackElems];  // summed in rank order in fp32, rounded once (as above)
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
@@ -238,7 +238,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
             rounded[i][k][j] = static_cast<DTYPE>(acc);
           }
-      store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, r0 + band, input_size_n, r0 + t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     }
     // 3. No rank may push its next band (this launch's or the next's) until
     // every peer has summed this one out of its inbox.

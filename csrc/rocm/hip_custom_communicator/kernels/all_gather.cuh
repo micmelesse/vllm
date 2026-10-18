@@ -34,18 +34,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
                         int offs_n, int slice_n, int rank) {
   constexpr int kPackElems = traits<DTYPE>::N;
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
-  using V = vec<DTYPE, kPackElems>;
-  // A PACK IS ONE 16-BYTE GLOBAL INSTRUCTION (reduce_scatter.cuh's).
-  static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
   if constexpr (WALK == Walk::flat) {
-    // Element e of an [*, n] buffer numbered row-major (the flat walk's address).
-    const auto element_at = [](DTYPE* ptr, int64_t stride_m, int64_t stride_n, int64_t e, int n) {
-      if (stride_m == int64_t{n} * stride_n) return ptr + e * stride_n;
-      const int64_t row = e < (int64_t{1} << 31)
-                              ? int64_t{static_cast<uint32_t>(e) / static_cast<uint32_t>(n)}
-                              : e / n;
-      return ptr + row * stride_m + (e - row * n) * stride_n;
-    };
+    // A rank's share is slot r of the output viewed flat (stride `slice` elements: common.cuh's
+    // Layout run / flat), as reduce_scatter's.
     DTYPE* const output_ptr = output;
     constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
     const int64_t total = int64_t{output_size_m} * output_size_n;
@@ -54,66 +45,37 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
     };
     if constexpr (kInt4) {
-      const uint8_t* values[WORLD];
-      const __fp16* scales[WORLD];
-#pragma unroll
-      for (int w = 0; w < WORLD; ++w) {
-        values[w] = ptr_array_at<uint8_t>(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD);
-        scales[w] = reinterpret_cast<__fp16*>(ptr_array_at(partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD) +
-                                              int4_scales_offset(partials_size_m, partials_size_n));
-      }
+      constexpr Layout kOutput = CONTIGUOUS ? Layout::group_run : Layout::group_flat;
       const int groups_all = slice / kInt4Group;
       const int grid = static_cast<int>(gridDim.x);
       const int per_block = (groups_all + grid - 1) / grid;
       const int g_first = static_cast<int>(blockIdx.x) * per_block;
       const int g_end = min(g_first + per_block, groups_all);
       for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
-        const int g = g0 + static_cast<int>(threadIdx.x);
-        u32x4 words[WORLD];
-        float group_scales[WORLD];
-#pragma unroll
-        for (int w = 0; w < WORLD; ++w) {
-          const int groups = share_len((rank + w) % WORLD) / kInt4Group;
-          const int at = max(min(g, groups - 1), 0);
-          // A uniform base plus a 32-bit byte offset, opaque so the address is built at its load.
-          uint32_t value_at = static_cast<uint32_t>(at) * 16;
-          uint32_t scale_at = static_cast<uint32_t>(at) * kInt4ScaleBytes;
-          asm volatile("" : "+v"(value_at));
-          asm volatile("" : "+v"(scale_at));
-          words[w] = *(const global_u32x4*)(values[w] + value_at);
-          group_scales[w] =
-              *(const global_f16*)(reinterpret_cast<const char*>(scales[w]) + scale_at);
-        }
-        // ISSUED HERE: no memory operation nor instruction crosses this point, so every rank's
-        // group is in flight before the first is decoded.
-        asm volatile("" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        // 1. Every rank's group of its summed share, raw, rotated (rank + w), all in flight before
+        // the first is decoded.
+        uint32_t words[WORLD][1][kInt4GroupPacks][2];
+        for (int w = 0; w < WORLD; ++w)
+          recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+              partials_ptr_array, partials_ptr_array_size, (rank + w) % WORLD, 0, 0,
+              partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1, slice,
+              words[w], 0, g0 * kInt4Group, 1);
+        // 2. Each decoded and stored where its rank's share goes.
 #pragma unroll
         for (int w = 0; w < WORLD; ++w) {
           const int r = (rank + w) % WORLD;
-          const int groups = share_len(r) / kInt4Group;
-          if (!(g < g_end && g < groups)) continue;
-          const int64_t first = int64_t{r} * slice;
-          V* group;
-          if constexpr (CONTIGUOUS) {
-            uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(DTYPE));
-            asm volatile("" : "+v"(offset));
-            group = reinterpret_cast<V*>(
-                reinterpret_cast<char*>(output_ptr + first * output_stride_n) + offset);
-          } else
-            group = reinterpret_cast<V*>(element_at(output_ptr, output_stride_m, output_stride_n,
-                                                    first + int64_t{g} * kInt4Group, output_size_n));
+          DTYPE x[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
-          for (int k = 0; k < kInt4GroupPacks; ++k) {
-            DTYPE x[kPackElems];
-            dequantize(words[w][k], group_scales[w], x);
-            u32x4 raw;
-            __builtin_memcpy(&raw, x, sizeof(raw));
-            *(global_u32x4*)(group + k) = raw;
-          }
+          for (int k = 0; k < kInt4GroupPacks; ++k)
+            dequantize(words[w][0][k][0], __builtin_bit_cast(float, words[w][0][k][1]), x[0][k]);
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput>(
+              x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
+              output_size_m, output_size_n, 1, min(g_end, share_len(r) / kInt4Group) * kInt4Group,
+              0, g0 * kInt4Group, 1);
         }
       }
     } else {
+      constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
       constexpr int kPacks = TILE_N / (kPackElems * kLanes);
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
@@ -122,31 +84,13 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
         const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][kPacks][kPackElems];
-        // 1. Rank r's summed chunk, in one round trip.
-        recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1, slice, got, 0, chunk * TILE_N, 0);
+        // 1. Rank r's summed chunk, a row of threads a rank, in one round trip.
+        recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
+                       slice, got, 0, chunk * TILE_N, 0);
         // 2. Stored where rank r's share goes, its first `len` elements.
-        const int64_t first = int64_t{r} * slice;
-        const int len = share_len(r);
-        V* const run = reinterpret_cast<V*>(output_ptr + first * output_stride_n);
-#pragma unroll
-        for (int k = 0; k < kPacks; ++k) {
-          const int c = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
-          if (c >= len / kPackElems) continue;
-          V* at;
-          if constexpr (CONTIGUOUS) {
-            // A uniform base plus a 32-bit byte offset, opaque so the address is built at its
-            // store (c is below the share, so no clamp).
-            uint32_t offset = static_cast<uint32_t>(c) * uint32_t{sizeof(V)};
-            asm volatile("" : "+v"(offset));
-            at = reinterpret_cast<V*>(reinterpret_cast<char*>(run) + offset);
-          } else {
-            at = reinterpret_cast<V*>(element_at(output_ptr, output_stride_m, output_stride_n,
-                                                 first + int64_t{c} * kPackElems, output_size_n));
-          }
-          u32x4 raw;
-          __builtin_memcpy(&raw, got[0][k], sizeof(raw));
-          *(global_u32x4*)(at) = raw;
-        }
+        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput>(
+            got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
+            output_size_m, output_size_n, 1, share_len(r), 0, chunk * TILE_N, 1);
       }
     }
   } else {
@@ -156,72 +100,41 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     static_assert(std::extent_v<Tile, 2> == kPackElems, "a tile's pack is the dtype's");
     (void)output_stride_m;
     (void)output_stride_n;
-    // Row i of the tile: past output_size_m the last row (one row of threads, so the row is the
-    // block's and its address scalar); a tile of several rows skips a row past it instead of
-    // re-reading the last over the links (one row's is real wherever a kernel makes one, and a
-    // branch around its loads cost registers: 126 -> 178 VGPRs, 23-46-07Z). Pack k's column, past
-    // output_size_n the last below it, so every load is in bounds and none is under a branch.
-    const auto row_of = [&](int i) {
-      return offs_m + i < output_size_m ? offs_m + i : output_size_m - 1;
-    };
-    const auto col_of = [&](int k) {
+    // EACH PACK FROM THE RANK OWNING ITS COLUMNS, slice_n columns a rank (the last rank's to the
+    // end): a per-lane rank (a wave's packs may have two owners), so a recv a pack, the pack's
+    // column as recv clamps it (past output_size_n the last below it). int4: every pack's raw
+    // words and scales first, all in flight, then decoded.
+    const auto owner_of = [&](int k) {
       const int n = offs_n / kPackElems + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
-      return n < output_size_n / kPackElems ? n : output_size_n / kPackElems - 1;
+      const int col = n < output_size_n / kPackElems ? n : output_size_n / kPackElems - 1;
+      return min(col / (slice_n / kPackElems), WORLD - 1);
     };
     if constexpr (!kInt4) {
 #pragma unroll
-      for (int i = 0; i < kRows; ++i) {
-        if (kRows > 1 && offs_m + i >= output_size_m) continue;
+      for (int k = 0; k < kPacks; ++k) {
+        DTYPE pack[kRows][1][kPackElems];
+        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+            partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0, partials_stride_m,
+            partials_stride_n, 1, partials_size_m, partials_size_n, output_size_m, output_size_n,
+            pack, offs_m, offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k) {
-          const int col = col_of(k);
-          const int owner = min(col / (slice_n / kPackElems), WORLD - 1);
-          const u32x4 raw = *(const global_u32x4*)(
-              reinterpret_cast<const V*>(lane_ptr_array_at<const DTYPE, WORLD>(partials_ptr_array, partials_ptr_array_size, owner)) +
-              int64_t{row_of(i)} * (partials_stride_m / kPackElems) + col);
-          __builtin_memcpy(output[i][k], &raw, sizeof(raw));
-        }
+        for (int i = 0; i < kRows; ++i)
+#pragma unroll
+          for (int j = 0; j < kPackElems; ++j) output[i][k][j] = pack[i][0][j];
       }
-      // ISSUED HERE: every owner's pack in flight before anything below runs.
-      asm volatile("" ::: "memory");
-      __builtin_amdgcn_sched_barrier(0);
     } else {
-      static_assert(THREADS_PER_BLOCK % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-      // The partials' INT4 payload, from their own sizes (the INT4 payload layout).
-      const int64_t values_stride_m = partials_size_n / 2;
-      const int64_t scales_stride_m = partials_size_n / kInt4Group;
-      const int64_t scales_offset = int4_scales_offset(partials_size_m, partials_size_n);
-      uint32_t words[kRows][kPacks];
-      float scales[kRows][kPacks];
+      uint32_t raw[kPacks][kRows][1][2];
 #pragma unroll
-      for (int i = 0; i < kRows; ++i) {
-        if (kRows > 1 && offs_m + i >= output_size_m) continue;
-#pragma unroll
-        for (int k = 0; k < kPacks; ++k) {
-          const int col = col_of(k);
-          const int owner = min(col / (slice_n / kPackElems), WORLD - 1);
-          const int64_t row = row_of(i);
-          // The pack's word of values and its group's scale, each a row's base plus an opaque
-          // 32-bit byte offset (built at its load).
-          uint32_t value_at = static_cast<uint32_t>(col) * kInt4WordBytes;
-          uint32_t scale_at = static_cast<uint32_t>(col / kInt4GroupPacks) * kInt4ScaleBytes;
-          asm volatile("" : "+v"(value_at));
-          asm volatile("" : "+v"(scale_at));
-          words[i][k] = *(const global_u32*)(lane_ptr_array_at<const uint8_t, WORLD>(partials_ptr_array, partials_ptr_array_size, owner) + row * values_stride_m +
-                                             value_at);
-          scales[i][k] = *(const global_f16*)(
-              reinterpret_cast<const char*>(
-                  reinterpret_cast<const __fp16*>(lane_ptr_array_at<const char, WORLD>(partials_ptr_array, partials_ptr_array_size, owner) + scales_offset) +
-                  row * scales_stride_m) +
-              scale_at);
-        }
-      }
-      asm volatile("" ::: "memory");  // issued (above)
-      __builtin_amdgcn_sched_barrier(0);
+      for (int k = 0; k < kPacks; ++k)
+        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+            partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0, partials_stride_m,
+            partials_stride_n, 1, partials_size_m, partials_size_n, output_size_m, output_size_n,
+            raw[k], offs_m, offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
 #pragma unroll
       for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < kPacks; ++k) dequantize(words[i][k], scales[i][k], output[i][k]);
+        for (int k = 0; k < kPacks; ++k)
+          dequantize(raw[k][i][0][0], __builtin_bit_cast(float, raw[k][i][0][1]), output[i][k]);
     }
   }
 }
