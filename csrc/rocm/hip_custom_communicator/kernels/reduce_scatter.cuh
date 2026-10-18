@@ -82,7 +82,7 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 //
 // WALK::rows (the fused ops' two-shots): this rank's columns of every row, equal slices of whole
 // packs a rank (a late rank's short or empty). ACCUMULATE lds (pull): a chunk of a row at a time,
-// WORLD rows of kLanes threads, row w rank rank + w's copy picked per lane (Ranks::lane), summed
+// WORLD rows of kLanes threads, row w rank rank + w's copy recv'd per lane (a row of threads' rank), summed
 // over the rows through LDS into this rank's partials. ACCUMULATE registers: a row of threads as
 // wide as a rank's slice of a TILE_N row (whole waves), a pack a thread, as many rows at once as the
 // block holds, every rank's pack summed in registers in rank order; push stores the sum in every
