@@ -17,9 +17,9 @@
 // one-entry array, `&x_ptr, 1`), its strides and its sizes, in elements; stride_n is 1 (the host
 // checks it; the packed loads need it). How a buffer is allocated is the host's (STANDARDS 3.2).
 // A thread's registers are a plain array the caller declares, `T v[ROWS][K][P]`, an input or an
-// output like a buffer: P a pack's elements (traits<T>::N), thread t lane t % THREADS_N of
-// thread-row t / THREADS_N, holding rows offs_m + (t / THREADS_N + i * THREADS_M) * row_step and
-// packs offs_n / P + t % THREADS_N + k * THREADS_N; every rank's is `T v[WORLD][ROWS][K][P]`.
+// output like a buffer: P a pack's elements (traits<T>::N); a call names the tile's rows TILE_M
+// and THREADS_PER_BLOCK, and the thread layout is derived from them (load and store, below);
+// every rank's is `T v[WORLD][ROWS][K][P]`.
 // The extents are deduced from the array: the array's shape is what the caller drills.
 //
 // CONCURRENCY IS PART OF EACH OP'S CONTRACT, so a kernel keeps it by using them:
@@ -98,17 +98,17 @@ struct Max {
 };
 
 // THE AXIS a reduce reduces over (template ints, as Quantization): `all`, the whole block;
-// `m`, the THREADS_M rows of THREADS_N threads, elementwise a lane.
+// `m`, the TILE_M rows of THREADS_PER_BLOCK / TILE_M threads, elementwise a lane.
 namespace ReduceAxis {
 constexpr int all = 0;
 constexpr int m = 1;
 }  // namespace ReduceAxis
 
-// THE BLOCK REDUCTION, one for every case: reduce<OP, AXIS, THREADS_M, THREADS_N>(input,
+// THE BLOCK REDUCTION, one for every case: reduce<OP, AXIS, TILE_M, THREADS_PER_BLOCK>(input,
 // output), OP Sum or Max, every value of [K][P] reduced on its own, in fp32. Input and output may
 // be the same array (in place).
 //
-// AXIS all: over the whole block (THREADS_M * THREADS_N threads, THREADS_M 1), every thread left
+// AXIS all: over the whole block (THREADS_PER_BLOCK threads, TILE_M 1), every thread left
 // holding the results. Each wave reduces its values by DPP, then every thread combines the waves'
 // partials in wave order (the same order in every thread, so every thread holds the same totals).
 // One wave reducing the partials over all 64 lanes, then broadcasting them, was a second DPP pass a
@@ -123,14 +123,18 @@ constexpr int m = 1;
 // the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
 // after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
 // ISA 2026-10-15).
-template <typename OP, int AXIS, int THREADS_M, int THREADS_N, typename T, typename U, int K,
+template <typename OP, int AXIS, int TILE_M, int THREADS_PER_BLOCK, typename T, typename U, int K,
           int P>
 DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
+  // The block as TILE_M rows of kThreadsN threads.
+  constexpr int kThreadsM = TILE_M;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / TILE_M;
+  static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the block is TILE_M whole rows of threads");
   if constexpr (AXIS == ReduceAxis::all) {
-    static_assert(THREADS_M == 1, "AXIS all is one row of the block's threads");
+    static_assert(TILE_M == 1, "AXIS all is one row of the block's threads");
     constexpr int kValues = K * P;
-    constexpr int kWaves = (THREADS_N + kWaveSize - 1) / kWaveSize;
+    constexpr int kWaves = (kThreadsN + kWaveSize - 1) / kWaveSize;
     __shared__ float partial[kValues][kWaves];
     const int lane = threadIdx.x % kWaveSize;
     const int wave = threadIdx.x / kWaveSize;
@@ -185,16 +189,16 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
     __syncthreads();
   } else {
     using V = vec<T, P>;
-    __shared__ V part[THREADS_M][K][THREADS_N];
-    const int mine = static_cast<int>(threadIdx.x) % THREADS_N;
+    __shared__ V part[kThreadsM][K][kThreadsN];
+    const int mine = static_cast<int>(threadIdx.x) % kThreadsN;
 #pragma unroll
     for (int k = 0; k < K; ++k)
-      __builtin_memcpy(&part[static_cast<int>(threadIdx.x) / THREADS_N][k][mine], input[k], sizeof(V));
+      __builtin_memcpy(&part[static_cast<int>(threadIdx.x) / kThreadsN][k][mine], input[k], sizeof(V));
     __syncthreads();
-    // THE FIRST ROW OF THREADS_PER_BLOCK HOLDS THE SUM: a compare only when there are several (threadIdx.x <
-    // THREADS_N is not folded from the launch bounds: a compare and a branch around every store,
+    // THE FIRST ROW OF THREADS HOLDS THE SUM: a compare only when there are several (threadIdx.x <
+    // kThreadsN is not folded from the launch bounds: a compare and a branch around every store,
     // ISA 2026-10-15).
-    if (THREADS_M == 1 || static_cast<int>(threadIdx.x) < THREADS_N) {
+    if (kThreadsM == 1 || static_cast<int>(threadIdx.x) < kThreadsN) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         float x[P];
@@ -202,7 +206,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
 #pragma unroll
         for (int j = 0; j < P; ++j) x[j] = static_cast<float>(reinterpret_cast<const T*>(&p)[j]);
 #pragma unroll
-        for (int r = 1; r < THREADS_M; ++r) {
+        for (int r = 1; r < kThreadsM; ++r) {
           p = part[r][k][mine];
 #pragma unroll
           for (int j = 0; j < P; ++j)
@@ -630,14 +634,14 @@ constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
 // LANDED IN U two values a 32-bit word: with bf16 one v_cvt_pk_bf16_f32, where each element's own
 // conversion was one with a zero half, then a shift and an or (12 instructions a pack, not 4; ISA
 // 2026-10-16T02-01-12Z).
-template <typename U, int P>
-DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
-  static_assert(P == 8, "a word is 8 values");
+template <typename U, int kPackElems>
+DINLINE void dequantize(uint32_t word, float scale, U (&output)[kPackElems]) {
+  static_assert(kPackElems == 8, "a word is 8 values");
   static_assert(std::is_same_v<U, float> || sizeof(U) == 2, "fp32 terms or a 16-bit dtype");
   const float scale16 = scale * 0.0625f;
   const float bias = scale * -1032.0f;
   const float bias16 = scale * -72.0f;
-  float term[P];
+  float term[kPackElems];
   uint32_t p0, p1, p2, p3;
   asm volatile("v_and_or_b32 %[p0], %[w], %[m0], %[magic]\n\t"
       "v_and_or_b32 %[p1], %[w], %[m1], %[magic]\n\t"
@@ -659,11 +663,11 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
         [s] "v"(scale), [b] "v"(bias), [s16] "v"(scale16), [b16] "v"(bias16));
   if constexpr (std::is_same_v<U, float>) {
 #pragma unroll
-    for (int j = 0; j < P; ++j) output[j] = term[j];
+    for (int j = 0; j < kPackElems; ++j) output[j] = term[j];
   } else {
     u32x4 packed;
 #pragma unroll
-    for (int w = 0; w < P / 2; ++w) {
+    for (int w = 0; w < kPackElems / 2; ++w) {
       const float a = term[2 * w], b = term[2 * w + 1];
       if constexpr (kBf16<U>)
         packed[w] = __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{a, b}, bf16x2));
@@ -692,18 +696,18 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
 // bytes: element 2i + 2's value shifted 4 and OR'd onto 2i's makes a byte of the word, and two
 // v_perm_b32 gather the even elements' bytes and the odd ones' (7 instructions a word, where a
 // shift and an OR an element was 16).
-template <int THREAD_PACKS, typename T, int P>
-DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
+template <int THREAD_PACKS, typename T, int kPackElems>
+DINLINE void quantize(const T (&input)[THREAD_PACKS][kPackElems], uint32_t (&words)[THREAD_PACKS],
                     float& scale) {
-  static_assert(P * 4 == 32, "a pack is one word of 8 values");
+  static_assert(kPackElems * 4 == 32, "a pack is one word of 8 values");
   static_assert(THREAD_PACKS == 1 || THREAD_PACKS == kInt4GroupPacks,
                 "a pack a thread (its quad's group) or a group a thread");
-  float x[THREAD_PACKS][P];
+  float x[THREAD_PACKS][kPackElems];
   float amax = 0.0f;
 #pragma unroll
   for (int k = 0; k < THREAD_PACKS; ++k)
 #pragma unroll
-    for (int j = 0; j < P; ++j) {
+    for (int j = 0; j < kPackElems; ++j) {
       x[k][j] = static_cast<float>(input[k][j]);
       amax = fmaxf(amax, fabsf(x[k][j]));
     }
@@ -718,11 +722,11 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
   scale = static_cast<float>(static_cast<__fp16>(fminf(amax * (1.0f / 7.0f), 65504.0f)));
   const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
   // A PACK'S WORD from its 8 values at the inverse.
-  const auto word = [](const float (&v)[P], float inverse) {
+  const auto word = [](const float (&v)[kPackElems], float inverse) {
     constexpr float kLowest = 12582912.0f;  // 1.5 * 2^23, q + 8 = 0
-    uint32_t q[P];
+    uint32_t q[kPackElems];
 #pragma unroll
-    for (int p = 0; p < P / 2; ++p) {
+    for (int p = 0; p < kPackElems / 2; ++p) {
 #pragma clang fp contract(off)
       const f32x2 y = f32x2{v[2 * p], v[2 * p + 1]} * f32x2{inverse, inverse} +
                       f32x2{kLowest + 8.0f, kLowest + 8.0f};
@@ -752,9 +756,11 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 // =================================================================================================
 // LOAD AND STORE: A THREAD'S REGISTERS FROM AND TO A BUFFER, the one load and the one store
 //
-// A THREAD'S REGISTERS `U v[ROWS][K][P]` (P a pack, 16 bytes of the kernel's dtype), the place as
-// ints: thread t holds rows offs_m + (t / THREADS_N + i * THREADS_M) * row_step and packs
-// offs_n / P + t % THREADS_N + k * THREADS_N; stride_n must be 1. One round trip; a row past
+// A THREAD'S REGISTERS `U v[kRows][kPacks][kPackElems]` (a pack, kPackElems elements: 16 bytes of
+// the kernel's dtype), the layout from the tile's rows TILE_M and the block's THREADS_PER_BLOCK:
+// kThreadsM = TILE_M / kRows rows of threads, kThreadsN = THREADS_PER_BLOCK / kThreadsM threads a
+// row; thread t holds rows offs_m + (t / kThreadsN + i * kThreadsM) * row_step and packs
+// offs_n / kPackElems + t % kThreadsN + k * kThreadsN; stride_n must be 1. One round trip; a row past
 // clip_m reads the last row below it, a store skips it.
 // THE BUFFER (`input` / `output`), ALWAYS ONE FORM: its pointer array (`x_ptr_array`,
 // `x_ptr_array_size` entries: rank r's copy at entry r; a buffer only this rank has is a one-entry
@@ -766,12 +772,15 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 // holding part of a tensor at the tensor's places (the partials, a band of inputs) clips and masks
 // at the tensor's (or the band's) sizes, not its own.
 // THE VARIATIONS, template parameters:
-//   RANKS, which copies: own, entry x_rank's slot x_slot (registers U[ROWS][K][P]); every, every
-//     rank's entry at slot x_slot (registers U[WORLD][ROWS][K][P], rank order, all in flight
+//   RANKS, which copies: own, entry x_rank's slot x_slot (registers U[kRows][kPacks][kPackElems]); every, every
+//     rank's entry at slot x_slot (registers U[WORLD][kRows][kPacks][kPackElems], rank order, all in flight
 //     together; a store's same registers to every rank's copy, issued together, posted: the next
 //     ordered barrier's release completes and publishes them, BARRIER); every_slot, every slot of
-//     entry x_rank (a load's registers U[WORLD][ROWS][K][P], writer order: the inbox's WORLD
-//     writers); lane, entry x_rank where x_rank differs across the wave (each lane's rank).
+//     entry x_rank (a load's registers U[WORLD][kRows][kPacks][kPackElems], writer order: the inbox's WORLD
+//     writers); lane, the block as WORLD rows of threads, a rank's copy each (kThreadsN =
+//     THREADS_PER_BLOCK / WORLD): a load's entry x_rank differs across the wave (each lane's rank);
+//     a store's is this rank's, from the first row only (a reduce over the rows, AXIS m, leaves the
+//     result there).
 //   QUANTIZATION: none, the buffer holds the registers' dtype; int4, it holds their INT4 payload
 //     (QUANTIZATION), its values from the slot's start and its scales at the offset its own sizes
 //     give (int4_scales_offset), a load dequantizing into its registers' dtype, a store quantizing
@@ -791,20 +800,28 @@ enum class Ranks { own, every, every_slot, lane };
 // position (the other way round cost 16 scalar instructions at two packs: ISA
 // 2026-10-01T00-31-14Z). Nothing waits until the registers are used, so loads issued here run
 // under other work.
-template <int THREADS_M, int THREADS_N, Ranks RANKS = Ranks::own,
-          int QUANTIZATION = Quantization::none, int WORLD = 1, typename PTR, typename OUTPUT>
+template <int TILE_M, int THREADS_PER_BLOCK, Ranks RANKS, int QUANTIZATION, int WORLD, typename PTR,
+          typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n,
-                  int row_step = 1) {
+                  int row_step) {
   constexpr bool kEvery = RANKS == Ranks::every || RANKS == Ranks::every_slot;
-  constexpr int COPIES = kEvery ? std::extent_v<OUTPUT, 0> : 1;
-  constexpr int ROWS = std::extent_v<OUTPUT, kEvery ? 1 : 0>;
-  constexpr int K = std::extent_v<OUTPUT, kEvery ? 2 : 1>;
-  constexpr int P = std::extent_v<OUTPUT, kEvery ? 3 : 2>;
+  constexpr int kCopies = kEvery ? std::extent_v<OUTPUT, 0> : 1;
+  constexpr int kRows = std::extent_v<OUTPUT, kEvery ? 1 : 0>;
+  constexpr int kPacks = std::extent_v<OUTPUT, kEvery ? 2 : 1>;
+  constexpr int kPackElems = std::extent_v<OUTPUT, kEvery ? 3 : 2>;
   using U = std::remove_all_extents_t<OUTPUT>;
-  using V = vec<U, P>;
+  // THE LAYOUT, from the tile: kThreadsM rows of threads (TILE_M rows, kRows a thread) of kThreadsN
+  // threads, the block's (lane: each of the block's WORLD rows of threads, a rank's copy each).
+  constexpr int kThreadsM = TILE_M / kRows;
+  constexpr int kRankRows = RANKS == Ranks::lane ? WORLD : 1;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / (kRankRows * kThreadsM);
+  static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
+  static_assert(kRankRows * kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
+  static_assert(RANKS != Ranks::lane || kThreadsM == 1, "lane: a row of threads a rank");
+  using V = vec<U, kPackElems>;
   // Copy c of the buffer (entry and slot), as its elements (none) or its bytes (int4).
   using E = std::conditional_t<QUANTIZATION == Quantization::none, const U, const uint8_t>;
   const auto base = [&](int c) -> E* {
@@ -826,25 +843,25 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   // Thread-row i's row (one row of threads: the block's, so its address stays scalar), a row past
   // clip_m reading the last below it; pack k's column, past clip_n the last below it.
   const auto row_at = [&](int i) {
-    return offs_m + (THREADS_M == 1 ? i : tid / THREADS_N + i * THREADS_M) * row_step;
+    return offs_m + (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
   };
   const auto row_of = [&](int i) { return row_at(i) < clip_m ? row_at(i) : clip_m - 1; };
   // A LOAD SKIPS ROW i only at several rows a thread or rows of threads, whose rows past clip_m
   // would re-read the last over the links. One row's is real wherever a kernel makes one, and a
   // branch around its loads cost registers (126 -> 178 VGPRs, spilling at 16384: 23-46-07Z).
-  const auto skips = [&](int i) { return !(ROWS == 1 && THREADS_M == 1) && row_at(i) >= clip_m; };
+  const auto skips = [&](int i) { return !(kRows == 1 && kThreadsM == 1) && row_at(i) >= clip_m; };
   const auto pack_of = [&](int k) {
-    const int n = offs_n / P + tid % THREADS_N + k * THREADS_N;
-    return n < clip_n / P ? n : clip_n / P - 1;
+    const int n = offs_n / kPackElems + tid % kThreadsN + k * kThreadsN;
+    return n < clip_n / kPackElems ? n : clip_n / kPackElems - 1;
   };
   if constexpr (QUANTIZATION == Quantization::none && !kEvery) {
     const V* at = reinterpret_cast<const V*>(base(0));
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int i = 0; i < kRows; ++i) {
       if (skips(i)) continue;
-      const V* row = at + int64_t{row_of(i)} * (input_stride_m / P);
+      const V* row = at + int64_t{row_of(i)} * (input_stride_m / kPackElems);
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
+      for (int k = 0; k < kPacks; ++k) {
         // A ROW'S PACK k AS A UNIFORM BASE PLUS AN UNSIGNED 32-BIT BYTE OFFSET: the form
         // global_load takes with the base in scalar registers (saddr), so every tensor sharing the
         // columns shares one offset register. A signed column added to the pointer was a 64-bit
@@ -871,22 +888,22 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
   } else if constexpr (QUANTIZATION == Quantization::none) {
-    const U* at_copy[COPIES];
+    const U* at_copy[kCopies];
 #pragma unroll
-    for (int c = 0; c < COPIES; ++c) at_copy[c] = base(c);
+    for (int c = 0; c < kCopies; ++c) at_copy[c] = base(c);
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int i = 0; i < kRows; ++i) {
       if (skips(i)) continue;
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
+      for (int k = 0; k < kPacks; ++k) {
         // THE POSITION ONCE, IN A VECTOR REGISTER: left to the compiler, the row's uniform part
         // was added to every rank's base in scalar registers, an add and a carry a rank (16
         // instructions a tile at eight ranks, the plain all-reduce against the flat walk: ISA
         // 2026-10-11); held in a VGPR, each rank's address is one shift-and-add of it.
-        int64_t at = int64_t{row_of(i)} * (input_stride_m / P) + pack_of(k);
+        int64_t at = int64_t{row_of(i)} * (input_stride_m / kPackElems) + pack_of(k);
         asm volatile("" : "+v"(at));
 #pragma unroll
-        for (int c = 0; c < COPIES; ++c) {
+        for (int c = 0; c < kCopies; ++c) {
           const V* p = reinterpret_cast<const V*>(at_copy[c]) + at;
           V v;
           if constexpr (sizeof(V) == 16) {
@@ -902,7 +919,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
   } else {
-    static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
+    static_assert(kThreadsN % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
     // The buffer's INT4 payload, from its own sizes (the INT4 payload layout).
     const int64_t values_stride_m = input_size_n / 2;
     const int64_t scales_stride_m = input_size_n / kInt4Group;
@@ -910,19 +927,19 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     // Every copy's words and scales, the position once a pack in a vector register (32-BIT BYTE
     // OFFSETS: a quantized buffer is ours, at most the box's, select's exchange_sizes), each
     // copy's word and scale an add of it; all in flight before the first is decoded.
-    const uint8_t* values[COPIES];
-    const char* scales[COPIES];
+    const uint8_t* values[kCopies];
+    const char* scales[kCopies];
 #pragma unroll
-    for (int c = 0; c < COPIES; ++c) values[c] = base(c);
+    for (int c = 0; c < kCopies; ++c) values[c] = base(c);
 #pragma unroll
-    for (int c = 0; c < COPIES; ++c) scales[c] = reinterpret_cast<const char*>(values[c] + scales_at);
-    uint32_t words[COPIES][ROWS][K];
-    float group_scales[COPIES][ROWS][K];
+    for (int c = 0; c < kCopies; ++c) scales[c] = reinterpret_cast<const char*>(values[c] + scales_at);
+    uint32_t words[kCopies][kRows][kPacks];
+    float group_scales[kCopies][kRows][kPacks];
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int i = 0; i < kRows; ++i) {
       if (skips(i)) continue;
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
+      for (int k = 0; k < kPacks; ++k) {
         const int64_t row = row_of(i);
         const int pack = pack_of(k);
         uint32_t value_at = static_cast<uint32_t>(row * values_stride_m) +
@@ -932,7 +949,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
         asm volatile("" : "+v"(value_at));
         asm volatile("" : "+v"(scale_at));
 #pragma unroll
-        for (int c = 0; c < COPIES; ++c) {
+        for (int c = 0; c < kCopies; ++c) {
           words[c][i][k] = *(const global_u32*)(values[c] + value_at);
           group_scales[c][i][k] = *(const global_f16*)(scales[c] + scale_at);
         }
@@ -941,11 +958,11 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-    for (int c = 0; c < COPIES; ++c)
+    for (int c = 0; c < kCopies; ++c)
 #pragma unroll
-      for (int i = 0; i < ROWS; ++i)
+      for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < kPacks; ++k) {
           if constexpr (kEvery)
             dequantize(words[c][i][k], group_scales[c][i][k], output[c][i][k]);
           else
@@ -959,21 +976,29 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 // folded from the launch bounds, a compare and a branch around every store, ISA 2026-10-15).
 // EVERY RANK'S (WORLD of them): a pack position at a time, every rank's store for it issued together
 // (the position once, as load's); int4 quantizes once.
-template <int THREADS_M, int THREADS_N, int THREADS_PER_BLOCK, Ranks RANKS = Ranks::own,
-          int QUANTIZATION = Quantization::none, int WORLD = 1, typename INPUT, typename PTR>
+template <int TILE_M, int THREADS_PER_BLOCK, Ranks RANKS, int QUANTIZATION, int WORLD, typename INPUT,
+          typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                    int output_rank, int output_slot, int64_t output_stride_slot,
                    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
                    int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
-                   int offs_n, int row_step = 1) {
-  static_assert(RANKS == Ranks::own || RANKS == Ranks::every, "a store is to one copy or every rank's");
-  static_assert(THREADS_M * THREADS_N <= THREADS_PER_BLOCK, "a layout is the block or fewer");
-  constexpr int COPIES = RANKS == Ranks::every ? WORLD : 1;
-  constexpr int ROWS = std::extent_v<INPUT, 0>;
-  constexpr int K = std::extent_v<INPUT, 1>;
-  constexpr int P = std::extent_v<INPUT, 2>;
+                   int offs_n, int row_step) {
+  static_assert(RANKS == Ranks::own || RANKS == Ranks::every || RANKS == Ranks::lane,
+                "a store is to one copy (own; lane: the first of WORLD rows of threads) or every rank's");
+  constexpr int kCopies = RANKS == Ranks::every ? WORLD : 1;
+  constexpr int kRows = std::extent_v<INPUT, 0>;
+  constexpr int kPacks = std::extent_v<INPUT, 1>;
+  constexpr int kPackElems = std::extent_v<INPUT, 2>;
   using U = std::remove_all_extents_t<INPUT>;
-  using V = vec<U, P>;
+  // THE LAYOUT, from the tile: kThreadsM rows of threads (TILE_M rows, kRows a thread) of kThreadsN
+  // threads, the block's (lane: each of the block's WORLD rows of threads, a rank's copy each).
+  constexpr int kThreadsM = TILE_M / kRows;
+  constexpr int kRankRows = RANKS == Ranks::lane ? WORLD : 1;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / (kRankRows * kThreadsM);
+  static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
+  static_assert(kRankRows * kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
+  static_assert(RANKS != Ranks::lane || kThreadsM == 1, "lane: a row of threads a rank");
+  using V = vec<U, kPackElems>;
   using E = std::conditional_t<QUANTIZATION == Quantization::none, U, uint8_t>;
   const auto base = [&](int c) -> E* {
     const int entry = RANKS == Ranks::every ? c : output_rank;
@@ -987,31 +1012,31 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     return at + output_slot * output_stride_slot;
   };
   const int tid = static_cast<int>(threadIdx.x);
-  if constexpr (THREADS_M * THREADS_N < THREADS_PER_BLOCK)
-    if (tid >= THREADS_M * THREADS_N) return;
+  if constexpr (kRankRows > 1)
+    if (tid >= kThreadsM * kThreadsN) return;
   const auto row_at = [&](int i) {
-    return offs_m + (THREADS_M == 1 ? i : tid / THREADS_N + i * THREADS_M) * row_step;
+    return offs_m + (kThreadsM == 1 ? i : tid / kThreadsN + i * kThreadsM) * row_step;
   };
-  const auto col_at = [&](int k) { return offs_n / P + tid % THREADS_N + k * THREADS_N; };
-  E* at_copy[COPIES];
+  const auto col_at = [&](int k) { return offs_n / kPackElems + tid % kThreadsN + k * kThreadsN; };
+  E* at_copy[kCopies];
 #pragma unroll
-  for (int c = 0; c < COPIES; ++c) at_copy[c] = base(c);
+  for (int c = 0; c < kCopies; ++c) at_copy[c] = base(c);
   if constexpr (QUANTIZATION == Quantization::none) {
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int i = 0; i < kRows; ++i) {
       if (row_at(i) >= clip_m) continue;
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        if (col_at(k) >= clip_n / P) continue;
+      for (int k = 0; k < kPacks; ++k) {
+        if (col_at(k) >= clip_n / kPackElems) continue;
         V v;
         __builtin_memcpy(&v, input[i][k], sizeof(v));
         // The position once (load's): a uniform base plus a 32-bit byte offset for one copy, a
         // vector-register pack index shared by every copy's address for every rank's.
-        int64_t at = int64_t{row_at(i)} * (output_stride_m / P) + col_at(k);
-        if constexpr (COPIES == 1) {
+        int64_t at = int64_t{row_at(i)} * (output_stride_m / kPackElems) + col_at(k);
+        if constexpr (kCopies == 1) {
           uint32_t offset = static_cast<uint32_t>(col_at(k)) * uint32_t{sizeof(V)};
           asm volatile("" : "+v"(offset));
-          V* row = reinterpret_cast<V*>(at_copy[0]) + int64_t{row_at(i)} * (output_stride_m / P);
+          V* row = reinterpret_cast<V*>(at_copy[0]) + int64_t{row_at(i)} * (output_stride_m / kPackElems);
           V* p = reinterpret_cast<V*>(reinterpret_cast<char*>(row) + offset);
           if constexpr (sizeof(V) == 16) {
             u32x4 raw;
@@ -1023,7 +1048,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
         } else {
           asm volatile("" : "+v"(at));
 #pragma unroll
-          for (int c = 0; c < COPIES; ++c) {
+          for (int c = 0; c < kCopies; ++c) {
             V* p = reinterpret_cast<V*>(at_copy[c]) + at;
             if constexpr (sizeof(V) == 16) {
               u32x4 raw;
@@ -1038,27 +1063,27 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
     }
   } else {
     // INT4 QUANTIZES ONCE, whichever ranks it is stored in.
-    static_assert(THREADS_N % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
-    constexpr int QP = kInt4Group / kInt4GroupPacks;
-    uint32_t words[ROWS][K];
-    float scales[ROWS][K];
+    static_assert(kThreadsN % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
+    constexpr int kInt4PackElems = kInt4Group / kInt4GroupPacks;
+    uint32_t words[kRows][kPacks];
+    float scales[kRows][kPacks];
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i)
+    for (int i = 0; i < kRows; ++i)
 #pragma unroll
-      for (int k = 0; k < K; ++k)
-        quantize(reinterpret_cast<const U(&)[1][P]>(input[i][k]),
+      for (int k = 0; k < kPacks; ++k)
+        quantize(reinterpret_cast<const U(&)[1][kPackElems]>(input[i][k]),
                   reinterpret_cast<uint32_t(&)[1]>(words[i][k]), scales[i][k]);
     const int64_t values_stride_m = output_size_n / 2;
     const int64_t scales_stride_m = output_size_n / kInt4Group;
     const int64_t scales_at = int4_scales_offset(output_size_m, output_size_n);
 #pragma unroll
-    for (int i = 0; i < ROWS; ++i) {
+    for (int i = 0; i < kRows; ++i) {
       if (row_at(i) >= clip_m) continue;
       const int64_t row = row_at(i);
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        const int pack = offs_n / QP + tid % THREADS_N + k * THREADS_N;
-        if (pack >= clip_n / QP) continue;
+      for (int k = 0; k < kPacks; ++k) {
+        const int pack = offs_n / kInt4PackElems + tid % kThreadsN + k * kThreadsN;
+        if (pack >= clip_n / kInt4PackElems) continue;
         uint32_t value_at = static_cast<uint32_t>(row * values_stride_m) +
                             static_cast<uint32_t>(pack) * kInt4WordBytes;
         uint32_t scale_at = static_cast<uint32_t>(
@@ -1066,7 +1091,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
         asm volatile("" : "+v"(value_at));
         asm volatile("" : "+v"(scale_at));
 #pragma unroll
-        for (int c = 0; c < COPIES; ++c) {
+        for (int c = 0; c < kCopies; ++c) {
           *(global_u32*)(at_copy[c] + value_at) = words[i][k];
           if (pack % kInt4GroupPacks == 0)
             *(global_f16*)(at_copy[c] + scales_at + scale_at) = static_cast<__fp16>(scales[i][k]);

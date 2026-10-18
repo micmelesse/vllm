@@ -50,8 +50,8 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  constexpr int P = traits<DTYPE>::N;
-  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
+  constexpr int kPackElems = traits<DTYPE>::N;
+  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
   // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -79,22 +79,22 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // the residual's and the weight's. A load issues where it is written (an
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
-    DTYPE peers[WORLD][1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0);
-    DTYPE res[1][K][P];
+    DTYPE peers[WORLD][1][kPacks][kPackElems];
+    load<1, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
+    DTYPE res[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
-    WEIGHT_DTYPE w[1][K][P];
-    load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
+      load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
+    WEIGHT_DTYPE w[1][kPacks][kPackElems];
+    load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
     // The peers' sum in rank order in fp32, so every rank's agrees bitwise, rounded to DTYPE as
     // the reference's all-reduce is; ADD_RESIDUAL adds the residual in fp32, the new residual that
     // sum rounded to DTYPE (the norm reads the fp32 sum).
-    float s[1][K][P];
-    [[maybe_unused]] DTYPE added[1][K][P];
+    float s[1][kPacks][kPackElems];
+    [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-      for (int j = 0; j < P; ++j) {
+      for (int j = 0; j < kPackElems; ++j) {
         float acc = static_cast<float>(peers[0][0][k][j]);
 #pragma unroll
         for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
@@ -105,14 +105,14 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
         }
       }
     if constexpr (ADD_RESIDUAL) {
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+      store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
     float scale[1];
-    DTYPE normed[1][K][P];
+    DTYPE normed[1][kPacks][kPackElems];
     rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
                                                      input_size_n, 0);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+    store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
   }
 
   // 3. No rank may overwrite its input until every peer has read it.
@@ -235,8 +235,8 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  constexpr int P = traits<DTYPE>::N;
-  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
+  constexpr int kPackElems = traits<DTYPE>::N;
+  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
   const int slice_m = (input_size_m + WORLD - 1) / WORLD;
 
@@ -252,16 +252,16 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     for (int band = 0; band < input_size_m; band += slice_m) {
       const int rows = min(slice_m, input_size_m - band);
       for (int t = blockIdx.x; t < rows; t += 4 * gridDim.x)
-        for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
-          DTYPE x[4][1][1][P];
+        for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+          DTYPE x[4][1][1][kPackElems];
 #pragma unroll
           for (int s = 0; s < 4; ++s)
-            load<1, THREADS_PER_BLOCK>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+            load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
                                        input_size_m, input_size_n, band + rows, input_size_n,
                                        x[s], band + t + s * static_cast<int>(gridDim.x), c, 1);
 #pragma unroll
           for (int s = 0; s < 4; ++s)
-            store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
+            store<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(
                 x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
                 staging_stride_n, 1, staging_size_m, staging_size_n, band + rows, input_size_n,
                 band + t + s * static_cast<int>(gridDim.x), c, 1);
@@ -286,30 +286,30 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const int first = rank * slice_m;
   const int last = min(first + slice_m, input_size_m);
   // Row `row` from every rank.
-  const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][K][P]) {
+  const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][kPacks][kPackElems]) {
     if constexpr (QUANTIZATION == Quantization::none)
-      load<1, THREADS_PER_BLOCK, Ranks::every>(
+      load<1, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(
           input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
-          input_size_m, input_size_n, input_size_m, input_size_n, got, row, 0);
+          input_size_m, input_size_n, input_size_m, input_size_n, got, row, 0, 1);
     else
-      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
+      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION, WORLD>(
           staging_ptr_array, staging_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
-          staging_size_m, staging_size_n, input_size_m, input_size_n, got, row, 0);
+          staging_size_m, staging_size_n, input_size_m, input_size_n, got, row, 0, 1);
   };
   // THE WEIGHT ONCE, AND EVERY OTHER LOAD BEFORE THE NEXT ROW'S: loads complete
   // in issue order, so waiting on one issued after the peers' would wait on the
   // peers' too.
-  WEIGHT_DTYPE w[1][K][P];
-  load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
   // ONE ROW: its residual, then the next row's peer loads into `next`, then
   // this row's sum (its wait covers only its own, older, loads), so the next
   // round trip runs under the reduction and norm. Its rows land in this rank's
   // partials at row - first.
-  const auto one_row = [&](int row, const DTYPE(&cur)[WORLD][1][K][P],
-                           DTYPE(&next)[WORLD][1][K][P]) {
-    DTYPE res[1][K][P];
+  const auto one_row = [&](int row, const DTYPE(&cur)[WORLD][1][kPacks][kPackElems],
+                           DTYPE(&next)[WORLD][1][kPacks][kPackElems]) {
+    DTYPE res[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
+      load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
     // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform
     // branch costs nothing, where a clamped unconditional load re-read the last
     // row (a block's whole round trip again; at 256 tokens every block has one
@@ -317,12 +317,12 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     if (row + static_cast<int>(gridDim.x) < last)
       load_peers(row + gridDim.x, next);
     // The sum and the residual, rounding as the reference does (see the one-shot kernel):
-    float s[1][K][P];
-    [[maybe_unused]] DTYPE added[1][K][P];
+    float s[1][kPacks][kPackElems];
+    [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-      for (int j = 0; j < P; ++j) {
+      for (int j = 0; j < kPackElems; ++j) {
         float acc = static_cast<float>(cur[0][0][k][j]);
 #pragma unroll
         for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(cur[r][0][k][j]);
@@ -333,7 +333,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
         }
       }
     if constexpr (ADD_RESIDUAL) {
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
+      store<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
     }
     // ADD_RESIDUAL LEAVES THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW:
     // every rank norms it while gathering, so the link carries one row a row,
@@ -341,27 +341,27 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // residual was twice that: 215.9 against 155.2 us at 4096 tokens,
     // 2026-10-01T02-17-54Z).
     float scale[1];
-    DTYPE normed[1][K][P];
+    DTYPE normed[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL) {
       rms_norm<THREADS_PER_BLOCK, NormPart::scale, true>(s, scale, w, normed, eps, inv_hidden,
                                                          input_size_n, 0);
       // The row's scale into this rank's scales, [slice_m] floats (ADD_RESIDUAL's own buffer): a
       // row of one element, so its one pack is thread 0's.
       float scale_row[1][1][1] = {{{scale[0]}}};
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(
+      store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(
           scale_row, scales_ptr_array, scales_ptr_array_size, rank, 0, 0, scales_stride_m, 1, 1,
-          scales_size_m, 1, scales_size_m, 1, row - first, 0);
+          scales_size_m, 1, scales_size_m, 1, row - first, 0, 1);
       return;
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
     rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
                                                      input_size_n, 0);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0);
+    store<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, row - first, 0, 1);
   };
   // PING-PONG: two buffers that trade roles each row, so no row copies its
   // packs into the other (a copy cost 32 moves a row at one pack a thread: ISA
   // 2026-10-01T00-58-37Z).
-  DTYPE a[WORLD][1][K][P], b[WORLD][1][K][P];
+  DTYPE a[WORLD][1][kPacks][kPackElems], b[WORLD][1][kPacks][kPackElems];
   int row = first + blockIdx.x;
   if (row < last) load_peers(row, a);
   for (; row < last; row += 2 * gridDim.x) {
@@ -391,7 +391,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   //    to the compiler, the scales were loaded and waited on before the packs
   //    were issued, two round trips a row (ISA 2026-10-01T02-33-11Z).
   // A PACK A THREAD, stepping across the row (THREADS_PER_BLOCK packs a step,
-  // K = 1): every owner's step in flight is WORLD packs a thread, as the
+  // kPacks = 1): every owner's step in flight is WORLD packs a thread, as the
   // pack-at-a-time copy was (a whole row's was 16 at 7168, and 2-3% slower).
   // THE PARTIALS'S POINTERS are computed where they are read, from the
   // partials' array, so nothing held across the reduce (a table read after the
@@ -402,35 +402,35 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     // l of every owner's scales, a row of one float, every thread the same one.
     float sc[WORLD][1][1][1];
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK, Ranks::every>(
+      load<1, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(
           scales_ptr_array, scales_ptr_array_size, 0, 0, 0, scales_stride_m, 1, 1, scales_size_m,
-          1, scales_size_m, 1, sc, l, 0);
-    for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
+          1, scales_size_m, 1, sc, l, 0, 1);
+    for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
       // THE GATHER: row l of every owner's partials (owner r's is row r * slice_m + l), one load
       // of every rank's; ADD_RESIDUAL norms the gathered rows below, by their owners' scales.
-      DTYPE got[WORLD][1][1][P];
-      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION>(
+      DTYPE got[WORLD][1][1][kPackElems];
+      load<1, THREADS_PER_BLOCK, Ranks::every, QUANTIZATION, WORLD>(
           partials_ptr_array, partials_ptr_array_size, 0, 0, 0, partials_stride_m, partials_stride_n, 1,
-          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c);
-      WEIGHT_DTYPE w_step[1][1][P];
+          partials_size_m, partials_size_n, slice_m, input_size_n, got, l, c, 1);
+      WEIGHT_DTYPE w_step[1][1][kPackElems];
       if constexpr (ADD_RESIDUAL)
-        load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c);
+        load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w_step, 0, c, 1);
 #pragma unroll
       for (int r = 0; r < WORLD; ++r) {
         const int row = r * slice_m + l;
         if (row >= input_size_m) continue;
         if constexpr (ADD_RESIDUAL) {
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
-          float got_f[1][1][P];
+          store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(got[r], &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
+          float got_f[1][1][kPackElems];
 #pragma unroll
-          for (int j = 0; j < P; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
+          for (int j = 0; j < kPackElems; ++j) got_f[0][0][j] = static_cast<float>(got[r][0][0][j]);
           float scale[1] = {sc[r][0][0][0]};
-          DTYPE normed[1][1][P];
+          DTYPE normed[1][1][kPackElems];
           rms_norm<THREADS_PER_BLOCK, NormPart::apply, true>(got_f, scale, w_step, normed, eps,
                                                              inv_hidden, input_size_n, c);
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
+          store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         } else {
-          store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c);
+          store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(got[r], &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         }
       }
     }
@@ -562,8 +562,8 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     int signals_size_parity, int signals_size_block, int signals_size_writer,
     uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
     int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
-  constexpr int P = traits<DTYPE>::N;
-  constexpr int K = TILE_N / (P * THREADS_PER_BLOCK);
+  constexpr int kPackElems = traits<DTYPE>::N;
+  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
   // 1-3. none: nothing staged, every rank's input read in place where the input table says.
   // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
@@ -592,20 +592,20 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
-    DTYPE own[1][K][P], res[1][K][P];
-    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0);
+    DTYPE own[1][kPacks][kPackElems], res[1][kPacks][kPackElems];
+    load<1, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
     if constexpr (ADD_RESIDUAL)
-      load<1, THREADS_PER_BLOCK>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0);
-    WEIGHT_DTYPE w[1][K][P];
-    load<1, THREADS_PER_BLOCK>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0);
+      load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
+    WEIGHT_DTYPE w[1][kPacks][kPackElems];
+    load<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
     // The owner's sum in fp32; ADD_RESIDUAL adds the residual in fp32, the new residual that sum
     // rounded to DTYPE (as the one-shot kernel's).
-    float s[1][K][P];
-    [[maybe_unused]] DTYPE added[1][K][P];
+    float s[1][kPacks][kPackElems];
+    [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-      for (int j = 0; j < P; ++j) {
+      for (int j = 0; j < kPackElems; ++j) {
         s[0][k][j] = static_cast<float>(own[0][k][j]);
         if constexpr (ADD_RESIDUAL) {
           s[0][k][j] += static_cast<float>(res[0][k][j]);
@@ -613,14 +613,14 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
         }
       }
     if constexpr (ADD_RESIDUAL) {
-      store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+      store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
     }
     // out = T(W(W(s * scale) * float(w))), as the reference rounds (rms_norm.cuh)
     float scale[1];
-    DTYPE normed[1][K][P];
+    DTYPE normed[1][kPacks][kPackElems];
     rms_norm<THREADS_PER_BLOCK, NormPart::row, true>(s, scale, w, normed, eps, inv_hidden,
                                                      input_size_n, 0);
-    store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0);
+    store<1, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, 0, 1);
   }
 }
 

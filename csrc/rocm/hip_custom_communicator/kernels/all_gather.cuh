@@ -14,9 +14,9 @@
 
 namespace hip_custom_communicator {
 
-// WALK::flat (the plain two-shot): `output` a buffer, T*, of output_size_m x output_size_n at its
+// WALK::flat (the plain two-shot): `output` a buffer, DTYPE*, of output_size_m x output_size_n at its
 // strides; every rank's share (reduce_scatter's flat walk: rows numbered row-major, a rank's share
-// one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy LANES = THREADS_PER_BLOCK /
+// one contiguous range) stored at its place, a TILE_N chunk a step, a rank's copy kLanes = THREADS_PER_BLOCK /
 // WORLD threads (rotated, rank + w). int4: a group a thread, each block the contiguous range of
 // groups reduce_scatter's same block summed, every rank's group in flight, decoded and stored.
 //
@@ -26,28 +26,28 @@ namespace hip_custom_communicator {
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
 template <int WORLD, int THREADS_PER_BLOCK, int TILE_N, Walk WALK, int QUANTIZATION, bool CONTIGUOUS,
-          typename T, typename OUTPUT>
+          typename DTYPE, typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
                         int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
                         int64_t output_stride_n, int output_size_m, int output_size_n, int offs_m,
                         int offs_n, int slice_n, int rank) {
-  constexpr int P = traits<T>::N;
+  constexpr int kPackElems = traits<DTYPE>::N;
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
-  using V = vec<T, P>;
+  using V = vec<DTYPE, kPackElems>;
   // A PACK IS ONE 16-BYTE GLOBAL INSTRUCTION (reduce_scatter.cuh's).
   static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
   if constexpr (WALK == Walk::flat) {
     // Element e of an [*, n] buffer numbered row-major (the flat walk's address).
-    const auto element_at = [](T* ptr, int64_t stride_m, int64_t stride_n, int64_t e, int n) {
+    const auto element_at = [](DTYPE* ptr, int64_t stride_m, int64_t stride_n, int64_t e, int n) {
       if (stride_m == int64_t{n} * stride_n) return ptr + e * stride_n;
       const int64_t row = e < (int64_t{1} << 31)
                               ? int64_t{static_cast<uint32_t>(e) / static_cast<uint32_t>(n)}
                               : e / n;
       return ptr + row * stride_m + (e - row * n) * stride_n;
     };
-    T* const output_ptr = output;
-    constexpr int kUnit = kInt4 ? kInt4Group : P;
+    DTYPE* const output_ptr = output;
+    constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
     const int64_t total = int64_t{output_size_m} * output_size_n;
     const int slice = static_cast<int>((total / kUnit + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
@@ -96,7 +96,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
           const int64_t first = int64_t{r} * slice;
           V* group;
           if constexpr (CONTIGUOUS) {
-            uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(T));
+            uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(DTYPE));
             asm volatile("" : "+v"(offset));
             group = reinterpret_cast<V*>(
                 reinterpret_cast<char*>(output_ptr + first * output_stride_n) + offset);
@@ -105,7 +105,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
                                                     first + int64_t{g} * kInt4Group, output_size_n));
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k) {
-            T x[P];
+            DTYPE x[kPackElems];
             dequantize(words[w][k], group_scales[w], x);
             u32x4 raw;
             __builtin_memcpy(&raw, x, sizeof(raw));
@@ -114,25 +114,25 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         }
       }
     } else {
-      constexpr int LANES = THREADS_PER_BLOCK / WORLD;
-      constexpr int K = TILE_N / (P * LANES);
-      static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-      static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
+      constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
+      constexpr int kPacks = TILE_N / (kPackElems * kLanes);
+      static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
+      static_assert(kLanes % kWaveSize == 0, "a rank's copy is whole waves");
       const int chunks = (slice + TILE_N - 1) / TILE_N;
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-        const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-        T got[1][K][P];
+        const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+        DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, in one round trip.
-        load<1, LANES>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
+        load<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
                        slice, got, 0, chunk * TILE_N, 1);
         // 2. Stored where rank r's share goes, its first `len` elements.
         const int64_t first = int64_t{r} * slice;
         const int len = share_len(r);
         V* const run = reinterpret_cast<V*>(output_ptr + first * output_stride_n);
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
-          const int c = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-          if (c >= len / P) continue;
+        for (int k = 0; k < kPacks; ++k) {
+          const int c = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+          if (c >= len / kPackElems) continue;
           V* at;
           if constexpr (CONTIGUOUS) {
             // A uniform base plus a 32-bit byte offset, opaque so the address is built at its
@@ -142,7 +142,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
             at = reinterpret_cast<V*>(reinterpret_cast<char*>(run) + offset);
           } else {
             at = reinterpret_cast<V*>(element_at(output_ptr, output_stride_m, output_stride_n,
-                                                 first + int64_t{c} * P, output_size_n));
+                                                 first + int64_t{c} * kPackElems, output_size_n));
           }
           u32x4 raw;
           __builtin_memcpy(&raw, got[0][k], sizeof(raw));
@@ -152,9 +152,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     }
   } else {
     using Tile = std::remove_reference_t<OUTPUT>;
-    constexpr int ROWS = std::extent_v<Tile, 0>;
-    constexpr int K = std::extent_v<Tile, 1>;
-    static_assert(std::extent_v<Tile, 2> == P, "a tile's pack is the dtype's");
+    constexpr int kRows = std::extent_v<Tile, 0>;
+    constexpr int kPacks = std::extent_v<Tile, 1>;
+    static_assert(std::extent_v<Tile, 2> == kPackElems, "a tile's pack is the dtype's");
     (void)output_stride_m;
     (void)output_stride_n;
     // Row i of the tile: past output_size_m the last row (one row of threads, so the row is the
@@ -166,20 +166,20 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       return offs_m + i < output_size_m ? offs_m + i : output_size_m - 1;
     };
     const auto col_of = [&](int k) {
-      const int n = offs_n / P + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
-      return n < output_size_n / P ? n : output_size_n / P - 1;
+      const int n = offs_n / kPackElems + static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK + k * THREADS_PER_BLOCK;
+      return n < output_size_n / kPackElems ? n : output_size_n / kPackElems - 1;
     };
     if constexpr (!kInt4) {
 #pragma unroll
-      for (int i = 0; i < ROWS; ++i) {
-        if (ROWS > 1 && offs_m + i >= output_size_m) continue;
+      for (int i = 0; i < kRows; ++i) {
+        if (kRows > 1 && offs_m + i >= output_size_m) continue;
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < kPacks; ++k) {
           const int col = col_of(k);
-          const int owner = min(col / (slice_n / P), WORLD - 1);
+          const int owner = min(col / (slice_n / kPackElems), WORLD - 1);
           const u32x4 raw = *(const global_u32x4*)(
-              reinterpret_cast<const V*>(lane_ptr_array_at<WORLD, const T>(partials_ptr_array, partials_ptr_array_size, owner)) +
-              int64_t{row_of(i)} * (partials_stride_m / P) + col);
+              reinterpret_cast<const V*>(lane_ptr_array_at<WORLD, const DTYPE>(partials_ptr_array, partials_ptr_array_size, owner)) +
+              int64_t{row_of(i)} * (partials_stride_m / kPackElems) + col);
           __builtin_memcpy(output[i][k], &raw, sizeof(raw));
         }
       }
@@ -192,15 +192,15 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const int64_t values_stride_m = partials_size_n / 2;
       const int64_t scales_stride_m = partials_size_n / kInt4Group;
       const int64_t scales_offset = int4_scales_offset(partials_size_m, partials_size_n);
-      uint32_t words[ROWS][K];
-      float scales[ROWS][K];
+      uint32_t words[kRows][kPacks];
+      float scales[kRows][kPacks];
 #pragma unroll
-      for (int i = 0; i < ROWS; ++i) {
-        if (ROWS > 1 && offs_m + i >= output_size_m) continue;
+      for (int i = 0; i < kRows; ++i) {
+        if (kRows > 1 && offs_m + i >= output_size_m) continue;
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < kPacks; ++k) {
           const int col = col_of(k);
-          const int owner = min(col / (slice_n / P), WORLD - 1);
+          const int owner = min(col / (slice_n / kPackElems), WORLD - 1);
           const int64_t row = row_of(i);
           // The pack's word of values and its group's scale, each a row's base plus an opaque
           // 32-bit byte offset (built at its load).
@@ -220,9 +220,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       asm volatile("" ::: "memory");  // issued (above)
       __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-      for (int i = 0; i < ROWS; ++i)
+      for (int i = 0; i < kRows; ++i)
 #pragma unroll
-        for (int k = 0; k < K; ++k) dequantize(words[i][k], scales[i][k], output[i][k]);
+        for (int k = 0; k < kPacks; ++k) dequantize(words[i][k], scales[i][k], output[i][k]);
     }
   }
 }

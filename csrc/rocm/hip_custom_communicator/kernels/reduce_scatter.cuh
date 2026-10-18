@@ -38,7 +38,7 @@ namespace hip_custom_communicator {
 // BADLY a strided buffer: its runs are its rows wherever it has them, and each
 // pack's row and column are divided out. The walk is the same for every step
 // and every rank, so a block reads in the all-gather what the same block on
-// each rank wrote in the reduce-scatter. A RANK'S COPY OF A CHUNK IS LANES =
+// each rank wrote in the reduce-scatter. A RANK'S COPY OF A CHUNK IS kLanes =
 // THREADS_PER_BLOCK / WORLD threads, whole waves (its rank's pointer one scalar select;
 // every rank's held up front was ~20 scalar loads before the first barrier).
 //
@@ -67,7 +67,7 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 //
 // WALK::flat (the plain two-shot): rows offs_m.. offs_m + input_size_m of the [*, input_size_n]
 // problem numbered row-major, each rank's SHARE one contiguous range of them, a TILE_N chunk a step,
-// a rank's copy of a chunk LANES = THREADS_PER_BLOCK / WORLD threads (whole waves, its rank rank + w,
+// a rank's copy of a chunk kLanes = THREADS_PER_BLOCK / WORLD threads (whole waves, its rank rank + w,
 // rotated). PULL (ACCUMULATE lds, none): every rank's input read in place through the INPUT TABLE
 // (input_ptr_array at its strides). PUSH (none, lds): this rank's input (input_ptr) pushed into
 // every rank's staging inbox, [WORLD, slot] (writer w's slot at row w, staging_stride_m elements a
@@ -80,17 +80,17 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 //
 // WALK::rows (the fused ops' two-shots): this rank's columns of every row, equal slices of whole
 // packs a rank (a late rank's short or empty). ACCUMULATE lds (pull): a chunk of a row at a time,
-// WORLD rows of LANES threads, row w rank rank + w's copy picked per lane (Ranks::lane), summed
+// WORLD rows of kLanes threads, row w rank rank + w's copy picked per lane (Ranks::lane), summed
 // over the rows through LDS into this rank's partials. ACCUMULATE registers: a row of threads as
 // wide as a rank's slice of a TILE_N row (whole waves), a pack a thread, as many rows at once as the
 // block holds, every rank's pack summed in registers in rank order; push stores the sum in every
 // rank's partials, pull in this rank's. none reads every rank's input in place; int4 every rank's
 // staged INT4 payload, an INT4 payload's layout from its own buffer's sizes.
 template <int WORLD, int THREADS_PER_BLOCK, int TILE_M, int TILE_N, Walk WALK, Accumulate ACCUMULATE,
-          Direction DIRECTION, int QUANTIZATION, bool CONTIGUOUS, Until UNTIL, typename T>
+          Direction DIRECTION, int QUANTIZATION, bool CONTIGUOUS, Until UNTIL, typename DTYPE>
 DINLINE void reduce_scatter(
-    const T* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
-    int input_size_n, const T* const* input_ptr_array, int input_ptr_array_size,
+    const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
+    int input_size_n, const DTYPE* const* input_ptr_array, int input_ptr_array_size,
     int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
     char* const* staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
     int64_t staging_stride_n, int staging_size_m, int staging_size_n,
@@ -101,9 +101,9 @@ DINLINE void reduce_scatter(
     int signals_size_block, int signals_size_writer, uint32_t* status_ptr,
     int64_t status_stride_field, int status_size_field, int offs_m, int rank,
     uint64_t timeout_ticks) {
-  constexpr int P = traits<T>::N;
+  constexpr int kPackElems = traits<DTYPE>::N;
   constexpr bool kInt4 = QUANTIZATION == Quantization::int4;
-  using V = vec<T, P>;
+  using V = vec<DTYPE, kPackElems>;
   // A PACK IS ONE 16-BYTE GLOBAL INSTRUCTION: loaded and stored as a global u32x4 (global_load_dwordx4
   // / global_store_dwordx4), where a pointer read out of an array is otherwise flat_*.
   static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
@@ -118,7 +118,7 @@ DINLINE void reduce_scatter(
 
   if constexpr (WALK == Walk::flat) {
     // THE SHARES of the band's elements, in whole packs (int4: whole groups), the last rank's short.
-    constexpr int kUnit = kInt4 ? kInt4Group : P;
+    constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
     const int64_t total = int64_t{input_size_m} * input_size_n;
     const int slice = static_cast<int>((total / kUnit + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
@@ -135,7 +135,7 @@ DINLINE void reduce_scatter(
       // 1. THE PUSH: every rank's share of this rank's input, a group a thread, quantized here and
       // stored in that rank's staging payload at this rank's slot. TWO RANKS' GROUPS IN FLIGHT:
       // unrolled whole, every rank's 4 loads were hoisted together, 128 VGPRs of input, spilling.
-      const T* const band_input = input_ptr + offs_m * input_stride_m;
+      const DTYPE* const band_input = input_ptr + offs_m * input_stride_m;
       const int64_t mine = int64_t{rank} * slice;  // this rank's slot in every inbox
       for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
         const int g = g0 + static_cast<int>(threadIdx.x);
@@ -150,7 +150,7 @@ DINLINE void reduce_scatter(
           if constexpr (CONTIGUOUS) {
             // A UNIFORM BASE PLUS A 32-BIT BYTE OFFSET, the offset opaque so the address is built
             // at its load (saddr), not hoisted and held as a 64-bit vector address.
-            uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(T));
+            uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(DTYPE));
             asm volatile("" : "+v"(offset));
             group = reinterpret_cast<const V*>(
                 reinterpret_cast<const char*>(band_input + first * input_stride_n) + offset);
@@ -159,7 +159,7 @@ DINLINE void reduce_scatter(
                                                           input_stride_n,
                                                           first + int64_t{at} * kInt4Group,
                                                           input_size_n));
-          T x[kInt4GroupPacks][P];
+          DTYPE x[kInt4GroupPacks][kPackElems];
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k) {
             const u32x4 raw = *(const global_u32x4*)(group + k);
@@ -225,44 +225,44 @@ DINLINE void reduce_scatter(
           asm volatile("" ::: "memory");
           __builtin_amdgcn_sched_barrier(0);
           // EVERY WRITER'S GROUP SUMMED FROM THE WORDS, in fp32 in writer order: each element (q - 8) *
-          // scale landed in T, as a quantized load lands it, then added. No pack of every writer decoded
+          // scale landed in DTYPE, as a quantized load lands it, then added. No pack of every writer decoded
           // first: decoded whole, the push kernels held 172 VGPRs (102 unquantized; ISA
           // 2026-10-15T22-47-01Z). WITH BF16, TWO WRITERS' TERMS A STEP: landed together (one
           // v_cvt_pk_bf16_f32) and added by one v_dot2c_f32_bf16 against (1, 1), where each was a
           // conversion, a shift and an add. v_dot2_f32_bf16 IS GFX950'S (dot12-insts), the
           // one arch built (CMakeLists.txt).
-          float sum[kInt4GroupPacks][P];
+          float sum[kInt4GroupPacks][kPackElems];
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k) {
 #pragma unroll
-            for (int j = 0; j < P; ++j) sum[k][j] = 0.0f;
+            for (int j = 0; j < kPackElems; ++j) sum[k][j] = 0.0f;
             int w = 0;
-            if constexpr (kBf16<T>) {
+            if constexpr (kBf16<DTYPE>) {
               const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
               for (; w + 1 < WORLD; w += 2) {
-                float a[P], b[P];
+                float a[kPackElems], b[kPackElems];
                 dequantize(words[w][k], group_scales[w], a);
                 dequantize(words[w + 1][k], group_scales[w + 1], b);
 #pragma unroll
-                for (int j = 0; j < P; ++j)
+                for (int j = 0; j < kPackElems; ++j)
                   sum[k][j] = __builtin_amdgcn_fdot2_f32_bf16(
                       __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, sum[k][j], false);
                 // THE SUMS DONE BEFORE THE NEXT DEQUANTIZE'S VOLATILE ASM: the scheduler, free to use 256
                 // VGPRs at 512 threads, decoded every writer's words of a group ahead of the first sum and
                 // spilled (the plain kernel 256 VGPRs, 264 B of partials: ISA 2026-10-16T02-22-15Z).
 #pragma unroll
-                for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[k][j]));
+                for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[k][j]));
               }
             }
 #pragma unroll
             for (; w < WORLD; ++w) {
-              float a[P];
+              float a[kPackElems];
               dequantize(words[w][k], group_scales[w], a);
 #pragma unroll
-              for (int j = 0; j < P; ++j) sum[k][j] += static_cast<float>(static_cast<T>(a[j]));
+              for (int j = 0; j < kPackElems; ++j) sum[k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
 #pragma unroll
-              for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[k][j]));  // as above
+              for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[k][j]));  // as above
             }
           }
           uint32_t out[kInt4GroupPacks];
@@ -285,32 +285,32 @@ DINLINE void reduce_scatter(
                               status_stride_field, status_size_field, rank, timeout_ticks);
     } else {
       static_assert(ACCUMULATE == Accumulate::lds, "the exact flat walk sums through LDS");
-      constexpr int LANES = THREADS_PER_BLOCK / WORLD;
-      constexpr int K = TILE_N / (P * LANES);
-      static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-      static_assert(LANES % kWaveSize == 0, "a rank's copy is whole waves");
-      static_assert(K * P * LANES == TILE_N, "a chunk is whole packs a thread");
+      constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
+      constexpr int kPacks = TILE_N / (kPackElems * kLanes);
+      static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
+      static_assert(kLanes % kWaveSize == 0, "a rank's copy is whole waves");
+      static_assert(kPacks * kPackElems * kLanes == TILE_N, "a chunk is whole packs a thread");
       const int chunks = (slice + TILE_N - 1) / TILE_N;
       if constexpr (DIRECTION == Direction::push) {
         // 1. THE PUSH: this rank's input, every rank's share of it, read here (no peer reads the
         // caller's input) and stored in THAT rank's inbox at this rank's slot, each block the
         // chunks that rank's same block sums (the same walk).
-        const T* const band_input = input_ptr + offs_m * input_stride_m;
+        const DTYPE* const band_input = input_ptr + offs_m * input_stride_m;
         for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-          const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
+          const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
           const int len = share_len(r);
           if (len == 0) continue;
           const int64_t first = int64_t{r} * slice;
-          T part[K][P];
+          DTYPE part[kPacks][kPackElems];
           if constexpr (CONTIGUOUS) {
             // The last pack, the run's start, then the column: the order the two-shot's
             // instructions came out in (ISA 2026-10-15).
 #pragma unroll
-            for (int k = 0; k < K; ++k) {
-              const int last = len / P - 1;
+            for (int k = 0; k < kPacks; ++k) {
+              const int last = len / kPackElems - 1;
               const V* run = reinterpret_cast<const V*>(band_input + first * input_stride_n);
-              const int n = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-              const int col = n < len / P ? n : last;
+              const int n = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+              const int col = n < len / kPackElems ? n : last;
               uint32_t offset = static_cast<uint32_t>(col) * uint32_t{sizeof(V)};
               asm volatile("" : "+v"(offset));
               const u32x4 raw =
@@ -319,13 +319,13 @@ DINLINE void reduce_scatter(
             }
           } else {
 #pragma unroll
-            for (int k = 0; k < K; ++k) {
+            for (int k = 0; k < kPacks; ++k) {
               // The pack's column, past the share the last in it (every load in bounds, none
               // under a branch).
-              const int n = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-              const int col = n < len / P ? n : len / P - 1;
+              const int n = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+              const int col = n < len / kPackElems ? n : len / kPackElems - 1;
               const u32x4 raw = *(const global_u32x4*)(element_at(
-                  band_input, input_stride_m, input_stride_n, first + int64_t{col} * P,
+                  band_input, input_stride_m, input_stride_n, first + int64_t{col} * kPackElems,
                   input_size_n));
               __builtin_memcpy(part[k], &raw, sizeof(raw));
             }
@@ -335,12 +335,12 @@ DINLINE void reduce_scatter(
           // scheduler alone sank peer loads past the first adds: ISA 2026-10-01T00-39-51Z).
           asm volatile("" ::: "memory");
           __builtin_amdgcn_sched_barrier(0);
-          V* const inbox = reinterpret_cast<V*>(ptr_array_at<T>(staging_ptr_array, staging_ptr_array_size, r) +
+          V* const inbox = reinterpret_cast<V*>(ptr_array_at<DTYPE>(staging_ptr_array, staging_ptr_array_size, r) +
                                                 rank * staging_stride_m);
 #pragma unroll
-          for (int k = 0; k < K; ++k) {
-            const int c = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-            if (c >= len / P) continue;
+          for (int k = 0; k < kPacks; ++k) {
+            const int c = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+            if (c >= len / kPackElems) continue;
             uint32_t offset = static_cast<uint32_t>(c) * uint32_t{sizeof(V)};
             asm volatile("" : "+v"(offset));
             u32x4 raw;
@@ -356,30 +356,30 @@ DINLINE void reduce_scatter(
       // 2. THE SUM: this rank's share, a TILE_N chunk a step, every rank's copy (pull: its input
       // through the table, from this rank's first element; push: writer w's slot of this rank's
       // inbox) in one round trip, summed over the ranks in rotated order through LDS, rounded once
-      // to T, stored in this rank's partials.
+      // to DTYPE, stored in this rank's partials.
       const int len = share_len(rank);
       if (len != 0) {  // a late rank's share is empty at few packs (every block alike)
-        [[maybe_unused]] const T* const inbox = ptr_array_at<T>(staging_ptr_array, staging_ptr_array_size, rank);
+        [[maybe_unused]] const DTYPE* const inbox = ptr_array_at<DTYPE>(staging_ptr_array, staging_ptr_array_size, rank);
         constexpr bool kRun = DIRECTION == Direction::push || CONTIGUOUS;
         const int64_t stride_m = DIRECTION == Direction::push ? staging_stride_m : input_ptr_array_stride_m;
         const int64_t stride_n = DIRECTION == Direction::push ? staging_stride_n : input_ptr_array_stride_n;
         const int64_t first = DIRECTION == Direction::push ? 0 : int64_t{rank} * slice;
         for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-          const int w = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-          const T* from;
+          const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+          const DTYPE* from;
           if constexpr (DIRECTION == Direction::push)
             from = inbox + w * staging_stride_m;
           else {
             from = ptr_array_at(input_ptr_array, input_ptr_array_size, w) + offs_m * input_ptr_array_stride_m;
           }
-          T got[1][K][P];
+          DTYPE got[1][kPacks][kPackElems];
           if constexpr (kRun) {
 #pragma unroll
-            for (int k = 0; k < K; ++k) {
-              const int last = len / P - 1;
+            for (int k = 0; k < kPacks; ++k) {
+              const int last = len / kPackElems - 1;
               const V* run = reinterpret_cast<const V*>(from + first * stride_n);
-              const int n = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-              const int col = n < len / P ? n : last;
+              const int n = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+              const int col = n < len / kPackElems ? n : last;
               uint32_t offset = static_cast<uint32_t>(col) * uint32_t{sizeof(V)};
               asm volatile("" : "+v"(offset));
               const u32x4 raw =
@@ -388,19 +388,19 @@ DINLINE void reduce_scatter(
             }
           } else {
 #pragma unroll
-            for (int k = 0; k < K; ++k) {
-              const int n = chunk * TILE_N / P + static_cast<int>(threadIdx.x) % LANES + k * LANES;
-              const int col = n < len / P ? n : len / P - 1;
+            for (int k = 0; k < kPacks; ++k) {
+              const int n = chunk * TILE_N / kPackElems + static_cast<int>(threadIdx.x) % kLanes + k * kLanes;
+              const int col = n < len / kPackElems ? n : len / kPackElems - 1;
               const u32x4 raw = *(const global_u32x4*)(element_at(
-                  from, stride_m, stride_n, first + int64_t{col} * P, input_size_n));
+                  from, stride_m, stride_n, first + int64_t{col} * kPackElems, input_size_n));
               __builtin_memcpy(got[0][k], &raw, sizeof(raw));
             }
           }
           asm volatile("" ::: "memory");  // issued (above)
           __builtin_amdgcn_sched_barrier(0);
-          T rounded[1][K][P];
-          reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
-          store<1, LANES, THREADS_PER_BLOCK>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+          DTYPE rounded[1][kPacks][kPackElems];
+          reduce<Sum, ReduceAxis::m, WORLD, THREADS_PER_BLOCK>(got[0], rounded[0]);
+          store<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
@@ -413,11 +413,11 @@ DINLINE void reduce_scatter(
     // THIS RANK'S COLUMNS, in whole packs (a late rank's short or empty), and this block's rows,
     // worked out before the first barrier, in scalar registers: after it they were vector
     // arithmetic (a division by the grid a lane; ISA 2026-10-15T18-38-16Z).
-    const int packs = input_size_n / P;  // the row, in packs (n is whole packs)
+    const int packs = input_size_n / kPackElems;  // the row, in packs (n is whole packs)
     const int slice = (packs + WORLD - 1) / WORLD;
     const int col0 = min(rank * slice, packs);
     const int own_packs = max(0, min(slice, packs - col0));
-    const int end = (col0 + own_packs) * P;  // this rank's columns end, in elements
+    const int end = (col0 + own_packs) * kPackElems;  // this rank's columns end, in elements
     [[maybe_unused]] const int block_size_m =
         input_size_m > static_cast<int>(blockIdx.x)
             ? (input_size_m - blockIdx.x + gridDim.x - 1) / gridDim.x
@@ -428,16 +428,16 @@ DINLINE void reduce_scatter(
       constexpr int kTiles = TILE_M < 4 ? 4 / TILE_M : 1;
       const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
       for (int t = blockIdx.x; t < tiles; t += kTiles * gridDim.x)
-        for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * P) {
-          T x[kTiles][TILE_M][1][P];
+        for (int c = 0; c < input_size_n; c += THREADS_PER_BLOCK * kPackElems) {
+          DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            load<1, THREADS_PER_BLOCK>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+            load<TILE_M, THREADS_PER_BLOCK, Ranks::own, Quantization::none, WORLD>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
                              input_size_m, input_size_n, input_size_m, input_size_n, x[s],
                              (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            store<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
+            store<TILE_M, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION, WORLD>(
                 x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
                 staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, input_size_n,
                 (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -449,43 +449,43 @@ DINLINE void reduce_scatter(
                               status_stride_field, status_size_field, rank, timeout_ticks);
     if constexpr (ACCUMULATE == Accumulate::lds) {
       static_assert(DIRECTION == Direction::pull, "the rows walk through LDS pulls");
-      constexpr int LANES = THREADS_PER_BLOCK / WORLD;
-      static_assert(LANES * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
-      using Summed = std::conditional_t<kInt4, float, T>;
+      constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
+      static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
+      using Summed = std::conditional_t<kInt4, float, DTYPE>;
       const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
       for (int t = blockIdx.x; t < tiles; t += gridDim.x)
         for (int row = t * TILE_M; row < min(t * TILE_M + TILE_M, input_size_m); ++row)
-          for (int c = col0 * P; c < end; c += LANES * P) {
+          for (int c = col0 * kPackElems; c < end; c += kLanes * kPackElems) {
             // 2. Every rank's copy of the chunk, a row of threads each, in one round trip.
-            const int r = (rank + static_cast<int>(threadIdx.x) / LANES) % WORLD;
-            T got[1][1][P];
+            const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+            DTYPE got[1][1][kPackElems];
             if constexpr (!kInt4)
-              load<1, LANES, Ranks::lane, Quantization::none, WORLD>(
+              load<1, THREADS_PER_BLOCK, Ranks::lane, Quantization::none, WORLD>(
                   input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m,
                   input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end,
                   got, row, c, 1);
             else
-              load<1, LANES, Ranks::lane, QUANTIZATION, WORLD>(
+              load<1, THREADS_PER_BLOCK, Ranks::lane, QUANTIZATION, WORLD>(
                   staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m,
                   staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got,
                   row, c, 1);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
-            Summed rounded[1][1][P];
-            reduce<Sum, ReduceAxis::m, WORLD, LANES>(got[0], rounded[0]);
+            Summed rounded[1][1][kPackElems];
+            reduce<Sum, ReduceAxis::m, WORLD, THREADS_PER_BLOCK>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
-            store<1, LANES, THREADS_PER_BLOCK, Ranks::own, QUANTIZATION>(
+            store<1, THREADS_PER_BLOCK, Ranks::lane, QUANTIZATION, WORLD>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 row + 1, end, row, c, 1);
           }
     } else {
-      constexpr int kSliceWaves = (TILE_N / WORLD / P + kWaveSize - 1) / kWaveSize * kWaveSize;
-      constexpr int LANES = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
-      constexpr int ROWS = THREADS_PER_BLOCK / LANES;  // rows of threads at once
+      constexpr int kSliceWaves = (TILE_N / WORLD / kPackElems + kWaveSize - 1) / kWaveSize * kWaveSize;
+      constexpr int kThreadsN = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
+      constexpr int kThreadsM = THREADS_PER_BLOCK / kThreadsN;  // rows of threads at once
       constexpr Ranks kStoreRanks = DIRECTION == Direction::push ? Ranks::every : Ranks::own;
-      using Summed = std::conditional_t<kInt4, float, T>;
-      const int offs_n = col0 * P;
-      const int size_n = own_packs * P;
+      using Summed = std::conditional_t<kInt4, float, DTYPE>;
+      const int offs_n = col0 * kPackElems;
+      const int size_n = own_packs * kPackElems;
       // INT4'S SUM IS FROM THE WORDS (the flat walk's: a decoded tile of every peer held 172
       // VGPRs), so its loads are the words and scales, every rank's at its staging's place.
       const uint8_t* input_values[WORLD];
@@ -503,20 +503,20 @@ DINLINE void reduce_scatter(
               input_values[r] + int4_scales_offset(staging_size_m, staging_size_n));
       }
       if (size_n > 0)  // a late rank owns no columns
-        for (int q = 0; q < block_size_m; q += ROWS)
-          for (int c = offs_n; c < offs_n + size_n; c += LANES * P) {
+        for (int q = 0; q < block_size_m; q += kThreadsM)
+          for (int c = offs_n; c < offs_n + size_n; c += kThreadsN * kPackElems) {
             const int row = static_cast<int>(blockIdx.x + q * gridDim.x);
-            Summed rounded[1][1][P];
+            Summed rounded[1][1][kPackElems];
             if constexpr (!kInt4) {
-              T peers[WORLD][1][1][P];
-              load<ROWS, LANES, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
+              DTYPE peers[WORLD][1][1][kPackElems];
+              load<kThreadsM, THREADS_PER_BLOCK, Ranks::every, Quantization::none, WORLD>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
                                               input_ptr_array_stride_m, input_ptr_array_stride_n,
                                               1, input_size_m, input_size_n, input_size_m,
                                               offs_n + size_n, peers, row, c,
                                               static_cast<int>(gridDim.x));
               // Summed in rank order in fp32, so every rank's sum agrees bitwise, rounded once.
 #pragma unroll
-              for (int j = 0; j < P; ++j) {
+              for (int j = 0; j < kPackElems; ++j) {
                 float acc = static_cast<float>(peers[0][0][0][j]);
 #pragma unroll
                 for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][0][j]);
@@ -527,16 +527,16 @@ DINLINE void reduce_scatter(
               // (32-BIT BYTE OFFSETS: a quantized buffer is ours, at most the box's, select's exchange_sizes),
               // each rank's an add of it, all in flight. Only rows of threads skip a row past input_size_m
               // (load's rule: one row's is real wherever the walk makes one).
-              static_assert(LANES % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
+              static_assert(kThreadsN % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
               uint32_t peer_words[WORLD];
               float peer_scales[WORLD];
-              const int thread_row = ROWS == 1 ? 0 : static_cast<int>(threadIdx.x) / LANES;
-              if (!(ROWS > 1 && row + thread_row * static_cast<int>(gridDim.x) >= input_size_m)) {
+              const int thread_row = kThreadsM == 1 ? 0 : static_cast<int>(threadIdx.x) / kThreadsN;
+              if (!(kThreadsM > 1 && row + thread_row * static_cast<int>(gridDim.x) >= input_size_m)) {
                 const int64_t at_m = row + thread_row * static_cast<int>(gridDim.x) < input_size_m
                                          ? row + thread_row * static_cast<int>(gridDim.x)
                                          : input_size_m - 1;
-                const int n = c / P + static_cast<int>(threadIdx.x) % LANES;
-                const int pack = n < (offs_n + size_n) / P ? n : (offs_n + size_n) / P - 1;
+                const int n = c / kPackElems + static_cast<int>(threadIdx.x) % kThreadsN;
+                const int pack = n < (offs_n + size_n) / kPackElems ? n : (offs_n + size_n) / kPackElems - 1;
                 uint32_t value_at = static_cast<uint32_t>(at_m * values_stride_m) +
                                     static_cast<uint32_t>(pack) * kInt4WordBytes;
                 uint32_t scale_at = static_cast<uint32_t>(
@@ -553,41 +553,41 @@ DINLINE void reduce_scatter(
               asm volatile("" ::: "memory");  // issued: every rank's in flight before the first is summed
               __builtin_amdgcn_sched_barrier(0);
               // Every rank's pack summed from the words, in fp32 in rank order (the flat walk's sum above).
-              float sum[P];
+              float sum[kPackElems];
 #pragma unroll
-              for (int j = 0; j < P; ++j) sum[j] = 0.0f;
+              for (int j = 0; j < kPackElems; ++j) sum[j] = 0.0f;
               int w = 0;
-              if constexpr (kBf16<T>) {
+              if constexpr (kBf16<DTYPE>) {
                 const bf16x2 ones = __builtin_bit_cast(bf16x2, 0x3f803f80u);
 #pragma unroll
                 for (; w + 1 < WORLD; w += 2) {
-                  float a[P], b[P];
+                  float a[kPackElems], b[kPackElems];
                   dequantize(peer_words[w], peer_scales[w], a);
                   dequantize(peer_words[w + 1], peer_scales[w + 1], b);
 #pragma unroll
-                  for (int j = 0; j < P; ++j)
+                  for (int j = 0; j < kPackElems; ++j)
                     sum[j] = __builtin_amdgcn_fdot2_f32_bf16(
                         __builtin_convertvector(f32x2{a[j], b[j]}, bf16x2), ones, sum[j], false);
 #pragma unroll
-                  for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[j]));
+                  for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[j]));
                 }
               }
 #pragma unroll
               for (; w < WORLD; ++w) {
-                float a[P];
+                float a[kPackElems];
                 dequantize(peer_words[w], peer_scales[w], a);
 #pragma unroll
-                for (int j = 0; j < P; ++j) sum[j] += static_cast<float>(static_cast<T>(a[j]));
+                for (int j = 0; j < kPackElems; ++j) sum[j] += static_cast<float>(static_cast<DTYPE>(a[j]));
 #pragma unroll
-                for (int j = 0; j < P; ++j) asm volatile("" ::"v"(sum[j]));
+                for (int j = 0; j < kPackElems; ++j) asm volatile("" ::"v"(sum[j]));
               }
 #pragma unroll
-              for (int j = 0; j < P; ++j) rounded[0][0][j] = sum[j];
+              for (int j = 0; j < kPackElems; ++j) rounded[0][0][j] = sum[j];
 
             }
             // Push: every rank's partials, the stores issued together (int4: quantized once);
             // pull: this rank's.
-            store<ROWS, LANES, THREADS_PER_BLOCK, kStoreRanks, QUANTIZATION, WORLD>(
+            store<kThreadsM, THREADS_PER_BLOCK, kStoreRanks, QUANTIZATION, WORLD>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
