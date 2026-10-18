@@ -403,7 +403,7 @@ DINLINE void reduce_scatter(
           __builtin_amdgcn_sched_barrier(0);
           DTYPE rounded[1][kPacks][kPackElems];
           reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+          store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
@@ -435,12 +435,12 @@ DINLINE void reduce_scatter(
           DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+            load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
                              input_size_m, input_size_n, input_size_m, input_size_n, x[s],
                              (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            store<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, Ranks::own>(
+            store<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION>(
                 x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
                 staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, input_size_n,
                 (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -463,12 +463,12 @@ DINLINE void reduce_scatter(
             const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
             DTYPE got[1][1][kPackElems];
             if constexpr (!kInt4)
-              load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(
+              recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::lane>(
                   input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m,
                   input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end,
                   got, row, c, 1);
             else
-              load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
+              recv<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
                   staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m,
                   staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got,
                   row, c, 1);
@@ -476,7 +476,7 @@ DINLINE void reduce_scatter(
             Summed rounded[1][1][kPackElems];
             reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
-            store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::lane>(
+            store<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 row + 1, end, row, c, 1);
@@ -485,7 +485,6 @@ DINLINE void reduce_scatter(
       constexpr int kSliceWaves = (TILE_N / WORLD / kPackElems + kWaveSize - 1) / kWaveSize * kWaveSize;
       constexpr int kThreadsN = kSliceWaves < THREADS_PER_BLOCK ? kSliceWaves : THREADS_PER_BLOCK;
       constexpr int kThreadsM = THREADS_PER_BLOCK / kThreadsN;  // rows of threads at once
-      constexpr Ranks kStoreRanks = DIRECTION == Direction::push ? Ranks::every : Ranks::own;
       using Summed = std::conditional_t<kInt4, float, DTYPE>;
       const int offs_n = col0 * kPackElems;
       const int size_n = own_packs * kPackElems;
@@ -512,7 +511,7 @@ DINLINE void reduce_scatter(
             Summed rounded[1][1][kPackElems];
             if constexpr (!kInt4) {
               DTYPE peers[WORLD][1][1][kPackElems];
-              load<WORLD, kThreadsM, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
+              recv<WORLD, kThreadsM, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0,
                                               input_ptr_array_stride_m, input_ptr_array_stride_n,
                                               1, input_size_m, input_size_n, input_size_m,
                                               offs_n + size_n, peers, row, c,
@@ -588,12 +587,18 @@ DINLINE void reduce_scatter(
               for (int j = 0; j < kPackElems; ++j) rounded[0][0][j] = sum[j];
 
             }
-            // Push: every rank's partials, the stores issued together (int4: quantized once);
-            // pull: this rank's.
-            store<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, kStoreRanks>(
-                rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
-                partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
-                input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
+            // Push: sent to every rank's partials, the stores issued together (int4: quantized
+            // once); pull: stored in this rank's.
+            if constexpr (DIRECTION == Direction::push)
+              send<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Ranks::every>(
+                  rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+                  partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
+                  input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
+            else
+              store<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION>(
+                  rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+                  partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
+                  input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
           }
     }
     barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
