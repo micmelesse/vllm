@@ -614,8 +614,8 @@ struct AllReduceLaunch {
   int64_t output_size_m, output_size_n;
   int64_t partials_stride_m, partials_stride_n;
   int64_t partials_size_m, partials_size_n;
-  int64_t inputs_stride_m, inputs_stride_n;
-  int64_t inputs_size_m, inputs_size_n;
+  int64_t staging_stride_m, staging_stride_n;
+  int64_t staging_size_m, staging_size_n;
   DType dtype;
 };
 
@@ -643,8 +643,8 @@ struct AllReduceRmsNormLaunch {
   int64_t output_size_m, output_size_n;
   int64_t partials_stride_m, partials_stride_n;
   int64_t partials_size_m, partials_size_n;
-  int64_t inputs_stride_m, inputs_stride_n;
-  int64_t inputs_size_m, inputs_size_n;
+  int64_t staging_stride_m, staging_stride_n;
+  int64_t staging_size_m, staging_size_n;
   DType dtype;
   DType weight_dtype;
   float eps;
@@ -682,8 +682,8 @@ struct AllReduceAddRmsNormLaunch {
   // The pull two-shot's ADD_RESIDUAL row scales, [scales_size_m] floats (0 rows elsewhere).
   int64_t scales_stride_m;
   int64_t scales_size_m;
-  int64_t inputs_stride_m, inputs_stride_n;
-  int64_t inputs_size_m, inputs_size_n;
+  int64_t staging_stride_m, staging_stride_n;
+  int64_t staging_size_m, staging_size_n;
   DType dtype;
   DType weight_dtype;
   float eps;
@@ -737,8 +737,8 @@ struct AllReduceAddAttnResRmsNormLaunch {
   int64_t block_output_size_m, block_output_size_n;
   int64_t partials_stride_m, partials_stride_n;
   int64_t partials_size_m, partials_size_n;
-  int64_t inputs_stride_m, inputs_stride_n;
-  int64_t inputs_size_m, inputs_size_n;
+  int64_t staging_stride_m, staging_stride_n;
+  int64_t staging_size_m, staging_size_n;
   DType dtype;
   int num_blocks;
   float eps;

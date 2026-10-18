@@ -1125,7 +1125,7 @@ inline bool quantizes(const Handle& h, OpType o, int64_t m, int64_t n,
   return h.quantization() == Quantization::int4 && elem_bytes(dtype) == 2 &&
          m * n * elem_bytes(dtype) >= int4_min_bytes(o) &&
          int4_takes_row(n, h.world_size()) &&
-         int4_payload_bytes(m, n) <= h.inputs_bytes() &&
+         int4_payload_bytes(m, n) <= h.staging_bytes() &&
          int4_payload_bytes(1, m * n) <= h.partials_bytes();
 }
 
@@ -1255,7 +1255,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // An INT4 payload lies in the region that holds it exact (common.cuh's
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
   // most one row of the partials's elements (its every view's bound).
-  if (int4 && int4_payload_bytes(m, n) > h->inputs_bytes())
+  if (int4 && int4_payload_bytes(m, n) > h->staging_bytes())
     return Error::inputs_too_small;
   const int64_t partials = partials_need(fn, m, packs, world);
   if (int4 && int4_payload_bytes(1, partials / elem_bytes(dtype)) >
@@ -1269,7 +1269,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // calls of one shape agree), or an INT4 call's quantized payload (the INT4
   // all-reduce: pushed).
   const int64_t bytes = m * n * elem_bytes(dtype);
-  if (!in_passes && bytes > h->inputs_bytes())
+  if (!in_passes && bytes > h->staging_bytes())
     return Error::inputs_too_small;
   return std::nullopt;
 }
@@ -1362,10 +1362,10 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     // slice a row; the input is read where it is.
     band = slice_bytes > 0 ? h.partials_bytes() / slice_bytes : 0;
   } else if (row_bytes > 0 && !is_two_shot(fn)) {
-    band = h.inputs_bytes() / (world * row_bytes);
+    band = h.staging_bytes() / (world * row_bytes);
   } else if (row_bytes > 0) {
-    band = h.inputs_bytes() / row_bytes;
-    if (band > 0 && world * slot_packs(band) * pack > h.inputs_bytes()) --band;
+    band = h.staging_bytes() / row_bytes;
+    if (band > 0 && world * slot_packs(band) * pack > h.staging_bytes()) --band;
     if (slice_bytes > 0 && h.partials_bytes() / slice_bytes < band)
       band = h.partials_bytes() / slice_bytes;
   }
@@ -1385,7 +1385,7 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     HIP_CHECK(hipStreamIsCapturing(stream, &capture));
     if (capture != hipStreamCaptureStatusActive &&
-        m * n * elem_bytes(dtype) > h.inputs_bytes())
+        m * n * elem_bytes(dtype) > h.staging_bytes())
       return Error::inputs_too_small;
   }
   // 3. Only a tile its threads lay out whole at this world: TILE_N whole groups
@@ -1519,15 +1519,15 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
       // payload found from the problem's [m, n] (its slots where the shares lie).
       // IN PLACE: none (the table's strides are the launch's, handle.cuh's
       // InputTable).
-      .inputs_stride_m = in_place                         ? 0
+      .staging_stride_m = in_place                         ? 0
                          : !in_passes || !is_two_shot(fn) ? n
                              : slot_packs(rows) * pack / elem_bytes(dtype),
-      .inputs_stride_n = in_place ? 0 : 1,
-      .inputs_size_m = in_place     ? 0
+      .staging_stride_n = in_place ? 0 : 1,
+      .staging_size_m = in_place     ? 0
                        : !in_passes ? m
                        : is_two_shot(fn) ? world
                                          : world * rows,
-      .inputs_size_n = in_place                         ? 0
+      .staging_size_n = in_place                         ? 0
                        : !in_passes || !is_two_shot(fn) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype),
       .dtype = dtype};
@@ -1658,10 +1658,10 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                  .partials_stride_n = 1,
                                  .partials_size_m = partials_rows,
                                  .partials_size_n = n,
-                               .inputs_stride_m = n,
-                               .inputs_stride_n = 1,
-                               .inputs_size_m = m,
-                               .inputs_size_n = n,
+                               .staging_stride_m = n,
+                               .staging_stride_n = 1,
+                               .staging_size_m = m,
+                               .staging_size_n = n,
                                  .dtype = dtype,
                                  .weight_dtype = weight_dtype,
                                  .eps = eps};
@@ -1815,10 +1815,10 @@ select_all_reduce_add_rms_norm(
       .scales_size_m = fn == Template::all_reduce_pull_two_shot_add_rms_norm
                            ? (m + world - 1) / world
                            : 0,
-      .inputs_stride_m = n,
-      .inputs_stride_n = 1,
-      .inputs_size_m = m,
-      .inputs_size_n = n,
+      .staging_stride_m = n,
+      .staging_stride_n = 1,
+      .staging_size_m = m,
+      .staging_size_n = n,
       .dtype = dtype,
       .weight_dtype = weight_dtype,
       .eps = eps};
@@ -2020,10 +2020,10 @@ select_all_reduce_add_attn_res_rms_norm(
       .partials_stride_n = 1,
       .partials_size_m = partials_rows,
       .partials_size_n = n,
-      .inputs_stride_m = n,
-      .inputs_stride_n = 1,
-      .inputs_size_m = m,
-      .inputs_size_n = n,
+      .staging_stride_m = n,
+      .staging_stride_n = 1,
+      .staging_size_m = m,
+      .staging_size_n = n,
       .dtype = dtype,
       .num_blocks = num_blocks,
       .eps = eps,
@@ -2109,7 +2109,7 @@ constexpr int64_t widest_row(OpType o) {
 // fits by construction. Each rounded to a whole pack, and at least one.
 struct ExchangeSizes {
   int64_t partials_bytes;
-  int64_t inputs_bytes;
+  int64_t staging_bytes;
 };
 constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
                                        int world) {
@@ -2117,7 +2117,7 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
   const auto whole = [pack](int64_t bytes) {
     return bytes < pack ? pack : (bytes + pack - 1) / pack * pack;
   };
-  int64_t partials = 0, inputs = int4_payload_bytes(max_rows, max_cols);
+  int64_t partials = 0, staging = int4_payload_bytes(max_rows, max_cols);
   for (const DType d : kBuild.supports.dtypes) {
     const int64_t packs = packs_of(max_cols, d);
     for (const TemplateInfo& t : kTemplates) {
@@ -2127,15 +2127,15 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
       if (need > 0 && int4 > partials) partials = int4;
     }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
-    if (input > inputs) inputs = input;
+    if (input > staging) staging = input;
     // THE PUSHED ALL-REDUCE'S INBOX (forced) takes a pass of at least one
     // row: the one-shot's WORLD slots of a row each, which covers the
     // two-shot's WORLD shares of one row rounded up to whole packs. The
     // in-place pull's eager copy is the input whole, above.
     const int64_t one_row_each = world * max_cols * elem_bytes(d);
-    if (one_row_each > inputs) inputs = one_row_each;
+    if (one_row_each > staging) staging = one_row_each;
   }
-  return {whole(partials), whole(inputs)};
+  return {whole(partials), whole(staging)};
 }
 
 // THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
@@ -2146,7 +2146,7 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 // leaving two results, two). Python admits a call by it or by the box the
 // exchange was sized for (`exchange_sizes`), whichever is larger.
 constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
-                            int64_t inputs_bytes) {
+                            int64_t staging_bytes) {
   int64_t per_byte = 0;
   for (const TunedKernel& k : op(o).kernels) {
     const int64_t need =
@@ -2157,9 +2157,9 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
   // pull) copy an eager input into the inputs whole. (The pushed variant,
   // forced, runs any call in the box: its inbox holds a row a rank,
   // `exchange_sizes`.)
-  if (per_byte == 0) return inputs_bytes;
+  if (per_byte == 0) return staging_bytes;
   const int64_t partials = partials_bytes / per_byte;
-  return partials < inputs_bytes ? partials : inputs_bytes;
+  return partials < staging_bytes ? partials : staging_bytes;
 }
 
 // EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and

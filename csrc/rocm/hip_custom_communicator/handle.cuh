@@ -126,12 +126,12 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //   signals    0                          kSignalsRegionBytes: the barrier
 //                                         flags (torch SymmetricMemory's
 //                                         "signal pad")
-//   inputs     signals end                what this rank publishes of its
+//   staging    signals end                what this rank publishes of its
 //                                         input: an eager exact call's host
 //                                         copy (read through the eager input
 //                                         table), an INT4 call's payload, or
 //                                         the pushed all-reduce's inbox
-//   partials   inputs end                 what this rank publishes of its
+//   partials   staging end                what this rank publishes of its
 //                                         reduced slice for the all-gather
 //                                         (two-shot only)
 //   scales     partials end               the add-RMS-norm pull two-shot's row
@@ -171,17 +171,17 @@ constexpr int64_t region_aligned(int64_t bytes) {
 }
 struct ArenaLayout {
   int64_t signals = 0;
-  int64_t inputs = 0;
+  int64_t staging = 0;
   int64_t partials = 0;
   int64_t scales = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
 };
-inline ArenaLayout arena_layout(int64_t inputs_bytes, int64_t partials_bytes,
+inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
                                 int64_t scales_bytes) {
   ArenaLayout l;
   l.signals = 0;
-  l.inputs = l.signals + kSignalsRegionBytes;
-  l.partials = l.inputs + region_aligned(inputs_bytes);
+  l.staging = l.signals + kSignalsRegionBytes;
+  l.partials = l.staging + region_aligned(staging_bytes);
   l.scales = l.partials + region_aligned(partials_bytes);
   l.end = l.scales + region_aligned(scales_bytes);
   return l;
@@ -480,7 +480,7 @@ struct InputTable {
 class Handle {
  public:
   // OPENED on every rank together: this rank's arena allocated (the signals,
-  // the inputs, the partials: `arena_layout`), its IPC handle exchanged with
+  // the staging, the partials, the scales: `arena_layout`), its IPC handle exchanged with
   // every rank's, and the peers' opened.
   // `world_size` is one the build holds (the opener checks it).
   // `timeout_seconds`: how long a kernel waits on a peer before it records a
@@ -496,18 +496,18 @@ class Handle {
   // not (0), or could not tell (-1): observed and logged, never acted on.
   Handle(int rank, int world_size, int device, const Gather& gather,
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
-         int64_t inputs_bytes, int64_t partials_bytes,
+         int64_t staging_bytes, int64_t partials_bytes,
          int quantization, LogMode log_mode, int rccl_ready)
       : rank_(rank),
         world_size_(world_size),
         device_(device),
         max_rows_(max_rows),
         max_cols_(max_cols),
-        inputs_bytes_(inputs_bytes),
+        staging_bytes_(staging_bytes),
         partials_bytes_(partials_bytes),
         quantization_(quantization),
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
-        layout_(arena_layout(inputs_bytes, partials_bytes,
+        layout_(arena_layout(staging_bytes, partials_bytes,
                              max_rows * static_cast<int64_t>(sizeof(float)))) {
     // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
     // an open that fails or hangs is read there.
@@ -665,7 +665,7 @@ class Handle {
   int64_t max_rows() const { return max_rows_; }
   int64_t max_cols() const { return max_cols_; }
   // Each region's bytes, what its largest payload in either encoding takes.
-  int64_t inputs_bytes() const { return inputs_bytes_; }
+  int64_t staging_bytes() const { return staging_bytes_; }
   int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
@@ -805,12 +805,12 @@ class Handle {
       return {slot, world_size_, stride_m, 1};
     }
     const int64_t row = n * elem_bytes;
-    if (m * row > inputs_bytes_)
+    if (m * row > staging_bytes_)
       throw std::runtime_error(
           "hip_custom_communicator: an eager " + std::to_string(m * row) +
-          "-byte input exceeds the " + std::to_string(inputs_bytes_) +
+          "-byte input exceeds the " + std::to_string(staging_bytes_) +
           "-byte inputs region");
-    HIP_CHECK(hipMemcpy2DAsync(arena_->base(rank_) + layout_.inputs,
+    HIP_CHECK(hipMemcpy2DAsync(arena_->base(rank_) + layout_.staging,
                                static_cast<size_t>(row), input,
                                static_cast<size_t>(stride_m * elem_bytes),
                                static_cast<size_t>(row),
@@ -1007,7 +1007,7 @@ class Handle {
       for (int r = 0; r < world_size_; ++r) {
         char* const base = arena_->base(r);
         at[kSignalsArray * kMaxRanks + r] = base + layout_.signals;
-        at[kStagingArray * kMaxRanks + r] = base + layout_.inputs;
+        at[kStagingArray * kMaxRanks + r] = base + layout_.staging;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
         at[kScalesArray * kMaxRanks + r] = base + layout_.scales;
       }
@@ -1025,7 +1025,7 @@ class Handle {
     {
       std::vector<void*> eager(kMaxRanks, nullptr);
       for (int r = 0; r < world_size_; ++r)
-        eager[r] = arena_->base(r) + layout_.inputs;
+        eager[r] = arena_->base(r) + layout_.staging;
       HIP_CHECK(hipMemcpy(tables_, eager.data(), kMaxRanks * sizeof(void*),
                           hipMemcpyHostToDevice));
       next_slot_ = 1;
@@ -1239,7 +1239,7 @@ class Handle {
   int device_;
   int64_t max_rows_;
   int64_t max_cols_;
-  int64_t inputs_bytes_;
+  int64_t staging_bytes_;
   int64_t partials_bytes_;
   int quantization_;
   std::shared_ptr<Log> log_;

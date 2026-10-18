@@ -280,7 +280,7 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
       (*pg)->getRank(), world, static_cast<int>(device), gather_over(*pg),
-      timeout_seconds, max_rows, max_cols, sizes.inputs_bytes,
+      timeout_seconds, max_rows, max_cols, sizes.staging_bytes,
       sizes.partials_bytes, static_cast<int>(quantization),
       static_cast<hip_custom_communicator::LogMode>(log_mode),
       static_cast<int>(rccl_ready));
@@ -373,10 +373,10 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
   const auto sizes = hip_custom_communicator::exchange_sizes(
       max_rows, max_cols, static_cast<int>(world));
   std::vector<int64_t> out{max_rows, max_cols, sizes.partials_bytes,
-                           sizes.inputs_bytes};
+                           sizes.staging_bytes};
   for (const auto& o : hip_custom_communicator::kOps)
     out.push_back(hip_custom_communicator::max_bytes(
-        o.type, sizes.partials_bytes, sizes.inputs_bytes));
+        o.type, sizes.partials_bytes, sizes.staging_bytes));
   return out;
 }
 
