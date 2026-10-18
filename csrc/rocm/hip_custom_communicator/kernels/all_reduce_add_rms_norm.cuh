@@ -3,7 +3,8 @@
 //
 // ALL-REDUCE THEN RMSNORM, AND THEN ADD THEN RMSNORM: their kernels, one
 // section each (pull one-shot, pull two-shot, push two-shot), each kernel of
-// the RMSNorm op a wrapper over its add-RMSNorm body.
+// the RMSNorm op a wrapper over its add-RMSNorm body; then our separate norm
+// kernels (rms_norm_rows, add_rms_norm_rows), the splits' second.
 
 #pragma once
 
@@ -946,6 +947,117 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       signals_stride_writer, signals_size_parity, signals_size_block,
       signals_size_writer, status_ptr, status_stride_field, status_size_field,
       rank, timeout_ticks, eps);
+}
+
+// =============================================================================
+// rms_norm_rows, add_rms_norm_rows
+//
+// OUR SEPARATE NORM KERNELS, THE SPLITS' SECOND (STANDARDS 3.2, *We win at the
+// op level*): RMSNorm (and fused_add_rms_norm) on rows already all-reduced. The
+// norm op's split (select.cuh, Template::all_reduce_pull_split_rms_norm and
+// _add_rms_norm) runs the plain all-reduce into this rank's local sums
+// (Handle::sums), then this kernel on them, on its own grid: nothing over the
+// peers. Every row's math and rounding the one-shot's (above): the sum `input`
+// is the all-reduce's, rounded to DTYPE as theirs is, s = float(sum)
+// (+ float(residual), residual_out = DTYPE(s)), out = DTYPE(W(W(s * scale) *
+// float(w))) (rms_norm.cuh).
+// =============================================================================
+
+// A TILE OF TILE_M ROWS a work item, the grid striding over them; the weight
+// loaded once, every tile's. Each kernel written out whole (STANDARDS 3.2: an op
+// file has no shared body).
+template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
+          int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+    rms_norm_rows(const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+                  int64_t input_stride_n, int input_size_m, int input_size_n,
+                  const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
+                  int weight_size_n, DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
+                  int64_t output_stride_n, int output_size_m, int output_size_n, float eps) {
+  constexpr int kPackElems = traits<DTYPE>::N;
+  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+  const int m = input_size_m, n = input_size_n;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+      &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+  const int tiles = (m + TILE_M - 1) / TILE_M;
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int offs_m = t * TILE_M;
+    DTYPE x[TILE_M][kPacks][kPackElems];
+    load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x, offs_m, 0, 1);
+    // s = float(sum): the sum as the all-reduce landed it, DTYPE.
+    float s[TILE_M][kPacks][kPackElems];
+#pragma unroll
+    for (int i = 0; i < TILE_M; ++i)
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < kPackElems; ++j) s[i][k][j] = static_cast<float>(x[i][k][j]);
+    float scale[TILE_M];
+    DTYPE normed[TILE_M][kPacks][kPackElems];
+    rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
+                                Layout::tile);
+    store<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,
+        0, 1);
+  }
+}
+
+template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
+          int WAVES_PER_EU>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
+    add_rms_norm_rows(const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+                      int64_t input_stride_n, int input_size_m, int input_size_n,
+                      const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
+                      int64_t residual_stride_n, int residual_size_m, int residual_size_n,
+                      const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
+                      int weight_size_n, DTYPE* __restrict__ output_ptr,
+                      int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
+                      int output_size_n, DTYPE* __restrict__ residual_output_ptr,
+                      int64_t residual_output_stride_m, int64_t residual_output_stride_n,
+                      int residual_output_size_m, int residual_output_size_n, float eps) {
+  constexpr int kPackElems = traits<DTYPE>::N;
+  constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+  const int m = input_size_m, n = input_size_n;
+  const float inv_hidden = 1.0f / static_cast<float>(n);
+  WEIGHT_DTYPE w[1][kPacks][kPackElems];
+  load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+      &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
+  const int tiles = (m + TILE_M - 1) / TILE_M;
+  for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int offs_m = t * TILE_M;
+    DTYPE x[TILE_M][kPacks][kPackElems], res[TILE_M][kPacks][kPackElems];
+    load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, m, n, m, n, x, offs_m, 0, 1);
+    load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, m, n, m, n, res,
+        offs_m, 0, 1);
+    // s = float(sum) + float(residual) in fp32, the new residual s rounded to DTYPE (the norm
+    // reads the fp32 s).
+    float s[TILE_M][kPacks][kPackElems];
+    DTYPE added[TILE_M][kPacks][kPackElems];
+#pragma unroll
+    for (int i = 0; i < TILE_M; ++i)
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < kPackElems; ++j) {
+          s[i][k][j] = static_cast<float>(x[i][k][j]) + static_cast<float>(res[i][k][j]);
+          added[i][k][j] = static_cast<DTYPE>(s[i][k][j]);
+        }
+    store<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
+        residual_output_stride_n, 1, m, n, m, n, offs_m, 0, 1);
+    float scale[TILE_M];
+    DTYPE normed[TILE_M][kPacks][kPackElems];
+    rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row, true,
+                                Layout::tile);
+    store<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+        normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, m, n, m, n, offs_m,
+        0, 1);
+  }
 }
 
 }  // namespace hip_custom_communicator

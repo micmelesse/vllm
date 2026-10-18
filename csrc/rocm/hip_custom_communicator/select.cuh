@@ -190,7 +190,24 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
 };
 
-// OUR SEPARATE ATTNRES KERNEL (the split's second, add_attn_res_rms_norm): a row a tile, the
+// OUR SEPARATE NORM KERNELS (the norm splits' second, rms_norm_rows and add_rms_norm_rows): a
+// row a tile, Layout::tile, a block's threads along the row; each as it is and with its
+// all-reduce moving INT4.
+constexpr BuildConfig kRmsNormSplitExactConfigs[] = {
+    AllReduceRmsNormBuildConfig{256, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{256, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
+};
+constexpr auto kRmsNormSplitConfigs = and_int4(kRmsNormSplitExactConfigs);
+constexpr BuildConfig kAddRmsNormSplitExactConfigs[] = {
+    AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
+};
+constexpr auto kAddRmsNormSplitConfigs = and_int4(kAddRmsNormSplitExactConfigs);
+// OUR SEPARATE ATTNRES KERNEL (the split's second, add_attn_res_rms_norm_rows): a row a tile, the
 // fused pull's exact tile (TILE_N a row's packs over the threads, Layout::tile), at Triton's
 // AttnRes program (256 threads, a source a step: the reference's prefill config) and the
 // neighbours a sweep picks among; each as it is and with its all-reduce moving INT4.
@@ -262,10 +279,15 @@ constexpr TemplateInfo kTemplates[] = {
      OpType::all_reduce, Algorithm::two_shot, true, kAllReduceTwoShotConfigs},
     // THE OP AS TWO KERNELS OF OURS (Algorithm::split; STANDARDS 3.2, *We win at the op level*):
     // the plain all-reduce, its tuned pick at the build's quantization, into this rank's local
-    // sums (Handle::sums), then our separate AttnRes kernel on them (add_attn_res_rms_norm), on
+    // sums (Handle::sums), then our separate AttnRes kernel on them (add_attn_res_rms_norm_rows), on
     // its own grid at its own occupancy. Its builds are that kernel's.
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, Algorithm::split, false, kAttnResSplitConfigs},
+    // THE NORMS AS TWO KERNELS OF OURS: the plain all-reduce, then our separate norm kernel.
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_rms_norm),
+     OpType::all_reduce_rms_norm, Algorithm::split, false, kRmsNormSplitConfigs},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_add_rms_norm),
+     OpType::all_reduce_add_rms_norm, Algorithm::split, false, kAddRmsNormSplitConfigs},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -712,6 +734,16 @@ constexpr TunedKernel kRmsNormKernels[] = {
      16384,
      Template::all_reduce_pull_one_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
 };
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB
@@ -764,6 +796,16 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
      16384,
      Template::all_reduce_pull_one_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68
@@ -934,6 +976,16 @@ constexpr TunedKernel kRmsNormInt4Kernels[] = {
      7168,
      Template::all_reduce_pull_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
 };
 constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
     {8,
@@ -946,6 +998,16 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      7168,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
+    {8,
+     4096,
+     3584,
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
+    {8,
+     4096,
+     7168,
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
 };
 // AttnRes's INT4 kernels, its own: the pull, a group a thread, a row split in
 // units of a row and a class of owners (its INT4 body), TILE_K 3 (the best at every prefill size,
@@ -1757,6 +1819,26 @@ inline std::variant<AllReduceLaunch, Error> select_all_reduce(
   return l;
 }
 
+// A SPLIT'S ALL-REDUCE (Algorithm::split): the plain all-reduce's tuned kernel at the split
+// build's `quantization` (its INT4 list or its exact one), forced whole, into this rank's local
+// sums (Handle::sums), dense rows; its own select checks it (its band, its regions, its
+// residency). The caller's own check holds the sums to the inputs region's size.
+inline std::variant<AllReduceLaunch, Error> split_all_reduce(
+    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
+    int64_t m, int64_t n, DType dtype, int quantization, hipStream_t stream) {
+  const Op& plain = op(OpType::all_reduce);
+  const std::variant<TunedKernel, Error> t =
+      pick(OpType::all_reduce, h.world_size(), m, n, tile_cols(OpType::all_reduce, n), dtype,
+           quantization == Quantization::int4 ? plain.int4_kernels : plain.kernels);
+  if (const Error* e = std::get_if<Error>(&t)) return *e;
+  const TunedKernel& r = std::get<TunedKernel>(t);
+  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
+  return select_all_reduce(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
+                           dtype, algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n,
+                           b.threads_per_block, r.config.launch.blocks_per_grid, b.waves_per_eu,
+                           b.quantization, stream);
+}
+
 // all_reduce_rms_norm: out = rms_norm(all_reduce(inp), weight), vLLM's
 // roundings exactly. inp [rows, hidden]; the weight `weight_dtype`, dtype or
 // f32.
@@ -1835,15 +1917,31 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                       all_reduce_push_two_shot_rms_norm<T, W, NG, TN, TPB,
                                                         WPE, C.quantization>);
                 });
+          case K::all_reduce_pull_split_rms_norm:
+            return by_build<K::all_reduce_pull_split_rms_norm>(
+                c.build, [&](auto cc) {
+                  constexpr AllReduceRmsNormBuildConfig C = decltype(cc)::value;
+                  constexpr int TM = C.tile_m, TN = C.tile_n, TPB = C.threads_per_block,
+                                WPE = C.waves_per_eu;
+                  kernel = instance<RmsNormRowsKernel>(rms_norm_rows<T, W, TM, TN, TPB, WPE>);
+                });
           default:
             not_this_ops(fn);
         }
       });
     });
   });
-  // 4.
   const AllReduceRmsNormBuildConfig& r =
       std::get<AllReduceRmsNormBuildConfig>(c.build);
+  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
+  std::optional<AllReduceLaunch> all_reduce;
+  if (is_split(fn)) {
+    const std::variant<AllReduceLaunch, Error> got = split_all_reduce(
+        h, input, input_stride_m, input_stride_n, m, n, dtype, r.quantization, stream);
+    if (const Error* e = std::get_if<Error>(&got)) return *e;
+    all_reduce = std::get<AllReduceLaunch>(got);
+  }
+  // 4.
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, m,
@@ -1885,8 +1983,10 @@ inline std::variant<AllReduceRmsNormLaunch, Error> select_all_reduce_rms_norm(
                                .staging_size_n = n,
                                  .dtype = dtype,
                                  .weight_dtype = weight_dtype,
-                                 .eps = eps};
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
+                                 .eps = eps,
+                                 .all_reduce = all_reduce};
+  // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
+  if (!is_split(fn) && !resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
@@ -1977,15 +2077,32 @@ select_all_reduce_add_rms_norm(
                       all_reduce_push_two_shot_add_rms_norm<T, W, NG, TN, TPB,
                                                             WPE, C.quantization>);
                 });
+          case K::all_reduce_pull_split_add_rms_norm:
+            return by_build<K::all_reduce_pull_split_add_rms_norm>(
+                c.build, [&](auto cc) {
+                  constexpr AllReduceAddRmsNormBuildConfig C = decltype(cc)::value;
+                  constexpr int TM = C.tile_m, TN = C.tile_n, TPB = C.threads_per_block,
+                                WPE = C.waves_per_eu;
+                  kernel =
+                      instance<AddRmsNormRowsKernel>(add_rms_norm_rows<T, W, TM, TN, TPB, WPE>);
+                });
           default:
             not_this_ops(fn);
         }
       });
     });
   });
-  // 4.
   const AllReduceAddRmsNormBuildConfig& r =
       std::get<AllReduceAddRmsNormBuildConfig>(c.build);
+  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
+  std::optional<AllReduceLaunch> all_reduce;
+  if (is_split(fn)) {
+    const std::variant<AllReduceLaunch, Error> got = split_all_reduce(
+        h, input, input_stride_m, input_stride_n, m, n, dtype, r.quantization, stream);
+    if (const Error* e = std::get_if<Error>(&got)) return *e;
+    all_reduce = std::get<AllReduceLaunch>(got);
+  }
+  // 4.
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none),
   // at its row stride: the exact pull two-shot's row is its scale's pack then the
   // row (partials_need); the INT4 build's rows are the row alone, its scales in
@@ -2049,9 +2166,11 @@ select_all_reduce_add_rms_norm(
       .staging_size_n = n,
       .dtype = dtype,
       .weight_dtype = weight_dtype,
-      .eps = eps};
+      .eps = eps,
+      .all_reduce = all_reduce};
   if (l.scales_size_m > h.scales_size_m()) return Error::partials_too_small;
-  if (!resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
+  // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
+  if (!is_split(fn) && !resident(h, kernel, l.blocks_per_grid, l.threads_per_block))
     return Error::grid_not_resident;
   return l;
 }
@@ -2168,7 +2287,7 @@ select_all_reduce_add_attn_res_rms_norm(
                 constexpr int TM = C.tile_m, TN = C.tile_n, TK = C.tile_k,
                               TPB = C.threads_per_block, WPE = C.waves_per_eu;
                 kernel = instance<AddAttnResRmsNormKernel>(
-                    add_attn_res_rms_norm<T, TM, TN, TK, TPB, WPE>);
+                    add_attn_res_rms_norm_rows<T, TM, TN, TK, TPB, WPE>);
               });
         default:
           not_this_ops(fn);
@@ -2177,24 +2296,11 @@ select_all_reduce_add_attn_res_rms_norm(
   });
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
-  // THE SPLIT'S ALL-REDUCE: the plain all-reduce's tuned kernel at the build's quantization (its
-  // INT4 list or its exact one), whole, into this rank's local sums, dense rows; its own select
-  // checks it (its band, its regions, its residency). The sums hold the call: refused above
-  // when the inputs region, their size, does not hold its input.
+  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
   std::optional<AllReduceLaunch> all_reduce;
   if (is_split(fn)) {
-    const std::variant<TunedKernel, Error> t =
-        pick(OpType::all_reduce, world, m, n, tile_cols(OpType::all_reduce, n), dtype,
-             a.quantization == Quantization::int4
-                 ? kOps[static_cast<int>(OpType::all_reduce)].int4_kernels
-                 : kOps[static_cast<int>(OpType::all_reduce)].kernels);
-    if (const Error* e = std::get_if<Error>(&t)) return *e;
-    const TunedKernel& r = std::get<TunedKernel>(t);
-    const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
-    const std::variant<AllReduceLaunch, Error> got = select_all_reduce(
-        h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n, dtype,
-        algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n, b.threads_per_block,
-        r.config.launch.blocks_per_grid, b.waves_per_eu, b.quantization, stream);
+    const std::variant<AllReduceLaunch, Error> got = split_all_reduce(
+        h, input, input_stride_m, input_stride_n, m, n, dtype, a.quantization, stream);
     if (const Error* e = std::get_if<Error>(&got)) return *e;
     all_reduce = std::get<AllReduceLaunch>(got);
   }

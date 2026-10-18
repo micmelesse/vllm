@@ -3,7 +3,7 @@
 //
 // ALL-REDUCE THEN ADD, ATTNRES AND RMSNORM: the kernels, one section each (pull
 // one-shot, pull two-shot, push two-shot), then our separate AttnRes kernel
-// (add_attn_res_rms_norm), the split's second. Every one computes AttnRes by
+// (add_attn_res_rms_norm_rows), the split's second. Every one computes AttnRes by
 // the one function, attn_res (attn_res.cuh).
 
 #pragma once
@@ -497,7 +497,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 // =============================================================================
-// add_attn_res_rms_norm
+// add_attn_res_rms_norm_rows
 //
 // OUR SEPARATE ATTNRES KERNEL, THE SPLIT'S SECOND: Kimi-K3's AttnRes and its
 // RMSNorm on rows already all-reduced (STANDARDS 3.2, *We win at the op level*:
@@ -518,7 +518,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK,
           int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    add_attn_res_rms_norm(
+    add_attn_res_rms_norm_rows(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* __restrict__ prefix_ptr, int64_t prefix_stride_m,

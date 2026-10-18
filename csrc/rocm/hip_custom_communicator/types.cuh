@@ -178,6 +178,8 @@ enum class Template : int {
   all_reduce_push_one_shot = 11,
   all_reduce_push_two_shot = 12,
   all_reduce_pull_split_add_attn_res_rms_norm = 13,
+  all_reduce_pull_split_rms_norm = 14,
+  all_reduce_pull_split_add_rms_norm = 15,
 };
 
 // HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's
@@ -514,7 +516,28 @@ using AllReduceAddAttnResRmsNormOneShotKernel = void (*)(
     int64_t /*status_stride_field*/, int /*status_size_field*/, int /*rank*/,
     uint64_t /*timeout_ticks*/, int /*num_blocks*/, float /*eps*/,
     float /*output_eps*/);
-// THE SPLIT'S SECOND KERNEL (add_attn_res_rms_norm): AttnRes on rows already
+// THE NORM SPLITS' SECOND KERNELS (rms_norm_rows, add_rms_norm_rows): the norm
+// on rows already all-reduced, `input` this rank's local sums.
+using RmsNormRowsKernel = void (*)(
+    const void* /*input_ptr*/, int64_t /*input_stride_m*/,
+    int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*weight_ptr*/, int64_t /*weight_stride_n*/,
+    int /*weight_size_n*/, void* /*output_ptr*/, int64_t /*output_stride_m*/,
+    int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
+    float /*eps*/);
+using AddRmsNormRowsKernel = void (*)(
+    const void* /*input_ptr*/, int64_t /*input_stride_m*/,
+    int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
+    const void* /*residual_ptr*/, int64_t /*residual_stride_m*/,
+    int64_t /*residual_stride_n*/, int /*residual_size_m*/,
+    int /*residual_size_n*/, const void* /*weight_ptr*/,
+    int64_t /*weight_stride_n*/, int /*weight_size_n*/, void* /*output_ptr*/,
+    int64_t /*output_stride_m*/, int64_t /*output_stride_n*/,
+    int /*output_size_m*/, int /*output_size_n*/,
+    void* /*residual_output_ptr*/, int64_t /*residual_output_stride_m*/,
+    int64_t /*residual_output_stride_n*/, int /*residual_output_size_m*/,
+    int /*residual_output_size_n*/, float /*eps*/);
+// THE SPLIT'S SECOND KERNEL (add_attn_res_rms_norm_rows): AttnRes on rows already
 // all-reduced, `input` this rank's local sums; nothing over the peers.
 using AddAttnResRmsNormKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
@@ -680,6 +703,8 @@ struct AllReduceRmsNormLaunch {
   DType dtype;
   DType weight_dtype;
   float eps;
+  // THE SPLIT'S ALL-REDUCE, as AttnRes's (below): none for a one-kernel launch.
+  std::optional<AllReduceLaunch> all_reduce;
 };
 
 struct AllReduceAddRmsNormLaunch {
@@ -719,6 +744,8 @@ struct AllReduceAddRmsNormLaunch {
   DType dtype;
   DType weight_dtype;
   float eps;
+  // THE SPLIT'S ALL-REDUCE, as AttnRes's (below): none for a one-kernel launch.
+  std::optional<AllReduceLaunch> all_reduce;
 };
 
 // tile_m 1 on the one-shot and push (a row a tile); reduce_scatter_blocks the

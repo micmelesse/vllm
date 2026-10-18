@@ -155,8 +155,24 @@ inline InputTable fused_input(Handle& h, const LAUNCH& l) {
                        l.input_size_n, elem_bytes(l.dtype), l.stream);
 }
 
+// THE NORMS' SPLIT (their `all_reduce` set): that launch first, into this rank's local sums,
+// then our norm kernel on them, stream-ordered after it, nothing over the peers.
 inline void launch_all_reduce_rms_norm(Handle& h,
                                        const AllReduceRmsNormLaunch& l) {
+  if (l.all_reduce) {
+    const AllReduceLaunch& r = *l.all_reduce;
+    launch_all_reduce(h, r);
+    h.begin_launch(OpType::all_reduce_rms_norm, l.kernel, l.input_size_m,
+                   l.input_size_n, l.dtype, l.stream);
+    Call<RmsNormRowsKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, r.output,
+        r.output_stride_m, r.output_stride_n, static_cast<int>(r.output_size_m),
+        static_cast<int>(r.output_size_n), l.weight, l.weight_stride_n,
+        static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
+        l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), l.eps);
+    return;
+  }
   h.begin_launch(OpType::all_reduce_rms_norm, l.kernel, l.input_size_m,
                  l.input_size_n, l.dtype, l.stream);
   const InputTable t = fused_input(h, l);
@@ -195,6 +211,25 @@ inline void launch_all_reduce_rms_norm(Handle& h,
 
 inline void launch_all_reduce_add_rms_norm(Handle& h,
                                            const AllReduceAddRmsNormLaunch& l) {
+  if (l.all_reduce) {
+    const AllReduceLaunch& r = *l.all_reduce;
+    launch_all_reduce(h, r);
+    h.begin_launch(OpType::all_reduce_add_rms_norm, l.kernel, l.input_size_m,
+                   l.input_size_n, l.dtype, l.stream);
+    Call<AddRmsNormRowsKernel>::run(
+        l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, r.output,
+        r.output_stride_m, r.output_stride_n, static_cast<int>(r.output_size_m),
+        static_cast<int>(r.output_size_n), l.residual, l.residual_stride_m,
+        l.residual_stride_n, static_cast<int>(l.residual_size_m),
+        static_cast<int>(l.residual_size_n), l.weight, l.weight_stride_n,
+        static_cast<int>(l.weight_size_n), l.output, l.output_stride_m,
+        l.output_stride_n, static_cast<int>(l.output_size_m),
+        static_cast<int>(l.output_size_n), l.residual_output,
+        l.residual_output_stride_m, l.residual_output_stride_n,
+        static_cast<int>(l.residual_output_size_m),
+        static_cast<int>(l.residual_output_size_n), l.eps);
+    return;
+  }
   h.begin_launch(OpType::all_reduce_add_rms_norm, l.kernel, l.input_size_m,
                  l.input_size_n, l.dtype, l.stream);
   const InputTable t = fused_input(h, l);
