@@ -188,9 +188,7 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
     AllReduceAddAttnResRmsNormBuildConfig{128, 3, 1, 4096, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{128, 4, 1, 4096, 1, Quantization::int4},
     AllReduceAddAttnResRmsNormBuildConfig{256, 3, 1, 8192, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 4, 1, 8192, 1, Quantization::int4},
 };
 
 // What each template is, in Template's order: its op, its shot, and its builds.
