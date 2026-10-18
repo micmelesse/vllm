@@ -106,7 +106,7 @@ constexpr auto kRmsNormPushConfigs = and_int4(kRmsNormPushExactConfigs);
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
 // against 81.0 and 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
 // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32 threads
-// (int4_build).
+// (kRmsNormInt4Kernels).
 constexpr BuildConfig kRmsNormPullConfigs[] = {
     AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
     AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
@@ -786,17 +786,11 @@ constexpr Int4Crossover kInt4Crossovers[] = {
 // 8192; 03-31-44Z). A one-shot moves its input as it is, so it has no INT4 entry;
 // the INT4 list is consulted only from the op's crossover up (kInt4Crossovers),
 // where the exact lists pick two-shots. THE PULLED NORMS' INT4 IS A GROUP A
-// THREAD (their INT4 body, all_reduce_add_rms_norm.cuh): the same tile at
-// TILE_N / 32 threads, a block one row's groups (int4_build).
+// THREAD (their INT4 body, all_reduce_add_rms_norm.cuh): TILE_N / 32 threads,
+// a block one row's groups, their lists their own (below).
 constexpr bool int4_group_a_thread(Template k) {
   return k == Template::all_reduce_pull_two_shot_rms_norm ||
          k == Template::all_reduce_pull_two_shot_add_rms_norm;
-}
-constexpr BuildConfig int4_build(Template k, BuildConfig b) {
-  b = quantized(b, Quantization::int4);
-  if (int4_group_a_thread(k))
-    std::visit([](auto& f) { f.threads_per_block = f.tile_n / kInt4Group; }, b);
-  return b;
 }
 // THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a group-a-thread
 // INT4 norm's inbox, WORLD slots of an owner's ceil(m / WORLD) rows.
@@ -818,16 +812,44 @@ constexpr std::array<TunedKernel, M> int4_of(const TunedKernel (&exact)[N]) {
   for (const TunedKernel& k : exact)
     if (is_two_shot(k.fn))
       int4[i++] = TunedKernel{k.world, k.m, k.n, k.fn,
-                              {int4_build(k.fn, k.config.build),
+                              {quantized(k.config.build, Quantization::int4),
                                k.config.launch}};
   return int4;
 }
 constexpr auto kAllReduceInt4Kernels =
     int4_of<two_shots(kAllReduceKernels)>(kAllReduceKernels);
-constexpr auto kRmsNormInt4Kernels =
-    int4_of<two_shots(kRmsNormKernels)>(kRmsNormKernels);
-constexpr auto kAddRmsNormInt4Kernels =
-    int4_of<two_shots(kAddRmsNormKernels)>(kAddRmsNormKernels);
+// THE PULLED NORMS' INT4 KERNELS, their own (not int4_of's): from the crossover
+// up select picks the pull, a group a thread, at the grid its sweep set
+// (forced, 64-384 blocks, 1024-8192 tokens; 2026-10-18T05-42-13Z): 256 blocks
+// of 128 threads at 3584, 128 of 256 at 7168, each within 10% of the best grid
+// at every size (rms 8192 x 7168 228.9 us, QuickReduce INT4 + rms_norm 412.3;
+// add 266.9 against 448.6). The grid the exact kernels run, 48, left INT4 at
+// 0.98-1.9x QuickReduce's (2026-10-18T05-23-31Z): a block a row, a group a
+// thread, so the grid is the rows in flight.
+constexpr TunedKernel kRmsNormInt4Kernels[] = {
+    {8,
+     1,
+     3584,
+     Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {256, 0}}},
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
+};
+constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
+    {8,
+     1,
+     3584,
+     Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {256, 0}}},
+    {8,
+     1,
+     7168,
+     Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
+};
 constexpr auto kAttnResInt4Kernels =
     int4_of<two_shots(kAttnResKernels)>(kAttnResKernels);
 
