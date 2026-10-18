@@ -54,7 +54,7 @@ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 // (the grid, reduce_scatter_blocks) is not a build's: each tuned kernel (below)
 // gives its own, and a forced call gives its own. tile_n counts the elements of
 // a 16-bit dtype, the only ones built. A build that spills shows in its code
-// object (Handle::resources_of) and loses on the clock; none is ruled out by
+// object (gp report isa) and loses on the clock; none is ruled out by
 // policy. The sweeps cited beside a list set its builds and the grids its tuned
 // kernels carry.
 
@@ -476,7 +476,7 @@ const void* instance(void (*kernel)(PARAMS...)) {
 // the compiled kernel knows what it uses.
 inline bool resident(const Handle& h, const void* kernel, int blocks,
                      int threads) {
-  return blocks <= resident_blocks(kTarget, h.resources_of(kernel), threads);
+  return blocks <= h.resident_blocks(kernel, threads);
 }
 
 // From `m` rows up (to the next entry's), at `world` ranks and rows `n`

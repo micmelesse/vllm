@@ -33,6 +33,7 @@
 
 #include <array>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <cerrno>
 #include <cstdint>
@@ -43,6 +44,7 @@
 #include <future>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -891,15 +893,25 @@ class Handle {
                      uint32_t{1}, __ATOMIC_RELEASE);
   }
 
-  // What a compiled kernel uses, read once from the code object loaded on this
-  // device: only the compiler knows it.
-  Resources resources_of(const void* kernel) const {
-    if (const auto it = resources_.find(kernel); it != resources_.end())
+  // THE MOST BLOCKS OF `kernel`, `threads` A BLOCK, RESIDENT AT ONCE ON THIS
+  // DEVICE: the textbook query, HIP's occupancy API (CUDA's
+  // cudaOccupancyMaxActiveBlocksPerMultiprocessor), blocks a CU from the
+  // compiled kernel's registers, LDS and the CU's wave slots, times the
+  // device's CUs. A peer barrier spins until the same block on every peer
+  // arrives, so a grid past it can hang (select refuses it,
+  // grid_not_resident). Asked once per kernel and block size, then cached; no
+  // dynamic LDS (launch.cuh launches with 0).
+  int resident_blocks(const void* kernel, int threads) const {
+    const std::pair<const void*, int> key{kernel, threads};
+    if (const auto it = resident_.find(key); it != resident_.end())
       return it->second;
-    hipFuncAttributes attrs{};
-    HIP_CHECK(hipFuncGetAttributes(&attrs, kernel));
-    return resources_[kernel] = {attrs.numRegs,
-                                 static_cast<int64_t>(attrs.sharedSizeBytes)};
+    int per_cu = 0;
+    HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel,
+                                                           threads, 0));
+    int cus = 0;
+    HIP_CHECK(hipDeviceGetAttribute(
+        &cus, hipDeviceAttributeMultiprocessorCount, device_));
+    return resident_[key] = per_cu * cus;
   }
 
  private:
@@ -1258,7 +1270,7 @@ class Handle {
   uint32_t* status_ = nullptr;
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
-  mutable std::unordered_map<const void*, Resources> resources_;
+  mutable std::map<std::pair<const void*, int>, int> resident_;
   // THE INPUT TABLES (INPUT TABLES): the slab, the next free slot, the
   // captured launches awaiting registration (input, slot), and every peer
   // allocation opened for one, by its IPC handle's bytes.
