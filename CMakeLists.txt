@@ -1556,6 +1556,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_include_directories(_rocm_C_hcc PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
     target_compile_options(_rocm_C_hcc PRIVATE
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>)
+    # KERNEL ARGUMENTS PRELOADED into SGPRs (LLVM AMDGPUUsage, "Preloaded Kernel Arguments",
+    # gfx940+), as aiter builds every kernel (aiter/jit/core.py, count 32): a wave starts with its
+    # first arguments in registers instead of waiting on a cold kernarg line, then the next.
+    target_compile_options(_rocm_C_hcc PRIVATE
+      "$<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:SHELL:-mllvm --amdgpu-kernarg-preload-count=32>")
     target_compile_definitions(_rocm_C_hcc PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
     target_link_libraries(_rocm_C_hcc PRIVATE torch)
   else()
