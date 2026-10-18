@@ -38,6 +38,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -80,7 +81,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
     // address is built at its load), and the weight after the peers' sum was a
     // round trip of its own (+0.34 us at 16 x 3584, 2026-10-04T17-25-35Z).
     DTYPE peers[WORLD][1][kPacks][kPackElems];
-    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
+    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers, row, 0, 1);
     DTYPE res[1][kPacks][kPackElems];
     if constexpr (ADD_RESIDUAL)
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::own>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
@@ -131,6 +132,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -144,7 +146,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
       staging_size_m, staging_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
@@ -160,6 +162,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -178,7 +181,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -218,6 +221,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -287,7 +291,7 @@ DINLINE void all_reduce_pull_two_shot_add_rms_norm_body(
   const auto load_peers = [&](int row, DTYPE(&got)[WORLD][1][kPacks][kPackElems]) {
     if constexpr (QUANTIZATION == Quantization::none)
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Ranks::every>(
-          input_ptr_array, input_ptr_array_size, 0, 0, 0, staging_stride_m, staging_stride_n, 1,
+          input_ptr_array, input_ptr_array_size, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1,
           input_size_m, input_size_n, input_size_m, input_size_n, got, row, 0, 1);
     else
       load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Ranks::every>(
@@ -444,6 +448,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -460,7 +465,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, nullptr, 0, 0, 0, staging_ptr_array,
@@ -479,6 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -501,7 +507,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
@@ -544,6 +550,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
     const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
     int64_t input_stride_n, int input_size_m, int input_size_n,
     const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
     const DTYPE* residual_ptr, int64_t residual_stride_m,
     int64_t residual_stride_n, const WEIGHT_DTYPE* weight_ptr,
     int64_t weight_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
@@ -569,7 +576,7 @@ DINLINE void all_reduce_push_two_shot_add_rms_norm_body(
   // this rank's partials.
   reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, Until::launched>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
-      input_ptr_array_size, staging_stride_m, staging_stride_n, staging_ptr_array,
+      input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
       staging_size_n, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
@@ -628,6 +635,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
         int weight_size_n, DTYPE* __restrict__ output_ptr,
         int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
@@ -644,7 +652,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       nullptr, 0, 0, weight_ptr, weight_stride_n, output_ptr, output_stride_m,
       output_stride_n, nullptr, 0, 0, partials_ptr_array, partials_ptr_array_size, partials_stride_m,
       partials_stride_n, partials_size_m, partials_size_n, staging_ptr_array,
@@ -663,6 +671,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+    int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
         int64_t residual_stride_n, int residual_size_m, int residual_size_n,
         const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
@@ -686,7 +695,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
-      input_ptr_array, input_ptr_array_size,
+      input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       residual_ptr, residual_stride_m, residual_stride_n, weight_ptr,
       weight_stride_n, output_ptr, output_stride_m, output_stride_n,
       residual_output_ptr, residual_output_stride_m, residual_output_stride_n,
