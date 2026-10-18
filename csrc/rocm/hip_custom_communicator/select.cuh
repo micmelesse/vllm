@@ -1224,11 +1224,7 @@ inline std::variant<Chosen, Error> chosen(
 // barrier (the pull norm at 32 tokens ran 36 blocks for 4 rows a rank).
 constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m,
                            int64_t grid_cols, int world) {
-  // A group-a-thread INT4 build splits rows, whatever its exact build slices.
-  const bool row_split =
-      is_two_shot(t) &&
-      (!slices_columns(t) ||
-       (int4_group_a_thread(t) && quantization_of(c.build) == Quantization::int4));
+  const bool row_split = is_two_shot(t) && !slices_columns(t);
   const int64_t mine = row_split ? (m + world - 1) / world : m;
   const int64_t tm = tile_m_of(c.build), tn = tile_n_of(c.build);
   return (mine + tm - 1) / tm * ((grid_cols + tn - 1) / tn);
