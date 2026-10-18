@@ -82,13 +82,13 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
   else if (in_place)
     Call<AllReduceTwoShotInPlaceKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, t.ptr_array, t.ptr_array_size,
-        t.stride_m, t.stride_n, static_cast<int>(l.input_size_m),
+        h.signals_ptr_array(), h.signals_ptr_array_size(), t.stride_m, t.stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
         static_cast<int>(l.output_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
         l.partials_stride_m, l.partials_stride_n,
         static_cast<int>(l.partials_size_m),
-        static_cast<int>(l.partials_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
+        static_cast<int>(l.partials_size_n),
         h.signals_stride_parity(), h.signals_stride_block(),
         h.signals_stride_writer(), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),

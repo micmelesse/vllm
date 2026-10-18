@@ -350,14 +350,14 @@ using AllReduceOneShotInPlaceKernel = void (*)(
     void* /*status_ptr*/, int64_t /*status_stride_field*/,
     int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotInPlaceKernel = void (*)(
-    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/, int64_t /*input_stride_m*/,
+    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/,
+    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
     const void* /*partials_ptr_array*/, int /*partials_ptr_array_size*/,
     int64_t /*partials_stride_m*/, int64_t /*partials_stride_n*/,
     int /*partials_size_m*/, int /*partials_size_n*/,
-    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/,
     int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
     int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,

@@ -127,13 +127,18 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
-        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
+        // THE TRIAL EXCEPTION TO THE CANONICAL ORDER (STANDARDS 3.2): the two pointer tables read
+        // at entry, the input table and the signals table, first, inside the 56 bytes the kernarg
+        // preload puts in SGPRs (CMakeLists' --amdgpu-kernarg-preload-count=32), so their scalar
+        // loads need no kernarg load first; everything else in the canonical order.
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+        int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
         char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
