@@ -29,7 +29,7 @@ namespace hip_custom_communicator {
 // THE FLAT WALK (the plain two-shot): an elementwise [R, M, N] problem -- R
 // ranks' copies of an [M, N] buffer, each at its own strides -- WALKED AS
 // [R, 1, M*N]: the rows are only the buffer's layout, so the elements are
-// numbered row-major (e = row * N + col, reduce_scatter's element_at) and each rank's SHARE is one
+// numbered row-major (e = row * N + col, common.cuh's element_at, Layout flat) and each rank's SHARE is one
 // contiguous range of them, a TILE_N chunk a step. WHY: the links and HBM
 // reward long reads from each peer. Cut a row at a time, a rank's share was its
 // slice of every row -- 1.8 KB runs at N = 7168, the plain all-reduce +2%
