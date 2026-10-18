@@ -20,8 +20,8 @@ which every rank opened at open over legacy HIP IPC. Every exact call reads ever
 rank's input IN PLACE through an input table (aiter's gfx950 pattern): a captured
 call's tensors, registered when `capture()` exits (one exchange of their IPC handles
 over the CPU group, a collective), or an eager call's copy, which C++ makes into the
-arena's inputs region on the call's stream. An INT4 call's kernel quantizes its input
-into the inputs region itself.
+arena's staging region on the call's stream. An INT4 call's kernel quantizes its input
+into the staging region itself.
 
 The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 `close()` has to run.
@@ -107,7 +107,7 @@ class Error(IntEnum):
     no_such_quantization = 30
     quantization_not_two_shot = 31
     row_not_int4_groups = 32
-    quantized_too_small = 33  # retired: INT4 lies inside inputs and partials
+    quantized_too_small = 33  # retired: INT4 lies inside staging and partials
 
 
 class Where(IntEnum):
@@ -193,7 +193,7 @@ class LogKind(IntEnum):
     open_check = 2
     open_warning = 3
     launch_issued = 4
-    copy_in_issued = 5  # an eager all-reduce's host copy into the inputs
+    copy_in_issued = 5  # an eager all-reduce's host copy into the staging
     stream_seen = 6
     kernel_seen = 7
     deadline_expired = 8
@@ -693,24 +693,24 @@ class Capacity:
     """WHAT ONE COMMUNICATOR HOLDS (C++'s `hip_custom_communicator_capacity`): the
     largest call its exchange was sized for, `max_rows` rows of at most `max_cols`
     elements (for a model, the server's tokens a batch by its hidden size), the
-    exchange's partials and inputs bytes, and each op's most bytes on them whatever
+    exchange's partials and staging bytes, and each op's most bytes on them whatever
     a call's shape."""
 
     max_rows: int
     max_cols: int
     partials_bytes: int
-    inputs_bytes: int
+    staging_bytes: int
     max_bytes: dict[str, int]
 
 
 def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
     """What a communicator serving `max_rows` rows of at most `max_cols` columns at
     `world` ranks holds: C++'s answer, the same function its opener allocates by."""
-    rows, cols, partials, inputs, *most = (
+    rows, cols, partials, staging, *most = (
         torch.ops._rocm_C.hip_custom_communicator_capacity(max_rows, max_cols, world)
     )
     return Capacity(
-        rows, cols, partials, inputs, dict(zip(build_info().op_names, most))
+        rows, cols, partials, staging, dict(zip(build_info().op_names, most))
     )
 
 
@@ -1577,11 +1577,11 @@ class HipCustomCommunicator:
         )
         logger.info(
             "HipCustomCommunicator ready: exchange sized for %d rows of %d "
-            "(partials %.1f MiB, inputs %.1f MiB)",
+            "(partials %.1f MiB, staging %.1f MiB)",
             self.capacity.max_rows,
             self.capacity.max_cols,
             self.capacity.partials_bytes / 2**20,
-            self.capacity.inputs_bytes / 2**20,
+            self.capacity.staging_bytes / 2**20,
         )
         return None
 

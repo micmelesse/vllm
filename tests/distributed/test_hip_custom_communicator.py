@@ -994,8 +994,8 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     )
     assert error is Error.weight_not_built, error
 
-    # Out of capacity: one row wider than the inputs, which no pass holds.
-    wide = torch.ones(comm.capacity.inputs_bytes, dtype=bf16, device=comm.device)
+    # Out of capacity: one row wider than the staging, which no pass holds.
+    wide = torch.ones(comm.capacity.staging_bytes, dtype=bf16, device=comm.device)
     for shot in ("all_reduce_pull_one_shot", "all_reduce_pull_two_shot"):
         forced = _forced_whole(shot)
         error = _refused(comm, rank, shot, partial(comm.all_reduce, wide, **forced))
