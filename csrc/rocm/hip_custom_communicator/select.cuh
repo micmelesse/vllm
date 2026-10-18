@@ -639,7 +639,8 @@ static_assert(all_reduce_kernels_lay_out(),
 // writes them. rms_norm: one-shot through 128 KiB (at 64 KiB it lost at 16
 // tokens, 11.43 against 10.56 us; 2026-09-30T21-06-57Z); the push through 1.75
 // MiB (256 tokens of 3584: 18.04 against the pull's 18.41), the pull from 2.6
-// MiB (2026-10-01T03-26-44Z).
+// MiB (2026-10-01T03-26-44Z). At 7168 the push through 256 tokens since its first
+// barrier is unordered (31.1 against the pull's 32.6 us; 2026-10-18T10-14-39Z).
 constexpr TunedKernel kRmsNormKernels[] = {
     {8,
      1,
@@ -667,7 +668,7 @@ constexpr TunedKernel kRmsNormKernels[] = {
      Template::all_reduce_push_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
     {8,
-     129,
+     257,
      7168,
      Template::all_reduce_pull_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
@@ -682,7 +683,10 @@ constexpr TunedKernel kRmsNormKernels[] = {
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB
 // (192 tokens of 3584: 15.48 against the pull's 16.28), the pull at 1.75 MiB
-// (18.36 against the push's 18.46; 2026-10-01T03-26-44Z).
+// (18.36 against the push's 18.46; 2026-10-01T03-26-44Z). Since the push's first
+// barrier is unordered, the push through 512 tokens at 3584 (256 / 512: 18.9 / 32.6
+// against the pull's 22.5 / 35.3 us) and 256 at 7168 (128 / 256: 18.4 / 32.0
+// against 24.3 / 36.2; 2026-10-18T10-14-39Z).
 constexpr TunedKernel kAddRmsNormKernels[] = {
     {8,
      1,
@@ -695,7 +699,7 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
      Template::all_reduce_push_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
     {8,
-     193,
+     513,
      3584,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
@@ -710,7 +714,7 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
      Template::all_reduce_push_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
     {8,
-     97,
+     257,
      7168,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
@@ -728,7 +732,10 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
 // 384 27.7 against the push's 30.4; 7168 x 192 27.3 against 27.7). THE ONE-SHOT
 // BESIDE THE PUSH from 1 token: listed after it, so it runs only where the push
 // does not (a row narrower than a pack a rank); its grid the norms' one-shot's,
-// not swept.
+// not swept. THE PULL AT 512 THREADS, TILE_K 1, from 128 tokens: it beat the push
+// (unordered first barrier) at 128 / 256 tokens, 15.4 / 21.5 against 16.0 / 22.0 us
+// at 3584, 21.8 / 34.1 against 22.3 / 36.9 at 7168, and the 256-thread TILE_K 3 pull
+// at 256 x 7168 (36.3) (2026-10-18T10-14-39Z, 10-08-46Z).
 constexpr TunedKernel kAttnResKernels[] = {
     {8,
      1,
@@ -740,6 +747,11 @@ constexpr TunedKernel kAttnResKernels[] = {
      3584,
      Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
+    {8,
+     128,
+     3584,
+     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
     {8,
      257,
      3584,
@@ -756,10 +768,10 @@ constexpr TunedKernel kAttnResKernels[] = {
      Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {16, 0}}},
     {8,
-     193,
+     128,
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3}, {256, 0}}},
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
     {8,
      512,
      7168,
