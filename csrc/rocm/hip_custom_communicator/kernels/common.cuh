@@ -421,7 +421,7 @@ constexpr int kStatusFields = 10;
 enum class Until { launched, visible, read };
 
 // THE BARRIER, one for every case, and the whole protocol in one place:
-// barrier<WORLD, Until::read, 1>(the signals buffer, the status buffer, rank, timeout_ticks),
+// barrier<WORLD>(the signals buffer, the status buffer, rank, timeout_ticks, Until::read, 1),
 // each buffer its pointer, strides and sizes, as the kernel took them. Nothing outlives the
 // call. The PARITY is the kernel's: its k-th barrier, in source order, takes k % 2, so a launch
 // starts on parity 0 and, its barriers even in number, ends on 1 (dev/lint_kernels.sh checks
@@ -443,18 +443,20 @@ enum class Until { launched, visible, read };
 // lose it: an ordered barrier's wait for every wave's stores covers it; an
 // unordered one waits for the lane's own stores just before it signals, after
 // the whole phase between, so the clear has long landed.
-template <int WORLD, Until UNTIL, int PARITY>
+template <int WORLD>
 DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
                      int64_t signals_stride_parity,
                      int64_t signals_stride_block,
                      int64_t signals_stride_writer, int signals_size_parity,
                      int signals_size_block, int signals_size_writer,
                      uint32_t* status_ptr, int64_t status_stride_field,
-                     int status_size_field, int rank, uint64_t timeout_ticks) {
-  static_assert(PARITY == 0 || PARITY == 1, "a barrier's parity is 0 or 1");
-  constexpr bool kOrdered = UNTIL != Until::read;
-  constexpr bool kFirst = UNTIL == Until::launched;
-  constexpr uint32_t parity = PARITY;
+                     int status_size_field, int rank, uint64_t timeout_ticks, Until until,
+                     uint32_t parity) {
+  // UNTIL AND PARITY ARE PLAIN ARGUMENTS: barrier is force-inlined and every call passes literals,
+  // so they fold as template parameters would (I8, ISA summary).
+  if (HIP_CUSTOM_COMMUNICATOR_DEBUG && parity > 1) __builtin_trap();
+  const bool ordered = until != Until::read;
+  const bool first = until == Until::launched;
   // 1. SKEW, debug builds only: up to ~32 x 8K cycles, different per rank, block and parity.
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG) {
     uint32_t h = static_cast<uint32_t>(rank) * 73856093u ^
@@ -468,10 +470,10 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
   // ISA), so the releasing wave's fence would cover only its own stores, and another wave's
   // could still be in flight when the flag lands -- a remote store above all.
-  if constexpr (kOrdered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  if (ordered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
   if (threadIdx.x < WORLD) {
-    if constexpr (!kOrdered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (!ordered) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     // 3. THE TWO FLAGS, from the signals buffer [R, 2, B, R]: rank `owner`'s for block `block`
     // on rank `writer`, at `parity` (every rank's address, its strides and its sizes; debug
     // builds check each index against its size). AN INDEX KEEPS ITS CALLER'S TYPE (a block
@@ -496,7 +498,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
     // 4. SIGNAL: a SYSTEM-scope atomic store, release when ordered. A flag is touched only by
     // the __scoped_atomic builtins, each with its order and scope spelled at the call.
     __scoped_atomic_store_n(theirs_ptr, static_cast<uint32_t>(FlagState::arrived),
-                            kOrdered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
+                            ordered ? __ATOMIC_RELEASE : __ATOMIC_RELAXED,
                             __MEMORY_SCOPE_SYSTEM);
     // 5. WAIT, AT SYSTEM SCOPE, for the flag a peer's system-scope release stored. Spins
     // relaxed and acquires once, after: an acquire per poll would invalidate the caches on
@@ -538,7 +540,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
                 static_cast<uint32_t>(FaultState::writing), false, __ATOMIC_RELAXED,
                 __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
           *word(StatusField::where) =
-              static_cast<uint32_t>(kFirst ? Where::start : Where::peer_barrier);
+              static_cast<uint32_t>(first ? Where::start : Where::peer_barrier);
           *word(StatusField::rank) = static_cast<uint32_t>(rank);
           *word(StatusField::block) = blockIdx.x;
           *word(StatusField::peer) = threadIdx.x;
@@ -556,7 +558,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
       __builtin_amdgcn_endpgm();
     }
     // 6. ACQUIRE, ordered only: one SYSTEM-scope acquire once the flag is seen.
-    if constexpr (kOrdered) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    if (ordered) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     // 7. CLEAR: a relaxed system-scope store into this rank's own flag.
     __scoped_atomic_store_n(mine_ptr, static_cast<uint32_t>(FlagState::clear),
                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
@@ -778,7 +780,7 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     ordered barrier's release completes and publishes them, BARRIER); every_slot, every slot of
 //     entry x_rank (a load's registers U[WORLD][kRows][kPacks][kPackElems], writer order: the inbox's WORLD
 //     writers); lane, the block as WORLD rows of threads, a rank's copy each (kThreadsN =
-//     THREADS_PER_BLOCK / WORLD): a load's entry x_rank differs across the wave (each lane's rank);
+//     THREADS_PER_BLOCK / WORLD): a load's entry x_rank is its row's rank (per lane when a row is narrower than a wave);
 //     a store's is this rank's, from the first row only (a reduce over the rows, AXIS m, leaves the
 //     result there).
 //   QUANTIZATION: none, the buffer holds the registers' dtype; int4, it holds their INT4 payload
@@ -831,7 +833,11 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
     // The entries as plain pointers (a kernel's own pointer is __restrict__).
     const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
     E* at;
-    if constexpr (RANKS == Ranks::lane)
+    // LANE, A RANK A ROW OF THREADS: rows of whole waves have a wave-uniform entry, a scalar read
+    // of it (ptr_array_at); rows narrower than a wave pick each lane's (lane_ptr_array_at: WORLD
+    // scalar reads and a select; all_gather's whole-wave rows through it were +86-143 VALU a
+    // plain two-shot, I8 ISA 2026-10-18T00-13-04Z).
+    if constexpr (RANKS == Ranks::lane && kThreadsN % kWaveSize != 0)
       at = lane_ptr_array_at<E, WORLD>(entries, input_ptr_array_size, entry);
     else if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
       at = reinterpret_cast<E*>(entries[0]);
