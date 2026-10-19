@@ -129,7 +129,7 @@ DINLINE void all_reduce_pull_one_shot_add_rms_norm_body(
 
 // THE KERNELS, one per op, both the body above.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -147,6 +147,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none, "this kernel supports only exact transfers");
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -159,7 +160,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 }
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -182,6 +183,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none, "this kernel supports only exact transfers");
   all_reduce_pull_one_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -700,6 +702,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -742,6 +746,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   all_reduce_pull_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -891,6 +897,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
@@ -934,6 +942,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, float eps) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   all_reduce_push_two_shot_add_rms_norm_body<DTYPE, WEIGHT_DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n,
       input_ptr_array, input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,

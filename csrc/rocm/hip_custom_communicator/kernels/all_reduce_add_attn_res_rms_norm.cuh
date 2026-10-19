@@ -27,7 +27,7 @@ namespace hip_custom_communicator {
 // there is nothing to gather. `blocks` is [m, num_sources, n] at its row,
 // source and column strides in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -58,6 +58,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
+  static_assert(QUANTIZATION == Quantization::none, "this kernel supports only exact transfers");
   constexpr int kPackElems = traits<DTYPE>::N;
   constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
   const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
@@ -315,6 +316,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps, int reduce_scatter_blocks) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   if constexpr (QUANTIZATION == Quantization::int4) {
     static_assert(TILE_M == 1, "the INT4 build is a row a block");
     (void)reduce_scatter_blocks;
@@ -448,6 +451,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
+  static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
+                "unsupported quantization");
   // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's
   // INT4 payload layout): found from each region's own sizes where read or
   // written.
