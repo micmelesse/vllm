@@ -81,8 +81,11 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
       static_assert(kLanes % kWaveSize == 0, "a rank's copy is whole waves");
       const int chunks = (slice + TILE_N - 1) / TILE_N;
+      // A ROW OF THREADS' RANK, whole waves, so read from the first lane: recv then takes its
+      // scalar path alone (from a lane's value it kept the per-lane select too, WORLD - 1 rank
+      // compares whose masks spilled to a VGPR in the plain two-shot: ISA 2026-10-19T03-16-52Z).
+      const int r = __builtin_amdgcn_readfirstlane((rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD);
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-        const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, a row of threads a rank, in one round trip.
         recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
