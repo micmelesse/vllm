@@ -30,10 +30,16 @@
 
 namespace hip_custom_communicator {
 
-// WHAT A BUFFER MUST HOLD FOR AN [m, n] INT4 PAYLOAD (kernels/common.cuh's layout): the values,
-// then the scales at int4_scales_offset.
+// WHAT A BUFFER MUST HOLD FOR AN [m, n] INT4 PAYLOAD, sized by the host from its own facts: a
+// 4-bit value an element (m * n / 2 bytes), rounded up to the scales' 256-byte alignment, then an
+// fp16 scale for each group of 32 elements of a row. The kernels place the payload themselves; a
+// CPU test holds this to the end of their layout's last scale.
+constexpr int64_t kInt4PayloadGroup = 32;
+constexpr int64_t kInt4PayloadScalesAlign = 256;
 constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
-  return int4_scales_offset(m, n) + m * (n / kInt4Group) * kInt4ScaleBytes;
+  const int64_t values = (m * n / 2 + kInt4PayloadScalesAlign - 1) / kInt4PayloadScalesAlign *
+                         kInt4PayloadScalesAlign;
+  return values + m * (n / kInt4PayloadGroup) * static_cast<int64_t>(sizeof(c10::Half));
 }
 
 // =================================================================================================

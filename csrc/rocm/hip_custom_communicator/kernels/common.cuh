@@ -84,18 +84,6 @@ constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's valu
 constexpr int kInt4WordBytes = 4;        // a pack's values
 constexpr int kInt4ScaleBytes = 2;       // a group's scale
 
-// AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
-// (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a
-// row's stride n / 2); its scales at int4_scales_offset(m, n) bytes past it, [m, n / kInt4Group]
-// fp16 (a row's stride n / kInt4Group). The offset is the buffer's own m and n alone (STANDARDS
-// 3.2: where an encoded buffer keeps its scales is worked out from its own sizes), so every rank
-// computes the same one. What a buffer must hold for it is the host's (select.cuh's
-// int4_payload_bytes).
-constexpr int64_t kInt4ScalesAlign = 256;
-__host__ __device__ constexpr int64_t int4_scales_offset(int64_t m, int64_t n) {
-  return (m * n / 2 + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-}
-
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 // A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
@@ -136,6 +124,18 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
                       float& scale);
 
 namespace internal {
+
+// AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
+// (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a
+// row's stride n / 2); its scales at int4_scales_offset(m, n) bytes past it, [m, n / kInt4Group]
+// fp16 (a row's stride n / kInt4Group). The offset is the buffer's own m and n alone (STANDARDS
+// 3.2: where an encoded buffer keeps its scales is worked out from its own sizes), so every rank
+// computes the same one. What a buffer must hold for it is the host's own sizing (config.cuh's
+// int4_payload_bytes).
+constexpr int64_t kInt4ScalesAlign = 256;
+__host__ __device__ constexpr int64_t int4_scales_offset(int64_t m, int64_t n) {
+  return (m * n / 2 + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
+}
 
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
 // addresses, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
