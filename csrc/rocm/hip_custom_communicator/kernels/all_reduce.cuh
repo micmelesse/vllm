@@ -73,6 +73,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int kPacks = TILE_N / (kPackElems * kThreadsN);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
+  // 0. Every rank's input entry, read before the barrier (load's entry form: the table is fixed
+  // for the launch), so its round trip runs under the barrier's.
+  const DTYPE* input_entries[WORLD];
+#pragma unroll
+  for (int r = 0; r < WORLD; ++r) input_entries[r] = load(input_ptr_array, input_ptr_array_size, r);
   // 1. Every rank's input is ready (written before its launch: the caller's,
   // or the host's copy) and visible (the first barrier is ordered).
   barrier<WORLD>(
@@ -83,8 +88,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
+#pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
     // same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];

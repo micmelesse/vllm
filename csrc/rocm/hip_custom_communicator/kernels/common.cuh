@@ -1440,8 +1440,20 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
       input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
 }
 
+// LOAD, AN ENTRY: entry x_rank of this rank's device array of pointers (a table, written by the
+// host before the launch), x_rank the same across the wave, into scalar registers. For a caller
+// that reads a peer's buffer only after a barrier: the entry is fixed for the launch, so it is
+// read before the barrier and its round trip (a cold scalar load, 914 cycles a wave at 16x3584,
+// ATT 2026-10-18T15-45-22Z) runs under the barrier's own, and the buffer is then passed to the
+// four as the one-entry array `&entry, 1`. aiter reads its RankData before start_sync the same
+// way.
+template <typename T>
+DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
+  return ptr_array_at(x_ptr_array, x_ptr_array_size, x_rank);
+}
+
 // RECV: rank input_rank's buffer (a peer's, over the fabric; the rank may differ by lane) into a
-// thread's registers.
+// thread's registers. A one-entry array (`&entry, 1`, an entry loaded earlier) is that entry.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
           typename PTR, typename OUTPUT>
 DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
@@ -1450,7 +1462,12 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
                   int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n, int row_step) {
   const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(input_rank);
-  if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
+  if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
+    read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+        entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
+        input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
+        row_step);
+  else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
     read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
         ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
         input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,

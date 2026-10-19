@@ -212,6 +212,12 @@ DINLINE void reduce_scatter(
               chunk * TILE_N, 1);
         }
       }
+      // THIS ROW OF THREADS' RANK w, and (pull) rank w's input entry, read before the barrier
+      // (load's entry form: the table is fixed for the launch).
+      const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
+      [[maybe_unused]] const DTYPE* input_entry = nullptr;
+      if constexpr (DIRECTION == Direction::pull)
+        input_entry = load(input_ptr_array, input_ptr_array_size, w);
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
@@ -223,7 +229,6 @@ DINLINE void reduce_scatter(
       const int len = share_len(rank);
       if (len != 0) {  // a late rank's share is empty at few packs (every block alike)
         for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
-          const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
           DTYPE got[1][kPacks][kPackElems];
           if constexpr (DIRECTION == Direction::push)
             load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::run>(
@@ -232,7 +237,7 @@ DINLINE void reduce_scatter(
                 got, 0, chunk * TILE_N, 1);
           else
             recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput>(
-                input_ptr_array, input_ptr_array_size, w, rank, slice, input_ptr_array_stride_m,
+                &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, len, got,
                 offs_m, chunk * TILE_N, 1);
           DTYPE rounded[1][kPacks][kPackElems];
