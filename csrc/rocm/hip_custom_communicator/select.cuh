@@ -899,15 +899,16 @@ constexpr Int4Crossover kInt4Crossovers[] = {
     // at 1.75 MiB a tie, 256 x 3584 15.3 against 16.1, 128 x 7168 15.3 against ~15.4;
     // 2026-10-18T12-14-52Z, 11-55-21Z).
     {OpType::all_reduce, 3584 * 1024},
-    // The norms from 7 MiB since their INT4 is a group a thread (forced INT4
-    // against the exact pick at 1024 x 3584 and 512 x 7168: rms 39.0 / 40.4
-    // against 44.8 / 54.5 us, add 44.0 / 45.9 against 63.0 / 59.3; at 3.5 MiB a
-    // tie, 30.3 / 31.3 against 28.5 / 32.6; 2026-10-18T05-49-21Z).
-    {OpType::all_reduce_rms_norm, 7 * 1024 * 1024},
-    {OpType::all_reduce_add_rms_norm, 7 * 1024 * 1024},
-    // AttnRes from 7 MiB since its INT4 is a group a thread (1024 x 3584: 47.4 us against the
-    // exact pick's 54.8; 2026-10-18T07-50-18Z, 04-52-25Z).
-    {OpType::all_reduce_add_attn_res_rms_norm, 7 * 1024 * 1024},
+    // The norms and AttnRes from 3.5 MiB, the plain all-reduce's, since their INT4 is the split
+    // (our plain INT4 all-reduce, then our norm or AttnRes kernel): at 3.5 MiB the split against
+    // the exact pick, 512 x 3584 / 256 x 7168, rms 22.2 / 22.5 against 28.2 / 31.2 us, add 23.2 /
+    // 23.4 against 32.2 / 31.9, AttnRes 27.3 / 27.8 against 31.4 / 33.4; at 1.75 MiB a tie or a
+    // loss, 256 x 3584 / 128 x 7168, rms 17.8 / 18.5 against 18.3 / 17.9, AttnRes 21.2 / 22.5
+    // against 21.0 / 21.7 (run 2026-10-18T23-56-01Z). Before the split: 7 MiB, their INT4 a group
+    // a thread (2026-10-18T05-49-21Z, 07-50-18Z).
+    {OpType::all_reduce_rms_norm, 3584 * 1024},
+    {OpType::all_reduce_add_rms_norm, 3584 * 1024},
+    {OpType::all_reduce_add_attn_res_rms_norm, 3584 * 1024},
 };
 // EACH OP'S INT4 KERNELS, its own list, consulted only from the op's crossover up
 // (kInt4Crossovers), where the exact lists pick two-shots (a one-shot moves its input as
@@ -957,32 +958,26 @@ constexpr TunedKernel kAllReduceInt4Kernels[] = {
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
 };
-// THE PULLED NORMS' INT4 KERNELS, their own: from the crossover
-// up select picks the pull, a group a thread, at the grid its sweep set
-// (forced, 64-384 blocks, 1024-8192 tokens; 2026-10-18T05-42-13Z): 256 blocks
-// of 128 threads at 3584, 128 of 256 at 7168, each within 10% of the best grid
-// at every size (rms 8192 x 7168 228.9 us, QuickReduce INT4 + rms_norm 412.3;
-// add 266.9 against 448.6). The grid the exact kernels run, 48, left INT4 at
-// 0.98-1.9x QuickReduce's (2026-10-18T05-23-31Z): a block a row, a group a
-// thread, so the grid is the rows in flight.
+// THE NORMS' INT4 KERNELS, their own: THE SPLIT at every size from the crossover (STANDARDS 3.2, *We
+// win at the op level*): our plain INT4 all-reduce into the local sums, then our separate norm
+// kernel (256 threads a row, a block a row: 8192 blocks cut to the rows). It beat the fused INT4
+// pull (a group a thread, 256 blocks of 128 threads at 3584, 128 of 256 at 7168) at every size
+// from 256 tokens and QuickReduce INT4 + the norm everywhere (run 2026-10-18T23-56-01Z, us):
+// rms 3584 x 512 / 1024 / 2048 / 4096 / 8192: 22.2 / 29.3 / 44.6 / 65.5 / 116.0 against the fused
+// pull's 29.9 / 38.8 / 64.6 / 92.3 / 145.1 and QR's 40.0 / 49.3 / 77.8 / 129.9 / 217.4; 7168:
+// 31.5 / 43.9 / 65.8 / 116.1 / 218.1 against 39.9 / 64.2 / 90.1 / 138.6 / 228.1 and QR's 50.0 /
+// 78.8 / 131.1 / 222.4 / 413.3. add: 3584 23.2 / 32.3 / 47.8 / 73.7 / 135.9 against 35.3 / 43.8 /
+// 66.6 / 95.3 / 149.6 and QR's 40.7 / 50.7 / 79.4 / 137.4 / 233.9; 7168 34.3 / 48.1 / 74.0 /
+// 136.1 / 260.3 against 45.4 / 68.4 / 98.2 / 154.8 / 265.9 and QR's 51.3 / 79.2 / 139.4 / 240.0 /
+// 450.9. The fused INT4 pull is no longer listed (a forced call runs it at its build and grid).
 constexpr TunedKernel kRmsNormInt4Kernels[] = {
     {8,
      1,
      3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
-    {8,
-     4096,
-     3584,
      Template::all_reduce_pull_split_rms_norm,
      {AllReduceRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
     {8,
-     4096,
+     1,
      7168,
      Template::all_reduce_pull_split_rms_norm,
      {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
@@ -991,20 +986,10 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
     {8,
      1,
      3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {128, 0}}},
-    {8,
-     4096,
-     3584,
      Template::all_reduce_pull_split_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
     {8,
-     4096,
+     1,
      7168,
      Template::all_reduce_pull_split_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
