@@ -1604,11 +1604,12 @@ class HipCustomCommunicator:
         )
         logger.info(
             "HipCustomCommunicator ready: exchange sized for %d rows of %d "
-            "(partials %.1f MiB, staging %.1f MiB)",
+            "(partials %.1f MiB, staging %.1f MiB), quantization=%s",
             self.capacity.max_rows,
             self.capacity.max_cols,
             self.capacity.partials_bytes / 2**20,
             self.capacity.staging_bytes / 2**20,
+            self.quantization,
         )
         return None
 

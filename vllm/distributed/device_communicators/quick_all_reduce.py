@@ -257,6 +257,7 @@ class QuickAllReduce:
             )
         self.create_shared_buffer()
         self.disabled = False
+        logger.info("QuickReduce ready: quantization=%s", self.qr_quant_level.name)
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
