@@ -14,65 +14,6 @@
 
 namespace hip_custom_communicator {
 
-// ATTNRES'S OWN MATH (moved from common.cuh, I3: only AttnRes calls it): the online softmax, a
-// tile's registers zeroed, and the weighted sum's fused multiply-add.
-// -------------------------------------------------------------------------------------------------
-// SOFTMAX
-//
-// THE ONLINE SOFTMAX, at thread scope: a softmax over logits that arrive a tile
-// at a time, folded into a running weighted sum without a second pass (flash
-// attention's).
-// -------------------------------------------------------------------------------------------------
-
-// THE SOFTMAX SO FAR, two registers: the largest logit seen (`softmax_max`,
-// from -INFINITY) and the sum of exp(logit - max) (`softmax_denominator`, from
-// 0). Folds N logits into them (a -INFINITY logit is no source). Returns the
-// scale the weighted sum so far takes, and in `scale` each logit's weight; the
-// sum is final once divided by softmax_denominator.
-template <int NUM_LOGITS>
-DINLINE float thread_softmax_fold(float& softmax_max, float& softmax_denominator,
-                                  const float (&logit)[NUM_LOGITS],
-                                  float (&scale)[NUM_LOGITS]) {
-  float new_max = softmax_max;
-#pragma unroll
-  for (int t = 0; t < NUM_LOGITS; ++t) new_max = fmaxf(new_max, logit[t]);
-  const float old_scale = __expf(softmax_max - new_max);
-  softmax_denominator *= old_scale;
-#pragma unroll
-  for (int t = 0; t < NUM_LOGITS; ++t) {
-    scale[t] = __expf(logit[t] - new_max);
-    softmax_denominator += scale[t];
-  }
-  softmax_max = new_max;
-  return old_scale;
-}
-
-template <typename T, int ROWS, int K, int P>
-DINLINE void zeros(T (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j) output[i][k][j] = T(0);
-}
-
-// output = a * a_row_scale + b * b_row_scale, a row's scales each.
-template <typename B, int ROWS, int K, int P>
-DINLINE void fma(const float (&a)[ROWS][K][P], const float (&a_row_scale)[ROWS],
-                 const B (&b)[ROWS][K][P], const float (&b_row_scale)[ROWS],
-                 float (&output)[ROWS][K][P]) {
-#pragma unroll
-  for (int i = 0; i < ROWS; ++i)
-#pragma unroll
-    for (int k = 0; k < K; ++k)
-#pragma unroll
-      for (int j = 0; j < P; ++j)
-        output[i][k][j] = fmaf(static_cast<float>(b[i][k][j]), b_row_scale[i],
-                               a[i][k][j] * a_row_scale[i]);
-}
-
-
 // ATTNRES, THE ONE FUNCTION every AttnRes kernel calls (the fused ones and our
 // separate one alike: the single place its math lives): the tile's ROWS rows at once,
 // TILE_K sources a step (the reduced dimension, Triton's BLOCK_L), so each step
@@ -166,7 +107,12 @@ DINLINE void attn_res(
         w[0][k][j] = static_cast<float>(norm_weight[0][k][j]) * static_cast<float>(qk_weight[0][k][j]);
     // THE SUM STARTS AT ZERO, here: registers start unset (a zeroed default
     // was 32 moves a source in the loop, ISA 2026-10-04T02-22-41Z).
-    zeros(acc);
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) acc[i][k][j] = float(0);
     // THE SOFTMAX SO FAR, a row's: its largest logit and the sum of exp(logit - max).
     float softmax_max[ROWS], softmax_denominator[ROWS];
 #pragma unroll
@@ -240,17 +186,43 @@ DINLINE void attn_res(
                         rsqrtf(sums[0][(m * TILE_K + s) * 2] * inv_hidden + eps)
                   : -INFINITY;
         float row_scale[TILE_K];
-        old_scale[m] = thread_softmax_fold(softmax_max[m], softmax_denominator[m], logit, row_scale);
+        float new_max = softmax_max[m];
+#pragma unroll
+        for (int t = 0; t < TILE_K; ++t) new_max = fmaxf(new_max, logit[t]);
+        const float previous_scale = __expf(softmax_max[m] - new_max);
+        softmax_denominator[m] *= previous_scale;
+#pragma unroll
+        for (int t = 0; t < TILE_K; ++t) {
+          row_scale[t] = __expf(logit[t] - new_max);
+          softmax_denominator[m] += row_scale[t];
+        }
+        softmax_max[m] = new_max;
+        old_scale[m] = previous_scale;
 #pragma unroll
         for (int s = 0; s < TILE_K; ++s) scale[s][m] = row_scale[s];
       }
-      fma(acc, old_scale, v[0], scale[0], acc);
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j)
+            acc[i][k][j] = fmaf(static_cast<float>(v[0][i][k][j]), scale[0][i],
+                                acc[i][k][j] * old_scale[i]);
       if constexpr (TILE_K > 1) {
         float ones[ROWS];
 #pragma unroll
         for (int m = 0; m < ROWS; ++m) ones[m] = 1.0f;
 #pragma unroll
-        for (int s = 1; s < TILE_K; ++s) fma(acc, ones, v[s], scale[s], acc);
+        for (int s = 1; s < TILE_K; ++s)
+#pragma unroll
+          for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+            for (int k = 0; k < K; ++k)
+#pragma unroll
+              for (int j = 0; j < P; ++j)
+                acc[i][k][j] = fmaf(static_cast<float>(v[s][i][k][j]), scale[s][i],
+                                    acc[i][k][j] * ones[i]);
       }
     };
     for (int src0 = 0; src0 < full; src0 += TILE_K)
