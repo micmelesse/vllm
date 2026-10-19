@@ -287,26 +287,34 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       }
     });
     HIP_CHECK(hipGetLastError());
+    with_config<OpType::all_reduce_rms_norm>(config, [&]<Config C>() {
+      using T = typename of_dtype<C.dtype>::t;
+      using W = typename of_dtype<C.weight_dtype>::t;
+      h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
+          dtype, stream);
+      if constexpr (C.kernel == Kernel::rms_norm_rows) {
+        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
+            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          static_cast<const T*>(h.sums()),
+          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
+          static_cast<int>(input_size_n), static_cast<const W*>(weight), weight_stride_n,
+          static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
+          output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), eps);
+      }
+    });
+    HIP_CHECK(hipGetLastError());
+    return config;
   }
   with_config<OpType::all_reduce_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
         dtype, stream);
-    const InputTable t = config.split || config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::none
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
-    if constexpr (C.kernel == Kernel::rms_norm_rows) {
-      rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
-        static_cast<const T*>(h.sums()),
-        input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-        static_cast<int>(input_size_n), static_cast<const W*>(weight), weight_stride_n,
-        static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
-        output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), eps);
-    }
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_rms_norm) {
       all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
@@ -522,31 +530,39 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
       }
     });
     HIP_CHECK(hipGetLastError());
+    with_config<OpType::all_reduce_add_rms_norm>(config, [&]<Config C>() {
+      using T = typename of_dtype<C.dtype>::t;
+      using W = typename of_dtype<C.weight_dtype>::t;
+      h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
+          input_size_n, dtype, stream);
+      if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
+        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
+            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          static_cast<const T*>(h.sums()),
+          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
+          static_cast<int>(input_size_n), static_cast<const T*>(residual), residual_stride_m,
+          residual_stride_n, static_cast<int>(residual_size_m),
+          static_cast<int>(residual_size_n), static_cast<const W*>(weight), weight_stride_n,
+          static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
+          output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), static_cast<T*>(residual_output),
+          residual_output_stride_m, residual_output_stride_n,
+          static_cast<int>(residual_output_size_m),
+          static_cast<int>(residual_output_size_n), eps);
+      }
+    });
+    HIP_CHECK(hipGetLastError());
+    return config;
   }
   with_config<OpType::all_reduce_add_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
-    const InputTable t = config.split || config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::none
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
-    if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
-      add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
-        static_cast<const T*>(h.sums()),
-        input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-        static_cast<int>(input_size_n), static_cast<const T*>(residual), residual_stride_m,
-        residual_stride_n, static_cast<int>(residual_size_m),
-        static_cast<int>(residual_size_n), static_cast<const W*>(weight), weight_stride_n,
-        static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
-        output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), static_cast<T*>(residual_output),
-        residual_output_stride_m, residual_output_stride_n,
-        static_cast<int>(residual_output_size_m),
-        static_cast<int>(residual_output_size_n), eps);
-    }
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_rms_norm) {
       all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
@@ -821,41 +837,49 @@ all_reduce_add_attn_res_rms_norm(
       }
     });
     HIP_CHECK(hipGetLastError());
+    with_config<OpType::all_reduce_add_attn_res_rms_norm>(config, [&]<Config C>() {
+      using T = typename of_dtype<C.dtype>::t;
+      using W = typename of_dtype<C.weight_dtype>::t;
+      h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
+          input_size_n, dtype, stream);
+      if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
+        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu>
+            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          static_cast<const T*>(h.sums()),
+          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
+          static_cast<int>(input_size_n), static_cast<const T*>(prefix), prefix_stride_m,
+          prefix_stride_n, static_cast<int>(prefix_size_m),
+          static_cast<int>(prefix_size_n), static_cast<const T*>(blocks), blocks_stride_m,
+          blocks_stride_r, blocks_stride_n, static_cast<int>(blocks_size_m),
+          static_cast<int>(blocks_size_r), static_cast<int>(blocks_size_n),
+          static_cast<const T*>(norm_weight), norm_weight_stride_n,
+          static_cast<int>(norm_weight_size_n), static_cast<const T*>(qk_weight),
+          qk_weight_stride_n, static_cast<int>(qk_weight_size_n),
+          static_cast<const T*>(output_norm_weight), output_norm_weight_stride_n,
+          static_cast<int>(output_norm_weight_size_n), static_cast<T*>(prefix_output),
+          prefix_output_stride_m, prefix_output_stride_n,
+          static_cast<int>(prefix_output_size_m),
+          static_cast<int>(prefix_output_size_n), static_cast<T*>(output), output_stride_m,
+          output_stride_n, static_cast<int>(output_size_m),
+          static_cast<int>(output_size_n), static_cast<T*>(block_output),
+          block_output_stride_m, block_output_stride_n,
+          static_cast<int>(block_output_size_m),
+          static_cast<int>(block_output_size_n), num_blocks, eps,
+          output_eps);
+      }
+    });
+    HIP_CHECK(hipGetLastError());
+    return config;
   }
   with_config<OpType::all_reduce_add_attn_res_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
-    const InputTable t = config.split || config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::none
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
-    if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
-      add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
-        static_cast<const T*>(h.sums()),
-        input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-        static_cast<int>(input_size_n), static_cast<const T*>(prefix), prefix_stride_m,
-        prefix_stride_n, static_cast<int>(prefix_size_m),
-        static_cast<int>(prefix_size_n), static_cast<const T*>(blocks), blocks_stride_m,
-        blocks_stride_r, blocks_stride_n, static_cast<int>(blocks_size_m),
-        static_cast<int>(blocks_size_r), static_cast<int>(blocks_size_n),
-        static_cast<const T*>(norm_weight), norm_weight_stride_n,
-        static_cast<int>(norm_weight_size_n), static_cast<const T*>(qk_weight),
-        qk_weight_stride_n, static_cast<int>(qk_weight_size_n),
-        static_cast<const T*>(output_norm_weight), output_norm_weight_stride_n,
-        static_cast<int>(output_norm_weight_size_n), static_cast<T*>(prefix_output),
-        prefix_output_stride_m, prefix_output_stride_n,
-        static_cast<int>(prefix_output_size_m),
-        static_cast<int>(prefix_output_size_n), static_cast<T*>(output), output_stride_m,
-        output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), static_cast<T*>(block_output),
-        block_output_stride_m, block_output_stride_n,
-        static_cast<int>(block_output_size_m),
-        static_cast<int>(block_output_size_n), num_blocks, eps,
-        output_eps);
-    }
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) {
       all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
           C.waves_per_eu>
