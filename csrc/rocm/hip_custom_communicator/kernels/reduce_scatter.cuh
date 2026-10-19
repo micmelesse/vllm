@@ -212,12 +212,13 @@ DINLINE void reduce_scatter(
               chunk * TILE_N, 1);
         }
       }
-      // THIS ROW OF THREADS' RANK w, and (pull) rank w's input entry, read before the barrier
-      // (load's entry form: the table is fixed for the launch).
+      // THIS ROW OF THREADS' RANK w, (pull) rank w's input entry and this rank's partials entry,
+      // read before the barrier (load's entry form: the tables are fixed for the launch).
       const int w = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
       [[maybe_unused]] const DTYPE* input_entry = nullptr;
       if constexpr (DIRECTION == Direction::pull)
         input_entry = load(input_ptr_array, input_ptr_array_size, w);
+      char* const partials_entry = load(partials_ptr_array, partials_ptr_array_size, rank);
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
                               signals_size_block, signals_size_writer, status_ptr,
@@ -242,7 +243,7 @@ DINLINE void reduce_scatter(
                 offs_m, chunk * TILE_N, 1);
           DTYPE rounded[1][kPacks][kPackElems];
           reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
-          store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
+          store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
