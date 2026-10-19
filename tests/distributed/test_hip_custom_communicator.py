@@ -560,6 +560,7 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         assert any(r.kind is LogKind.copy_in_issued for r in log.records)
 
 
+@pytest.mark.smoke
 @on_eight_gpus
 def test_basic_correctness() -> None:
     """Open, each op once at a decode row, a prefill-sized all-reduce and one
@@ -681,6 +682,7 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
                         print(f"{op} {hidden} {dtype} {forced}: refused at every size")
 
 
+@pytest.mark.example
 @on_eight_gpus
 @pytest.mark.parametrize("op", get_args(Op))
 def test_op_matches_the_ops_it_replaces(op: Op) -> None:
@@ -935,6 +937,7 @@ def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _unquantized_case(comm, rank)
 
 
+@pytest.mark.example
 @on_eight_gpus
 def test_int4_two_shot_matches_the_format_it_moves() -> None:
     # Every rank's slice of each row is whole INT4 groups.
@@ -1022,6 +1025,7 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _assert_clean(comm, "past the box")
 
 
+@pytest.mark.example
 @on_eight_gpus
 def test_refused_calls_name_why_and_fall_back_cleanly() -> None:
     _on_every_rank(_refusals_on_rank)
@@ -1052,6 +1056,7 @@ def _warmup_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _assert_clean(comm, "warmup")
 
 
+@pytest.mark.example
 @on_eight_gpus
 def test_capture_warmup_launches_nothing() -> None:
     """A capture's warmup, which vLLM runs on the capture stream and discards,
@@ -1064,6 +1069,8 @@ def test_capture_warmup_launches_nothing() -> None:
 # --------------------------------------------------------------------------------
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 def test_python_names_match_the_build() -> None:
     """`Error` and `Where` are C++'s, name for name in order, and `Op` names C++'s
     ops."""
@@ -1076,6 +1083,8 @@ def test_python_names_match_the_build() -> None:
     assert set(get_args(Op)) == set(built.op_names)
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
     launch; a two-shot or a split lists each exact build again moving INT4 (a
@@ -1107,6 +1116,8 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert not int4, name
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("op", "rows", "cols", "quantization", "launch", "want"),
     [
@@ -1181,6 +1192,8 @@ def test_build_info_tuned_is_selects_pick(
     assert got == want, got
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 def test_build_info_tuned_takes_a_launch_whole() -> None:
     """A launch is its algorithm and its direction, both or neither."""
     import vllm._rocm_C  # noqa: F401
@@ -1193,6 +1206,8 @@ def test_build_info_tuned_takes_a_launch_whole() -> None:
     assert isinstance(got, Ran) and got.quantization == "none", got
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401
 
@@ -1202,6 +1217,8 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     assert got is Error.no_such_group
 
 
+@pytest.mark.example
+@pytest.mark.gpu
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])
 def test_supported_is_the_builds_answer(size: int) -> None:
     """This device runs exactly the worlds `build_info` says are built."""
@@ -1215,6 +1232,8 @@ def test_supported_is_the_builds_answer(size: int) -> None:
         assert got is Error.world_not_built
 
 
+@pytest.mark.example
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("variable", "given", "want"),
     [

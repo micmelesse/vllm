@@ -124,6 +124,15 @@ enable_error_code = ["method-assign"]
 
 [tool.pytest.ini_options]
 markers = [
+    "cpu: communicator test requires no GPU",
+    "gpu: communicator test requires one GPU",
+    "multi_gpu: test requires multiple GPUs (derived by multi_gpu_marks)",
+    "smoke: basic correctness of major functions",
+    "example: specific input with an expected result",
+    "regression: reproduces a fixed bug",
+    "property: generated inputs checking an invariant",
+    "stress: repeated operations checking timing and ordering",
+    "fixture: recorded input through the real path",
     "slow_test",
     "skip_global_cleanup",
     "core_model: enable this model test in each PR instead of only nightly",

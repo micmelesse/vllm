@@ -2050,11 +2050,12 @@ def multi_gpu_marks(*, num_gpus: int):
     """Get a collection of pytest marks to apply for `@multi_gpu_test`."""
     test_selector = pytest.mark.distributed(num_gpus=num_gpus)
     test_skipif = pytest.mark.skipif(
-        current_platform.device_count() < num_gpus,
+        "__import__('vllm.platforms', fromlist=['current_platform'])"
+        f".current_platform.device_count() < {num_gpus}",
         reason=f"Need at least {num_gpus} GPUs to run the test.",
     )
 
-    return [test_selector, test_skipif]
+    return [pytest.mark.multi_gpu, test_selector, test_skipif]
 
 
 def multi_gpu_test(*, num_gpus: int):
