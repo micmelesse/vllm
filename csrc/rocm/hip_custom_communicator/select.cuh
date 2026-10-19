@@ -734,16 +734,6 @@ constexpr TunedKernel kRmsNormKernels[] = {
      16384,
      Template::all_reduce_pull_one_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    {8,
-     4096,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
 };
 
 // add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB
@@ -796,16 +786,6 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
      16384,
      Template::all_reduce_pull_one_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    {8,
-     4096,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
 };
 
 // AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68
@@ -864,16 +844,6 @@ constexpr TunedKernel kAttnResKernels[] = {
      7168,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
-    {8,
-     4096,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
 };
 
 // INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
