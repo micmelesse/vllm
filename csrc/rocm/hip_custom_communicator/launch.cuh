@@ -70,30 +70,28 @@ inline void launch_all_reduce(Handle& h, const AllReduceLaunch& l) {
   if (in_place && l.algorithm == Algorithm::one_shot)
     Call<AllReduceOneShotInPlaceKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, t.ptr_array, t.ptr_array_size,
+        h.signals_ptr_array(), h.signals_ptr_array_size(), h.rank(),
+        h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
         t.stride_m, t.stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
-        h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.signals_size_parity(),
+        static_cast<int>(l.output_size_n), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-        h.status_stride_field(), h.status_size_field(), h.rank(),
-        h.timeout_ticks());
+        h.status_stride_field(), h.status_size_field(), h.timeout_ticks());
   else if (in_place)
     Call<AllReduceTwoShotInPlaceKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, t.ptr_array, t.ptr_array_size,
+        h.signals_ptr_array(), h.signals_ptr_array_size(), h.partials_ptr_array(),
+        h.partials_ptr_array_size(), h.rank(),
+        h.signals_stride_parity(), h.signals_stride_block(), h.signals_stride_writer(),
         t.stride_m, t.stride_n, static_cast<int>(l.input_size_m),
         static_cast<int>(l.input_size_n), l.output, l.output_stride_m,
         l.output_stride_n, static_cast<int>(l.output_size_m),
-        static_cast<int>(l.output_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-        l.partials_stride_m, l.partials_stride_n,
+        static_cast<int>(l.output_size_n), l.partials_stride_m, l.partials_stride_n,
         static_cast<int>(l.partials_size_m),
-        static_cast<int>(l.partials_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
-        h.signals_stride_parity(), h.signals_stride_block(),
-        h.signals_stride_writer(), h.signals_size_parity(),
+        static_cast<int>(l.partials_size_n), h.signals_size_parity(),
         h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-        h.status_stride_field(), h.status_size_field(), h.rank(),
-        h.timeout_ticks());
+        h.status_stride_field(), h.status_size_field(), h.timeout_ticks());
   else if (l.algorithm == Algorithm::one_shot)
     Call<AllReduceOneShotPushedKernel>::run(
         l.kernel, l.blocks_per_grid, l.threads_per_block, l.stream, l.input,
