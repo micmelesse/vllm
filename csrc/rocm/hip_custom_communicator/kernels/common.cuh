@@ -472,7 +472,11 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   // unsigned, as blockIdx.x; a rank as passed): an int where the caller had an unsigned costs
   // a sign extension in every kernel. Theirs: this lane's peer's, written by this rank; mine:
   // this rank's, written by this lane's peer.
-  const auto flag = [&](auto owner, unsigned block, auto writer) {
+  // THE OWNER'S SIGNALS are its entry of the table: theirs a lane's peer (lane_ptr_array_at),
+  // mine this rank's, the same across the wave, so one scalar read (ptr_array_at; through the
+  // lane form it was WORLD - 1 rank compares and a select chain, their masks spilled to a VGPR in
+  // the plain two-shot: ISA 2026-10-19T03-07-38Z), kept a global pointer as the lane form's is.
+  const auto flag = [&](uint32_t* owner_signals, auto owner, unsigned block, auto writer) {
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
         (static_cast<int64_t>(owner) < 0 || static_cast<int64_t>(owner) >= WORLD ||
          static_cast<int64_t>(parity) >= signals_size_parity ||
@@ -480,9 +484,7 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
          static_cast<int64_t>(writer) < 0 ||
          static_cast<int64_t>(writer) >= signals_size_writer))
       __builtin_trap();
-    return lane_ptr_array_at<uint32_t, WORLD>(signals_ptr_array, signals_ptr_array_size,
-                                    static_cast<int>(owner)) +
-           parity * signals_stride_parity + block * signals_stride_block +
+    return owner_signals + parity * signals_stride_parity + block * signals_stride_block +
            writer * signals_stride_writer;
   };
   // THEIR ADDRESSES FIRST, before the block barrier: the signals table is fixed at open, so its
@@ -491,8 +493,12 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
   uint32_t* theirs_ptr = nullptr;
   uint32_t* mine_ptr = nullptr;
   if (threadIdx.x < WORLD) {
-    theirs_ptr = flag(threadIdx.x, blockIdx.x, rank);
-    mine_ptr = flag(rank, blockIdx.x, threadIdx.x);
+    theirs_ptr = flag(lane_ptr_array_at<uint32_t, WORLD>(signals_ptr_array, signals_ptr_array_size,
+                                                        static_cast<int>(threadIdx.x)),
+                      threadIdx.x, blockIdx.x, rank);
+    mine_ptr = flag((uint32_t*)(__attribute__((address_space(1))) uint32_t*)ptr_array_at(
+                        signals_ptr_array, signals_ptr_array_size, rank),
+                    rank, blockIdx.x, threadIdx.x);
   }
   // 3. EVERY WAVE'S STORES DONE before a block barrier that one wave then releases:
   // `__syncthreads` waits for none (gfx9 emits no vmcnt wait before s_barrier; seen in the
