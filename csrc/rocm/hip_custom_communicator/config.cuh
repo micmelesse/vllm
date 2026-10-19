@@ -75,11 +75,14 @@ constexpr BuildConfig kAllReduceOneShotConfigs[] = {
     AllReduceBuildConfig{256, 1, 1, 2048},
     AllReduceBuildConfig{512, 1, 1, 4096},
 };
-// The plain two-shot: a group a thread of a row of threads a rank, at eight
-// ranks (512, a wave per peer). The grid is the size's (kAllReduceKernels). 512
-// threads, 64 a rank's row: a row is whole waves (the kernel's static_assert).
+// The plain two-shot: 512 threads divided into whole waves per peer. The
+// eight-rank tile is 512 elements; four and two ranks need 1024 and 2048
+// elements respectively so every lane owns a complete pack. Keep the tuned
+// eight-rank build first; fallback picks use the smallest valid tile below.
 constexpr BuildConfig kAllReduceTwoShotExactConfigs[] = {
     AllReduceBuildConfig{512, 1, 1, 512},
+    AllReduceBuildConfig{512, 1, 1, 1024},
+    AllReduceBuildConfig{512, 1, 1, 2048},
 };
 constexpr auto kAllReduceTwoShotConfigs = and_int4(kAllReduceTwoShotExactConfigs);
 constexpr BuildConfig kRmsNormOneShotConfigs[] = {
@@ -519,7 +522,8 @@ constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
 }
 constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
                                  int nl) {
-  return c.tile_m == 1 && c.threads_per_block % world == 0 &&
+  return world > 0 && c.tile_m == 1 && c.threads_per_block % world == 0 &&
+         (c.threads_per_block / world) % kWaveSize == 0 &&
          c.tile_n % (nl * (c.threads_per_block / world)) == 0;
 }
 constexpr bool all_reduce_kernels_lay_out() {
@@ -1104,6 +1108,32 @@ constexpr int tuned_world(OpType o, int world) {
   return w;
 }
 
+// A nearest-world tuning entry supplies the algorithm and grid, but its tile
+// must also lay out at the actual world. Preserve every valid entry (including
+// all world-eight picks); widen only an incompatible plain two-shot tile to
+// the smallest listed build with the same threads, waves and quantization.
+// Explicit forcings never pass through this fallback.
+constexpr std::variant<TunedKernel, Error> at_world(TunedKernel k, int world,
+                                                   DType dtype) {
+  if (op_of(k.fn) != OpType::all_reduce || !is_two_shot(k.fn)) return k;
+  const auto original = std::get<AllReduceBuildConfig>(k.config.build);
+  const int pack_elems = kBuild.memory.pack_bytes / elem_bytes(dtype);
+  if (two_shot_lays_out(original, world, pack_elems)) return k;
+  const AllReduceBuildConfig* best = nullptr;
+  for (const BuildConfig& listed : builds_of(k.fn)) {
+    const auto& b = std::get<AllReduceBuildConfig>(listed);
+    if (b.threads_per_block != original.threads_per_block ||
+        b.waves_per_eu != original.waves_per_eu ||
+        b.tile_m != original.tile_m || b.quantization != original.quantization ||
+        b.tile_n < original.tile_n || !two_shot_lays_out(b, world, pack_elems))
+      continue;
+    if (!best || b.tile_n < best->tile_n) best = &b;
+  }
+  if (!best) return Error::tile_not_built;
+  k.config.build = *best;
+  return k;
+}
+
 constexpr std::variant<TunedKernel, Error> pick(
     OpType o, int world, int64_t m, int64_t n, int64_t tile_cols, DType dtype,
     std::span<const TunedKernel> kernels) {
@@ -1130,7 +1160,7 @@ constexpr std::variant<TunedKernel, Error> pick(
     if (!least || k.m < least->m) least = &k;
     if (k.m <= as_rows && (!most || k.m > most->m)) most = &k;
   }
-  return most ? *most : *least;
+  return at_world(most ? *most : *least, world, dtype);
 }
 // The op's exact kernels.
 constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
@@ -1348,6 +1378,7 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 inline std::variant<std::optional<Chosen>, Error> tuned(
     OpType o, int world, int64_t m, int64_t n, DType dtype, int quantization,
     std::optional<Template> fn) {
+  if (world <= 0) return Error::world_not_built;
   const std::span<const TunedKernel> listed =
       quantization == Quantization::int4 ? op(o).int4_kernels : op(o).kernels;
   std::vector<TunedKernel> of_fn;
