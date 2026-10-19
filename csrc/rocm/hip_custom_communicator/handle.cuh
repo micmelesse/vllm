@@ -120,7 +120,7 @@ constexpr int64_t kSignalsRegionBytes = (kSignalsBytes + 4095) / 4096 * 4096;
 constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 
 // THE ARENA'S LAYOUT, the same offsets on every rank (bytes from the arena's
-// base; `arena_layout` computes it from the sizes open is given, select.cuh's
+// base; `arena_layout` computes it from the sizes open is given, config.cuh's
 // `exchange_sizes`). A signal pad, then ONE PUBLISHED REGION PER PHASE, whose
 // data peers may still read while this rank writes the next phase's:
 //
@@ -142,7 +142,7 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // Rank r's region is at its arena's base (wherever its IPC opening put it)
 // plus the region's offset, written into the region's device array at open. INT4 IS AN ENCODING, NOT A
 // REGION: each region is sized for the largest encoding it may hold
-// (select.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
+// (config.cuh's `exchange_sizes`: the larger of the exact bytes and the INT4
 // values plus scales at the largest problem), and the encoding lays out the
 // inside (common.cuh's INT4 payload layout: values, then scales at an offset from
 // the call's m and n, the same on every rank).
@@ -489,9 +489,9 @@ class Handle {
   // fault and leaves (common.cuh's BARRIER), the caller's: the process group's
   // own timeout, as every other collective on it has. THE EXCHANGE'S SIZES are
   // the caller's too, computed from the largest call it serves, `max_rows` rows
-  // of at most `max_cols` columns (select.cuh's `exchange_sizes`): kept, so
+  // of at most `max_cols` columns (config.cuh's `exchange_sizes`): kept, so
   // what the buffers were sized for can be asked. `quantization`: what the tuned path moves
-  // across the links, a Quantization (select.cuh's `quantizes`).
+  // across the links, a Quantization (config.cuh's `quantizes`).
   // `device`: the device the communicator was given (open checks it is the
   // current one). `log_mode`: what the log records (log.cuh). `rccl_ready`:
   // whether the caller found the device group's RCCL communicator set up (1),
@@ -674,7 +674,7 @@ class Handle {
   int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
-  // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (select.cuh's
+  // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (config.cuh's
   // Algorithm::split), written by its plain all-reduce and read by its own
   // epilogue kernel after it on the stream. Never a peer's (not in the arena:
   // hipMalloc, cacheable), so nothing orders it but the stream. Sized as the
@@ -911,7 +911,7 @@ class Handle {
   // device's CUs. A peer barrier spins until the same block on every peer
   // arrives, so a grid past it can hang (select refuses it,
   // grid_not_resident). Asked once per kernel and block size, then cached; no
-  // dynamic LDS (launch.cuh launches with 0).
+  // dynamic LDS (Config selects zero shared memory).
   int resident_blocks(const void* kernel, int threads) const {
     const std::pair<const void*, int> key{kernel, threads};
     if (const auto it = resident_.find(key); it != resident_.end())

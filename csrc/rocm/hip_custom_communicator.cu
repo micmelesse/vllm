@@ -212,26 +212,22 @@ using Answer = std::vector<int64_t>;
 Answer refusal(hip_custom_communicator::Error e) {
   return {static_cast<int64_t>(e)};
 }
-template <typename LAUNCH>
-Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
+Answer answer(const std::variant<hip_custom_communicator::Config,
+                                 hip_custom_communicator::Error>& got) {
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
     return refusal(*e);
-  const LAUNCH& l = std::get<LAUNCH>(got);
-  int64_t tile_k = 0, reduce_scatter_blocks = 0;
-  if constexpr (requires { l.tile_k; }) tile_k = l.tile_k;
-  if constexpr (requires { l.reduce_scatter_blocks; })
-    reduce_scatter_blocks = l.reduce_scatter_blocks;
+  const auto& config = std::get<hip_custom_communicator::Config>(got);
   return {-1,
-          static_cast<int64_t>(l.algorithm),
-          static_cast<int64_t>(l.direction),
-          l.tile_m,
-          l.tile_n,
-          l.threads_per_block,
-          l.blocks_per_grid,
-          l.waves_per_eu,
-          tile_k,
-          reduce_scatter_blocks,
-          static_cast<int64_t>(l.quantization)};
+          static_cast<int64_t>(config.algorithm),
+          static_cast<int64_t>(config.direction),
+          config.tile_m,
+          config.tile_n,
+          config.threads,
+          config.blocks,
+          config.waves_per_eu,
+          config.tile_k,
+          config.reduce_scatter_blocks,
+          static_cast<int64_t>(config.quantization)};
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
@@ -241,7 +237,7 @@ Answer answer(const std::variant<LAUNCH, hip_custom_communicator::Error>& got) {
 // before it reports a fault. `max_rows` and `max_cols`: the largest call it
 // serves (for a model, the server's tokens a batch by its hidden size), from
 // which its exchange is sized (`exchange_sizes`). `quantization`: what its
-// tuned calls move across the links, a Quantization (select.cuh's
+// tuned calls move across the links, a Quantization (config.cuh's
 // `quantizes`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
 // caller found the device group's RCCL communicator set up (1), not (0), or
 // could not tell (-1), logged as an observation. A torch op cannot return a
@@ -342,7 +338,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
           b);
     counts.push_back(static_cast<int64_t>(t.builds.size()));
   }
-  // EACH OP'S PLAIN CALL (kOps, select.cuh), in `ops`' order: its dtypes and
+  // EACH OP'S PLAIN CALL (kOps, config.cuh), in `ops`' order: its dtypes and
   // its weight's besides its input's, flat, and four ints an op: those two
   // counts, widest_row and two_d. What a call may hold is a communicator's
   // (`hip_custom_communicator_capacity`), not the build's.
@@ -362,7 +358,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
           op_weights, op_facts};
 }
 
-// THE TUNED KERNEL, select's own pick as a query (select.cuh's `tuned`): for
+// THE TUNED KERNEL, select's own pick as a query (config.cuh's `tuned`): for
 // op `op_name` at `rows` x `cols` of `dtype` (C++'s DType name) on `world`
 // ranks, from its list of `quantization`, among the entries of the template
 // `algorithm` and `direction` name (both or neither: neither is every

@@ -21,7 +21,7 @@ namespace hip_custom_communicator {
 //
 // THE HARDWARE: each target's facts, as the device and AMD's docs report them.
 // No decision lives here: BUILD derives what a build is from them,
-// select.cuh a launch from them, the input and each op's tuned kernels
+// config.cuh a launch from them, the input and each op's tuned kernels
 // (measured, each citing its sweep). A new target is one more `Hardware`;
 // `kTarget` is the one the host tunes for.
 // =================================================================================================
@@ -149,7 +149,7 @@ static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize,
 //
 // THE BUILD: every number fixed at compile time, derived from the device's
 // `Hardware` (HARDWARE) and nothing else; what depends on the input is
-// select's (select.cuh), at run time. A number neither gives is a policy: one
+// select's (config.cuh), at run time. A number neither gives is a policy: one
 // named line in `derive`.
 // =================================================================================================
 
@@ -201,7 +201,7 @@ constexpr BuildInfo derive(const Hardware& hw) {
   // NCCL.
   m.pack_bytes = hw.max_load_bytes;
   // THE EXCHANGE (partials and inputs) IS NOT HERE: it is sized at open from
-  // the largest call the communicator serves (select.cuh's `exchange_sizes`),
+  // the largest call the communicator serves (config.cuh's `exchange_sizes`),
   // never a constant.
 
   BuildInfo::Kernels& b = info.kernels;
@@ -244,7 +244,7 @@ static_assert(kBuild.kernels.max_threads <= kTarget.max_workgroup &&
 
 // THE PEERS' LIMITS, for the layouts host and device share (the signal block, handle.cuh): at
 // most kMaxPeers ranks; ONE SIGNAL SLOT PER BLOCK THE HARDWARE CAN HOLD RESIDENT, so the signal
-// block never rules out a grid. Which grid is fast is select's (select.cuh).
+// block never rules out a grid. Which grid is fast is select's (config.cuh).
 constexpr int kMaxRanks = kMaxPeers;
 constexpr int kMaxBlocks = kMaxResidentBlocks;
 
