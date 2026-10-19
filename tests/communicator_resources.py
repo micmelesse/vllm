@@ -7,6 +7,7 @@ from collections import Counter
 import pytest
 
 RESOURCES = ("cpu", "gpu", "multi_gpu")
+TIERS = ("cpu", "gpu", "gpus2", "gpus4", "gpus8")
 KINDS = ("smoke", "example", "regression", "property", "stress", "fixture")
 
 
@@ -14,19 +15,28 @@ def _communicator(item):
     return item.path.name == "test_hip_custom_communicator.py"
 
 
+def _required(item):
+    mark = item.get_closest_marker("multi_gpu")
+    if mark is not None:
+        if len(mark.args) != 1 or mark.args[0] not in (2, 4, 8) or mark.kwargs:
+            raise ValueError("multi_gpu requires one positional world size: 2, 4, or 8")
+        return mark.args[0]
+    return 1 if item.get_closest_marker("gpu") else 0
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--on",
-        choices=RESOURCES,
+        choices=TIERS,
         default="cpu",
         help="Communicator resources: cpu (default), gpu (includes cpu), "
-        "multi_gpu (all; requires exactly 8 visible GPUs at execution)",
+        "gpus2, gpus4, gpus8 (cumulative GPU world sizes)",
     )
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    allowed = RESOURCES[: RESOURCES.index(config.getoption("--on")) + 1]
+    limit = (0, 1, 2, 4, 8)[TIERS.index(config.getoption("--on"))]
     selected, deselected, errors = [], [], []
     for item in items:
         if not _communicator(item):
@@ -35,10 +45,13 @@ def pytest_collection_modifyitems(config, items):
         marks = [m.name for m in item.iter_markers() if m.name in RESOURCES]
         if len(marks) != 1:
             errors.append(f"{item.nodeid}: expected exactly one resource, got {marks}")
-        elif marks[0] in allowed:
-            selected.append(item)
         else:
-            deselected.append(item)
+            try:
+                required = _required(item)
+            except ValueError as error:
+                errors.append(f"{item.nodeid}: {error}")
+                continue
+            (selected if required <= limit else deselected).append(item)
     if errors:
         raise pytest.UsageError("\n".join(errors))
     items[:] = selected
@@ -72,8 +85,8 @@ def pytest_runtest_setup(item):
     import torch
 
     count = torch.cuda.device_count()
-    if item.get_closest_marker("multi_gpu"):
-        if count != 8:
-            pytest.fail(f"{item.nodeid}: requires exactly 8 visible GPUs, got {count}")
-    elif count < 1:
-        pytest.fail(f"{item.nodeid}: requires at least one visible GPU, got {count}")
+    required = _required(item)
+    if count < required:
+        pytest.fail(
+            f"{item.nodeid}: requires at least {required} visible GPUs, got {count}"
+        )

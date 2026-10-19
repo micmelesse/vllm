@@ -2055,7 +2055,7 @@ def multi_gpu_marks(*, num_gpus: int):
         reason=f"Need at least {num_gpus} GPUs to run the test.",
     )
 
-    return [pytest.mark.multi_gpu, test_selector, test_skipif]
+    return [pytest.mark.multi_gpu(num_gpus), test_selector, test_skipif]
 
 
 def multi_gpu_test(*, num_gpus: int):

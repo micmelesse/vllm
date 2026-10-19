@@ -126,7 +126,7 @@ enable_error_code = ["method-assign"]
 markers = [
     "cpu: communicator test requires no GPU",
     "gpu: communicator test requires one GPU",
-    "multi_gpu: test requires multiple GPUs (derived by multi_gpu_marks)",
+    "multi_gpu(n): test requires n GPUs, n=2/4/8 (derived by multi_gpu_marks)",
     "smoke: basic correctness of major functions",
     "example: specific input with an expected result",
     "regression: reproduces a fixed bug",
