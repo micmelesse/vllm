@@ -68,12 +68,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     DTYPE peers[WORLD][1][kPacks][kPackElems];
     for (int r = 0; r < WORLD; ++r)
       recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], row, 0, 1);
-    DTYPE res[1][kPacks][kPackElems];
 
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
     float s[1][kPacks][kPackElems];
-    [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
     for (int k = 0; k < kPacks; ++k)
 #pragma unroll
@@ -234,8 +232,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     constexpr int kScaleSlot = 0;
-    [[maybe_unused]] const int64_t scale_stride_m =
-        partials_stride_m * static_cast<int64_t>(sizeof(DTYPE)) / static_cast<int64_t>(sizeof(float));
     const int row_n = input_size_n + kScaleSlot;  // a partials row's elements
 
     // 1. Wait until every peer has launched (its input is ready before it). UNORDERED (started):
@@ -266,7 +262,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // partials at row - first.
     const auto one_row = [&](int row, const DTYPE(&cur)[WORLD][1][kPacks][kPackElems],
                              DTYPE(&next)[WORLD][1][kPacks][kPackElems]) {
-      DTYPE res[1][kPacks][kPackElems];
 
       // ONLY A ROW THAT EXISTS: issued here, never hoisted, so the block-uniform
       // branch costs nothing, where a clamped unconditional load re-read the last
@@ -276,7 +271,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         load_peers(row + gridDim.x, next);
       // The sum and the residual, rounding as the reference does (see the one-shot kernel):
       float s[1][kPacks][kPackElems];
-      [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
       for (int k = 0; k < kPacks; ++k)
 #pragma unroll
@@ -316,18 +310,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks, Until::visible, 1);
 
     for (int l = blockIdx.x; l < slice_m; l += gridDim.x) {
-      [[maybe_unused]] float sc[WORLD][1][1][1];
       const auto step = [&](int c, bool scales) {
         DTYPE got[WORLD][1][1][kPackElems];
         for (int r = 0; r < WORLD; ++r)
           recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
               partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m, partials_stride_n, 1,
               partials_size_m, partials_size_n, slice_m, row_n, got[r], l, c + kScaleSlot, 1);
-         r < WORLD; ++r)
-              recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
-                  partials_ptr_array, partials_ptr_array_size, r, 0, 0, scale_stride_m, 1, 1,
-                  partials_size_m, scale_stride_m, slice_m, 1, sc[r], l, 0, 1);
-        WEIGHT_DTYPE w_step[1][1][kPackElems];
 
 #pragma unroll
         for (int r = 0; r < WORLD; ++r) {
@@ -392,19 +380,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
         &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
     for (int l = blockIdx.x; l < rows_of(rank); l += grid) {
-      const int row = rank * slice_m + l;
       // Every writer's group of the row, from this rank's inbox (slots rotated from this rank's),
       // and the residual's, all in flight before the sum.
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, got, 0, l * n, 1);
-      DTYPE res[1][kInt4GroupPacks][kPackElems];
 
       float sum[1][kInt4GroupPacks][kPackElems];
       dequantize<DTYPE>(got, sum);
       float s[1][kInt4GroupPacks][kPackElems];
-      [[maybe_unused]] DTYPE added[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
       for (int k = 0; k < kInt4GroupPacks; ++k)
 #pragma unroll
@@ -431,7 +416,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         rank, timeout_ticks, Until::visible, 1);
 
     for (int l = blockIdx.x; l < slice_m; l += grid) {
-      [[maybe_unused]] float sc[WORLD][1][1][1];
 
       uint32_t raw[WORLD][1][kInt4GroupPacks][2];
       for (int v = 0; v < WORLD; ++v)
@@ -842,13 +826,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
-    DTYPE own[1][kPacks][kPackElems], res[1][kPacks][kPackElems];
+    DTYPE own[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
 
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
     float s[1][kPacks][kPackElems];
-    [[maybe_unused]] DTYPE added[1][kPacks][kPackElems];
 #pragma unroll
     for (int k = 0; k < kPacks; ++k)
 #pragma unroll
