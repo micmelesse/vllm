@@ -82,9 +82,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-pytest_plugins = ["tests.communicator_resources"]
-
-
 @pytest.fixture
 def sample_json_schema():
     return {

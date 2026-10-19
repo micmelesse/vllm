@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HipCustomCommunicator at worlds 2/4, with a TP=8 shipped-config smoke,
-the hidden row (7168)
+"""HipCustomCommunicator at Kimi-K3's configuration: TP=8, the hidden row (7168)
 and the latent MoE row (3584), decode- and prefill-sized batches.
 
 Each op runs eager and under CUDA graphs (several layers a graph, every capture
@@ -60,6 +59,7 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_rocm(), reason="ROCm-only HipCustomCommunicator tests"
 )
 
+WORLD_SIZE = 8
 # The largest call Kimi-K3's server makes (max_num_batched_tokens 16384 of the
 # hidden row), which the communicator's exchange is sized for.
 MAX_TOKENS = 16384
@@ -108,19 +108,9 @@ F = TypeVar("F", bound=Callable[..., None])
 
 
 def on_eight_gpus(f: F) -> F:
-    for mark in multi_gpu_marks(num_gpus=8):
+    for mark in multi_gpu_marks(num_gpus=WORLD_SIZE):
         f = mark(f)
     return f
-
-
-# Each parameter carries its own resource requirement before collection filtering.
-worlds = pytest.mark.parametrize(
-    "world_size",
-    [
-        pytest.param(n, marks=multi_gpu_marks(num_gpus=n), id=f"world{n}")
-        for n in (2, 4)
-    ],
-)
 
 
 def _tolerance(dtype: torch.dtype, normed: bool) -> Tolerance:
@@ -187,7 +177,6 @@ def _step(rank: int, name: str) -> Iterator[None]:
 
 def _rank_main(
     rank: int,
-    world_size: int,
     port: int,
     target: Callable[..., None],
     kwargs: dict[str, str],
@@ -203,7 +192,7 @@ def _rank_main(
     try:
         device = torch.device(f"cuda:{rank}")
         torch.accelerator.set_device_index(device)
-        init_test_distributed_environment(world_size, 1, rank, str(port), rank)
+        init_test_distributed_environment(WORLD_SIZE, 1, rank, str(port), rank)
         tp = get_tp_group()
         # RCCL UP BEFORE THE COMMUNICATOR OPENS, as vLLM's own startup does (and the
         # old harness did): torch builds its RCCL communicator lazily, at the first
@@ -245,13 +234,12 @@ def _rank_main(
 
 def _on_every_rank(
     target: Callable[..., None],
-    world_size: int,
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
     **kwargs: str,
 ) -> None:
-    """`target(comm, rank, **kwargs)` on world_size spawned ranks, each holding a
+    """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`. A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
@@ -262,18 +250,9 @@ def _on_every_rank(
     procs = [
         ctx.Process(
             target=_rank_main,
-            args=(
-                r,
-                world_size,
-                port,
-                target,
-                kwargs,
-                failures,
-                kernel_timeout_s,
-                log_mode,
-            ),
+            args=(r, port, target, kwargs, failures, kernel_timeout_s, log_mode),
         )
-        for r in range(world_size)
+        for r in range(WORLD_SIZE)
     ]
     for p in procs:
         p.start()
@@ -398,7 +377,7 @@ def _make(
     layer: AttnResLayer | None = None,
 ) -> tuple[torch.Tensor, Args]:
     """This rank's input and the op's other arguments."""
-    x = _randn((rows, hidden), dtype, seed * 8 + rank + 1)
+    x = _randn((rows, hidden), dtype, seed * WORLD_SIZE + rank + 1)
     shared = seed * 101 + 7
     if op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
         residual = None
@@ -581,7 +560,6 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
         assert any(r.kind is LogKind.copy_in_issued for r in log.records)
 
 
-@pytest.mark.smoke
 @on_eight_gpus
 def test_basic_correctness() -> None:
     """Open, each op once at a decode row, a prefill-sized all-reduce and one
@@ -589,7 +567,6 @@ def test_basic_correctness() -> None:
     open and its flags clear: a broken basic fails in minutes, naming its step."""
     _on_every_rank(
         _smoke_on_rank,
-        world_size=8,
         process_timeout_s=SMOKE_PROCESS_TIMEOUT_S,
         kernel_timeout_s=SMOKE_KERNEL_TIMEOUT_S,
         log_mode="everything",
@@ -704,11 +681,10 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
                         print(f"{op} {hidden} {dtype} {forced}: refused at every size")
 
 
-@pytest.mark.example
-@worlds
+@on_eight_gpus
 @pytest.mark.parametrize("op", get_args(Op))
-def test_op_matches_the_ops_it_replaces(op: Op, world_size: int) -> None:
-    _on_every_rank(_op_on_rank, world_size, op=op)
+def test_op_matches_the_ops_it_replaces(op: Op) -> None:
+    _on_every_rank(_op_on_rank, op=op)
 
 
 # --------------------------------------------------------------------------------
@@ -759,24 +735,21 @@ def _int4_sum(terms: Sequence[torch.Tensor], owner: torch.Tensor) -> torch.Tenso
     """The fp32 sum in the kernel's order: each element from its `owner` on."""
     stacked = torch.stack([t.float() for t in terms])
     acc = torch.zeros_like(stacked[0])
-    world_size = len(terms)
-    for k in range(world_size):
-        acc += stacked.gather(0, ((owner + k) % world_size).unsqueeze(0)).squeeze(0)
+    for k in range(WORLD_SIZE):
+        acc += stacked.gather(0, ((owner + k) % WORLD_SIZE).unsqueeze(0)).squeeze(0)
     return acc
 
 
-def _int4_owner(
-    op: Op, template: str, shape: tuple[int, int], world_size: int
-) -> torch.Tensor:
+def _int4_owner(op: Op, template: str, shape: tuple[int, int]) -> torch.Tensor:
     """Which rank sums each element: the plain two-shot's flat share, the AttnRes
     pull's row slice (its INT4 build a group a thread, each owner's rows summed from
     its inbox), or rank order (the push kernels and the pull norms)."""
     rows, hidden = shape
     if op == "all_reduce":
         flat = torch.arange(rows * hidden).reshape(rows, hidden)
-        return flat // (rows * hidden // world_size)
+        return flat // (rows * hidden // WORLD_SIZE)
     if template.startswith("all_reduce_pull_two_shot") and "attn_res" in op:
-        slice_m = -(-rows // world_size)
+        slice_m = -(-rows // WORLD_SIZE)
         return (torch.arange(rows) // slice_m).unsqueeze(1).expand(rows, hidden)
     return torch.zeros(rows, hidden, dtype=torch.long)
 
@@ -814,10 +787,9 @@ def _int4_case(
     where = f"{template} {shape} int4"
     device, dtype = comm.device, torch.bfloat16
     rows, hidden = shape
-    world_size = comm.cpu_group.size()
-    inputs = [_int4_input(r, 0, shape) for r in range(world_size)]
+    inputs = [_int4_input(r, 0, shape) for r in range(WORLD_SIZE)]
     landed = [_int4_landed(x, dtype) for x in inputs]
-    total = _int4_sum(landed, _int4_owner(op, template, shape, world_size))
+    total = _int4_sum(landed, _int4_owner(op, template, shape))
     exact = _int4_sum(inputs, torch.zeros(shape, dtype=torch.long)).to(dtype)
     summed = _int4_landed(total, dtype)
     pull_norm = (
@@ -833,8 +805,8 @@ def _int4_case(
         got = comm.all_reduce(mine, **forced)
         checks = [("out", got, summed, exact, INT4_LANDED_TOLERANCE)]
     elif op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
-        residual = _int4_input(world_size, 1, shape)
-        weight = _int4_input(world_size + 1, 2, (hidden,))
+        residual = _int4_input(WORLD_SIZE, 1, shape)
+        weight = _int4_input(WORLD_SIZE + 1, 2, (hidden,))
         if op == "all_reduce_add_rms_norm":
             got, got_residual = comm.all_reduce_add_rms_norm(
                 mine, residual.to(device), weight.to(device), EPS, **forced
@@ -880,14 +852,14 @@ def _int4_case(
         # block, so both are the landed sum.
         blocks = torch.stack(
             [
-                _int4_input(world_size + 2 + s, 3, shape)
+                _int4_input(WORLD_SIZE + 2 + s, 3, shape)
                 for s in range(ATTN_RES_SOURCES)
             ],
             dim=1,
         ).contiguous()
-        norm_w = _int4_input(world_size + 20, 4, (hidden,)).to(device)
-        qk_w = _int4_input(world_size + 21, 5, (hidden,)).to(device)
-        out_w = _int4_input(world_size + 22, 6, (hidden,)).to(device)
+        norm_w = _int4_input(WORLD_SIZE + 20, 4, (hidden,)).to(device)
+        qk_w = _int4_input(WORLD_SIZE + 21, 5, (hidden,)).to(device)
+        out_w = _int4_input(WORLD_SIZE + 22, 6, (hidden,)).to(device)
         num_blocks = write_index = 4
 
         def reference(
@@ -942,11 +914,10 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
     """A call that does not ask for INT4 moves the input as it is: a plain call on
     a communicator whose quantization is none (the default), and a forced
     two-shot whose forcing leaves its quantization out."""
-    world_size = comm.cpu_group.size()
     forced = _forced_whole("all_reduce_pull_two_shot")
     del forced["quantization"]
     for name, forcing in (("plain", {}), ("forced", forced)):
-        x = _randn((2048, HIDDEN), torch.bfloat16, 77 * world_size + rank)
+        x = _randn((2048, HIDDEN), torch.bfloat16, 77 * WORLD_SIZE + rank)
         summed = _sum(x, comm)
         got = comm.all_reduce(x, **forcing)
         _assert_clean(comm, name)
@@ -964,12 +935,11 @@ def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _unquantized_case(comm, rank)
 
 
-@pytest.mark.example
-@worlds
-def test_int4_two_shot_matches_the_format_it_moves(world_size: int) -> None:
+@on_eight_gpus
+def test_int4_two_shot_matches_the_format_it_moves() -> None:
     # Every rank's slice of each row is whole INT4 groups.
-    assert all(cols % (INT4_GROUP * world_size) == 0 for _, cols in INT4_SHAPES)
-    _on_every_rank(_int4_on_rank, world_size)
+    assert all(cols % (INT4_GROUP * WORLD_SIZE) == 0 for _, cols in INT4_SHAPES)
+    _on_every_rank(_int4_on_rank)
 
 
 # --------------------------------------------------------------------------------
@@ -1052,10 +1022,9 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _assert_clean(comm, "past the box")
 
 
-@pytest.mark.example
-@worlds
-def test_refused_calls_name_why_and_fall_back_cleanly(world_size: int) -> None:
-    _on_every_rank(_refusals_on_rank, world_size)
+@on_eight_gpus
+def test_refused_calls_name_why_and_fall_back_cleanly() -> None:
+    _on_every_rank(_refusals_on_rank)
 
 
 def _warmup_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
@@ -1083,12 +1052,11 @@ def _warmup_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     _assert_clean(comm, "warmup")
 
 
-@pytest.mark.example
-@worlds
-def test_capture_warmup_launches_nothing(world_size: int) -> None:
+@on_eight_gpus
+def test_capture_warmup_launches_nothing() -> None:
     """A capture's warmup, which vLLM runs on the capture stream and discards,
     returns outputs of the right shape and launches nothing."""
-    _on_every_rank(_warmup_on_rank, world_size)
+    _on_every_rank(_warmup_on_rank)
 
 
 # --------------------------------------------------------------------------------
@@ -1096,8 +1064,6 @@ def test_capture_warmup_launches_nothing(world_size: int) -> None:
 # --------------------------------------------------------------------------------
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 def test_python_names_match_the_build() -> None:
     """`Error` and `Where` are C++'s, name for name in order, and `Op` names C++'s
     ops."""
@@ -1110,8 +1076,6 @@ def test_python_names_match_the_build() -> None:
     assert set(get_args(Op)) == set(built.op_names)
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
     launch; a two-shot or a split lists each exact build again moving INT4 (a
@@ -1143,8 +1107,6 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert not int4, name
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("op", "rows", "cols", "quantization", "launch", "want"),
     [
@@ -1219,8 +1181,6 @@ def test_build_info_tuned_is_selects_pick(
     assert got == want, got
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 def test_build_info_tuned_takes_a_launch_whole() -> None:
     """A launch is its algorithm and its direction, both or neither."""
     import vllm._rocm_C  # noqa: F401
@@ -1233,8 +1193,6 @@ def test_build_info_tuned_takes_a_launch_whole() -> None:
     assert isinstance(got, Ran) and got.quantization == "none", got
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401
 
@@ -1244,8 +1202,6 @@ def test_open_refuses_a_group_no_one_registered() -> None:
     assert got is Error.no_such_group
 
 
-@pytest.mark.example
-@pytest.mark.gpu
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16])
 def test_supported_is_the_builds_answer(size: int) -> None:
     """This device runs exactly the worlds `build_info` says are built."""
@@ -1259,8 +1215,6 @@ def test_supported_is_the_builds_answer(size: int) -> None:
         assert got is Error.world_not_built
 
 
-@pytest.mark.example
-@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("variable", "given", "want"),
     [
@@ -1296,7 +1250,7 @@ def test_quantization_reaches_the_opener(
         group_name = "fake"
 
         def size(self) -> int:
-            return 8
+            return WORLD_SIZE
 
     comm = HipCustomCommunicator(
         Group(),
