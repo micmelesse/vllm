@@ -105,7 +105,7 @@ class Error(IntEnum):
     row_narrower_than_world = 28
     forced_incomplete = 29
     no_such_quantization = 30
-    quantization_not_two_shot = 31
+    quantization_not_supported = 31
     row_not_int4_groups = 32
     quantized_too_small = 33  # retired: INT4 lies inside staging and partials
 
@@ -799,9 +799,9 @@ class Refused(RuntimeError):
     """A call this backend does not take, raised by the op with the Error C++ refused
     it for, and the input it was asked to run on. A call `should` admits never is."""
 
-    def __init__(self, error: Error, input: torch.Tensor) -> None:
+    def __init__(self, error: Error, input: torch.Tensor, detail: str = "") -> None:
         super().__init__(
-            f"{error.name}: shape={tuple(input.shape)} dtype={input.dtype}"
+            f"{error.name}: {detail}shape={tuple(input.shape)} dtype={input.dtype}"
         )
         self.error = error
 
@@ -1163,7 +1163,7 @@ class HipCustomCommunicator:
     # `split`) and the direction (`pull` or `push`) where the op has more than one
     # template, every field of one of its builds (`build_info().templates`), and the
     # launch (blocks_per_grid, and the AttnRes op's reduce_scatter_blocks); some but
-    # not all is `forced_incomplete`. The build's `quantization` alone may be left out, and is
+    # not all is `forced_incomplete`. The build's `quantization` may be left out; it is
     # then none, never the communicator's: a forced call runs what it names. All None
     # is the backend's choice; the model forces none. A forced call asks no `should_`:
     # C++ answers it. An op raises Refused with the Error C++ refused it for; a call
@@ -1207,7 +1207,7 @@ class HipCustomCommunicator:
             waves_per_eu,
             quantization,
         )
-        self._launched("all_reduce", input, answer)
+        self._launched("all_reduce", input, answer, algorithm, direction, quantization)
         return output
 
     @final
@@ -1255,7 +1255,9 @@ class HipCustomCommunicator:
             waves_per_eu,
             quantization,
         )
-        self._launched("all_reduce_rms_norm", input, answer)
+        self._launched(
+            "all_reduce_rms_norm", input, answer, algorithm, direction, quantization
+        )
         return output
 
     @final
@@ -1306,7 +1308,9 @@ class HipCustomCommunicator:
             waves_per_eu,
             quantization,
         )
-        self._launched("all_reduce_add_rms_norm", input, answer)
+        self._launched(
+            "all_reduce_add_rms_norm", input, answer, algorithm, direction, quantization
+        )
         return output, residual_output
 
     @final
@@ -1378,7 +1382,14 @@ class HipCustomCommunicator:
             waves_per_eu,
             quantization,
         )
-        self._launched("all_reduce_add_attn_res_rms_norm", input, answer)
+        self._launched(
+            "all_reduce_add_attn_res_rms_norm",
+            input,
+            answer,
+            algorithm,
+            direction,
+            quantization,
+        )
         return prefix_output, output
 
     @final
@@ -1523,11 +1534,25 @@ class HipCustomCommunicator:
             raise Refused(Error.disabled, input)
 
     @final
-    def _launched(self, op: Op, input: torch.Tensor, answer: Answer) -> None:
+    def _launched(
+        self,
+        op: Op,
+        input: torch.Tensor,
+        answer: Answer,
+        algorithm: str | None = None,
+        direction: str | None = None,
+        quantization: Quantization | None = None,
+    ) -> None:
         """After an op's kernel hook: Refused with the Error's number it answered, or
         the launch, and what it ran, into the flight recorder."""
         if answer[0] >= 0:
-            raise Refused(Error(answer[0]), input)
+            error = Error(answer[0])
+            detail = ""
+            if error is Error.quantization_not_supported:
+                suffix = op.removeprefix("all_reduce")
+                kernel = f"all_reduce_{direction}_{algorithm}{suffix}"
+                detail = f"{quantization} not supported for {kernel}; "
+            raise Refused(error, input, detail)
         self._record(op, input, Ran.of(answer))
 
     @final

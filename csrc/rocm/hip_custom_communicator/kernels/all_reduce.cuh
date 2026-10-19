@@ -11,12 +11,12 @@
 // barrier and the two-shot's second barrier follows its every read of them, so
 // when a rank's launch ends every peer is done reading its input, and the next
 // call's host copy (stream-ordered after it) or the caller may overwrite it.
-// The INT4 two-shot (all_reduce_pull_two_shot_int4, either two-shot template's INT4 build) encodes its
+// The INT4 two-shot (all_reduce_push_two_shot<..., int4>) encodes its
 // input itself: what crosses the links is quantized by its owner, so it cannot
 // be read in place; it pushes the quantized shares (below).
 //
 // THE PUSHED VARIANT (all_reduce_push_one_shot, all_reduce_push_two_shot; a
-// caller forces it by its direction, select never picks it), each PUSHED: a rank reads only its own input (the caller's tensor, which no
+// caller forces exact push by its direction; INT4 picks push), each PUSHED: a rank reads only its own input (the caller's tensor, which no
 // peer reads) and stores it, or each rank's share of it, into the peers'
 // receive areas (their staging, the INBOX: [writer slot, ...]),
 // a band of rows a pass; after the ordered barrier each rank sums the WORLD

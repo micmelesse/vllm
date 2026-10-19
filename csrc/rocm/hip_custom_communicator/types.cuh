@@ -55,7 +55,7 @@ enum class Error : int {
   row_narrower_than_world = 28,
   forced_incomplete = 29,
   no_such_quantization = 30,
-  quantization_not_two_shot = 31,
+  quantization_not_supported = 31,
   row_not_int4_groups = 32,
   quantized_too_small = 33,  // retired: INT4 is an encoding inside the
                              // regions (inputs_too_small, partials_too_small)
@@ -146,9 +146,9 @@ constexpr const char* to_string(Error e) {
              "its build and its launch) or none";
     case Error::no_such_quantization:
       return "no_such_quantization: the quantization is none or int4";
-    case Error::quantization_not_two_shot:
-      return "quantization_not_two_shot: only a two-shot moves INT4; a "
-             "one-shot reads its peers' inputs as they are";
+    case Error::quantization_not_supported:
+      return "quantization_not_supported: INT4 is not supported for the selected "
+             "kernel";
     case Error::row_not_int4_groups:
       return "row_not_int4_groups: an INT4 row is whole groups of 32 for every "
              "rank";

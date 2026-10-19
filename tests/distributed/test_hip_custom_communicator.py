@@ -929,7 +929,10 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
 def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     for op in get_args(Op):
         for template in _templates(op):
-            if "two_shot" in template:
+            if "two_shot" in template and any(
+                b["quantization"] == "int4"
+                for b in build_info().templates[template].builds
+            ):
                 for shape in INT4_SHAPES:
                     _int4_case(comm, rank, op, template, shape)
     _unquantized_case(comm, rank)
@@ -1101,6 +1104,8 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
                 b["threads_per_block"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
                 for b in int4
             ), name
+        elif name == "all_reduce_pull_two_shot":
+            assert not int4, name
         elif "two_shot" in name or "_split_" in name:
             assert [b | {"quantization": "none"} for b in int4] == exact, name
         else:
@@ -1145,16 +1150,16 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             512,
             3584,
             "int4",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 512, 512, 56, 1, 0, 0, "int4"),
+            "push_two_shot",
+            Ran("two_shot", "push", 1, 512, 512, 56, 1, 0, 0, "int4"),
         ),
         (
             "all_reduce",
             1024,
             3584,
             "int4",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 512, 512, 128, 1, 0, 0, "int4"),
+            "push_two_shot",
+            Ran("two_shot", "push", 1, 512, 512, 128, 1, 0, 0, "int4"),
         ),
         # No INT4 entry of the AttnRes push nor of any one-shot.
         ("all_reduce_add_attn_res_rms_norm", 256, 3584, "int4", "push_two_shot", None),
