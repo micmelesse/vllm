@@ -24,7 +24,7 @@ def pytest_addoption(parser):
     )
 
 
-@pytest.hookimpl(tryfirst=True)
+@pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     allowed = RESOURCES[: RESOURCES.index(config.getoption("--on")) + 1]
     selected, deselected, errors = [], [], []
@@ -44,6 +44,7 @@ def pytest_collection_modifyitems(config, items):
     items[:] = selected
     if deselected:
         config.hook.pytest_deselected(items=deselected)
+    return (yield)
 
 
 def pytest_collection_finish(session):
