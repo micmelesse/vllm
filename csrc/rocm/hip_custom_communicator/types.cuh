@@ -345,35 +345,31 @@ using AllReduceTwoShotKernel = void (*)(
     int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 // THE IN-PLACE PULL: every rank's input through the input's device array (one
 // pointer and its size, the world: handle.cuh's INPUT TABLES) at its strides; no input pointer of its own, no staging.
-// THE PULLS LEAD WITH WHAT THEY READ FIRST (all_reduce.cuh says why): the tables, the rank and
-// the signals' strides, then the canonical order.
 using AllReduceOneShotInPlaceKernel = void (*)(
-    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/,
-    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/, int /*rank*/,
-    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
-    int64_t /*signals_stride_writer*/, int64_t /*input_stride_m*/,
+    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
-    int /*signals_size_parity*/,
+    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/,
+    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+    int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
     void* /*status_ptr*/, int64_t /*status_stride_field*/,
-    int /*status_size_field*/, uint64_t /*timeout_ticks*/);
+    int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceTwoShotInPlaceKernel = void (*)(
-    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/,
-    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/,
-    const void* /*partials_ptr_array*/, int /*partials_ptr_array_size*/, int /*rank*/,
-    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
-    int64_t /*signals_stride_writer*/, int64_t /*input_stride_m*/,
+    const void* /*input_ptr_array*/, int /*input_ptr_array_size*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,
     void* /*output_ptr*/, int64_t /*output_stride_m*/,
     int64_t /*output_stride_n*/, int /*output_size_m*/, int /*output_size_n*/,
+    const void* /*partials_ptr_array*/, int /*partials_ptr_array_size*/,
     int64_t /*partials_stride_m*/, int64_t /*partials_stride_n*/,
     int /*partials_size_m*/, int /*partials_size_n*/,
-    int /*signals_size_parity*/,
+    const void* /*signals_ptr_array*/, int /*signals_ptr_array_size*/,
+    int64_t /*signals_stride_parity*/, int64_t /*signals_stride_block*/,
+    int64_t /*signals_stride_writer*/, int /*signals_size_parity*/,
     int /*signals_size_block*/, int /*signals_size_writer*/,
     void* /*status_ptr*/, int64_t /*status_stride_field*/,
-    int /*status_size_field*/, uint64_t /*timeout_ticks*/);
+    int /*status_size_field*/, int /*rank*/, uint64_t /*timeout_ticks*/);
 using AllReduceOneShotPushedKernel = void (*)(
     const void* /*input_ptr*/, int64_t /*input_stride_m*/,
     int64_t /*input_stride_n*/, int /*input_size_m*/, int /*input_size_n*/,

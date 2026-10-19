@@ -56,23 +56,16 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(
-        // THE ARGUMENTS WHAT THE KERNEL READS FIRST LEADS, the one exception to the canonical order
-        // (STANDARDS 3.2): the pointer tables (their entries are read before the first barrier),
-        // this rank and the signals' strides (the barrier's flag addresses) inside the 56 bytes
-        // the kernarg preload puts in SGPRs (CMakeLists' --amdgpu-kernarg-preload-count=32), so
-        // none of them waits for a kernarg load; everything else in the canonical order.
-        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
-        uint32_t* const* signals_ptr_array, int signals_ptr_array_size, int rank,
-        int64_t signals_stride_parity, int64_t signals_stride_block,
-        int64_t signals_stride_writer,
-        int64_t input_stride_m,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        int signals_size_parity,
+        uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
+        int64_t signals_stride_parity, int64_t signals_stride_block,
+        int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
-        int status_size_field, uint64_t timeout_ticks) {
+        int status_size_field, int rank, uint64_t timeout_ticks) {
   constexpr int kThreadsM = TILE_M;
   constexpr int kThreadsN = THREADS_PER_BLOCK / TILE_M;
   constexpr int kRows = TILE_M / kThreadsM;
@@ -140,26 +133,18 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU, bool CONTIGUOUS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
-        // THE ARGUMENTS WHAT THE KERNEL READS FIRST LEADS, the one exception to the canonical order
-        // (STANDARDS 3.2): the pointer tables (their entries are read before the first barrier),
-        // this rank and the signals' strides (the barrier's flag addresses) inside the 56 bytes
-        // the kernarg preload puts in SGPRs (CMakeLists' --amdgpu-kernarg-preload-count=32), so
-        // none of them waits for a kernarg load; everything else in the canonical order.
-        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
-        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
-        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int rank,
-        int64_t signals_stride_parity, int64_t signals_stride_block,
-        int64_t signals_stride_writer,
-        int64_t input_stride_m,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        int64_t partials_stride_m,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
-        int signals_size_parity,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+        int64_t signals_stride_parity, int64_t signals_stride_block,
+        int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
-        int status_size_field, uint64_t timeout_ticks) {
+        int status_size_field, int rank, uint64_t timeout_ticks) {
   for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
     const int band =
         min(partials_size_m, input_size_m - r0);  // this pass's rows
