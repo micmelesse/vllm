@@ -433,10 +433,11 @@ struct TunedKernel {
 // 2026-10-18T08-56-55Z); 8 tokens of 7168 the one-shot on 56 blocks (8.5 ->
 // 8.1, 09-02-30Z; the same bytes at 16 of 3584 lost, 8.4 -> 9.0).
 // THE DECODE ROWS (2026-10-20, n11, bf16, 8 ranks; the sweep run 2026-10-20T03-51-59Z, one run a
-// config, against aiter's): THE PUSHED ONE-SHOT (the flag in the line) at 1 token and 2 of 3584,
-// where it beats our pull (5.8 against 6.2 us at 1 x 3584, 6.1 against 6.3 at 1 x 7168; aiter's LL
-// 5.5, run 2026-10-20T03-35-02Z), listed first so select picks it (the pull's entry second, for
-// the forced pattern). The pull one-shot from 2 tokens of 7168 and 4 of 3584 (0.81x aiter's LL at
+// config, against aiter's): THE PUSHED ONE-SHOT (the flag in the line) NOT PICKED YET, listed after
+// the pull at its rows (for the forced pattern): it beats our pull at 1 token and 2 of 3584 (5.8
+// against 6.2 us at 1 x 3584, 6.1 against 6.3 at 1 x 7168; aiter's LL 5.5, run
+// 2026-10-20T03-35-02Z), not aiter (Michael's bar), and picked it fails the fork's smoke, which
+// expects a 1-token capture's inputs registered (run 04-33-53Z). The pull one-shot from 2 tokens of 7168 and 4 of 3584 (0.81x aiter's LL at
 // 4 x 7168 and 8 x 3584). THE PULL TWO-SHOT ON AITER'S GRID from 16 tokens of 3584 (8 of 7168),
 // one block a 64 packs of each rank's share, at every capture size up to 64 x 3584: 16 x 3584
 // 7.98 -> 7.65 us (aiter 7.54), 32 x 3584 7.92 -> 7.83 (7.74), 64 x 3584 8.70 -> 8.64 (8.57).
@@ -447,13 +448,13 @@ constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      1,
      3584,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
+     Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8,
      1,
      3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+     Template::all_reduce_push_one_shot,
+     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
     {8,
      4,
      3584,
@@ -527,13 +528,13 @@ constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      1,
      7168,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
+     Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8,
      1,
      7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+     Template::all_reduce_push_one_shot,
+     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
     {8,
      2,
      7168,
