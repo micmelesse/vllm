@@ -442,7 +442,7 @@ struct TunedKernel {
 // 7.98 -> 7.65 us (aiter 7.54), 32 x 3584 7.92 -> 7.83 (7.74), 64 x 3584 8.70 -> 8.64 (8.57).
 // The rule (aiter's 2-stage: a 512-thread block a 64 packs of each rank's share) at every
 // capture size between: 40 x 7168 on the 32-row entry's 56 blocks lost, 10.2 against 9.1 us
-// (run 2026-10-20T04-03-15Z).
+// (run 2026-10-20T04-03-15Z); 20 and 28 x 3584 on the 16 and 24 rows' grids, 1.20 (04-19-17Z).
 constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      1,
@@ -465,10 +465,20 @@ constexpr TunedKernel kAllReduceKernels[] = {
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {14, 0}}},
     {8,
+     20,
+     3584,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {18, 0}}},
+    {8,
      24,
      3584,
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {21, 0}}},
+    {8,
+     28,
+     3584,
+     Template::all_reduce_pull_two_shot,
+     {AllReduceBuildConfig{512, 1, 1, 512}, {25, 0}}},
     {8,
      32,
      3584,
