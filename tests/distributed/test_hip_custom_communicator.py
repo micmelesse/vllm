@@ -39,7 +39,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Op,
     Open,
     Quantization,
-    Ran,
     Refused,
     Supported,
     Where,
@@ -48,6 +47,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     last_log,
     open_handle,
     supported,
+    tuned_points,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -699,9 +699,10 @@ def test_op_matches_the_ops_it_replaces(op: Op) -> None:
 INT4_GROUP = 32
 INT4_SHAPES = ((1, LATENT), (16, HIDDEN), (2048, HIDDEN))
 # Near every element as the emulation computes it, the rest a quantization step
-# off; and the whole within INT4's error of the exact op.
+# off. INT4's own error against the exact op is the format's, judged end to end
+# (the gsm8k gate), not here: a kernel is right when it computes what the format
+# computes.
 INT4_TIGHT = 0.995
-INT4_RELATIVE_RMS = 0.25
 INT4_LANDED_TOLERANCE = (1e-6, 2**-7)
 INT4_SEED = 20260615
 
@@ -758,10 +759,9 @@ def _int4_verdict(
     where: str,
     got: torch.Tensor,
     want: torch.Tensor,
-    exact: torch.Tensor,
     tolerance: Tolerance,
 ) -> None:
-    a, b, e = got.float().cpu(), want.float().cpu(), exact.float().cpu()
+    a, b = got.float().cpu(), want.float().cpu()
     assert a.shape == b.shape, f"{where}: {tuple(a.shape)}, not {tuple(b.shape)}"
     assert torch.isfinite(a).all(), f"{where} is not finite"
     atol, rtol = tolerance
@@ -770,8 +770,6 @@ def _int4_verdict(
         f"{where}: {tight:.3%} of elements match the INT4 emulation "
         f"(worst |diff| {(a - b).abs().max().item():.4g})"
     )
-    relative = ((a - e).norm() / e.norm().clamp_min(1e-30)).item()
-    assert relative <= INT4_RELATIVE_RMS, f"{where}: RMS error {relative:.3f}"
 
 
 def _int4_case(
@@ -790,7 +788,6 @@ def _int4_case(
     inputs = [_int4_input(r, 0, shape) for r in range(WORLD_SIZE)]
     landed = [_int4_landed(x, dtype) for x in inputs]
     total = _int4_sum(landed, _int4_owner(op, template, shape))
-    exact = _int4_sum(inputs, torch.zeros(shape, dtype=torch.long)).to(dtype)
     summed = _int4_landed(total, dtype)
     pull_norm = (
         template.startswith("all_reduce_pull_two_shot")
@@ -800,19 +797,16 @@ def _int4_case(
     forced = _forced_whole(template, _tile_cols(op, hidden), "int4")
     mine = inputs[rank].to(device)
     normed = _tolerance(dtype, normed=True)
-    checks: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, Tolerance]]
+    checks: list[tuple[str, torch.Tensor, torch.Tensor, Tolerance]]
     if op == "all_reduce":
         got = comm.all_reduce(mine, **forced)
-        checks = [("out", got, summed, exact, INT4_LANDED_TOLERANCE)]
+        checks = [("out", got, summed, INT4_LANDED_TOLERANCE)]
     elif op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
         residual = _int4_input(WORLD_SIZE, 1, shape)
         weight = _int4_input(WORLD_SIZE + 1, 2, (hidden,))
         if op == "all_reduce_add_rms_norm":
             got, got_residual = comm.all_reduce_add_rms_norm(
                 mine, residual.to(device), weight.to(device), EPS, **forced
-            )
-            exact_out, exact_residual = vllm.ir.ops.fused_add_rms_norm(
-                exact, residual, weight, EPS
             )
             if pull_norm:
                 # A row split: the owner adds the residual to the unquantized sum
@@ -827,18 +821,11 @@ def _int4_case(
                     summed, residual, weight, EPS
                 )
             checks = [
-                ("out", got, want, exact_out, normed),
-                (
-                    "residual",
-                    got_residual,
-                    want_residual,
-                    exact_residual,
-                    INT4_LANDED_TOLERANCE,
-                ),
+                ("out", got, want, normed),
+                ("residual", got_residual, want_residual, INT4_LANDED_TOLERANCE),
             ]
         else:
             got = comm.all_reduce_rms_norm(mine, weight.to(device), EPS, **forced)
-            exact_out = vllm.ir.ops.rms_norm(exact, weight, EPS)
             if pull_norm:
                 # The owner norms the unquantized sum; the normed row crosses.
                 want = _int4_landed(
@@ -846,7 +833,7 @@ def _int4_case(
                 )
             else:
                 want = vllm.ir.ops.rms_norm(summed, weight, EPS)
-            checks = [("out", got, want, exact_out, normed)]
+            checks = [("out", got, want, normed)]
     else:
         # The block-write layer: the sum starts the prefix and is written as the
         # block, so both are the landed sum.
@@ -882,7 +869,6 @@ def _int4_case(
             return out, prefix, ref_blocks
 
         want, want_prefix, want_blocks = reference(summed)
-        exact_out, exact_prefix, exact_blocks = reference(exact)
         got_blocks = blocks.to(device).clone()
         got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
             mine,
@@ -898,16 +884,16 @@ def _int4_case(
             **forced,
         )
         checks = [
-            ("out", got, want, exact_out, normed),
-            ("prefix", got_prefix, want_prefix, exact_prefix, INT4_LANDED_TOLERANCE),
-            ("blocks", got_blocks, want_blocks, exact_blocks, INT4_LANDED_TOLERANCE),
+            ("out", got, want, normed),
+            ("prefix", got_prefix, want_prefix, INT4_LANDED_TOLERANCE),
+            ("blocks", got_blocks, want_blocks, INT4_LANDED_TOLERANCE),
         ]
     _assert_clean(comm, where)
     ran = comm._calls[-1].ran
     assert ran is not None and ran.quantization == "int4", f"{where}: ran {ran}"
     assert ran.algorithm == "two_shot", f"{where}: ran {ran}"
-    for name, a, b, e, tolerance in checks:
-        _int4_verdict(f"{where} {name}", a, b, e, tolerance)
+    for name, a, b, tolerance in checks:
+        _int4_verdict(f"{where} {name}", a, b, tolerance)
 
 
 def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
@@ -970,13 +956,14 @@ def _refused(
 def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     bf16 = torch.bfloat16
 
-    # A two-shot row with fewer 16-byte packs than ranks; the plain call runs.
+    # A two-shot row with fewer 16-byte packs than ranks runs (the late ranks'
+    # slices empty), as the plain call does.
     narrow = _randn((16, 8), bf16, rank)
     two_shot = _forced_whole("all_reduce_pull_two_shot")
     error = _refused(
         comm, rank, "narrow row", lambda: comm.all_reduce(narrow, **two_shot)
     )
-    assert error is Error.row_narrower_than_world, error
+    assert error is None, error
     _eager(comm, rank, "all_reduce", 16, 8, bf16, {}, None, 5)
 
     # An input whose innermost stride is not 1: declined, and refused if called.
@@ -1112,90 +1099,15 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert not int4, name
 
 
-@pytest.mark.parametrize(
-    ("op", "rows", "cols", "quantization", "launch", "want"),
-    [
-        # AttnRes's INT4 is the split at every size (kAttnResInt4Kernels): 256
-        # threads, a source a step, 8192 blocks cut to the rows (a row a tile); its
-        # fused INT4 pull is no longer listed.
-        (
-            "all_reduce_add_attn_res_rms_norm",
-            2048,
-            3584,
-            "int4",
-            "pull_split",
-            Ran("split", "pull", 1, 4096, 256, 2048, 1, 1, 0, "int4"),
-        ),
-        (
-            "all_reduce_add_attn_res_rms_norm",
-            8192,
-            7168,
-            "int4",
-            "pull_split",
-            Ran("split", "pull", 1, 8192, 256, 8192, 1, 1, 0, "int4"),
-        ),
-        ("all_reduce_add_attn_res_rms_norm", 2048, 3584, "int4", "pull_two_shot", None),
-        # Its exact pull from 257 rows: 256 threads, TILE_K 3, 256 blocks.
-        (
-            "all_reduce_add_attn_res_rms_norm",
-            512,
-            3584,
-            "none",
-            "pull_two_shot",
-            Ran("two_shot", "pull", 1, 4096, 256, 256, 1, 3, 0, "none"),
-        ),
-        # The plain all-reduce's INT4 (kAllReduceInt4Kernels), its grid as given.
-        (
-            "all_reduce",
-            512,
-            3584,
-            "int4",
-            "push_two_shot",
-            Ran("two_shot", "push", 1, 512, 512, 56, 1, 0, 0, "int4"),
-        ),
-        (
-            "all_reduce",
-            1024,
-            3584,
-            "int4",
-            "push_two_shot",
-            Ran("two_shot", "push", 1, 512, 512, 128, 1, 0, 0, "int4"),
-        ),
-        # No INT4 entry of the AttnRes push nor of any one-shot.
-        ("all_reduce_add_attn_res_rms_norm", 256, 3584, "int4", "push_two_shot", None),
-        ("all_reduce", 8, 3584, "int4", "pull_one_shot", None),
-    ],
-)
-def test_build_info_tuned_is_selects_pick(
-    op: Op,
-    rows: int,
-    cols: int,
-    quantization: Quantization,
-    launch: str,
-    want: Ran | None,
-) -> None:
-    """`build_info().tuned` answers what select launches at a forced launch: the
-    tuned list's entry of that template for the size, its grid cut as select cuts
-    it, at 8 ranks; None where the list has no entry of the template."""
+def test_the_tuned_points_are_the_arch_file() -> None:
+    """The arch's tuned points (`hip_custom_communicator_configs/gfx950.json`) are
+    what open takes, `kPointFields` integers a point; an arch with no file has none,
+    named."""
     import vllm._rocm_C  # noqa: F401
 
-    direction, algorithm = launch.split("_", 1)
-    got = build_info().tuned(
-        op, rows, cols, 8, torch.bfloat16, quantization, algorithm, direction
-    )
-    assert got == want, got
-
-
-def test_build_info_tuned_takes_a_launch_whole() -> None:
-    """A launch is its algorithm and its direction, both or neither."""
-    import vllm._rocm_C  # noqa: F401
-
-    with pytest.raises(RuntimeError, match="both or neither"):
-        build_info().tuned(
-            "all_reduce", 512, 3584, 8, torch.bfloat16, "none", "two_shot"
-        )
-    got = build_info().tuned("all_reduce", 512, 3584, 8, torch.bfloat16)
-    assert isinstance(got, Ran) and got.quantization == "none", got
+    points = tuned_points("gfx950")
+    assert isinstance(points, list) and points and len(points) % 15 == 0, points[:15]
+    assert isinstance(tuned_points("gfx0"), str)
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:

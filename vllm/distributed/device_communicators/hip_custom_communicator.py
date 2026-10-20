@@ -761,9 +761,8 @@ def should(
         return False
     rows = input.numel() // row
     in_box = rows <= capacity.max_rows and row <= capacity.max_cols
-    return (
-        row * input.element_size() % built.pack_bytes == 0
-        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes[op])
+    return row * input.element_size() % built.pack_bytes == 0 and (
+        in_box or input.numel() * input.element_size() <= capacity.max_bytes[op]
     )
 
 
@@ -785,25 +784,40 @@ class Supported:
     arch: str
 
 
-# THE TUNED POINTS, a file an arch (`hip_custom_communicator_configs/<arch>.json`, written by
-# `gp bench tune`): `points`, per op and table (`mode`: exact, or quantized: every size, exact
-# kernels where quantizing does not pay and INT4 where it does), measured calls each with the
-# kernel and config that won there; `configs`, each kernel's config where no point picks it (a
-# forced call's). C++ checks them at open and runs a call at its nearest point (config.cuh's
-# `lookup`): every tuned number is here, none in C++.
+# THE TUNED POINTS, a file an arch (`hip_custom_communicator_configs/<arch>.json`,
+# written by `gp bench tune`): `points`, per op and table (`mode`: exact, or quantized:
+# every size, exact kernels where quantizing does not pay and INT4 where it does),
+# measured calls each with the kernel and config that won there; `configs`, each
+# kernel's config where no point picks it (a forced call's). C++ checks them at open
+# and runs a call at its nearest point (config.cuh's `lookup`): every tuned number is
+# here, none in C++.
 _CONFIGS = Path(__file__).with_name("hip_custom_communicator_configs")
-_POINT_KEYS = frozenset({
-    "op", "mode", "world", "hidden", "tokens", "kernel", "threads_per_block",
-    "waves_per_eu", "tile_m", "tile_n", "tile_k", "quantization", "blocks_per_grid",
-    "reduce_scatter_blocks",
-})
+_POINT_KEYS = frozenset(
+    {
+        "op",
+        "mode",
+        "world",
+        "hidden",
+        "tokens",
+        "kernel",
+        "threads_per_block",
+        "waves_per_eu",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "quantization",
+        "blocks_per_grid",
+        "reduce_scatter_blocks",
+    }
+)
 _MODES = ("exact", "quantized")
 
 
 def tuned_points(arch: str) -> list[int] | str:
     """THE ARCH'S TUNED POINTS as C++ takes them at open (types.cuh's TunedPoint, its
     `kPointFields` int64 a point, in its order), or why there are none: no file for the
-    arch. A file that is not one raises, naming it and the entry; C++ checks the rest."""
+    arch. A file that is not one raises, naming it and the entry; C++ checks the
+    rest."""
     path = _CONFIGS / f"{arch}.json"
     if not path.is_file():
         return f"no tuned config for {arch} ({path})"
@@ -817,14 +831,28 @@ def tuned_points(arch: str) -> list[int] | str:
         keys = _POINT_KEYS if pick else _POINT_KEYS - {"mode"}
         for i, e in enumerate(raw[section]):
             if set(e) != keys:
-                raise ValueError(f"{path}: {section}[{i}] has keys {sorted(e)}, not {sorted(keys)}")
+                raise ValueError(
+                    f"{path}: {section}[{i}] has keys {sorted(e)}, not {sorted(keys)}"
+                )
             # A config's table is its encoding's: it is no table's pick.
             mode = _MODES.index(e["mode"]) if pick else int(e["quantization"] == "int4")
-            wire += [built.op_names.index(e["op"]), mode, pick, e["world"], e["hidden"],
-                     e["tokens"], templates.index(e["kernel"]), e["threads_per_block"],
-                     e["waves_per_eu"], e["tile_m"], e["tile_n"], e["tile_k"],
-                     _QUANTIZATIONS.index(e["quantization"]), e["blocks_per_grid"],
-                     e["reduce_scatter_blocks"]]
+            wire += [
+                built.op_names.index(e["op"]),
+                mode,
+                pick,
+                e["world"],
+                e["hidden"],
+                e["tokens"],
+                templates.index(e["kernel"]),
+                e["threads_per_block"],
+                e["waves_per_eu"],
+                e["tile_m"],
+                e["tile_n"],
+                e["tile_k"],
+                _QUANTIZATIONS.index(e["quantization"]),
+                e["blocks_per_grid"],
+                e["reduce_scatter_blocks"],
+            ]
     return wire
 
 
@@ -847,8 +875,8 @@ def open_handle(
     tuned points a plain call reads (int4: the quantized one).
     `log_mode`: what the state log records. `rccl_ready`: whether the device group's
     RCCL communicator was found set up (`rccl_ready`), logged as an observation.
-    `points`: the arch's tuned points (`tuned_points`), checked by C++ here. An open that
-    fails one of its checks raises, naming it, with the log appended."""
+    `points`: the arch's tuned points (`tuned_points`), checked by C++ here. An open
+    that fails one of its checks raises, naming it, with the log appended."""
     try:
         handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
             cpu_group,
@@ -1199,11 +1227,11 @@ class HipCustomCommunicator:
         direction: str | None = None,
     ) -> "Ran | Error | None":
         """WHAT THIS COMMUNICATOR LAUNCHES for `op` on `rows` x `cols` of `dtype`, C++'s
-        own answer from its tuned points (config.cuh's `tuned`): with neither `algorithm`
-        nor `direction`, a plain call's pick from its table; with both, that kernel's
-        config moving `quantization` (its nearest point, a pick or a config). Forcing the
-        answer whole runs exactly it. The Error where no point runs the call, None where
-        the kernel has no point."""
+        own answer from its tuned points (config.cuh's `tuned`): with neither
+        `algorithm` nor `direction`, a plain call's pick from its table; with both, that
+        kernel's config moving `quantization` (its nearest point, a pick or a config).
+        Forcing the answer whole runs exactly it. None where the kernel has no
+        point."""
         name = next(n for n, d in _DTYPES.items() if d == dtype)
         answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
             self._handle, op, rows, cols, name, quantization, algorithm, direction
@@ -1646,8 +1674,8 @@ class HipCustomCommunicator:
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        # THE TUNED POINTS for this device's arch: none, and the communicator is disabled,
-        # naming why, as on a device it does not support.
+        # THE TUNED POINTS for this device's arch: none, and the communicator is
+        # disabled, naming why, as on a device it does not support.
         found = supported(self.device, self.device_group.size())
         if isinstance(found, Error):
             return found.name
