@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       }
       send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
-          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0,
+          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, 0,
           l * n_pad + col, 1);
     };
     if constexpr (!CHUNKED) {
@@ -309,13 +309,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t got[WORLD][1][kInt4GroupPacks][2];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
-            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0,
+            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, got, 0,
             l * n_pad + col, 1);
         float summed[1][kInt4GroupPacks][kPackElems];
         dequantize<DTYPE>(got, summed);
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             summed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
-            partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0,
+            partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, 0,
             l * n_pad + col, 1);
       };
       if constexpr (CHUNKED)
@@ -343,7 +343,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           uint32_t raw[1][kInt4GroupPacks][2];
           recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
               partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
-              partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, raw, 0,
+              partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, raw, 0,
               l * n_pad + col, 1);
 #pragma unroll
           for (int k = 0; k < kInt4GroupPacks; ++k)
@@ -365,7 +365,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t raw[1][kInt4GroupPacks][2];
         recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
-            partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, raw, 0, l * n_pad, 1);
+            partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, raw, 0, l * n_pad, 1);
         DTYPE sum[1][kInt4GroupPacks][kPackElems];
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
