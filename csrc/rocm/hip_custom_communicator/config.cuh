@@ -650,29 +650,14 @@ constexpr bool int4_takes_row(int64_t n, int world) {
   return n % kInt4Group == 0 && (n / kInt4Group) % world == 0;
 }
 
-// WHETHER A POINT'S KERNEL RUNS THIS CALL: every rank gets columns, its tile holds the row where
-// the op's tile must, and, moving INT4, a pack is a word of 16-bit values, the row is whole groups
-// for every rank and the payload fits the regions. A point that does not is passed over, never
-// refused: the nearest that does runs the call.
-inline bool runs(const Handle& h, const TunedPoint& p, int64_t m, int64_t n, int64_t tile_cols,
-                 DType dtype) {
-  if (!every_rank_gets_columns(p.fn, n, dtype, h.world_size())) return false;
-  if (tile_n_of(p.config.build) < tile_cols) return false;
-  if (quantization_of(p.config.build) != Quantization::int4) return true;
-  return elem_bytes(dtype) == 2 && int4_takes_row(n, h.world_size()) &&
-         int4_payload_bytes(m, n) <= h.staging_bytes() &&
-         int4_payload_bytes(1, m * n) <= h.partials_bytes();
-}
-
-// THE NEAREST POINT `take` admits that runs the call: at the handle's world, the nearest width,
-// then the nearest size (rows x width, so a width no point lists reads the nearest width's points
-// at the same bytes), the smaller on a tie. None where none runs it.
+// THE NEAREST POINT `take` admits: at the handle's world, the nearest width, then the nearest
+// size (rows x width, so a width no point lists reads the nearest width's points at the same
+// bytes), the smaller on a tie. Whether its kernel takes the call is the kernel's to say: a
+// kernel that cannot is refused by its checks, never passed over for another. None where `take`
+// admits no point.
 template <typename TAKE>
-inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t n,
-                                 int64_t tile_cols, DType dtype) {
-  const auto admitted = [&](const TunedPoint& p) {
-    return p.world == h.world_size() && take(p) && runs(h, p, m, n, tile_cols, dtype);
-  };
+inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t n) {
+  const auto admitted = [&](const TunedPoint& p) { return p.world == h.world_size() && take(p); };
   int64_t width = 0;
   for (const TunedPoint& p : h.points())
     if (admitted(p) && (width == 0 || distance(p.hidden, n) < distance(width, n)))
@@ -687,15 +672,14 @@ inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t 
   return best;
 }
 
-// THE KERNEL A PLAIN CALL RUNS: the nearest point its communicator's table picks; none running it
-// is the row's fault (too wide for every tile, or narrower than the world).
-inline std::variant<Chosen, Error> lookup(const Handle& h, OpType o, int64_t m, int64_t n,
-                                          int64_t tile_cols, DType dtype) {
+// THE KERNEL A PLAIN CALL RUNS: the nearest point its communicator's table picks (`check` holds
+// that every op has picks at every world and mode it builds).
+inline Chosen lookup(const Handle& h, OpType o, int64_t m, int64_t n) {
   const Mode mode = h.mode();
-  const auto picks = [&](const TunedPoint& p) { return p.op == o && p.mode == mode && p.pick; };
-  if (const TunedPoint* p = nearest(h, picks, m, n, tile_cols, dtype))
-    return Chosen{p->fn, p->config};
-  return nearest(h, picks, m, n, 0, dtype) ? Error::row_too_wide : Error::row_narrower_than_world;
+  const TunedPoint* p = nearest(h, [&](const TunedPoint& p) {
+    return p.op == o && p.mode == mode && p.pick;
+  }, m, n);
+  return Chosen{p->fn, p->config};
 }
 
 // A KERNEL'S CONFIG FOR A CALL THAT NAMES IT (a forced launch at the tuned config: gp's kernel
@@ -703,12 +687,12 @@ inline std::variant<Chosen, Error> lookup(const Handle& h, OpType o, int64_t m, 
 // in either table; moving INT4 where it has no INT4 point, its nearest exact point moved INT4 (a
 // build it lists). None where it has neither.
 inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int quantization,
-                                           int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
+                                           int64_t m, int64_t n) {
   const auto of = [&](int q) {
     return nearest(h, [&](const TunedPoint& p) {
       return p.fn == fn && quantization_of(p.config.build) == q &&
              built(fn, quantized(p.config.build, quantization));
-    }, m, n, tile_cols, dtype);
+    }, m, n);
   };
   const TunedPoint* p = of(quantization);
   if (!p && quantization == Quantization::int4) p = of(Quantization::none);
@@ -719,11 +703,11 @@ inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int qua
 // THE KERNEL A CALL RUNS: the forced one as forced, else its nearest point.
 inline std::variant<Chosen, Error> chosen(
     const Handle& h, const std::variant<std::optional<Chosen>, Error>& forcing,
-    OpType o, int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
+    OpType o, int64_t m, int64_t n) {
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing))
     return *f;
-  return lookup(h, o, m, n, tile_cols, dtype);
+  return lookup(h, o, m, n);
 }
 
 // =================================================================================================
@@ -851,10 +835,8 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
 inline std::variant<std::optional<Chosen>, Error> tuned(const Handle& h, OpType o, int64_t m,
                                                         int64_t n, DType dtype, int quantization,
                                                         std::optional<Template> fn) {
-  if (fn) return kernel_config(h, *fn, quantization, m, n, tile_cols(o, n), dtype);
-  const std::variant<Chosen, Error> c = lookup(h, o, m, n, tile_cols(o, n), dtype);
-  if (const Error* e = std::get_if<Error>(&c)) return *e;
-  return std::optional<Chosen>{std::get<Chosen>(c)};
+  if (fn) return kernel_config(h, *fn, quantization, m, n);
+  return std::optional<Chosen>{lookup(h, o, m, n)};
 }
 
 // =================================================================================================
@@ -1302,7 +1284,7 @@ inline std::variant<Config, Error> all_reduce_config(
                return AllReduceBuildConfig{*threads_per_block, *waves_per_eu,
                                            *tile_m, *tile_n};
              }),
-      OpType::all_reduce, m, n, tile_cols(OpType::all_reduce, n), dtype);
+      OpType::all_reduce, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
@@ -1433,8 +1415,8 @@ inline std::variant<Config, Error> split_all_reduce_config(
   const TunedPoint* r = nearest(h, [&](const TunedPoint& p) {
     return p.op == OpType::all_reduce && p.mode == mode && p.pick &&
            quantization_of(p.config.build) == quantization;
-  }, m, n, tile_cols(OpType::all_reduce, n), dtype);
-  if (!r) return Error::row_narrower_than_world;
+  }, m, n);
+  if (!r) return Error::quantization_not_supported;
   const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r->config.build);
   return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
                            dtype, algorithm_of(r->fn), direction_of(r->fn), b.tile_m, b.tile_n,
@@ -1470,7 +1452,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
                       return AllReduceRmsNormBuildConfig{
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
                     }),
-             op, m, n, tile_cols(op, n), dtype);
+             op, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
@@ -1570,7 +1552,7 @@ all_reduce_add_rms_norm_config(
                       return AllReduceAddRmsNormBuildConfig{
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
                     }),
-             op, m, n, tile_cols(op, n), dtype);
+             op, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
@@ -1696,7 +1678,7 @@ all_reduce_add_attn_res_rms_norm_config(
                           *threads_per_block, *waves_per_eu, *tile_m, *tile_n,
                           *tile_k};
                     }),
-             op, m, n, tile_cols(op, n), dtype);
+             op, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
