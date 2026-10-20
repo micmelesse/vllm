@@ -291,7 +291,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int w = 0; w < WORLD; ++w) {
           const int r = (rank + w) % WORLD;
           if ((r & mask) != c || l >= rows_of(r)) continue;
-#pragma unroll 1
           for (int col = 0; col < n; col += TILE_N) push(l, r, col);
         }
     }
@@ -305,7 +304,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // from this rank's), summed in fp32 and left INT4 in this rank's partials.
     for (int l = first; l < slice_m; l += step) {
       if ((rank & mask) != c || l >= rows_of(rank)) continue;
-#pragma unroll 1
       for (int col = 0; col < n; col += TILE_N) {  // a wide row's chunks (one, unless it is)
         uint32_t got[WORLD][1][kInt4GroupPacks][2];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(

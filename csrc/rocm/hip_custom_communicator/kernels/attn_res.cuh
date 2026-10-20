@@ -79,7 +79,6 @@ DINLINE void attn_res(
       return LAYOUT == Layout::tile ? c / P + t + k * THREADS_PER_BLOCK : c / P + t * K + k;
     };
     // A. THE NEW PREFIX, chunk by chunk, stored (and the block written) before any source is read.
-#pragma unroll 1
     for (int c = 0; c < n_all; c += tile_n) {
       DTYPE d[ROWS][K][P];
       sum_chunk(c, d);
@@ -127,7 +126,6 @@ DINLINE void attn_res(
         float sums[1][ROWS * 2 * TILE_K];
 #pragma unroll
         for (int q = 0; q < ROWS * 2 * TILE_K; ++q) sums[0][q] = 0.0f;
-#pragma unroll 1
         for (int c = 0; c < n_all; c += tile_n) {
           DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
           load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, n_all, 1, n_all, norm_weight, 0, c, 1);
@@ -212,7 +210,6 @@ DINLINE void attn_res(
     if (output_norm_weight_ptr != nullptr) {
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) scale[m] = 0.0f;
-#pragma unroll 1
       for (int c = 0; c < n_all; c += tile_n) {
         float acc[ROWS][K][P];
         mix(c, acc);
@@ -221,7 +218,6 @@ DINLINE void attn_res(
                                     NormPart::wide, false, LAYOUT);
       }
     }
-#pragma unroll 1
     for (int c = 0; c < n_all; c += tile_n) {
       float acc[ROWS][K][P];
       mix(c, acc);
