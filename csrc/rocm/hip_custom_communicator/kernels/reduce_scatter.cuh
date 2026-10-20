@@ -115,7 +115,8 @@ DINLINE void reduce_scatter(
     const int64_t total = int64_t{input_size_m} * input_size_n;
     // A SHARE IS WHOLE UNITS, the last rank's to the band's end (int4: its last group short where
     // the band is not whole groups; the clips below are in elements, so a short group is masked).
-    const int slice = static_cast<int>(((total + kUnit - 1) / kUnit + WORLD - 1) / WORLD * kUnit);
+    const int64_t units = kInt4 ? (total + kUnit - 1) / kUnit : total / kUnit;  // exact: whole packs
+    const int slice = static_cast<int>((units + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
     };
