@@ -56,7 +56,7 @@ namespace hip_custom_communicator {
 // T(m * scale * w) or T(m). The softmax's sum is taken directly (each source weighted by
 // exp(logit - max) / denominator), not online as attn_res's: the same value, its fp32 rounding
 // apart.
-template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, typename DTYPE, int ROWS,
+template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, bool TAIL, typename DTYPE, int ROWS,
           int K, int P, typename SUM_CHUNK = std::nullptr_t>
 DINLINE void attn_res(
     const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
@@ -85,7 +85,7 @@ DINLINE void attn_res(
       DTYPE new_prefix[ROWS][K][P];
       if (prefix_ptr != nullptr) {
         DTYPE old_prefix[ROWS][K][P];
-        load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, n_all, input_size_m, n_all, old_prefix, offs_m, c, 1);
+        load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, n_all, input_size_m, n_all, old_prefix, offs_m, c, 1);
 #pragma unroll
         for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -102,15 +102,15 @@ DINLINE void attn_res(
 #pragma unroll
             for (int j = 0; j < P; ++j) new_prefix[i][k][j] = d[i][k][j];
       }
-      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
       if (block_output_ptr != nullptr)
-        store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+        store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
     }
     // Source src's chunk at column c: a block, or the new prefix (the last source).
     const auto source = [&](int src, int c, DTYPE (&v)[ROWS][K][P]) {
       const bool block = src < num_blocks;
       const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-      load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, n_all, input_size_m, n_all, v, offs_m, c, 1);
+      load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, n_all, input_size_m, n_all, v, offs_m, c, 1);
     };
     extern __shared__ float wide_logits[];  // [ROWS][num_blocks + 1]
     const int sources = num_blocks + 1;
@@ -128,8 +128,8 @@ DINLINE void attn_res(
         for (int q = 0; q < ROWS * 2 * TILE_K; ++q) sums[0][q] = 0.0f;
         for (int c = 0; c < n_all; c += tile_n) {
           DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-          load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, n_all, 1, n_all, norm_weight, 0, c, 1);
-          load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, n_all, 1, n_all, qk_weight, 0, c, 1);
+          load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, n_all, 1, n_all, norm_weight, 0, c, 1);
+          load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, n_all, 1, n_all, qk_weight, 0, c, 1);
 #pragma unroll
           for (int s = 0; s < TILE_K; ++s) {
             const int src = src0 + s < sources ? src0 + s : num_blocks;  // padding: the prefix again
@@ -224,7 +224,7 @@ DINLINE void attn_res(
       DTYPE result[ROWS][K][P];
       if (output_norm_weight_ptr != nullptr) {
         DTYPE output_norm_weight[1][K][P];
-        load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, n_all, 1, n_all, output_norm_weight, 0, c, 1);
+        load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, n_all, 1, n_all, output_norm_weight, 0, c, 1);
         rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps, inv_hidden,
                                     n_all, c, NormPart::apply, false, LAYOUT);
       } else {
@@ -235,7 +235,7 @@ DINLINE void attn_res(
 #pragma unroll
             for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
       }
-      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
     }
     __syncthreads();  // the LDS's logits read by every thread before the next rows' are written
   } else {
@@ -249,7 +249,7 @@ DINLINE void attn_res(
     DTYPE new_prefix[ROWS][K][P];
     if (prefix_ptr != nullptr) {  // a scalar branch: the pointer is the launch's
       DTYPE old_prefix[ROWS][K][P];
-      load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
+      load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, old_prefix, offs_m, offs_n, 1);
 #pragma unroll
       for (int i = 0; i < ROWS; ++i)
 #pragma unroll
@@ -266,9 +266,9 @@ DINLINE void attn_res(
 #pragma unroll
           for (int j = 0; j < P; ++j) new_prefix[i][k][j] = sum[i][k][j];
     }
-    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
     if (block_output_ptr != nullptr)
-      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
     // THE PREFIX IS NOT HELD ACROSS THE LOOP: the last source, it is read back
     // from `prefix_output_ptr`, where this launch just stored it (Triton's kernel
     // does the same: held in fp32 it was 32 VGPRs at 7168, 256 threads).
@@ -282,8 +282,8 @@ DINLINE void attn_res(
     if (num_blocks != 0) {
       // A WEIGHT IS ONE ROW, every row's: row 0 of a 1 x input_size_n tensor.
       DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
-      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
-      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
+      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, norm_weight, 0, offs_n, 1);
+      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, qk_weight, 0, offs_n, 1);
       float w[1][K][P];
 #pragma unroll
       for (int k = 0; k < K; ++k)
@@ -322,7 +322,7 @@ DINLINE void attn_res(
           // padding source re-reads the prefix; its logit is -inf.
           const bool block = !decltype(last)::value || src < num_blocks;
           const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
-          load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
+          load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, input_size_n, input_size_m, input_size_n, v[s], offs_m, offs_n, 1);
           // This thread's share of each row's sum of squares, then of its dot with w (rms_norm.cuh's
           // mask: packs past input_size_n count zero, multiplied in so nothing branches).
           float ss[ROWS], dw[ROWS];
@@ -429,7 +429,7 @@ DINLINE void attn_res(
     DTYPE result[ROWS][K][P];
     if (output_norm_weight_ptr != nullptr) {
       DTYPE output_norm_weight[1][K][P];
-      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
+      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, input_size_n, 1, input_size_n, output_norm_weight, 0, offs_n, 1);
       float scale[ROWS];
       rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps,
                                               inv_hidden, input_size_n, offs_n, NormPart::row, false, LAYOUT);
@@ -441,7 +441,7 @@ DINLINE void attn_res(
 #pragma unroll
           for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
     }
-    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT, TAIL>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
   }
 }
 

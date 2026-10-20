@@ -95,7 +95,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           }
       };
       DTYPE unread[1][kPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
-      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, false>(
           unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
           qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
@@ -120,7 +120,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
         sum[0][k][j] = static_cast<DTYPE>(acc);
       }
-    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, false>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         };
         if constexpr (CHUNKED) {  // a row wider than the tile (attn_res.cuh's sum_chunk)
           DTYPE unread[1][kInt4GroupPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
-          attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run>(
+          attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run, TAIL>(
               unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
               blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
               qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
@@ -370,7 +370,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
           dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
-        attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run>(
+        attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run, TAIL>(
             sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
             blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
             qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               col, slice_n, rank);
         };
         DTYPE unread[TILE_M][kPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
-        attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+        attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, TAIL>(
             unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
             blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
             qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
           partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m, 0,
           slice_n, rank);
-      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, TAIL>(
           sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
           blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
           norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -536,7 +536,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // every input read in place after it (written before the peers' launches), and the pushes into a
   // peer's partials after it land where that peer finished reading in its last launch, ended before
   // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched, false>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched, TAIL>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,
       staging_ptr_array, staging_ptr_array_size, staging_stride_m, staging_stride_n,
@@ -559,7 +559,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, col, 1);
       };
       DTYPE unread[1][kPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
-      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, TAIL>(
           unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
           qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
@@ -572,7 +572,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
     DTYPE sum[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, 0, 1);
-    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, TAIL>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,
@@ -643,7 +643,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             input_size_n, input_size_m, input_size_n, sum, offs_m, col, 1);
       };
       DTYPE unread[TILE_M][kPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
-      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, false>(
           unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
           blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
           qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
@@ -658,7 +658,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
         &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
         input_size_n, input_size_m, input_size_n, sum, offs_m, 0, 1);
-    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+    attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile, false>(
         sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
         blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
         norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n,

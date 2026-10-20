@@ -83,6 +83,7 @@ constexpr int kInt4Group = 32;           // elements a group
 constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's values
 constexpr int kInt4WordBytes = 4;        // a pack's values
 constexpr int kInt4ScaleBytes = 2;       // a group's scale
+constexpr uint32_t kInt4ZeroWord = 0x88888888u;  // a word of zeros (each value stored q + 8)
 
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
@@ -541,7 +542,10 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // load (saddr), not hoisted and held as a 64-bit vector address.
     const int g = offs_n / kInt4Group + tid % kThreadsN;
     // TAIL: THE LAST GROUP MAY BE SHORT (clip_n whole packs, not whole groups), its packs past the
-    // clip reading the last pack inside it, as a tile's do.
+    // clip ZERO: a short group is quantized, summed and normed whole, and a pack past the clip that
+    // held a repeat (exact) or a word nobody wrote (INT4) would count in its scale (the INT4 pulled
+    // norms re-quantize the group they sum: 3 x 40 at 0.026 of the emulation's RMS, n11
+    // 2026-10-20T20-15-38Z).
     const int at = TAIL ? min(g, static_cast<int>(int4_groups(clip_n)) - 1)
                         : min(g, clip_n / kInt4Group - 1);
     if constexpr (QUANTIZATION == Quantization::none) {
@@ -587,6 +591,11 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
             }
           }
         }
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k)
+          if (k > last)
+#pragma unroll
+            for (int j = 0; j < kPackElems; ++j) output[0][k][j] = static_cast<U>(0.0f);
       } else {
         const V* group;
         if constexpr (kRun) {
@@ -646,9 +655,11 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         auto& out = [&]() -> U(&)[kPacks][kPackElems] {
           if constexpr (kSlots) return output[c][0]; else return output[0];
         }();
+        // TAIL: the words past the clip zero (a short group's, above).
+        const int last = clip_n / (kInt4Group / kInt4GroupPacks) - 1 - at * kInt4GroupPacks;
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k) {
-          out[k][0] = words[k];
+          out[k][0] = TAIL && k > last ? kInt4ZeroWord : words[k];
           out[k][1] = scale;
         }
       }
