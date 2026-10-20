@@ -82,6 +82,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
       {
         const auto chunk = values;
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           chunk(c, s);
@@ -91,9 +92,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         values(c, s);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
         DTYPE normed[1][kPacks][kPackElems];
@@ -218,6 +223,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
       {
         const auto chunk = scale_values;
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           chunk(c, s);
@@ -227,10 +233,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         DTYPE added[1][kPacks][kPackElems];
         values(c, s, added);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
@@ -416,6 +426,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = values;
+#pragma unroll 1
           for (int c = 0; c < input_size_n; c += TILE_N) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
@@ -425,9 +436,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           values(c, s);
+          // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+          asm volatile("" ::: "memory");
+          __builtin_amdgcn_sched_barrier(0);
           WEIGHT_DTYPE wc[1][kPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
           DTYPE normed[1][kPacks][kPackElems];
@@ -529,6 +544,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int w = 0; w < WORLD; ++w) {
           const int r = (rank + w) % WORLD;
           if (l >= rows_of(r)) continue;
+#pragma unroll 1
           for (int c = 0; c < n; c += TILE_N) push(l, r, c);
         }
     }
@@ -564,6 +580,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = [&](int c, float (&s)[1][kInt4GroupPacks][kPackElems]) { values(l, c, s); };
+#pragma unroll 1
           for (int c = 0; c < n; c += TILE_N) {
             float s[1][kInt4GroupPacks][kPackElems];
             chunk(c, s);
@@ -573,9 +590,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::group_run);
           }
         }
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) {
           float s[1][kInt4GroupPacks][kPackElems];
           values(l, c, s);
+          // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+          asm volatile("" ::: "memory");
+          __builtin_amdgcn_sched_barrier(0);
           WEIGHT_DTYPE wc[1][kInt4GroupPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
               &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
@@ -651,6 +672,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int l = blockIdx.x; l < slice_m; l += grid) gather(l, 0);
     else
       for (int l = blockIdx.x; l < slice_m; l += grid)
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) gather(l, c);
   }
 }
@@ -808,6 +830,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
         {
           const auto chunk = scale_values;
+#pragma unroll 1
           for (int c = 0; c < input_size_n; c += TILE_N) {
             float s[1][kPacks][kPackElems];
             chunk(c, s);
@@ -817,10 +840,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::tile);
           }
         }
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           DTYPE added[1][kPacks][kPackElems];
           values(c, s, added);
+          // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+          asm volatile("" ::: "memory");
+          __builtin_amdgcn_sched_barrier(0);
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, row_n, row - first, kScaleSlot + c, 1);
         }
         float scale_row[1][1][1] = {{{scale[0]}}};
@@ -937,6 +964,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int w = 0; w < WORLD; ++w) {
           const int r = (rank + w) % WORLD;
           if (l >= rows_of(r)) continue;
+#pragma unroll 1
           for (int c = 0; c < n; c += TILE_N) push(l, r, c);
         }
     }
@@ -985,6 +1013,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       DTYPE added[1][kInt4GroupPacks][kPackElems];
                       values(l, c, s, added);
                     };
+#pragma unroll 1
           for (int c = 0; c < n; c += TILE_N) {
             float s[1][kInt4GroupPacks][kPackElems];
             chunk(c, s);
@@ -994,10 +1023,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                         NormPart::wide, true, Layout::group_run);
           }
         }
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) {
           float s[1][kInt4GroupPacks][kPackElems];
           DTYPE added[1][kInt4GroupPacks][kPackElems];
           values(l, c, s, added);
+          // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+          asm volatile("" ::: "memory");
+          __builtin_amdgcn_sched_barrier(0);
           store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
               added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0,
@@ -1102,6 +1135,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int l = blockIdx.x; l < slice_m; l += grid) gather(l, 0, w);
     else
       for (int l = blockIdx.x; l < slice_m; l += grid)
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) {
           WEIGHT_DTYPE wc[1][kInt4GroupPacks][kPackElems];
           load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
@@ -1199,6 +1233,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
       {
         const auto chunk = values;
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           chunk(c, s);
@@ -1208,9 +1243,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         values(c, s);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
         DTYPE normed[1][kPacks][kPackElems];
@@ -1324,6 +1363,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   DTYPE added[1][kPacks][kPackElems];
                   values(c, s, added);
                 };
+#pragma unroll 1
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           chunk(c, s);
@@ -1333,10 +1373,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         DTYPE added[1][kPacks][kPackElems];
         values(c, s, added);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m, residual_output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, row, c, 1);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, wc, 0, c, 1);
@@ -1430,6 +1474,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int m = 0; m < TILE_M; ++m) scale[m] = 0.0f;
       {
         const auto chunk = values;
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) {
           float s[TILE_M][kPacks][kPackElems];
           chunk(c, s);
@@ -1439,9 +1484,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < n; c += TILE_N) {
         float s[TILE_M][kPacks][kPackElems];
         values(c, s);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         WEIGHT_DTYPE wc[1][kPacks][kPackElems];
         load<1, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
             &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
@@ -1527,6 +1576,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   DTYPE added[TILE_M][kPacks][kPackElems];
                   values(c, s, added);
                 };
+#pragma unroll 1
         for (int c = 0; c < n; c += TILE_N) {
           float s[TILE_M][kPacks][kPackElems];
           chunk(c, s);
@@ -1536,10 +1586,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                       NormPart::wide, true, Layout::tile);
         }
       }
+#pragma unroll 1
       for (int c = 0; c < n; c += TILE_N) {
         float s[TILE_M][kPacks][kPackElems];
         DTYPE added[TILE_M][kPacks][kPackElems];
         values(c, s, added);
+        // THE CHUNK'S VALUES BEFORE ITS WEIGHT: the load hoisted beside them held both.
+        asm volatile("" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
         store<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
             added, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
             residual_output_stride_n, 1, m, n, m, n, offs_m, c, 1);
