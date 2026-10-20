@@ -158,10 +158,6 @@ constexpr BuildConfig kAddRmsNormPullConfigs[] = {
 constexpr BuildConfig kAttnResOneShotConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
-    // FOUR SOURCES A STEP (TILE_K 4, the model's Triton AttnRes at decode, BLOCK_L 4): a block
-    // reduction a step, not a source. Not swept yet.
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 4},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 4},
 };
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98
 // against 39.93, 83.15, 159.33 at 128), a row a block below that
@@ -173,9 +169,7 @@ constexpr BuildConfig kAttnResPushExactConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
     AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
     AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},    // FOUR SOURCES A STEP, as the one-shot's (decode). Not swept yet.
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 4},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 4},
+    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
 };
 constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192
