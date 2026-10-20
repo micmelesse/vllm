@@ -52,7 +52,8 @@ enum class Error : int {
   waves_not_built = 25,
   inner_stride_not_one = 26,
   row_stride_not_packs = 27,
-  row_narrower_than_world = 28,
+  row_narrower_than_world = 28,  // retired: every two-shot takes a row narrower than a
+                                // pack a rank (the late ranks' slices empty)
   forced_incomplete = 29,
   no_such_quantization = 30,
   quantization_not_supported = 31,
