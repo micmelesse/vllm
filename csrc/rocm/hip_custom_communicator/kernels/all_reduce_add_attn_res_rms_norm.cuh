@@ -304,19 +304,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // from this rank's), summed in fp32 and left INT4 in this rank's partials.
     for (int l = first; l < slice_m; l += step) {
       if ((rank & mask) != c || l >= rows_of(rank)) continue;
-      for (int col = 0; col < n; col += TILE_N) {  // a wide row's chunks (one, unless it is)
+      // The row's groups from column col: one chunk, or a CHUNKED row's every chunk.
+      const auto sum = [&](int col) {
         uint32_t got[WORLD][1][kInt4GroupPacks][2];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
             staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0,
             l * n_pad + col, 1);
-        float sum[1][kInt4GroupPacks][kPackElems];
-        dequantize<DTYPE>(got, sum);
+        float summed[1][kInt4GroupPacks][kPackElems];
+        dequantize<DTYPE>(got, summed);
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
-            sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
+            summed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0,
             l * n_pad + col, 1);
-      }
+      };
+      if constexpr (CHUNKED)
+        for (int col = 0; col < n; col += TILE_N) sum(col);
+      else
+        sum(0);
     }
 
     // 3. Every rank's rows are visible to its peers.
