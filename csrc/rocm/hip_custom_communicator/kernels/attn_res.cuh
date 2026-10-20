@@ -39,34 +39,10 @@ namespace hip_custom_communicator {
 // LAYOUT: how the thread's packs lie in the row, every access's (common.cuh's Layout): tile (pack
 // k of thread t at t + k * THREADS_PER_BLOCK, the exact kernels'), or group_run (a group a thread,
 // its K packs consecutive at t * K + k, the INT4 pull's: its sum lands a group a thread).
-// A ROW WIDER THAN THE TILE, as attn_res takes it in place of the sum's registers: `sum_chunk(c, d)`
-// the chunk at column c of the block's ROWS rows summed over the ranks (the kernel's own: read,
-// never written, by attn_res), and the tile's width, `tile_n` (K * P * THREADS_PER_BLOCK).
-template <typename DTYPE, int ROWS, int K, int P, typename F>
-struct WideRow {
-  F sum_chunk;
-  int tile_n;
-};
-// WHAT ATTN_RES'S SUM IS: its registers, or a wide row's chunks; its dtype and shape either way.
-template <typename SUM>
-struct AttnResSum;
-template <typename T, int ROWS_, int K_, int P_>
-struct AttnResSum<T[ROWS_][K_][P_]> {
-  using dtype = T;
-  static constexpr int rows = ROWS_, k = K_, p = P_;
-  static constexpr bool wide = false;
-};
-template <typename T, int ROWS_, int K_, int P_, typename F>
-struct AttnResSum<WideRow<T, ROWS_, K_, P_, F>> {
-  using dtype = T;
-  static constexpr int rows = ROWS_, k = K_, p = P_;
-  static constexpr bool wide = true;
-};
-
-// A WIDE ROW (a WideRow for the sum): attn_res's math over the row's chunks of `tile_n` columns (a
-// tile's, from column 0), the block's ROWS rows at offs_m (offs_n unused), in passes, each over
-// every chunk:
-//   A. the new prefix (and the one block written), from the WideRow's `sum_chunk(c, d)`, the chunk at column c
+// A ROW WIDER THAN THE TILE (`sum_chunk` given, `sum` unread): attn_res's math over the row's
+// chunks of `tile_n` columns (the tile's, K * P * THREADS_PER_BLOCK, from column 0), the block's
+// ROWS rows at offs_m (offs_n unused), in passes, each over every chunk:
+//   A. the new prefix (and the one block written), from `sum_chunk(c, d)`, the chunk at column c
 //      of the rows summed over the ranks (the kernel's own: read, never written, here);
 //   B. every source's logit, TILE_K sources a step, its sums of squares and dots with
 //      norm_w * qk_w over the chunks, one block reduction a step; the logits kept in the launch's
@@ -80,32 +56,32 @@ struct AttnResSum<WideRow<T, ROWS_, K_, P_, F>> {
 // T(m * scale * w) or T(m). The softmax's sum is taken directly (each source weighted by
 // exp(logit - max) / denominator), not online as attn_res's: the same value, its fp32 rounding
 // apart.
-template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, typename SUM>
+template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, typename DTYPE, int ROWS,
+          int K, int P, typename SUM_CHUNK = std::nullptr_t>
 DINLINE void attn_res(
-    const SUM& sum, const typename AttnResSum<SUM>::dtype* prefix_ptr,
-    int64_t prefix_stride_m, int64_t prefix_stride_n, const typename AttnResSum<SUM>::dtype* blocks_ptr,
+    const DTYPE (&sum)[ROWS][K][P], const DTYPE* prefix_ptr,
+    int64_t prefix_stride_m, int64_t prefix_stride_n, const DTYPE* blocks_ptr,
     int64_t blocks_stride_m, int64_t blocks_stride_r, int64_t blocks_stride_n,
-    const typename AttnResSum<SUM>::dtype* norm_weight_ptr, int64_t norm_weight_stride_n,
-    const typename AttnResSum<SUM>::dtype* qk_weight_ptr, int64_t qk_weight_stride_n,
-    const typename AttnResSum<SUM>::dtype* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
-    typename AttnResSum<SUM>::dtype* prefix_output_ptr, int64_t prefix_output_stride_m,
-    int64_t prefix_output_stride_n, typename AttnResSum<SUM>::dtype* output_ptr, int64_t output_stride_m,
-    int64_t output_stride_n, typename AttnResSum<SUM>::dtype* block_output_ptr,
+    const DTYPE* norm_weight_ptr, int64_t norm_weight_stride_n,
+    const DTYPE* qk_weight_ptr, int64_t qk_weight_stride_n,
+    const DTYPE* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
+    DTYPE* prefix_output_ptr, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, DTYPE* output_ptr, int64_t output_stride_m,
+    int64_t output_stride_n, DTYPE* block_output_ptr,
     int64_t block_output_stride_m, int64_t block_output_stride_n,
     int input_size_m, int input_size_n, int offs_m, int offs_n, int num_blocks,
-    float eps, float output_eps, float inv_hidden) {
-  using DTYPE = typename AttnResSum<SUM>::dtype;
-  constexpr int ROWS = AttnResSum<SUM>::rows, K = AttnResSum<SUM>::k, P = AttnResSum<SUM>::p;
-  if constexpr (AttnResSum<SUM>::wide) {
+    float eps, float output_eps, float inv_hidden, SUM_CHUNK sum_chunk = nullptr,
+    int tile_n = 0) {
+  if constexpr (!std::is_same_v<SUM_CHUNK, std::nullptr_t>) {
     const int n_all = input_size_n;
     [[maybe_unused]] const auto pack_at = [&](int k, int c) {
       const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
       return LAYOUT == Layout::tile ? c / P + t + k * THREADS_PER_BLOCK : c / P + t * K + k;
     };
     // A. THE NEW PREFIX, chunk by chunk, stored (and the block written) before any source is read.
-    for (int c = 0; c < n_all; c += sum.tile_n) {
+    for (int c = 0; c < n_all; c += tile_n) {
       DTYPE d[ROWS][K][P];
-      sum.sum_chunk(c, d);
+      sum_chunk(c, d);
       DTYPE new_prefix[ROWS][K][P];
       if (prefix_ptr != nullptr) {
         DTYPE old_prefix[ROWS][K][P];
@@ -150,7 +126,7 @@ DINLINE void attn_res(
         float sums[1][ROWS * 2 * TILE_K];
 #pragma unroll
         for (int q = 0; q < ROWS * 2 * TILE_K; ++q) sums[0][q] = 0.0f;
-        for (int c = 0; c < n_all; c += sum.tile_n) {
+        for (int c = 0; c < n_all; c += tile_n) {
           DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
           load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, n_all, 1, n_all, norm_weight, 0, c, 1);
           load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, n_all, 1, n_all, qk_weight, 0, c, 1);
@@ -234,7 +210,7 @@ DINLINE void attn_res(
     if (output_norm_weight_ptr != nullptr) {
 #pragma unroll
       for (int m = 0; m < ROWS; ++m) scale[m] = 0.0f;
-      for (int c = 0; c < n_all; c += sum.tile_n) {
+      for (int c = 0; c < n_all; c += tile_n) {
         float acc[ROWS][K][P];
         mix(c, acc);
         DTYPE wide_w[1][K][P], wide_out[ROWS][K][P];
@@ -242,7 +218,7 @@ DINLINE void attn_res(
                                     NormPart::wide, false, LAYOUT);
       }
     }
-    for (int c = 0; c < n_all; c += sum.tile_n) {
+    for (int c = 0; c < n_all; c += tile_n) {
       float acc[ROWS][K][P];
       mix(c, acc);
       DTYPE result[ROWS][K][P];
