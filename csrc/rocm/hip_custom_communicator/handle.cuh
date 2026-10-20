@@ -517,7 +517,7 @@ class Handle {
   // the caller's too, computed from the largest call it serves, `max_rows` rows
   // of at most `max_cols` columns (config.cuh's `exchange_sizes`): kept, so
   // what the buffers were sized for can be asked. `quantization`: what the tuned path moves
-  // across the links, a Quantization (config.cuh's `quantizes`).
+  // across the links, a Quantization: its plain calls read the quantized table where INT4.
   // `device`: the device the communicator was given (open checks it is the
   // current one). `log_mode`: what the log records (log.cuh). `rccl_ready`:
   // whether the caller found the device group's RCCL communicator set up (1),
@@ -525,8 +525,10 @@ class Handle {
   Handle(int rank, int world_size, int device, const Gather& gather,
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
          int64_t staging_bytes, int64_t partials_bytes,
-         int quantization, LogMode log_mode, int rccl_ready)
-      : rank_(rank),
+         int quantization, LogMode log_mode, int rccl_ready,
+         std::vector<TunedPoint> points)
+      : points_(std::move(points)),
+        rank_(rank),
         world_size_(world_size),
         device_(device),
         max_rows_(max_rows),
@@ -701,6 +703,10 @@ class Handle {
   int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
+  // THE TUNED POINTS this communicator selects from (types.cuh's TunedPoint), checked at open,
+  // and the table its plain calls read: the quantized one where it quantizes.
+  const std::vector<TunedPoint>& points() const { return points_; }
+  Mode mode() const { return quantization_ == Quantization::int4 ? Mode::quantized : Mode::exact; }
   // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (config.cuh's
   // Algorithm::split), written by its plain all-reduce and read by its own
   // epilogue kernel after it on the stream. Never a peer's (not in the arena:
@@ -1327,6 +1333,8 @@ class Handle {
     return i;
   }
 
+  // THE TUNED POINTS (points()), first: open checks them before anything is made.
+  std::vector<TunedPoint> points_;
   int rank_;
   int world_size_;
   int device_;

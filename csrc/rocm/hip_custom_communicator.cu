@@ -230,6 +230,42 @@ Answer answer(const std::variant<hip_custom_communicator::Config,
           static_cast<int64_t>(config.quantization)};
 }
 
+// THE TUNED POINTS FROM THE WIRE (types.cuh's TunedPoint, kPointFields int64 a point, in its
+// order: op, mode, pick, world, hidden, tokens, template, threads_per_block, waves_per_eu, tile_m,
+// tile_n, tile_k, quantization, blocks_per_grid, reduce_scatter_blocks), checked (config.cuh's
+// `check`): a malformed or unsound file raises, naming its point.
+std::vector<hip_custom_communicator::TunedPoint> points_from(const std::vector<int64_t>& wire) {
+  using namespace hip_custom_communicator;
+  TORCH_CHECK(wire.size() % kPointFields == 0,
+              "hip_custom_communicator: the points are ", kPointFields, " fields each, not ",
+              wire.size(), " fields");
+  std::vector<TunedPoint> out;
+  for (size_t at = 0; at < wire.size(); at += kPointFields) {
+    const int64_t* f = &wire[at];
+    TORCH_CHECK(f[0] >= 0 && f[0] < kNumOps && (f[1] == 0 || f[1] == 1) && f[6] >= 0 &&
+                    f[6] < kNumTemplates,
+                "hip_custom_communicator: point ", at / kPointFields,
+                " names no op, mode or kernel this build has");
+    const OpType o = static_cast<OpType>(f[0]);
+    const int threads = static_cast<int>(f[7]), waves = static_cast<int>(f[8]),
+              tile_m = static_cast<int>(f[9]), tile_n = static_cast<int>(f[10]),
+              tile_k = static_cast<int>(f[11]), q = static_cast<int>(f[12]);
+    BuildConfig b = AllReduceBuildConfig{threads, waves, tile_m, tile_n, q};
+    if (o == OpType::all_reduce_rms_norm)
+      b = AllReduceRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
+    if (o == OpType::all_reduce_add_rms_norm)
+      b = AllReduceAddRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
+    if (o == OpType::all_reduce_add_attn_res_rms_norm)
+      b = AllReduceAddAttnResRmsNormBuildConfig{threads, waves, tile_m, tile_n, tile_k, q};
+    out.push_back({o, static_cast<Mode>(f[1]), f[2] != 0, static_cast<int>(f[3]), f[4], f[5],
+                   static_cast<Template>(f[6]),
+                   {b, {static_cast<int>(f[13]), static_cast<int>(f[14])}}});
+  }
+  const std::optional<std::string> bad = check(out);
+  TORCH_CHECK(!bad, "hip_custom_communicator: the config file's ", *bad);
+  return out;
+}
+
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
 // (which carries the handles) and `device_group`, a collective: this rank's
 // symmetric memory, made and owned here, its handle gathered with every rank's,
@@ -237,8 +273,8 @@ Answer answer(const std::variant<hip_custom_communicator::Config,
 // before it reports a fault. `max_rows` and `max_cols`: the largest call it
 // serves (for a model, the server's tokens a batch by its hidden size), from
 // which its exchange is sized (`exchange_sizes`). `quantization`: what its
-// tuned calls move across the links, a Quantization (config.cuh's
-// `quantizes`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
+// plain calls read, a Quantization: the quantized table where INT4 (config.cuh's
+// `lookup`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
 // caller found the device group's RCCL communicator set up (1), not (0), or
 // could not tell (-1), logged as an observation. A torch op cannot return a
 // variant, so it is two optionals and exactly one is set, the handle or the
@@ -248,7 +284,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       int64_t device, double timeout_seconds,
                                       int64_t max_rows, int64_t max_cols,
                                       int64_t quantization, int64_t log_mode,
-                                      int64_t rccl_ready) {
+                                      int64_t rccl_ready,
+                                      const std::vector<int64_t>& points) {
   TORCH_CHECK(
       log_mode == 0 || log_mode == 1,
       "a communicator's log mode is errors (0) or everything (1): ", log_mode);
@@ -273,6 +310,9 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&ok))
     return refused(*e);
+  // THE TUNED POINTS, checked before anything is made: a file that cannot be run raises, naming
+  // its point.
+  std::vector<hip_custom_communicator::TunedPoint> tuned = points_from(points);
   const auto sizes =
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
@@ -280,7 +320,7 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       timeout_seconds, max_rows, max_cols, sizes.staging_bytes,
       sizes.partials_bytes, static_cast<int>(quantization),
       static_cast<hip_custom_communicator::LogMode>(log_mode),
-      static_cast<int>(rccl_ready));
+      static_cast<int>(rccl_ready), std::move(tuned));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -340,8 +380,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
   }
   // EACH OP'S PLAIN CALL (kOps, config.cuh), in `ops`' order: its dtypes and
   // its weight's besides its input's, flat, and four ints an op: those two
-  // counts, widest_row and two_d. What a call may hold is a communicator's
-  // (`hip_custom_communicator_capacity`), not the build's.
+  // counts and two_d. What a call may hold is a communicator's (`hip_custom_communicator_capacity`
+  // and, from its points, `hip_custom_communicator_limits`), not the build's.
   Names op_dtypes, op_weights;
   std::vector<int64_t> op_facts;
   for (const Op& o : kOps) {
@@ -349,7 +389,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
     for (const DType d : o.weights) op_weights.push_back(to_string(d));
     op_facts.insert(op_facts.end(), {static_cast<int64_t>(o.dtypes.size()),
                                      static_cast<int64_t>(o.weights.size()),
-                                     widest_row(o.type), o.two_d});
+                                     o.two_d});
   }
   return {dtypes,     worlds,       kBuild.memory.pack_bytes,
           ops,        errors,       where_names,
@@ -365,7 +405,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
 // template's, the plain call's pick), what select launches, as an op's Answer
 // says what ran; or [] where that list has no entry of the template.
 std::vector<int64_t> hip_custom_communicator_tuned(
-    const std::string& op_name, int64_t world, int64_t rows, int64_t cols,
+    fptr_t handle_ptr, const std::string& op_name, int64_t rows, int64_t cols,
     const std::string& dtype, const std::string& quantization,
     std::optional<std::string> algorithm,
     std::optional<std::string> direction) {
@@ -386,9 +426,8 @@ std::vector<int64_t> hip_custom_communicator_tuned(
     fn = template_of(*o, *algorithm_from(algorithm), *direction_from(direction));
     if (!fn) return refusal(Error::no_such_template);
   }
-  const auto got =
-      tuned(*o, static_cast<int>(world), rows, cols, *d,
-            *quantization_from(quantization), fn);
+  const auto got = tuned(handle_of(handle_ptr), *o, rows, cols, *d,
+                         *quantization_from(quantization), fn);
   if (const Error* e = std::get_if<Error>(&got)) return refusal(*e);
   const std::optional<Chosen>& c = std::get<std::optional<Chosen>>(got);
   if (!c) return {};
@@ -413,20 +452,26 @@ std::vector<int64_t> hip_custom_communicator_tuned(
 
 // WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
 // `world` RANKS HOLDS, for Python's `should`: the box, its exchange's partials
-// and inputs bytes (`exchange_sizes`, what the opener allocates), then each
-// op's most bytes on them whatever the call's shape (`max_bytes`), in kOps'
-// order. A pure function of its arguments, so a communicator that is not open
-// can be asked.
+// and inputs bytes (`exchange_sizes`, what the opener allocates). A pure function of its
+// arguments, so a communicator that is not open can be asked.
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t max_cols,
                                                       int64_t world) {
   const auto sizes = hip_custom_communicator::exchange_sizes(
       max_rows, max_cols, static_cast<int>(world));
-  std::vector<int64_t> out{max_rows, max_cols, sizes.partials_bytes,
-                           sizes.staging_bytes};
-  for (const auto& o : hip_custom_communicator::kOps)
-    out.push_back(hip_custom_communicator::max_bytes(
-        o.type, sizes.partials_bytes, sizes.staging_bytes));
+  return {max_rows, max_cols, sizes.partials_bytes, sizes.staging_bytes};
+}
+
+// WHAT AN OPENED COMMUNICATOR'S PLAIN CALLS MAY HOLD, from its points (config.cuh's `widest_row`
+// and `max_bytes`): each op's [widest_row, max_bytes] in kOps' order, asked once after open.
+std::vector<int64_t> hip_custom_communicator_limits(fptr_t handle_ptr) {
+  const hip_custom_communicator::Handle& h = handle_of(handle_ptr);
+  std::vector<int64_t> out;
+  for (const auto& o : hip_custom_communicator::kOps) {
+    out.push_back(hip_custom_communicator::widest_row(h.points(), o.type));
+    out.push_back(hip_custom_communicator::max_bytes(h.points(), o.type, h.partials_bytes(),
+                                                     h.staging_bytes()));
+  }
   return out;
 }
 

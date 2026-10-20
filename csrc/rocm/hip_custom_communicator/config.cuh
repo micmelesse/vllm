@@ -57,7 +57,7 @@ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
 
 // A TWO-SHOT TEMPLATE'S BUILDS: each listed build as it is, then the same
 // moving INT4 (common.cuh's QUANTIZATION), forced as any build is or taken by
-// select for a call the handle quantizes (`quantizes`). A one-shot
+// a tuned point (the quantized table's INT4 points). A one-shot
 // moves its input as it is.
 template <size_t N>
 constexpr std::array<BuildConfig, 2 * N> and_int4(
@@ -400,454 +400,9 @@ inline bool resident(const Handle& h, const void* kernel, int blocks,
   return blocks <= h.resident_blocks(kernel, threads);
 }
 
-// From `m` rows up (to the next entry's), at `world` ranks and rows `n`
-// elements wide: template `fn` at `config`, its build and its launch, as
-// measured.
-struct TunedKernel {
-  int world;
-  int64_t m;
-  int64_t n;
-  Template fn;
-  KernelConfig config;
-};
-
 // =================================================================================================
 // EACH OP'S KERNELS.
 // =================================================================================================
-
-// all_reduce, gfx950 on n11, bf16, 8 ranks: the one-shot while a row's tiles
-// are few (through 8 tokens of 3584, 4 of 7168; swept 2026-10-10T23-22-13Z),
-// then the two-shot. From 64 tokens of 7168 (128 of 3584) the two-shot's grid
-// is the flat walk's measured best, swept uniformly at 40-256 blocks
-// (2026-10-12T01-27-40Z, 01-45-53Z; one run a point): 80-120 blocks at mid
-// sizes, 72 from 1 MB-ish shares up, where the flat walk beats be0e1f4e9c (7168
-// x 4096: 262.4 against 263.9 us). Equal bytes measure alike (the walk is over
-// the flat range), so the two widths share grids. At 48 tokens a chunk a block
-// (48 and 84 blocks: 48x3584 10.2 -> 9.0 us, 48x7168 11.2 -> 10.4;
-// 2026-10-18T08-56-55Z); 8 tokens of 7168 the one-shot on 56 blocks (8.5 ->
-// 8.1, 09-02-30Z; the same bytes at 16 of 3584 lost, 8.4 -> 9.0).
-// THE DECODE ROWS (2026-10-20, n11, bf16, 8 ranks; the sweep run 2026-10-20T03-51-59Z, one run a
-// config, against aiter's): THE PUSHED ONE-SHOT (the flag in the line) NOT PICKED YET, listed after
-// the pull at its rows (for the forced pattern): it beats our pull at 1 token and 2 of 3584 (5.8
-// against 6.2 us at 1 x 3584, 6.1 against 6.3 at 1 x 7168; aiter's LL 5.5, run
-// 2026-10-20T03-35-02Z), not aiter (Michael's bar), and picked it fails the fork's smoke, which
-// expects a 1-token capture's inputs registered (run 04-33-53Z). The pull one-shot from 2 tokens of 7168 and 4 of 3584 (0.81x aiter's LL at
-// 4 x 7168 and 8 x 3584). THE PULL TWO-SHOT ON AITER'S GRID from 16 tokens of 3584 (8 of 7168),
-// one block a 64 packs of each rank's share, at every capture size up to 64 x 3584: 16 x 3584
-// 7.98 -> 7.65 us (aiter 7.54), 32 x 3584 7.92 -> 7.83 (7.74), 64 x 3584 8.70 -> 8.64 (8.57).
-// The rule (aiter's 2-stage: a 512-thread block a 64 packs of each rank's share) at every
-// capture size between: 40 x 7168 on the 32-row entry's 56 blocks lost, 10.2 against 9.1 us
-// (run 2026-10-20T04-03-15Z); 20 and 28 x 3584 on the 16 and 24 rows' grids, 1.20 (04-19-17Z).
-constexpr TunedKernel kAllReduceKernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {8,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {56, 0}}},
-    {8,
-     2,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8,
-     4,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8,
-     16,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {14, 0}}},
-    {8,
-     20,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {18, 0}}},
-    {8,
-     24,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {21, 0}}},
-    {8,
-     28,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {25, 0}}},
-    {8,
-     32,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {28, 0}}},
-    {8,
-     40,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {35, 0}}},
-    {8,
-     48,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {42, 0}}},
-    {8,
-     56,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {49, 0}}},
-    {8,
-     64,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {56, 0}}},
-    {8,
-     256,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {80, 0}}},
-    {8,
-     512,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {120, 0}}},
-    {8,
-     1024,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {104, 0}}},
-    {8,
-     2048,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {72, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {56, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {8,
-     2,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {8,
-     8,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {14, 0}}},
-    {8,
-     12,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {21, 0}}},
-    {8,
-     16,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {28, 0}}},
-    {8,
-     20,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {35, 0}}},
-    {8,
-     24,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {42, 0}}},
-    {8,
-     28,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {49, 0}}},
-    {8,
-     32,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {56, 0}}},
-    {8,
-     40,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {70, 0}}},
-    {8,
-     48,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {84, 0}}},
-    {8,
-     64,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {64, 0}}},
-    {8,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {80, 0}}},
-    {8,
-     256,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {120, 0}}},
-    {8,
-     512,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {104, 0}}},
-    {8,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512}, {72, 0}}},
-    // World 2/4 defaults inherit world-eight grids; these are not measured tunes.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {56, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {2,
-     16,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {64, 0}}},
-    {2,
-     32,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {32, 0}}},
-    {2,
-     48,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {48, 0}}},
-    {2,
-     64,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {64, 0}}},
-    {2,
-     256,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {80, 0}}},
-    {2,
-     512,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {120, 0}}},
-    {2,
-     1024,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {104, 0}}},
-    {2,
-     2048,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {72, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {56, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {2,
-     8,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {56, 0}}},
-    {2,
-     16,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {32, 0}}},
-    {2,
-     32,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {64, 0}}},
-    {2,
-     48,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {84, 0}}},
-    {2,
-     64,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {64, 0}}},
-    {2,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {80, 0}}},
-    {2,
-     256,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {120, 0}}},
-    {2,
-     512,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {104, 0}}},
-    {2,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048}, {72, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {56, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {4,
-     16,
-     3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {64, 0}}},
-    {4,
-     32,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {32, 0}}},
-    {4,
-     48,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {48, 0}}},
-    {4,
-     64,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {64, 0}}},
-    {4,
-     256,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {80, 0}}},
-    {4,
-     512,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {120, 0}}},
-    {4,
-     1024,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {104, 0}}},
-    {4,
-     2048,
-     3584,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {72, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {56, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
-    {4,
-     8,
-     7168,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {56, 0}}},
-    {4,
-     16,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {32, 0}}},
-    {4,
-     32,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {64, 0}}},
-    {4,
-     48,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {84, 0}}},
-    {4,
-     64,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {64, 0}}},
-    {4,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {80, 0}}},
-    {4,
-     256,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {120, 0}}},
-    {4,
-     512,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {104, 0}}},
-    {4,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024}, {72, 0}}},
-};
 
 // THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT WHOLE at `world` ranks and `nl`
 // elements a pack, which its dispatch instantiates and nothing else: the
@@ -866,24 +421,6 @@ constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
          (c.threads_per_block / world) % kWaveSize == 0 &&
          c.tile_n % (nl * (c.threads_per_block / world)) == 0;
 }
-constexpr bool all_reduce_kernels_lay_out() {
-  const int nl =
-      kBuild.memory.pack_bytes / 2;  // the tuned dtypes', bf16 and fp16
-  for (const TunedKernel& k : kAllReduceKernels) {
-    const auto& c = std::get<AllReduceBuildConfig>(k.config.build);
-    if (k.fn == Template::all_reduce_pull_one_shot && !one_shot_lays_out(c, nl))
-      return false;
-    if (k.fn == Template::all_reduce_push_one_shot &&
-        !one_shot_lays_out(c, push_one_shot_pack(2)))
-      return false;
-    if (k.fn == Template::all_reduce_pull_two_shot &&
-        !two_shot_lays_out(c, k.world, nl))
-      return false;
-  }
-  return true;
-}
-static_assert(all_reduce_kernels_lay_out(),
-              "a tuned all-reduce build its dispatch never instantiates");
 // EVERY PUSHED ONE-SHOT BUILD'S TILE FITS A LINES SLOT (handle.cuh's LINES) at
 // every built dtype.
 constexpr bool push_one_shot_tiles_fit() {
@@ -895,574 +432,7 @@ constexpr bool push_one_shot_tiles_fit() {
 static_assert(push_one_shot_tiles_fit(),
               "a pushed one-shot tile wider than its lines slot");
 
-// gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps
-// set (each crossover cites its run) at the widths we run, until the tuner
-// writes them. rms_norm: one-shot through 128 KiB (at 64 KiB it lost at 16
-// tokens, 11.43 against 10.56 us; 2026-09-30T21-06-57Z); the push through 1.75
-// MiB (256 tokens of 3584: 18.04 against the pull's 18.41), the pull from 2.6
-// MiB (2026-10-01T03-26-44Z). At 7168 the push through 256 tokens since its first
-// barrier is unordered (31.1 against the pull's 32.6 us; 2026-10-18T10-14-39Z).
-// At 3584 the push from 9 tokens: 16 x 3584 8.45 against the one-shot's 9.43 us (aiter's fused
-// 10.41), the one-shot still ahead at 8 (8.22 against 8.34; sweep 2026-10-20T04-45-54Z).
-constexpr TunedKernel kRmsNormKernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {8,
-     9,
-     3584,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8,
-     256,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {8,
-     1024,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
-    {8,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8,
-     256,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the
-    // 8192's; not swept.
-    {8,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {2,
-     19,
-     3584,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {2,
-     257,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    {2,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 32 blocks through 2048 tokens (512 / 1024 / 2048: 52.4 / 88.9 / 160.6 against 54.9 / 91.0
-    // / 165.5 us on 48; more blocks lose, 61.4 / 137.5 at 128: 2026-10-18T10-26-41Z, 10-14-39Z),
-    // 48 from 4096 (not swept since).
-    {2,
-     257,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
-    {2,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
-    // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the
-    // 8192's; not swept.
-    {2,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {4,
-     19,
-     3584,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {4,
-     257,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    {4,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 32 blocks through 2048 tokens (512 / 1024 / 2048: 52.4 / 88.9 / 160.6 against 54.9 / 91.0
-    // / 165.5 us on 48; more blocks lose, 61.4 / 137.5 at 128: 2026-10-18T10-26-41Z, 10-14-39Z),
-    // 48 from 4096 (not swept since).
-    {4,
-     257,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
-    {4,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
-    // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the
-    // 8192's; not swept.
-    {4,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-};
-
-// add_rms_norm: the one-shot not swept (rms_norm's); the push through 1.31 MiB
-// (192 tokens of 3584: 15.48 against the pull's 16.28), the pull at 1.75 MiB
-// (18.36 against the push's 18.46; 2026-10-01T03-26-44Z). Since the push's first
-// barrier is unordered, the push through 512 tokens at 3584 (256 / 512: 18.9 / 32.6
-// against the pull's 22.5 / 35.3 us) and 256 at 7168 (128 / 256: 18.4 / 32.0
-// against 24.3 / 36.2; 2026-10-18T10-14-39Z).
-constexpr TunedKernel kAddRmsNormKernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {8,
-     16,
-     3584,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8,
-     19,
-     3584,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {8,
-     256,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {8,
-     8192,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
-    {8,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    {8,
-     256,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    // Past the model's widths, as rms_norm's.
-    {8,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {2,
-     19,
-     3584,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {2,
-     513,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    {2,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 40 blocks through 2048 tokens (512 / 1024 / 2048: 58.3 / 99.2 / 173.5 against 60.1 / 102.8
-    // / 175.8 us on 48; 2026-10-18T10-26-41Z), 48 from 4096 (not swept since).
-    {2,
-     257,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
-    {2,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
-    // Past the model's widths, as rms_norm's.
-    {2,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {4,
-     19,
-     3584,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
-    {4,
-     513,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {16, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
-    {4,
-     10,
-     7168,
-     Template::all_reduce_push_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 40 blocks through 2048 tokens (512 / 1024 / 2048: 58.3 / 99.2 / 173.5 against 60.1 / 102.8
-    // / 175.8 us on 48; 2026-10-18T10-26-41Z), 48 from 4096 (not swept since).
-    {4,
-     257,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
-    {4,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
-    // Past the model's widths, as rms_norm's.
-    {4,
-     1,
-     16384,
-     Template::all_reduce_pull_one_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384}, {16, 0}}},
-};
-
-// AttnRes: the push from 1 token (it beat the one-shot, 12.89 against 13.68
-// us; 14.03 against 15.18 at 8; 2026-10-01T03-57-23Z); the pull past 256 tokens
-// at 3584 and 192 at 7168, with balanced slices (2026-10-05T03-40-33Z: 3584 x
-// 384 27.7 against the push's 30.4; 7168 x 192 27.3 against 27.7). THE ONE-SHOT
-// BESIDE THE PUSH from 1 token: listed after it, so it runs only where the push
-// does not (a row narrower than a pack a rank); its grid the norms' one-shot's,
-// not swept. THE PULL AT 512 THREADS, TILE_K 1, from 128 tokens: it beat the push
-// (unordered first barrier) at 128 / 256 tokens, 15.4 / 21.5 against 16.0 / 22.0 us
-// at 3584, 21.8 / 34.1 against 22.3 / 36.9 at 7168, and the 256-thread TILE_K 3 pull
-// at 256 x 7168 (36.3) (2026-10-18T10-14-39Z, 10-08-46Z).
-constexpr TunedKernel kAttnResKernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
-    {8,
-     16,
-     3584,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {8,
-     128,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {8,
-     257,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3}, {256, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {16, 0}}},
-    {8,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {8,
-     256,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
-    {2,
-     128,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {2,
-     257,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3}, {256, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {16, 0}}},
-    {2,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {2,
-     512,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {256, 0}}},
-    {2,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
-    {4,
-     128,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
-    {4,
-     257,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3}, {256, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {16, 0}}},
-    {4,
-     128,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {4,
-     512,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {256, 0}}},
-    {4,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
-};
-
-// INT4'S CROSSOVER, an op's: the least bytes a two-shot call moves INT4 at when
-// the handle's quantization is int4, the exact build below it. Measured at each
-// op's exact grids, INT4 on against off (tuned picks, 7168 bf16, 8 ranks,
-// 2026-10-16T03-50-18Z against 04-01-55Z), us at 512 / 1024 / 8192 tokens:
-//   plain      41.7 / 75.4 / 535.1 exact, 88.2 / 72.4 / 284.4 INT4: 1024 tokens up
-//   rms_norm   42.8 / 76.8 / 547.8 exact, 48.8 / 62.0 / 362.2 INT4: 1024 up
-//   add_rms    51.2 / 92.4 / 566.5 exact, 58.1 / 84.2 / 471.4 INT4: 1024 up
-//   AttnRes    57.7 / 92.9 / 643.1 exact, 51.3 / 105.5 / 762.5 INT4: NEVER for now
-//     (its reduce-scatter is still the LDS one, a word a thread, one wave summing;
-//     the plain path's register sum, a group a thread, is what made INT4 win there)
-// So 14 MiB (1024 tokens of 7168) for the three, and AttnRes never; the norms'
-// and AttnRes since 7 MiB, their INT4 a group a thread, and the plain one since
-// 3.5 MiB (below).
-struct Int4Crossover {
-  OpType op;
-  int64_t min_bytes;
-};
-constexpr Int4Crossover kInt4Crossovers[] = {
-    // The plain all-reduce from 3.5 MiB since its push and gather are a rank a row of threads
-    // (forced INT4 at 512 x 3584 and 256 x 7168: 19.1 us against the exact pick's 23.7 / 23.8;
-    // at 1.75 MiB a tie, 256 x 3584 15.3 against 16.1, 128 x 7168 15.3 against ~15.4;
-    // 2026-10-18T12-14-52Z, 11-55-21Z).
-    {OpType::all_reduce, 3584 * 1024},
-    // The norms and AttnRes from 3.5 MiB, the plain all-reduce's, since their INT4 is the split
-    // (our plain INT4 all-reduce, then our norm or AttnRes kernel): at 3.5 MiB the split against
-    // the exact pick, 512 x 3584 / 256 x 7168, rms 22.2 / 22.5 against 28.2 / 31.2 us, add 23.2 /
-    // 23.4 against 32.2 / 31.9, AttnRes 27.3 / 27.8 against 31.4 / 33.4; at 1.75 MiB a tie or a
-    // loss, 256 x 3584 / 128 x 7168, rms 17.8 / 18.5 against 18.3 / 17.9, AttnRes 21.2 / 22.5
-    // against 21.0 / 21.7 (run 2026-10-18T23-56-01Z). Before the split: 7 MiB, their INT4 a group
-    // a thread (2026-10-18T05-49-21Z, 07-50-18Z).
-    {OpType::all_reduce_rms_norm, 3584 * 1024},
-    {OpType::all_reduce_add_rms_norm, 3584 * 1024},
-    {OpType::all_reduce_add_attn_res_rms_norm, 3584 * 1024},
-};
-// EACH OP'S INT4 KERNELS, its own list, consulted only from the op's crossover up
-// (kInt4Crossovers), where the exact lists pick two-shots (a one-shot moves its input as
-// it is, so it has no INT4 entry). They began as the exact lists' two-shots moving INT4
-// at the same grids (the plain all-reduce at 72 blocks: 71.8 / 109.0 / 178.2 / 286.6 us
-// at 1024-8192 tokens of 7168 against the exact 75.5 / 142.0 / 273.3 / 535.4;
-// 2026-10-16T03-14-06Z); each op's INT4 body and grid are now its own (below). THE
-// PULLED NORMS' INT4 IS A GROUP A THREAD (their INT4 body, all_reduce_add_rms_norm.cuh):
+// THE PULLED NORMS' INT4 IS A GROUP A THREAD (their INT4 body, all_reduce_add_rms_norm.cuh):
 // TILE_N / 32 threads, a block one row's groups.
 constexpr bool int4_group_a_thread(Template k) {
   return k == Template::all_reduce_pull_two_shot_rms_norm ||
@@ -1476,293 +446,11 @@ constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world
              ? world * ((m + world - 1) / world)
              : m;
 }
-// THE PLAIN ALL-REDUCE'S INT4 KERNELS, its own (no longer the exact list's grids) since its
-// push and gather are a rank a row of threads (reduce_scatter.cuh). Grids from its forced sweep
-// (16-256 blocks, 128-8192 tokens; 2026-10-18T12-05-38Z, 12-14-52Z): 56 blocks through 3.5 MiB
-// (512 x 3584: 19.1 us, 64 blocks 19.4, 128 20.2), 128 from 7 MiB (8192 x 7168: 183.0 against
-// 212.7 on 96 and 229.2 on 64; 1024 x 3584 26.3 against the best, 80, 26.0). The exact
-// list's grids (72-120) had left it 1.10-1.19x QuickReduce INT4's.
-constexpr TunedKernel kAllReduceInt4Kernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {56, 0}}},
-    {8,
-     1024,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {56, 0}}},
-    {8,
-     512,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
-    // World 2/4 defaults inherit world-eight grids; these are not measured tunes.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048, Quantization::int4}, {56, 0}}},
-    {2,
-     1024,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048, Quantization::int4}, {128, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048, Quantization::int4}, {56, 0}}},
-    {2,
-     512,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 2048, Quantization::int4}, {128, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024, Quantization::int4}, {56, 0}}},
-    {4,
-     1024,
-     3584,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024, Quantization::int4}, {128, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024, Quantization::int4}, {56, 0}}},
-    {4,
-     512,
-     7168,
-     Template::all_reduce_push_two_shot,
-     {AllReduceBuildConfig{512, 1, 1, 1024, Quantization::int4}, {128, 0}}},
-};
-// THE NORMS' INT4 KERNELS, their own: THE SPLIT at every size from the crossover (STANDARDS 3.2, *We
-// win at the op level*): our plain INT4 all-reduce into the local sums, then our separate norm
-// kernel (256 threads a row, a block a row: 8192 blocks cut to the rows). It beat the fused INT4
-// pull (a group a thread, 256 blocks of 128 threads at 3584, 128 of 256 at 7168) at every size
-// from 256 tokens and QuickReduce INT4 + the norm everywhere (run 2026-10-18T23-56-01Z, us):
-// rms 3584 x 512 / 1024 / 2048 / 4096 / 8192: 22.2 / 29.3 / 44.6 / 65.5 / 116.0 against the fused
-// pull's 29.9 / 38.8 / 64.6 / 92.3 / 145.1 and QR's 40.0 / 49.3 / 77.8 / 129.9 / 217.4; 7168:
-// 31.5 / 43.9 / 65.8 / 116.1 / 218.1 against 39.9 / 64.2 / 90.1 / 138.6 / 228.1 and QR's 50.0 /
-// 78.8 / 131.1 / 222.4 / 413.3. add: 3584 23.2 / 32.3 / 47.8 / 73.7 / 135.9 against 35.3 / 43.8 /
-// 66.6 / 95.3 / 149.6 and QR's 40.7 / 50.7 / 79.4 / 137.4 / 233.9; 7168 34.3 / 48.1 / 74.0 /
-// 136.1 / 260.3 against 45.4 / 68.4 / 98.2 / 154.8 / 265.9 and QR's 51.3 / 79.2 / 139.4 / 240.0 /
-// 450.9. The fused INT4 pull is no longer listed (a forced call runs it at its build and grid).
-constexpr TunedKernel kRmsNormInt4Kernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {48, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-};
-constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {48, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096, Quantization::int4}, {8192, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
-};
-// AttnRes's INT4 kernels, its own: THE SPLIT at every size from its crossover (STANDARDS 3.2, *We
-// win at the op level*): our plain INT4 all-reduce into the local sums, then our separate AttnRes
-// kernel (256 threads, a row a block, a source a step: Triton's prefill program; a block a row,
-// 8192 blocks cut to the rows). It beat the fused INT4 pull at every size measured, 512-8192
-// tokens at both widths, and QuickReduce INT4 + attn_res everywhere (run 2026-10-18T22-22-13Z,
-// us): 3584 x 512 / 1024 / 2048 / 4096 / 8192: 27.2 / 39.5 / 61.0 / 100.3 / 188.5 against the
-// fused pull's 30.2 / 47.4 / 82.7 / 162.5 / 310.4 and QR's 44.3 / 58.1 / 92.4 / 162.6 / 289.4;
-// 7168: 39.7 / 61.5 / 100.7 / 190.4 / 364.7 against 41.2 / 76.2 / 174.0 / 306.5 / 498.7 and QR's
-// 61.1 / 98.3 / 177.7 / 326.9 / 606.7. The fused pull ran AttnRes on the communication kernel's
-// grid at 250 VGPRs, 2 waves a SIMD (TILE_K 3); the split runs it at 90 VGPRs, 5 waves. THE
-// FUSED INT4 PULL is no longer listed (a forced call runs it at its exact entry moving INT4); its
-// grids were 512 blocks of 128 threads TILE_K 3 at 3584 (1024 at 2048-4096 tokens) and 512 / 256
-// (from 4096 tokens) of 256 at 7168 (2026-10-18T07-50-18Z, 13-15-40Z).
-constexpr TunedKernel kAttnResInt4Kernels[] = {
-    // world 8, 3584 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {48, 0}}},
-    // world 8, 7168 wide: gp bench tune, run 2026-10-20T13-19-20Z
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {8192, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {48, 0}}},
-    // Explicit world 2/4 defaults inherit world-eight configs and grids.
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {48, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {8192, 0}}},
-    {2,
-     1,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1, Quantization::int4}, {8192, 0}}},
-    {4,
-     1,
-     3584,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {48, 0}}},
-    {4,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4}, {8192, 0}}},
-};
-
-constexpr int64_t int4_min_bytes(OpType o) {
-  for (const Int4Crossover& c : kInt4Crossovers)
-    if (c.op == o) return c.min_bytes;
-  return -1;  // never: every op has one (ops_have_crossovers)
-}
 
 // =================================================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it), its tuned
-// kernels, and what a plain call of it (nothing forced) must be to run, which
-// `build_info` hands Python's `should`.
+// THE OPS, in OpType's order: each one's name (as Python calls it) and what a plain call of it
+// (nothing forced) must be to run, which `build_info` hands Python's `should`. What each runs at
+// a size is the tuned points' (types.cuh's TunedPoint), the handle's.
 // =================================================================================================
 
 // A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly
@@ -1772,9 +460,6 @@ constexpr DType kNormWeights[] = {DType::f32};
 struct Op {
   OpType type;
   const char* name;
-  std::span<const TunedKernel> kernels;
-  // Its INT4 kernels: what a call the handle quantizes runs (kInt4Crossovers).
-  std::span<const TunedKernel> int4_kernels;
   // The dtypes its input may have.
   std::span<const DType> dtypes;
   // The dtypes its weight may have besides its input's; none for an op with no
@@ -1793,17 +478,15 @@ struct Op {
 
 constexpr Op kOps[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce),
-     kAllReduceKernels, kAllReduceInt4Kernels,
      kBuild.supports.dtypes,
      {},
      false,
      false},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm), kRmsNormKernels, kRmsNormInt4Kernels,
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm),
      kBuild.supports.dtypes, kNormWeights, true, true},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm), kAddRmsNormKernels, kAddRmsNormInt4Kernels,
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm),
      kBuild.supports.dtypes, kNormWeights, true, true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm),
-     kAttnResKernels, kAttnResInt4Kernels,
      kBuild.supports.dtypes,
      {},
      true,
@@ -1822,15 +505,6 @@ constexpr bool ops_in_order() {
 }
 static_assert(ops_in_order(), "kOps must list every OpType in its order");
 
-constexpr bool ops_have_crossovers() {
-  if (sizeof(kInt4Crossovers) / sizeof(Int4Crossover) != kNumOps) return false;
-  for (const Op& o : kOps)
-    if (int4_min_bytes(o.type) < 0) return false;
-  return true;
-}
-static_assert(ops_have_crossovers(),
-              "kInt4Crossovers must give every op its crossover once");
-
 // EVERY OP HAS KERNELS, each one of its own templates, its build listed and its
 // launch one the forcing would accept (a grid of 1 to kMaxBlocks blocks, a
 // split only on the AttnRes pull).
@@ -1840,62 +514,6 @@ constexpr bool launch_fits(Template t, const LaunchConfig& l) {
   return l.reduce_scatter_blocks == 0 ||
          t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
 }
-constexpr bool ops_have_kernels() {
-  for (const Op& o : kOps) {
-    if (o.kernels.empty()) return false;
-    for (const TunedKernel& k : o.kernels)
-      if (op_of(k.fn) != o.type || !built(k.fn, k.config.build) ||
-          !launch_fits(k.fn, k.config.launch))
-        return false;
-  }
-  return true;
-}
-// EVERY OP'S INT4 KERNELS ARE ITS OWN TWO-SHOTS, BUILT MOVING INT4 and launchable.
-constexpr bool ops_have_int4_kernels() {
-  for (const Op& o : kOps) {
-    if (o.int4_kernels.empty()) return false;
-    for (const TunedKernel& k : o.int4_kernels)
-      if (op_of(k.fn) != o.type || algorithm_of(k.fn) == Algorithm::one_shot ||
-          quantization_of(k.config.build) != Quantization::int4 ||
-          !built(k.fn, k.config.build) || !launch_fits(k.fn, k.config.launch))
-        return false;
-  }
-  return true;
-}
-static_assert(ops_have_int4_kernels(),
-              "an op has no INT4 kernels, or one is not its own INT4 two-shot");
-static_assert(ops_have_kernels(),
-              "an op has no kernels, or one is another op's, not built or not "
-              "launchable");
-
-// EVERY KERNEL HAS A CONFIG (Michael, 2026-10-20): every template has an entry at every built world
-// in its op's table of each encoding it is built for (an exact entry serves its INT4 build too,
-// moved INT4, as a forced INT4 call takes it, only where that build moved INT4 is built: the fused
-// pull two-shots' INT4 builds are their own, a group a thread), so the op's lookup restricted to the template
-// (`tuned` with a template: a forced call at select's config) answers at every size (`pick` takes
-// the template's smallest entry below its first). An entry that is a kernel's config and not its
-// pick sits after the pick at the same row (the first listed wins a tie). How good a config is, is
-// the measurement's question (gp bench run --variants); having none is an error.
-constexpr bool every_kernel_has_a_config() {
-  for (const TemplateInfo& t : kTemplates)
-    for (const int world : kBuild.supports.worlds)
-      for (const int q : {Quantization::none, Quantization::int4}) {
-        bool builds_it = false;
-        for (const BuildConfig& b : t.builds) builds_it |= quantization_of(b) == q;
-        if (!builds_it) continue;
-        bool listed = false;
-        for (const TunedKernel& k : op(t.op).kernels)
-          listed |= k.fn == t.fn && k.world == world &&
-                    (q == Quantization::none || built(t.fn, quantized(k.config.build, q)));
-        if (q == Quantization::int4)
-          for (const TunedKernel& k : op(t.op).int4_kernels)
-            listed |= k.fn == t.fn && k.world == world;
-        if (!listed) return false;
-      }
-  return true;
-}
-static_assert(every_kernel_has_a_config(),
-              "a kernel has no tuned entry at a built world for an encoding it is built for");
 
 // THE OP'S TEMPLATES, in the catalog's order, and how many.
 constexpr int templates_of(OpType o) {
@@ -2014,57 +632,14 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
 }
 
 // =================================================================================================
-// 2. THE PICK: an op's tuned kernel for the call, exactly as listed, or the
-// Error that no listed kernel runs it.
+// 2. THE LOOKUP: a call runs its nearest tuned point's kernel and config (types.cuh's
+// TunedPoint: the handle's, from the arch's config file, `check`ed at open). Nothing here is a
+// tuned number: the points are.
 // =================================================================================================
 
 constexpr int64_t distance(int64_t a, int64_t b) {
   return a < b ? b - a : a - b;
 }
-
-// Among entries at the actual world that run the call, choose the nearest
-// width and then the greatest row threshold reached (the first listed on ties).
-// Every supported world has explicit entries; selection never changes a build.
-constexpr std::variant<TunedKernel, Error> pick(
-    OpType o, int world, int64_t m, int64_t n, int64_t tile_cols, DType dtype,
-    std::span<const TunedKernel> kernels) {
-  const int w = world;
-  const auto columns = [&](const TunedKernel& k) {
-    return every_rank_gets_columns(k.fn, n, dtype, world);
-  };
-  const auto runs = [&](const TunedKernel& k) {
-    return k.world == w && columns(k) && tile_n_of(k.config.build) >= tile_cols;
-  };
-  int64_t h = 0;
-  for (const TunedKernel& k : kernels)
-    if (runs(k) && (h == 0 || distance(k.n, n) < distance(h, n))) h = k.n;
-  if (h == 0) {
-    for (const TunedKernel& k : kernels)
-      if (k.world == w && columns(k)) return Error::row_too_wide;
-    return Error::row_narrower_than_world;
-  }
-  const int64_t as_rows = m * n / h;
-  const TunedKernel* most = nullptr;
-  const TunedKernel* least = nullptr;
-  for (const TunedKernel& k : kernels) {
-    if (!runs(k) || k.n != h) continue;
-    if (!least || k.m < least->m) least = &k;
-    if (k.m <= as_rows && (!most || k.m > most->m)) most = &k;
-  }
-  return most ? *most : *least;
-}
-// The op's exact kernels.
-constexpr std::variant<TunedKernel, Error> pick(OpType o, int world, int64_t m,
-                                                int64_t n, int64_t tile_cols,
-                                                DType dtype) {
-  return pick(o, world, m, n, tile_cols, dtype, op(o).kernels);
-}
-
-// =================================================================================================
-// THE QUANTIZATION: which calls move INT4 (common.cuh's QUANTIZATION), by the
-// handle's quantization and the op's crossover (kInt4Crossovers), and the
-// INT4 payload's room in the regions.
-// =================================================================================================
 
 // WHETHER AN INT4 TWO-SHOT TAKES A ROW OF `n` ELEMENTS at `world` ranks: whole
 // groups, and whole groups for every rank, so every rank's slice (a column
@@ -2075,70 +650,80 @@ constexpr bool int4_takes_row(int64_t n, int world) {
   return n % kInt4Group == 0 && (n / kInt4Group) % world == 0;
 }
 
-// THE TUNED KERNEL MOVES INT4 when the handle's quantization is int4, the call
-// is its op's crossover or more, its kernel a two-shot, its dtype 16-bit (a
-// pack is a word of its group), its row `int4_takes_row` and the quantized
-// regions hold it; then its build moves INT4, its template, tile and grid as
-// tuned. Else, and for every one-shot, its build as it is. A forced call is
-// never changed here: its quantization is its own.
-inline bool quantizes(const Handle& h, OpType o, int64_t m, int64_t n,
-                      DType dtype) {
-  return h.quantization() == Quantization::int4 && elem_bytes(dtype) == 2 &&
-         m * n * elem_bytes(dtype) >= int4_min_bytes(o) &&
-         int4_takes_row(n, h.world_size()) &&
+// WHETHER A POINT'S KERNEL RUNS THIS CALL: every rank gets columns, its tile holds the row where
+// the op's tile must, and, moving INT4, a pack is a word of 16-bit values, the row is whole groups
+// for every rank and the payload fits the regions. A point that does not is passed over, never
+// refused: the nearest that does runs the call.
+inline bool runs(const Handle& h, const TunedPoint& p, int64_t m, int64_t n, int64_t tile_cols,
+                 DType dtype) {
+  if (!every_rank_gets_columns(p.fn, n, dtype, h.world_size())) return false;
+  if (tile_n_of(p.config.build) < tile_cols) return false;
+  if (quantization_of(p.config.build) != Quantization::int4) return true;
+  return elem_bytes(dtype) == 2 && int4_takes_row(n, h.world_size()) &&
          int4_payload_bytes(m, n) <= h.staging_bytes() &&
          int4_payload_bytes(1, m * n) <= h.partials_bytes();
 }
 
-// THE KERNEL A CALL RUNS: the forced one as forced, else the tuned one at the
-// handle's quantization.
+// THE NEAREST POINT `take` admits that runs the call: at the handle's world, the nearest width,
+// then the nearest size (rows x width, so a width no point lists reads the nearest width's points
+// at the same bytes), the smaller on a tie. None where none runs it.
+template <typename TAKE>
+inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t n,
+                                 int64_t tile_cols, DType dtype) {
+  const auto admitted = [&](const TunedPoint& p) {
+    return p.world == h.world_size() && take(p) && runs(h, p, m, n, tile_cols, dtype);
+  };
+  int64_t width = 0;
+  for (const TunedPoint& p : h.points())
+    if (admitted(p) && (width == 0 || distance(p.hidden, n) < distance(width, n)))
+      width = p.hidden;
+  const TunedPoint* best = nullptr;
+  for (const TunedPoint& p : h.points()) {
+    if (p.hidden != width || !admitted(p)) continue;
+    const int64_t d = distance(p.tokens * p.hidden, m * n);
+    const int64_t held = best ? distance(best->tokens * best->hidden, m * n) : 0;
+    if (!best || d < held || (d == held && p.tokens < best->tokens)) best = &p;
+  }
+  return best;
+}
+
+// THE KERNEL A PLAIN CALL RUNS: the nearest point its communicator's table picks; none running it
+// is the row's fault (too wide for every tile, or narrower than the world).
+inline std::variant<Chosen, Error> lookup(const Handle& h, OpType o, int64_t m, int64_t n,
+                                          int64_t tile_cols, DType dtype) {
+  const Mode mode = h.mode();
+  const auto picks = [&](const TunedPoint& p) { return p.op == o && p.mode == mode && p.pick; };
+  if (const TunedPoint* p = nearest(h, picks, m, n, tile_cols, dtype))
+    return Chosen{p->fn, p->config};
+  return nearest(h, picks, m, n, 0, dtype) ? Error::row_too_wide : Error::row_narrower_than_world;
+}
+
+// A KERNEL'S CONFIG FOR A CALL THAT NAMES IT (a forced launch at the tuned config: gp's kernel
+// lines, the tests): the nearest point of kernel `fn` moving `quantization`, a pick or a config,
+// in either table; moving INT4 where it has no INT4 point, its nearest exact point moved INT4 (a
+// build it lists). None where it has neither.
+inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int quantization,
+                                           int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
+  const auto of = [&](int q) {
+    return nearest(h, [&](const TunedPoint& p) {
+      return p.fn == fn && quantization_of(p.config.build) == q &&
+             built(fn, quantized(p.config.build, quantization));
+    }, m, n, tile_cols, dtype);
+  };
+  const TunedPoint* p = of(quantization);
+  if (!p && quantization == Quantization::int4) p = of(Quantization::none);
+  if (!p) return std::nullopt;
+  return Chosen{p->fn, {quantized(p->config.build, quantization), p->config.launch}};
+}
+
+// THE KERNEL A CALL RUNS: the forced one as forced, else its nearest point.
 inline std::variant<Chosen, Error> chosen(
     const Handle& h, const std::variant<std::optional<Chosen>, Error>& forcing,
     OpType o, int64_t m, int64_t n, int64_t tile_cols, DType dtype) {
   if (const Error* e = std::get_if<Error>(&forcing)) return *e;
   if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing))
     return *f;
-  const std::variant<TunedKernel, Error> tuned =
-      pick(o, h.world_size(), m, n, tile_cols, dtype,
-           quantizes(h, o, m, n, dtype) ? op(o).int4_kernels : op(o).kernels);
-  if (const Error* e = std::get_if<Error>(&tuned)) return *e;
-  const TunedKernel& k = std::get<TunedKernel>(tuned);
-  return Chosen{k.fn, k.config};
-}
-
-// =================================================================================================
-// 3. THE GRID CUT TO THE WORK: a rule on the launch, never a field filled in.
-// =================================================================================================
-
-// THE TILES THERE ARE, one block's work each: this rank's rows (a row
-// two-shot's share, every row otherwise) in TILE_M, by the grid's `grid_cols`
-// columns in TILE_N. A grid wider is idle blocks, each still paying every
-// barrier (the pull norm at 32 tokens ran 36 blocks for 4 rows a rank).
-constexpr int64_t tiles_of(Template t, const KernelConfig& c, int64_t m,
-                           int64_t grid_cols, int world) {
-  const bool row_split = is_two_shot(t) && !slices_columns(t);
-  const int64_t mine = row_split ? (m + world - 1) / world : m;
-  const int64_t tm = tile_m_of(c.build), tn = tile_n_of(c.build);
-  return (mine + tm - 1) / tm * ((grid_cols + tn - 1) / tn);
-}
-
-// A TILED OP'S GRID, at most the tiles there are (at least one block). THE
-// FUSED ATTNRES PULL'S GRID ALSO DIVIDES ITS TILES: each block's most tiles
-// kept, the blocks cut until every block but the last has that many (384 rows
-// on 256 blocks left half the blocks one row: 32.2 against 27.7 us on 192,
-// 2026-10-05T03-45-51Z). The other templates' not yet measured. The plain
-// all-reduce runs its grid as given: its tuned grids were measured as they run.
-constexpr Chosen cut_to_the_work(Chosen k, int64_t m, int64_t grid_cols,
-                                 int world) {
-  const int64_t tiles = tiles_of(k.fn, k.config, m, grid_cols, world);
-  int& blocks = k.config.launch.blocks_per_grid;
-  if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
-  if ((k.fn == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm || is_split(k.fn)) &&
-      tiles > 0) {
-    const int64_t most = (tiles + blocks - 1) / blocks;
-    blocks = static_cast<int>((tiles + most - 1) / most);
-  }
-  return k;
+  return lookup(h, o, m, n, tile_cols, dtype);
 }
 
 // =================================================================================================
@@ -2218,7 +803,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // Refused, so the caller takes the one-shot or RCCL.
   if (!every_rank_gets_columns(fn, n, dtype, world))
     return Error::row_narrower_than_world;
-  // AN INT4 ROW is whole groups for every rank (quantizes's rule, which a
+  // AN INT4 ROW is whole groups for every rank (`runs`' rule for an INT4 point, which a
   // forced call meets here).
   if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
   // An INT4 payload lies in the region that holds it exact (common.cuh's
@@ -2259,31 +844,17 @@ constexpr int64_t tile_cols(OpType o, int64_t n) {
   return op(o).tile_holds_row ? n : 0;
 }
 
-// THE TUNED KERNEL AS A QUERY (`build_info().tuned`): what select launches for
-// `m` rows of `n` at `world` ranks in `dtype`, picked as `chosen` picks (`pick`)
-// from the op's list of `quantization` (its INT4 list for int4 at any bytes; a
-// plain call reads that list only from its crossover up, `quantizes`), among the
-// entries of template `fn` where one is named (a forced launch: select's pick at
-// that template), its grid cut to the work as the op's select cuts it (every op
-// but the plain all-reduce, which runs its grid as given). None where that list
-// has no entry of `fn`. A function of its arguments alone: no handle, no device.
-inline std::variant<std::optional<Chosen>, Error> tuned(
-    OpType o, int world, int64_t m, int64_t n, DType dtype, int quantization,
-    std::optional<Template> fn) {
-  if (!world_built(world)) return Error::world_not_built;
-  const std::span<const TunedKernel> listed =
-      quantization == Quantization::int4 ? op(o).int4_kernels : op(o).kernels;
-  std::vector<TunedKernel> of_fn;
-  for (const TunedKernel& k : listed)
-    if (!fn || k.fn == *fn) of_fn.push_back(k);
-  if (of_fn.empty()) return std::optional<Chosen>{};
-  const std::variant<TunedKernel, Error> picked =
-      pick(o, world, m, n, tile_cols(o, n), dtype, of_fn);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const TunedKernel& k = std::get<TunedKernel>(picked);
-  const Chosen c{k.fn, k.config};
-  return std::optional<Chosen>{
-      o == OpType::all_reduce ? c : cut_to_the_work(c, m, n, world)};
+// THE TUNED CONFIG AS A QUERY (`HipCustomCommunicator.tuned`): with no kernel named, what a plain
+// call of `m` rows of `n` in `dtype` runs on this communicator (`lookup`); with kernel `fn` named,
+// its config moving `quantization` (`kernel_config`): a forced launch at the tuned config. None
+// where `fn` has no point.
+inline std::variant<std::optional<Chosen>, Error> tuned(const Handle& h, OpType o, int64_t m,
+                                                        int64_t n, DType dtype, int quantization,
+                                                        std::optional<Template> fn) {
+  if (fn) return kernel_config(h, *fn, quantization, m, n, tile_cols(o, n), dtype);
+  const std::variant<Chosen, Error> c = lookup(h, o, m, n, tile_cols(o, n), dtype);
+  if (const Error* e = std::get_if<Error>(&c)) return *e;
+  return std::optional<Chosen>{std::get<Chosen>(c)};
 }
 
 // =================================================================================================
@@ -2850,23 +1421,24 @@ inline std::variant<Config, Error> all_reduce_config(
   return config;
 }
 
-// A SPLIT'S ALL-REDUCE (Algorithm::split): the plain all-reduce's tuned kernel at the split
-// build's `quantization` (its INT4 list or its exact one), forced whole, into this rank's local
+// A SPLIT'S ALL-REDUCE (Algorithm::split): the plain all-reduce's nearest pick moving the split
+// build's `quantization` (from the quantized table moving INT4, the exact one exact), forced
+// whole, into this rank's local
 // sums (Handle::sums), dense rows; its own select checks it (its band, its regions, its
 // residency). The caller's own check holds the sums to the inputs region's size.
 inline std::variant<Config, Error> split_all_reduce_config(
     const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
     int64_t m, int64_t n, DType dtype, int quantization, hipStream_t stream) {
-  const Op& plain = op(OpType::all_reduce);
-  const std::variant<TunedKernel, Error> t =
-      pick(OpType::all_reduce, h.world_size(), m, n, tile_cols(OpType::all_reduce, n), dtype,
-           quantization == Quantization::int4 ? plain.int4_kernels : plain.kernels);
-  if (const Error* e = std::get_if<Error>(&t)) return *e;
-  const TunedKernel& r = std::get<TunedKernel>(t);
-  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
+  const Mode mode = quantization == Quantization::int4 ? Mode::quantized : Mode::exact;
+  const TunedPoint* r = nearest(h, [&](const TunedPoint& p) {
+    return p.op == OpType::all_reduce && p.mode == mode && p.pick &&
+           quantization_of(p.config.build) == quantization;
+  }, m, n, tile_cols(OpType::all_reduce, n), dtype);
+  if (!r) return Error::row_narrower_than_world;
+  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r->config.build);
   return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
-                           dtype, algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n,
-                           b.threads_per_block, r.config.launch.blocks_per_grid, b.waves_per_eu,
+                           dtype, algorithm_of(r->fn), direction_of(r->fn), b.tile_m, b.tile_n,
+                           b.threads_per_block, r->config.launch.blocks_per_grid, b.waves_per_eu,
                            b.quantization, stream);
 }
 
@@ -2900,7 +1472,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
                     }),
              op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
@@ -3000,7 +1572,7 @@ all_reduce_add_rms_norm_config(
                     }),
              op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
@@ -3126,7 +1698,7 @@ all_reduce_add_attn_res_rms_norm_config(
                     }),
              op, m, n, tile_cols(op, n), dtype);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = cut_to_the_work(std::get<Chosen>(picked), m, n, world);
+  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e =
@@ -3200,60 +1772,11 @@ all_reduce_add_attn_res_rms_norm_config(
 // capability is a compile error, not one that overruns its signal slots.
 // =================================================================================================
 
-// The tuned kernel for `m` rows of `row` elements, cut to the work: picked, and
-// launchable.
-constexpr bool tuned_fits(OpType o, int world, int64_t m, int64_t row,
-                          int64_t tile_cols, int64_t grid_cols) {
-  const std::variant<TunedKernel, Error> t =
-      pick(o, world, m, row, tile_cols, DType::bf16);
-  if (std::holds_alternative<Error>(t)) return false;
-  const TunedKernel& k = std::get<TunedKernel>(t);
-  const Chosen cut =
-      cut_to_the_work(Chosen{k.fn, k.config}, m, grid_cols, world);
-  return launch_fits(cut.fn, cut.config.launch);
-}
-constexpr bool selections_fit() {
-  for (const std::array<int64_t, 3> call :
-       {std::array<int64_t, 3>{2, 1, 8},
-        std::array<int64_t, 3>{kMaxRanks, 4096, 7168}}) {
-    const int w = static_cast<int>(call[0]);
-    const int64_t m = call[1], n = call[2];
-    for (const OpType o :
-         {OpType::all_reduce_rms_norm, OpType::all_reduce_add_rms_norm,
-          OpType::all_reduce_add_attn_res_rms_norm})
-      if (!tuned_fits(o, w, m, n, n, n)) return false;
-    // The plain all-reduce's tuned kernel, as measured (its grid not cut).
-    if (std::holds_alternative<Error>(
-            pick(OpType::all_reduce, w, m, n, 0, DType::bf16)))
-      return false;
-  }
-  return true;
-}
-static_assert(selections_fit(),
-              "a selection declines, or exceeds a kernel capability");
-
 // =================================================================================================
 // A PLAIN CALL'S FACTS, an op's (nothing forced, contiguous, whole packs): its
 // row and its bytes up to these always run. `build_info` hands them to Python's
 // `should`, which admits nothing past them.
 // =================================================================================================
-
-// THE WIDEST ROW A PLAIN CALL RUNS, in elements: at every built world, the
-// widest tile of its tuned kernels there; none (0) for an op whose tiles cross
-// the row.
-constexpr int64_t widest_row(OpType o) {
-  if (!op(o).tile_holds_row) return 0;
-  int64_t widest = 0;
-  for (const int world : kBuild.supports.worlds) {
-    const int w = world;
-    int64_t at_world = 0;
-    for (const TunedKernel& k : op(o).kernels)
-      if (k.world == w && tile_n_of(k.config.build) > at_world)
-        at_world = tile_n_of(k.config.build);
-    if (widest == 0 || at_world < widest) widest = at_world;
-  }
-  return widest;
-}
 
 // THE EXCHANGE, SIZED FROM THE PROBLEM (STANDARDS, *A kernel's own buffers are
 // sized from the problem it serves*): the largest call a communicator serves is
@@ -3299,55 +1822,98 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
   return {whole(partials), whole(staging)};
 }
 
-// THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what
-// the inputs holds (an eager input is copied in whole: by a per-row kernel, or
-// by the host for the in-place all-reduce), and what the partials
-// holds at the most partials a byte of its input needs among its tuned kernels:
-// at one row of one pack, where rounding up is all of it (a row two-shot
-// leaving two results, two). Python admits a call by it or by the box the
-// exchange was sized for (`exchange_sizes`), whichever is larger.
-constexpr int64_t max_bytes(OpType o, int64_t partials_bytes,
-                            int64_t staging_bytes) {
-  int64_t per_byte = 0;
-  for (const TunedKernel& k : op(o).kernels) {
-    const int64_t need =
-        partials_need(k.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
-    if (need > per_byte) per_byte = need;
+// =================================================================================================
+// THE POINTS' FACTS AND CHECK: what Python's `should` admits by (from the exact table's picks, a
+// plain call's), and the check open makes of a config file before anything is made (what the
+// compile-time checks held of the tables before the tables became a file).
+// =================================================================================================
+
+// THE WIDEST ROW A PLAIN CALL RUNS, in elements: at every built world the points cover, the
+// widest tile among the op's exact picks there, the narrowest of those; none (0) for an op whose
+// tiles cross the row.
+inline int64_t widest_row(const std::vector<TunedPoint>& points, OpType o) {
+  if (!op(o).tile_holds_row) return 0;
+  int64_t widest = 0;
+  for (const int world : kBuild.supports.worlds) {
+    int64_t at = 0;
+    for (const TunedPoint& p : points)
+      if (p.op == o && p.mode == Mode::exact && p.pick && p.world == world &&
+          tile_n_of(p.config.build) > at)
+        at = tile_n_of(p.config.build);
+    if (at > 0 && (widest == 0 || at < widest)) widest = at;
   }
-  // THE PLAIN ALL-REDUCE as the fused ops: its tuned kernels (the in-place
-  // pull) copy an eager input into the inputs whole. (The pushed variant,
-  // forced, runs any call in the box: its inbox holds a row a rank,
-  // `exchange_sizes`.)
+  return widest;
+}
+
+// THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds (an
+// eager input is copied in whole), and what the partials holds at the most partials a byte of its
+// input needs among the op's exact picks: at one row of one pack, where rounding up is all of it.
+// Python admits a call by it or by the box the exchange was sized for, whichever is larger.
+inline int64_t max_bytes(const std::vector<TunedPoint>& points, OpType o, int64_t partials_bytes,
+                         int64_t staging_bytes) {
+  int64_t per_byte = 0;
+  for (const TunedPoint& p : points)
+    if (p.op == o && p.mode == Mode::exact && p.pick) {
+      const int64_t need = partials_need(p.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
+      if (need > per_byte) per_byte = need;
+    }
   if (per_byte == 0) return staging_bytes;
   const int64_t partials = partials_bytes / per_byte;
   return partials < staging_bytes ? partials : staging_bytes;
 }
 
-// EVERY WHOLE-PACK ROW UP TO THE WIDEST IS PICKED, at every built world and
-// dtype. Past kMaxRanks packs every kernel takes the row's columns, so its
-// widest tile at the world holds any row up to widest_row; the narrower rows,
-// which a slicing kernel cannot take, are checked one by one. One op a check,
-// each its own constant evaluation.
-constexpr bool plain_rows_pick(OpType o) {
-  const int64_t widest = widest_row(o);
-  for (const int world : kBuild.supports.worlds)
-    for (const DType d : op(o).dtypes)
-      for (int64_t p = 1; p <= kMaxRanks; ++p) {
-        const int64_t n = p * kBuild.memory.pack_bytes / elem_bytes(d);
-        if (widest != 0 && n > widest) break;
-        if (std::holds_alternative<Error>(
-                pick(o, world, 1, n, tile_cols(o, n), d)))
-          return false;
+// THE CHECK OPEN MAKES OF THE POINTS: the first point a call could not run, named, or a table or
+// a kernel left without a point; none if the file is sound. Every point a built kernel of its own
+// op at a built world, its build one its kernel lists, its grid in range (the LL push's within its
+// lines' blocks), an exact table moving nothing quantized; every op a pick in each table at every
+// built world; every kernel a config at every built world for each encoding it builds (an INT4
+// build's may be an exact point's, moved INT4, where that build is listed).
+inline std::optional<std::string> check(const std::vector<TunedPoint>& points) {
+  const auto mode_name = [](Mode m) { return m == Mode::exact ? "exact" : "quantized"; };
+  for (size_t i = 0; i < points.size(); ++i) {
+    const TunedPoint& p = points[i];
+    const auto named = [&](const char* why) {
+      return "point " + std::to_string(i) + " (" + op(p.op).name + ", " + mode_name(p.mode) +
+             ", world " + std::to_string(p.world) + ", " + std::to_string(p.hidden) + " wide, " +
+             std::to_string(p.tokens) + " tokens, " + info(p.fn).name + "): " + why;
+    };
+    if (op_of(p.fn) != p.op) return named("the kernel is another op's");
+    if (!world_built(p.world)) return named("its world is not built");
+    if (p.hidden < 1 || p.tokens < 1) return named("no width or no tokens");
+    if (p.config.build.index() != family_of(p.fn) || !built(p.fn, p.config.build))
+      return named("its build is not one its kernel lists");
+    if (!launch_fits(p.fn, p.config.launch)) return named("its grid is out of range");
+    if (p.fn == Template::all_reduce_push_one_shot &&
+        p.config.launch.blocks_per_grid > kLineBlocks)
+      return named("the LL push's grid is past its lines' blocks");
+    if (p.mode == Mode::exact && quantization_of(p.config.build) != Quantization::none)
+      return named("a point of the exact table moves INT4");
+  }
+  for (const Op& o : kOps)
+    for (const int world : kBuild.supports.worlds)
+      for (const Mode mode : {Mode::exact, Mode::quantized}) {
+        bool any = false;
+        for (const TunedPoint& p : points)
+          any |= p.op == o.type && p.world == world && p.mode == mode && p.pick;
+        if (!any)
+          return std::string(o.name) + ": no point picks at world " + std::to_string(world) +
+                 " in the " + mode_name(mode) + " table";
       }
-  return true;
+  for (const TemplateInfo& t : kTemplates)
+    for (const int world : kBuild.supports.worlds)
+      for (const int q : {Quantization::none, Quantization::int4}) {
+        bool builds_it = false;
+        for (const BuildConfig& b : t.builds) builds_it |= quantization_of(b) == q;
+        bool has = false;
+        for (const TunedPoint& p : points)
+          has |= p.fn == t.fn && p.world == world &&
+                 (quantization_of(p.config.build) == q ||
+                  (q == Quantization::int4 && built(t.fn, quantized(p.config.build, q))));
+        if (builds_it && !has)
+          return std::string(t.name) + ": no config at world " + std::to_string(world) +
+                 (q == Quantization::int4 ? " moving INT4" : " exact");
+      }
+  return std::nullopt;
 }
-static_assert(plain_rows_pick(OpType::all_reduce),
-              "a plain call's row under the widest is picked by no kernel");
-static_assert(plain_rows_pick(OpType::all_reduce_rms_norm),
-              "a plain call's row under the widest is picked by no kernel");
-static_assert(plain_rows_pick(OpType::all_reduce_add_rms_norm),
-              "a plain call's row under the widest is picked by no kernel");
-static_assert(plain_rows_pick(OpType::all_reduce_add_attn_res_rms_norm),
-              "a plain call's row under the widest is picked by no kernel");
 
 }  // namespace hip_custom_communicator

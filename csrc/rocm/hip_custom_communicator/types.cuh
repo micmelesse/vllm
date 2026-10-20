@@ -208,7 +208,7 @@ enum class OpType : int {
 // the reduced dimension a step (AttnRes's sources a step); `quantization`, what
 // crosses the links (common.cuh's QUANTIZATION): a two-shot's build is listed
 // as it is and moving INT4 (select's `and_int4`), forced like any field or
-// taken by select for a call the handle quantizes. One type an op, so a config
+// named by a tuned point. One type an op, so a config
 // cannot cross ops, though three hold the same fields. all_reduce: a tile a
 // work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
@@ -289,6 +289,27 @@ constexpr BuildConfig quantized(BuildConfig b, int q) {
   std::visit([q](auto& f) { f.quantization = q; }, b);
   return b;
 }
+
+// THE TUNED POINTS (vllm/.../hip_custom_communicator_configs/<arch>.json, loaded by Python and
+// handed to open, checked there, held by the handle): each a measured call (its op, world, width
+// and tokens) with the kernel and config that won there. A call runs its nearest point's
+// (config.cuh's `lookup`). `mode`: the table the point belongs to, the communicator's exact one or
+// its quantized one (every size: exact kernels where quantizing does not pay, INT4 where it does).
+// `pick` false: not a choice, a kernel's config for a call that forces it where no point picks it.
+enum class Mode : int { exact = 0, quantized = 1 };
+struct TunedPoint {
+  OpType op;
+  Mode mode;
+  bool pick;
+  int world;
+  int64_t hidden;
+  int64_t tokens;
+  Template fn;
+  KernelConfig config;
+};
+// A point on the wire from Python: its fields in this order, int64 each (`Template` and `OpType`
+// by their enums' numbers, `build_info`'s order).
+constexpr int kPointFields = 15;
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
 // A row of `elems` of `dtype` in 16-byte packs.
