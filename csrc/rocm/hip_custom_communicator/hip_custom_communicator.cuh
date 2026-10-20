@@ -94,14 +94,12 @@ inline std::variant<Config, Error> all_reduce(
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
         output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(),
-        config.staging_stride_m,
-        config.staging_stride_n, static_cast<int>(config.staging_size_m),
-        static_cast<int>(config.staging_size_n), h.signals_ptr_array(),
-            h.signals_ptr_array_size(), h.signals_stride_parity(),
-        h.signals_stride_block(), h.signals_stride_writer(),
-        h.signals_size_parity(), h.signals_size_block(),
-        h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+        static_cast<int>(output_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
+        config.lines_stride_slot, config.lines_stride_m, config.lines_stride_n,
+        static_cast<int>(config.lines_size_slot), static_cast<int>(config.lines_size_m),
+        static_cast<int>(config.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
+        h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
+        static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks());
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
@@ -216,14 +214,12 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
           sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(),
-          reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
+          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
+          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
+          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
+          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
+          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
@@ -441,14 +437,12 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
           sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(),
-          reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
+          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
+          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
+          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
+          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
+          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
@@ -730,14 +724,12 @@ all_reduce_add_attn_res_rms_norm(
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
           sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.staging_ptr_array(), h.staging_ptr_array_size(),
-          reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
+          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
+          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
+          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
+          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
+          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
+          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {

@@ -167,6 +167,30 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // before its launch; its peers read it through the eager input table only
 // after its first barrier, and its launch ends only after every peer's last
 // read (INPUT TABLES).
+//
+// LINES AND EPOCHS, the pushed one-shot's own (kernels/all_reduce.cuh: the flag in the
+// line, no barrier), two more regions after the scales:
+//   lines      the INBOX peers push lines into: [writer, bank * block] rows of a block's
+//              tile, kLineSlotBytes of payload a row, each payload byte two in lines
+//              (common.cuh's Layout::line), two banks: world * 2 * kLineBlocks rows.
+//              Its own region, never another kernel's: a stale line another kernel left
+//              could carry an epoch's value.
+// THE EPOCHS are not a region: each block's last epoch, a 16-byte pack a block (its
+// word at column 0), kLineBlocks of them, read only by their own rank, so CACHED
+// rank-local memory (hipMalloc, zeroed at open; aiter's block_flags): from the
+// uncached arena each launch began with an uncached load (~2k cycles before any
+// send, ATT 2026-10-19T04-09-17Z). The lines start zeroed with the arena (no line
+// carries epoch 0, the first is 1); both are written only by that kernel. THE CAP: aiter's LL serves at most 128 KiB a call
+// (kLLPocSlotCapPk, 16384 packets) and refuses more; ours takes any size, a pass of a
+// tile a block, so its cap is the grid's, kLineBlocks blocks (config.cuh cuts the grid to
+// it): 128 blocks of 1024 elements, 256 KiB in one pass. 8 MiB at eight ranks.
+constexpr int kLineBlocks = 128;
+constexpr int64_t kLineSlotBytes = 2048;  // a block's tile's payload, at most
+constexpr int64_t lines_bytes(int world) {
+  return 2 * int64_t{kLineBlocks} * world * kLineSlotBytes * (kLineBytes / kLinePayloadBytes);
+}
+constexpr int64_t kEpochsBytes = int64_t{kLineBlocks} * kBuild.memory.pack_bytes;
+
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
   return (bytes + kRegionAlign - 1) / kRegionAlign * kRegionAlign;
@@ -176,16 +200,18 @@ struct ArenaLayout {
   int64_t staging = 0;
   int64_t partials = 0;
   int64_t scales = 0;
+  int64_t lines = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
 };
 inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
-                                int64_t scales_bytes) {
+                                int64_t scales_bytes, int64_t lines_bytes) {
   ArenaLayout l;
   l.signals = 0;
   l.staging = l.signals + kSignalsRegionBytes;
   l.partials = l.staging + region_aligned(staging_bytes);
   l.scales = l.partials + region_aligned(partials_bytes);
-  l.end = l.scales + region_aligned(scales_bytes);
+  l.lines = l.scales + region_aligned(scales_bytes);
+  l.end = l.lines + region_aligned(lines_bytes);
   return l;
 }
 
@@ -510,7 +536,8 @@ class Handle {
         quantization_(quantization),
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
         layout_(arena_layout(staging_bytes, partials_bytes,
-                             max_rows * static_cast<int64_t>(sizeof(float)))) {
+                             max_rows * static_cast<int64_t>(sizeof(float)),
+                             lines_bytes(world_size))) {
     // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
     // an open that fails or hangs is read there.
     set_last_log(log_);
@@ -712,6 +739,19 @@ class Handle {
   }
   int scales_ptr_array_size() const { return world_size_; }
   int64_t scales_size_m() const { return max_rows_; }
+  // EVERY RANK'S LINES (the pushed one-shot's inbox), a device array of every rank's address of
+  // that region with its size, the world, as [writer, row, n] (config.cuh's); and THIS RANK'S EPOCHS
+  // (its per-block counters, read only here), their own pointer, as [block, n], a pack of int32 a
+  // block (LINES AND EPOCHS, above).
+  char* const* lines_ptr_array() const { return region_ptr_arrays_ + kLinesArray * kMaxRanks; }
+  int lines_ptr_array_size() const { return world_size_; }
+  int32_t* epochs_ptr() const { return epochs_; }
+  static constexpr int64_t epochs_stride_block() {
+    return kBuild.memory.pack_bytes / int64_t{sizeof(int32_t)};
+  }
+  static constexpr int64_t epochs_stride_n() { return 1; }
+  static constexpr int64_t epochs_size_block() { return kLineBlocks; }
+  static constexpr int64_t epochs_size_n() { return epochs_stride_block(); }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
   // kMaxRanks] (parity, block, writer) at signals_ptr_array()[r]: the
@@ -1033,7 +1073,13 @@ class Handle {
         at[kStagingArray * kMaxRanks + r] = base + layout_.staging;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
         at[kScalesArray * kMaxRanks + r] = base + layout_.scales;
+        at[kLinesArray * kMaxRanks + r] = base + layout_.lines;
       }
+      // THE EPOCHS: this rank's own hipMalloc (no peer reads them; a pointer of their own).
+      HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&epochs_), static_cast<size_t>(kEpochsBytes)));
+      HIP_CHECK(hipMemset(epochs_, 0, static_cast<size_t>(kEpochsBytes)));
+      // Zero before any launch on the caller's streams, which do not wait for the null stream.
+      HIP_CHECK(hipDeviceSynchronize());
       HIP_CHECK(hipMemcpy(region_ptr_arrays_, at.data(),
                           at.size() * sizeof(char*), hipMemcpyHostToDevice));
     }
@@ -1143,10 +1189,18 @@ class Handle {
     }
     return out;
   }
-  // THE LOCAL SUMS freed (ours, local): with our arena, in teardown's second
-  // half. Idempotent.
+  // THE LOCAL SUMS AND THE EPOCHS freed (ours, local): with our arena, in
+  // teardown's second half. Idempotent.
   Arena::Released release_sums() {
     Arena::Released out;
+    if (epochs_ != nullptr) {
+      const hipError_t e = hipFree(epochs_);
+      if (e != hipSuccess) {
+        (void)hipGetLastError();
+        out.error = e;
+      }
+      epochs_ = nullptr;
+    }
     if (sums_ != nullptr) {
       const hipError_t e = hipFree(sums_);
       if (e != hipSuccess) {
@@ -1305,10 +1359,12 @@ class Handle {
   // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
   // allocation: the signals, the inputs, the partials.
   static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
-                       kRegionPtrArrays = 4;
+                       kLinesArray = 4, kRegionPtrArrays = 5;
   char** region_ptr_arrays_ = nullptr;
   // THE LOCAL SUMS (`sums`), staging_bytes_ of them.
   void* sums_ = nullptr;
+  // THE EPOCHS (LINES AND EPOCHS), kEpochsBytes, this rank's alone.
+  int32_t* epochs_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;
   std::vector<void**> pending_slots_;

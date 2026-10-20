@@ -81,6 +81,19 @@ constexpr BuildConfig kAllReduceOneShotConfigs[] = {
     AllReduceBuildConfig{256, 1, 1, 2048},
     AllReduceBuildConfig{512, 1, 1, 4096},
 };
+// THE PUSHED ONE-SHOT (the flag in the line): a tile a row high, a pack a
+// thread; aiter's ar_ll_gfx9 runs 256 threads of one 8-byte packet each, 1024
+// elements a block (7 blocks at 7168), which {128, 1, 1, 1024} matches block for
+// block at a 16-byte pack a thread. Every build's tile fits a lines slot
+// (handle.cuh's kLineSlotBytes, checked below). Not swept yet.
+constexpr BuildConfig kAllReducePushOneShotConfigs[] = {
+    AllReduceBuildConfig{64, 1, 1, 512},
+    AllReduceBuildConfig{128, 1, 1, 1024},
+    AllReduceBuildConfig{256, 1, 1, 1024},
+};
+// THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
+// builds lay out at that many elements a thread.
+constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / elem_bytes; }
 // The plain two-shot: 512 threads divided into whole waves per peer. The
 // eight-rank tile is 512 elements; four and two ranks need 1024 and 2048
 // elements respectively so every lane owns a complete pack. Keep the tuned
@@ -267,9 +280,10 @@ constexpr TemplateInfo kTemplates[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_push_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, true, kAttnResPushConfigs},
-    // Plain push supports exact and INT4; plain pull supports exact only.
+    // Plain push supports exact and INT4 (the one-shot exact only: the flag in the line, its own
+    // builds); plain pull supports exact only.
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_one_shot),
-     OpType::all_reduce, Algorithm::one_shot, true, kAllReduceOneShotConfigs},
+     OpType::all_reduce, Algorithm::one_shot, true, kAllReducePushOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot),
      OpType::all_reduce, Algorithm::two_shot, true, kAllReduceTwoShotConfigs},
     // THE OP AS TWO KERNELS OF OURS (Algorithm::split; STANDARDS 3.2, *We win at the op level*):
@@ -412,12 +426,21 @@ struct TunedKernel {
 // (48 and 84 blocks: 48x3584 10.2 -> 9.0 us, 48x7168 11.2 -> 10.4;
 // 2026-10-18T08-56-55Z); 8 tokens of 7168 the one-shot on 56 blocks (8.5 ->
 // 8.1, 09-02-30Z; the same bytes at 16 of 3584 lost, 8.4 -> 9.0).
+// THE PUSHED ONE-SHOT (the flag in the line) IS NOT PICKED: 1.04-1.07x aiter at
+// 1-8 tokens (run 2026-10-19T05-49-08Z, on the fork before the host rewrite); forced
+// only until it wins (its tuned entry, for the bench's forced pattern, sits beside the
+// pull's at the same rows, listed second so select keeps the pull).
 constexpr TunedKernel kAllReduceKernels[] = {
     {8,
      1,
      3584,
      Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8,
+     1,
+     3584,
+     Template::all_reduce_push_one_shot,
+     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
     {8,
      16,
      3584,
@@ -463,6 +486,11 @@ constexpr TunedKernel kAllReduceKernels[] = {
      7168,
      Template::all_reduce_pull_one_shot,
      {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+    {8,
+     1,
+     7168,
+     Template::all_reduce_push_one_shot,
+     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
     {8,
      8,
      7168,
@@ -725,6 +753,9 @@ constexpr bool all_reduce_kernels_lay_out() {
     const auto& c = std::get<AllReduceBuildConfig>(k.config.build);
     if (k.fn == Template::all_reduce_pull_one_shot && !one_shot_lays_out(c, nl))
       return false;
+    if (k.fn == Template::all_reduce_push_one_shot &&
+        !one_shot_lays_out(c, push_one_shot_pack(2)))
+      return false;
     if (k.fn == Template::all_reduce_pull_two_shot &&
         !two_shot_lays_out(c, k.world, nl))
       return false;
@@ -733,6 +764,16 @@ constexpr bool all_reduce_kernels_lay_out() {
 }
 static_assert(all_reduce_kernels_lay_out(),
               "a tuned all-reduce build its dispatch never instantiates");
+// EVERY PUSHED ONE-SHOT BUILD'S TILE FITS A LINES SLOT (handle.cuh's LINES) at
+// every built dtype.
+constexpr bool push_one_shot_tiles_fit() {
+  for (const BuildConfig& b : kAllReducePushOneShotConfigs)
+    for (const DType d : kBuild.supports.dtypes)
+      if (tile_m_of(b) != 1 || tile_n_of(b) * elem_bytes(d) > kLineSlotBytes) return false;
+  return true;
+}
+static_assert(push_one_shot_tiles_fit(),
+              "a pushed one-shot tile wider than its lines slot");
 
 // gfx950 on n11, bf16, 8 ranks. Transcribed from the size thresholds the sweeps
 // set (each crossover cites its run) at the widths we run, until the tuner
@@ -1981,6 +2022,14 @@ struct ConfigFields {
   int64_t staging_stride_n{};
   int64_t staging_size_m{};
   int64_t staging_size_n{};
+  // THE PUSHED ONE-SHOT'S LINES INBOX, [slot, m, n] in payload elements (kernels/all_reduce.cuh;
+  // handle.cuh's LINES): zeros for every other kernel.
+  int64_t lines_stride_slot{};
+  int64_t lines_stride_m{};
+  int64_t lines_stride_n{};
+  int64_t lines_size_slot{};
+  int64_t lines_size_m{};
+  int64_t lines_size_n{};
   int64_t scales_stride_m{};
   int64_t scales_size_m{};
   int64_t sums_stride_n{};
@@ -2156,6 +2205,8 @@ void with_config_build(const Config& config, F& f) {
           constexpr int WORLD = decltype(world)::value;
           constexpr bool valid = [=] {
             if constexpr (op_of(FN) != OpType::all_reduce) return true;
+            else if constexpr (FN == Template::all_reduce_push_one_shot)
+              return one_shot_lays_out(B, push_one_shot_pack(sizeof(T)));
             else if constexpr (algorithm_of(FN) == Algorithm::one_shot)
               return one_shot_lays_out(B, traits<T>::N);
             else return two_shot_lays_out(B, WORLD, traits<T>::N);
@@ -2359,11 +2410,21 @@ inline std::variant<Config, Error> all_reduce_config(
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
   const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
-  const KernelConfig c = k.config;
+  KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
   // IN PLACE: the exact pull, every rank's input read where its table says.
   const bool in_place = direction_of(fn) == Direction::pull &&
                         a.quantization == Quantization::none;
+  // THE LINES: the pushed one-shot pushes into its own inbox (handle.cuh's LINES), a tile a
+  // block a pass, nothing staged. ITS GRID, a rule on the launch as the other ops' cut: at most
+  // its tiles (a wider grid is idle blocks) and the lines' blocks (each block its own slots).
+  const bool lines = fn == Template::all_reduce_push_one_shot;
+  if (lines) {
+    const int64_t tiles = (m + a.tile_m - 1) / a.tile_m * ((n + a.tile_n - 1) / a.tile_n);
+    int& blocks = c.launch.blocks_per_grid;
+    if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
+    if (blocks > kLineBlocks) blocks = kLineBlocks;
+  }
   // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
   // the whole input). INT4 pushes its input's shares quantized, whole,
   // instead.
@@ -2382,8 +2443,8 @@ inline std::variant<Config, Error> all_reduce_config(
     return (rows * packs + world - 1) / world;
   };
   int64_t band = 0;
-  if (in_place && !is_two_shot(fn)) {
-    band = m;  // nothing staged: one pass
+  if ((in_place && !is_two_shot(fn)) || lines) {
+    band = m;  // nothing staged: one pass (the lines' passes are the kernel's)
   } else if (in_place) {
     // THE IN-PLACE TWO-SHOT'S BAND: what the partials hold, a row of its
     // slice a row; the input is read where it is.
@@ -2431,17 +2492,26 @@ inline std::variant<Config, Error> all_reduce_config(
   config.partials_stride_n = 1;
   config.partials_size_m = in_passes ? rows : m;
   config.partials_size_n = slice_bytes / elem_bytes(dtype);
-  config.staging_stride_m = in_place                         ? 0
+  config.staging_stride_m = in_place || lines                ? 0
                          : !in_passes || !is_two_shot(fn) ? n
                              : slot_packs(rows) * pack / elem_bytes(dtype);
-  config.staging_stride_n = in_place ? 0 : 1;
-  config.staging_size_m = in_place     ? 0
+  config.staging_stride_n = in_place || lines ? 0 : 1;
+  config.staging_size_m = in_place || lines ? 0
                        : !in_passes ? m
                        : is_two_shot(fn) ? world
                                          : world * rows;
-  config.staging_size_n = in_place                         ? 0
+  config.staging_size_n = in_place || lines                ? 0
                        : !in_passes || !is_two_shot(fn) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype);
+  // THE LINES: [writer, row, n] payload elements, 2 * kLineBlocks rows (bank, block) of
+  // kLineSlotBytes of payload each whatever the build (so a block's row is the same bytes at
+  // every build), a writer's rows contiguous.
+  config.lines_stride_slot = lines ? 2 * kLineBlocks * (kLineSlotBytes / elem_bytes(dtype)) : 0;
+  config.lines_stride_m = lines ? kLineSlotBytes / elem_bytes(dtype) : 0;
+  config.lines_stride_n = lines ? 1 : 0;
+  config.lines_size_slot = lines ? world : 0;
+  config.lines_size_m = lines ? 2 * kLineBlocks : 0;
+  config.lines_size_n = lines ? kLineSlotBytes / elem_bytes(dtype) : 0;
   config.dtype = dtype;
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
@@ -2893,10 +2963,11 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
     }
     const int64_t input = max_rows * max_cols * elem_bytes(d);
     if (input > staging) staging = input;
-    // THE PUSHED ALL-REDUCE'S INBOX (forced) takes a pass of at least one
-    // row: the one-shot's WORLD slots of a row each, which covers the
-    // two-shot's WORLD shares of one row rounded up to whole packs. The
-    // in-place pull's eager copy is the input whole, above.
+    // THE PUSHED TWO-SHOT'S INBOX (forced) takes a pass of at least one row:
+    // WORLD slots of a row each covers its WORLD shares of one row rounded up
+    // to whole packs. The in-place pull's eager copy is the input whole,
+    // above. (The pushed one-shot's inbox is its own region, handle.cuh's
+    // LINES.)
     const int64_t one_row_each = world * max_cols * elem_bytes(d);
     if (one_row_each > staging) staging = one_row_each;
   }

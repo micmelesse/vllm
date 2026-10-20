@@ -112,7 +112,83 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
 //     U[1][kInt4GroupPacks][kPackElems] (raw: U[1][kInt4GroupPacks][2]; with a slot dimension,
 //     every slot's).
-enum class Layout { tile, run, flat, group_run, group_flat };
+//   line: THE FLAG IN THE LINE (NCCL's LL; aiter's `ar_ll_gfx9` LLPackedMsg): the tile's threads
+//     and places, but the buffer holds every 8 bytes of payload in a 16-byte LINE, (4 bytes of
+//     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
+//     sees both flags of a line holds its data, with no barrier. Strides and sizes count the
+//     payload's elements; a row's lines take twice its payload's bytes (kLineBytes /
+//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. send writes the registers' lines carrying `flag`;
+//     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
+//     writer c at slot input_slot + c) and POLLS until each line it waits for carries `flag`: the
+//     rows and packs inside the clip (those past it are nobody's: their registers are left
+//     unread), every writer but input_rank (this rank, which never writes its own inbox; its
+//     registers are left as read, garbage). Both nontemporal 16-byte accesses, aiter's
+//     ll_store_b128 / ll_load_b128 (`global_*_dwordx4 ... nt`): a line moves in one transaction.
+//     The poll leaves past timeout_ticks or once the status's `abort` is set, as barrier's wait
+//     does (give_up, Where::start: the line wait is its kernel's only one).
+enum class Layout { tile, run, flat, group_run, group_flat, line };
+// A LINE: 16 bytes, one global_store_dwordx4 / global_load_dwordx4, carrying 8 bytes of payload
+// (two words) and the flag twice (the line's two halves each carry it: a reader trusts the line
+// only whole).
+constexpr int kLineBytes = 16;
+constexpr int kLinePayloadBytes = 8;
+
+// =================================================================================================
+// THE STATUS: barrier's fault protocol, which the host reads (handle.cuh, log.cuh)
+// =================================================================================================
+
+// WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's
+// `Where`, number for number. 0 is no fault.
+enum class Where : uint32_t {
+  start = 1,     // a launch's first barrier: the peer had not launched
+  peer_barrier,  // a later barrier
+};
+
+// A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it
+// and sets `abort` while a kernel still runs, and a graph replay, which runs
+// none of our host code, still reports: a buffer of 32-bit words, one a field,
+// `status[field]` at its stride (`status_stride_field`), the field a
+// StatusField. 32-BIT, as the record's fields always were: 64-bit words cost
+// the fault path a register pair a field and an occupancy step in 157 of 440
+// kernels (2026-10-13T16-59-48Z). A wait that outlives the timeout writes the
+// fault once (the first block to claim `state` wins) and sets `abort`; every
+// wait checks `abort` with its clock and leaves, so one fault ends the rank's
+// kernel instead of each block spinning out its own timeout. The host sets
+// `abort` to end a kernel it has given up on.
+// A FLAG'S STATES, the only values a barrier writes: `arrived` into a peer's
+// slot for it, `clear` into its own once it has seen it. Between launches every
+// flag is `clear`; any other value is not a state the protocol has, so the
+// memory is corrupt.
+enum class FlagState : uint32_t {
+  clear =
+      0,  // the writer has not reached this barrier, or the owner has seen it
+  arrived =
+      1,  // the writer reached this barrier; the owner has not yet seen it
+};
+
+// THE FAULT'S STATES, the status's `state` word: claimed by the first wait to
+// give up, then written whole; the host reads the fault's fields only once
+// `written`.
+enum class FaultState : uint32_t {
+  none = 0,
+  writing = 1,
+  written = 2,
+};
+
+enum class StatusField : int {
+  abort,        // 1: every wait on this rank leaves; 0: they wait
+  state,        // a FaultState
+  where,        // Where
+  rank,         // this rank
+  block,        // the block that gave up
+  peer,         // the rank it waited for
+  count,        // the flag it read last
+  want,         // the value it waited for
+  elapsed_low,  // how long it waited, in the device wall clock's ticks: the low
+                // word
+  elapsed_high,  // and the high
+};
+constexpr int kStatusFields = 10;
 
 // THE OPERATIONS THE INTERNALS CALL, declared before them (defined below, QUANTIZATION).
 template <typename U, int P>
@@ -192,6 +268,40 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const*
   return reinterpret_cast<std::conditional_t<std::is_void_v<U>, T, U>*>((char*)global);
 }
 
+// THE FAULT, written once by the first wait on this rank to give up (the two waits on a peer:
+// barrier's flag and the line read's lines, read_buffer): `state` claimed 0 -> 1, the fields, then
+// 2 released, so the host reads them only whole. Then `abort`, so every other wait on this rank
+// leaves at its next check rather than spinning out its own timeout. The caller then ends its wave.
+// Its own reason: two waits writing the one record would drift.
+DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int status_size_field,
+                     Where where, int rank, uint32_t peer, uint32_t count, uint32_t want,
+                     uint64_t waited) {
+  // One word of this rank's status, by its field, at the buffer's stride.
+  const auto word = [&](StatusField f) {
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (static_cast<int64_t>(f) < 0 || static_cast<int64_t>(f) >= status_size_field))
+      __builtin_trap();
+    return status_ptr + static_cast<int64_t>(f) * status_stride_field;
+  };
+  uint32_t none = static_cast<uint32_t>(FaultState::none);
+  if (__scoped_atomic_compare_exchange_n(word(StatusField::state), &none,
+                                         static_cast<uint32_t>(FaultState::writing), false,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                         __MEMORY_SCOPE_SYSTEM)) {
+    *word(StatusField::where) = static_cast<uint32_t>(where);
+    *word(StatusField::rank) = static_cast<uint32_t>(rank);
+    *word(StatusField::block) = blockIdx.x;
+    *word(StatusField::peer) = peer;
+    *word(StatusField::count) = count;
+    *word(StatusField::want) = want;
+    *word(StatusField::elapsed_low) = static_cast<uint32_t>(waited);
+    *word(StatusField::elapsed_high) = static_cast<uint32_t>(waited >> 32);
+    __scoped_atomic_store_n(word(StatusField::state), static_cast<uint32_t>(FaultState::written),
+                            __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+  }
+  __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+}
+
 // A LOAD NEVER BRANCHES: a thread outside a narrow layout loads its clamped, in-bounds place and
 // its values go unused. Under a thread compare the load was an exec branch, so every array's
 // old registers stayed live across AttnRes's loops (ISA 2026-10-04T16-39-15Z).
@@ -205,12 +315,18 @@ DINLINE std::conditional_t<std::is_void_v<U>, T, U>* lane_ptr_array_at(T* const*
 // undecoded, [0] the pack's word and [1] its group's scale as fp32 bits: a caller summing every
 // rank's words (v_dot2, never a decoded tile of every rank: 172 VGPRs, reduce_scatter.cuh) or
 // loading every rank's before decoding any.
+// THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the writer not waited for, and the
+// fault's), `flag` the value every line waited for carries, and the status buffer and limit its
+// poll gives up by; every other layout passes them as their defaults and reads none.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
           typename OUTPUT>
 DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride_slot,
                          int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
                          int input_size_m, int input_size_n, int clip_m, int clip_n,
-                         OUTPUT& output, int offs_m, int offs_n, int row_step) {
+                         OUTPUT& output, int offs_m, int offs_n, int row_step, int rank = 0,
+                         uint32_t flag = 0, uint32_t* status_ptr = nullptr,
+                         int64_t status_stride_field = 0, int status_size_field = 0,
+                         uint64_t timeout_ticks = 0) {
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
   constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
   constexpr int kRows = std::extent_v<OUTPUT, kSlots ? 1 : 0>;
@@ -264,7 +380,116 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
   };
   constexpr bool kGroup = LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat;
   constexpr bool kRun = LAYOUT == Layout::run || LAYOUT == Layout::group_run;
-  if constexpr (LAYOUT != Layout::tile && !kGroup) {
+  if constexpr (LAYOUT == Layout::line) {
+    // THE LINE READ: every writer's lines of the tile at once (two a pack), then the check, again
+    // until every line waited for carries the flag. A lane leaves the loop once its own are all
+    // there; a lane past the clip waits for none.
+    static_assert(QUANTIZATION == Quantization::none && kSlots && kCopies == WORLD,
+                  "a line read is every writer's exact copy");
+    // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
+    constexpr int kLines = sizeof(V) / kLinePayloadBytes;
+    static_assert(sizeof(V) % kLinePayloadBytes == 0 && kLines >= 1 && kLines <= 2 &&
+                      sizeof(u32x4) == kLineBytes,
+                  "a pack is one or two lines");
+    constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG &&
+        (input_slot < 0 || input_slot + WORLD > input_size_slot || flag == 0))
+      __builtin_trap();
+    const char* slots[WORLD];
+#pragma unroll
+    for (int c = 0; c < WORLD; ++c)
+      slots[c] = reinterpret_cast<const char*>(input) +
+                 int64_t{input_slot + c} * input_stride_slot * int64_t{sizeof(U)} * kLineScale;
+    // A PACK'S FIRST LINE, as a 32-bit byte offset into its slot, and whether its thread waits
+    // for it (inside the clip). A ROW'S LINES ARE ITS PACKS' FIRST LINES, THEN THEIR SECOND (`half`
+    // apart), so one load (or store) instruction's lanes cover one contiguous run, as aiter's
+    // packets: a pack's two lines side by side put a lane's 16 bytes 32 apart.
+    const uint32_t half = static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)});
+    uint32_t line_at[kRows][kPacks];
+    bool waits[kRows][kPacks];
+#pragma unroll
+    for (int i = 0; i < kRows; ++i)
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k) {
+        line_at[i][k] = static_cast<uint32_t>(row_of(i)) *
+                            static_cast<uint32_t>(input_stride_m * int64_t{sizeof(U)}) *
+                            kLineScale +
+                        static_cast<uint32_t>(pack_of(k)) * uint32_t{kLineBytes};
+        waits[i][k] = row_at(i) < clip_m &&
+                      offs_n / kPackElems + tid % kThreadsN + k * kThreadsN < clip_n / kPackElems;
+      }
+    u32x4 got[WORLD][kRows][kPacks][kLines];
+    const uint64_t t0 = wall_clock64();
+    for (uint32_t n = 1;; ++n) {
+#pragma unroll
+      for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+            for (int h = 0; h < kLines; ++h)
+              got[c][i][k][h] = __builtin_nontemporal_load(
+                  (const global_u32x4*)(slots[c] + line_at[i][k] + h * half));
+      // NOT HOISTED: each pass reads the lines again.
+      asm volatile("" ::: "memory");
+      bool missing = false;
+#pragma unroll
+      for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+#pragma unroll
+          for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+            for (int h = 0; h < kLines; ++h)
+              missing |= c != rank && waits[i][k] &&
+                         (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag);
+      if (!missing) break;
+      if ((n & 255u) != 0) continue;
+      // THE SLOW PATH every 256 polls, as barrier's wait: the clock and the status's `abort`.
+      const uint64_t waited = wall_clock64() - t0;
+      const bool aborted =
+          __scoped_atomic_load_n(status_ptr + static_cast<int64_t>(StatusField::abort) *
+                                                  status_stride_field,
+                                 __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) != 0;
+      if (!aborted && waited <= timeout_ticks) continue;
+      if (!aborted) {
+        // THE FAULT'S PEER AND WHAT IT SAW: the last writer whose line was not there.
+        uint32_t peer = 0, seen = flag;
+#pragma unroll
+        for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+          for (int i = 0; i < kRows; ++i)
+#pragma unroll
+            for (int k = 0; k < kPacks; ++k)
+#pragma unroll
+              for (int h = 0; h < kLines; ++h)
+                if (c != rank && waits[i][k] &&
+                    (got[c][i][k][h][1] != flag || got[c][i][k][h][3] != flag)) {
+                  peer = c;
+                  seen = got[c][i][k][h][1];
+                }
+        give_up(status_ptr, status_stride_field, status_size_field, Where::start, rank, peer,
+                seen, flag, waited);
+      }
+      __builtin_amdgcn_endpgm();
+    }
+    // THE PAYLOAD: each line's two data words, a pack's from its lines.
+#pragma unroll
+    for (int c = 0; c < WORLD; ++c)
+#pragma unroll
+      for (int i = 0; i < kRows; ++i)
+#pragma unroll
+        for (int k = 0; k < kPacks; ++k) {
+          uint32_t words[2 * kLines];
+#pragma unroll
+          for (int h = 0; h < kLines; ++h) {
+            words[2 * h] = got[c][i][k][h][0];
+            words[2 * h + 1] = got[c][i][k][h][2];
+          }
+          __builtin_memcpy(output[c][i][k], words, sizeof(words));
+        }
+  } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
     static_assert(QUANTIZATION == Quantization::none && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
@@ -544,13 +769,15 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 // registers of a dtype are quantized here; uint32_t registers U[kRows][kPacks][2] are the payload
 // already quantized ([0] the word, [1] the group's scale as fp32 bits), so a caller sending to
 // every rank quantizes once, before its loop.
+// THE LINE WRITE'S OWN (Layout::line): `flag`, the value its lines carry; every other layout
+// passes it as its default.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
           typename INPUT>
 DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                           int64_t output_stride_slot, int64_t output_stride_m,
                           int64_t output_stride_n, int output_size_slot, int output_size_m,
                           int output_size_n, int clip_m, int clip_n, int offs_m, int offs_n,
-                          int row_step) {
+                          int row_step, uint32_t flag = 0) {
   constexpr int kRows = std::extent_v<INPUT, 0>;
   constexpr int kPacks = std::extent_v<INPUT, 1>;
   constexpr int kPackElems = std::extent_v<INPUT, 2>;
@@ -585,7 +812,43 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   };
   constexpr bool kGroup = LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat;
   constexpr bool kRun = LAYOUT == Layout::run || LAYOUT == Layout::group_run;
-  if constexpr (LAYOUT != Layout::tile && !kGroup) {
+  if constexpr (LAYOUT == Layout::line) {
+    // THE LINE WRITE: each pack as its two lines, the flag in each. NO BRANCH: a lane past the
+    // clip writes its clamped place (the last row and pack inside it), whose registers it loaded
+    // clamped the same way, so the same bytes its owner writes. Under a branch, each store's data
+    // registers were rebuilt after the join, which waited for every store before (s_waitcnt
+    // vmcnt(0)): a send's remote stores ran one at a time, 40k of 60k cycles a wave (ATT
+    // 2026-10-19T04-09-17Z, 1 x 7168).
+    static_assert(QUANTIZATION == Quantization::none, "a line carries exact payload");
+    // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
+    constexpr int kLines = sizeof(V) / kLinePayloadBytes;
+    static_assert(sizeof(V) % kLinePayloadBytes == 0 && kLines >= 1 && kLines <= 2 &&
+                      sizeof(u32x4) == kLineBytes,
+                  "a pack is one or two lines");
+    constexpr int kLineScale = kLineBytes / kLinePayloadBytes;
+    if (HIP_CUSTOM_COMMUNICATOR_DEBUG && flag == 0) __builtin_trap();
+    char* const slot = reinterpret_cast<char*>(output) +
+                       int64_t{output_slot} * output_stride_slot * int64_t{sizeof(U)} * kLineScale;
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      const int row = min(row_at(i), clip_m - 1);
+#pragma unroll
+      for (int k = 0; k < kPacks; ++k) {
+        const int col = min(col_at(k), clip_n / kPackElems - 1);
+        uint32_t words[2 * kLines];
+        __builtin_memcpy(words, input[i][k], sizeof(words));
+        // A row's packs' first lines, then their second (the line read's layout).
+        const uint32_t half = static_cast<uint32_t>(output_stride_m * int64_t{sizeof(U)});
+        uint32_t at = static_cast<uint32_t>(row) * half * kLineScale +
+                      static_cast<uint32_t>(col) * uint32_t{kLineBytes};
+        asm volatile("" : "+v"(at));
+#pragma unroll
+        for (int h = 0; h < kLines; ++h)
+          __builtin_nontemporal_store(u32x4{words[2 * h], flag, words[2 * h + 1], flag},
+                                      (global_u32x4*)(slot + at + h * half));
+      }
+    }
+  } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
     static_assert(QUANTIZATION == Quantization::none && kRows == 1,
                   "the flat walk writes one exact copy a row of threads");
@@ -865,63 +1128,6 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
 }
 
 // =================================================================================================
-// THE STATUS: barrier's fault protocol, which the host reads (handle.cuh, log.cuh)
-// =================================================================================================
-
-// WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's
-// `Where`, number for number. 0 is no fault.
-enum class Where : uint32_t {
-  start = 1,     // a launch's first barrier: the peer had not launched
-  peer_barrier,  // a later barrier
-};
-
-// A RANK'S STATUS, in HOST-MAPPED memory (the handle's), so the host reads it
-// and sets `abort` while a kernel still runs, and a graph replay, which runs
-// none of our host code, still reports: a buffer of 32-bit words, one a field,
-// `status[field]` at its stride (`status_stride_field`), the field a
-// StatusField. 32-BIT, as the record's fields always were: 64-bit words cost
-// the fault path a register pair a field and an occupancy step in 157 of 440
-// kernels (2026-10-13T16-59-48Z). A wait that outlives the timeout writes the
-// fault once (the first block to claim `state` wins) and sets `abort`; every
-// wait checks `abort` with its clock and leaves, so one fault ends the rank's
-// kernel instead of each block spinning out its own timeout. The host sets
-// `abort` to end a kernel it has given up on.
-// A FLAG'S STATES, the only values a barrier writes: `arrived` into a peer's
-// slot for it, `clear` into its own once it has seen it. Between launches every
-// flag is `clear`; any other value is not a state the protocol has, so the
-// memory is corrupt.
-enum class FlagState : uint32_t {
-  clear =
-      0,  // the writer has not reached this barrier, or the owner has seen it
-  arrived =
-      1,  // the writer reached this barrier; the owner has not yet seen it
-};
-
-// THE FAULT'S STATES, the status's `state` word: claimed by the first wait to
-// give up, then written whole; the host reads the fault's fields only once
-// `written`.
-enum class FaultState : uint32_t {
-  none = 0,
-  writing = 1,
-  written = 2,
-};
-
-enum class StatusField : int {
-  abort,        // 1: every wait on this rank leaves; 0: they wait
-  state,        // a FaultState
-  where,        // Where
-  rank,         // this rank
-  block,        // the block that gave up
-  peer,         // the rank it waited for
-  count,        // the flag it read last
-  want,         // the value it waited for
-  elapsed_low,  // how long it waited, in the device wall clock's ticks: the low
-                // word
-  elapsed_high,  // and the high
-};
-constexpr int kStatusFields = 10;
-
-// =================================================================================================
 // BARRIER
 //
 // THE RANKS' SYNCHRONIZATION, over the SIGNALS buffer, [R, 2, B, R]:
@@ -1130,34 +1336,11 @@ DINLINE void barrier(uint32_t* const* signals_ptr_array, int signals_ptr_array_s
       const bool aborted = __scoped_atomic_load_n(word(StatusField::abort), __ATOMIC_RELAXED,
                                                   __MEMORY_SCOPE_SYSTEM) != 0;
       if (!aborted && waited <= timeout_ticks) continue;
-      if (!aborted) {
-        // THE FAULT, written once by the first wait on this rank to give up: `state` claimed
-        // 0 -> 1, the fields, then 2 released, so the host reads them only whole. Then
-        // `abort`, so every other wait on this rank leaves at its next check rather than
-        // spinning out its own timeout.
-        const uint32_t count =
-            __scoped_atomic_load_n(mine_ptr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-        uint32_t none = static_cast<uint32_t>(FaultState::none);
-        if (__scoped_atomic_compare_exchange_n(
-                word(StatusField::state), &none,
-                static_cast<uint32_t>(FaultState::writing), false, __ATOMIC_RELAXED,
-                __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM)) {
-          *word(StatusField::where) =
-              static_cast<uint32_t>(first ? Where::start : Where::peer_barrier);
-          *word(StatusField::rank) = static_cast<uint32_t>(rank);
-          *word(StatusField::block) = blockIdx.x;
-          *word(StatusField::peer) = threadIdx.x;
-          *word(StatusField::count) = count;
-          *word(StatusField::want) = want;
-          *word(StatusField::elapsed_low) = static_cast<uint32_t>(waited);
-          *word(StatusField::elapsed_high) = static_cast<uint32_t>(waited >> 32);
-          __scoped_atomic_store_n(word(StatusField::state),
-                                  static_cast<uint32_t>(FaultState::written),
-                                  __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-        }
-        __scoped_atomic_store_n(word(StatusField::abort), 1u, __ATOMIC_RELAXED,
-                                __MEMORY_SCOPE_SYSTEM);
-      }
+      if (!aborted)
+        internal::give_up(status_ptr, status_stride_field, status_size_field,
+                          first ? Where::start : Where::peer_barrier, rank, threadIdx.x,
+                          __scoped_atomic_load_n(mine_ptr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM),
+                          want, waited);
       __builtin_amdgcn_endpgm();
     }
     // 6. ACQUIRE, ordered only: one SYSTEM-scope acquire once the flag is seen.
@@ -1404,13 +1587,17 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
 // EVIDENCE for the scalar path where it can: all_gather's whole-wave rows through the select were
 // +86-143 VALU a plain two-shot (I8 ISA 2026-10-18T00-13-04Z).
 
-// LOAD: this rank's buffer (entry input_rank) into a thread's registers.
+// LOAD: this rank's buffer (entry input_rank) into a thread's registers. Layout::line's poll
+// takes its flag, the status and the limit (read_buffer's line read); no other layout reads them.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
           typename PTR, typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
-                  int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n, int row_step) {
+                  int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n, int row_step,
+                  uint32_t flag = 0, uint32_t* status_ptr = nullptr,
+                  int64_t status_stride_field = 0, int status_size_field = 0,
+                  uint64_t timeout_ticks = 0) {
   // The entries as plain pointers (a kernel's own pointer is __restrict__).
   const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
   const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
@@ -1418,7 +1605,8 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
                                 : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
   internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
       input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
-      input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
+      input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
+      flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
 }
 
 // LOAD, AN ENTRY: entry x_rank of this rank's device array of pointers (a table, written by the
@@ -1479,27 +1667,27 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 
 // SEND: a thread's registers into rank output_rank's buffer (a peer's, over the fabric; the rank
 // may differ by lane). Posted: the next ordered barrier's release completes and publishes it
-// (BARRIER).
+// (BARRIER); a Layout::line send carries `flag` in its lines and needs no barrier.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
           typename INPUT, typename PTR>
 DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                   int output_rank, int output_slot, int64_t output_stride_slot,
                   int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
                   int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
-                  int offs_n, int row_step) {
+                  int offs_n, int row_step, uint32_t flag = 0) {
   const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(output_rank);
   if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
     internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
         input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
         output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
-        output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
+        output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
   else
     internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
         input,
         internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
         output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
-        output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
+        output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
 }
 
 
