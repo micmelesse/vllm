@@ -870,6 +870,9 @@ struct ConfigFields {
   DType weight_dtype{};
   bool contiguous{};
   bool in_place{};
+  // CHUNKED: a norm's or AttnRes's row wider than the build's tile, walked in tile-wide chunks in
+  // passes (the kernels' CHUNKED instance); a row the tile holds runs the one-pass instance.
+  bool chunked{};
   int64_t partials_stride_m{};
   int64_t partials_stride_n{};
   int64_t partials_size_m{};
@@ -1068,7 +1071,7 @@ void with_config_build(const Config& config, F& f) {
             else return two_shot_lays_out(B, WORLD, traits<T>::N);
           }();
           if constexpr (valid) {
-            const auto layout = [&]<bool CONTIGUOUS>() {
+            const auto layout = [&]<bool CONTIGUOUS, bool CHUNKED>() {
               constexpr Config C = [=] {
                 Config c{};
                 c.kernel = kernel_of(FN);
@@ -1084,14 +1087,18 @@ void with_config_build(const Config& config, F& f) {
                 c.waves_per_eu = B.waves_per_eu;
                 c.quantization = B.quantization;
                 c.contiguous = CONTIGUOUS;
+                c.chunked = CHUNKED;
                 return c;
               }();
               f.template operator()<C>();
             };
             if constexpr (op_of(FN) == OpType::all_reduce && is_two_shot(FN)) {
-              if (config.contiguous) layout.template operator()<true>();
-              else layout.template operator()<false>();
-            } else layout.template operator()<false>();
+              if (config.contiguous) layout.template operator()<true, false>();
+              else layout.template operator()<false, false>();
+            } else if constexpr (op_of(FN) != OpType::all_reduce) {
+              if (config.chunked) layout.template operator()<false, true>();
+              else layout.template operator()<false, false>();
+            } else layout.template operator()<false, false>();
           }
         });
       };
@@ -1195,48 +1202,48 @@ const void* kernel_pointer() {
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::rms_norm_rows)
     return reinterpret_cast<const void*>(
-        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>);
+        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-            C.quantization>);
+            C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::add_rms_norm_rows)
     return reinterpret_cast<const void*>(
-        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>);
+        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
-            C.waves_per_eu, C.quantization>);
+            C.waves_per_eu, C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k,
-            C.threads, C.waves_per_eu, C.quantization>);
+            C.threads, C.waves_per_eu, C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
-            C.waves_per_eu, C.quantization>);
+            C.waves_per_eu, C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows)
     return reinterpret_cast<const void*>(
-        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu>);
+        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu, C.chunked>);
 }
 
 inline std::variant<Config, Error> all_reduce_config(
@@ -1495,6 +1502,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
       config.quantization == Quantization::none;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  config.chunked = n > config.tile_n;
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
@@ -1606,6 +1615,8 @@ all_reduce_add_rms_norm_config(
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
       config.quantization == Quantization::none;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  config.chunked = n > config.tile_n;
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
@@ -1727,6 +1738,8 @@ all_reduce_add_attn_res_rms_norm_config(
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
       config.quantization == Quantization::none;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  config.chunked = n > config.tile_n;
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;

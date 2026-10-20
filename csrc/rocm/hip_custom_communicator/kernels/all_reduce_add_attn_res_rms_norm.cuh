@@ -27,7 +27,7 @@ namespace hip_custom_communicator {
 // there is nothing to gather. `blocks` is [m, num_sources, n] at its row,
 // source and column strides in elements; `write_idx` < 0 writes no block.
 template <typename DTYPE, int WORLD, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -79,7 +79,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // A ROW WIDER THAN THE TILE (attn_res.cuh's sum_chunk): its chunks in passes, the sum's
     // chunk read once, in the first.
-    if (input_size_n > TILE_N) {
+    if constexpr (CHUNKED) {
       const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
         DTYPE peers[WORLD][1][kPacks][kPackElems];
         for (int r = 0; r < WORLD; ++r)
@@ -188,7 +188,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N,
           int TILE_K, int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          int QUANTIZATION>
+          int QUANTIZATION, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -275,7 +275,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0,
           l * n_pad + col, 1);
     };
-    if (n <= TILE_N) {
+    if constexpr (!CHUNKED) {
       for (int l = first; l < slice_m; l += step) {
 #pragma unroll 2
         for (int w = 0; w < WORLD; ++w) {
@@ -344,7 +344,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int k = 0; k < kInt4GroupPacks; ++k)
             dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
         };
-        if (n > TILE_N) {  // a row wider than the tile (attn_res.cuh's sum_chunk)
+        if constexpr (CHUNKED) {  // a row wider than the tile (attn_res.cuh's sum_chunk)
           DTYPE unread[1][kInt4GroupPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
           attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run>(
               unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
@@ -419,7 +419,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       const int offs_m = t * TILE_M;
         // A ROW WIDER THAN THE TILE (attn_res.cuh's sum_chunk): its chunks in passes, the sum's
       // chunk read once, in the first.
-      if (input_size_n > TILE_N) {
+      if constexpr (CHUNKED) {
         const auto sum_chunk = [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
           all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows>(
               partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
@@ -475,7 +475,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // QUANTIZATION as the pull's: with int4 the sums pushed to and read from the
 // partials' INT4 payload.
 template <typename DTYPE, int WORLD, int TILE_N, int TILE_K,
-          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION>
+          int THREADS_PER_BLOCK, int WAVES_PER_EU, int QUANTIZATION, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -549,7 +549,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
     // A ROW WIDER THAN THE TILE (attn_res.cuh's sum_chunk): its chunks in passes, the sum's
     // chunk read once, in the first.
-    if (input_size_n > TILE_N) {
+    if constexpr (CHUNKED) {
       const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
         load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, col, 1);
       };
@@ -599,7 +599,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // [m, num_sources, n] at its row, source and column strides in elements;
 // `block_output_ptr` null writes no block.
 template <typename DTYPE, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK,
-          int WAVES_PER_EU>
+          int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     add_attn_res_rms_norm_rows(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -631,7 +631,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int offs_m = t * TILE_M;
     // A ROW WIDER THAN THE TILE (attn_res.cuh's sum_chunk): its chunks in passes, the sum's
     // chunk read once, in the first.
-    if (input_size_n > TILE_N) {
+    if constexpr (CHUNKED) {
       const auto sum_chunk = [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
         load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
             &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,

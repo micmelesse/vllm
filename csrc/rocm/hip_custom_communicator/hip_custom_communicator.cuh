@@ -251,7 +251,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
           dtype, stream);
       if constexpr (C.kernel == Kernel::rms_norm_rows) {
-        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
+        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>
             <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
@@ -275,7 +275,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_rms_norm) {
       all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -296,7 +296,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_rms_norm) {
       all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -320,7 +320,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_rms_norm) {
       all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -474,7 +474,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
       h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
           input_size_n, dtype, stream);
       if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
-        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu>
+        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>
             <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
@@ -503,7 +503,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_rms_norm) {
       all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -529,7 +529,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_rms_norm) {
       all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -560,7 +560,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_rms_norm) {
       all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization>
+          C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -761,7 +761,7 @@ all_reduce_add_attn_res_rms_norm(
       h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
           input_size_n, dtype, stream);
       if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
-        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu>
+        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu, C.chunked>
             <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
@@ -800,7 +800,7 @@ all_reduce_add_attn_res_rms_norm(
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) {
       all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
-          C.waves_per_eu, C.quantization>
+          C.waves_per_eu, C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -833,7 +833,7 @@ all_reduce_add_attn_res_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) {
       all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
-          C.waves_per_eu, C.quantization>
+          C.waves_per_eu, C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -871,7 +871,7 @@ all_reduce_add_attn_res_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) {
       all_reduce_pull_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k,
-          C.threads, C.waves_per_eu, C.quantization>
+          C.threads, C.waves_per_eu, C.quantization, C.chunked>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
