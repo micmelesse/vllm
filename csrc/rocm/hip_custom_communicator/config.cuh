@@ -1808,16 +1808,16 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 // compile-time checks held of the tables before the tables became a file).
 // =================================================================================================
 
-// THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds (an
-// eager input is copied in whole), and what the partials holds at the most partials a byte of its
-// input needs among the op's exact picks: at one row of one pack, where rounding up is all of it.
-// Python admits a call by it or by the box the exchange was sized for, whichever is larger.
-inline int64_t max_bytes(const std::vector<TunedPoint>& points, OpType o, int64_t partials_bytes,
-                         int64_t staging_bytes) {
+// THE MOST BYTES A CALL OF AN OP RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds
+// (an eager input is copied in whole), and what the partials holds at the most partials a byte of
+// its input needs among the op's templates (any may be a point's): at one row of one pack, where
+// rounding up is all of it. Python admits a call by it or by the box the exchange was sized for,
+// whichever is larger.
+constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_bytes) {
   int64_t per_byte = 0;
-  for (const TunedPoint& p : points)
-    if (p.op == o && p.mode == Mode::exact && p.pick) {
-      const int64_t need = partials_need(p.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
+  for (const TemplateInfo& t : kTemplates)
+    if (t.op == o) {
+      const int64_t need = partials_need(t.fn, 1, 1, kMaxRanks) / kBuild.memory.pack_bytes;
       if (need > per_byte) per_byte = need;
     }
   if (per_byte == 0) return staging_bytes;

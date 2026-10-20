@@ -112,7 +112,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "cols, str dtype, str quantization, str? algorithm, str? direction) -> "
       "int[]",
       &hip_custom_communicator_tuned);
-  rocm_ops.def("hip_custom_communicator_limits", &hip_custom_communicator_limits);
   rocm_ops.def("hip_custom_communicator_capacity",
                &hip_custom_communicator_capacity);
   rocm_ops.def("hip_custom_communicator_close", &hip_custom_communicator_close);

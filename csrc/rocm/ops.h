@@ -75,9 +75,6 @@ std::vector<int64_t> hip_custom_communicator_tuned(
     const std::string& dtype, const std::string& quantization,
     std::optional<std::string> algorithm,
     std::optional<std::string> direction);
-// What an opened communicator's plain calls may hold: each op's most bytes, in kOps'
-// order, from its points.
-std::vector<int64_t> hip_custom_communicator_limits(fptr_t handle_ptr);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // partials_bytes, inputs_bytes].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,

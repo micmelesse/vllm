@@ -39,10 +39,10 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from types import FrameType, MappingProxyType
+from types import FrameType
 from typing import ClassVar, Literal, final, get_args
 
 import torch
@@ -693,24 +693,25 @@ class Capacity:
     """WHAT ONE COMMUNICATOR HOLDS (C++'s `hip_custom_communicator_capacity`): the
     largest call its exchange was sized for, `max_rows` rows of at most `max_cols`
     elements (for a model, the server's tokens a batch by its hidden size), the
-    exchange's partials and staging bytes; and, once it is open, from its tuned points
-    (`hip_custom_communicator_limits`), each op's most bytes on those buffers whatever a
-    call's shape (none known: the box alone)."""
+    exchange's partials and staging bytes, and each op's most bytes on them whatever
+    a call's shape."""
 
     max_rows: int
     max_cols: int
     partials_bytes: int
     staging_bytes: int
-    max_bytes: Mapping[str, int] = MappingProxyType({})
+    max_bytes: dict[str, int]
 
 
 def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
     """What a communicator serving `max_rows` rows of at most `max_cols` columns at
     `world` ranks holds: C++'s answer, the same function its opener allocates by."""
-    rows, cols, partials, staging = torch.ops._rocm_C.hip_custom_communicator_capacity(
-        max_rows, max_cols, world
+    rows, cols, partials, staging, *most = (
+        torch.ops._rocm_C.hip_custom_communicator_capacity(max_rows, max_cols, world)
     )
-    return Capacity(rows, cols, partials, staging)
+    return Capacity(
+        rows, cols, partials, staging, dict(zip(build_info().op_names, most))
+    )
 
 
 def problem_size() -> tuple[int, int] | None:
@@ -762,7 +763,7 @@ def should(
     in_box = rows <= capacity.max_rows and row <= capacity.max_cols
     return (
         row * input.element_size() % built.pack_bytes == 0
-        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes.get(op, 0))
+        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes[op])
     )
 
 
@@ -1670,11 +1671,6 @@ class HipCustomCommunicator:
         if isinstance(handle, Error):
             return handle.name
         self._handle = handle
-        # WHAT ITS PLAIN CALLS MAY HOLD, from its points: each op's most bytes.
-        limits = torch.ops._rocm_C.hip_custom_communicator_limits(handle)
-        self.capacity = replace(
-            self.capacity, max_bytes=MappingProxyType(dict(zip(build_info().op_names, limits)))
-        )
         _install_exit_hooks()
         # WHAT OPEN OBSERVED of the broader state: warnings, never a failure.
         opened = self.log()

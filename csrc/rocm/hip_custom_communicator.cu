@@ -380,8 +380,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
   }
   // EACH OP'S PLAIN CALL (kOps, config.cuh), in `ops`' order: its dtypes and
   // its weight's besides its input's, flat, and four ints an op: those two
-  // counts and two_d. What a call may hold is a communicator's (`hip_custom_communicator_capacity`
-  // and, from its points, `hip_custom_communicator_limits`), not the build's.
+  // counts and two_d. What a call may hold is a communicator's (`hip_custom_communicator_capacity`),
+  // not the build's.
   Names op_dtypes, op_weights;
   std::vector<int64_t> op_facts;
   for (const Op& o : kOps) {
@@ -459,18 +459,11 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
                                                       int64_t world) {
   const auto sizes = hip_custom_communicator::exchange_sizes(
       max_rows, max_cols, static_cast<int>(world));
-  return {max_rows, max_cols, sizes.partials_bytes, sizes.staging_bytes};
-}
-
-// WHAT AN OPENED COMMUNICATOR'S PLAIN CALLS MAY HOLD, from its points (config.cuh's
-// `max_bytes`): each op's most bytes in kOps' order, asked once after open.
-std::vector<int64_t> hip_custom_communicator_limits(fptr_t handle_ptr) {
-  const hip_custom_communicator::Handle& h = handle_of(handle_ptr);
-  std::vector<int64_t> out;
-  for (const auto& o : hip_custom_communicator::kOps) {
-    out.push_back(hip_custom_communicator::max_bytes(h.points(), o.type, h.partials_bytes(),
-                                                     h.staging_bytes()));
-  }
+  std::vector<int64_t> out{max_rows, max_cols, sizes.partials_bytes,
+                           sizes.staging_bytes};
+  for (const auto& o : hip_custom_communicator::kOps)
+    out.push_back(hip_custom_communicator::max_bytes(
+        o.type, sizes.partials_bytes, sizes.staging_bytes));
   return out;
 }
 
