@@ -264,7 +264,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, never read), A RANK THE COMPILER
     //    KNOWS: no branch between the sends, whose joins waited for every store before
     //    (s_waitcnt vmcnt(0)), so the remote stores ran one after another (ATT
-    //    2026-10-19T04-09-17Z: 40k of 60k cycles a wave; 2.3-2.9x aiter at 1-8 tokens).
+    //    2026-10-19T04-09-17Z: 40k of 60k cycles a wave; 2.3-2.9x aiter at 1-8 tokens). The
+    //    seven peers as (rank + i) % WORLD read from the first lane still compiled both of send's
+    //    paths and a scalar load of each peer's entry before its store: 863 -> 1535 instructions,
+    //    the stores 57 apart (ISA, d7da3439da).
     DTYPE mine[kRows][kPacks][kPackElems];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, mine, offs_m, offs_n, 1);
     // This pass's epoch (the last + 1, never 0) and this block's row of the inbox in its bank.
