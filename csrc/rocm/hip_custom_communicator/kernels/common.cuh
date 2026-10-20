@@ -324,7 +324,7 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
 // fault's), `flag` the value every line waited for carries, and the status buffer and limit its
 // poll gives up by; every other layout passes them as their defaults and reads none.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename OUTPUT>
+          bool TAIL, typename OUTPUT>
 DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride_slot,
                          int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
                          int input_size_m, int input_size_n, int clip_m, int clip_n,
@@ -540,48 +540,80 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // A UNIFORM BASE PLUS A 32-BIT BYTE OFFSET, the offset opaque so the address is built at its
     // load (saddr), not hoisted and held as a 64-bit vector address.
     const int g = offs_n / kInt4Group + tid % kThreadsN;
-    // THE LAST GROUP MAY BE SHORT (clip_n whole packs, not whole groups): its packs past the clip
-    // read the last pack inside it, as a tile's do.
-    const int at = min(g, static_cast<int>(int4_groups(clip_n)) - 1);
+    // TAIL: THE LAST GROUP MAY BE SHORT (clip_n whole packs, not whole groups), its packs past the
+    // clip reading the last pack inside it, as a tile's do.
+    const int at = TAIL ? min(g, static_cast<int>(int4_groups(clip_n)) - 1)
+                        : min(g, clip_n / kInt4Group - 1);
     if constexpr (QUANTIZATION == Quantization::none) {
       // ONE COPY, exact: its group's packs. Its scheduling is the caller's (the int4 push keeps two
       // ranks' groups in flight: reduce_scatter.cuh).
       static_assert(!kSlots, "an exact group is one copy");
       const U* const from = reinterpret_cast<const U*>(input) + int64_t{offs_m} * input_stride_m;
       const int64_t first = int64_t{input_slot} * input_stride_slot;
-      // A PACK'S PLACE: run, the group's start plus the pack; flat, each pack's own (a group may
-      // cross a row where the row is not whole groups).
-      [[maybe_unused]] const V* group = nullptr;
-      if constexpr (kRun) {
-        uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(U));
-        asm volatile("" : "+v"(offset));
-        group = reinterpret_cast<const V*>(
-            reinterpret_cast<const char*>(from + first * input_stride_n) + offset);
-      }
-      const auto pack_at = [&](int kk) -> const V* {
-        if constexpr (kRun) return group + kk;
-        else
-          return reinterpret_cast<const V*>(element_at(
-              from, input_stride_m, input_stride_n,
-              first + int64_t{at} * kInt4Group + int64_t{kk} * kPackElems, input_size_n));
-      };
-      // A PACK OF A 16-BIT DTYPE one 16-byte load; of fp32 (a norm's weight, a pack of the row's
-      // dtype wide) its 16-byte halves, as the tile's wider pack is read.
-      static_assert(sizeof(V) % sizeof(u32x4) == 0, "a pack is whole 16-byte loads");
-      const int last = clip_n / kPackElems - 1 - at * kInt4GroupPacks;  // the clip's, in the group
+      if constexpr (TAIL) {
+        // A PACK'S PLACE: run, the group's start plus the pack; flat, each pack's own (a group may
+        // cross a row where the row is not whole groups).
+        [[maybe_unused]] const V* group = nullptr;
+        if constexpr (kRun) {
+          uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(U));
+          asm volatile("" : "+v"(offset));
+          group = reinterpret_cast<const V*>(
+              reinterpret_cast<const char*>(from + first * input_stride_n) + offset);
+        }
+        const auto pack_at = [&](int kk) -> const V* {
+          if constexpr (kRun) return group + kk;
+          else
+            return reinterpret_cast<const V*>(element_at(
+                from, input_stride_m, input_stride_n,
+                first + int64_t{at} * kInt4Group + int64_t{kk} * kPackElems, input_size_n));
+        };
+        // A PACK OF A 16-BIT DTYPE one 16-byte load; of fp32 (a norm's weight, a pack of the row's
+        // dtype wide) its 16-byte halves, as the tile's wider pack is read.
+        static_assert(sizeof(V) % sizeof(u32x4) == 0, "a pack is whole 16-byte loads");
+        const int last = clip_n / kPackElems - 1 - at * kInt4GroupPacks;  // the clip's, in the group
 #pragma unroll
-      for (int k = 0; k < kInt4GroupPacks; ++k) {
-        const int kk = k < last ? k : last;
-        if constexpr (sizeof(V) == sizeof(u32x4)) {
-          const u32x4 raw = *(const global_u32x4*)(pack_at(kk));
-          __builtin_memcpy(output[0][k], &raw, sizeof(raw));
-        } else {
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          const int kk = k < last ? k : last;
+          if constexpr (sizeof(V) == sizeof(u32x4)) {
+            const u32x4 raw = *(const global_u32x4*)(pack_at(kk));
+            __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+          } else {
 #pragma unroll
-          for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
-            const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(pack_at(kk)) +
-                                                     h * sizeof(u32x4));
-            __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
-                             sizeof(raw));
+            for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
+              const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(pack_at(kk)) +
+                                                       h * sizeof(u32x4));
+              __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
+                               sizeof(raw));
+            }
+          }
+        }
+      } else {
+        const V* group;
+        if constexpr (kRun) {
+          uint32_t offset = static_cast<uint32_t>(at) * (kInt4Group * sizeof(U));
+          asm volatile("" : "+v"(offset));
+          group = reinterpret_cast<const V*>(
+              reinterpret_cast<const char*>(from + first * input_stride_n) + offset);
+        } else
+          group = reinterpret_cast<const V*>(element_at(from, input_stride_m, input_stride_n,
+                                                        first + int64_t{at} * kInt4Group,
+                                                        input_size_n));
+        // A PACK OF A 16-BIT DTYPE one 16-byte load; of fp32 (a norm's weight, a pack of the row's
+        // dtype wide) its 16-byte halves, as the tile's wider pack is read.
+        static_assert(sizeof(V) % sizeof(u32x4) == 0, "a pack is whole 16-byte loads");
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          if constexpr (sizeof(V) == sizeof(u32x4)) {
+            const u32x4 raw = *(const global_u32x4*)(group + k);
+            __builtin_memcpy(output[0][k], &raw, sizeof(raw));
+          } else {
+#pragma unroll
+            for (int h = 0; h < static_cast<int>(sizeof(V) / sizeof(u32x4)); ++h) {
+              const u32x4 raw = *(const global_u32x4*)(reinterpret_cast<const char*>(group + k) +
+                                                       h * sizeof(u32x4));
+              __builtin_memcpy(reinterpret_cast<char*>(output[0][k]) + h * sizeof(u32x4), &raw,
+                               sizeof(raw));
+            }
           }
         }
       }
@@ -723,7 +755,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     static_assert(kThreadsN % kInt4GroupPacks == 0, "a group is 4 lanes' packs");
     // The buffer's INT4 payload, from its own sizes (the INT4 payload layout).
     const int64_t values_stride_m = input_size_n / 2;
-    const int64_t scales_stride_m = int4_groups(input_size_n);
+    const int64_t scales_stride_m = TAIL ? int4_groups(input_size_n) : input_size_n / kInt4Group;
     const int64_t scales_at = int4_scales_offset(input_size_m, input_size_n);
     // Every slot's words and scales, the position once a pack in a vector register (32-BIT BYTE
     // OFFSETS: a quantized buffer is ours, at most the box's, select's exchange_sizes), each
@@ -787,7 +819,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 // THE LINE WRITE'S OWN (Layout::line): `flag`, the value its lines carry; every other layout
 // passes it as its default.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename INPUT>
+          bool TAIL, typename INPUT>
 DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                           int64_t output_stride_slot, int64_t output_stride_m,
                           int64_t output_stride_n, int output_size_slot, int output_size_m,
@@ -897,30 +929,51 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
     const int g = offs_n / kInt4Group + tid % kThreadsN;
     if constexpr (QUANTIZATION == Quantization::none) {
-      // EXACT: the group's packs at their place, a short last group's inside the clip.
-      if (g >= int4_groups(clip_n)) return;
-      U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
-      const int64_t first = int64_t{output_slot} * output_stride_slot;
-      // A PACK'S PLACE, load's: run, the group's start plus the pack; flat, each pack's own.
-      [[maybe_unused]] V* group = nullptr;
-      if constexpr (kRun) {
-        uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(U));
-        asm volatile("" : "+v"(offset));
-        group = reinterpret_cast<V*>(reinterpret_cast<char*>(to + first * output_stride_n) + offset);
-      }
-      const auto pack_at = [&](int k) -> V* {
-        if constexpr (kRun) return group + k;
-        else
-          return reinterpret_cast<V*>(element_at(
-              to, output_stride_m, output_stride_n,
-              first + int64_t{g} * kInt4Group + int64_t{k} * kPackElems, output_size_n));
-      };
+      if constexpr (TAIL) {
+        // EXACT: the group's packs at their place, a short last group's inside the clip.
+        if (g >= int4_groups(clip_n)) return;
+        U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
+        const int64_t first = int64_t{output_slot} * output_stride_slot;
+        // A PACK'S PLACE, load's: run, the group's start plus the pack; flat, each pack's own.
+        [[maybe_unused]] V* group = nullptr;
+        if constexpr (kRun) {
+          uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(U));
+          asm volatile("" : "+v"(offset));
+          group = reinterpret_cast<V*>(reinterpret_cast<char*>(to + first * output_stride_n) + offset);
+        }
+        const auto pack_at = [&](int k) -> V* {
+          if constexpr (kRun) return group + k;
+          else
+            return reinterpret_cast<V*>(element_at(
+                to, output_stride_m, output_stride_n,
+                first + int64_t{g} * kInt4Group + int64_t{k} * kPackElems, output_size_n));
+        };
 #pragma unroll
-      for (int k = 0; k < kInt4GroupPacks; ++k) {
-        if (g * kInt4GroupPacks + k >= clip_n / kPackElems) continue;
-        u32x4 raw;
-        __builtin_memcpy(&raw, input[0][k], sizeof(raw));
-        *(global_u32x4*)(pack_at(k)) = raw;
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          if (g * kInt4GroupPacks + k >= clip_n / kPackElems) continue;
+          u32x4 raw;
+          __builtin_memcpy(&raw, input[0][k], sizeof(raw));
+          *(global_u32x4*)(pack_at(k)) = raw;
+        }
+      } else {
+        // EXACT: the group's packs at their place.
+        if (g >= clip_n / kInt4Group) return;
+        U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
+        const int64_t first = int64_t{output_slot} * output_stride_slot;
+        V* group;
+        if constexpr (kRun) {
+          uint32_t offset = static_cast<uint32_t>(g) * (kInt4Group * sizeof(U));
+          asm volatile("" : "+v"(offset));
+          group = reinterpret_cast<V*>(reinterpret_cast<char*>(to + first * output_stride_n) + offset);
+        } else
+          group = reinterpret_cast<V*>(element_at(to, output_stride_m, output_stride_n,
+                                                  first + int64_t{g} * kInt4Group, output_size_n));
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          u32x4 raw;
+          __builtin_memcpy(&raw, input[0][k], sizeof(raw));
+          *(global_u32x4*)(group + k) = raw;
+        }
       }
     } else {
       // INT4: the group's four words one 16-byte store and its scale, into the dense payload at
@@ -935,7 +988,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       } else {
         quantize(input[0], words, scale);
       }
-      if (g < int4_groups(clip_n)) {
+      if (g < (TAIL ? static_cast<int>(int4_groups(clip_n)) : clip_n / kInt4Group)) {
         const int64_t slot = int64_t{output_slot} * output_stride_slot;
         uint8_t* const values = reinterpret_cast<uint8_t*>(output) + slot / 2;
         __fp16* const scales =
@@ -946,10 +999,10 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         uint32_t scale_at = static_cast<uint32_t>(g) * kInt4ScaleBytes;
         asm volatile("" : "+v"(value_at));
         asm volatile("" : "+v"(scale_at));
-        // A SHORT LAST GROUP writes only its words inside the clip (a word a pack): the 16 bytes
-        // would run past the payload's values.
+        // TAIL: A SHORT LAST GROUP writes only its words inside the clip (a word a pack): the 16
+        // bytes would run past the payload's values.
         const int words_in = clip_n / (kInt4Group / kInt4GroupPacks) - g * kInt4GroupPacks;
-        if (words_in >= kInt4GroupPacks) {
+        if (!TAIL || words_in >= kInt4GroupPacks) {
           *(global_u32x4*)(values + value_at) = u32x4{words[0], words[1], words[2], words[3]};
         } else {
 #pragma unroll
@@ -1000,7 +1053,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         }
       }
     const int64_t values_stride_m = output_size_n / 2;
-    const int64_t scales_stride_m = int4_groups(output_size_n);
+    const int64_t scales_stride_m = TAIL ? int4_groups(output_size_n) : output_size_n / kInt4Group;
     const int64_t scales_at = int4_scales_offset(output_size_m, output_size_n);
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
@@ -1621,7 +1674,7 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
 // LOAD: this rank's buffer (entry input_rank) into a thread's registers. Layout::line's poll
 // takes its flag, the status and the limit (read_buffer's line read); no other layout reads them.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename PTR, typename OUTPUT>
+          bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
@@ -1634,7 +1687,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
                                 ? entries[0]
                                 : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
-  internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+  internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
       input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
       input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
       flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
@@ -1655,7 +1708,7 @@ DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
 // RECV: rank input_rank's buffer (a peer's, over the fabric; the rank may differ by lane) into a
 // thread's registers. A one-entry array (`&entry, 1`, an entry loaded earlier) is that entry.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename PTR, typename OUTPUT>
+          bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
@@ -1663,17 +1716,17 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(input_rank);
   if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
         entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
         input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step);
   else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
         internal::ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
         input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
         clip_n, output, offs_m, offs_n, row_step);
   else
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
         internal::lane_ptr_array_at<void, WORLD>(entries, input_ptr_array_size, input_rank),
         input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
@@ -1681,7 +1734,7 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
 
 // STORE: a thread's registers into this rank's buffer (entry output_rank).
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename INPUT, typename PTR>
+          bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                    int output_rank, int output_slot, int64_t output_stride_slot,
                    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
@@ -1691,7 +1744,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
   void* const output = __builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1
                            ? entries[0]
                            : internal::ptr_array_at(entries, output_ptr_array_size, output_rank);
-  internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+  internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
       input, output, output_slot, output_stride_slot, output_stride_m, output_stride_n,
       output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
 }
@@ -1700,7 +1753,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 // may differ by lane). Posted: the next ordered barrier's release completes and publishes it
 // (BARRIER); a Layout::line send carries `flag` in its lines and needs no barrier.
 template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          typename INPUT, typename PTR>
+          bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                   int output_rank, int output_slot, int64_t output_stride_slot,
                   int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
@@ -1709,12 +1762,12 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
   const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(output_rank);
   if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
         input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
         output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
         output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
   else
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT>(
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
         input,
         internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
         output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,

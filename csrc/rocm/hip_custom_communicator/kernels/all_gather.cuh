@@ -26,7 +26,7 @@ namespace hip_custom_communicator {
 // owner's partials picked in each lane (a wave's packs may have two owners). int4: the owner's
 // words and scales, decoded.
 template <typename DTYPE, int WORLD, int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION, bool CONTIGUOUS,
-          Walk WALK, typename OUTPUT>
+          Walk WALK, bool TAIL, typename OUTPUT>
 DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_size,
                         int64_t partials_stride_m, int64_t partials_stride_n, int partials_size_m,
                         int partials_size_n, OUTPUT&& output, int64_t output_stride_m,
@@ -42,7 +42,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     const int64_t total = int64_t{output_size_m} * output_size_n;
     // A SHARE IS WHOLE UNITS, the last rank's to the band's end (int4: its last group short where
     // the band is not whole groups; the clips below are in elements, so a short group is masked).
-    const int64_t units = kInt4 ? (total + kUnit - 1) / kUnit : total / kUnit;  // exact: whole packs
+    const int64_t units = TAIL ? (total + kUnit - 1) / kUnit : total / kUnit;  // reduce_scatter's
     const int slice = static_cast<int>((units + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
@@ -60,11 +60,12 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK && kRankLanes % kWaveSize == 0,
                     "a rank's groups are whole waves");
       const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
-      const int end = min(g_end * kInt4Group, share_len(r));
+      const int end = TAIL ? min(g_end * kInt4Group, share_len(r))
+                           : min(g_end, share_len(r) / kInt4Group) * kInt4Group;
       for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
         // 1. Rank r's group of its summed share, raw.
         uint32_t words[1][kInt4GroupPacks][2];
-        recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+        recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run, TAIL>(
             partials_ptr_array, partials_ptr_array_size, r, 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, 1, slice, words, 0,
             g0 * kInt4Group, 1);
@@ -73,7 +74,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
           dequantize(words[0][k][0], __builtin_bit_cast(float, words[0][k][1]), x[0][k]);
-        store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kOutput>(
+        store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kOutput, TAIL>(
             x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
             output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
       }
@@ -94,7 +95,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
         recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
                        slice, got, 0, chunk * TILE_N, 0);
         // 2. Stored where rank r's share goes, its first `len` elements.
-        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput>(
+        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput, TAIL>(
             got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
             output_size_m, output_size_n, 1, share_len(r), 0, chunk * TILE_N, 1);
       }
@@ -119,7 +120,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
 #pragma unroll
       for (int k = 0; k < kPacks; ++k) {
         DTYPE pack[kRows][1][kPackElems];
-        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, output_size_m, output_size_n,
             pack, offs_m, offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);
@@ -132,7 +133,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       uint32_t raw[kPacks][kRows][1][2];
 #pragma unroll
       for (int k = 0; k < kPacks; ++k)
-        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+        recv<WORLD, kRows, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner_of(k), 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, output_size_m, output_size_n,
             raw[k], offs_m, offs_n + k * THREADS_PER_BLOCK * kPackElems, 1);

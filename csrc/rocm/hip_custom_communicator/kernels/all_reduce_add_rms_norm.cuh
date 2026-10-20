@@ -304,7 +304,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // Each op owns its complete kernel body.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          int QUANTIZATION, bool CHUNKED>
+          int QUANTIZATION, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
-    const int n_pad = (n + kInt4Group - 1) / kInt4Group * kInt4Group;
+    const int n_pad = TAIL ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
@@ -496,7 +496,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // Owner r's row l, its groups from column c (a TILE_N chunk: one, unless the row is wider).
     const auto push = [&](int l, int r, int c) {
       DTYPE x[1][kInt4GroupPacks][kPackElems];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
           &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, n,
           input_size_m, n, x, r * slice_m + l, c, 1);
       // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
@@ -509,7 +509,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         payload[0][k][0] = words[k];
         payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
       }
-      send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0,
           l * n_pad + c, 1);
@@ -540,13 +540,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 2. THIS RANK'S ROWS. The weight once (the same columns, a thread's group, in every row).
     WEIGHT_DTYPE w[1][kInt4GroupPacks][kPackElems];
-    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
         &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
     // THE ROW'S VALUES FROM COLUMN c: every writer's group, from this rank's inbox (slots rotated
     // from this rank's), summed (a wide row's chunk: rms_norm.cuh's NormPart::wide).
     const auto values = [&](int l, int c, float (&s)[1][kInt4GroupPacks][kPackElems]) {
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0,
           l * n_pad + c, 1);
@@ -577,12 +577,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           float s[1][kInt4GroupPacks][kPackElems];
           values(l, c, s);
           WEIGHT_DTYPE wc[1][kInt4GroupPacks][kPackElems];
-          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
               &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
           DTYPE normed[1][kInt4GroupPacks][kPackElems];
           rms_norm<THREADS_PER_BLOCK>(s, scale, wc, normed, eps, inv_hidden, n, c,
                                       NormPart::apply, true, Layout::group_run);
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
               normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0,
               l * n_pad + c, 1);
@@ -592,7 +592,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // Every writer's group of the row, from this rank's inbox (slots rotated from this rank's),
       // and the residual's, all in flight before the sum.
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0, l * n_pad, 1);
 
@@ -611,7 +611,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       {
         rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::row,
                                     true, Layout::group_run);
-        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
       }
@@ -628,7 +628,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const auto gather = [&](int l, int c) {
       uint32_t raw[WORLD][1][kInt4GroupPacks][2];
       for (int v = 0; v < WORLD; ++v)
-        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             partials_ptr_array, partials_ptr_array_size, (rank + v) % WORLD, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1,
             l * n_pad + n, raw[v], 0, l * n_pad + c, 1);
@@ -641,7 +641,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int k = 0; k < kInt4GroupPacks; ++k)
           dequantize(raw[v][0][k][0], __builtin_bit_cast(float, raw[v][0][k][1]), row_got[0][k]);
         {
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
               row_got, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n,
               1, n, row, c, 1);
         }
@@ -657,7 +657,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          int QUANTIZATION, bool CHUNKED>
+          int QUANTIZATION, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -892,7 +892,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
-    const int n_pad = (n + kInt4Group - 1) / kInt4Group * kInt4Group;
+    const int n_pad = TAIL ? (n + kInt4Group - 1) / kInt4Group * kInt4Group : n;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
@@ -904,7 +904,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // Owner r's row l, its groups from column c (a TILE_N chunk: one, unless the row is wider).
     const auto push = [&](int l, int r, int c) {
       DTYPE x[1][kInt4GroupPacks][kPackElems];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
           &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, n,
           input_size_m, n, x, r * slice_m + l, c, 1);
       // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
@@ -917,7 +917,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         payload[0][k][0] = words[k];
         payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
       }
-      send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0,
           l * n_pad + c, 1);
@@ -948,19 +948,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
     // 2. THIS RANK'S ROWS. The weight once (the same columns, a thread's group, in every row).
     WEIGHT_DTYPE w[1][kInt4GroupPacks][kPackElems];
-    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+    load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
         &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
     // THE ROW'S VALUES FROM COLUMN c: every writer's group, from this rank's inbox (slots rotated
     // from this rank's), summed, and the residual added (`added`, the new residual).
     const auto values = [&](int l, int c, float (&s)[1][kInt4GroupPacks][kPackElems],
                             DTYPE (&added)[1][kInt4GroupPacks][kPackElems]) {
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0,
           l * n_pad + c, 1);
       DTYPE res[1][kInt4GroupPacks][kPackElems];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
           &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, n,
           input_size_m, n, res, rank * slice_m + l, c, 1);
       float sum[1][kInt4GroupPacks][kPackElems];
@@ -998,7 +998,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           float s[1][kInt4GroupPacks][kPackElems];
           DTYPE added[1][kInt4GroupPacks][kPackElems];
           values(l, c, s, added);
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
               added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0,
               l * n_pad + c, 1);
@@ -1013,11 +1013,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       // Every writer's group of the row, from this rank's inbox (slots rotated from this rank's),
       // and the residual's, all in flight before the sum.
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
           staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0, l * n_pad, 1);
       DTYPE res[1][kInt4GroupPacks][kPackElems];
-      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+      load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
             &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, n,
             input_size_m, n, res, row, 0, 1);
       float sum[1][kInt4GroupPacks][kPackElems];
@@ -1038,7 +1038,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       DTYPE normed[1][kInt4GroupPacks][kPackElems];
       {
         // THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW (the exact body says why).
-        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
         rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::scale,
@@ -1067,7 +1067,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               1, scales_size_m, 1, scales_size_m, 1, sc[v], l, 0, 1);
       uint32_t raw[WORLD][1][kInt4GroupPacks][2];
       for (int v = 0; v < WORLD; ++v)
-        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
+        recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run, TAIL>(
             partials_ptr_array, partials_ptr_array_size, (rank + v) % WORLD, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1,
             l * n_pad + n, raw[v], 0, l * n_pad + c, 1);
@@ -1080,7 +1080,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         for (int k = 0; k < kInt4GroupPacks; ++k)
           dequantize(raw[v][0][k][0], __builtin_bit_cast(float, raw[v][0][k][1]), row_got[0][k]);
         {
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
               row_got, &residual_output_ptr, 1, 0, 0, 0, residual_output_stride_m,
               residual_output_stride_n, 1, input_size_m, n, 1, n, row, c, 1);
           float got_f[1][kInt4GroupPacks][kPackElems];
@@ -1092,7 +1092,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           DTYPE normed[1][kInt4GroupPacks][kPackElems];
           rms_norm<THREADS_PER_BLOCK>(got_f, scale, w, normed, eps, inv_hidden, n, c,
                                       NormPart::apply, true, Layout::group_run);
-          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
               normed, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n,
               1, n, row, c, 1);
         }
@@ -1104,7 +1104,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       for (int l = blockIdx.x; l < slice_m; l += grid)
         for (int c = 0; c < n; c += TILE_N) {
           WEIGHT_DTYPE wc[1][kInt4GroupPacks][kPackElems];
-          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
+          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run, TAIL>(
               &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, wc, 0, c, 1);
           gather(l, c, wc);
         }
@@ -1138,7 +1138,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // Each op owns its complete kernel body.
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          int QUANTIZATION, bool CHUNKED>
+          int QUANTIZATION, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -1174,7 +1174,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // every input read in place after it (written before the peers' launches), and the pushes into a
   // peer's partials after it land where that peer finished reading in its last launch, ended before
   // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
@@ -1189,7 +1189,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if constexpr (CHUNKED) {
       const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
         DTYPE own[1][kPacks][kPackElems];
-        load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, c, 1);
+        load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, c, 1);
 #pragma unroll
         for (int k = 0; k < kPacks; ++k)
 #pragma unroll
@@ -1223,7 +1223,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
     DTYPE own[1][kPacks][kPackElems];
-    load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
+    load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
 
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);
@@ -1247,7 +1247,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 
 template <typename DTYPE, typename WEIGHT_DTYPE, int WORLD, int TILE_N,
           int THREADS_PER_BLOCK, int WAVES_PER_EU,
-          int QUANTIZATION, bool CHUNKED>
+          int QUANTIZATION, bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot_add_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -1290,7 +1290,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // every input read in place after it (written before the peers' launches), and the pushes into a
   // peer's partials after it land where that peer finished reading in its last launch, ended before
   // this one started. int4 stages this rank's rows before it, so it stays ordered (launched).
-  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched>(
+  reduce_scatter<WORLD, 1, TILE_N, THREADS_PER_BLOCK, QUANTIZATION, true, Walk::rows, Accumulate::registers, Direction::push, QUANTIZATION == Quantization::none ? Until::started : Until::launched, false>(
       input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
       input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, staging_ptr_array,
       staging_ptr_array_size, staging_stride_m, staging_stride_n, staging_size_m,
@@ -1306,7 +1306,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       const auto values = [&](int c, float (&s)[1][kPacks][kPackElems],
                               DTYPE (&added)[1][kPacks][kPackElems]) {
         DTYPE own[1][kPacks][kPackElems];
-        load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, c, 1);
+        load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, c, 1);
         DTYPE res[1][kPacks][kPackElems];
         load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, c, 1);
 #pragma unroll
@@ -1350,7 +1350,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // Every load of the row before any store, in flight together: the
     // partials's, the residual's and the weight's (one-shot's).
     DTYPE own[1][kPacks][kPackElems], res[1][kPacks][kPackElems];
-    load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
+    load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, own, row, 0, 1);
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, res, row, 0, 1);
     WEIGHT_DTYPE w[1][kPacks][kPackElems];
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, input_size_n, 1, input_size_n, w, 0, 0, 1);

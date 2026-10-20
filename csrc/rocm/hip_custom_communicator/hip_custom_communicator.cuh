@@ -104,7 +104,7 @@ inline std::variant<Config, Error> all_reduce(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
       all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
-          C.contiguous, C.quantization>
+          C.contiguous, C.quantization, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -224,7 +224,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
         all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
-            C.contiguous, C.quantization>
+            C.contiguous, C.quantization, C.tail>
             <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -296,7 +296,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_rms_norm) {
       all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization, C.chunked>
+          C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -320,7 +320,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_rms_norm) {
       all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization, C.chunked>
+          C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -447,7 +447,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
         all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
-            C.contiguous, C.quantization>
+            C.contiguous, C.quantization, C.tail>
             <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -529,7 +529,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_rms_norm) {
       all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization, C.chunked>
+          C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -560,7 +560,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_rms_norm) {
       all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
-          C.quantization, C.chunked>
+          C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -734,7 +734,7 @@ all_reduce_add_attn_res_rms_norm(
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
         all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
-            C.contiguous, C.quantization>
+            C.contiguous, C.quantization, C.tail>
             <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -833,7 +833,7 @@ all_reduce_add_attn_res_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) {
       all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
-          C.waves_per_eu, C.quantization, C.chunked>
+          C.waves_per_eu, C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
@@ -871,7 +871,7 @@ all_reduce_add_attn_res_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) {
       all_reduce_pull_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k,
-          C.threads, C.waves_per_eu, C.quantization, C.chunked>
+          C.threads, C.waves_per_eu, C.quantization, C.chunked, C.tail>
           <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),

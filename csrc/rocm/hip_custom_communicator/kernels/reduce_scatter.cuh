@@ -91,7 +91,7 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 // staged INT4 payload, an INT4 payload's layout from its own buffer's sizes.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int QUANTIZATION, bool CONTIGUOUS,
           Walk WALK,
-          Accumulate ACCUMULATE, Direction DIRECTION, Until UNTIL, typename DTYPE>
+          Accumulate ACCUMULATE, Direction DIRECTION, Until UNTIL, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,
     int input_size_n, const DTYPE* const* input_ptr_array, int input_ptr_array_size,
@@ -115,7 +115,8 @@ DINLINE void reduce_scatter(
     const int64_t total = int64_t{input_size_m} * input_size_n;
     // A SHARE IS WHOLE UNITS, the last rank's to the band's end (int4: its last group short where
     // the band is not whole groups; the clips below are in elements, so a short group is masked).
-    const int64_t units = kInt4 ? (total + kUnit - 1) / kUnit : total / kUnit;  // exact: whole packs
+    // whole packs (exact), whole groups (int4 but TAIL), or the last group short (TAIL)
+    const int64_t units = TAIL ? (total + kUnit - 1) / kUnit : total / kUnit;
     const int slice = static_cast<int>((units + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
@@ -139,10 +140,10 @@ DINLINE void reduce_scatter(
                     "a rank's groups are whole waves");
       const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
       const int len = share_len(r);
-      if (len != 0)  // a late rank's empty share (wave-uniform)
+      if (TAIL ? len != 0 : len / kInt4Group != 0)  // a late rank's empty share (wave-uniform)
         for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
           DTYPE x[1][kInt4GroupPacks][kPackElems];
-          load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kInput>(
+          load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
               input_size_n, input_size_m, len, x, offs_m, g0 * kInt4Group, 1);
           // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
@@ -155,10 +156,11 @@ DINLINE void reduce_scatter(
             payload[0][k][0] = words[k];
             payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
           }
-          send<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+          send<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run, TAIL>(
               payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1,
-              min(g_end * kInt4Group, len), 0, g0 * kInt4Group, 1);
+              TAIL ? min(g_end * kInt4Group, len) : min(g_end, len / kInt4Group) * kInt4Group, 0,
+              g0 * kInt4Group, 1);
         }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
@@ -168,20 +170,22 @@ DINLINE void reduce_scatter(
       // inbox (its slots, rotated from this rank's), all in flight, summed in fp32 from the words,
       // quantized and stored in this rank's partials.
       const int own = share_len(rank);
-      if (own != 0) {  // a late rank's share is empty at few groups (every block alike)
+      // A late rank's share is empty at few groups (every block alike).
+      if (TAIL ? own != 0 : own / kInt4Group != 0) {
         for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
           uint32_t words[WORLD][1][kInt4GroupPacks][2];
-          load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+          load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run, TAIL>(
               staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
               staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, own, words, 0,
               g0 * kInt4Group, 1);
           // EVERY WRITER'S GROUP SUMMED FROM THE WORDS (dequantize's slot form, common.cuh).
           float sum[1][kInt4GroupPacks][kPackElems];
           dequantize<DTYPE>(words, sum);
-          store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
+          store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run, TAIL>(
               sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1,
-              min(g_end * kInt4Group, own), 0, g0 * kInt4Group, 1);
+              TAIL ? min(g_end * kInt4Group, own) : min(g_end, own / kInt4Group) * kInt4Group, 0,
+              g0 * kInt4Group, 1);
         }
       }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
@@ -206,7 +210,7 @@ DINLINE void reduce_scatter(
           const int len = share_len(r);
           if (len == 0) continue;
           DTYPE part[1][kPacks][kPackElems];
-          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput>(
+          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
               input_size_n, input_size_m, len, part, offs_m, chunk * TILE_N, 1);
           send<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::run>(
@@ -240,7 +244,7 @@ DINLINE void reduce_scatter(
                 staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, len,
                 got, 0, chunk * TILE_N, 1);
           else
-            recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput>(
+            recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
                 &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, len, got,
                 offs_m, chunk * TILE_N, 1);
@@ -262,7 +266,8 @@ DINLINE void reduce_scatter(
     const int packs = input_size_n / kPackElems;  // the row, in packs (n is whole packs)
     // int4: whole groups a rank (a group is 4 lanes' packs, which quantize together), the last
     // rank's last group short where the row is not whole groups.
-    constexpr int kSliceUnit = kInt4 ? kInt4GroupPacks : 1;
+    // (TAIL: where the groups do not split evenly over the ranks, or the last is short).
+    constexpr int kSliceUnit = TAIL ? kInt4GroupPacks : 1;
     const int slice = ((packs + kSliceUnit - 1) / kSliceUnit + WORLD - 1) / WORLD * kSliceUnit;
     const int col0 = min(rank * slice, packs);
     const int own_packs = max(0, min(slice, packs - col0));
@@ -286,7 +291,7 @@ DINLINE void reduce_scatter(
                              (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            store<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+            store<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                 x[s], staging_ptr_array, staging_ptr_array_size, rank, 0, 0, staging_stride_m,
                 staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, input_size_n,
                 (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
@@ -311,12 +316,12 @@ DINLINE void reduce_scatter(
             if constexpr (!kInt4)
               recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
             else
-              recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m, staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got, row, c, 0);
+              recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m, staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got, row, c, 0);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
             Summed rounded[1][1][kPackElems];
             reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
             // 4. Stored in this rank's slice.
-            store<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+            store<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                 rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                 partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                 row + 1, end, row, c, 1);
@@ -350,7 +355,7 @@ DINLINE void reduce_scatter(
               // VGPRs): every rank's word and scale of this thread's pack received raw, all in flight.
               uint32_t raw[WORLD][1][1][2];
               for (int r = 0; r < WORLD; ++r)
-                recv<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+                recv<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                     staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m,
                     staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m,
                     offs_n + size_n, raw[r], row, c, static_cast<int>(gridDim.x));
@@ -403,18 +408,18 @@ DINLINE void reduce_scatter(
                 }
                 for (int r = 0; r < WORLD; ++r) {
                   if constexpr (kInt4)
-                    send<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+                    send<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                         payload, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
                         partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                         input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
                   else
-                    send<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+                    send<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                         rounded, partials_ptr_array, partials_ptr_array_size, r, 0, 0,
                         partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                         input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
                 }
             } else
-              store<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(
+              store<WORLD, kThreadsM, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(
                   rounded, partials_ptr_array, partials_ptr_array_size, rank, 0, 0,
                   partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n,
                   input_size_m, offs_n + size_n, row, c, static_cast<int>(gridDim.x));
