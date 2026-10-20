@@ -57,7 +57,8 @@ enum class Error : int {
   forced_incomplete = 29,
   no_such_quantization = 30,
   quantization_not_supported = 31,
-  row_not_int4_groups = 32,
+  row_not_int4_groups = 32,  // retired: every INT4 kernel takes a row of whole packs, its last
+                             // group short
   quantized_too_small = 33,  // retired: INT4 is an encoding inside the
                              // regions (inputs_too_small, partials_too_small)
 };

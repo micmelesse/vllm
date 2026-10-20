@@ -39,7 +39,17 @@ constexpr int64_t kInt4PayloadScalesAlign = 256;
 constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
   const int64_t values = (m * n / 2 + kInt4PayloadScalesAlign - 1) / kInt4PayloadScalesAlign *
                          kInt4PayloadScalesAlign;
-  return values + m * (n / kInt4PayloadGroup) * static_cast<int64_t>(sizeof(c10::Half));
+  return values + m * ((n + kInt4PayloadGroup - 1) / kInt4PayloadGroup) *
+                      static_cast<int64_t>(sizeof(c10::Half));
+}
+
+// THE INT4 FLAT WALK'S SHARE (reduce_scatter.cuh, the plain push two-shot's INT4): an [m, n]
+// input's elements numbered row-major, a rank's share whole groups, the last rank's to the end.
+// Its payloads lie on views of their own, [1, world * share] in the inbox and [1, share] in the
+// partials: on the input's [m, n] the rounded-up shares would run past its values.
+constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
+  return ((m * n + kInt4PayloadGroup - 1) / kInt4PayloadGroup + world - 1) / world *
+         kInt4PayloadGroup;
 }
 
 // =================================================================================================
@@ -439,6 +449,13 @@ constexpr bool int4_group_a_thread(Template k) {
          k == Template::all_reduce_pull_two_shot_add_rms_norm ||
          k == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
 }
+// A ROW OF THE STAGING AND PARTIALS AS A KERNEL VIEWS IT: n, or a group-a-thread INT4 norm's
+// payload row, whole groups (its kernels' n_pad: every row's groups start on a group).
+constexpr int64_t payload_row(Template k, int quantization, int64_t n) {
+  return int4_group_a_thread(k) && quantization == Quantization::int4
+             ? (n + kInt4PayloadGroup - 1) / kInt4PayloadGroup * kInt4PayloadGroup
+             : n;
+}
 // THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a group-a-thread
 // INT4 norm's inbox, WORLD slots of an owner's ceil(m / WORLD) rows.
 constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world) {
@@ -624,14 +641,6 @@ constexpr int64_t distance(int64_t a, int64_t b) {
   return a < b ? b - a : a - b;
 }
 
-// WHETHER AN INT4 TWO-SHOT TAKES A ROW OF `n` ELEMENTS at `world` ranks: whole
-// groups, and whole groups for every rank, so every rank's slice (a column
-// split's columns, the flat walk's share) starts on a group and a group is 4
-// lanes' packs in every layout. 3584 and 7168 at 8 ranks: 14 and 28 groups a
-// rank.
-constexpr bool int4_takes_row(int64_t n, int world) {
-  return n % kInt4Group == 0 && (n / kInt4Group) % world == 0;
-}
 
 // THE NEAREST POINT `take` admits: at the handle's world, the nearest width, then the nearest
 // size (rows x width, so a width no point lists reads the nearest width's points at the same
@@ -764,17 +773,21 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (tile_n_of(c.build) < tile_cols) return Error::row_too_wide;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
-  // AN INT4 ROW is whole groups for every rank (`runs`' rule for an INT4 point, which a
-  // forced call meets here).
-  if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
   // An INT4 payload lies in the region that holds it exact (common.cuh's
   // INT4 payload layout): the input's in the inputs, the sums' in the partials, at
-  // most one row of the partials's elements (its every view's bound).
-  if (int4 && int4_payload_bytes(staged_rows(fn, Quantization::int4, m, world), n) >
+  // most one row of the partials's elements (its every view's bound); the flat walk's
+  // on its shares' own views (int4_flat_share).
+  const bool flat = fn == Template::all_reduce_push_two_shot;
+  const int64_t share = int4_flat_share(m, n, world);
+  const int64_t row = payload_row(fn, Quantization::int4, n);
+  if (int4 && (flat ? int4_payload_bytes(1, world * share)
+                    : int4_payload_bytes(staged_rows(fn, Quantization::int4, m, world), row)) >
                   h->staging_bytes())
     return Error::inputs_too_small;
   const int64_t partials = partials_need(fn, m, packs, world);
-  if (int4 && int4_payload_bytes(1, partials / elem_bytes(dtype)) >
+  if (int4 && (flat                       ? int4_payload_bytes(1, share)
+               : int4_group_a_thread(fn) ? int4_payload_bytes((m + world - 1) / world, row)
+                                         : int4_payload_bytes(1, partials / elem_bytes(dtype))) >
                   h->partials_bytes())
     return Error::partials_too_small;
   if (!in_passes && partials > h->partials_bytes())
@@ -1343,19 +1356,25 @@ inline std::variant<Config, Error> all_reduce_config(
   config.blocks = c.launch.blocks_per_grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
-  config.partials_stride_m = slice_bytes / elem_bytes(dtype);
+  // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share).
+  const bool int4_flat = !in_passes && is_two_shot(fn);
+  const int64_t share = int4_flat_share(m, n, world);
+  config.partials_stride_m = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.partials_stride_n = 1;
-  config.partials_size_m = in_passes ? rows : m;
-  config.partials_size_n = slice_bytes / elem_bytes(dtype);
+  config.partials_size_m = int4_flat ? 1 : in_passes ? rows : m;
+  config.partials_size_n = int4_flat ? share : slice_bytes / elem_bytes(dtype);
   config.staging_stride_m = in_place || lines                ? 0
+                         : int4_flat                       ? world * share
                          : !in_passes || !is_two_shot(fn) ? n
                              : slot_packs(rows) * pack / elem_bytes(dtype);
   config.staging_stride_n = in_place || lines ? 0 : 1;
   config.staging_size_m = in_place || lines ? 0
+                       : int4_flat ? 1
                        : !in_passes ? m
                        : is_two_shot(fn) ? world
                                          : world * rows;
   config.staging_size_n = in_place || lines                ? 0
+                       : int4_flat                       ? world * share
                        : !in_passes || !is_two_shot(fn) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype);
   // THE LINES: [writer, row, n] payload elements, 2 * kLineBlocks rows (bank, block) of
@@ -1468,14 +1487,15 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   config.blocks = c.launch.blocks_per_grid;
   config.waves_per_eu = r.waves_per_eu;
   config.quantization = r.quantization;
-  config.partials_stride_m = n;
+  const int64_t row_n = payload_row(fn, r.quantization, n);
+  config.partials_stride_m = row_n;
   config.partials_stride_n = 1;
   config.partials_size_m = partials_rows;
-  config.partials_size_n = n;
-  config.staging_stride_m = n;
+  config.partials_size_n = row_n;
+  config.staging_stride_m = row_n;
   config.staging_stride_n = 1;
   config.staging_size_m = staged_rows(fn, r.quantization, m, world);
-  config.staging_size_n = n;
+  config.staging_size_n = row_n;
   config.dtype = dtype;
   config.weight_dtype = weight_dtype;
   config.split = all_reduce.has_value();
@@ -1554,13 +1574,13 @@ all_reduce_add_rms_norm_config(
   // the scales region.
   const bool scale_slot = fn == Template::all_reduce_pull_two_shot_add_rms_norm &&
                           r.quantization == Quantization::none;
-  const int64_t partials_stride_m =
-      n + (scale_slot ? kScaleSlotPacks * kBuild.memory.pack_bytes / elem_bytes(dtype) : 0);
+  const int64_t slot = scale_slot ? kScaleSlotPacks * kBuild.memory.pack_bytes / elem_bytes(dtype) : 0;
+  const int64_t partials_stride_m = payload_row(fn, r.quantization, n) + slot;
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, m,
                            n * elem_bytes(dtype) / kBuild.memory.pack_bytes,
                            world) /
-                  (partials_stride_m * elem_bytes(dtype))
+                  ((n + slot) * elem_bytes(dtype))
             : 0;
   Config config{};
   config.shared_memory_bytes = 0;
@@ -1583,10 +1603,10 @@ all_reduce_add_rms_norm_config(
   config.scales_size_m = fn == Template::all_reduce_pull_two_shot_add_rms_norm && !scale_slot
                            ? (m + world - 1) / world
                            : 0;
-  config.staging_stride_m = n;
+  config.staging_stride_m = payload_row(fn, r.quantization, n);
   config.staging_stride_n = 1;
   config.staging_size_m = staged_rows(fn, r.quantization, m, world);
-  config.staging_size_n = n;
+  config.staging_size_n = payload_row(fn, r.quantization, n);
   config.dtype = dtype;
   config.weight_dtype = weight_dtype;
   config.split = all_reduce.has_value();
@@ -1697,14 +1717,15 @@ all_reduce_add_attn_res_rms_norm_config(
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
   config.reduce_scatter_blocks = rs;
-  config.partials_stride_m = n;
+  const int64_t row_n = payload_row(fn, a.quantization, n);
+  config.partials_stride_m = row_n;
   config.partials_stride_n = 1;
   config.partials_size_m = partials_rows;
-  config.partials_size_n = n;
-  config.staging_stride_m = n;
+  config.partials_size_n = row_n;
+  config.staging_stride_m = row_n;
   config.staging_stride_n = 1;
   config.staging_size_m = staged_rows(fn, a.quantization, m, world);
-  config.staging_size_n = n;
+  config.staging_size_n = row_n;
   config.dtype = dtype;
   config.split = all_reduce.has_value();
   if (all_reduce) {

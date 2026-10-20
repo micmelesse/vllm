@@ -40,7 +40,9 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     DTYPE* const output_ptr = output;
     constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
     const int64_t total = int64_t{output_size_m} * output_size_n;
-    const int slice = static_cast<int>((total / kUnit + WORLD - 1) / WORLD * kUnit);
+    // A SHARE IS WHOLE UNITS, the last rank's to the band's end (int4: its last group short where
+    // the band is not whole groups; the clips below are in elements, so a short group is masked).
+    const int slice = static_cast<int>(((total + kUnit - 1) / kUnit + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
     };
@@ -57,7 +59,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK && kRankLanes % kWaveSize == 0,
                     "a rank's groups are whole waves");
       const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
-      const int end = min(g_end, share_len(r) / kInt4Group) * kInt4Group;
+      const int end = min(g_end * kInt4Group, share_len(r));
       for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
         // 1. Rank r's group of its summed share, raw.
         uint32_t words[1][kInt4GroupPacks][2];

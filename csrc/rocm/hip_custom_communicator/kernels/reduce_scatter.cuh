@@ -113,7 +113,9 @@ DINLINE void reduce_scatter(
     // common.cuh's Layout run / flat).
     constexpr int kUnit = kInt4 ? kInt4Group : kPackElems;
     const int64_t total = int64_t{input_size_m} * input_size_n;
-    const int slice = static_cast<int>((total / kUnit + WORLD - 1) / WORLD * kUnit);
+    // A SHARE IS WHOLE UNITS, the last rank's to the band's end (int4: its last group short where
+    // the band is not whole groups; the clips below are in elements, so a short group is masked).
+    const int slice = static_cast<int>(((total + kUnit - 1) / kUnit + WORLD - 1) / WORLD * kUnit);
     const auto share_len = [&](int r) {
       return static_cast<int>(max(int64_t{0}, min(int64_t{slice}, total - int64_t{r} * slice)));
     };
@@ -136,7 +138,7 @@ DINLINE void reduce_scatter(
                     "a rank's groups are whole waves");
       const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
       const int len = share_len(r);
-      if (len / kInt4Group != 0)  // a late rank's empty share (wave-uniform)
+      if (len != 0)  // a late rank's empty share (wave-uniform)
         for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
           DTYPE x[1][kInt4GroupPacks][kPackElems];
           load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kInput>(
@@ -155,7 +157,7 @@ DINLINE void reduce_scatter(
           send<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1,
-              min(g_end, len / kInt4Group) * kInt4Group, 0, g0 * kInt4Group, 1);
+              min(g_end * kInt4Group, len), 0, g0 * kInt4Group, 1);
         }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
                               signals_stride_block, signals_stride_writer, signals_size_parity,
@@ -165,7 +167,7 @@ DINLINE void reduce_scatter(
       // inbox (its slots, rotated from this rank's), all in flight, summed in fp32 from the words,
       // quantized and stored in this rank's partials.
       const int own = share_len(rank);
-      if (own / kInt4Group != 0) {  // a late rank's share is empty at few groups (every block alike)
+      if (own != 0) {  // a late rank's share is empty at few groups (every block alike)
         for (int g0 = g_first; g0 < g_end; g0 += THREADS_PER_BLOCK) {
           uint32_t words[WORLD][1][kInt4GroupPacks][2];
           load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
@@ -178,7 +180,7 @@ DINLINE void reduce_scatter(
           store<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::group_run>(
               sum, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1,
-              min(g_end, own / kInt4Group) * kInt4Group, 0, g0 * kInt4Group, 1);
+              min(g_end * kInt4Group, own), 0, g0 * kInt4Group, 1);
         }
       }
       barrier<WORLD>(signals_ptr_array, signals_ptr_array_size, signals_stride_parity,
@@ -257,7 +259,10 @@ DINLINE void reduce_scatter(
     // worked out before the first barrier, in scalar registers: after it they were vector
     // arithmetic (a division by the grid a lane; ISA 2026-10-15T18-38-16Z).
     const int packs = input_size_n / kPackElems;  // the row, in packs (n is whole packs)
-    const int slice = (packs + WORLD - 1) / WORLD;
+    // int4: whole groups a rank (a group is 4 lanes' packs, which quantize together), the last
+    // rank's last group short where the row is not whole groups.
+    constexpr int kSliceUnit = kInt4 ? kInt4GroupPacks : 1;
+    const int slice = ((packs + kSliceUnit - 1) / kSliceUnit + WORLD - 1) / WORLD * kSliceUnit;
     const int col0 = min(rank * slice, packs);
     const int own_packs = max(0, min(slice, packs - col0));
     const int end = (col0 + own_packs) * kPackElems;  // this rank's columns end, in elements

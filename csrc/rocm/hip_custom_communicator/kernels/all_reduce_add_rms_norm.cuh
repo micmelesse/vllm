@@ -337,9 +337,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(kPackElems * kInt4GroupPacks == kInt4Group, "a pack is a word of its group");
     static_assert(TILE_N == kInt4Group * THREADS_PER_BLOCK, "a group a thread: the block one row's groups");
     const int n = input_size_n;
+    // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
+    // groups start on a group of its slot.
+    const int n_pad = static_cast<int>(int4_groups(n)) * kInt4Group;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
-    const int slice = slice_m * n;  // a rank's rows, flat: its slot of an inbox
+    const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
     const auto rows_of = [&](int r) { return max(0, min(slice_m, input_size_m - r * slice_m)); };
     const int grid = static_cast<int>(gridDim.x);
 
@@ -366,7 +369,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         }
         send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
-            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, 0, l * n, 1);
+            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
       }
     }
     barrier<WORLD>(
@@ -385,7 +388,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
-          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, got, 0, l * n, 1);
+          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0, l * n_pad, 1);
 
       float sum[1][kInt4GroupPacks][kPackElems];
       dequantize<DTYPE>(got, sum);
@@ -404,7 +407,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                                     true, Layout::group_run);
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             normed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
-            partials_stride_n, 1, partials_size_m, partials_size_n, 1, (l + 1) * n, 0, l * n, 1);
+            partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
       }
     }
 
@@ -422,7 +425,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             partials_ptr_array, partials_ptr_array_size, (rank + v) % WORLD, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1,
-            (l + 1) * n, raw[v], 0, l * n, 1);
+            l * n_pad + n, raw[v], 0, l * n_pad, 1);
 #pragma unroll
       for (int v = 0; v < WORLD; ++v) {
         const int row = (rank + v) % WORLD * slice_m + l;
@@ -618,9 +621,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(kPackElems * kInt4GroupPacks == kInt4Group, "a pack is a word of its group");
     static_assert(TILE_N == kInt4Group * THREADS_PER_BLOCK, "a group a thread: the block one row's groups");
     const int n = input_size_n;
+    // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
+    // groups start on a group of its slot.
+    const int n_pad = static_cast<int>(int4_groups(n)) * kInt4Group;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
-    const int slice = slice_m * n;  // a rank's rows, flat: its slot of an inbox
+    const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
     const auto rows_of = [&](int r) { return max(0, min(slice_m, input_size_m - r * slice_m)); };
     const int grid = static_cast<int>(gridDim.x);
 
@@ -647,7 +653,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         }
         send<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
-            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, 0, l * n, 1);
+            staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
       }
     }
     barrier<WORLD>(
@@ -667,7 +673,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
           staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
-          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, (l + 1) * n, got, 0, l * n, 1);
+          staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, l * n_pad + n, got, 0, l * n_pad, 1);
       DTYPE res[1][kInt4GroupPacks][kPackElems];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
             &residual_ptr, 1, 0, 0, 0, residual_stride_m, residual_stride_n, 1, input_size_m, n,
@@ -692,7 +698,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         // THE NEW RESIDUAL AND ITS SCALE, NOT THE NORMED ROW (the exact body says why).
         store<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             added, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
-            partials_stride_n, 1, partials_size_m, partials_size_n, 1, (l + 1) * n, 0, l * n, 1);
+            partials_stride_n, 1, partials_size_m, partials_size_n, 1, l * n_pad + n, 0, l * n_pad, 1);
         rms_norm<THREADS_PER_BLOCK>(s, scale, w, normed, eps, inv_hidden, n, 0, NormPart::scale,
                                     true, Layout::group_run);
         float scale_row[1][1][1] = {{{scale[0]}}};
@@ -720,7 +726,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
             partials_ptr_array, partials_ptr_array_size, (rank + v) % WORLD, 0, 0,
             partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, 1,
-            (l + 1) * n, raw[v], 0, l * n, 1);
+            l * n_pad + n, raw[v], 0, l * n_pad, 1);
 #pragma unroll
       for (int v = 0; v < WORLD; ++v) {
         const int row = (rank + v) % WORLD * slice_m + l;
