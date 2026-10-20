@@ -261,12 +261,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int clip_m = min(TILE_M, input_size_m - offs_m);
     const int clip_n = min(TILE_N, input_size_n - offs_n);
     // 1. This rank's tile, read here, into slot [rank] of every peer's inbox, its lines carrying
-    //    the epoch. THE SEVEN PEERS ONLY (aiter's), from the next rank, each peer read from the
-    //    first lane so send sees a wave-uniform rank and takes its scalar path alone: no branch
-    //    between the sends, whose joins waited for every store before (s_waitcnt vmcnt(0)), so
-    //    the remote stores ran one after another (ATT 2026-10-19T04-09-17Z: 40k of 60k cycles a
-    //    wave; 2.3-2.9x aiter at 1-8 tokens); every rank's slot this one's too was 8 sends, 1.05x
-    //    aiter at 1 token (run 2026-10-20T03-35-02Z).
+    //    the epoch. EVERY RANK'S, THIS ONE'S TOO (its own slot, never read), A RANK THE COMPILER
+    //    KNOWS: no branch between the sends, whose joins waited for every store before
+    //    (s_waitcnt vmcnt(0)), so the remote stores ran one after another (ATT
+    //    2026-10-19T04-09-17Z: 40k of 60k cycles a wave; 2.3-2.9x aiter at 1-8 tokens).
     DTYPE mine[kRows][kPacks][kPackElems];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, mine, offs_m, offs_n, 1);
     // This pass's epoch (the last + 1, never 0) and this block's row of the inbox in its bank.
@@ -276,8 +274,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     ran = true;
     const int row = (static_cast<int>(epoch & 1u) * blocks + static_cast<int>(blockIdx.x)) * TILE_M;
 #pragma unroll
-    for (int i = 1; i < WORLD; ++i)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::line>(mine, lines_ptr_array, lines_ptr_array_size, __builtin_amdgcn_readfirstlane((rank + i) % WORLD), rank, lines_stride_slot, lines_stride_m, lines_stride_n, lines_size_slot, lines_size_m, lines_size_n, row + clip_m, clip_n, row, 0, 1, epoch);
+    for (int r = 0; r < WORLD; ++r)
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::line>(mine, lines_ptr_array, lines_ptr_array_size, r, rank, lines_stride_slot, lines_stride_m, lines_stride_n, lines_size_slot, lines_size_m, lines_size_n, row + clip_m, clip_n, row, 0, 1, epoch);
     // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
     load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::line>(lines_ptr_array, lines_ptr_array_size, rank, 0, lines_stride_slot, lines_stride_m, lines_stride_n, lines_size_slot, lines_size_m, lines_size_n, row + clip_m, clip_n, peers, row, 0, 1, epoch, status_ptr, status_stride_field, status_size_field, timeout_ticks);
