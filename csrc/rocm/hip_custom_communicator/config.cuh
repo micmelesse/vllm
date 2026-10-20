@@ -850,6 +850,8 @@ static_assert(push_one_shot_tiles_fit(),
 // MiB (256 tokens of 3584: 18.04 against the pull's 18.41), the pull from 2.6
 // MiB (2026-10-01T03-26-44Z). At 7168 the push through 256 tokens since its first
 // barrier is unordered (31.1 against the pull's 32.6 us; 2026-10-18T10-14-39Z).
+// At 3584 the push from 9 tokens: 16 x 3584 8.45 against the one-shot's 9.43 us (aiter's fused
+// 10.41), the one-shot still ahead at 8 (8.22 against 8.34; sweep 2026-10-20T04-45-54Z).
 constexpr TunedKernel kRmsNormKernels[] = {
     {8,
      1,
@@ -857,7 +859,7 @@ constexpr TunedKernel kRmsNormKernels[] = {
      Template::all_reduce_pull_one_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
     {8,
-     19,
+     9,
      3584,
      Template::all_reduce_push_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
