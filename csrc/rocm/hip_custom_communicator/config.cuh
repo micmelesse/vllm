@@ -406,8 +406,8 @@ static_assert(one_template_a_shot(),
 // =================================================================================================
 
 inline bool resident(const Handle& h, const void* kernel, int blocks,
-                     int threads) {
-  return blocks <= h.resident_blocks(kernel, threads);
+                     int threads, int shared_bytes = 0) {
+  return blocks <= h.resident_blocks(kernel, threads, shared_bytes);
 }
 
 // =================================================================================================
@@ -482,9 +482,6 @@ struct Op {
   // The dtypes its weight may have besides its input's; none for an op with no
   // weight.
   std::span<const DType> weights;
-  // Whether a tile holds the whole row (its tile_n at least the row: a norm
-  // reads the whole row); otherwise the tiles cross it.
-  bool tile_holds_row;
   // Whether its input is [rows, cols] as given (2-D), not any shape read as
   // rows of its last dimension.
   bool two_d;
@@ -497,16 +494,14 @@ constexpr Op kOps[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce),
      kBuild.supports.dtypes,
      {},
-     false,
      false},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm),
-     kBuild.supports.dtypes, kNormWeights, true, true},
+     kBuild.supports.dtypes, kNormWeights, true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm),
-     kBuild.supports.dtypes, kNormWeights, true, true},
+     kBuild.supports.dtypes, kNormWeights, true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_attn_res_rms_norm),
      kBuild.supports.dtypes,
      {},
-     true,
      true},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
@@ -748,7 +743,7 @@ inline std::optional<Error> layout_refused(
 // checks that need peers are left out.
 inline std::optional<Error> refused(const Handle* h, Template fn,
                                     const KernelConfig& c, DType dtype,
-                                    int64_t m, int64_t n, int64_t tile_cols,
+                                    int64_t m, int64_t n,
                                     std::optional<Error> own_error,
                                     bool in_passes) {
   const int world = h ? h->world_size() : 1;
@@ -770,7 +765,6 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (!built_at(fn, threads)) return Error::threads_not_built;
   if (!built_at(fn, threads, waves_of(c.build))) return Error::waves_not_built;
   if (!built(fn, c.build)) return Error::tile_not_built;
-  if (tile_n_of(c.build) < tile_cols) return Error::row_too_wide;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
   // An INT4 payload lies in the region that holds it exact (common.cuh's
@@ -810,12 +804,6 @@ constexpr std::optional<Error> weight_refused(OpType o, DType dtype,
   for (const DType w : op(o).weights)
     if (weight_dtype == w) return std::nullopt;
   return Error::weight_not_built;
-}
-
-// THE COLUMNS AN OP'S TILE MUST HOLD on a row of `n`: the row where its tile
-// holds it, else none.
-constexpr int64_t tile_cols(OpType o, int64_t n) {
-  return op(o).tile_holds_row ? n : 0;
 }
 
 // THE TUNED CONFIG AS A QUERY (`HipCustomCommunicator.tuned`): with no kernel named, what a plain
@@ -1327,7 +1315,7 @@ inline std::variant<Config, Error> all_reduce_config(
   }
   const int64_t rows = band < m ? band : m;  // a pass's rows
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, tile_cols(OpType::all_reduce, n),
+          refused(&h, fn, c, dtype, m, n,
                   std::nullopt, in_passes))
     return *e;
   if (in_place && is_two_shot(fn) && band < 1)
@@ -1454,7 +1442,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
-          &h, fn, c, dtype, m, n, tile_cols(op, n),
+          &h, fn, c, dtype, m, n,
           weight_refused(op, dtype, weight_dtype), false))
     return *e;
   const AllReduceRmsNormBuildConfig& r =
@@ -1555,7 +1543,7 @@ all_reduce_add_rms_norm_config(
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
-          &h, fn, c, dtype, m, n, tile_cols(op, n),
+          &h, fn, c, dtype, m, n,
           weight_refused(op, dtype, weight_dtype), false))
     return *e;
   const AllReduceAddRmsNormBuildConfig& r =
@@ -1681,7 +1669,7 @@ all_reduce_add_attn_res_rms_norm_config(
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e =
-          refused(&h, fn, c, dtype, m, n, tile_cols(op, n), std::nullopt,
+          refused(&h, fn, c, dtype, m, n, std::nullopt,
                   false))
     return *e;
   const AllReduceAddAttnResRmsNormBuildConfig& a =
@@ -1703,7 +1691,10 @@ all_reduce_add_attn_res_rms_norm_config(
                   (n * elem_bytes(dtype))
             : 0;
   Config config{};
-  config.shared_memory_bytes = 0;
+  // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
+  // attn_res_wide): [tile_m][num_blocks + 1] floats.
+  config.shared_memory_bytes =
+      n > a.tile_n ? static_cast<int>(a.tile_m * (num_blocks + 1) * sizeof(float)) : 0;
   config.weight_dtype = dtype;
   config.kernel = kernel_of(fn);
   config.algorithm = algorithm_of(fn);
@@ -1740,7 +1731,8 @@ all_reduce_add_attn_res_rms_norm_config(
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
   // A SPLIT'S ATTNRES KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) && !resident(h, kernel, config.blocks, config.threads))
+  if (!is_split(fn) &&
+      !resident(h, kernel, config.blocks, config.threads, config.shared_memory_bytes))
     return Error::grid_not_resident;
   return config;
 }

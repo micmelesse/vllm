@@ -259,4 +259,199 @@ DINLINE void attn_res(
   store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
 }
 
+// A ROW WIDER THAN THE TILE: attn_res's math over the row's chunks of `tile_n` columns (a tile's,
+// from column 0), the block's ROWS rows at offs_m, in passes, each over every chunk:
+//   A. the new prefix (and the one block written), from `sum_chunk(c, d)`, the chunk at column c
+//      of the rows summed over the ranks (the kernel's own: read, never written, here);
+//   B. every source's logit, TILE_K sources a step, its sums of squares and dots with
+//      norm_w * qk_w over the chunks, one block reduction a step; the logits kept in the launch's
+//      dynamic LDS, [ROWS][num_blocks + 1] floats (the host sizes it, attn_res_wide_lds_bytes),
+//      their softmax's largest and denominator kept as they come (online);
+//   C. with out_norm_w, the mix's sum of squares (mix = the softmax's weighted sum of the sources);
+//   D. the mix again, normed or not, stored.
+// Every pass reads what the one before stored at the same thread's places (the layout is the
+// tile's in every pass), so no pass waits on another's threads; the LDS is written by thread 0
+// between two block barriers. Rounds as attn_res: d as summed, the prefix T(prefix + d), out
+// T(m * scale * w) or T(m). The softmax's sum is taken directly (each source weighted by
+// exp(logit - max) / denominator), not online as attn_res's: the same value, its fp32 rounding
+// apart.
+template <int TILE_K, int THREADS_PER_BLOCK, Layout LAYOUT, typename DTYPE, int ROWS, int K, int P,
+          typename SUM>
+DINLINE void attn_res_wide(
+    SUM&& sum_chunk, int tile_n, const DTYPE* prefix_ptr, int64_t prefix_stride_m,
+    int64_t prefix_stride_n, const DTYPE* blocks_ptr, int64_t blocks_stride_m,
+    int64_t blocks_stride_r, int64_t blocks_stride_n, const DTYPE* norm_weight_ptr,
+    int64_t norm_weight_stride_n, const DTYPE* qk_weight_ptr, int64_t qk_weight_stride_n,
+    const DTYPE* output_norm_weight_ptr, int64_t output_norm_weight_stride_n,
+    DTYPE* prefix_output_ptr, int64_t prefix_output_stride_m, int64_t prefix_output_stride_n,
+    DTYPE* output_ptr, int64_t output_stride_m, int64_t output_stride_n, DTYPE* block_output_ptr,
+    int64_t block_output_stride_m, int64_t block_output_stride_n, int input_size_m,
+    int input_size_n, int offs_m, int num_blocks, float eps, float output_eps, float inv_hidden) {
+  const int n_all = input_size_n;
+  [[maybe_unused]] const auto pack_at = [&](int k, int c) {
+    const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
+    return LAYOUT == Layout::tile ? c / P + t + k * THREADS_PER_BLOCK : c / P + t * K + k;
+  };
+  // A. THE NEW PREFIX, chunk by chunk, stored (and the block written) before any source is read.
+  for (int c = 0; c < n_all; c += tile_n) {
+    DTYPE d[ROWS][K][P];
+    sum_chunk(c, d);
+    DTYPE new_prefix[ROWS][K][P];
+    if (prefix_ptr != nullptr) {
+      DTYPE old_prefix[ROWS][K][P];
+      load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&prefix_ptr, 1, 0, 0, 0, prefix_stride_m, prefix_stride_n, 1, input_size_m, n_all, input_size_m, n_all, old_prefix, offs_m, c, 1);
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j)
+            new_prefix[i][k][j] = static_cast<DTYPE>(static_cast<float>(old_prefix[i][k][j]) +
+                                                     static_cast<float>(d[i][k][j]));
+    } else {
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j) new_prefix[i][k][j] = d[i][k][j];
+    }
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &prefix_output_ptr, 1, 0, 0, 0, prefix_output_stride_m, prefix_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+    if (block_output_ptr != nullptr)
+      store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(new_prefix, &block_output_ptr, 1, 0, 0, 0, block_output_stride_m, block_output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+  }
+  // Source src's chunk at column c: a block, or the new prefix (the last source).
+  const auto source = [&](int src, int c, DTYPE (&v)[ROWS][K][P]) {
+    const bool block = src < num_blocks;
+    const DTYPE* const source_ptr = block ? blocks_ptr : prefix_output_ptr;
+    load<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&source_ptr, 1, 0, block ? src : 0, block ? blocks_stride_r : 0, block ? blocks_stride_m : prefix_output_stride_m, block ? blocks_stride_n : prefix_output_stride_n, block ? num_blocks : 1, input_size_m, n_all, input_size_m, n_all, v, offs_m, c, 1);
+  };
+  extern __shared__ float wide_logits[];  // [ROWS][num_blocks + 1]
+  const int sources = num_blocks + 1;
+  float softmax_max[ROWS], softmax_denominator[ROWS];
+#pragma unroll
+  for (int m = 0; m < ROWS; ++m) {
+    softmax_max[m] = -INFINITY;
+    softmax_denominator[m] = 0.0f;
+  }
+  if (num_blocks != 0) {
+    // B. EVERY SOURCE'S LOGIT, TILE_K a step.
+    for (int src0 = 0; src0 < sources; src0 += TILE_K) {
+      float sums[1][ROWS * 2 * TILE_K];
+#pragma unroll
+      for (int q = 0; q < ROWS * 2 * TILE_K; ++q) sums[0][q] = 0.0f;
+      for (int c = 0; c < n_all; c += tile_n) {
+        DTYPE norm_weight[1][K][P], qk_weight[1][K][P];
+        load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&norm_weight_ptr, 1, 0, 0, 0, 0, norm_weight_stride_n, 1, 1, n_all, 1, n_all, norm_weight, 0, c, 1);
+        load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&qk_weight_ptr, 1, 0, 0, 0, 0, qk_weight_stride_n, 1, 1, n_all, 1, n_all, qk_weight, 0, c, 1);
+#pragma unroll
+        for (int s = 0; s < TILE_K; ++s) {
+          const int src = src0 + s < sources ? src0 + s : num_blocks;  // padding: the prefix again
+          DTYPE v[ROWS][K][P];
+          source(src, c, v);
+#pragma unroll
+          for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+            for (int k = 0; k < K; ++k) {
+              float ss_k = 0.0f, dw_k = 0.0f;
+#pragma unroll
+              for (int j = 0; j < P; ++j) {
+                const float x = static_cast<float>(v[m][k][j]);
+                ss_k = fmaf(x, x, ss_k);
+                dw_k = fmaf(x, static_cast<float>(norm_weight[0][k][j]) *
+                                   static_cast<float>(qk_weight[0][k][j]),
+                            dw_k);
+              }
+              const float in = pack_at(k, c) < n_all / P ? 1.0f : 0.0f;
+              sums[0][(m * TILE_K + s) * 2] += in * ss_k;
+              sums[0][(m * TILE_K + s) * 2 + 1] += in * dw_k;
+            }
+        }
+      }
+      reduce<1, THREADS_PER_BLOCK, ReduceAxis::all>(sums, sums);
+#pragma unroll
+      for (int m = 0; m < ROWS; ++m)
+#pragma unroll
+        for (int s = 0; s < TILE_K; ++s) {
+          if (src0 + s >= sources) continue;
+          const float logit = sums[0][(m * TILE_K + s) * 2 + 1] *
+                              rsqrtf(sums[0][(m * TILE_K + s) * 2] * inv_hidden + eps);
+          if (threadIdx.x == 0) wide_logits[m * sources + src0 + s] = logit;
+          const float new_max = fmaxf(softmax_max[m], logit);
+          softmax_denominator[m] = softmax_denominator[m] * __expf(softmax_max[m] - new_max) +
+                                   __expf(logit - new_max);
+          softmax_max[m] = new_max;
+        }
+    }
+    __syncthreads();  // every logit in the LDS before any thread reads one
+  }
+  // THE MIX'S CHUNK at column c: the new prefix alone with no blocks, else every source weighted.
+  const auto mix = [&](int c, float (&acc)[ROWS][K][P]) {
+    if (num_blocks == 0) {
+      DTYPE v[ROWS][K][P];
+      source(num_blocks, c, v);
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j) acc[i][k][j] = static_cast<float>(v[i][k][j]);
+      return;
+    }
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+      for (int k = 0; k < K; ++k)
+#pragma unroll
+        for (int j = 0; j < P; ++j) acc[i][k][j] = 0.0f;
+    for (int src = 0; src < sources; ++src) {
+      DTYPE v[ROWS][K][P];
+      source(src, c, v);
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i) {
+        const float p = __expf(wide_logits[i * sources + src] - softmax_max[i]) /
+                        softmax_denominator[i];
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j)
+            acc[i][k][j] = fmaf(static_cast<float>(v[i][k][j]), p, acc[i][k][j]);
+      }
+    }
+  };
+  // C. WITH out_norm_w, THE MIX'S SCALE over its chunks; D. the mix again, stored.
+  float scale[ROWS];
+  if (output_norm_weight_ptr != nullptr) {
+    float ss[1][ROWS];
+#pragma unroll
+    for (int m = 0; m < ROWS; ++m) ss[0][m] = 0.0f;
+    for (int c = 0; c < n_all; c += tile_n) {
+      float acc[ROWS][K][P];
+      mix(c, acc);
+      add_squares<THREADS_PER_BLOCK>(acc, ss, n_all, c, LAYOUT);
+    }
+    scales_of<THREADS_PER_BLOCK>(ss, scale, inv_hidden, output_eps);
+  }
+  for (int c = 0; c < n_all; c += tile_n) {
+    float acc[ROWS][K][P];
+    mix(c, acc);
+    DTYPE result[ROWS][K][P];
+    if (output_norm_weight_ptr != nullptr) {
+      DTYPE output_norm_weight[1][K][P];
+      load<1, 1, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(&output_norm_weight_ptr, 1, 0, 0, 0, 0, output_norm_weight_stride_n, 1, 1, n_all, 1, n_all, output_norm_weight, 0, c, 1);
+      rms_norm<THREADS_PER_BLOCK>(acc, scale, output_norm_weight, result, output_eps, inv_hidden,
+                                  n_all, c, NormPart::apply, false, LAYOUT);
+    } else {
+#pragma unroll
+      for (int i = 0; i < ROWS; ++i)
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+          for (int j = 0; j < P; ++j) result[i][k][j] = static_cast<DTYPE>(acc[i][k][j]);
+    }
+    store<1, ROWS, THREADS_PER_BLOCK, Quantization::none, LAYOUT>(result, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, n_all, input_size_m, n_all, offs_m, c, 1);
+  }
+  __syncthreads();  // the LDS's logits read by every thread before the next rows' are written
+}
+
 }  // namespace hip_custom_communicator

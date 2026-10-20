@@ -32,7 +32,7 @@ enum class Error : int {
   world_not_built = 5,
   row_not_packs = 6,
   template_not_this_ops = 7,
-  row_too_wide = 8,
+  row_too_wide = 8,  // retired: every kernel takes a row wider than its tile, in chunks
   block_not_a_wave_per_peer = 9,
   partials_too_small = 10,
   grid_not_resident = 11,

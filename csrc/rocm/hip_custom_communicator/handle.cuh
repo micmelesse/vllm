@@ -34,6 +34,7 @@
 #include <array>
 #include <fstream>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <cerrno>
 #include <cstdint>
@@ -956,15 +957,15 @@ class Handle {
   // compiled kernel's registers, LDS and the CU's wave slots, times the
   // device's CUs. A peer barrier spins until the same block on every peer
   // arrives, so a grid past it can hang (select refuses it,
-  // grid_not_resident). Asked once per kernel and block size, then cached; no
-  // dynamic LDS (Config selects zero shared memory).
-  int resident_blocks(const void* kernel, int threads) const {
-    const std::pair<const void*, int> key{kernel, threads};
+  // grid_not_resident). Asked once per kernel, block size and dynamic LDS (a
+  // wide AttnRes row's logits), then cached.
+  int resident_blocks(const void* kernel, int threads, int shared_bytes = 0) const {
+    const std::tuple<const void*, int, int> key{kernel, threads, shared_bytes};
     if (const auto it = resident_.find(key); it != resident_.end())
       return it->second;
     int per_cu = 0;
     HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel,
-                                                           threads, 0));
+                                                           threads, shared_bytes));
     int cus = 0;
     HIP_CHECK(hipDeviceGetAttribute(
         &cus, hipDeviceAttributeMultiprocessorCount, device_));
@@ -1359,7 +1360,7 @@ class Handle {
   uint32_t* status_ = nullptr;
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
-  mutable std::map<std::pair<const void*, int>, int> resident_;
+  mutable std::map<std::tuple<const void*, int, int>, int> resident_;
   // THE INPUT TABLES (INPUT TABLES): the slab, the next free slot, the
   // captured launches awaiting registration (input, slot), and every peer
   // allocation opened for one, by its IPC handle's bytes.
