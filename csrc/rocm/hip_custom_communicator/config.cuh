@@ -536,23 +536,6 @@ constexpr bool slices_columns(Template k) {
          k == Template::all_reduce_push_two_shot_add_attn_res_rms_norm;
 }
 
-// A TEMPLATE THAT CUTS EVERY ROW INTO A COLUMN SLICE A RANK: the plain two-shot
-// and the column splits. It needs a 16-byte pack for every rank; with fewer, a
-// rank's slice is empty.
-constexpr bool slices_a_row(Template k) {
-  return k == Template::all_reduce_pull_two_shot ||
-         k == Template::all_reduce_push_two_shot || slices_columns(k);
-}
-
-// WHETHER EVERY RANK GETS COLUMNS: a template that slices a row needs a load's
-// worth (16 bytes) of the row's `n` for each of the `world` ranks; any other
-// template takes any row.
-constexpr bool every_rank_gets_columns(Template k, int64_t n, DType dtype,
-                                       int world) {
-  return !slices_a_row(k) ||
-         n * elem_bytes(dtype) >= int64_t{world} * kBuild.memory.pack_bytes;
-}
-
 // =================================================================================================
 // 1. THE FORCING, ALL OR NOTHING: the template (its algorithm and direction,
 // where the op has more than one), every field of its build, and its launch, or
@@ -781,12 +764,6 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (tile_n_of(c.build) < tile_cols) return Error::row_too_wide;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
-  // A TWO-SHOT ROW CUT INTO A SLICE A RANK needs a pack for every rank: with
-  // fewer, the ranks past the row own empty slices, which the kernels do not
-  // handle (a GPU memory fault, 2026-10-10, at 8 bf16 columns on 8 ranks).
-  // Refused, so the caller takes the one-shot or RCCL.
-  if (!every_rank_gets_columns(fn, n, dtype, world))
-    return Error::row_narrower_than_world;
   // AN INT4 ROW is whole groups for every rank (`runs`' rule for an INT4 point, which a
   // forced call meets here).
   if (int4 && !int4_takes_row(n, world)) return Error::row_not_int4_groups;
@@ -1809,23 +1786,6 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 // plain call's), and the check open makes of a config file before anything is made (what the
 // compile-time checks held of the tables before the tables became a file).
 // =================================================================================================
-
-// THE WIDEST ROW A PLAIN CALL RUNS, in elements: at every built world the points cover, the
-// widest tile among the op's exact picks there, the narrowest of those; none (0) for an op whose
-// tiles cross the row.
-inline int64_t widest_row(const std::vector<TunedPoint>& points, OpType o) {
-  if (!op(o).tile_holds_row) return 0;
-  int64_t widest = 0;
-  for (const int world : kBuild.supports.worlds) {
-    int64_t at = 0;
-    for (const TunedPoint& p : points)
-      if (p.op == o && p.mode == Mode::exact && p.pick && p.world == world &&
-          tile_n_of(p.config.build) > at)
-        at = tile_n_of(p.config.build);
-    if (at > 0 && (widest == 0 || at < widest)) widest = at;
-  }
-  return widest;
-}
 
 // THE MOST BYTES A PLAIN CALL RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds (an
 // eager input is copied in whole), and what the partials holds at the most partials a byte of its

@@ -462,13 +462,12 @@ std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
   return {max_rows, max_cols, sizes.partials_bytes, sizes.staging_bytes};
 }
 
-// WHAT AN OPENED COMMUNICATOR'S PLAIN CALLS MAY HOLD, from its points (config.cuh's `widest_row`
-// and `max_bytes`): each op's [widest_row, max_bytes] in kOps' order, asked once after open.
+// WHAT AN OPENED COMMUNICATOR'S PLAIN CALLS MAY HOLD, from its points (config.cuh's
+// `max_bytes`): each op's most bytes in kOps' order, asked once after open.
 std::vector<int64_t> hip_custom_communicator_limits(fptr_t handle_ptr) {
   const hip_custom_communicator::Handle& h = handle_of(handle_ptr);
   std::vector<int64_t> out;
   for (const auto& o : hip_custom_communicator::kOps) {
-    out.push_back(hip_custom_communicator::widest_row(h.points(), o.type));
     out.push_back(hip_custom_communicator::max_bytes(h.points(), o.type, h.partials_bytes(),
                                                      h.staging_bytes()));
   }

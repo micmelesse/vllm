@@ -1444,6 +1444,7 @@ package_data = {
         "py.typed",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
+        "distributed/device_communicators/hip_custom_communicator_configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",

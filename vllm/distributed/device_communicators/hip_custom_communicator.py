@@ -29,6 +29,7 @@ The C++ context crosses as an opaque `int` handle, so nothing frees it for us:
 
 import atexit
 import functools
+import json
 import os
 import signal
 import threading
@@ -38,9 +39,10 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
-from types import FrameType
+from pathlib import Path
+from types import FrameType, MappingProxyType
 from typing import ClassVar, Literal, final, get_args
 
 import torch
@@ -608,7 +610,6 @@ class OpRecord:
 
     dtypes: frozenset[torch.dtype]  # its input's
     weight_dtypes: frozenset[torch.dtype]  # its weight's besides its input's; none
-    widest_row: int  # elements a row at most; 0 for any (its tiles cross the row)
     two_d: bool  # its input is [rows, cols], not any shape read as rows of the last
 
 
@@ -630,33 +631,6 @@ class BuildInfo:
     templates: dict[str, TemplateBuild]
     # Each op by name, in C++'s `Op` order: its plain call.
     ops: dict[str, OpRecord]
-
-    def tuned(
-        self,
-        op: Op,
-        rows: int,
-        cols: int,
-        world: int,
-        dtype: torch.dtype,
-        quantization: Quantization = "none",
-        algorithm: str | None = None,
-        direction: str | None = None,
-    ) -> "Ran | Error | None":
-        """WHAT SELECT LAUNCHES for `op` on `rows` x `cols` of `dtype` at `world`
-        ranks, C++'s own pick (select.cuh's `tuned`), never a copy of its tables:
-        from the op's tuned list of `quantization` (its INT4 list for int4 at any
-        size; a plain call reads it only from the crossover up), among the entries
-        of the template `algorithm` and `direction` name (both or neither; neither,
-        the plain call's pick), the grid cut to the work as select cuts it. Forcing
-        the answer whole runs exactly it. The Error where no entry of that list
-        runs the call, None where it has no entry of that template."""
-        name = next(n for n, d in _DTYPES.items() if d == dtype)
-        answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
-            op, world, rows, cols, name, quantization, algorithm, direction
-        )
-        if not answer:
-            return None
-        return Ran.of(answer) or Error(answer[0])
 
 
 @functools.cache
@@ -691,8 +665,8 @@ def build_info() -> BuildInfo:
         templates[name] = TemplateBuild(op, tuple(builds))
     records: dict[str, OpRecord] = {}
     at_dtype = at_weight = 0
-    for op, at in zip(ops, range(0, len(op_facts), 4)):
-        num_dtypes, num_weights, widest_row, two_d = op_facts[at : at + 4]
+    for op, at in zip(ops, range(0, len(op_facts), 3)):
+        num_dtypes, num_weights, two_d = op_facts[at : at + 3]
         dtypes_in = op_dtypes[at_dtype : at_dtype + num_dtypes]
         weights_in = op_weights[at_weight : at_weight + num_weights]
         at_dtype += num_dtypes
@@ -700,7 +674,6 @@ def build_info() -> BuildInfo:
         records[op] = OpRecord(
             frozenset(_DTYPES[d] for d in dtypes_in),
             frozenset(_DTYPES[d] for d in weights_in),
-            widest_row,
             bool(two_d),
         )
     return BuildInfo(
@@ -720,25 +693,24 @@ class Capacity:
     """WHAT ONE COMMUNICATOR HOLDS (C++'s `hip_custom_communicator_capacity`): the
     largest call its exchange was sized for, `max_rows` rows of at most `max_cols`
     elements (for a model, the server's tokens a batch by its hidden size), the
-    exchange's partials and staging bytes, and each op's most bytes on them whatever
-    a call's shape."""
+    exchange's partials and staging bytes; and, once it is open, from its tuned points
+    (`hip_custom_communicator_limits`), each op's most bytes on those buffers whatever a
+    call's shape (none known: the box alone)."""
 
     max_rows: int
     max_cols: int
     partials_bytes: int
     staging_bytes: int
-    max_bytes: dict[str, int]
+    max_bytes: Mapping[str, int] = MappingProxyType({})
 
 
 def capacity_of(max_rows: int, max_cols: int, world: int) -> Capacity:
     """What a communicator serving `max_rows` rows of at most `max_cols` columns at
     `world` ranks holds: C++'s answer, the same function its opener allocates by."""
-    rows, cols, partials, staging, *most = (
-        torch.ops._rocm_C.hip_custom_communicator_capacity(max_rows, max_cols, world)
+    rows, cols, partials, staging = torch.ops._rocm_C.hip_custom_communicator_capacity(
+        max_rows, max_cols, world
     )
-    return Capacity(
-        rows, cols, partials, staging, dict(zip(build_info().op_names, most))
-    )
+    return Capacity(rows, cols, partials, staging)
 
 
 def problem_size() -> tuple[int, int] | None:
@@ -768,7 +740,7 @@ def should(
     weight: torch.Tensor | None = None,
 ) -> bool:
     """Whether a PLAIN call of `op` (nothing forced) on `input`, and a norm's `weight`,
-    runs on a communicator holding `capacity`: inside the op's record
+    runs on an open communicator holding `capacity`: inside the op's record
     (`build_info().ops`), whole packs a row, and inside what its exchange holds,
     either the box it was sized for (rows and row width) or the op's most bytes.
     Python alone, no C++ call, as vLLM's `should_custom_ar`; C++ refuses no call this
@@ -790,8 +762,7 @@ def should(
     in_box = rows <= capacity.max_rows and row <= capacity.max_cols
     return (
         row * input.element_size() % built.pack_bytes == 0
-        and (record.widest_row == 0 or row <= record.widest_row)
-        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes[op])
+        and (in_box or input.numel() * input.element_size() <= capacity.max_bytes.get(op, 0))
     )
 
 
@@ -813,6 +784,49 @@ class Supported:
     arch: str
 
 
+# THE TUNED POINTS, a file an arch (`hip_custom_communicator_configs/<arch>.json`, written by
+# `gp bench tune`): `points`, per op and table (`mode`: exact, or quantized: every size, exact
+# kernels where quantizing does not pay and INT4 where it does), measured calls each with the
+# kernel and config that won there; `configs`, each kernel's config where no point picks it (a
+# forced call's). C++ checks them at open and runs a call at its nearest point (config.cuh's
+# `lookup`): every tuned number is here, none in C++.
+_CONFIGS = Path(__file__).with_name("hip_custom_communicator_configs")
+_POINT_KEYS = frozenset({
+    "op", "mode", "world", "hidden", "tokens", "kernel", "threads_per_block",
+    "waves_per_eu", "tile_m", "tile_n", "tile_k", "quantization", "blocks_per_grid",
+    "reduce_scatter_blocks",
+})
+_MODES = ("exact", "quantized")
+
+
+def tuned_points(arch: str) -> list[int] | str:
+    """THE ARCH'S TUNED POINTS as C++ takes them at open (types.cuh's TunedPoint, its
+    `kPointFields` int64 a point, in its order), or why there are none: no file for the
+    arch. A file that is not one raises, naming it and the entry; C++ checks the rest."""
+    path = _CONFIGS / f"{arch}.json"
+    if not path.is_file():
+        return f"no tuned config for {arch} ({path})"
+    raw = json.loads(path.read_text())
+    if set(raw) != {"arch", "tuned_by", "points", "configs"} or raw["arch"] != arch:
+        raise ValueError(f"{path}: not a tuned config for {arch}: keys {sorted(raw)}")
+    built = build_info()
+    templates = list(built.templates)
+    wire: list[int] = []
+    for section, pick in (("points", 1), ("configs", 0)):
+        keys = _POINT_KEYS if pick else _POINT_KEYS - {"mode"}
+        for i, e in enumerate(raw[section]):
+            if set(e) != keys:
+                raise ValueError(f"{path}: {section}[{i}] has keys {sorted(e)}, not {sorted(keys)}")
+            # A config's table is its encoding's: it is no table's pick.
+            mode = _MODES.index(e["mode"]) if pick else int(e["quantization"] == "int4")
+            wire += [built.op_names.index(e["op"]), mode, pick, e["world"], e["hidden"],
+                     e["tokens"], templates.index(e["kernel"]), e["threads_per_block"],
+                     e["waves_per_eu"], e["tile_m"], e["tile_n"], e["tile_k"],
+                     _QUANTIZATIONS.index(e["quantization"]), e["blocks_per_grid"],
+                     e["reduce_scatter_blocks"]]
+    return wire
+
+
 def open_handle(
     cpu_group: str,
     device_group: str,
@@ -823,15 +837,17 @@ def open_handle(
     quantization: Quantization,
     log_mode: LogMode = "errors",
     rccl_ready: int = -1,
+    points: Sequence[int] = (),
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
-    C++'s opener, so its arguments are written once. `quantization`: what the calls C++
-    picks move across the links (each op's crossover is C++'s, `select.cuh`).
+    C++'s opener, so its arguments are written once. `quantization`: which table of the
+    tuned points a plain call reads (int4: the quantized one).
     `log_mode`: what the state log records. `rccl_ready`: whether the device group's
-    RCCL communicator was found set up (`rccl_ready`), logged as an observation. An
-    open that fails one of its checks raises, naming it, with the log appended."""
+    RCCL communicator was found set up (`rccl_ready`), logged as an observation.
+    `points`: the arch's tuned points (`tuned_points`), checked by C++ here. An open that
+    fails one of its checks raises, naming it, with the log appended."""
     try:
         handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
             cpu_group,
@@ -843,6 +859,7 @@ def open_handle(
             _QUANTIZATIONS.index(quantization),
             _LOG_MODES.index(log_mode),
             rccl_ready,
+            list(points),
         )
     except RuntimeError as e:
         raise RuntimeError(f"{e}\n{last_log() or 'no log was made'}") from e
@@ -1168,6 +1185,31 @@ class HipCustomCommunicator:
     # is the backend's choice; the model forces none. A forced call asks no `should_`:
     # C++ answers it. An op raises Refused with the Error C++ refused it for; a call
     # its `should_` admitted is never refused.
+
+    @final
+    def tuned(
+        self,
+        op: Op,
+        rows: int,
+        cols: int,
+        dtype: torch.dtype,
+        quantization: Quantization = "none",
+        algorithm: str | None = None,
+        direction: str | None = None,
+    ) -> "Ran | Error | None":
+        """WHAT THIS COMMUNICATOR LAUNCHES for `op` on `rows` x `cols` of `dtype`, C++'s
+        own answer from its tuned points (config.cuh's `tuned`): with neither `algorithm`
+        nor `direction`, a plain call's pick from its table; with both, that kernel's
+        config moving `quantization` (its nearest point, a pick or a config). Forcing the
+        answer whole runs exactly it. The Error where no point runs the call, None where
+        the kernel has no point."""
+        name = next(n for n, d in _DTYPES.items() if d == dtype)
+        answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
+            self._handle, op, rows, cols, name, quantization, algorithm, direction
+        )
+        if not answer:
+            return None
+        return Ran.of(answer) or Error(answer[0])
 
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
@@ -1603,6 +1645,14 @@ class HipCustomCommunicator:
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
+        # THE TUNED POINTS for this device's arch: none, and the communicator is disabled,
+        # naming why, as on a device it does not support.
+        found = supported(self.device, self.device_group.size())
+        if isinstance(found, Error):
+            return found.name
+        points = tuned_points(found.arch)
+        if isinstance(points, str):
+            return points
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
         handle = open_handle(
@@ -1615,10 +1665,16 @@ class HipCustomCommunicator:
             self.quantization,
             self.log_mode,
             rccl_ready(self.device_group, self.device),
+            points,
         )
         if isinstance(handle, Error):
             return handle.name
         self._handle = handle
+        # WHAT ITS PLAIN CALLS MAY HOLD, from its points: each op's most bytes.
+        limits = torch.ops._rocm_C.hip_custom_communicator_limits(handle)
+        self.capacity = replace(
+            self.capacity, max_bytes=MappingProxyType(dict(zip(build_info().op_names, limits)))
+        )
         _install_exit_hooks()
         # WHAT OPEN OBSERVED of the broader state: warnings, never a failure.
         opened = self.log()
