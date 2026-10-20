@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <variant>
+#include <vector>
 
 #include "kernels/common.cuh"
 #include "kernels/reduce_scatter.cuh"
@@ -292,26 +293,36 @@ constexpr BuildConfig quantized(BuildConfig b, int q) {
   return b;
 }
 
-// THE TUNED POINTS (vllm/.../hip_custom_communicator_configs/<arch>.json, loaded by Python and
-// handed to open, checked there, held by the handle): each a measured call (its op, world, width
-// and tokens) with the kernel and config that won there. A call runs its nearest point's
-// (config.cuh's `lookup`). `mode`: the table the point belongs to, the communicator's exact one or
-// its quantized one (every size: exact kernels where quantizing does not pay, INT4 where it does).
-// `pick` false: not a choice, a kernel's config for a call that forces it where no point picks it.
+// THE TUNED TABLE (vllm/.../hip_custom_communicator_configs/<arch>.json, loaded by Python and
+// handed to open, checked there, held by the handle), the file's two lists: the CONFIGS (the
+// config space tuned: a kernel and its build and launch), and the INPUTS (the input points
+// measured: an op's call at a world, width and tokens, in one of its tables, `mode`: the
+// communicator's exact table or its quantized one, every size: exact kernels where quantizing does
+// not pay, INT4 where it does), each naming the config it runs. A call runs its nearest input's
+// config (config.cuh's `lookup`); a config no input names is a kernel's for a call that forces it.
 enum class Mode : int { exact = 0, quantized = 1 };
-struct TunedPoint {
-  OpType op;
-  Mode mode;
-  bool pick;
-  int world;
-  int64_t hidden;
-  int64_t tokens;
+struct TunedConfig {
   Template fn;
   KernelConfig config;
 };
-// A point on the wire from Python: its fields in this order, int64 each (`Template` and `OpType`
-// by their enums' numbers, `build_info`'s order).
-constexpr int kPointFields = 15;
+struct TunedInput {
+  OpType op;
+  Mode mode;
+  int world;
+  int64_t hidden;
+  int64_t tokens;
+  int config;  // its config, an index into the table's configs
+};
+struct TunedTable {
+  std::vector<TunedInput> inputs;
+  std::vector<TunedConfig> configs;
+};
+// THE TABLE ON THE WIRE from Python, two lists of int64 (`Template` and `OpType` by their enums'
+// numbers, `build_info`'s order): a config's fields, then an input's, in these orders:
+// template, threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, quantization,
+// blocks_per_grid, reduce_scatter_blocks; and op, mode, world, hidden, tokens, config.
+constexpr int kConfigFields = 9;
+constexpr int kInputFields = 6;
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
 // A row of `elems` of `dtype` in 16-byte packs.

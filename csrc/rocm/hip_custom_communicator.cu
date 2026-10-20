@@ -230,26 +230,25 @@ Answer answer(const std::variant<hip_custom_communicator::Config,
           static_cast<int64_t>(config.quantization)};
 }
 
-// THE TUNED POINTS FROM THE WIRE (types.cuh's TunedPoint, kPointFields int64 a point, in its
-// order: op, mode, pick, world, hidden, tokens, template, threads_per_block, waves_per_eu, tile_m,
-// tile_n, tile_k, quantization, blocks_per_grid, reduce_scatter_blocks), checked (config.cuh's
-// `check`): a malformed or unsound file raises, naming its point.
-std::vector<hip_custom_communicator::TunedPoint> points_from(const std::vector<int64_t>& wire) {
+// THE TUNED TABLE FROM THE WIRE (types.cuh's TunedTable: its configs, kConfigFields int64 each,
+// and its inputs, kInputFields each, in its orders), checked (config.cuh's `check`): a malformed
+// or unsound file raises, naming its config or input.
+hip_custom_communicator::TunedTable table_from(const std::vector<int64_t>& configs,
+                                               const std::vector<int64_t>& inputs) {
   using namespace hip_custom_communicator;
-  TORCH_CHECK(wire.size() % kPointFields == 0,
-              "hip_custom_communicator: the points are ", kPointFields, " fields each, not ",
-              wire.size(), " fields");
-  std::vector<TunedPoint> out;
-  for (size_t at = 0; at < wire.size(); at += kPointFields) {
-    const int64_t* f = &wire[at];
-    TORCH_CHECK(f[0] >= 0 && f[0] < kNumOps && (f[1] == 0 || f[1] == 1) && f[6] >= 0 &&
-                    f[6] < kNumTemplates,
-                "hip_custom_communicator: point ", at / kPointFields,
-                " names no op, mode or kernel this build has");
-    const OpType o = static_cast<OpType>(f[0]);
-    const int threads = static_cast<int>(f[7]), waves = static_cast<int>(f[8]),
-              tile_m = static_cast<int>(f[9]), tile_n = static_cast<int>(f[10]),
-              tile_k = static_cast<int>(f[11]), q = static_cast<int>(f[12]);
+  TORCH_CHECK(configs.size() % kConfigFields == 0 && inputs.size() % kInputFields == 0,
+              "hip_custom_communicator: a config is ", kConfigFields, " fields and an input ",
+              kInputFields, ", not ", configs.size(), " and ", inputs.size(), " fields");
+  TunedTable out;
+  for (size_t at = 0; at < configs.size(); at += kConfigFields) {
+    const int64_t* f = &configs[at];
+    TORCH_CHECK(f[0] >= 0 && f[0] < kNumTemplates, "hip_custom_communicator: config ",
+                at / kConfigFields, " names no kernel this build has");
+    const Template fn = static_cast<Template>(f[0]);
+    const OpType o = op_of(fn);
+    const int threads = static_cast<int>(f[1]), waves = static_cast<int>(f[2]),
+              tile_m = static_cast<int>(f[3]), tile_n = static_cast<int>(f[4]),
+              tile_k = static_cast<int>(f[5]), q = static_cast<int>(f[6]);
     BuildConfig b = AllReduceBuildConfig{threads, waves, tile_m, tile_n, q};
     if (o == OpType::all_reduce_rms_norm)
       b = AllReduceRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
@@ -257,9 +256,15 @@ std::vector<hip_custom_communicator::TunedPoint> points_from(const std::vector<i
       b = AllReduceAddRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
     if (o == OpType::all_reduce_add_attn_res_rms_norm)
       b = AllReduceAddAttnResRmsNormBuildConfig{threads, waves, tile_m, tile_n, tile_k, q};
-    out.push_back({o, static_cast<Mode>(f[1]), f[2] != 0, static_cast<int>(f[3]), f[4], f[5],
-                   static_cast<Template>(f[6]),
-                   {b, {static_cast<int>(f[13]), static_cast<int>(f[14])}}});
+    out.configs.push_back({fn, {b, {static_cast<int>(f[7]), static_cast<int>(f[8])}}});
+  }
+  for (size_t at = 0; at < inputs.size(); at += kInputFields) {
+    const int64_t* f = &inputs[at];
+    TORCH_CHECK(f[0] >= 0 && f[0] < kNumOps && (f[1] == 0 || f[1] == 1),
+                "hip_custom_communicator: input ", at / kInputFields,
+                " names no op or table this build has");
+    out.inputs.push_back({static_cast<OpType>(f[0]), static_cast<Mode>(f[1]),
+                          static_cast<int>(f[2]), f[3], f[4], static_cast<int>(f[5])});
   }
   const std::optional<std::string> bad = check(out);
   TORCH_CHECK(!bad, "hip_custom_communicator: the config file's ", *bad);
@@ -285,7 +290,8 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       int64_t max_rows, int64_t max_cols,
                                       int64_t quantization, int64_t log_mode,
                                       int64_t rccl_ready,
-                                      const std::vector<int64_t>& points) {
+                                      const std::vector<int64_t>& configs,
+                                      const std::vector<int64_t>& inputs) {
   TORCH_CHECK(
       log_mode == 0 || log_mode == 1,
       "a communicator's log mode is errors (0) or everything (1): ", log_mode);
@@ -310,9 +316,9 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&ok))
     return refused(*e);
-  // THE TUNED POINTS, checked before anything is made: a file that cannot be run raises, naming
-  // its point.
-  std::vector<hip_custom_communicator::TunedPoint> tuned = points_from(points);
+  // THE TUNED TABLE, checked before anything is made: a file that cannot be run raises, naming
+  // its config or input.
+  hip_custom_communicator::TunedTable tuned = table_from(configs, inputs);
   const auto sizes =
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(

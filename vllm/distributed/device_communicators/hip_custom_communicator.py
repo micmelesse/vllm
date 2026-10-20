@@ -784,76 +784,86 @@ class Supported:
     arch: str
 
 
-# THE TUNED POINTS, a file an arch (`hip_custom_communicator_configs/<arch>.json`,
-# written by `gp bench tune`): `points`, per op and table (`mode`: exact, or quantized:
-# every size, exact kernels where quantizing does not pay and INT4 where it does),
-# measured calls each with the kernel and config that won there; `configs`, each
-# kernel's config where no point picks it (a forced call's). C++ checks them at open
-# and runs a call at its nearest point (config.cuh's `lookup`): every tuned number is
-# here, none in C++.
-_CONFIGS = Path(__file__).with_name("hip_custom_communicator_configs")
-_POINT_KEYS = frozenset(
+# THE TUNED TABLE (`hip_custom_communicator.json`, written by `gp bench tune`), each
+# op's two lists: its `inputs` (the input points measured, the workload's, the same on
+# every arch: a table, `mode`: exact, or quantized: every size, exact kernels where
+# quantizing does not pay and INT4 where it does; world, width and tokens), each naming
+# its config on each arch by index; and its `configs` on each arch (the config space
+# tuned there: a kernel of the op, what it moves, its build and launch). C++ checks the
+# device's arch's table at open and runs a call at its nearest input's config
+# (config.cuh's `lookup`): every tuned number is here, none in C++.
+_TABLE = Path(__file__).with_name("hip_custom_communicator.json")
+_INPUT_KEYS = frozenset({"mode", "world", "hidden", "tokens", "config"})
+_CONFIG_KEYS = frozenset(
     {
-        "op",
-        "mode",
-        "world",
-        "hidden",
-        "tokens",
         "kernel",
+        "quantization",
         "threads_per_block",
         "waves_per_eu",
         "tile_m",
         "tile_n",
-        "tile_k",
-        "quantization",
         "blocks_per_grid",
-        "reduce_scatter_blocks",
     }
 )
+# AttnRes's kernels take sources a step and a reduce-scatter split besides.
+_ATTN_RES_KEYS = frozenset({"tile_k", "reduce_scatter_blocks"})
 _MODES = ("exact", "quantized")
 
 
-def tuned_points(arch: str) -> list[int] | str:
-    """THE ARCH'S TUNED POINTS as C++ takes them at open (types.cuh's TunedPoint, its
-    `kPointFields` int64 a point, in its order), or why there are none: no file for the
-    arch. A file that is not one raises, naming it and the entry; C++ checks the
-    rest."""
-    path = _CONFIGS / f"{arch}.json"
-    if not path.is_file():
-        return f"no tuned config for {arch} ({path})"
-    raw = json.loads(path.read_text())
-    if set(raw) != {"arch", "tuned_by", "points", "configs"} or raw["arch"] != arch:
-        raise ValueError(f"{path}: not a tuned config for {arch}: keys {sorted(raw)}")
+def tuned_table(arch: str) -> tuple[list[int], list[int]] | str:
+    """THE TUNED TABLE ON `arch` as C++ takes it at open (types.cuh's TunedTable on the
+    wire: every op's configs on the arch, `kConfigFields` int64 each, then every op's
+    inputs, `kInputFields` each, an input's config its index among every op's), or why
+    there is none: an op the arch has no table for (every input a config on it). A file
+    that is not one raises, naming the entry; C++ checks the rest."""
+    raw = json.loads(_TABLE.read_text())
     built = build_info()
+    if set(raw) != set(built.op_names):
+        raise ValueError(f"{_TABLE}: its ops are {sorted(raw)}, not {built.op_names}")
     templates = list(built.templates)
-    wire: list[int] = []
-    for section, pick in (("points", 1), ("configs", 0)):
-        keys = _POINT_KEYS if pick else _POINT_KEYS - {"mode"}
-        for i, e in enumerate(raw[section]):
-            if set(e) != keys:
+    configs: list[int] = []
+    inputs: list[int] = []
+    first = 0  # the op's first config, among every op's
+    for name in built.op_names:
+        table = raw[name]
+        if set(table) != {"inputs", "configs"}:
+            raise ValueError(f"{_TABLE}: {name} is not an op's table: {sorted(table)}")
+        if arch not in table["configs"]:
+            return f"{name} is not tuned on {arch} ({_TABLE})"
+        own = _CONFIG_KEYS | (_ATTN_RES_KEYS if "attn_res" in name else frozenset())
+        arch_configs = table["configs"][arch]
+        for i, c in enumerate(arch_configs):
+            if set(c) != own:
                 raise ValueError(
-                    f"{path}: {section}[{i}] has keys {sorted(e)}, not {sorted(keys)}"
+                    f"{_TABLE}: {name}.configs.{arch}[{i}] has keys {sorted(c)}, "
+                    f"not {sorted(own)}"
                 )
-            # A config's table is its encoding's: it is no table's pick.
-            mode = _MODES.index(e["mode"]) if pick else int(e["quantization"] == "int4")
-            wire += [
-                built.op_names.index(e["op"]),
-                mode,
-                pick,
+            configs += [
+                templates.index(c["kernel"]),
+                c["threads_per_block"],
+                c["waves_per_eu"],
+                c["tile_m"],
+                c["tile_n"],
+                c.get("tile_k", 0),
+                _QUANTIZATIONS.index(c["quantization"]),
+                c["blocks_per_grid"],
+                c.get("reduce_scatter_blocks", 0),
+            ]
+        for i, e in enumerate(table["inputs"]):
+            if set(e) != _INPUT_KEYS:
+                raise ValueError(f"{_TABLE}: {name}.inputs[{i}] has keys {sorted(e)}")
+            if not 0 <= e["config"].get(arch, -1) < len(arch_configs):
+                return f"{name}.inputs[{i}] has no config on {arch} ({_TABLE})"
+            inputs += [
+                built.op_names.index(name),
+                _MODES.index(e["mode"]),
                 e["world"],
                 e["hidden"],
                 e["tokens"],
-                templates.index(e["kernel"]),
-                e["threads_per_block"],
-                e["waves_per_eu"],
-                e["tile_m"],
-                e["tile_n"],
-                e["tile_k"],
-                _QUANTIZATIONS.index(e["quantization"]),
-                e["blocks_per_grid"],
-                e["reduce_scatter_blocks"],
+                first + e["config"][arch],
             ]
-    return wire
+        first += len(arch_configs)
+    return configs, inputs
 
 
 def open_handle(
@@ -866,17 +876,17 @@ def open_handle(
     quantization: Quantization,
     log_mode: LogMode = "errors",
     rccl_ready: int = -1,
-    points: Sequence[int] = (),
+    table: tuple[Sequence[int], Sequence[int]] = ((), ()),
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
     C++'s opener, so its arguments are written once. `quantization`: which table of the
-    tuned points a plain call reads (int4: the quantized one).
+    tuned table's a plain call reads (int4: the quantized one).
     `log_mode`: what the state log records. `rccl_ready`: whether the device group's
     RCCL communicator was found set up (`rccl_ready`), logged as an observation.
-    `points`: the arch's tuned points (`tuned_points`), checked by C++ here. An open
-    that fails one of its checks raises, naming it, with the log appended."""
+    `table`: the arch's tuned table (`tuned_table`), checked by C++ here. An open that
+    fails one of its checks raises, naming it, with the log appended."""
     try:
         handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
             cpu_group,
@@ -888,7 +898,8 @@ def open_handle(
             _QUANTIZATIONS.index(quantization),
             _LOG_MODES.index(log_mode),
             rccl_ready,
-            list(points),
+            list(table[0]),
+            list(table[1]),
         )
     except RuntimeError as e:
         raise RuntimeError(f"{e}\n{last_log() or 'no log was made'}") from e
@@ -1227,7 +1238,7 @@ class HipCustomCommunicator:
         direction: str | None = None,
     ) -> "Ran | Error | None":
         """WHAT THIS COMMUNICATOR LAUNCHES for `op` on `rows` x `cols` of `dtype`, C++'s
-        own answer from its tuned points (config.cuh's `tuned`): with neither
+        own answer from its tuned table (config.cuh's `tuned`): with neither
         `algorithm` nor `direction`, a plain call's pick from its table; with both, that
         kernel's config moving `quantization` (its nearest point, a pick or a config).
         Forcing the answer whole runs exactly it. None where the kernel has no
@@ -1674,14 +1685,14 @@ class HipCustomCommunicator:
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        # THE TUNED POINTS for this device's arch: none, and the communicator is
+        # THE TUNED TABLE for this device's arch: none, and the communicator is
         # disabled, naming why, as on a device it does not support.
         found = supported(self.device, self.device_group.size())
         if isinstance(found, Error):
             return found.name
-        points = tuned_points(found.arch)
-        if isinstance(points, str):
-            return points
+        table = tuned_table(found.arch)
+        if isinstance(table, str):
+            return table
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
         handle = open_handle(
@@ -1694,7 +1705,7 @@ class HipCustomCommunicator:
             self.quantization,
             self.log_mode,
             rccl_ready(self.device_group, self.device),
-            points,
+            table,
         )
         if isinstance(handle, Error):
             return handle.name

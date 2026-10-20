@@ -67,7 +67,8 @@ hip_custom_communicator_open(const std::string& cpu_group,
                              double timeout_seconds, int64_t max_rows,
                              int64_t max_cols, int64_t quantization,
                              int64_t log_mode, int64_t rccl_ready,
-                             const std::vector<int64_t>& points);
+                             const std::vector<int64_t>& configs,
+                             const std::vector<int64_t>& inputs);
 // What an opened communicator launches for an op's call: a plain call's pick, or, a launch named,
 // that kernel's tuned config (hip_custom_communicator.cu).
 std::vector<int64_t> hip_custom_communicator_tuned(

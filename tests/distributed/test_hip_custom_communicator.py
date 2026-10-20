@@ -47,7 +47,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     last_log,
     open_handle,
     supported,
-    tuned_points,
+    tuned_table,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -1099,15 +1099,18 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert not int4, name
 
 
-def test_the_tuned_points_are_the_arch_file() -> None:
-    """The arch's tuned points (`hip_custom_communicator_configs/gfx950.json`) are
-    what open takes, `kPointFields` integers a point; an arch with no file has none,
-    named."""
+def test_the_tuned_table_is_the_arch_file() -> None:
+    """The arch's tuned table (`hip_custom_communicator_configs/gfx950.json`) is what
+    open takes: every op's configs, 9 integers each, and its inputs, 6 each, every
+    input's config one of the configs; an arch with no file has none, named."""
     import vllm._rocm_C  # noqa: F401
 
-    points = tuned_points("gfx950")
-    assert isinstance(points, list) and points and len(points) % 15 == 0, points[:15]
-    assert isinstance(tuned_points("gfx0"), str)
+    table = tuned_table("gfx950")
+    assert not isinstance(table, str), table
+    configs, inputs = table
+    assert configs and len(configs) % 9 == 0 and inputs and len(inputs) % 6 == 0
+    assert all(0 <= i < len(configs) // 9 for i in inputs[5::6])
+    assert isinstance(tuned_table("gfx0"), str)
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:

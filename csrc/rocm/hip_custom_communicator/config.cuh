@@ -79,7 +79,7 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 
 // A TWO-SHOT TEMPLATE'S BUILDS: each listed build as it is, then the same
 // moving INT4 (common.cuh's QUANTIZATION), forced as any build is or taken by
-// a tuned point (the quantized table's INT4 points). A one-shot
+// a tuned config (the quantized table's INT4 configs). A one-shot
 // moves its input as it is.
 template <size_t N>
 constexpr std::array<BuildConfig, 2 * N> and_int4(
@@ -479,7 +479,7 @@ constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world
 // =================================================================================================
 // THE OPS, in OpType's order: each one's name (as Python calls it) and what a plain call of it
 // (nothing forced) must be to run, which `build_info` hands Python's `should`. What each runs at
-// a size is the tuned points' (types.cuh's TunedPoint), the handle's.
+// a size is the tuned table's (types.cuh's TunedTable), the handle's.
 // =================================================================================================
 
 // A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly
@@ -639,9 +639,9 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
 }
 
 // =================================================================================================
-// 2. THE LOOKUP: a call runs its nearest tuned point's kernel and config (types.cuh's
-// TunedPoint: the handle's, from the arch's config file, `check`ed at open). Nothing here is a
-// tuned number: the points are.
+// 2. THE LOOKUP: a call runs its nearest tuned input's config (types.cuh's TunedTable: the
+// handle's, from the arch's config file, `check`ed at open). Nothing here is a tuned number: the
+// table's are.
 // =================================================================================================
 
 constexpr int64_t distance(int64_t a, int64_t b) {
@@ -649,20 +649,23 @@ constexpr int64_t distance(int64_t a, int64_t b) {
 }
 
 
-// THE NEAREST POINT `take` admits: at the handle's world, the nearest width, then the nearest
-// size (rows x width, so a width no point lists reads the nearest width's points at the same
-// bytes), the smaller on a tie. Whether its kernel takes the call is the kernel's to say: a
-// kernel that cannot is refused by its checks, never passed over for another. None where `take`
-// admits no point.
+// THE NEAREST INPUT `take` admits (given the input and its config): at the handle's world, the
+// nearest width, then the nearest size (rows x width, so a width no input lists reads the nearest
+// width's inputs at the same bytes), the smaller on a tie. Whether its kernel takes the call is
+// the kernel's to say: a kernel that cannot is refused by its checks, never passed over for
+// another. None where `take` admits no input.
 template <typename TAKE>
-inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t n) {
-  const auto admitted = [&](const TunedPoint& p) { return p.world == h.world_size() && take(p); };
+inline const TunedInput* nearest(const Handle& h, TAKE take, int64_t m, int64_t n) {
+  const TunedTable& t = h.table();
+  const auto admitted = [&](const TunedInput& p) {
+    return p.world == h.world_size() && take(p, t.configs[p.config]);
+  };
   int64_t width = 0;
-  for (const TunedPoint& p : h.points())
+  for (const TunedInput& p : t.inputs)
     if (admitted(p) && (width == 0 || distance(p.hidden, n) < distance(width, n)))
       width = p.hidden;
-  const TunedPoint* best = nullptr;
-  for (const TunedPoint& p : h.points()) {
+  const TunedInput* best = nullptr;
+  for (const TunedInput& p : t.inputs) {
     if (p.hidden != width || !admitted(p)) continue;
     const int64_t d = distance(p.tokens * p.hidden, m * n);
     const int64_t held = best ? distance(best->tokens * best->hidden, m * n) : 0;
@@ -671,35 +674,44 @@ inline const TunedPoint* nearest(const Handle& h, TAKE take, int64_t m, int64_t 
   return best;
 }
 
-// THE KERNEL A PLAIN CALL RUNS: the nearest point its communicator's table picks (`check` holds
-// that every op has picks at every world and mode it builds).
+// THE KERNEL A PLAIN CALL RUNS: the config of the nearest input of its communicator's table
+// (`check` holds that every op has inputs at every world and mode it builds).
 inline Chosen lookup(const Handle& h, OpType o, int64_t m, int64_t n) {
   const Mode mode = h.mode();
-  const TunedPoint* p = nearest(h, [&](const TunedPoint& p) {
-    return p.op == o && p.mode == mode && p.pick;
+  const TunedInput* p = nearest(h, [&](const TunedInput& p, const TunedConfig&) {
+    return p.op == o && p.mode == mode;
   }, m, n);
-  return Chosen{p->fn, p->config};
+  const TunedConfig& c = h.table().configs[p->config];
+  return Chosen{c.fn, c.config};
 }
 
 // A KERNEL'S CONFIG FOR A CALL THAT NAMES IT (a forced launch at the tuned config: gp's kernel
-// lines, the tests): the nearest point of kernel `fn` moving `quantization`, a pick or a config,
-// in either table; moving INT4 where it has no INT4 point, its nearest exact point moved INT4 (a
-// build it lists). None where it has neither.
+// lines, the tests): the config of kernel `fn` moving `quantization` its nearest input runs, in
+// either table, else the first such config of the table's; moving INT4 where it has no INT4
+// config, its exact config moved INT4 (a build it lists). None where it has neither.
 inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int quantization,
                                            int64_t m, int64_t n) {
-  const auto of = [&](int q) {
-    return nearest(h, [&](const TunedPoint& p) {
-      return p.fn == fn && quantization_of(p.config.build) == q &&
-             built(fn, quantized(p.config.build, quantization));
-    }, m, n);
+  const TunedTable& t = h.table();
+  const auto takes = [&](const TunedConfig& c, int q) {
+    return c.fn == fn && quantization_of(c.config.build) == q &&
+           built(fn, quantized(c.config.build, quantization));
   };
-  const TunedPoint* p = of(quantization);
-  if (!p && quantization == Quantization::int4) p = of(Quantization::none);
-  if (!p) return std::nullopt;
-  return Chosen{p->fn, {quantized(p->config.build, quantization), p->config.launch}};
+  const auto of = [&](int q) -> const TunedConfig* {
+    if (const TunedInput* p = nearest(h, [&](const TunedInput&, const TunedConfig& c) {
+          return takes(c, q);
+        }, m, n))
+      return &t.configs[p->config];
+    for (const TunedConfig& c : t.configs)
+      if (takes(c, q)) return &c;
+    return nullptr;
+  };
+  const TunedConfig* c = of(quantization);
+  if (!c && quantization == Quantization::int4) c = of(Quantization::none);
+  if (!c) return std::nullopt;
+  return Chosen{c->fn, {quantized(c->config.build, quantization), c->config.launch}};
 }
 
-// THE KERNEL A CALL RUNS: the forced one as forced, else its nearest point.
+// THE KERNEL A CALL RUNS: the forced one as forced, else its nearest input's config.
 inline std::variant<Chosen, Error> chosen(
     const Handle& h, const std::variant<std::optional<Chosen>, Error>& forcing,
     OpType o, int64_t m, int64_t n) {
@@ -821,7 +833,7 @@ constexpr std::optional<Error> weight_refused(OpType o, DType dtype,
 // THE TUNED CONFIG AS A QUERY (`HipCustomCommunicator.tuned`): with no kernel named, what a plain
 // call of `m` rows of `n` in `dtype` runs on this communicator (`lookup`); with kernel `fn` named,
 // its config moving `quantization` (`kernel_config`): a forced launch at the tuned config. None
-// where `fn` has no point.
+// where `fn` has no config.
 inline std::variant<std::optional<Chosen>, Error> tuned(const Handle& h, OpType o, int64_t m,
                                                         int64_t n, DType dtype, int quantization,
                                                         std::optional<Template> fn) {
@@ -1430,15 +1442,16 @@ inline std::variant<Config, Error> split_all_reduce_config(
     const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
     int64_t m, int64_t n, DType dtype, int quantization, hipStream_t stream) {
   const Mode mode = quantization == Quantization::int4 ? Mode::quantized : Mode::exact;
-  const TunedPoint* r = nearest(h, [&](const TunedPoint& p) {
-    return p.op == OpType::all_reduce && p.mode == mode && p.pick &&
-           quantization_of(p.config.build) == quantization;
+  const TunedInput* p = nearest(h, [&](const TunedInput& p, const TunedConfig& c) {
+    return p.op == OpType::all_reduce && p.mode == mode &&
+           quantization_of(c.config.build) == quantization;
   }, m, n);
-  if (!r) return Error::quantization_not_supported;
-  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r->config.build);
+  if (!p) return Error::quantization_not_supported;
+  const TunedConfig& r = h.table().configs[p->config];
+  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
   return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
-                           dtype, algorithm_of(r->fn), direction_of(r->fn), b.tile_m, b.tile_n,
-                           b.threads_per_block, r->config.launch.blocks_per_grid, b.waves_per_eu,
+                           dtype, algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n,
+                           b.threads_per_block, r.config.launch.blocks_per_grid, b.waves_per_eu,
                            b.quantization, stream);
 }
 
@@ -1841,14 +1854,14 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 }
 
 // =================================================================================================
-// THE POINTS' FACTS AND CHECK: what Python's `should` admits by (from the exact table's picks, a
-// plain call's), and the check open makes of a config file before anything is made (what the
-// compile-time checks held of the tables before the tables became a file).
+// WHAT A CALL MAY HOLD, AND THE TABLE'S CHECK: what Python's `should` admits by, and the check
+// open makes of a config file before anything is made (what the compile-time checks held of the
+// tables before the tables became a file).
 // =================================================================================================
 
 // THE MOST BYTES A CALL OF AN OP RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds
 // (an eager input is copied in whole), and what the partials holds at the most partials a byte of
-// its input needs among the op's templates (any may be a point's): at one row of one pack, where
+// its input needs among the op's templates (any may be a config's): at one row of one pack, where
 // rounding up is all of it. Python admits a call by it or by the box the exchange was sized for,
 // whichever is larger.
 constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_bytes) {
@@ -1863,57 +1876,66 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
   return partials < staging_bytes ? partials : staging_bytes;
 }
 
-// THE CHECK OPEN MAKES OF THE POINTS: the first point a call could not run, named, or a table or
-// a kernel left without a point; none if the file is sound. Every point a built kernel of its own
-// op at a built world, its build one its kernel lists, its grid in range (the LL push's within its
-// lines' blocks), an exact table moving nothing quantized; every op a pick in each table at every
-// built world; every kernel a config at every built world for each encoding it builds (an INT4
-// build's may be an exact point's, moved INT4, where that build is listed).
-inline std::optional<std::string> check(const std::vector<TunedPoint>& points) {
+// THE CHECK OPEN MAKES OF THE TABLE: the first config or input a call could not run, named, or a
+// table or a kernel left without one; none if the file is sound. Every config a build its kernel
+// lists, its grid in range (the LL push's within its lines' blocks); every input a config of its own
+// op at a built world, an exact table's moving nothing quantized; every op inputs in each table at
+// every built world; every kernel a config for each encoding it builds (an INT4 build's may be an
+// exact config's, moved INT4, where that build is listed).
+inline std::optional<std::string> check(const TunedTable& table) {
   const auto mode_name = [](Mode m) { return m == Mode::exact ? "exact" : "quantized"; };
-  for (size_t i = 0; i < points.size(); ++i) {
-    const TunedPoint& p = points[i];
+  const std::vector<TunedConfig>& configs = table.configs;
+  for (size_t i = 0; i < configs.size(); ++i) {
+    const TunedConfig& c = configs[i];
     const auto named = [&](const char* why) {
-      return "point " + std::to_string(i) + " (" + op(p.op).name + ", " + mode_name(p.mode) +
-             ", world " + std::to_string(p.world) + ", " + std::to_string(p.hidden) + " wide, " +
-             std::to_string(p.tokens) + " tokens, " + info(p.fn).name + "): " + why;
+      return "config " + std::to_string(i) + " (" + info(c.fn).name + "): " + why;
     };
-    if (op_of(p.fn) != p.op) return named("the kernel is another op's");
+    if (c.config.build.index() != family_of(c.fn) || !built(c.fn, c.config.build))
+      return named("its build is not one its kernel lists");
+    if (!launch_fits(c.fn, c.config.launch)) return named("its grid is out of range");
+    if (c.fn == Template::all_reduce_push_one_shot &&
+        c.config.launch.blocks_per_grid > kLineBlocks)
+      return named("the LL push's grid is past its lines' blocks");
+  }
+  for (size_t i = 0; i < table.inputs.size(); ++i) {
+    const TunedInput& p = table.inputs[i];
+    const auto named = [&](const char* why) {
+      return "input " + std::to_string(i) + " (" + op(p.op).name + ", " + mode_name(p.mode) +
+             ", world " + std::to_string(p.world) + ", " + std::to_string(p.hidden) + " wide, " +
+             std::to_string(p.tokens) + " tokens): " + why;
+    };
+    if (p.config < 0 || p.config >= static_cast<int>(configs.size()))
+      return named("it names no config");
+    const TunedConfig& c = configs[p.config];
+    if (op_of(c.fn) != p.op) return named("its config's kernel is another op's");
     if (!world_built(p.world)) return named("its world is not built");
     if (p.hidden < 1 || p.tokens < 1) return named("no width or no tokens");
-    if (p.config.build.index() != family_of(p.fn) || !built(p.fn, p.config.build))
-      return named("its build is not one its kernel lists");
-    if (!launch_fits(p.fn, p.config.launch)) return named("its grid is out of range");
-    if (p.fn == Template::all_reduce_push_one_shot &&
-        p.config.launch.blocks_per_grid > kLineBlocks)
-      return named("the LL push's grid is past its lines' blocks");
-    if (p.mode == Mode::exact && quantization_of(p.config.build) != Quantization::none)
-      return named("a point of the exact table moves INT4");
+    if (p.mode == Mode::exact && quantization_of(c.config.build) != Quantization::none)
+      return named("an input of the exact table moves INT4");
   }
   for (const Op& o : kOps)
     for (const int world : kBuild.supports.worlds)
       for (const Mode mode : {Mode::exact, Mode::quantized}) {
         bool any = false;
-        for (const TunedPoint& p : points)
-          any |= p.op == o.type && p.world == world && p.mode == mode && p.pick;
+        for (const TunedInput& p : table.inputs)
+          any |= p.op == o.type && p.world == world && p.mode == mode;
         if (!any)
-          return std::string(o.name) + ": no point picks at world " + std::to_string(world) +
+          return std::string(o.name) + ": no input at world " + std::to_string(world) +
                  " in the " + mode_name(mode) + " table";
       }
   for (const TemplateInfo& t : kTemplates)
-    for (const int world : kBuild.supports.worlds)
-      for (const int q : {Quantization::none, Quantization::int4}) {
-        bool builds_it = false;
-        for (const BuildConfig& b : t.builds) builds_it |= quantization_of(b) == q;
-        bool has = false;
-        for (const TunedPoint& p : points)
-          has |= p.fn == t.fn && p.world == world &&
-                 (quantization_of(p.config.build) == q ||
-                  (q == Quantization::int4 && built(t.fn, quantized(p.config.build, q))));
-        if (builds_it && !has)
-          return std::string(t.name) + ": no config at world " + std::to_string(world) +
-                 (q == Quantization::int4 ? " moving INT4" : " exact");
-      }
+    for (const int q : {Quantization::none, Quantization::int4}) {
+      bool builds_it = false;
+      for (const BuildConfig& b : t.builds) builds_it |= quantization_of(b) == q;
+      bool has = false;
+      for (const TunedConfig& c : configs)
+        has |= c.fn == t.fn &&
+               (quantization_of(c.config.build) == q ||
+                (q == Quantization::int4 && built(t.fn, quantized(c.config.build, q))));
+      if (builds_it && !has)
+        return std::string(t.name) + ": no config" +
+               (q == Quantization::int4 ? " moving INT4" : " exact");
+    }
   return std::nullopt;
 }
 

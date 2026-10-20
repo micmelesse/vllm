@@ -527,8 +527,8 @@ class Handle {
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
          int64_t staging_bytes, int64_t partials_bytes,
          int quantization, LogMode log_mode, int rccl_ready,
-         std::vector<TunedPoint> points)
-      : points_(std::move(points)),
+         TunedTable table)
+      : table_(std::move(table)),
         rank_(rank),
         world_size_(world_size),
         device_(device),
@@ -704,9 +704,9 @@ class Handle {
   int64_t partials_bytes() const { return partials_bytes_; }
   // What the tuned path moves across the links, a Quantization.
   int quantization() const { return quantization_; }
-  // THE TUNED POINTS this communicator selects from (types.cuh's TunedPoint), checked at open,
-  // and the table its plain calls read: the quantized one where it quantizes.
-  const std::vector<TunedPoint>& points() const { return points_; }
+  // THE TUNED TABLE this communicator selects from (types.cuh's TunedTable), checked at open,
+  // and the mode its plain calls read: the quantized one where it quantizes.
+  const TunedTable& table() const { return table_; }
   Mode mode() const { return quantization_ == Quantization::int4 ? Mode::quantized : Mode::exact; }
   // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (config.cuh's
   // Algorithm::split), written by its plain all-reduce and read by its own
@@ -1334,8 +1334,8 @@ class Handle {
     return i;
   }
 
-  // THE TUNED POINTS (points()), first: open checks them before anything is made.
-  std::vector<TunedPoint> points_;
+  // THE TUNED TABLE (table()), first: open checks it before anything is made.
+  TunedTable table_;
   int rank_;
   int world_size_;
   int device_;
