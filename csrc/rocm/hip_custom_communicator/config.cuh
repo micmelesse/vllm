@@ -439,21 +439,22 @@ struct TunedKernel {
 // capture size between: 40 x 7168 on the 32-row entry's 56 blocks lost, 10.2 against 9.1 us
 // (run 2026-10-20T04-03-15Z); 20 and 28 x 3584 on the 16 and 24 rows' grids, 1.20 (04-19-17Z).
 constexpr TunedKernel kAllReduceKernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
-     Template::all_reduce_pull_one_shot,
-     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
+     Template::all_reduce_push_one_shot,
+     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
     {8,
      1,
      3584,
      Template::all_reduce_push_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {56, 0}}},
     {8,
-     1,
+     2,
      3584,
-     Template::all_reduce_push_one_shot,
-     {AllReduceBuildConfig{256, 1, 1, 1024}, {kLineBlocks, 0}}},
+     Template::all_reduce_pull_one_shot,
+     {AllReduceBuildConfig{128, 1, 1, 1024}, {32, 0}}},
     {8,
      4,
      3584,
@@ -524,6 +525,7 @@ constexpr TunedKernel kAllReduceKernels[] = {
      3584,
      Template::all_reduce_pull_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512}, {72, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
@@ -903,26 +905,33 @@ static_assert(push_one_shot_tiles_fit(),
 // At 3584 the push from 9 tokens: 16 x 3584 8.45 against the one-shot's 9.43 us (aiter's fused
 // 10.41), the one-shot still ahead at 8 (8.22 against 8.34; sweep 2026-10-20T04-45-54Z).
 constexpr TunedKernel kRmsNormKernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
      Template::all_reduce_pull_one_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
     {8,
-     1,
-     3584,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
-    {8,
      9,
      3584,
      Template::all_reduce_push_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
     {8,
-     257,
+     256,
+     3584,
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
+    {8,
+     1024,
      3584,
      Template::all_reduce_pull_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
+    {8,
+     1,
+     7168,
+     Template::all_reduce_push_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
     {8,
      1,
      7168,
@@ -931,26 +940,18 @@ constexpr TunedKernel kRmsNormKernels[] = {
     {8,
      1,
      7168,
-     Template::all_reduce_pull_split_rms_norm,
-     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
+     Template::all_reduce_pull_two_shot_rms_norm,
+     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
     {8,
      10,
      7168,
      Template::all_reduce_push_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 32 blocks through 2048 tokens (512 / 1024 / 2048: 52.4 / 88.9 / 160.6 against 54.9 / 91.0
-    // / 165.5 us on 48; more blocks lose, 61.4 / 137.5 at 128: 2026-10-18T10-26-41Z, 10-14-39Z),
-    // 48 from 4096 (not swept since).
     {8,
-     257,
+     256,
      7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {32, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_rms_norm,
-     {AllReduceRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+     Template::all_reduce_pull_split_rms_norm,
+     {AllReduceRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
     // PAST THE MODEL'S WIDTHS, to the widest build: the one-shot, its grid the
     // 8192's; not swept.
     {8,
@@ -1078,26 +1079,38 @@ constexpr TunedKernel kRmsNormKernels[] = {
 // against the pull's 22.5 / 35.3 us) and 256 at 7168 (128 / 256: 18.4 / 32.0
 // against 24.3 / 36.2; 2026-10-18T10-14-39Z).
 constexpr TunedKernel kAddRmsNormKernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
      Template::all_reduce_pull_one_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {16, 0}}},
     {8,
-     1,
+     16,
      3584,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
+     Template::all_reduce_push_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
     {8,
      19,
      3584,
      Template::all_reduce_push_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {256, 0}}},
     {8,
-     513,
+     256,
+     3584,
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096}, {8192, 0}}},
+    {8,
+     8192,
      3584,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096}, {48, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
+    {8,
+     1,
+     7168,
+     Template::all_reduce_push_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
     {8,
      1,
      7168,
@@ -1106,25 +1119,18 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
     {8,
      1,
      7168,
-     Template::all_reduce_pull_split_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
+     Template::all_reduce_pull_two_shot_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
     {8,
      10,
      7168,
      Template::all_reduce_push_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {256, 0}}},
-    // 40 blocks through 2048 tokens (512 / 1024 / 2048: 58.3 / 99.2 / 173.5 against 60.1 / 102.8
-    // / 175.8 us on 48; 2026-10-18T10-26-41Z), 48 from 4096 (not swept since).
     {8,
-     257,
+     256,
      7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {40, 0}}},
-    {8,
-     4096,
-     7168,
-     Template::all_reduce_pull_two_shot_add_rms_norm,
-     {AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192}, {48, 0}}},
+     Template::all_reduce_pull_split_add_rms_norm,
+     {AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192}, {8192, 0}}},
     // Past the model's widths, as rms_norm's.
     {8,
      1,
@@ -1251,21 +1257,22 @@ constexpr TunedKernel kAddRmsNormKernels[] = {
 // at 3584, 21.8 / 34.1 against 22.3 / 36.9 at 7168, and the 256-thread TILE_K 3 pull
 // at 256 x 7168 (36.3) (2026-10-18T10-14-39Z, 10-08-46Z).
 constexpr TunedKernel kAttnResKernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
-     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
+     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
     {8,
      1,
      3584,
      Template::all_reduce_pull_split_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1}, {8192, 0}}},
     {8,
-     1,
+     16,
      3584,
-     Template::all_reduce_pull_one_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {16, 0}}},
+     Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1}, {256, 0}}},
     {8,
      128,
      3584,
@@ -1276,16 +1283,12 @@ constexpr TunedKernel kAttnResKernels[] = {
      3584,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3}, {256, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
      Template::all_reduce_push_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
-    {8,
-     1,
-     7168,
-     Template::all_reduce_pull_split_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
     {8,
      1,
      7168,
@@ -1297,15 +1300,10 @@ constexpr TunedKernel kAttnResKernels[] = {
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1}, {256, 0}}},
     {8,
-     512,
+     256,
      7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {256, 0}}},
-    {8,
-     1024,
-     7168,
-     Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
-     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {192, 0}}},
+     Template::all_reduce_pull_split_add_attn_res_rms_norm,
+     {AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1}, {8192, 0}}},
     // Explicit world 2/4 defaults inherit world-eight configs and grids.
     {2,
      1,
@@ -1480,6 +1478,7 @@ constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world
 // 212.7 on 96 and 229.2 on 64; 1024 x 3584 26.3 against the best, 80, 26.0). The exact
 // list's grids (72-120) had left it 1.10-1.19x QuickReduce INT4's.
 constexpr TunedKernel kAllReduceInt4Kernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
@@ -1490,6 +1489,7 @@ constexpr TunedKernel kAllReduceInt4Kernels[] = {
      3584,
      Template::all_reduce_push_two_shot,
      {AllReduceBuildConfig{512, 1, 1, 512, Quantization::int4}, {128, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
@@ -1555,6 +1555,7 @@ constexpr TunedKernel kAllReduceInt4Kernels[] = {
 // 136.1 / 260.3 against 45.4 / 68.4 / 98.2 / 154.8 / 265.9 and QR's 51.3 / 79.2 / 139.4 / 240.0 /
 // 450.9. The fused INT4 pull is no longer listed (a forced call runs it at its build and grid).
 constexpr TunedKernel kRmsNormInt4Kernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
@@ -1565,6 +1566,7 @@ constexpr TunedKernel kRmsNormInt4Kernels[] = {
      3584,
      Template::all_reduce_pull_two_shot_rms_norm,
      {AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
@@ -1613,6 +1615,7 @@ constexpr TunedKernel kRmsNormInt4Kernels[] = {
      {AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4}, {8192, 0}}},
 };
 constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
@@ -1623,6 +1626,7 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
      3584,
      Template::all_reduce_pull_two_shot_add_rms_norm,
      {AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4}, {48, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
@@ -1684,6 +1688,7 @@ constexpr TunedKernel kAddRmsNormInt4Kernels[] = {
 // grids were 512 blocks of 128 threads TILE_K 3 at 3584 (1024 at 2048-4096 tokens) and 512 / 256
 // (from 4096 tokens) of 256 at 7168 (2026-10-18T07-50-18Z, 13-15-40Z).
 constexpr TunedKernel kAttnResInt4Kernels[] = {
+    // world 8, 3584 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      3584,
@@ -1694,6 +1699,7 @@ constexpr TunedKernel kAttnResInt4Kernels[] = {
      3584,
      Template::all_reduce_pull_two_shot_add_attn_res_rms_norm,
      {AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4}, {48, 0}}},
+    // world 8, 7168 wide: gp bench tune, run 2026-10-20T11-02-39Z
     {8,
      1,
      7168,
