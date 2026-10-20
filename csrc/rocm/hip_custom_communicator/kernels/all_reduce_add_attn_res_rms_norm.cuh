@@ -77,31 +77,32 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   // 2. Each of this block's rows: read it from every rank in rank order, sum,
   //    AttnRes.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (attn_res.cuh's attn_res_wide): its chunks in passes, the sum's
+    // A ROW WIDER THAN THE TILE (attn_res.cuh's WideRow): its chunks in passes, the sum's
     // chunk read once, in the first.
     if (input_size_n > TILE_N) {
-      attn_res_wide<TILE_K, THREADS_PER_BLOCK, Layout::tile, DTYPE, 1, kPacks, kPackElems>(
-          [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
-            DTYPE peers[WORLD][1][kPacks][kPackElems];
-            for (int r = 0; r < WORLD; ++r)
-              recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], row, col, 1);
+      const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
+        DTYPE peers[WORLD][1][kPacks][kPackElems];
+        for (int r = 0; r < WORLD; ++r)
+          recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], row, col, 1);
 #pragma unroll
-            for (int k = 0; k < kPacks; ++k)
+        for (int k = 0; k < kPacks; ++k)
 #pragma unroll
-              for (int j = 0; j < kPackElems; ++j) {
-                float acc = static_cast<float>(peers[0][0][k][j]);
+          for (int j = 0; j < kPackElems; ++j) {
+            float acc = static_cast<float>(peers[0][0][k][j]);
 #pragma unroll
-                for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
-                sum[0][k][j] = static_cast<DTYPE>(acc);
-              }
-          },
-          TILE_N,
+            for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][0][k][j]);
+            sum[0][k][j] = static_cast<DTYPE>(acc);
+          }
+      };
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+          WideRow<DTYPE, 1, kPacks, kPackElems, std::remove_cvref_t<decltype(sum_chunk)>>{sum_chunk, TILE_N},
           prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
-          qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
-          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-          output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
-          block_output_stride_n, input_size_m, input_size_n, row, num_blocks, eps, output_eps, inv_hidden);
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
+          qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
+          output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
+          prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
+          block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
+          input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden);
       continue;
     }
     DTYPE peers[WORLD][1][kPacks][kPackElems];
@@ -233,7 +234,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
-    const int n_pad = static_cast<int>(int4_groups(n)) * kInt4Group;
+    const int n_pad = (n + kInt4Group - 1) / kInt4Group * kInt4Group;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
@@ -342,16 +343,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int k = 0; k < kInt4GroupPacks; ++k)
             dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
         };
-        if (n > TILE_N) {  // a row wider than the tile (attn_res.cuh's attn_res_wide)
-          attn_res_wide<TILE_K, THREADS_PER_BLOCK, Layout::group_run, DTYPE, 1, kInt4GroupPacks,
-                        kPackElems>(
-              sum_chunk, TILE_N, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr,
-              blocks_stride_m, blocks_stride_r, blocks_stride_n, norm_weight_ptr,
-              norm_weight_stride_n, qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
+        if (n > TILE_N) {  // a row wider than the tile (attn_res.cuh's WideRow)
+          attn_res<TILE_K, THREADS_PER_BLOCK, Layout::group_run>(
+              WideRow<DTYPE, 1, kInt4GroupPacks, kPackElems, std::remove_cvref_t<decltype(sum_chunk)>>{sum_chunk, TILE_N},
+              prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+              blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
+              qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
               output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
               prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
               block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m, n,
-              owner * slice_m + l, num_blocks, eps, output_eps, inv_hidden);
+              owner * slice_m + l, 0, num_blocks, eps, output_eps, inv_hidden);
           continue;
         }
         uint32_t raw[1][kInt4GroupPacks][2];
@@ -414,23 +415,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
     for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
       const int offs_m = t * TILE_M;
-        // A ROW WIDER THAN THE TILE (attn_res.cuh's attn_res_wide): its chunks in passes, the sum's
+        // A ROW WIDER THAN THE TILE (attn_res.cuh's WideRow): its chunks in passes, the sum's
       // chunk read once, in the first.
       if (input_size_n > TILE_N) {
-        attn_res_wide<TILE_K, THREADS_PER_BLOCK, Layout::tile, DTYPE, TILE_M, kPacks, kPackElems>(
-            [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
-              all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows>(
-                  partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
-                  partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m,
-                  col, slice_n, rank);
-            },
-            TILE_N,
-          prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
-          qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
-          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-          output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
-          block_output_stride_n, input_size_m, input_size_n, offs_m, num_blocks, eps, output_eps, inv_hidden);
+        const auto sum_chunk = [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
+          all_gather<DTYPE, WORLD, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows>(
+              partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
+              partials_size_m, partials_size_n, sum, 0, 0, input_size_m, input_size_n, offs_m,
+              col, slice_n, rank);
+        };
+        attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+            WideRow<DTYPE, TILE_M, kPacks, kPackElems, std::remove_cvref_t<decltype(sum_chunk)>>{sum_chunk, TILE_N},
+            prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
+            blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
+            qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
+            output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
+            prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
+            block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
+            input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
         continue;
       }
       DTYPE sum[TILE_M][kPacks][kPackElems];
@@ -542,20 +544,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   //    peer's next kernel starts only once this one has finished).
   //    int4: its INT4 payload, worked out from the partials' own sizes by load.
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (attn_res.cuh's attn_res_wide): its chunks in passes, the sum's
+    // A ROW WIDER THAN THE TILE (attn_res.cuh's WideRow): its chunks in passes, the sum's
     // chunk read once, in the first.
     if (input_size_n > TILE_N) {
-      attn_res_wide<TILE_K, THREADS_PER_BLOCK, Layout::tile, DTYPE, 1, kPacks, kPackElems>(
-          [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
-            load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, col, 1);
-          },
-          TILE_N,
+      const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kPacks][kPackElems]) {
+        load<WORLD, 1, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile>(partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m, partials_stride_n, 1, partials_size_m, partials_size_n, input_size_m, input_size_n, sum, row, col, 1);
+      };
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+          WideRow<DTYPE, 1, kPacks, kPackElems, std::remove_cvref_t<decltype(sum_chunk)>>{sum_chunk, TILE_N},
           prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
-          qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
-          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-          output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
-          block_output_stride_n, input_size_m, input_size_n, row, num_blocks, eps, output_eps, inv_hidden);
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
+          qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
+          output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
+          prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
+          block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
+          input_size_n, row, 0, num_blocks, eps, output_eps, inv_hidden);
       continue;
     }
     DTYPE sum[1][kPacks][kPackElems];
@@ -622,22 +625,23 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t * TILE_M;
-    // A ROW WIDER THAN THE TILE (attn_res.cuh's attn_res_wide): its chunks in passes, the sum's
+    // A ROW WIDER THAN THE TILE (attn_res.cuh's WideRow): its chunks in passes, the sum's
     // chunk read once, in the first.
     if (input_size_n > TILE_N) {
-      attn_res_wide<TILE_K, THREADS_PER_BLOCK, Layout::tile, DTYPE, TILE_M, kPacks, kPackElems>(
-          [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
-            load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
-                &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
-                input_size_n, input_size_m, input_size_n, sum, offs_m, col, 1);
-          },
-          TILE_N,
+      const auto sum_chunk = [&](int col, DTYPE (&sum)[TILE_M][kPacks][kPackElems]) {
+        load<1, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(
+            &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m,
+            input_size_n, input_size_m, input_size_n, sum, offs_m, col, 1);
+      };
+      attn_res<TILE_K, THREADS_PER_BLOCK, Layout::tile>(
+          WideRow<DTYPE, TILE_M, kPacks, kPackElems, std::remove_cvref_t<decltype(sum_chunk)>>{sum_chunk, TILE_N},
           prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
-          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n, qk_weight_ptr,
-          qk_weight_stride_n, output_norm_weight_ptr, output_norm_weight_stride_n,
-          prefix_output_ptr, prefix_output_stride_m, prefix_output_stride_n, output_ptr,
-          output_stride_m, output_stride_n, block_output_ptr, block_output_stride_m,
-          block_output_stride_n, input_size_m, input_size_n, offs_m, num_blocks, eps, output_eps, inv_hidden);
+          blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
+          qk_weight_ptr, qk_weight_stride_n, output_norm_weight_ptr,
+          output_norm_weight_stride_n, prefix_output_ptr, prefix_output_stride_m,
+          prefix_output_stride_n, output_ptr, output_stride_m, output_stride_n,
+          block_output_ptr, block_output_stride_m, block_output_stride_n, input_size_m,
+          input_size_n, offs_m, 0, num_blocks, eps, output_eps, inv_hidden);
       continue;
     }
     DTYPE sum[TILE_M][kPacks][kPackElems];

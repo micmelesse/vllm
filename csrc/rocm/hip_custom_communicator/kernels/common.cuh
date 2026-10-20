@@ -199,12 +199,12 @@ template <int THREAD_PACKS, typename T, int P>
 DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREAD_PACKS],
                       float& scale);
 
+namespace internal {
+
 // A ROW OF n ELEMENTS' INT4 GROUPS, the last short where n is not whole groups.
 __host__ __device__ constexpr int64_t int4_groups(int64_t n) {
   return (n + kInt4Group - 1) / kInt4Group;
 }
-
-namespace internal {
 
 // AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
 // (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a

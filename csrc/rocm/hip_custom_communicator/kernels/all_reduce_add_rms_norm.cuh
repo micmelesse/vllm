@@ -61,7 +61,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       rank, timeout_ticks, Until::started, 0);
 
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its chunks in two passes, the scale's
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its chunks in two passes, the scale's
     // and the norm's, every chunk's values read again in the second.
     if (input_size_n > TILE_N) {
       const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
@@ -79,8 +79,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           }
       };
       float scale[1];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-          input_size_n, TILE_N, eps, inv_hidden, values, scale);
+      for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = values;
+        for (int c = 0; c < input_size_n; c += TILE_N) {
+          float s[1][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[1][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         values(c, s);
@@ -172,7 +182,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       rank, timeout_ticks, Until::started, 0);
 
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its chunks in two passes, the scale's
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its chunks in two passes, the scale's
     // and the norm's, every chunk's values read again in the second.
     if (input_size_n > TILE_N) {
       // The sum and the residual (`added`, the new residual, for the second pass to write).
@@ -205,8 +215,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         values(c, s, added);
       };
       float scale[1];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-          input_size_n, TILE_N, eps, inv_hidden, scale_values, scale);
+      for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = scale_values;
+        for (int c = 0; c < input_size_n; c += TILE_N) {
+          float s[1][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[1][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         DTYPE added[1][kPacks][kPackElems];
@@ -374,7 +394,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // PING-PONG: two buffers that trade roles each row, so no row copies its
     // packs into the other (a copy cost 32 moves a row at one pack a thread: ISA
     // 2026-10-01T00-58-37Z).
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its chunks in two passes, every
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its chunks in two passes, every
     // peer's read again in the second; no ping-pong.
     if (input_size_n > TILE_N) {
       for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
@@ -393,8 +413,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             }
         };
         float scale[1];
-        wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-            input_size_n, TILE_N, eps, inv_hidden, values, scale);
+        for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+        {
+          const auto chunk = values;
+          for (int c = 0; c < input_size_n; c += TILE_N) {
+            float s[1][kPacks][kPackElems];
+            chunk(c, s);
+            WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+            DTYPE wide_out[1][kPacks][kPackElems];
+            rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                        NormPart::wide, true, Layout::tile);
+          }
+        }
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           values(c, s);
@@ -454,7 +484,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
-    const int n_pad = static_cast<int>(int4_groups(n)) * kInt4Group;
+    const int n_pad = (n + kInt4Group - 1) / kInt4Group * kInt4Group;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
@@ -513,7 +543,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::group_run>(
         &weight_ptr, 1, 0, 0, 0, 0, weight_stride_n, 1, 1, n, 1, n, w, 0, 0, 1);
     // THE ROW'S VALUES FROM COLUMN c: every writer's group, from this rank's inbox (slots rotated
-    // from this rank's), summed (a wide row's chunk: rms_norm.cuh's wide_scale).
+    // from this rank's), summed (a wide row's chunk: rms_norm.cuh's NormPart::wide).
     const auto values = [&](int l, int c, float (&s)[1][kInt4GroupPacks][kPackElems]) {
       uint32_t got[WORLD][1][kInt4GroupPacks][2];
       load<WORLD, 1, THREADS_PER_BLOCK, Quantization::int4, Layout::group_run>(
@@ -531,9 +561,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if (n > TILE_N)
       for (int l = blockIdx.x; l < rows_of(rank); l += grid) {
         float scale[1];
-        wide_scale<THREADS_PER_BLOCK, Layout::group_run, 1, kInt4GroupPacks, kPackElems>(
-            n, TILE_N, eps, inv_hidden,
-            [&](int c, float (&s)[1][kInt4GroupPacks][kPackElems]) { values(l, c, s); }, scale);
+        for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+        {
+          const auto chunk = [&](int c, float (&s)[1][kInt4GroupPacks][kPackElems]) { values(l, c, s); };
+          for (int c = 0; c < n; c += TILE_N) {
+            float s[1][kInt4GroupPacks][kPackElems];
+            chunk(c, s);
+            WEIGHT_DTYPE wide_w[1][kInt4GroupPacks][kPackElems];
+            DTYPE wide_out[1][kInt4GroupPacks][kPackElems];
+            rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+                                        NormPart::wide, true, Layout::group_run);
+          }
+        }
         for (int c = 0; c < n; c += TILE_N) {
           float s[1][kInt4GroupPacks][kPackElems];
           values(l, c, s);
@@ -733,7 +772,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // PING-PONG: two buffers that trade roles each row, so no row copies its
     // packs into the other (a copy cost 32 moves a row at one pack a thread: ISA
     // 2026-10-01T00-58-37Z).
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its scale over its chunks, then the
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its scale over its chunks, then the
     // new residual written chunk by chunk, every peer's read again; no ping-pong.
     if (input_size_n > TILE_N) {
       for (int row = first + blockIdx.x; row < last; row += gridDim.x) {
@@ -766,8 +805,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           values(c, s, added);
         };
         float scale[1];
-        wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-            input_size_n, TILE_N, eps, inv_hidden, scale_values, scale);
+        for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+        {
+          const auto chunk = scale_values;
+          for (int c = 0; c < input_size_n; c += TILE_N) {
+            float s[1][kPacks][kPackElems];
+            chunk(c, s);
+            WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+            DTYPE wide_out[1][kPacks][kPackElems];
+            rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                        NormPart::wide, true, Layout::tile);
+          }
+        }
         for (int c = 0; c < input_size_n; c += TILE_N) {
           float s[1][kPacks][kPackElems];
           DTYPE added[1][kPacks][kPackElems];
@@ -843,7 +892,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
-    const int n_pad = static_cast<int>(int4_groups(n)) * kInt4Group;
+    const int n_pad = (n + kInt4Group - 1) / kInt4Group * kInt4Group;
     const float inv_hidden = 1.0f / static_cast<float>(n);
     const int slice_m = (input_size_m + WORLD - 1) / WORLD;
     const int slice = slice_m * n_pad;  // a rank's rows, flat: its slot of an inbox
@@ -927,16 +976,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     };
     if (n > TILE_N)
       for (int l = blockIdx.x; l < rows_of(rank); l += grid) {
-        // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its scale over its chunks, then
+        // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its scale over its chunks, then
         // the new residual, chunk by chunk.
         float scale[1];
-        wide_scale<THREADS_PER_BLOCK, Layout::group_run, 1, kInt4GroupPacks, kPackElems>(
-            n, TILE_N, eps, inv_hidden,
-            [&](int c, float (&s)[1][kInt4GroupPacks][kPackElems]) {
-              DTYPE added[1][kInt4GroupPacks][kPackElems];
-              values(l, c, s, added);
-            },
-            scale);
+        for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+        {
+          const auto chunk = [&](int c, float (&s)[1][kInt4GroupPacks][kPackElems]) {
+                      DTYPE added[1][kInt4GroupPacks][kPackElems];
+                      values(l, c, s, added);
+                    };
+          for (int c = 0; c < n; c += TILE_N) {
+            float s[1][kInt4GroupPacks][kPackElems];
+            chunk(c, s);
+            WEIGHT_DTYPE wide_w[1][kInt4GroupPacks][kPackElems];
+            DTYPE wide_out[1][kInt4GroupPacks][kPackElems];
+            rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+                                        NormPart::wide, true, Layout::group_run);
+          }
+        }
         for (int c = 0; c < n; c += TILE_N) {
           float s[1][kInt4GroupPacks][kPackElems];
           DTYPE added[1][kInt4GroupPacks][kPackElems];
@@ -1127,7 +1184,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       status_ptr, status_stride_field, status_size_field, 0, rank, timeout_ticks);
 
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its chunks of the partials (the whole
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its chunks of the partials (the whole
     // sum, every rank's columns) in two passes.
     if (input_size_n > TILE_N) {
       const auto values = [&](int c, float (&s)[1][kPacks][kPackElems]) {
@@ -1139,8 +1196,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int j = 0; j < kPackElems; ++j) s[0][k][j] = static_cast<float>(own[0][k][j]);
       };
       float scale[1];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-          input_size_n, TILE_N, eps, inv_hidden, values, scale);
+      for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = values;
+        for (int c = 0; c < input_size_n; c += TILE_N) {
+          float s[1][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[1][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         values(c, s);
@@ -1233,7 +1300,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       status_ptr, status_stride_field, status_size_field, 0, rank, timeout_ticks);
 
   for (int row = blockIdx.x; row < input_size_m; row += gridDim.x) {
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): its chunks of the partials and the
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): its chunks of the partials and the
     // residual in two passes, the second writing the new residual.
     if (input_size_n > TILE_N) {
       const auto values = [&](int c, float (&s)[1][kPacks][kPackElems],
@@ -1251,13 +1318,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           }
       };
       float scale[1];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, 1, kPacks, kPackElems>(
-          input_size_n, TILE_N, eps, inv_hidden,
-          [&](int c, float (&s)[1][kPacks][kPackElems]) {
-            DTYPE added[1][kPacks][kPackElems];
-            values(c, s, added);
-          },
-          scale);
+      for (int m = 0; m < 1; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = [&](int c, float (&s)[1][kPacks][kPackElems]) {
+                  DTYPE added[1][kPacks][kPackElems];
+                  values(c, s, added);
+                };
+        for (int c = 0; c < input_size_n; c += TILE_N) {
+          float s[1][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[1][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, input_size_n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < input_size_n; c += TILE_N) {
         float s[1][kPacks][kPackElems];
         DTYPE added[1][kPacks][kPackElems];
@@ -1338,7 +1413,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t * TILE_M;
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): the tile's rows' chunks in two passes.
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): the tile's rows' chunks in two passes.
     if (n > TILE_N) {
       const auto values = [&](int c, float (&s)[TILE_M][kPacks][kPackElems]) {
         DTYPE x[TILE_M][kPacks][kPackElems];
@@ -1352,8 +1427,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             for (int j = 0; j < kPackElems; ++j) s[i][k][j] = static_cast<float>(x[i][k][j]);
       };
       float scale[TILE_M];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, TILE_M, kPacks, kPackElems>(n, TILE_N, eps,
-                                                                              inv_hidden, values, scale);
+      for (int m = 0; m < TILE_M; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = values;
+        for (int c = 0; c < n; c += TILE_N) {
+          float s[TILE_M][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[TILE_M][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < n; c += TILE_N) {
         float s[TILE_M][kPacks][kPackElems];
         values(c, s);
@@ -1413,7 +1498,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   const int tiles = (m + TILE_M - 1) / TILE_M;
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int offs_m = t * TILE_M;
-    // A ROW WIDER THAN THE TILE (rms_norm.cuh's wide_scale): the tile's rows' chunks in two passes,
+    // A ROW WIDER THAN THE TILE (rms_norm.cuh's NormPart::wide): the tile's rows' chunks in two passes,
     // the second writing the new residual.
     if (n > TILE_N) {
       const auto values = [&](int c, float (&s)[TILE_M][kPacks][kPackElems],
@@ -1436,13 +1521,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             }
       };
       float scale[TILE_M];
-      wide_scale<THREADS_PER_BLOCK, Layout::tile, TILE_M, kPacks, kPackElems>(
-          n, TILE_N, eps, inv_hidden,
-          [&](int c, float (&s)[TILE_M][kPacks][kPackElems]) {
-            DTYPE added[TILE_M][kPacks][kPackElems];
-            values(c, s, added);
-          },
-          scale);
+      for (int m = 0; m < TILE_M; ++m) scale[m] = 0.0f;
+      {
+        const auto chunk = [&](int c, float (&s)[TILE_M][kPacks][kPackElems]) {
+                  DTYPE added[TILE_M][kPacks][kPackElems];
+                  values(c, s, added);
+                };
+        for (int c = 0; c < n; c += TILE_N) {
+          float s[TILE_M][kPacks][kPackElems];
+          chunk(c, s);
+          WEIGHT_DTYPE wide_w[1][kPacks][kPackElems];
+          DTYPE wide_out[TILE_M][kPacks][kPackElems];
+          rms_norm<THREADS_PER_BLOCK>(s, scale, wide_w, wide_out, eps, inv_hidden, n, c,
+                                      NormPart::wide, true, Layout::tile);
+        }
+      }
       for (int c = 0; c < n; c += TILE_N) {
         float s[TILE_M][kPacks][kPackElems];
         DTYPE added[TILE_M][kPacks][kPackElems];
