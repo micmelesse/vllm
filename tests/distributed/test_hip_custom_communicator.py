@@ -498,9 +498,9 @@ def _should(comm: HipCustomCommunicator, op: Op, x: torch.Tensor, args: Args) ->
 def _forced(
     template: str, cols: int = 0, quantization: Quantization = "none"
 ) -> Forced | None:
-    """`template` forced whole: its algorithm and direction, its first build moving
-    `quantization` whose tile holds `cols` columns, and a fixed launch. None when
-    no build's tile holds them."""
+    """`template` forced whole: the kernel by its name, its first build moving
+    `quantization` whose tile holds `cols` columns, and a fixed grid. None when no
+    build's tile holds them."""
     build = next(
         (
             b
@@ -511,18 +511,7 @@ def _forced(
     )
     if build is None:
         return None
-    split = {"reduce_scatter_blocks": 0} if "attn_res" in template else {}
-    return {
-        "algorithm": next(
-            a for a in ("two_shot", "split", "one_shot") if a in template
-        ),
-        "direction": "push" if "_push_" in template else "pull",
-        **build,
-        "grid_x": 16,
-        "grid_y": 1,
-        "grid_z": 1,
-        **split,
-    }
+    return {"kernel": template, "grid_x": 16, "grid_y": 1, "grid_z": 1, **build}
 
 
 def _forced_whole(
@@ -902,7 +891,7 @@ def _int4_case(
     _assert_clean(comm, where)
     ran = comm._calls[-1].ran
     assert ran is not None and ran.quantization == "int4", f"{where}: ran {ran}"
-    assert ran.algorithm == "two_shot", f"{where}: ran {ran}"
+    assert "_two_shot" in ran.kernel, f"{where}: ran {ran}"
     for name, a, b, tolerance in checks:
         _int4_verdict(f"{where} {name}", a, b, tolerance)
 
@@ -1090,11 +1079,18 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
     for name, t in built.templates.items():
         assert t.op in built.op_names, name
         for b in t.builds:
-            assert b["block_x"] > 0 and (b["block_y"], b["block_z"]) == (1, 1), (name, b)
+            assert b["block_x"] > 0 and (b["block_y"], b["block_z"]) == (1, 1), (
+                name,
+                b,
+            )
             assert b["waves_per_eu"] >= 1, (name, b)
             assert b["tile_m"] >= 1 and b["tile_n"] > 0, (name, b)
             assert b["quantization"] in get_args(Quantization), (name, b)
-            assert not {"grid_x", "grid_y", "grid_z", "reduce_scatter_blocks"} & b.keys()
+            assert not {"grid_x", "grid_y", "grid_z"} & b.keys()
+            assert b["tile_k"] >= 1 and ("attn_res" in name or b["tile_k"] == 1), (
+                name,
+                b,
+            )
         exact = [b for b in t.builds if b["quantization"] == "none"]
         int4 = [b for b in t.builds if b["quantization"] == "int4"]
         assert exact, name
@@ -1113,7 +1109,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
 
 def test_the_tuned_table_is_the_arch_file() -> None:
     """The arch's tuned table (`hip_custom_communicator.json`) is what open takes:
-    every op's configs, 13 integers each, and its inputs, 6 each, every input's
+    every op's configs, 12 integers each, and its inputs, 6 each, every input's
     config one of the configs; an arch the table has no configs on has none, named."""
     import vllm._rocm_C  # noqa: F401
 
@@ -1121,8 +1117,8 @@ def test_the_tuned_table_is_the_arch_file() -> None:
     table = tuned_table(raw, "gfx950")
     assert not isinstance(table, str), table
     configs, inputs = table
-    assert configs and len(configs) % 13 == 0 and inputs and len(inputs) % 6 == 0
-    assert all(0 <= i < len(configs) // 13 for i in inputs[5::6])
+    assert configs and len(configs) % 12 == 0 and inputs and len(inputs) % 6 == 0
+    assert all(0 <= i < len(configs) // 12 for i in inputs[5::6])
     assert isinstance(tuned_table(raw, "gfx0"), str)
 
 
@@ -1164,27 +1160,8 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
 
 
 def _is_config(ran: Ran | Error | None, config: dict[str, str | int]) -> bool:
-    """`ran` is `config`: its kernel (template), what it moves, its build and launch."""
-    if not isinstance(ran, Ran):
-        return False
-    return (
-        f"all_reduce_{ran.direction}_{ran.algorithm}" == config["kernel"]
-        and ran.quantization == config["quantization"]
-        and all(
-            getattr(ran, f) == config[f]
-            for f in (
-                "block_x",
-                "block_y",
-                "block_z",
-                "waves_per_eu",
-                "tile_m",
-                "tile_n",
-                "grid_x",
-                "grid_y",
-                "grid_z",
-            )
-        )
-    )
+    """`ran` is `config`: every field of its config point."""
+    return isinstance(ran, Ran) and all(getattr(ran, f) == v for f, v in config.items())
 
 
 def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:

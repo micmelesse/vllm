@@ -11,9 +11,10 @@ all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 
 The caller names an op and C++ picks the kernel and its launch (`select.cuh`), moving
 INT4 where the communicator's `quantization` asks; the keyword arguments an op takes
-after its own (the algorithm, the direction, every field of one build and the launch,
-all or none) are the one way to force one, for the sweep and the tests. Every one is
-passed through as it came: C++ builds the config, checks it, and answers.
+after its own (a config point in its essential order: the kernel by name, the grid, the
+block and its waves a EU, the tile, the quantization) are the one way to force one, for
+the tuner and the tests. Python fills what may be left out and refuses a partial
+forcing; C++ takes every field, checks the config, and answers.
 
 THE MEMORY (C++'s `Handle`): the communicator's arena is one allocation per rank,
 which every rank opened at open over legacy HIP IPC. Every exact call reads every
@@ -798,23 +799,23 @@ _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
 # THE TUNED TABLE AS THE FILE HOLDS IT, parsed: each op's `inputs` and `configs`.
 TunedTable = dict[str, Any]
 _INPUT_KEYS = frozenset({"mode", "world", "hidden", "tokens", "config"})
-_CONFIG_KEYS = frozenset(
-    {
-        "kernel",
-        "quantization",
-        "block_x",
-        "block_y",
-        "block_z",
-        "waves_per_eu",
-        "tile_m",
-        "tile_n",
-        "grid_x",
-        "grid_y",
-        "grid_z",
-    }
+# A CONFIG POINT'S ESSENTIAL FIELDS, in their order: the kernel, its grid, its
+# block and the block's waves a EU (__launch_bounds__), its tile (tile_k 1 where
+# the kernel has no K), then its knobs. Every config of every op carries each.
+_CONFIG_KEYS = (
+    "kernel",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+    "block_x",
+    "block_y",
+    "block_z",
+    "waves_per_eu",
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "quantization",
 )
-# AttnRes's kernels take sources a step and a reduce-scatter split besides.
-_ATTN_RES_KEYS = frozenset({"tile_k", "reduce_scatter_blocks"})
 _MODES = ("exact", "quantized")
 
 
@@ -842,28 +843,17 @@ def tuned_table(raw: TunedTable, arch: str) -> tuple[list[int], list[int]] | str
             )
         if arch not in table["configs"]:
             return f"{name} is not tuned on {arch}"
-        own = _CONFIG_KEYS | (_ATTN_RES_KEYS if "attn_res" in name else frozenset())
         arch_configs = table["configs"][arch]
         for i, c in enumerate(arch_configs):
-            if set(c) != own:
+            if list(c) != list(_CONFIG_KEYS):
                 raise ValueError(
                     f"the tuned table: {name}.configs.{arch}[{i}] has keys "
-                    f"{sorted(c)}, not {sorted(own)}"
+                    f"{list(c)}, not {list(_CONFIG_KEYS)} (in that order)"
                 )
             configs += [
                 templates.index(c["kernel"]),
-                c["block_x"],
-                c["block_y"],
-                c["block_z"],
-                c["waves_per_eu"],
-                c["tile_m"],
-                c["tile_n"],
-                c.get("tile_k", 0),
+                *(c[k] for k in _CONFIG_KEYS[1:-1]),
                 _QUANTIZATIONS.index(c["quantization"]),
-                c["grid_x"],
-                c["grid_y"],
-                c["grid_z"],
-                c.get("reduce_scatter_blocks", 0),
             ]
         for i, e in enumerate(table["inputs"]):
             if set(e) != _INPUT_KEYS:
@@ -1034,53 +1024,102 @@ _open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet(
 # number it was refused for, or -1 when it ran, then what ran.
 Answer = list[int]
 # C++'s `Algorithm`, `Direction` and `Quantization`, number for number.
-_ALGORITHMS = ("one_shot", "two_shot", "split")
-_DIRECTIONS = ("pull", "push")
 _QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
+# A FORCING, a whole config point in the essential order (the forced ops' trailing
+# arguments): kernel, grid x y z, block x y z, waves_per_eu, tile m n k, quantization.
+Forcing = tuple[str, int, int, int, int, int, int, int, int, int, int, str]
+
+
+def _forcing(
+    input: torch.Tensor,
+    kernel: str | None,
+    grid_x: int | None,
+    grid_y: int | None,
+    grid_z: int | None,
+    block_x: int | None,
+    block_y: int | None,
+    block_z: int | None,
+    waves_per_eu: int | None,
+    tile_m: int | None,
+    tile_n: int | None,
+    tile_k: int | None,
+    quantization: Quantization | None,
+) -> Forcing | None:
+    """THE FORCING an op's keyword arguments make: None where none is given (a plain
+    call), else the whole config point, the dimensions a kernel may leave out filled at
+    their identity (y and z 1, tile_k 1) and the quantization none; refused,
+    forced_incomplete, where another field is missing."""
+    given = (
+        kernel,
+        grid_x,
+        grid_y,
+        grid_z,
+        block_x,
+        block_y,
+        block_z,
+        waves_per_eu,
+        tile_m,
+        tile_n,
+        tile_k,
+        quantization,
+    )
+    if all(v is None for v in given):
+        return None
+    needed = (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n)
+    if any(v is None for v in needed):
+        raise Refused(Error.forced_incomplete, input)
+    one = lambda v: 1 if v is None else v  # noqa: E731
+    return (
+        kernel,
+        grid_x,
+        one(grid_y),
+        one(grid_z),
+        block_x,
+        one(block_y),  # type: ignore[return-value]
+        one(block_z),
+        waves_per_eu,
+        tile_m,
+        tile_n,
+        one(tile_k),
+        quantization or "none",
+    )
 
 
 @dataclass(frozen=True)
 class Ran:
-    """WHAT A LAUNCH RAN, as C++ answered it: the kernel's algorithm and direction,
-    its tile, its block (threads in x, y and z) and its grid (blocks in each);
-    `tile_k` and `reduce_scatter_blocks` 0 where the op has none; `quantization`,
-    what crossed the links ("none" or "int4")."""
+    """WHAT A LAUNCH RAN, as C++ answered it: its config point in the essential
+    order, the kernel (its template's name), its grid (blocks in x, y and z), its
+    block (threads in each) and the block's waves a EU, its tile (`tile_k` 1 where
+    the kernel has no K) and `quantization`, what crossed the links ("none" or
+    "int4")."""
 
-    algorithm: str
-    direction: str
-    tile_m: int
-    tile_n: int
-    block_x: int
-    block_y: int
-    block_z: int
+    kernel: str
     grid_x: int
     grid_y: int
     grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
     waves_per_eu: int
+    tile_m: int
+    tile_n: int
     tile_k: int
-    reduce_scatter_blocks: int
     quantization: Quantization
 
     @classmethod
     def of(cls, answer: Answer) -> "Ran | None":
         """From an answer that ran; None for one that says nothing of what ran (the
         test's torch control answers [-1])."""
-        if len(answer) < 15:
+        if len(answer) < 13:
             return None
         a = answer[1:]
-        return cls(
-            _ALGORITHMS[a[0]],
-            _DIRECTIONS[a[1]],
-            *a[2:11],
-            a[11],
-            a[12],
-            _QUANTIZATIONS[a[13]],
-        )
+        names = list(build_info().templates)
+        return cls(names[a[0]], *a[1:11], _QUANTIZATIONS[a[11]])
 
     def __str__(self) -> str:
         how = " int4" if self.quantization == "int4" else ""
         return (
-            f"{self.direction} {self.algorithm}{how} tile {self.tile_m}x{self.tile_n}"
+            f"{self.kernel}{how} tile {self.tile_m}x{self.tile_n}x{self.tile_k}"
             f" block {self.block_x}x{self.block_y}x{self.block_z}"
             f" grid {self.grid_x}x{self.grid_y}x{self.grid_z}"
         )
@@ -1241,16 +1280,15 @@ class HipCustomCommunicator:
     # Each `should_` asks the module's `should` of the op's own tensors: whether a
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
-    # Each op takes its own tensors and values, then, keyword-only, what the sweep and
-    # the tests force: ALL OR NOTHING, the algorithm (`one_shot`, `two_shot` or
-    # `split`) and the direction (`pull` or `push`) where the op has more than one
-    # template, every field of one of its builds (`build_info().templates`), and the
-    # launch (grid_x, grid_y, grid_z, and the AttnRes op's reduce_scatter_blocks); some but
-    # not all is `forced_incomplete`. The build's `quantization` may be left out; it is
-    # then none, never the communicator's: a forced call runs what it names. All None
-    # is the backend's choice; the model forces none. A forced call asks no `should_`:
-    # C++ answers it. An op raises Refused with the Error C++ refused it for; a call
-    # its `should_` admitted is never refused.
+    # Each op takes its own tensors and values, then, keyword-only, what the tuner and
+    # the tests force: a config point in its essential order (`_forcing`). All None is
+    # a plain call, the table's pick (the model forces none). A forcing gives the
+    # kernel, grid_x, block_x, waves_per_eu, tile_m and tile_n; y and z, tile_k and
+    # the quantization may be left out (1, 1, 1 and none: a forced call runs what it
+    # names, never the communicator's quantization); any other gap is
+    # `forced_incomplete`, refused here: C++ takes every field. A forced call asks no
+    # `should_`: C++ answers it. An op raises Refused with the Error C++ refused it for;
+    # a call its `should_` admitted is never refused.
 
     @final
     def tuned(
@@ -1259,20 +1297,23 @@ class HipCustomCommunicator:
         rows: int,
         cols: int,
         dtype: torch.dtype,
+        kernel: str | None = None,
         quantization: Quantization = "none",
-        algorithm: str | None = None,
-        direction: str | None = None,
     ) -> "Ran | Error | None":
         """WHAT THIS COMMUNICATOR LAUNCHES for `op` on `rows` x `cols` of `dtype`, C++'s
-        own answer from its tuned table (config.cuh's `tuned`): with neither
-        `algorithm` nor `direction`, a plain call's pick from its table; with both, that
-        kernel's config moving `quantization` (its nearest point, a pick or a config).
-        Forcing the answer whole runs exactly it. None where the kernel has no
-        point."""
+        own answer from its tuned table (`tuned`): with no `kernel`, a plain call's pick
+        from its table; with one, that kernel's config moving `quantization` (its
+        nearest point, a pick or a config). Forcing the answer whole runs exactly it.
+        None where the kernel has no point."""
         name = next(n for n, d in _DTYPES.items() if d == dtype)
-        answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
-            self._handle, op, rows, cols, name, quantization, algorithm, direction
-        )
+        if kernel is None:
+            answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
+                self._handle, op, rows, cols, name
+            )
+        else:
+            answer = torch.ops._rocm_C.hip_custom_communicator_tuned_kernel(
+                self._handle, kernel, rows, cols, name, quantization
+            )
         if not answer:
             return None
         return Ran.of(answer) or Error(answer[0])
@@ -1287,17 +1328,17 @@ class HipCustomCommunicator:
         self,
         input: torch.Tensor,
         *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
+        kernel: str | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
         waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
@@ -1310,20 +1351,23 @@ class HipCustomCommunicator:
         answer = self._all_reduce(
             input,
             output,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            _forcing(
+                input,
+                kernel,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                waves_per_eu,
+                tile_m,
+                tile_n,
+                tile_k,
+                quantization,
+            ),
         )
-        self._launched("all_reduce", input, answer, algorithm, direction, quantization)
+        self._launched("all_reduce", input, answer, kernel, quantization)
         return output
 
     @final
@@ -1342,17 +1386,17 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
+        kernel: str | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
         waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
         """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)` in one kernel. Returns
@@ -1366,22 +1410,23 @@ class HipCustomCommunicator:
             weight,
             output,
             eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            _forcing(
+                input,
+                kernel,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                waves_per_eu,
+                tile_m,
+                tile_n,
+                tile_k,
+                quantization,
+            ),
         )
-        self._launched(
-            "all_reduce_rms_norm", input, answer, algorithm, direction, quantization
-        )
+        self._launched("all_reduce_rms_norm", input, answer, kernel, quantization)
         return output
 
     @final
@@ -1401,17 +1446,17 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         eps: float,
         *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
+        kernel: str | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
         waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)` in
@@ -1427,22 +1472,23 @@ class HipCustomCommunicator:
             output,
             residual_output,
             eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            _forcing(
+                input,
+                kernel,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                waves_per_eu,
+                tile_m,
+                tile_n,
+                tile_k,
+                quantization,
+            ),
         )
-        self._launched(
-            "all_reduce_add_rms_norm", input, answer, algorithm, direction, quantization
-        )
+        self._launched("all_reduce_add_rms_norm", input, answer, kernel, quantization)
         return output, residual_output
 
     @final
@@ -1466,19 +1512,17 @@ class HipCustomCommunicator:
         eps: float,
         output_eps: float,
         *,
-        algorithm: str | None = None,
-        direction: str | None = None,
-        tile_m: int | None = None,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        reduce_scatter_blocks: int | None = None,
-        block_x: int | None = None,
-        block_y: int | None = None,
-        block_z: int | None = None,
+        kernel: str | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
         waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`attn_res(prefix, all_reduce(input), blocks, ...)` in one kernel, or with no
@@ -1507,28 +1551,24 @@ class HipCustomCommunicator:
             num_blocks,
             eps,
             output_eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            reduce_scatter_blocks,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            _forcing(
+                input,
+                kernel,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                waves_per_eu,
+                tile_m,
+                tile_n,
+                tile_k,
+                quantization,
+            ),
         )
         self._launched(
-            "all_reduce_add_attn_res_rms_norm",
-            input,
-            answer,
-            algorithm,
-            direction,
-            quantization,
+            "all_reduce_add_attn_res_rms_norm", input, answer, kernel, quantization
         )
         return prefix_output, output
 
@@ -1679,8 +1719,7 @@ class HipCustomCommunicator:
         op: Op,
         input: torch.Tensor,
         answer: Answer,
-        algorithm: str | None = None,
-        direction: str | None = None,
+        kernel: str | None = None,
         quantization: Quantization | None = None,
     ) -> None:
         """After an op's kernel hook: Refused with the Error's number it answered, or
@@ -1689,8 +1728,6 @@ class HipCustomCommunicator:
             error = Error(answer[0])
             detail = ""
             if error is Error.quantization_not_supported:
-                suffix = op.removeprefix("all_reduce")
-                kernel = f"all_reduce_{direction}_{algorithm}{suffix}"
                 detail = f"{quantization} not supported for {kernel}; "
             raise Refused(error, input, detail)
         self._record(op, input, Ran.of(answer))
@@ -1811,37 +1848,21 @@ class HipCustomCommunicator:
         self,
         input: torch.Tensor,
         output: torch.Tensor,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        block_x: int | None,
-        block_y: int | None,
-        block_z: int | None,
-        grid_x: int | None,
-        grid_y: int | None,
-        grid_z: int | None,
-        waves_per_eu: int | None,
-        quantization: Quantization | None,
+        forcing: Forcing | None,
     ) -> Answer:
         """Sum `input` across the TP ranks into `output`; the Error's number C++ refused
         the call for, or -1 and what ran (as every kernel hook answers: `Answer`)."""
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+        if forcing is None:
+            return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+                self._handle,
+                input,
+                output,
+            )
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_forced(
             self._handle,
             input,
             output,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            *forcing,
         )
 
     def _all_reduce_rms_norm(
@@ -1850,37 +1871,23 @@ class HipCustomCommunicator:
         weight: torch.Tensor,
         output: torch.Tensor,
         eps: float,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        block_x: int | None,
-        block_y: int | None,
-        block_z: int | None,
-        grid_x: int | None,
-        grid_y: int | None,
-        grid_z: int | None,
-        waves_per_eu: int | None,
-        quantization: Quantization | None,
+        forcing: Forcing | None,
     ) -> Answer:
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
+        if forcing is None:
+            return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
+                self._handle,
+                input,
+                weight,
+                output,
+                eps,
+            )
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm_forced(
             self._handle,
             input,
             weight,
             output,
             eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            *forcing,
         )
 
     def _all_reduce_add_rms_norm(
@@ -1891,22 +1898,21 @@ class HipCustomCommunicator:
         output: torch.Tensor,
         residual_output: torch.Tensor,
         eps: float,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        block_x: int | None,
-        block_y: int | None,
-        block_z: int | None,
-        grid_x: int | None,
-        grid_y: int | None,
-        grid_z: int | None,
-        waves_per_eu: int | None,
-        quantization: Quantization | None,
+        forcing: Forcing | None,
     ) -> Answer:
         """The normed result into `output`; the sum plus residual into
         `residual_output`."""
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
+        if forcing is None:
+            return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
+                self._handle,
+                input,
+                residual,
+                weight,
+                output,
+                residual_output,
+                eps,
+            )
+        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm_forced(
             self._handle,
             input,
             residual,
@@ -1914,18 +1920,7 @@ class HipCustomCommunicator:
             output,
             residual_output,
             eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+            *forcing,
         )
 
     def _all_reduce_add_attn_res_rms_norm(
@@ -1942,26 +1937,9 @@ class HipCustomCommunicator:
         num_blocks: int,
         eps: float,
         output_eps: float,
-        algorithm: str | None,
-        direction: str | None,
-        tile_m: int | None,
-        tile_n: int | None,
-        tile_k: int | None,
-        reduce_scatter_blocks: int | None,
-        block_x: int | None,
-        block_y: int | None,
-        block_z: int | None,
-        grid_x: int | None,
-        grid_y: int | None,
-        grid_z: int | None,
-        waves_per_eu: int | None,
-        quantization: Quantization | None,
+        forcing: Forcing | None,
     ) -> Answer:
-        launch = (
-            torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm
-        )
-        return launch(
-            self._handle,
+        tensors = (
             input,
             prefix,
             blocks,
@@ -1974,20 +1952,14 @@ class HipCustomCommunicator:
             num_blocks,
             eps,
             output_eps,
-            algorithm,
-            direction,
-            tile_m,
-            tile_n,
-            tile_k,
-            reduce_scatter_blocks,
-            block_x,
-            block_y,
-            block_z,
-            grid_x,
-            grid_y,
-            grid_z,
-            waves_per_eu,
-            quantization,
+        )
+        ops = torch.ops._rocm_C
+        if forcing is None:
+            return ops.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+                self._handle, *tensors
+            )
+        return ops.hip_custom_communicator_all_reduce_add_attn_res_rms_norm_forced(
+            self._handle, *tensors, *forcing
         )
 
     def _on_close(self) -> None:

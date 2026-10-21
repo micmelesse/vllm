@@ -223,12 +223,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
-        float eps, float output_eps, int reduce_scatter_blocks) {
+        float eps, float output_eps) {
   static_assert(QUANTIZATION == Quantization::none || QUANTIZATION == Quantization::int4,
                 "unsupported quantization");
   if constexpr (QUANTIZATION == Quantization::int4) {
     static_assert(TILE_M == 1, "the INT4 build is a row a block");
-    (void)reduce_scatter_blocks;
     constexpr int kPackElems = traits<DTYPE>::N;
     static_assert(kPackElems * kInt4GroupPacks == kInt4Group, "a pack is a word of its group");
     static_assert(TILE_N == kInt4Group * THREADS_PER_BLOCK, "a group a thread: the block one row's groups");
@@ -402,7 +401,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    for its bytes: thread traces 2026-10-04T21-03-09Z, 21-26-11Z), summed through LDS.
     // 3. Every rank's sums are in its partials: this block's twin on every rank has reduced the
     //    same rows.
-    (void)reduce_scatter_blocks;
     reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, Quantization::none, true, Walk::rows, Accumulate::lds, Direction::pull, Until::started, false>(
         input_ptr, input_stride_m, input_stride_n, input_size_m, input_size_n, input_ptr_array,
         input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n,

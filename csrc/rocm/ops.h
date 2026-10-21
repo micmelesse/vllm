@@ -71,11 +71,13 @@ hip_custom_communicator_open(const std::string& cpu_group,
                              const std::vector<int64_t>& inputs);
 // What an opened communicator launches for an op's call: a plain call's pick, or, a launch named,
 // that kernel's tuned config (hip_custom_communicator.cu).
-std::vector<int64_t> hip_custom_communicator_tuned(
-    fptr_t handle_ptr, const std::string& op_name, int64_t rows, int64_t cols,
-    const std::string& dtype, const std::string& quantization,
-    std::optional<std::string> algorithm,
-    std::optional<std::string> direction);
+std::vector<int64_t> hip_custom_communicator_tuned(fptr_t handle_ptr,
+                                                   const std::string& op_name,
+                                                   int64_t rows, int64_t cols,
+                                                   const std::string& dtype);
+std::vector<int64_t> hip_custom_communicator_tuned_kernel(
+    fptr_t handle_ptr, const std::string& kernel, int64_t rows, int64_t cols,
+    const std::string& dtype, const std::string& quantization);
 // What a communicator serving that box at `world` holds: [max_rows, max_cols,
 // partials_bytes, inputs_bytes].
 std::vector<int64_t> hip_custom_communicator_capacity(int64_t max_rows,
@@ -124,50 +126,114 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
            std::vector<std::string>, std::vector<int64_t>>
 hip_custom_communicator_build_info();
 
-// Each op takes its own forcing last: the template by name, every field of one
-// of its builds, and the launch, all or none (none: select's), the build's
-// quantization ("none" or "int4") optional within it. It returns the
-// Error's number it was refused for, or -1 and what ran
+// Each op twice, every argument required (optionality is Python's): its plain
+// call, which runs its table's pick, and its forced call, which takes a whole
+// config point last in the essential order (the kernel by name, the grid, the
+// block and its waves a EU, the tile, the quantization "none" or "int4"). Each
+// returns the Error's number it was refused for, or -1 and what ran
 // (hip_custom_communicator.cu's Answer).
 
 std::vector<int64_t> hip_custom_communicator_all_reduce(
-    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
-    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
-    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
-    std::optional<std::string> quantization);
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& output);
+std::vector<int64_t> hip_custom_communicator_all_reduce_forced(
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& output,
+    const std::string& kernel,
+    int64_t grid_x,
+    int64_t grid_y,
+    int64_t grid_z,
+    int64_t block_x,
+    int64_t block_y,
+    int64_t block_z,
+    int64_t waves_per_eu,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t tile_k,
+    const std::string& quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> block_x, std::optional<int64_t> block_y,
-    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
-    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
-    std::optional<std::string> quantization);
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& weight,
+    torch::Tensor& output,
+    double eps);
+std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm_forced(
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& weight,
+    torch::Tensor& output,
+    double eps,
+    const std::string& kernel,
+    int64_t grid_x,
+    int64_t grid_y,
+    int64_t grid_z,
+    int64_t block_x,
+    int64_t block_y,
+    int64_t block_z,
+    int64_t waves_per_eu,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t tile_k,
+    const std::string& quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
-    fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps,
-    std::optional<std::string> algorithm, std::optional<std::string> direction,
-    std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
-    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
-    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
-    std::optional<std::string> quantization);
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& output,
+    torch::Tensor& residual_output,
+    double eps);
+std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm_forced(
+    fptr_t handle_ptr, torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& output,
+    torch::Tensor& residual_output,
+    double eps,
+    const std::string& kernel,
+    int64_t grid_x,
+    int64_t grid_y,
+    int64_t grid_z,
+    int64_t block_x,
+    int64_t block_y,
+    int64_t block_z,
+    int64_t waves_per_eu,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t tile_k,
+    const std::string& quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& prefix,
+    torch::Tensor& blocks,
+    torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps, std::optional<std::string> algorithm,
-    std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
-    std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
-    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
-    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
-    std::optional<std::string> quantization);
+    torch::Tensor& prefix_output,
+    torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output,
+    int64_t num_blocks,
+    double eps,
+    double output_eps);
+std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm_forced(
+    fptr_t handle_ptr, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix,
+    torch::Tensor& blocks,
+    torch::Tensor& norm_weight,
+    torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output,
+    torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output,
+    int64_t num_blocks,
+    double eps,
+    double output_eps,
+    const std::string& kernel,
+    int64_t grid_x,
+    int64_t grid_y,
+    int64_t grid_z,
+    int64_t block_x,
+    int64_t block_y,
+    int64_t block_z,
+    int64_t waves_per_eu,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t tile_k,
+    const std::string& quantization);

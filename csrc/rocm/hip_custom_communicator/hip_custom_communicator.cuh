@@ -35,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -730,7 +731,7 @@ enum class Error : int {
   tile_not_built = 21,
   launch_out_of_range = 22,
   field_not_positive = 23,
-  field_not_this_templates = 24,
+  field_not_this_templates = 24,  // a forced tile_k other than 1 where the kernel has no K
   waves_not_built = 25,
   inner_stride_not_one = 26,
   row_stride_not_packs = 27,
@@ -812,8 +813,8 @@ constexpr const char* to_string(Error e) {
     case Error::field_not_positive:
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
-      return "field_not_this_templates: the forced template has no such config "
-             "field";
+      return "field_not_this_templates: a forced tile_k other than 1 on a kernel "
+             "with no K";
     case Error::inner_stride_not_one:
       return "inner_stride_not_one: a buffer's innermost stride is not 1 (the "
              "loads are packs)";
@@ -826,8 +827,7 @@ constexpr const char* to_string(Error e) {
              "slice is empty";
     case Error::forced_incomplete:
       return "forced_incomplete: a forced call gives every field of its config "
-             "(the template, "
-             "its build and its launch) or none";
+             "or none (Python's refusal: C++ takes every field)";
     case Error::no_such_quantization:
       return "no_such_quantization: the quantization is none or int4";
     case Error::quantization_not_supported:
@@ -897,9 +897,6 @@ struct Dim3 {
 constexpr int64_t volume(const Dim3& d) {
   return static_cast<int64_t>(d.x) * d.y * d.z;
 }
-// A DIMENSION AS A CALL FORCES IT, x, y and z each given or not: whole or
-// nothing, as every forced field.
-using Given3 = std::array<std::optional<int>, 3>;
 // Whether `d` is x alone: y = z = 1, every kernel's today.
 constexpr bool x_alone(const Dim3& d) { return d.y == 1 && d.z == 1; }
 
@@ -954,15 +951,9 @@ using BuildConfig =
                  AllReduceAddRmsNormBuildConfig,
                  AllReduceAddAttnResRmsNormBuildConfig>;
 
-// A KERNEL'S LAUNCH: its grid, blocks in each dimension, never compiled in, and
-// the blocks of it the
-// fused AttnRes pull two-shot gives its reduce-scatter (its reads queue behind
-// the links past a few dozen; AttnRes after it on every block).
-// reduce_scatter_blocks 0 is no split, every block both: the only value any
-// other kernel takes.
+// A KERNEL'S LAUNCH: its grid, blocks in each dimension, never compiled in.
 struct LaunchConfig {
   Dim3 grid;
-  int reduce_scatter_blocks;
 };
 
 // THE COMPLETE CONFIG: the build and the launch.
@@ -1023,9 +1014,9 @@ struct TunedTable {
 };
 // THE TABLE ON THE WIRE from Python, two lists of int64 (`Template` and `OpType` by their enums'
 // numbers, `build_info`'s order): a config's fields, then an input's, in these orders:
-// template, block x, y, z, waves_per_eu, tile_m, tile_n, tile_k, quantization,
-// grid x, y, z, reduce_scatter_blocks; and op, mode, world, hidden, tokens, config.
-constexpr int kConfigFields = 13;
+// template, grid x, y, z, block x, y, z, waves_per_eu, tile_m, tile_n, tile_k, quantization
+// (a config point's essential order); and op, mode, world, hidden, tokens, config.
+constexpr int kConfigFields = 12;
 constexpr int kInputFields = 6;
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
@@ -2470,7 +2461,7 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 
 // A TEMPLATE'S BUILDS, each of its op's BuildConfig (types.cuh): what dispatch
 // instantiates, what the check accepts and what a tuner searches. The launch
-// (the grid, reduce_scatter_blocks) is not a build's: each tuned kernel (below)
+// (the grid) is not a build's: each tuned kernel (below)
 // gives its own, and a forced call gives its own. tile_n counts the elements of
 // a 16-bit dtype, the only ones built. A build that spills shows in its code
 // object (gp report isa) and loses on the clock; none is ruled out by
@@ -2599,11 +2590,13 @@ constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // 447.2 us against 1160.7 at the 36 it had (2026-10-01T22-56-58Z,
 // 2026-10-01T23-00-47Z). TILE_M 2 and 4 lost at every grid, best 480.0 us at
 // 128 blocks against 412.8 at 1 on 192 (4096 x 7168, 2026-10-02T21-19-22Z). Its
-// reduce-scatter on the grid's first 32 blocks (reduce_scatter_blocks): its
-// reads queue behind the links past a few dozen blocks while AttnRes is compute
-// a row and wants every block. At 4096 tokens it took 146.6 us on 32 blocks
-// against 218.9 on 192, AttnRes 1110.5 against 199.4 (stamps,
-// 2026-10-01T23-45-31Z and 2026-10-01T23-50-54Z).
+// reduce-scatter once ran on the grid's first 32 blocks: its reads queue behind
+// the links past a few dozen blocks while AttnRes is compute a row and wants
+// every block. At 4096 tokens it took 146.6 us on 32 blocks against 218.9 on
+// 192, AttnRes 1110.5 against 199.4 (stamps, 2026-10-01T23-45-31Z and
+// 2026-10-01T23-50-54Z). The kernel no longer splits, and its knob
+// (reduce_scatter_blocks, read by nothing) is gone (2026-10-21): a split that
+// returns is a config field the kernel reads.
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4
 // are no longer built: they lost at every grid, and 4 spilled 25-30 VGPRs.
 constexpr BuildConfig kAttnResPullConfigs[] = {
@@ -2940,12 +2933,9 @@ static_assert(ops_in_order(), "kOps must list every OpType in its order");
 
 // EVERY OP HAS KERNELS, each one of its own templates, its build listed and its
 // launch one the forcing would accept (a grid of 1 to kMaxBlocks blocks in x
-// alone, every kernel's one dimension, a split only on the AttnRes pull).
-constexpr bool launch_fits(Template t, const LaunchConfig& l) {
-  if (!x_alone(l.grid) || l.grid.x < 1 || l.grid.x > kMaxBlocks) return false;
-  if (l.reduce_scatter_blocks < 0) return false;
-  return l.reduce_scatter_blocks == 0 ||
-         t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
+// alone, every kernel's one dimension).
+constexpr bool launch_fits(const LaunchConfig& l) {
+  return x_alone(l.grid) && l.grid.x >= 1 && l.grid.x <= kMaxBlocks;
 }
 
 // THE OP'S TEMPLATES, in the catalog's order, and how many.
@@ -2970,13 +2960,10 @@ constexpr bool slices_columns(Template k) {
 }
 
 // =================================================================================================
-// 1. THE FORCING, ALL OR NOTHING: the template (its algorithm and direction,
-// where the op has more than one), every field of its build, and its launch, or
-// none of them. Some but not all is forced_incomplete; a value out of range is
-// its Error; a build the template does not list is the check's to name. None:
-// select picks. The build's `quantization` alone may be left out of a forcing,
-// which is then none (the build as listed), never the handle's: a forced call
-// runs what it names; given without the rest, it is forced_incomplete.
+// 1. THE FORCING: a whole config point, every field given (the C++ API takes no optional; what a
+// caller may leave out is Python's to fill): the template, the grid, the block and its waves a EU,
+// the tile, the quantization. A value out of range is its Error; a build the template does not list
+// is the check's to name. An unforced call runs its table's pick (`lookup`).
 // =================================================================================================
 
 // The kernel a call runs: its template and its complete config.
@@ -2985,70 +2972,39 @@ struct Chosen {
   KernelConfig config;
 };
 
-// `block` is the build's block, x, y and z as the call forced them, and
-// `build_fields` the op's BuildConfig's other fields, in its order, but its
-// quantization, which is `quantization`; `grid` the launch's, as `block`;
-// `reduce_scatter_blocks` the AttnRes split, which only that op takes (another
-// passes none); `build_of` makes the op's BuildConfig from the fields, called
-// only when every one is given.
-template <typename BUILD_OF>
-constexpr std::variant<std::optional<Chosen>, Error> forced(
-    OpType o, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, Given3 block,
-    std::initializer_list<std::optional<int>> build_fields,
-    std::optional<int> quantization, Given3 grid,
-    std::optional<int> reduce_scatter_blocks, BUILD_OF build_of) {
-  const bool names_template = templates_of(o) > 1;
-  const bool splits = o == OpType::all_reduce_add_attn_res_rms_norm;
-  int given = 0, needed = 0;
-  const auto count = [&](bool is_given) {
-    ++needed;
-    given += is_given;
-  };
-  if (names_template) {
-    count(algorithm.has_value());
-    count(direction.has_value());
-  }
-  for (const std::optional<int>& d : block) count(d.has_value());
-  for (const std::optional<int>& f : build_fields) count(f.has_value());
-  for (const std::optional<int>& d : grid) count(d.has_value());
-  if (splits) count(reduce_scatter_blocks.has_value());
-  if (given == 0 && !algorithm && !direction && !quantization)
-    return std::optional<Chosen>{};
-  if (given != needed) return Error::forced_incomplete;
-  const int q = quantization.value_or(Quantization::none);
-  if (q != Quantization::none && q != Quantization::int4)
+// THE TEMPLATE BY ITS NAME (`build_info`'s, the config's `kernel`), or none.
+inline std::optional<Template> template_named(std::string_view name) {
+  for (const TemplateInfo& t : kTemplates)
+    if (name == t.name) return t.fn;
+  return std::nullopt;
+}
+
+// THE FORCED CONFIG of op `o`: template `fn` (its op's), the grid and the block (x alone, every
+// kernel's one dimension: y and z 1) of whole waves up to the build's maximum, waves a EU the CU
+// holds, the tile positive (tile_k 1 where the kernel has no K), the quantization none or int4.
+inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3 block,
+                                          int waves_per_eu, int tile_m, int tile_n, int tile_k,
+                                          int quantization) {
+  if (op_of(fn) != o) return Error::no_such_template;
+  if (quantization != Quantization::none && quantization != Quantization::int4)
     return Error::no_such_quantization;
-  // THE TEMPLATE: the one an op with one template has, else the algorithm and
-  // direction's.
-  const std::optional<Template> fn =
-      names_template ? template_of(o, *algorithm, *direction)
-                     : std::optional{only_template(o)};
-  if (!fn || (algorithm && algorithm_of(*fn) != *algorithm) ||
-      (direction && direction_of(*fn) != *direction))
-    return Error::no_such_template;
-  // THE RANGES, over x alone (every kernel's one dimension: y and z 1): a
-  // block of whole waves up to the build's maximum threads, a grid of 1 to
-  // kMaxBlocks blocks, waves a EU the CU holds, positive tile fields, a split
-  // only on the AttnRes pull.
-  const std::span<const std::optional<int>> f(build_fields.begin(),
-                                              build_fields.size());
-  const Dim3 b{*block[0], *block[1], *block[2]}, g{*grid[0], *grid[1], *grid[2]};
-  const int threads = b.x, waves = *f[0];
-  if (!x_alone(b) || !x_alone(g) || threads < kWaveSize ||
-      threads > kBuild.kernels.max_threads || threads % kWaveSize != 0 ||
-      g.x < 1 || g.x > kMaxBlocks || waves < 1 ||
-      waves > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
+  if (!x_alone(block) || !x_alone(grid) || block.x < kWaveSize ||
+      block.x > kBuild.kernels.max_threads || block.x % kWaveSize != 0 || grid.x < 1 ||
+      grid.x > kMaxBlocks || waves_per_eu < 1 ||
+      waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
     return Error::launch_out_of_range;
-  for (size_t i = 1; i < f.size(); ++i)
-    if (*f[i] < 1) return Error::field_not_positive;
-  const int split = splits ? *reduce_scatter_blocks : 0;
-  if (split < 0) return Error::field_not_positive;
-  if (split > 0 &&
-      *fn != Template::all_reduce_pull_two_shot_add_attn_res_rms_norm)
-    return Error::field_not_this_templates;
-  return std::optional<Chosen>{
-      Chosen{*fn, {quantized(build_of(), q), {g, split}}}};
+  if (tile_m < 1 || tile_n < 1 || tile_k < 1) return Error::field_not_positive;
+  const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm;
+  if (!has_k && tile_k != 1) return Error::field_not_this_templates;
+  BuildConfig b = AllReduceBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
+  if (o == OpType::all_reduce_rms_norm)
+    b = AllReduceRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
+  if (o == OpType::all_reduce_add_rms_norm)
+    b = AllReduceAddRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
+  if (has_k)
+    b = AllReduceAddAttnResRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, tile_k,
+                                              quantization};
+  return Chosen{fn, {b, {grid}}};
 }
 
 // =================================================================================================
@@ -3122,16 +3078,6 @@ inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int qua
   if (!c && quantization == Quantization::int4) c = of(Quantization::none);
   if (!c) return std::nullopt;
   return Chosen{c->fn, {quantized(c->config.build, quantization), c->config.launch}};
-}
-
-// THE KERNEL A CALL RUNS: the forced one as forced, else its nearest input's config.
-inline std::variant<Chosen, Error> chosen(
-    const Handle& h, const std::variant<std::optional<Chosen>, Error>& forcing,
-    OpType o, int64_t m, int64_t n) {
-  if (const Error* e = std::get_if<Error>(&forcing)) return *e;
-  if (const std::optional<Chosen>& f = std::get<std::optional<Chosen>>(forcing))
-    return *f;
-  return lookup(h, o, m, n);
 }
 
 // =================================================================================================
@@ -3296,12 +3242,11 @@ struct ConfigFields {
   int world{};
   int tile_m{};
   int tile_n{};
-  int tile_k{};
+  int tile_k{1};  // 1 where the kernel has no K, its identity
   Dim3 block{};
   Dim3 grid{};
   int waves_per_eu{};
   int quantization{};
-  int reduce_scatter_blocks{};
   int shared_memory_bytes{};
   DType dtype{};
   DType weight_dtype{};
@@ -3700,29 +3645,10 @@ inline std::variant<Config, Error> all_reduce_config(
     const Handle& h, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype,
-    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
-    std::optional<int> waves_per_eu, std::optional<int> quantization,
-    hipStream_t stream) {
+    int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   const int world = h.world_size();
-  // 1. The tile does not hold the row: the all-reduce tiles across it.
-  const std::variant<Chosen, Error> picked = chosen(
-      h,
-      forced(OpType::all_reduce, algorithm, direction,
-             {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n}, quantization,
-             {grid_x, grid_y, grid_z}, std::nullopt,
-             [&] {
-               return AllReduceBuildConfig{Dim3{*block_x, *block_y, *block_z}, *waves_per_eu,
-                                           *tile_m, *tile_n};
-             }),
-      OpType::all_reduce, m, n);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   KernelConfig c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
@@ -3862,12 +3788,8 @@ inline std::variant<Config, Error> split_all_reduce_config(
   }, m, n);
   if (!p) return Error::quantization_not_supported;
   const TunedConfig& r = h.table().configs[p->config];
-  const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
   return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
-                           dtype, algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n,
-                           b.block.x, b.block.y, b.block.z, r.config.launch.grid.x,
-                           r.config.launch.grid.y, r.config.launch.grid.z, b.waves_per_eu,
-                           b.quantization, stream);
+                           dtype, Chosen{r.fn, r.config}, stream);
 }
 
 // all_reduce_rms_norm: out = rms_norm(all_reduce(inp), weight), vLLM's
@@ -3879,28 +3801,12 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
     int64_t output_size_m, int64_t output_size_n, DType dtype,
-    DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
-    std::optional<int> quantization, hipStream_t stream) {
+    DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
   const OpType op = OpType::all_reduce_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> picked =
-      chosen(h,
-             forced(op, algorithm, direction,
-                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n},
-                    quantization, {grid_x, grid_y, grid_z}, std::nullopt,
-                    [&] {
-                      return AllReduceRmsNormBuildConfig{
-                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n};
-                    }),
-             op, m, n);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
@@ -3984,28 +3890,12 @@ all_reduce_add_rms_norm_config(
     int64_t output_size_n, void* residual_output,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
-    DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
-    std::optional<int> quantization, hipStream_t stream) {
+    DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
   const OpType op = OpType::all_reduce_add_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> picked =
-      chosen(h,
-             forced(op, algorithm, direction,
-                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n},
-                    quantization, {grid_x, grid_y, grid_z}, std::nullopt,
-                    [&] {
-                      return AllReduceAddRmsNormBuildConfig{
-                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n};
-                    }),
-             op, m, n);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e = refused(
@@ -4111,32 +4001,12 @@ all_reduce_add_attn_res_rms_norm_config(
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
     int64_t block_output_stride_n, int64_t block_output_size_m,
     int64_t block_output_size_n, DType dtype, int num_blocks, float eps,
-    float output_eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> tile_k,
-    std::optional<int> reduce_scatter_blocks,
-    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
-    std::optional<int> waves_per_eu, std::optional<int> quantization,
-    hipStream_t stream) {
+    float output_eps, const Chosen& k, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
   using K = Template;
   const OpType op = OpType::all_reduce_add_attn_res_rms_norm;
   const int world = h.world_size();
-  const std::variant<Chosen, Error> picked =
-      chosen(h,
-             forced(op, algorithm, direction,
-                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n, tile_k},
-                    quantization, {grid_x, grid_y, grid_z}, reduce_scatter_blocks,
-                    [&] {
-                      return AllReduceAddAttnResRmsNormBuildConfig{
-                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n,
-                          *tile_k};
-                    }),
-             op, m, n);
-  if (const Error* e = std::get_if<Error>(&picked)) return *e;
-  const Chosen k = std::get<Chosen>(picked);
   const Template fn = k.fn;
   const KernelConfig& c = k.config;
   if (const std::optional<Error> e =
@@ -4153,7 +4023,7 @@ all_reduce_add_attn_res_rms_norm_config(
     if (const Error* e = std::get_if<Error>(&got)) return *e;
     all_reduce = std::get<Config>(got);
   }
-  const int tm = a.tile_m, tk = a.tile_k, rs = c.launch.reduce_scatter_blocks;
+  const int tm = a.tile_m, tk = a.tile_k;
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, m,
@@ -4178,7 +4048,6 @@ all_reduce_add_attn_res_rms_norm_config(
   config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
-  config.reduce_scatter_blocks = rs;
   const int64_t row_n = payload_row(fn, a.quantization, n);
   config.partials_stride_m = row_n;
   config.partials_stride_n = 1;
@@ -4308,7 +4177,7 @@ inline std::optional<std::string> check(const TunedTable& table) {
     };
     if (c.config.build.index() != family_of(c.fn) || !built(c.fn, c.config.build))
       return named("its build is not one its kernel lists");
-    if (!launch_fits(c.fn, c.config.launch)) return named("its grid is out of range");
+    if (!launch_fits(c.config.launch)) return named("its grid is out of range");
     if (c.fn == Template::all_reduce_push_one_shot &&
         volume(c.config.launch.grid) > kLineBlocks)
       return named("the LL push's grid is past its lines' blocks");
@@ -4385,13 +4254,7 @@ inline std::variant<Config, Error> all_reduce(
     Handle& h, const void* input, int64_t input_stride_m,
     int64_t input_stride_n, int64_t input_size_m, int64_t input_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
-    int64_t output_size_m, int64_t output_size_n, DType dtype,
-    std::optional<Algorithm> algorithm, std::optional<Direction> direction,
-    std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
-    std::optional<int> waves_per_eu, std::optional<int> quantization,
-    hipStream_t stream) {
+    int64_t output_size_m, int64_t output_size_n, DType dtype, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e =
           layout_refused(dtype, {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -4399,8 +4262,7 @@ inline std::variant<Config, Error> all_reduce(
   std::variant<Config, Error> checked = all_reduce_config(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
-      dtype, algorithm, direction, tile_m, tile_n, block_x, block_y, block_z,
-      grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
+      dtype, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::all_reduce>(config, [&]<Config C>() {
@@ -4499,11 +4361,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     const void* weight, int64_t weight_stride_n, int64_t weight_size_n,
     void* output, int64_t output_stride_m, int64_t output_stride_n,
     int64_t output_size_m, int64_t output_size_n, DType dtype,
-    DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
-    std::optional<int> quantization, hipStream_t stream) {
+    DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e =
           layout_refused(dtype, {{output_stride_m, output_stride_n},
                                  {input_stride_m, input_stride_n}}))
@@ -4515,8 +4373,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       weight, weight_stride_n, weight_size_n, output, output_stride_m,
       output_stride_n, output_size_m, output_size_n, dtype, weight_dtype, eps,
-      algorithm, direction, tile_m, tile_n, block_x, block_y, block_z, grid_x, grid_y, grid_z,
-      waves_per_eu, quantization, stream);
+      k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   if (config.split) {
@@ -4716,11 +4573,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     int64_t output_size_n, void* residual_output,
     int64_t residual_output_stride_m, int64_t residual_output_stride_n,
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
-    DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
-    std::optional<int> quantization, hipStream_t stream) {
+    DType weight_dtype, float eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{output_stride_m, output_stride_n},
                   {residual_output_stride_m, residual_output_stride_n},
@@ -4738,8 +4591,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           output_stride_m, output_stride_n, output_size_m, output_size_n,
           residual_output, residual_output_stride_m, residual_output_stride_n,
           residual_output_size_m, residual_output_size_n, dtype, weight_dtype,
-          eps, algorithm, direction, tile_m, tile_n, block_x, block_y, block_z,
-          grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
+          eps, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   if (config.split) {
@@ -4980,14 +4832,7 @@ all_reduce_add_attn_res_rms_norm(
     int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
     int64_t block_output_stride_n, int64_t block_output_size_m,
     int64_t block_output_size_n, DType dtype, int num_blocks, float eps,
-    float output_eps, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> tile_k,
-    std::optional<int> reduce_scatter_blocks,
-    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
-    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
-    std::optional<int> waves_per_eu, std::optional<int> quantization,
-    hipStream_t stream) {
+    float output_eps, const Chosen& k, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{input_stride_m, input_stride_n},
                   {blocks_stride_m, blocks_stride_n},
@@ -5025,9 +4870,7 @@ all_reduce_add_attn_res_rms_norm(
           prefix_output_size_n, output, output_stride_m, output_stride_n,
           output_size_m, output_size_n, block_output, block_output_stride_m,
           block_output_stride_n, block_output_size_m, block_output_size_n,
-          dtype, num_blocks, eps, output_eps, algorithm, direction, tile_m,
-          tile_n, tile_k, reduce_scatter_blocks, block_x, block_y, block_z,
-          grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
+          dtype, num_blocks, eps, output_eps, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   if (config.split) {
@@ -5265,7 +5108,7 @@ all_reduce_add_attn_res_rms_norm(
         h.signals_size_parity(), h.signals_size_block(),
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks(), num_blocks, eps,
-        output_eps, config.reduce_scatter_blocks);
+        output_eps);
     }
   });
   HIP_CHECK(hipGetLastError());
