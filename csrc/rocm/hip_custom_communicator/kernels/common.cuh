@@ -8,16 +8,22 @@
 
 #include <hip/hip_runtime.h>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
 
-#include "hardware.cuh"
-
 namespace hip_custom_communicator {
 
 #define DINLINE __device__ __forceinline__
+
+// THE TARGET'S TWO FACTS THE DEVICE CODE HOLDS ITSELF, until the build passes them down (the build as
+// one value, next): a wave's lanes (the in-wave shuffles: reduce's DPP sequence), asserted against
+// the compiler's, and a pack's bytes, the widest load (traits). The host's HARDWARE asserts it agrees.
+constexpr int kWaveSize = 64;
+constexpr int kPackBytes = 16;
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize, "the compiler's wave is not the kernels'");
+#endif
 
 // A PACK IN A REGISTER, the unit load and store move and every op sums in.
 template <typename DTYPE, int VEC_SIZE>
@@ -25,11 +31,11 @@ struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {
   DTYPE d[VEC_SIZE];
 };
 
-// A PACK: kBuild.memory.pack_bytes (hardware.cuh's BUILD: the widest load, 8 bf16);
+// A PACK: kPackBytes (above: the widest load, 8 bf16);
 // traits<DTYPE>::N its elements, the P of a thread's registers.
 template <typename DTYPE>
 struct traits {
-  static constexpr int N = kBuild.memory.pack_bytes / sizeof(DTYPE);
+  static constexpr int N = kPackBytes / sizeof(DTYPE);
 };
 
 // PEER MEMORY THROUGH GLOBAL INSTRUCTIONS (load, store, and the collectives' inline walks). A
@@ -47,6 +53,14 @@ typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 #ifndef HIP_CUSTOM_COMMUNICATOR_DEBUG
   #define HIP_CUSTOM_COMMUNICATOR_DEBUG 0
 #endif
+
+// =================================================================================================
+// THE CONTRACT: what host and device both read, defined once. The formats of the bytes that cross
+// between them: the quantization codes, the INT4 encoding (its group, its words and scales, where
+// an encoded buffer keeps its scales, and what a buffer must hold for it), the LL line, and the
+// status words a wait writes and the host reads. Not state: the meaning of the bytes, as a struct's
+// layout is. Nothing else here is the host's.
+// =================================================================================================
 
 // =================================================================================================
 // QUANTIZATION
@@ -85,49 +99,29 @@ constexpr int kInt4WordBytes = 4;        // a pack's values
 constexpr int kInt4ScaleBytes = 2;       // a group's scale
 constexpr uint32_t kInt4ZeroWord = 0x88888888u;  // a word of zeros (each value stored q + 8)
 
-typedef float f32x2 __attribute__((ext_vector_type(2)));
-typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
-// A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
-template <typename U>
-constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
+// A ROW OF n ELEMENTS' INT4 GROUPS, the last short where n is not whole groups.
+__host__ __device__ constexpr int64_t int4_groups(int64_t n) {
+  return (n + kInt4Group - 1) / kInt4Group;
+}
 
-typedef __attribute__((address_space(1))) uint32_t global_u32;
-typedef __attribute__((address_space(1))) __fp16 global_f16;
+// AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
+// (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a
+// row's stride n / 2); its scales at int4_scales_offset(m, n) bytes past it, [m, int4_groups(n)]
+// fp16 (a row's stride its groups, the last short where n is not whole groups: its packs past the
+// row are nobody's). The offset is the buffer's own m and n alone (STANDARDS 3.2: where an encoded
+// buffer keeps its scales is worked out from its own sizes), so every rank computes the same one.
+// What a buffer must hold for it is int4_payload_bytes, below.
+constexpr int64_t kInt4ScalesAlign = 256;
+__host__ __device__ constexpr int64_t int4_scales_offset(int64_t m, int64_t n) {
+  return (m * n / 2 + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
+}
 
-// HOW A CALL'S THREADS COVER THE BUFFER, the four's LAYOUT (a template parameter: each value is
-// different code):
-//   tile: the block over TILE_M rows of packs (LOAD, STORE, SEND AND RECV, above).
-//   run, flat: THE FLAT WALK (reduce_scatter.cuh): the buffer's rows from offs_m numbered row-major,
-//     slot s's elements from element s * x_stride_slot (a rank's share, or a pushed inbox's
-//     writer), the block WORLD rows of kLanes = THREADS_PER_BLOCK / WORLD threads (whole waves, so a
-//     row of threads' rank and slot stay wave-uniform), thread t's pack k element (offs_n /
-//     kPackElems + t % kLanes + k * kLanes) * kPackElems of its slot; a read past clip_n reads the
-//     last below it, a write skips it. run: the buffer contiguous, a slot one run (a uniform base
-//     and a 32-bit byte offset a pack); flat: strided, a pack's row and column divided out
-//     (element_at). Registers U[1][kPacks][kPackElems].
-//   group_run, group_flat: THE INT4 FLAT WALK: the block TILE_M rows of kThreadsN threads (one row,
-//     or WORLD rows a copy each: the caller's rank or slot a lane), A GROUP A THREAD (thread t's group
-//     offs_n / kInt4Group + t % kThreadsN, its kInt4GroupPacks packs consecutive, so a thread
-//     quantizes alone),
-//     slots and run / flat as above. An INT4 payload is dense (group_run): an element's word at
-//     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
-//     U[1][kInt4GroupPacks][kPackElems] (raw: U[1][kInt4GroupPacks][2]; with a slot dimension,
-//     every slot's).
-//   line: THE FLAG IN THE LINE (NCCL's LL; aiter's `ar_ll_gfx9` LLPackedMsg): the tile's threads
-//     and places, but the buffer holds every 8 bytes of payload in a 16-byte LINE, (4 bytes of
-//     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
-//     sees both flags of a line holds its data, with no barrier. Strides and sizes count the
-//     payload's elements; a row's lines take twice its payload's bytes (kLineBytes /
-//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. send writes the registers' lines carrying `flag`;
-//     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
-//     writer c at slot input_slot + c) and POLLS until each line it waits for carries `flag`: the
-//     rows and packs inside the clip (those past it are nobody's: their registers are left
-//     unread), every writer but input_rank (this rank, which never writes its own inbox; its
-//     registers are left as read, garbage). Both nontemporal 16-byte accesses, aiter's
-//     ll_store_b128 / ll_load_b128 (`global_*_dwordx4 ... nt`): a line moves in one transaction.
-//     The poll leaves past timeout_ticks or once the status's `abort` is set, as barrier's wait
-//     does (give_up, Where::start: the line wait is its kernel's only one).
-enum class Layout { tile, run, flat, group_run, group_flat, line };
+// WHAT A BUFFER MUST HOLD FOR AN [m, n] INT4 PAYLOAD: its values to the scales' offset, then a
+// scale for each group of every row (the host sizes the exchange by it).
+__host__ __device__ constexpr int64_t int4_payload_bytes(int64_t m, int64_t n) {
+  return int4_scales_offset(m, n) + m * int4_groups(n) * kInt4ScaleBytes;
+}
+
 // A LINE: 16 bytes, one global_store_dwordx4 / global_load_dwordx4, carrying 8 bytes of payload
 // (two words) and the flag twice (the line's two halves each carry it: a reader trusts the line
 // only whole).
@@ -135,7 +129,7 @@ constexpr int kLineBytes = 16;
 constexpr int kLinePayloadBytes = 8;
 
 // =================================================================================================
-// THE STATUS: barrier's fault protocol, which the host reads (handle.cuh, log.cuh)
+// THE STATUS: barrier's fault protocol, which the host reads (the handle and the state log)
 // =================================================================================================
 
 // WHERE A WAIT WAS when it gave up, the fault record's `where`; Python's
@@ -191,6 +185,50 @@ enum class StatusField : int {
 };
 constexpr int kStatusFields = 10;
 
+typedef float f32x2 __attribute__((ext_vector_type(2)));
+typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
+// A 16-BIT DTYPE WITH BF16'S 8 MANTISSA DIGITS (c10::BFloat16's numeric_limits).
+template <typename U>
+constexpr bool kBf16 = sizeof(U) == 2 && std::numeric_limits<U>::digits == 8;
+
+typedef __attribute__((address_space(1))) uint32_t global_u32;
+typedef __attribute__((address_space(1))) __fp16 global_f16;
+
+// HOW A CALL'S THREADS COVER THE BUFFER, the four's LAYOUT (a template parameter: each value is
+// different code):
+//   tile: the block over TILE_M rows of packs (LOAD, STORE, SEND AND RECV, above).
+//   run, flat: THE FLAT WALK (reduce_scatter.cuh): the buffer's rows from offs_m numbered row-major,
+//     slot s's elements from element s * x_stride_slot (a rank's share, or a pushed inbox's
+//     writer), the block WORLD rows of kLanes = THREADS_PER_BLOCK / WORLD threads (whole waves, so a
+//     row of threads' rank and slot stay wave-uniform), thread t's pack k element (offs_n /
+//     kPackElems + t % kLanes + k * kLanes) * kPackElems of its slot; a read past clip_n reads the
+//     last below it, a write skips it. run: the buffer contiguous, a slot one run (a uniform base
+//     and a 32-bit byte offset a pack); flat: strided, a pack's row and column divided out
+//     (element_at). Registers U[1][kPacks][kPackElems].
+//   group_run, group_flat: THE INT4 FLAT WALK: the block TILE_M rows of kThreadsN threads (one row,
+//     or WORLD rows a copy each: the caller's rank or slot a lane), A GROUP A THREAD (thread t's group
+//     offs_n / kInt4Group + t % kThreadsN, its kInt4GroupPacks packs consecutive, so a thread
+//     quantizes alone),
+//     slots and run / flat as above. An INT4 payload is dense (group_run): an element's word at
+//     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
+//     U[1][kInt4GroupPacks][kPackElems] (raw: U[1][kInt4GroupPacks][2]; with a slot dimension,
+//     every slot's).
+//   line: THE FLAG IN THE LINE (NCCL's LL; aiter's `ar_ll_gfx9` LLPackedMsg): the tile's threads
+//     and places, but the buffer holds every 8 bytes of payload in a 16-byte LINE, (4 bytes of
+//     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
+//     sees both flags of a line holds its data, with no barrier. Strides and sizes count the
+//     payload's elements; a row's lines take twice its payload's bytes (kLineBytes /
+//     kLinePayloadBytes): its packs' first lines, then their second. A pack is two lines. send writes the registers' lines carrying `flag`;
+//     load reads EVERY WRITER'S slot of an inbox (registers U[WORLD][kRows][kPacks][kPackElems],
+//     writer c at slot input_slot + c) and POLLS until each line it waits for carries `flag`: the
+//     rows and packs inside the clip (those past it are nobody's: their registers are left
+//     unread), every writer but input_rank (this rank, which never writes its own inbox; its
+//     registers are left as read, garbage). Both nontemporal 16-byte accesses, aiter's
+//     ll_store_b128 / ll_load_b128 (`global_*_dwordx4 ... nt`): a line moves in one transaction.
+//     The poll leaves past timeout_ticks or once the status's `abort` is set, as barrier's wait
+//     does (give_up, Where::start: the line wait is its kernel's only one).
+enum class Layout { tile, run, flat, group_run, group_flat, line };
+
 // THE OPERATIONS THE INTERNALS CALL, declared before them (defined below, QUANTIZATION).
 template <typename U, int P>
 DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]);
@@ -201,23 +239,6 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
                       float& scale);
 
 namespace internal {
-
-// A ROW OF n ELEMENTS' INT4 GROUPS, the last short where n is not whole groups.
-__host__ __device__ constexpr int64_t int4_groups(int64_t n) {
-  return (n + kInt4Group - 1) / kInt4Group;
-}
-
-// AN [m, n] BUFFER ENCODED INT4 (the INT4 payload) lies inside the buffer that holds it exact
-// (staging, partials): its values from the buffer's start, [m, n / 2] bytes, rows back to back (a
-// row's stride n / 2); its scales at int4_scales_offset(m, n) bytes past it, [m, int4_groups(n)]
-// fp16 (a row's stride its groups, the last short where n is not whole groups: its packs past the
-// row are nobody's). The offset is the buffer's own m and n alone (STANDARDS 3.2: where an encoded
-// buffer keeps its scales is worked out from its own sizes), so every rank computes the same one.
-// What a buffer must hold for it is the host's own sizing (config.cuh's int4_payload_bytes).
-constexpr int64_t kInt4ScalesAlign = 256;
-__host__ __device__ constexpr int64_t int4_scales_offset(int64_t m, int64_t n) {
-  return (m * n / 2 + kInt4ScalesAlign - 1) / kInt4ScalesAlign * kInt4ScalesAlign;
-}
 
 // ENTRY r OF A DEVICE ARRAY OF POINTERS (`x_ptr_array`, `x_ptr_array_size` entries: a region's
 // addresses, a launch's inputs), `r` THE SAME ACROSS THE WAVE (a constant, or a per-wave rank: read
