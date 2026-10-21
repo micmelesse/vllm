@@ -509,7 +509,9 @@ def _forced(
         ),
         "direction": "push" if "_push_" in template else "pull",
         **build,
-        "blocks_per_grid": 16,
+        "grid_x": 16,
+        "grid_y": 1,
+        "grid_z": 1,
         **split,
     }
 
@@ -1079,16 +1081,17 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
     for name, t in built.templates.items():
         assert t.op in built.op_names, name
         for b in t.builds:
-            assert b["threads_per_block"] > 0 and b["waves_per_eu"] >= 1, (name, b)
+            assert b["block_x"] > 0 and (b["block_y"], b["block_z"]) == (1, 1), (name, b)
+            assert b["waves_per_eu"] >= 1, (name, b)
             assert b["tile_m"] >= 1 and b["tile_n"] > 0, (name, b)
             assert b["quantization"] in get_args(Quantization), (name, b)
-            assert not {"blocks_per_grid", "reduce_scatter_blocks"} & b.keys()
+            assert not {"grid_x", "grid_y", "grid_z", "reduce_scatter_blocks"} & b.keys()
         exact = [b for b in t.builds if b["quantization"] == "none"]
         int4 = [b for b in t.builds if b["quantization"] == "int4"]
         assert exact, name
         if name.startswith("all_reduce_pull_two_shot_") and int4:
             assert all(
-                b["threads_per_block"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
+                b["block_x"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
                 for b in int4
             ), name
         elif name == "all_reduce_pull_two_shot":

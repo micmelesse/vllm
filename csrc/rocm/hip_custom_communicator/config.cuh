@@ -98,10 +98,10 @@ constexpr std::array<BuildConfig, 2 * N> and_int4(
 // block size a launch may take. The grid is the size's (kAllReduceKernels,
 // which picks among these).
 constexpr BuildConfig kAllReduceOneShotConfigs[] = {
-    AllReduceBuildConfig{64, 1, 1, 512},
-    AllReduceBuildConfig{128, 1, 1, 1024},
-    AllReduceBuildConfig{256, 1, 1, 2048},
-    AllReduceBuildConfig{512, 1, 1, 4096},
+    AllReduceBuildConfig{{64, 1, 1}, 1, 1, 512},
+    AllReduceBuildConfig{{128, 1, 1}, 1, 1, 1024},
+    AllReduceBuildConfig{{256, 1, 1}, 1, 1, 2048},
+    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 4096},
 };
 // THE PUSHED ONE-SHOT (the flag in the line): a tile a row high, a pack a
 // thread; aiter's ar_ll_gfx9 runs 256 threads of one 8-byte packet each, 1024
@@ -109,9 +109,9 @@ constexpr BuildConfig kAllReduceOneShotConfigs[] = {
 // block at a 16-byte pack a thread. Every build's tile fits a lines slot
 // (handle.cuh's kLineSlotBytes, checked below). Not swept yet.
 constexpr BuildConfig kAllReducePushOneShotConfigs[] = {
-    AllReduceBuildConfig{64, 1, 1, 512},
-    AllReduceBuildConfig{128, 1, 1, 1024},
-    AllReduceBuildConfig{256, 1, 1, 1024},
+    AllReduceBuildConfig{{64, 1, 1}, 1, 1, 512},
+    AllReduceBuildConfig{{128, 1, 1}, 1, 1, 1024},
+    AllReduceBuildConfig{{256, 1, 1}, 1, 1, 1024},
 };
 // THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
 // builds lay out at that many elements a thread.
@@ -121,22 +121,22 @@ constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / el
 // elements respectively so every lane owns a complete pack. Keep the tuned
 // eight-rank build first; fallback picks use the smallest valid tile below.
 constexpr BuildConfig kAllReduceTwoShotExactConfigs[] = {
-    AllReduceBuildConfig{512, 1, 1, 512},
-    AllReduceBuildConfig{512, 1, 1, 1024},
-    AllReduceBuildConfig{512, 1, 1, 2048},
+    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 512},
+    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 1024},
+    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 2048},
 };
 constexpr auto kAllReduceTwoShotConfigs = and_int4(kAllReduceTwoShotExactConfigs);
 constexpr BuildConfig kRmsNormOneShotConfigs[] = {
-    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 16384},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
 };
 // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55
 // and 18.11 at 128; 2026-10-01T03-26-44Z); a row a block below that.
 constexpr BuildConfig kRmsNormPushExactConfigs[] = {
-    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 16384},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
 };
 constexpr auto kRmsNormPushConfigs = and_int4(kRmsNormPushExactConfigs);
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
@@ -144,33 +144,33 @@ constexpr auto kRmsNormPushConfigs = and_int4(kRmsNormPushExactConfigs);
 // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32 threads
 // (kRmsNormInt4Kernels).
 constexpr BuildConfig kRmsNormPullConfigs[] = {
-    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4},
-    AllReduceRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, Quantization::int4},
+    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, Quantization::int4},
 };
 // Not swept: rms_norm's.
 constexpr BuildConfig kAddRmsNormOneShotConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
 };
 // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128;
 // 2026-10-01T03-26-44Z).
 constexpr BuildConfig kAddRmsNormPushExactConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 16384},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
 };
 constexpr auto kAddRmsNormPushConfigs = and_int4(kAddRmsNormPushExactConfigs);
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us
 // at 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
 // INT4 a group a thread, as rms_norm's.
 constexpr BuildConfig kAddRmsNormPullConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{128, 1, 1, 4096, Quantization::int4},
-    AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192, Quantization::int4},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, Quantization::int4},
+    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, Quantization::int4},
 };
 
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got
@@ -178,8 +178,8 @@ constexpr BuildConfig kAddRmsNormPullConfigs[] = {
 // 166 VGPRs (stamps 2026-10-01T06-26-55Z against 04-15-48Z). The one-shot's
 // grid not swept: the norms'.
 constexpr BuildConfig kAttnResOneShotConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
 };
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98
 // against 39.93, 83.15, 159.33 at 128), a row a block below that
@@ -188,10 +188,10 @@ constexpr BuildConfig kAttnResOneShotConfigs[] = {
 // 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps 2026-10-02T20-36-56Z); its
 // grid not swept yet.
 constexpr BuildConfig kAttnResPushExactConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
 };
 constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192
@@ -207,39 +207,39 @@ constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4
 // are no longer built: they lost at every grid, and 4 spilled 25-30 VGPRs.
 constexpr BuildConfig kAttnResPullConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 2, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 4},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 2, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 4},
     // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32
     // threads, a row a tile (kAttnResInt4Kernels).
-    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 3, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 1, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 3, Quantization::int4},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3, Quantization::int4},
 };
 
 // OUR SEPARATE NORM KERNELS (the norm splits' second, rms_norm_rows and add_rms_norm_rows): a
 // row a tile, Layout::tile, a block's threads along the row; each as it is and with its
 // all-reduce moving INT4.
 constexpr BuildConfig kRmsNormSplitExactConfigs[] = {
-    AllReduceRmsNormBuildConfig{256, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{256, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
+    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
 };
 constexpr auto kRmsNormSplitConfigs = and_int4(kRmsNormSplitExactConfigs);
 constexpr BuildConfig kAddRmsNormSplitExactConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{256, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{256, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{512, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
+    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
+    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
 };
 constexpr auto kAddRmsNormSplitConfigs = and_int4(kAddRmsNormSplitExactConfigs);
 // OUR SEPARATE ATTNRES KERNEL (the split's second, add_attn_res_rms_norm_rows): a row a tile, the
@@ -247,16 +247,16 @@ constexpr auto kAddRmsNormSplitConfigs = and_int4(kAddRmsNormSplitExactConfigs);
 // AttnRes program (256 threads, a source a step: the reference's prefill config) and the
 // neighbours a sweep picks among; each as it is and with its all-reduce moving INT4.
 constexpr BuildConfig kAttnResSplitExactConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 4096, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{128, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 2, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{256, 1, 1, 8192, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{512, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 2, 4096, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 2},
+    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3},
+    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
 };
 constexpr auto kAttnResSplitConfigs = and_int4(kAttnResSplitExactConfigs);
 
@@ -355,20 +355,28 @@ constexpr bool built(Template k, const BuildConfig& b) {
     if (listed == b) return true;
   return false;
 }
-// Whether any build of `k` runs at `threads_per_block` (and `waves_per_eu`):
-// the check's names for a build that is not listed.
-constexpr bool built_at(Template k, int threads_per_block) {
+// Whether any build of `k` runs at `block` (and `waves_per_eu`): the check's
+// names for a build that is not listed.
+constexpr bool built_at(Template k, const Dim3& block) {
   for (const BuildConfig& listed : builds_of(k))
-    if (threads_of(listed) == threads_per_block) return true;
+    if (block_of(listed) == block) return true;
   return false;
 }
-constexpr bool built_at(Template k, int threads_per_block, int waves_per_eu) {
+constexpr bool built_at(Template k, const Dim3& block, int waves_per_eu) {
   for (const BuildConfig& listed : builds_of(k))
-    if (threads_of(listed) == threads_per_block &&
-        waves_of(listed) == waves_per_eu)
+    if (block_of(listed) == block && waves_of(listed) == waves_per_eu)
       return true;
   return false;
 }
+// EVERY BUILD'S BLOCK IS x ALONE: every kernel indexes x alone (types.cuh's
+// Dim3), so a build with threads in y or z would launch threads it never uses.
+constexpr bool every_build_x_alone() {
+  for (const TemplateInfo& t : kTemplates)
+    for (const BuildConfig& b : t.builds)
+      if (!x_alone(block_of(b))) return false;
+  return true;
+}
+static_assert(every_build_x_alone(), "a build's block indexes y or z");
 // THE BUILD TYPE A TEMPLATE'S BUILDS ARE (BuildConfig's index): its op's, every
 // entry the same.
 constexpr size_t family_of(Template k) { return builds_of(k)[0].index(); }
@@ -417,9 +425,10 @@ static_assert(one_template_a_shot(),
 // template parameter here; one that was not built raises.
 // =================================================================================================
 
-inline bool resident(const Handle& h, const void* kernel, int blocks,
-                     int threads, int shared_bytes = 0) {
-  return blocks <= h.resident_blocks(kernel, threads, shared_bytes);
+inline bool resident(const Handle& h, const void* kernel, const Dim3& grid,
+                     const Dim3& block, int shared_bytes = 0) {
+  return volume(grid) <=
+         h.resident_blocks(kernel, static_cast<int>(volume(block)), shared_bytes);
 }
 
 // =================================================================================================
@@ -434,14 +443,14 @@ inline bool resident(const Handle& h, const void* kernel, int blocks,
 // must lay out, or select would refuse it at run time (tile_not_built): checked
 // here, at compile time.
 constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
-  return c.threads_per_block % c.tile_m == 0 &&
-         c.tile_n % (nl * (c.threads_per_block / c.tile_m)) == 0;
+  return c.block.x % c.tile_m == 0 &&
+         c.tile_n % (nl * (c.block.x / c.tile_m)) == 0;
 }
 constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
                                  int nl) {
-  return world > 0 && c.tile_m == 1 && c.threads_per_block % world == 0 &&
-         (c.threads_per_block / world) % kWaveSize == 0 &&
-         c.tile_n % (nl * (c.threads_per_block / world)) == 0;
+  return world > 0 && c.tile_m == 1 && c.block.x % world == 0 &&
+         (c.block.x / world) % kWaveSize == 0 &&
+         c.tile_n % (nl * (c.block.x / world)) == 0;
 }
 // EVERY PUSHED ONE-SHOT BUILD'S TILE FITS A LINES SLOT (handle.cuh's LINES) at
 // every built dtype.
@@ -530,10 +539,10 @@ constexpr bool ops_in_order() {
 static_assert(ops_in_order(), "kOps must list every OpType in its order");
 
 // EVERY OP HAS KERNELS, each one of its own templates, its build listed and its
-// launch one the forcing would accept (a grid of 1 to kMaxBlocks blocks, a
-// split only on the AttnRes pull).
+// launch one the forcing would accept (a grid of 1 to kMaxBlocks blocks in x
+// alone, every kernel's one dimension, a split only on the AttnRes pull).
 constexpr bool launch_fits(Template t, const LaunchConfig& l) {
-  if (l.blocks_per_grid < 1 || l.blocks_per_grid > kMaxBlocks) return false;
+  if (!x_alone(l.grid) || l.grid.x < 1 || l.grid.x > kMaxBlocks) return false;
   if (l.reduce_scatter_blocks < 0) return false;
   return l.reduce_scatter_blocks == 0 ||
          t == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
@@ -576,17 +585,18 @@ struct Chosen {
   KernelConfig config;
 };
 
-// `build_fields` are the op's BuildConfig's fields as the call forced them, in
-// its order, but its quantization, which is `quantization`;
+// `block` is the build's block, x, y and z as the call forced them, and
+// `build_fields` the op's BuildConfig's other fields, in its order, but its
+// quantization, which is `quantization`; `grid` the launch's, as `block`;
 // `reduce_scatter_blocks` the AttnRes split, which only that op takes (another
 // passes none); `build_of` makes the op's BuildConfig from the fields, called
 // only when every one is given.
 template <typename BUILD_OF>
 constexpr std::variant<std::optional<Chosen>, Error> forced(
     OpType o, std::optional<Algorithm> algorithm,
-    std::optional<Direction> direction,
+    std::optional<Direction> direction, Given3 block,
     std::initializer_list<std::optional<int>> build_fields,
-    std::optional<int> quantization, std::optional<int> blocks_per_grid,
+    std::optional<int> quantization, Given3 grid,
     std::optional<int> reduce_scatter_blocks, BUILD_OF build_of) {
   const bool names_template = templates_of(o) > 1;
   const bool splits = o == OpType::all_reduce_add_attn_res_rms_norm;
@@ -599,8 +609,9 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
     count(algorithm.has_value());
     count(direction.has_value());
   }
+  for (const std::optional<int>& d : block) count(d.has_value());
   for (const std::optional<int>& f : build_fields) count(f.has_value());
-  count(blocks_per_grid.has_value());
+  for (const std::optional<int>& d : grid) count(d.has_value());
   if (splits) count(reduce_scatter_blocks.has_value());
   if (given == 0 && !algorithm && !direction && !quantization)
     return std::optional<Chosen>{};
@@ -616,18 +627,20 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
   if (!fn || (algorithm && algorithm_of(*fn) != *algorithm) ||
       (direction && direction_of(*fn) != *direction))
     return Error::no_such_template;
-  // THE RANGES: whole waves up to the build's maximum threads, a grid of 1 to
+  // THE RANGES, over x alone (every kernel's one dimension: y and z 1): a
+  // block of whole waves up to the build's maximum threads, a grid of 1 to
   // kMaxBlocks blocks, waves a EU the CU holds, positive tile fields, a split
   // only on the AttnRes pull.
   const std::span<const std::optional<int>> f(build_fields.begin(),
                                               build_fields.size());
-  const int threads = *f[0], waves = *f[1];
-  if (threads < kWaveSize || threads > kBuild.kernels.max_threads ||
-      threads % kWaveSize != 0 || *blocks_per_grid < 1 ||
-      *blocks_per_grid > kMaxBlocks || waves < 1 ||
+  const Dim3 b{*block[0], *block[1], *block[2]}, g{*grid[0], *grid[1], *grid[2]};
+  const int threads = b.x, waves = *f[0];
+  if (!x_alone(b) || !x_alone(g) || threads < kWaveSize ||
+      threads > kBuild.kernels.max_threads || threads % kWaveSize != 0 ||
+      g.x < 1 || g.x > kMaxBlocks || waves < 1 ||
       waves > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
     return Error::launch_out_of_range;
-  for (size_t i = 2; i < f.size(); ++i)
+  for (size_t i = 1; i < f.size(); ++i)
     if (*f[i] < 1) return Error::field_not_positive;
   const int split = splits ? *reduce_scatter_blocks : 0;
   if (split < 0) return Error::field_not_positive;
@@ -635,7 +648,7 @@ constexpr std::variant<std::optional<Chosen>, Error> forced(
       *fn != Template::all_reduce_pull_two_shot_add_attn_res_rms_norm)
     return Error::field_not_this_templates;
   return std::optional<Chosen>{
-      Chosen{*fn, {quantized(build_of(), q), {*blocks_per_grid, split}}}};
+      Chosen{*fn, {quantized(build_of(), q), {g, split}}}};
 }
 
 // =================================================================================================
@@ -782,12 +795,12 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (int4 && (algorithm_of(fn) == Algorithm::one_shot ||
                fn == Template::all_reduce_pull_two_shot))
     return Error::quantization_not_supported;
-  // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its threads, its
+  // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its block, its
   // waves, its tile.
-  const int threads = threads_of(c.build);
+  const Dim3 block = block_of(c.build);
   if (c.build.index() != family_of(fn)) return Error::tile_not_built;
-  if (!built_at(fn, threads)) return Error::threads_not_built;
-  if (!built_at(fn, threads, waves_of(c.build))) return Error::waves_not_built;
+  if (!built_at(fn, block)) return Error::threads_not_built;
+  if (!built_at(fn, block, waves_of(c.build))) return Error::waves_not_built;
   if (!built(fn, c.build)) return Error::tile_not_built;
   if (!h) return std::nullopt;
   const int64_t packs = packs_of(n, dtype);
@@ -884,8 +897,8 @@ struct ConfigFields {
   int tile_m{};
   int tile_n{};
   int tile_k{};
-  int threads{};
-  int blocks{};
+  Dim3 block{};
+  Dim3 grid{};
   int waves_per_eu{};
   int quantization{};
   int reduce_scatter_blocks{};
@@ -1080,7 +1093,7 @@ void with_config_build(const Config& config, F& f) {
         by_build<FN>([&]() -> BuildConfig {
           using B = family_t<FN>;
           B b{};
-          b.threads_per_block = config.threads;
+          b.block = config.block;
           b.waves_per_eu = config.waves_per_eu;
           b.tile_m = config.tile_m;
           b.tile_n = config.tile_n;
@@ -1111,7 +1124,7 @@ void with_config_build(const Config& config, F& f) {
                 c.tile_m = B.tile_m;
                 c.tile_n = B.tile_n;
                 if constexpr (requires { B.tile_k; }) c.tile_k = B.tile_k;
-                c.threads = B.threads_per_block;
+                c.block = B.block;
                 c.waves_per_eu = B.waves_per_eu;
                 c.quantization = B.quantization;
                 c.contiguous = CONTIGUOUS;
@@ -1222,65 +1235,65 @@ const void* kernel_pointer() {
   using W = typename of_dtype<C.weight_dtype>::t;
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>);
   if constexpr (C.kernel == Kernel::all_reduce_push_one_shot)
     return reinterpret_cast<const void*>(
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot)
     return reinterpret_cast<const void*>(
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization, C.tail>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::rms_norm_rows)
     return reinterpret_cast<const void*>(
-        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>);
+        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::add_rms_norm_rows)
     return reinterpret_cast<const void*>(
-        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>);
+        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
+        all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.block.x,
             C.waves_per_eu, C.quantization, C.chunked>);
   if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
         all_reduce_pull_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k,
-            C.threads, C.waves_per_eu, C.quantization, C.chunked, C.tail>);
+            C.block.x, C.waves_per_eu, C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm)
     return reinterpret_cast<const void*>(
-        all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
+        all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.block.x,
             C.waves_per_eu, C.quantization, C.chunked, C.tail>);
   if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows)
     return reinterpret_cast<const void*>(
-        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu, C.chunked>);
+        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.block.x, C.waves_per_eu, C.chunked>);
 }
 
 inline std::variant<Config, Error> all_reduce_config(
@@ -1290,7 +1303,8 @@ inline std::variant<Config, Error> all_reduce_config(
     int64_t output_size_m, int64_t output_size_n, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
     std::optional<int> waves_per_eu, std::optional<int> quantization,
     hipStream_t stream) {
   const int64_t m = input_size_m,
@@ -1300,10 +1314,10 @@ inline std::variant<Config, Error> all_reduce_config(
   const std::variant<Chosen, Error> picked = chosen(
       h,
       forced(OpType::all_reduce, algorithm, direction,
-             {threads_per_block, waves_per_eu, tile_m, tile_n}, quantization,
-             blocks_per_grid, std::nullopt,
+             {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n}, quantization,
+             {grid_x, grid_y, grid_z}, std::nullopt,
              [&] {
-               return AllReduceBuildConfig{*threads_per_block, *waves_per_eu,
+               return AllReduceBuildConfig{Dim3{*block_x, *block_y, *block_z}, *waves_per_eu,
                                            *tile_m, *tile_n};
              }),
       OpType::all_reduce, m, n);
@@ -1321,7 +1335,7 @@ inline std::variant<Config, Error> all_reduce_config(
   const bool lines = fn == Template::all_reduce_push_one_shot;
   if (lines) {
     const int64_t tiles = (m + a.tile_m - 1) / a.tile_m * ((n + a.tile_n - 1) / a.tile_n);
-    int& blocks = c.launch.blocks_per_grid;
+    int& blocks = c.launch.grid.x;  // the LL push indexes x alone
     if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
     if (blocks > kLineBlocks) blocks = kLineBlocks;
   }
@@ -1384,8 +1398,8 @@ inline std::variant<Config, Error> all_reduce_config(
   config.world = world;
   config.tile_m = a.tile_m;
   config.tile_n = a.tile_n;
-  config.threads = a.threads_per_block;
-  config.blocks = c.launch.blocks_per_grid;
+  config.block = a.block;
+  config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
   // THE INT4 FLAT WALK'S PAYLOADS on views of their own (int4_flat_share).
@@ -1428,7 +1442,7 @@ inline std::variant<Config, Error> all_reduce_config(
   const void* kernel = nullptr;
   with_config<OpType::all_reduce>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  if (!resident(h, kernel, config.blocks, config.threads))
+  if (!resident(h, kernel, config.grid, config.block))
     return Error::grid_not_resident;
   return config;
 }
@@ -1451,7 +1465,8 @@ inline std::variant<Config, Error> split_all_reduce_config(
   const AllReduceBuildConfig& b = std::get<AllReduceBuildConfig>(r.config.build);
   return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
                            dtype, algorithm_of(r.fn), direction_of(r.fn), b.tile_m, b.tile_n,
-                           b.threads_per_block, r.config.launch.blocks_per_grid, b.waves_per_eu,
+                           b.block.x, b.block.y, b.block.z, r.config.launch.grid.x,
+                           r.config.launch.grid.y, r.config.launch.grid.z, b.waves_per_eu,
                            b.quantization, stream);
 }
 
@@ -1466,8 +1481,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
     int64_t output_size_m, int64_t output_size_n, DType dtype,
     DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
+    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
     std::optional<int> quantization, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
@@ -1477,11 +1492,11 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   const std::variant<Chosen, Error> picked =
       chosen(h,
              forced(op, algorithm, direction,
-                    {threads_per_block, waves_per_eu, tile_m, tile_n},
-                    quantization, blocks_per_grid, std::nullopt,
+                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n},
+                    quantization, {grid_x, grid_y, grid_z}, std::nullopt,
                     [&] {
                       return AllReduceRmsNormBuildConfig{
-                          *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
+                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n};
                     }),
              op, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
@@ -1518,8 +1533,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   config.world = world;
   config.tile_m = r.tile_m;
   config.tile_n = r.tile_n;
-  config.threads = r.threads_per_block;
-  config.blocks = c.launch.blocks_per_grid;
+  config.block = r.block;
+  config.grid = c.launch.grid;
   config.waves_per_eu = r.waves_per_eu;
   config.quantization = r.quantization;
   const int64_t row_n = payload_row(fn, r.quantization, n);
@@ -1550,7 +1565,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
   // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) && !resident(h, kernel, config.blocks, config.threads))
+  if (!is_split(fn) && !resident(h, kernel, config.grid, config.block))
     return Error::grid_not_resident;
   return config;
 }
@@ -1571,8 +1586,8 @@ all_reduce_add_rms_norm_config(
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
     DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
+    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
     std::optional<int> quantization, hipStream_t stream) {
   const int64_t m = input_size_m,
                 n = input_size_n;  // the problem's shape: the input's
@@ -1582,11 +1597,11 @@ all_reduce_add_rms_norm_config(
   const std::variant<Chosen, Error> picked =
       chosen(h,
              forced(op, algorithm, direction,
-                    {threads_per_block, waves_per_eu, tile_m, tile_n},
-                    quantization, blocks_per_grid, std::nullopt,
+                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n},
+                    quantization, {grid_x, grid_y, grid_z}, std::nullopt,
                     [&] {
                       return AllReduceAddRmsNormBuildConfig{
-                          *threads_per_block, *waves_per_eu, *tile_m, *tile_n};
+                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n};
                     }),
              op, m, n);
   if (const Error* e = std::get_if<Error>(&picked)) return *e;
@@ -1630,8 +1645,8 @@ all_reduce_add_rms_norm_config(
   config.world = world;
   config.tile_m = r.tile_m;
   config.tile_n = r.tile_n;
-  config.threads = r.threads_per_block;
-  config.blocks = c.launch.blocks_per_grid;
+  config.block = r.block;
+  config.grid = c.launch.grid;
   config.waves_per_eu = r.waves_per_eu;
   config.quantization = r.quantization;
   config.partials_stride_m = partials_stride_m;
@@ -1666,7 +1681,7 @@ all_reduce_add_rms_norm_config(
   if (!kernel) return Error::tile_not_built;
   if (config.scales_size_m > h.scales_size_m()) return Error::partials_too_small;
   // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) && !resident(h, kernel, config.blocks, config.threads))
+  if (!is_split(fn) && !resident(h, kernel, config.grid, config.block))
     return Error::grid_not_resident;
   return config;
 }
@@ -1700,7 +1715,8 @@ all_reduce_add_attn_res_rms_norm_config(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
     std::optional<int> waves_per_eu, std::optional<int> quantization,
     hipStream_t stream) {
   const int64_t m = input_size_m,
@@ -1711,11 +1727,11 @@ all_reduce_add_attn_res_rms_norm_config(
   const std::variant<Chosen, Error> picked =
       chosen(h,
              forced(op, algorithm, direction,
-                    {threads_per_block, waves_per_eu, tile_m, tile_n, tile_k},
-                    quantization, blocks_per_grid, reduce_scatter_blocks,
+                    {block_x, block_y, block_z}, {waves_per_eu, tile_m, tile_n, tile_k},
+                    quantization, {grid_x, grid_y, grid_z}, reduce_scatter_blocks,
                     [&] {
                       return AllReduceAddAttnResRmsNormBuildConfig{
-                          *threads_per_block, *waves_per_eu, *tile_m, *tile_n,
+                          Dim3{*block_x, *block_y, *block_z}, *waves_per_eu, *tile_m, *tile_n,
                           *tile_k};
                     }),
              op, m, n);
@@ -1758,8 +1774,8 @@ all_reduce_add_attn_res_rms_norm_config(
   config.tile_m = tm;
   config.tile_n = a.tile_n;
   config.tile_k = tk;
-  config.threads = a.threads_per_block;
-  config.blocks = c.launch.blocks_per_grid;
+  config.block = a.block;
+  config.grid = c.launch.grid;
   config.waves_per_eu = a.waves_per_eu;
   config.quantization = a.quantization;
   config.reduce_scatter_blocks = rs;
@@ -1791,7 +1807,7 @@ all_reduce_add_attn_res_rms_norm_config(
   if (!kernel) return Error::tile_not_built;
   // A SPLIT'S ATTNRES KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
   if (!is_split(fn) &&
-      !resident(h, kernel, config.blocks, config.threads, config.shared_memory_bytes))
+      !resident(h, kernel, config.grid, config.block, config.shared_memory_bytes))
     return Error::grid_not_resident;
   return config;
 }
@@ -1894,7 +1910,7 @@ inline std::optional<std::string> check(const TunedTable& table) {
       return named("its build is not one its kernel lists");
     if (!launch_fits(c.fn, c.config.launch)) return named("its grid is out of range");
     if (c.fn == Template::all_reduce_push_one_shot &&
-        c.config.launch.blocks_per_grid > kLineBlocks)
+        volume(c.config.launch.grid) > kLineBlocks)
       return named("the LL push's grid is past its lines' blocks");
   }
   for (size_t i = 0; i < table.inputs.size(); ++i) {

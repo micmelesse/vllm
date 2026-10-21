@@ -11,6 +11,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -125,9 +126,9 @@ constexpr const char* to_string(Error e) {
       return "tile_not_built: no build of the template has that TILE_M or "
              "TILE_N";
     case Error::launch_out_of_range:
-      return "launch_out_of_range: threads_per_block is whole waves up to the "
-             "build's maximum, "
-             "blocks_per_grid at least 1 and at most the resident maximum";
+      return "launch_out_of_range: the block is whole waves up to the build's "
+             "maximum and the grid at least 1 and at most the resident maximum, "
+             "each over the dimensions its kernel indexes (x alone: y and z 1)";
     case Error::field_not_positive:
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
@@ -204,8 +205,26 @@ enum class OpType : int {
 // gives both, and select hands both to the launch; no field is ever 0 for "left
 // to someone else".
 //
-// EACH OP'S BUILD, Triton's autotune config less the grid: the block's threads
-// (Triton's num_warps x 64), the waves a SIMD (an EU) the compiler fits its
+// A LAUNCH DIMENSION, the kernel's dim3: x, y and z. Every kernel here indexes x
+// alone, so its configs hold y = z = 1; one that indexed y or z would widen its
+// space, nothing else.
+struct Dim3 {
+  int x = 1;
+  int y = 1;
+  int z = 1;
+  bool operator==(const Dim3&) const = default;
+};
+constexpr int64_t volume(const Dim3& d) {
+  return static_cast<int64_t>(d.x) * d.y * d.z;
+}
+// A DIMENSION AS A CALL FORCES IT, x, y and z each given or not: whole or
+// nothing, as every forced field.
+using Given3 = std::array<std::optional<int>, 3>;
+// Whether `d` is x alone: y = z = 1, every kernel's today.
+constexpr bool x_alone(const Dim3& d) { return d.y == 1 && d.z == 1; }
+
+// EACH OP'S BUILD, Triton's autotune config less the grid: the block, its
+// threads in each dimension (x: Triton's num_warps x 64), the waves a SIMD (an EU) the compiler fits its
 // registers to (__launch_bounds__'s second value, Triton's waves_per_eu; 1 asks
 // nothing), and the tile, TILE_M rows x TILE_N columns in elements; TILE_K is
 // the reduced dimension a step (AttnRes's sources a step); `quantization`, what
@@ -215,7 +234,7 @@ enum class OpType : int {
 // cannot cross ops, though three hold the same fields. all_reduce: a tile a
 // work item, the grid striding over the buffer's.
 struct AllReduceBuildConfig {
-  int threads_per_block;
+  Dim3 block;
   int waves_per_eu;
   int tile_m;
   int tile_n;
@@ -224,7 +243,7 @@ struct AllReduceBuildConfig {
 };
 // all_reduce_rms_norm.
 struct AllReduceRmsNormBuildConfig {
-  int threads_per_block;
+  Dim3 block;
   int waves_per_eu;
   int tile_m;
   int tile_n;
@@ -233,7 +252,7 @@ struct AllReduceRmsNormBuildConfig {
 };
 // all_reduce_add_rms_norm.
 struct AllReduceAddRmsNormBuildConfig {
-  int threads_per_block;
+  Dim3 block;
   int waves_per_eu;
   int tile_m;
   int tile_n;
@@ -242,7 +261,7 @@ struct AllReduceAddRmsNormBuildConfig {
 };
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
 struct AllReduceAddAttnResRmsNormBuildConfig {
-  int threads_per_block;
+  Dim3 block;
   int waves_per_eu;
   int tile_m;
   int tile_n;
@@ -255,13 +274,14 @@ using BuildConfig =
                  AllReduceAddRmsNormBuildConfig,
                  AllReduceAddAttnResRmsNormBuildConfig>;
 
-// A KERNEL'S LAUNCH: its grid, never compiled in, and the blocks of it the
+// A KERNEL'S LAUNCH: its grid, blocks in each dimension, never compiled in, and
+// the blocks of it the
 // fused AttnRes pull two-shot gives its reduce-scatter (its reads queue behind
 // the links past a few dozen; AttnRes after it on every block).
 // reduce_scatter_blocks 0 is no split, every block both: the only value any
 // other kernel takes.
 struct LaunchConfig {
-  int blocks_per_grid;
+  Dim3 grid;
   int reduce_scatter_blocks;
 };
 
@@ -272,8 +292,12 @@ struct KernelConfig {
 };
 
 // THE FIELDS EVERY BUILD HAS.
+constexpr Dim3 block_of(const BuildConfig& b) {
+  return std::visit([](const auto& f) { return f.block; }, b);
+}
+// A block's threads, every dimension's.
 constexpr int threads_of(const BuildConfig& b) {
-  return std::visit([](const auto& f) { return f.threads_per_block; }, b);
+  return static_cast<int>(volume(block_of(b)));
 }
 constexpr int waves_of(const BuildConfig& b) {
   return std::visit([](const auto& f) { return f.waves_per_eu; }, b);
@@ -319,9 +343,9 @@ struct TunedTable {
 };
 // THE TABLE ON THE WIRE from Python, two lists of int64 (`Template` and `OpType` by their enums'
 // numbers, `build_info`'s order): a config's fields, then an input's, in these orders:
-// template, threads_per_block, waves_per_eu, tile_m, tile_n, tile_k, quantization,
-// blocks_per_grid, reduce_scatter_blocks; and op, mode, world, hidden, tokens, config.
-constexpr int kConfigFields = 9;
+// template, block x, y, z, waves_per_eu, tile_m, tile_n, tile_k, quantization,
+// grid x, y, z, reduce_scatter_blocks; and op, mode, world, hidden, tokens, config.
+constexpr int kConfigFields = 13;
 constexpr int kInputFields = 6;
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }

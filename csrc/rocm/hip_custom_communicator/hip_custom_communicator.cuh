@@ -18,6 +18,12 @@
 
 namespace hip_custom_communicator {
 
+// A LAUNCH DIMENSION AS HIP TAKES IT.
+inline dim3 dim3_of(const Dim3& d) {
+  return dim3(static_cast<unsigned>(d.x), static_cast<unsigned>(d.y),
+              static_cast<unsigned>(d.z));
+}
+
 // =================================================================================================
 // all_reduce: the sum of every rank's `input` into `output`, each at its own
 // strides and sizes.
@@ -30,7 +36,8 @@ inline std::variant<Config, Error> all_reduce(
     int64_t output_size_m, int64_t output_size_n, DType dtype,
     std::optional<Algorithm> algorithm, std::optional<Direction> direction,
     std::optional<int> tile_m, std::optional<int> tile_n,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
     std::optional<int> waves_per_eu, std::optional<int> quantization,
     hipStream_t stream) {
   if (const std::optional<Error> e =
@@ -40,8 +47,8 @@ inline std::variant<Config, Error> all_reduce(
   std::variant<Config, Error> checked = all_reduce_config(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       output, output_stride_m, output_stride_n, output_size_m, output_size_n,
-      dtype, algorithm, direction, tile_m, tile_n, threads_per_block,
-      blocks_per_grid, waves_per_eu, quantization, stream);
+      dtype, algorithm, direction, tile_m, tile_n, block_x, block_y, block_z,
+      grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   with_config<OpType::all_reduce>(config, [&]<Config C>() {
@@ -54,9 +61,9 @@ inline std::variant<Config, Error> all_reduce(
             stream)
         : InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n};
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-      all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
         t.stride_m, t.stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
@@ -69,9 +76,9 @@ inline std::variant<Config, Error> all_reduce(
         h.timeout_ticks());
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-      all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
           C.contiguous, C.quantization>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
         t.stride_m, t.stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
@@ -87,9 +94,9 @@ inline std::variant<Config, Error> all_reduce(
         h.timeout_ticks());
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-      all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
@@ -103,9 +110,9 @@ inline std::variant<Config, Error> all_reduce(
         h.status_size_field(), h.rank(), h.timeout_ticks());
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-      all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
           C.contiguous, C.quantization, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
@@ -142,8 +149,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     int64_t output_size_m, int64_t output_size_n, DType dtype,
     DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
+    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
     std::optional<int> quantization, hipStream_t stream) {
   if (const std::optional<Error> e =
           layout_refused(dtype, {{output_stride_m, output_stride_n},
@@ -156,7 +163,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       h, input, input_stride_m, input_stride_n, input_size_m, input_size_n,
       weight, weight_stride_n, weight_size_n, output, output_stride_m,
       output_stride_n, output_size_m, output_size_n, dtype, weight_dtype, eps,
-      algorithm, direction, tile_m, tile_n, threads_per_block, blocks_per_grid,
+      algorithm, direction, tile_m, tile_n, block_x, block_y, block_z, grid_x, grid_y, grid_z,
       waves_per_eu, quantization, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
@@ -173,9 +180,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
               stream)
           : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
       if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -188,9 +195,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -207,9 +214,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -223,9 +230,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization, C.tail>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -251,8 +258,8 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
           dtype, stream);
       if constexpr (C.kernel == Kernel::rms_norm_rows) {
-        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>
-            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
+            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<const W*>(weight), weight_stride_n,
@@ -274,9 +281,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_rms_norm) {
-      all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_one_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -295,9 +302,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_rms_norm) {
-      all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_two_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -319,9 +326,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_rms_norm) {
-      all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_push_two_shot_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -359,8 +366,8 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     int64_t residual_output_size_m, int64_t residual_output_size_n, DType dtype,
     DType weight_dtype, float eps, std::optional<Algorithm> algorithm,
     std::optional<Direction> direction, std::optional<int> tile_m,
-    std::optional<int> tile_n, std::optional<int> threads_per_block,
-    std::optional<int> blocks_per_grid, std::optional<int> waves_per_eu,
+    std::optional<int> tile_n, std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z, std::optional<int> waves_per_eu,
     std::optional<int> quantization, hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
           dtype, {{output_stride_m, output_stride_n},
@@ -379,8 +386,8 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           output_stride_m, output_stride_n, output_size_m, output_size_n,
           residual_output, residual_output_stride_m, residual_output_stride_n,
           residual_output_size_m, residual_output_size_n, dtype, weight_dtype,
-          eps, algorithm, direction, tile_m, tile_n, threads_per_block,
-          blocks_per_grid, waves_per_eu, quantization, stream);
+          eps, algorithm, direction, tile_m, tile_n, block_x, block_y, block_z,
+          grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   if (config.split) {
@@ -396,9 +403,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
               stream)
           : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
       if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -411,9 +418,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -430,9 +437,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -446,9 +453,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization, C.tail>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -474,8 +481,8 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
       h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
           input_size_n, dtype, stream);
       if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
-        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.threads, C.waves_per_eu, C.chunked>
-            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
+            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<const T*>(residual), residual_stride_m,
@@ -502,9 +509,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_rms_norm) {
-      all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_one_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -528,9 +535,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_rms_norm) {
-      all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_pull_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -559,9 +566,9 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
         h.status_size_field(), h.rank(), h.timeout_ticks(), eps);
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_rms_norm) {
-      all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.threads, C.waves_per_eu,
+      all_reduce_push_two_shot_add_rms_norm<T, W, C.world, C.tile_n, C.block.x, C.waves_per_eu,
           C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -625,7 +632,8 @@ all_reduce_add_attn_res_rms_norm(
     std::optional<Direction> direction, std::optional<int> tile_m,
     std::optional<int> tile_n, std::optional<int> tile_k,
     std::optional<int> reduce_scatter_blocks,
-    std::optional<int> threads_per_block, std::optional<int> blocks_per_grid,
+    std::optional<int> block_x, std::optional<int> block_y, std::optional<int> block_z,
+    std::optional<int> grid_x, std::optional<int> grid_y, std::optional<int> grid_z,
     std::optional<int> waves_per_eu, std::optional<int> quantization,
     hipStream_t stream) {
   if (const std::optional<Error> e = layout_refused(
@@ -666,8 +674,8 @@ all_reduce_add_attn_res_rms_norm(
           output_size_m, output_size_n, block_output, block_output_stride_m,
           block_output_stride_n, block_output_size_m, block_output_size_n,
           dtype, num_blocks, eps, output_eps, algorithm, direction, tile_m,
-          tile_n, tile_k, reduce_scatter_blocks, threads_per_block,
-          blocks_per_grid, waves_per_eu, quantization, stream);
+          tile_n, tile_k, reduce_scatter_blocks, block_x, block_y, block_z,
+          grid_x, grid_y, grid_z, waves_per_eu, quantization, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
   if (config.split) {
@@ -683,9 +691,9 @@ all_reduce_add_attn_res_rms_norm(
               stream)
           : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
       if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -698,9 +706,9 @@ all_reduce_add_attn_res_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
           t.stride_m, t.stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -717,9 +725,9 @@ all_reduce_add_attn_res_rms_norm(
           h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.quantization>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -733,9 +741,9 @@ all_reduce_add_attn_res_rms_norm(
           h.status_size_field(), h.rank(), h.timeout_ticks());
       }
       if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.threads, C.waves_per_eu,
+        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
             C.contiguous, C.quantization, C.tail>
-            <<<reduced.blocks, C.threads, reduced.shared_memory_bytes, stream>>>(
+            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
           static_cast<const T*>(input),
           input_stride_m, input_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
@@ -761,8 +769,8 @@ all_reduce_add_attn_res_rms_norm(
       h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
           input_size_n, dtype, stream);
       if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
-        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.threads, C.waves_per_eu, C.chunked>
-            <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.block.x, C.waves_per_eu, C.chunked>
+            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
           static_cast<const T*>(h.sums()),
           input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
           static_cast<int>(input_size_n), static_cast<const T*>(prefix), prefix_stride_m,
@@ -799,9 +807,9 @@ all_reduce_add_attn_res_rms_norm(
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
     if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot_add_attn_res_rms_norm) {
-      all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
+      all_reduce_pull_one_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.block.x,
           C.waves_per_eu, C.quantization, C.chunked>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -832,9 +840,9 @@ all_reduce_add_attn_res_rms_norm(
         output_eps);
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot_add_attn_res_rms_norm) {
-      all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.threads,
+      all_reduce_push_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_n, C.tile_k, C.block.x,
           C.waves_per_eu, C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),
@@ -871,8 +879,8 @@ all_reduce_add_attn_res_rms_norm(
     }
     if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot_add_attn_res_rms_norm) {
       all_reduce_pull_two_shot_add_attn_res_rms_norm<T, C.world, C.tile_m, C.tile_n, C.tile_k,
-          C.threads, C.waves_per_eu, C.quantization, C.chunked, C.tail>
-          <<<config.blocks, C.threads, config.shared_memory_bytes, stream>>>(
+          C.block.x, C.waves_per_eu, C.quantization, C.chunked, C.tail>
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
         static_cast<const T*>(input),
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), reinterpret_cast<const T* const*>(t.ptr_array),

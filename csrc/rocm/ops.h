@@ -134,15 +134,17 @@ std::vector<int64_t> hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> tile_n, std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
@@ -150,8 +152,9 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     torch::Tensor& residual_output, double eps,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization);
 std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
@@ -164,6 +167,7 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
     std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization);

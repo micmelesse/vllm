@@ -205,9 +205,9 @@ using BuildInfoWire =
                Names, std::vector<int64_t>>;
 // AN OP'S ANSWER, primitive ints: [the Error's number it was refused for, or -1
 // when it ran; then, when it ran, WHAT RAN, for the flight recorder: algorithm,
-// direction, tile_m, tile_n, threads_per_block, blocks_per_grid, waves_per_eu,
-// tile_k, reduce_scatter_blocks (0 where the op has none),
-// quantization (common.cuh's Quantization)].
+// direction, tile_m, tile_n, block x, y, z, grid x, y, z, waves_per_eu, tile_k,
+// reduce_scatter_blocks (0 where the op has none), quantization (common.cuh's
+// Quantization)].
 using Answer = std::vector<int64_t>;
 Answer refusal(hip_custom_communicator::Error e) {
   return {static_cast<int64_t>(e)};
@@ -222,8 +222,12 @@ Answer answer(const std::variant<hip_custom_communicator::Config,
           static_cast<int64_t>(config.direction),
           config.tile_m,
           config.tile_n,
-          config.threads,
-          config.blocks,
+          config.block.x,
+          config.block.y,
+          config.block.z,
+          config.grid.x,
+          config.grid.y,
+          config.grid.z,
           config.waves_per_eu,
           config.tile_k,
           config.reduce_scatter_blocks,
@@ -246,17 +250,17 @@ hip_custom_communicator::TunedTable table_from(const std::vector<int64_t>& confi
                 at / kConfigFields, " names no kernel this build has");
     const Template fn = static_cast<Template>(f[0]);
     const OpType o = op_of(fn);
-    const int threads = static_cast<int>(f[1]), waves = static_cast<int>(f[2]),
-              tile_m = static_cast<int>(f[3]), tile_n = static_cast<int>(f[4]),
-              tile_k = static_cast<int>(f[5]), q = static_cast<int>(f[6]);
-    BuildConfig b = AllReduceBuildConfig{threads, waves, tile_m, tile_n, q};
+    const auto i = [&](int k) { return static_cast<int>(f[k]); };
+    const Dim3 block{i(1), i(2), i(3)}, grid{i(9), i(10), i(11)};
+    const int waves = i(4), tile_m = i(5), tile_n = i(6), tile_k = i(7), q = i(8);
+    BuildConfig b = AllReduceBuildConfig{block, waves, tile_m, tile_n, q};
     if (o == OpType::all_reduce_rms_norm)
-      b = AllReduceRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
+      b = AllReduceRmsNormBuildConfig{block, waves, tile_m, tile_n, q};
     if (o == OpType::all_reduce_add_rms_norm)
-      b = AllReduceAddRmsNormBuildConfig{threads, waves, tile_m, tile_n, q};
+      b = AllReduceAddRmsNormBuildConfig{block, waves, tile_m, tile_n, q};
     if (o == OpType::all_reduce_add_attn_res_rms_norm)
-      b = AllReduceAddAttnResRmsNormBuildConfig{threads, waves, tile_m, tile_n, tile_k, q};
-    out.configs.push_back({fn, {b, {static_cast<int>(f[7]), static_cast<int>(f[8])}}});
+      b = AllReduceAddAttnResRmsNormBuildConfig{block, waves, tile_m, tile_n, tile_k, q};
+    out.configs.push_back({fn, {b, {grid, i(12)}}});
   }
   for (size_t at = 0; at < inputs.size(); at += kInputFields) {
     const int64_t* f = &inputs[at];
@@ -362,11 +366,10 @@ BuildInfoWire hip_custom_communicator_build_info() {
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
   // search space, each one a forcing can name), flat: a build's fields in
   // `fields`' order, 0 where its op's BuildConfig has none (every field it has
-  // is set), its quantization a Quantization. The launch is not a build's: a
-  // forced call gives its own grid.
-  const Names fields = {"tile_m",       "tile_n",
-                        "tile_k",       "threads_per_block",
-                        "waves_per_eu", "quantization"};
+  // is set), its quantization a Quantization; its block a field a dimension.
+  // The launch is not a build's: a forced call gives its own grid.
+  const Names fields = {"tile_m",  "tile_n",  "tile_k",       "block_x",
+                        "block_y", "block_z", "waves_per_eu", "quantization"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
@@ -378,8 +381,8 @@ BuildInfoWire hip_custom_communicator_build_info() {
             int64_t k = 0;
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
             configs.insert(configs.end(),
-                           {f.tile_m, f.tile_n, k, f.threads_per_block,
-                            f.waves_per_eu, f.quantization});
+                           {f.tile_m, f.tile_n, k, f.block.x, f.block.y,
+                            f.block.z, f.waves_per_eu, f.quantization});
           },
           b);
     counts.push_back(static_cast<int64_t>(t.builds.size()));
@@ -446,8 +449,12 @@ std::vector<int64_t> hip_custom_communicator_tuned(
                 static_cast<int64_t>(direction_of(c->fn)),
                 b.tile_m,
                 b.tile_n,
-                b.threads_per_block,
-                c->config.launch.blocks_per_grid,
+                b.block.x,
+                b.block.y,
+                b.block.z,
+                c->config.launch.grid.x,
+                c->config.launch.grid.y,
+                c->config.launch.grid.z,
                 b.waves_per_eu,
                 tile_k,
                 c->config.launch.reduce_scatter_blocks,
@@ -623,8 +630,9 @@ Answer hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization) {
   check_device({&input, &output});
   TORCH_CHECK(output.sizes() == input.sizes(),
@@ -642,7 +650,7 @@ Answer hip_custom_communicator_all_reduce(
       output_rows->data_ptr(), output_rows->stride(0), output_rows->stride(1),
       output_rows->size(0), output_rows->size(1), dtype_of(input),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
-      narrowed(tile_n), narrowed(threads_per_block), narrowed(blocks_per_grid),
+      narrowed(tile_n), narrowed(block_x), narrowed(block_y), narrowed(block_z), narrowed(grid_x), narrowed(grid_y), narrowed(grid_z),
       narrowed(waves_per_eu), quantization_from(quantization),
       current_stream());
   return answer(got);
@@ -688,8 +696,9 @@ Answer hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps, std::optional<std::string> algorithm,
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
-    std::optional<int64_t> tile_n, std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> tile_n, std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization) {
   norm_tensors(input, nullptr, weight, output, nullptr);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
@@ -699,7 +708,7 @@ Answer hip_custom_communicator_all_reduce_rms_norm(
       output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), algorithm_from(algorithm),
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
-      narrowed(threads_per_block), narrowed(blocks_per_grid),
+      narrowed(block_x), narrowed(block_y), narrowed(block_z), narrowed(grid_x), narrowed(grid_y), narrowed(grid_z),
       narrowed(waves_per_eu), quantization_from(quantization),
       current_stream());
   return answer(got);
@@ -711,8 +720,9 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(
     torch::Tensor& residual_output, double eps,
     std::optional<std::string> algorithm, std::optional<std::string> direction,
     std::optional<int64_t> tile_m, std::optional<int64_t> tile_n,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization) {
   norm_tensors(input, &residual, weight, output, &residual_output);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
@@ -726,7 +736,7 @@ Answer hip_custom_communicator_all_reduce_add_rms_norm(
       residual_output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), algorithm_from(algorithm),
       direction_from(direction), narrowed(tile_m), narrowed(tile_n),
-      narrowed(threads_per_block), narrowed(blocks_per_grid),
+      narrowed(block_x), narrowed(block_y), narrowed(block_z), narrowed(grid_x), narrowed(grid_y), narrowed(grid_z),
       narrowed(waves_per_eu), quantization_from(quantization),
       current_stream());
   return answer(got);
@@ -822,8 +832,9 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     std::optional<std::string> direction, std::optional<int64_t> tile_m,
     std::optional<int64_t> tile_n, std::optional<int64_t> tile_k,
     std::optional<int64_t> reduce_scatter_blocks,
-    std::optional<int64_t> threads_per_block,
-    std::optional<int64_t> blocks_per_grid, std::optional<int64_t> waves_per_eu,
+    std::optional<int64_t> block_x, std::optional<int64_t> block_y,
+    std::optional<int64_t> block_z, std::optional<int64_t> grid_x,
+    std::optional<int64_t> grid_y, std::optional<int64_t> grid_z, std::optional<int64_t> waves_per_eu,
     std::optional<std::string> quantization) {
   attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
                    output_norm_weight, prefix_output, output, block_output,
@@ -848,7 +859,7 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
       static_cast<float>(eps), static_cast<float>(output_eps),
       algorithm_from(algorithm), direction_from(direction), narrowed(tile_m),
       narrowed(tile_n), narrowed(tile_k), narrowed(reduce_scatter_blocks),
-      narrowed(threads_per_block), narrowed(blocks_per_grid),
+      narrowed(block_x), narrowed(block_y), narrowed(block_z), narrowed(grid_x), narrowed(grid_y), narrowed(grid_z),
       narrowed(waves_per_eu), quantization_from(quantization),
       current_stream());
   return answer(got);

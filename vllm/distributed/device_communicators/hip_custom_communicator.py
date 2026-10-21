@@ -596,8 +596,8 @@ _DTYPES: Mapping[str, torch.dtype] = {
 class TemplateBuild:
     """One C++ template as built: its op, and the builds dispatch instantiates (its
     catalog list), each its fields by name as a forcing passes them
-    (threads_per_block, waves_per_eu, its tile and its quantization; never the launch,
-    which a forced call gives itself)."""
+    (block_x, block_y, block_z, waves_per_eu, its tile and its quantization; never the
+    launch, which a forced call gives itself)."""
 
     op: str
     builds: tuple[dict[str, int | str], ...]
@@ -798,11 +798,15 @@ _CONFIG_KEYS = frozenset(
     {
         "kernel",
         "quantization",
-        "threads_per_block",
+        "block_x",
+        "block_y",
+        "block_z",
         "waves_per_eu",
         "tile_m",
         "tile_n",
-        "blocks_per_grid",
+        "grid_x",
+        "grid_y",
+        "grid_z",
     }
 )
 # AttnRes's kernels take sources a step and a reduce-scatter split besides.
@@ -840,13 +844,17 @@ def tuned_table(arch: str) -> tuple[list[int], list[int]] | str:
                 )
             configs += [
                 templates.index(c["kernel"]),
-                c["threads_per_block"],
+                c["block_x"],
+                c["block_y"],
+                c["block_z"],
                 c["waves_per_eu"],
                 c["tile_m"],
                 c["tile_n"],
                 c.get("tile_k", 0),
                 _QUANTIZATIONS.index(c["quantization"]),
-                c["blocks_per_grid"],
+                c["grid_x"],
+                c["grid_y"],
+                c["grid_z"],
                 c.get("reduce_scatter_blocks", 0),
             ]
         for i, e in enumerate(table["inputs"]):
@@ -1024,15 +1032,20 @@ _QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
 @dataclass(frozen=True)
 class Ran:
     """WHAT A LAUNCH RAN, as C++ answered it: the kernel's algorithm and direction,
-    its tile and threads, its grid; `tile_k` and `reduce_scatter_blocks` 0 where
-    the op has none; `quantization`, what crossed the links ("none" or "int4")."""
+    its tile, its block (threads in x, y and z) and its grid (blocks in each);
+    `tile_k` and `reduce_scatter_blocks` 0 where the op has none; `quantization`,
+    what crossed the links ("none" or "int4")."""
 
     algorithm: str
     direction: str
     tile_m: int
     tile_n: int
-    threads_per_block: int
-    blocks_per_grid: int
+    block_x: int
+    block_y: int
+    block_z: int
+    grid_x: int
+    grid_y: int
+    grid_z: int
     waves_per_eu: int
     tile_k: int
     reduce_scatter_blocks: int
@@ -1042,27 +1055,24 @@ class Ran:
     def of(cls, answer: Answer) -> "Ran | None":
         """From an answer that ran; None for one that says nothing of what ran (the
         test's torch control answers [-1])."""
-        if len(answer) < 11:
+        if len(answer) < 15:
             return None
         a = answer[1:]
         return cls(
             _ALGORITHMS[a[0]],
             _DIRECTIONS[a[1]],
-            a[2],
-            a[3],
-            a[4],
-            a[5],
-            a[6],
-            a[7],
-            a[8],
-            _QUANTIZATIONS[a[9]],
+            *a[2:11],
+            a[11],
+            a[12],
+            _QUANTIZATIONS[a[13]],
         )
 
     def __str__(self) -> str:
         how = " int4" if self.quantization == "int4" else ""
         return (
             f"{self.direction} {self.algorithm}{how} tile {self.tile_m}x{self.tile_n}"
-            f" threads {self.threads_per_block} grid {self.blocks_per_grid}"
+            f" block {self.block_x}x{self.block_y}x{self.block_z}"
+            f" grid {self.grid_x}x{self.grid_y}x{self.grid_z}"
         )
 
 
@@ -1219,7 +1229,7 @@ class HipCustomCommunicator:
     # the tests force: ALL OR NOTHING, the algorithm (`one_shot`, `two_shot` or
     # `split`) and the direction (`pull` or `push`) where the op has more than one
     # template, every field of one of its builds (`build_info().templates`), and the
-    # launch (blocks_per_grid, and the AttnRes op's reduce_scatter_blocks); some but
+    # launch (grid_x, grid_y, grid_z, and the AttnRes op's reduce_scatter_blocks); some but
     # not all is `forced_incomplete`. The build's `quantization` may be left out; it is
     # then none, never the communicator's: a forced call runs what it names. All None
     # is the backend's choice; the model forces none. A forced call asks no `should_`:
@@ -1265,8 +1275,12 @@ class HipCustomCommunicator:
         direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
         waves_per_eu: int | None = None,
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
@@ -1284,8 +1298,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1312,8 +1330,12 @@ class HipCustomCommunicator:
         direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
         waves_per_eu: int | None = None,
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
@@ -1332,8 +1354,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1363,8 +1389,12 @@ class HipCustomCommunicator:
         direction: str | None = None,
         tile_m: int | None = None,
         tile_n: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
         waves_per_eu: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1385,8 +1415,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1422,8 +1456,12 @@ class HipCustomCommunicator:
         tile_n: int | None = None,
         tile_k: int | None = None,
         reduce_scatter_blocks: int | None = None,
-        threads_per_block: int | None = None,
-        blocks_per_grid: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
         waves_per_eu: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1459,8 +1497,12 @@ class HipCustomCommunicator:
             tile_n,
             tile_k,
             reduce_scatter_blocks,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1757,8 +1799,12 @@ class HipCustomCommunicator:
         direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
+        block_x: int | None,
+        block_y: int | None,
+        block_z: int | None,
+        grid_x: int | None,
+        grid_y: int | None,
+        grid_z: int | None,
         waves_per_eu: int | None,
         quantization: Quantization | None,
     ) -> Answer:
@@ -1772,8 +1818,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1788,8 +1838,12 @@ class HipCustomCommunicator:
         direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
+        block_x: int | None,
+        block_y: int | None,
+        block_z: int | None,
+        grid_x: int | None,
+        grid_y: int | None,
+        grid_z: int | None,
         waves_per_eu: int | None,
         quantization: Quantization | None,
     ) -> Answer:
@@ -1803,8 +1857,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1821,8 +1879,12 @@ class HipCustomCommunicator:
         direction: str | None,
         tile_m: int | None,
         tile_n: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
+        block_x: int | None,
+        block_y: int | None,
+        block_z: int | None,
+        grid_x: int | None,
+        grid_y: int | None,
+        grid_z: int | None,
         waves_per_eu: int | None,
         quantization: Quantization | None,
     ) -> Answer:
@@ -1840,8 +1902,12 @@ class HipCustomCommunicator:
             direction,
             tile_m,
             tile_n,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
@@ -1866,8 +1932,12 @@ class HipCustomCommunicator:
         tile_n: int | None,
         tile_k: int | None,
         reduce_scatter_blocks: int | None,
-        threads_per_block: int | None,
-        blocks_per_grid: int | None,
+        block_x: int | None,
+        block_y: int | None,
+        block_z: int | None,
+        grid_x: int | None,
+        grid_y: int | None,
+        grid_z: int | None,
         waves_per_eu: int | None,
         quantization: Quantization | None,
     ) -> Answer:
@@ -1894,8 +1964,12 @@ class HipCustomCommunicator:
             tile_n,
             tile_k,
             reduce_scatter_blocks,
-            threads_per_block,
-            blocks_per_grid,
+            block_x,
+            block_y,
+            block_z,
+            grid_x,
+            grid_y,
+            grid_z,
             waves_per_eu,
             quantization,
         )
