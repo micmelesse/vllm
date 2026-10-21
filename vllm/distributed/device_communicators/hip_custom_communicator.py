@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
-from typing import ClassVar, Literal, final, get_args
+from typing import Any, ClassVar, Literal, final, get_args
 
 import torch
 from torch.distributed import ProcessGroup
@@ -791,8 +791,12 @@ class Supported:
 # its config on each arch by index; and its `configs` on each arch (the config space
 # tuned there: a kernel of the op, what it moves, its build and launch). C++ checks the
 # device's arch's table at open and runs a call at its nearest input's config
-# (config.cuh's `lookup`): every tuned number is here, none in C++.
+# (config.cuh's `lookup`): every tuned number is here, none in C++. A communicator
+# opened with a `table` of the file's shape runs that one instead (the tuner's
+# candidate, checked through C++ before it is written here).
 _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
+# THE TUNED TABLE AS THE FILE HOLDS IT, parsed: each op's `inputs` and `configs`.
+TunedTable = dict[str, Any]
 _INPUT_KEYS = frozenset({"mode", "world", "hidden", "tokens", "config"})
 _CONFIG_KEYS = frozenset(
     {
@@ -814,16 +818,18 @@ _ATTN_RES_KEYS = frozenset({"tile_k", "reduce_scatter_blocks"})
 _MODES = ("exact", "quantized")
 
 
-def tuned_table(arch: str) -> tuple[list[int], list[int]] | str:
-    """THE TUNED TABLE ON `arch` as C++ takes it at open (types.cuh's TunedTable on the
-    wire: every op's configs on the arch, `kConfigFields` int64 each, then every op's
-    inputs, `kInputFields` each, an input's config its index among every op's), or why
-    there is none: an op the arch has no table for (every input a config on it). A file
-    that is not one raises, naming the entry; C++ checks the rest."""
-    raw = json.loads(_TABLE.read_text())
+def tuned_table(raw: TunedTable, arch: str) -> tuple[list[int], list[int]] | str:
+    """THE TUNED TABLE `raw` (the file's, or one handed in at open) ON `arch` as C++
+    takes it at open (types.cuh's TunedTable on the wire: every op's configs on the
+    arch, `kConfigFields` int64 each, then every op's inputs, `kInputFields` each, an
+    input's config its index among every op's), or why there is none: an op the arch
+    has no table for (every input a config on it). A table that is not one raises,
+    naming the entry; C++ checks the rest."""
     built = build_info()
     if set(raw) != set(built.op_names):
-        raise ValueError(f"{_TABLE}: its ops are {sorted(raw)}, not {built.op_names}")
+        raise ValueError(
+            f"the tuned table: its ops are {sorted(raw)}, not {built.op_names}"
+        )
     templates = list(built.templates)
     configs: list[int] = []
     inputs: list[int] = []
@@ -831,16 +837,18 @@ def tuned_table(arch: str) -> tuple[list[int], list[int]] | str:
     for name in built.op_names:
         table = raw[name]
         if set(table) != {"inputs", "configs"}:
-            raise ValueError(f"{_TABLE}: {name} is not an op's table: {sorted(table)}")
+            raise ValueError(
+                f"the tuned table: {name} is not an op's table: {sorted(table)}"
+            )
         if arch not in table["configs"]:
-            return f"{name} is not tuned on {arch} ({_TABLE})"
+            return f"{name} is not tuned on {arch}"
         own = _CONFIG_KEYS | (_ATTN_RES_KEYS if "attn_res" in name else frozenset())
         arch_configs = table["configs"][arch]
         for i, c in enumerate(arch_configs):
             if set(c) != own:
                 raise ValueError(
-                    f"{_TABLE}: {name}.configs.{arch}[{i}] has keys {sorted(c)}, "
-                    f"not {sorted(own)}"
+                    f"the tuned table: {name}.configs.{arch}[{i}] has keys "
+                    f"{sorted(c)}, not {sorted(own)}"
                 )
             configs += [
                 templates.index(c["kernel"]),
@@ -859,9 +867,11 @@ def tuned_table(arch: str) -> tuple[list[int], list[int]] | str:
             ]
         for i, e in enumerate(table["inputs"]):
             if set(e) != _INPUT_KEYS:
-                raise ValueError(f"{_TABLE}: {name}.inputs[{i}] has keys {sorted(e)}")
+                raise ValueError(
+                    f"the tuned table: {name}.inputs[{i}] has keys {sorted(e)}"
+                )
             if not 0 <= e["config"].get(arch, -1) < len(arch_configs):
-                return f"{name}.inputs[{i}] has no config on {arch} ({_TABLE})"
+                return f"{name}.inputs[{i}] has no config on {arch}"
             inputs += [
                 built.op_names.index(name),
                 _MODES.index(e["mode"]),
@@ -1148,6 +1158,7 @@ class HipCustomCommunicator:
         max_cols: int | None = None,
         quantization: Quantization | None = None,
         log_mode: LogMode | None = None,
+        table: TunedTable | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
@@ -1158,7 +1169,9 @@ class HipCustomCommunicator:
         calls C++ picks move across the links, from each op's crossover up; None is
         what the environment asks (`configured_quantization`). `log_mode`: what the
         state log records (`log()`); None is what the environment asks
-        (`configured_log_mode`)."""
+        (`configured_log_mode`). `table`: the tuned table C++ runs from, of the
+        file's shape (the tuner's candidate); None is the file's
+        (`hip_custom_communicator.json`)."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -1190,6 +1203,9 @@ class HipCustomCommunicator:
             configured_quantization() if quantization is None else quantization
         )
         self.log_mode: LogMode = configured_log_mode() if log_mode is None else log_mode
+        self.table: TunedTable = (
+            json.loads(_TABLE.read_text()) if table is None else table
+        )
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
@@ -1732,7 +1748,7 @@ class HipCustomCommunicator:
         found = supported(self.device, self.device_group.size())
         if isinstance(found, Error):
             return found.name
-        table = tuned_table(found.arch)
+        table = tuned_table(self.table, found.arch)
         if isinstance(table, str):
             return table
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the

@@ -10,6 +10,8 @@ two-shot also runs forced onto INT4 against an emulation of the format. Every
 call must leave the communicator open and its barrier flags clear.
 """
 
+import copy
+import json
 import multiprocessing as mp
 import os
 import queue
@@ -30,6 +32,7 @@ import torch.distributed as dist
 
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.device_communicators.hip_custom_communicator import (
+    _TABLE,
     ABANDON_WAIT_S,
     Error,
     FlagState,
@@ -39,8 +42,10 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Op,
     Open,
     Quantization,
+    Ran,
     Refused,
     Supported,
+    TunedTable,
     Where,
     abandon_open,
     build_info,
@@ -183,6 +188,7 @@ def _rank_main(
     failures: "Queue[str]",
     kernel_timeout_s: float,
     log_mode: LogMode,
+    table: TunedTable | None,
 ) -> None:
     global _COMM
     # SIGUSR1 AND SIGTERM TO THE DUMPER ONLY: blocked here before any thread starts
@@ -217,6 +223,7 @@ def _rank_main(
                 # the crossover would then be checked, lossy, against the exact
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
                 quantization="none",
+                table=table,
             )
         _COMM = comm
         try:
@@ -237,10 +244,12 @@ def _on_every_rank(
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
+    table: TunedTable | None = None,
     **kwargs: str,
 ) -> None:
     """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
-    communicator sized for Kimi-K3's largest call, its state log in `log_mode`. A
+    communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
+    tuned table `table` (None: the file's). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
     TERM_GRACE_S, then killed."""
@@ -250,7 +259,7 @@ def _on_every_rank(
     procs = [
         ctx.Process(
             target=_rank_main,
-            args=(r, port, target, kwargs, failures, kernel_timeout_s, log_mode),
+            args=(r, port, target, kwargs, failures, kernel_timeout_s, log_mode, table),
         )
         for r in range(WORLD_SIZE)
     ]
@@ -1103,17 +1112,105 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
 
 
 def test_the_tuned_table_is_the_arch_file() -> None:
-    """The arch's tuned table (`hip_custom_communicator_configs/gfx950.json`) is what
-    open takes: every op's configs, 9 integers each, and its inputs, 6 each, every
-    input's config one of the configs; an arch with no file has none, named."""
+    """The arch's tuned table (`hip_custom_communicator.json`) is what open takes:
+    every op's configs, 13 integers each, and its inputs, 6 each, every input's
+    config one of the configs; an arch the table has no configs on has none, named."""
     import vllm._rocm_C  # noqa: F401
 
-    table = tuned_table("gfx950")
+    raw = json.loads(_TABLE.read_text())
+    table = tuned_table(raw, "gfx950")
     assert not isinstance(table, str), table
     configs, inputs = table
-    assert configs and len(configs) % 9 == 0 and inputs and len(inputs) % 6 == 0
-    assert all(0 <= i < len(configs) // 9 for i in inputs[5::6])
-    assert isinstance(tuned_table("gfx0"), str)
+    assert configs and len(configs) % 13 == 0 and inputs and len(inputs) % 6 == 0
+    assert all(0 <= i < len(configs) // 13 for i in inputs[5::6])
+    assert isinstance(tuned_table(raw, "gfx0"), str)
+
+
+# THE HANDED-IN TABLE'S ONE INPUT: the plain all-reduce at the hidden row, a decode
+# step of 8 tokens, where the file names one config and this test another.
+_HANDED_TOKENS = 8
+
+
+def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
+    """THE FILE'S TABLE WITH THE PLAIN ALL-REDUCE'S INPUTS REPLACED BY ONE: the exact
+    mode at WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file
+    does not run there (the file's 1-token pick at that width, a config it already
+    runs on this world). Its config too."""
+    raw = json.loads(_TABLE.read_text())
+    entry = raw["all_reduce"]
+
+    def named(tokens: int) -> int:
+        (index,) = [
+            p["config"][arch]
+            for p in entry["inputs"]
+            if (p["mode"], p["world"], p["hidden"], p["tokens"])
+            == ("exact", WORLD_SIZE, HIDDEN, tokens)
+        ]
+        return index
+
+    handed = named(1)
+    assert handed != named(_HANDED_TOKENS), "the file runs that config there already"
+    table = copy.deepcopy(raw)
+    table["all_reduce"]["inputs"] = [
+        {
+            "mode": "exact",
+            "world": WORLD_SIZE,
+            "hidden": HIDDEN,
+            "tokens": _HANDED_TOKENS,
+            "config": {arch: handed},
+        }
+    ]
+    return table, entry["configs"][arch][handed]
+
+
+def _is_config(ran: Ran | Error | None, config: dict[str, str | int]) -> bool:
+    """`ran` is `config`: its kernel (template), what it moves, its build and launch."""
+    if not isinstance(ran, Ran):
+        return False
+    return (
+        f"all_reduce_{ran.direction}_{ran.algorithm}" == config["kernel"]
+        and ran.quantization == config["quantization"]
+        and all(
+            getattr(ran, f) == config[f]
+            for f in (
+                "block_x",
+                "block_y",
+                "block_z",
+                "waves_per_eu",
+                "tile_m",
+                "tile_n",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            )
+        )
+    )
+
+
+def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:
+    """C++'s own answer at the handed-in input is its config, and a plain call there
+    runs exactly it."""
+    want = json.loads(config)
+    rows, bf16 = _HANDED_TOKENS, torch.bfloat16
+    got = comm.tuned("all_reduce", rows, HIDDEN, bf16)
+    assert _is_config(got, want), f"rank {rank}: tuned {got}, the table names {want}"
+    comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
+    ran = comm._calls[-1].ran
+    assert ran == got, f"rank {rank}: ran {ran}, tuned {got}"
+
+
+@on_eight_gpus
+def test_a_table_handed_in_is_the_one_cpp_runs() -> None:
+    """A communicator opened with a `table` of the file's shape runs from it, not
+    the file: a one-input plain all-reduce table naming a config the file does not
+    run there, and C++'s `tuned` answers that config, which a plain call runs."""
+    # example-based: the decode step the tuner's candidate is checked at (gp tune)
+    import vllm._rocm_C  # noqa: F401
+
+    found = supported(torch.device("cuda:0"), WORLD_SIZE)
+    assert not isinstance(found, Error), found
+    table, config = _one_input_table(found.arch)
+    _on_every_rank(_handed_table_on_rank, table=table, config=json.dumps(config))
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
