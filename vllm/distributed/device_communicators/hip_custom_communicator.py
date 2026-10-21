@@ -9,12 +9,16 @@ CustomAllreduce) extended to every collective Kimi-K3 needs -- the all-reduce an
 all-reduces fused with the ops after them -- over our HIP kernels in `_rocm_C`
 (`csrc/rocm/hip_custom_communicator.cu`).
 
-The caller names an op and C++ picks the kernel and its launch (`select.cuh`), moving
-INT4 where the communicator's `quantization` asks; the keyword arguments an op takes
-after its own (a config point in its essential order: the kernel by name, the grid, the
-block and its waves a EU, the tile, the quantization) are the one way to force one, for
-the tuner and the tests. Python fills what may be left out and refuses a partial
-forcing; C++ takes every field, checks the config, and answers.
+The caller names an op and Python picks the kernel and its launch from the tuned table
+(`pick`: the communicator's `quantization` reads its quantized table, INT4 where it
+pays), one kernel or, where the op is faster as two kernels of ours, our all-reduce and
+then the op's norm on this rank's rows (`rms_norm`, `add_rms_norm`,
+`add_attn_res_rms_norm`), each a public op. The keyword arguments an op takes after its
+own (a config point in its essential order: the kernel by name, the grid, the block and
+its waves a EU, the tile, the quantization) are the one way to force one, for the tuner
+and the tests. Python fills what may be left out and refuses a partial forcing; C++
+takes every field of every call, checks the config, and answers: it holds no table and
+picks nothing.
 
 THE MEMORY (C++'s `Handle`): the communicator's arena is one allocation per rank,
 which every rank opened at open over legacy HIP IPC. Every exact call reads every
@@ -60,17 +64,35 @@ logger = init_logger(__name__)
 # exception an op raises when it does not take a call (`Refused`). ----
 
 # EVERY OP, as C++ names them (`enum class Op`; a test holds them equal) and as its
-# method is named: the all-reduce, then each all-reduce and the ops it fuses, in order.
+# method is named: the all-reduce, then each all-reduce and the ops it fuses, then each
+# norm on this rank's rows (the second kernel of an op composed as two), in order.
 Op = Literal[
     "all_reduce",
     "all_reduce_rms_norm",
     "all_reduce_add_rms_norm",
     "all_reduce_add_attn_res_rms_norm",
+    "rms_norm",
+    "add_rms_norm",
+    "add_attn_res_rms_norm",
 ]
+# THE OPS A PLAIN CALL OF RUNS ITS TABLE'S PICK (the tuned table's ops), and each one's
+# norm on rows, which a pick of two kernels runs after our all-reduce.
+TUNED_OPS: tuple[Op, ...] = (
+    "all_reduce",
+    "all_reduce_rms_norm",
+    "all_reduce_add_rms_norm",
+    "all_reduce_add_attn_res_rms_norm",
+)
+_ROWS: Mapping[Op, Op] = {
+    "all_reduce_rms_norm": "rms_norm",
+    "all_reduce_add_rms_norm": "add_rms_norm",
+    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
+}
 
-# WHAT CROSSES THE LINKS, C++'s `Quantization` by name: a communicator's setting for
-# the calls it picks, and a build field a forcing names.
+# WHAT CROSSES THE LINKS, C++'s `Quantization` by name (number for number): a
+# communicator's setting for the calls it picks, and a build field a forcing names.
 Quantization = Literal["none", "int4"]
+_QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
 
 
 class Error(IntEnum):
@@ -789,12 +811,12 @@ class Supported:
 # op's two lists: its `inputs` (the input points measured, the workload's, the same on
 # every arch: a table, `mode`: exact, or quantized: every size, exact kernels where
 # quantizing does not pay and INT4 where it does; world, width and tokens), each naming
-# its config on each arch by index; and its `configs` on each arch (the config space
-# tuned there: a kernel of the op, what it moves, its build and launch). C++ checks the
-# device's arch's table at open and runs a call at its nearest input's config
-# (config.cuh's `lookup`): every tuned number is here, none in C++. A communicator
-# opened with a `table` of the file's shape runs that one instead (the tuner's
-# candidate, checked through C++ before it is written here).
+# on each arch the configs a plain call of it runs, in order, by index (one kernel, or
+# our all-reduce then the op's norm on rows); and its `configs` on each arch (the config
+# space tuned there: a kernel, its grid, block, waves, tile and what it moves). Read
+# once at open and checked (`tuned_table`); a call runs its nearest input's configs
+# (`pick`). Every tuned number is here, none in C++. A communicator opened with a
+# `table` of the file's shape runs that one instead (the tuner's candidate).
 _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
 # THE TUNED TABLE AS THE FILE HOLDS IT, parsed: each op's `inputs` and `configs`.
 TunedTable = dict[str, Any]
@@ -816,26 +838,65 @@ _CONFIG_KEYS = (
     "tile_k",
     "quantization",
 )
+# A BUILD'S FIELDS among them (what the template compiles in): all but kernel and grid.
+_BUILD_KEYS = _CONFIG_KEYS[4:]
 _MODES = ("exact", "quantized")
+# A CONFIG POINT ON THE WIRE, every op's trailing arguments: kernel, grid x y z, block
+# x y z, waves_per_eu, tile m n k, quantization (`_CONFIG_KEYS`' order).
+Forcing = tuple[str, int, int, int, int, int, int, int, int, int, int, str]
 
 
-def tuned_table(raw: TunedTable, arch: str) -> tuple[list[int], list[int]] | str:
-    """THE TUNED TABLE `raw` (the file's, or one handed in at open) ON `arch` as C++
-    takes it at open (types.cuh's TunedTable on the wire: every op's configs on the
-    arch, `kConfigFields` int64 each, then every op's inputs, `kInputFields` each, an
-    input's config its index among every op's), or why there is none: an op the arch
-    has no table for (every input a config on it). A table that is not one raises,
-    naming the entry; C++ checks the rest."""
+@dataclass(frozen=True)
+class TunedInput:
+    """AN INPUT POINT of an op's table on one arch: its table (`mode`), world, width and
+    tokens, and the configs a plain call of it runs, in order: one kernel of the op, or
+    our all-reduce then the op's norm on rows."""
+
+    mode: str
+    world: int
+    hidden: int
+    tokens: int
+    configs: tuple[Forcing, ...]
+
+
+@dataclass(frozen=True)
+class OpTable:
+    """ONE OP'S TABLE on one arch, checked: its input points and its configs (a config
+    no input names is a kernel's, for `kernel_config`)."""
+
+    inputs: tuple[TunedInput, ...]
+    configs: tuple[Forcing, ...]
+
+
+# THE TUNED TABLE ON ONE ARCH, checked: each tuned op's.
+Table = dict[str, OpTable]
+
+
+def _built(forcing: Forcing) -> bool:
+    """Whether `forcing`'s kernel is built and lists its build (C++'s `built`)."""
+    template = build_info().templates.get(forcing[0])
+    build = dict(zip(_BUILD_KEYS, forcing[4:]))
+    return template is not None and build in template.builds
+
+
+def _moved(forcing: Forcing, quantization: Quantization) -> Forcing:
+    """The same config point moving `quantization` across the links."""
+    return (*forcing[:-1], quantization)  # type: ignore[return-value]
+
+
+def tuned_table(raw: TunedTable, arch: str) -> Table | str:
+    """THE TUNED TABLE `raw` (the file's, or one handed in at open) ON `arch`, checked,
+    or why there is none on it: an op not tuned there, an input with no config there. A
+    table that is not sound raises, naming the entry: every config a kernel the build
+    has, its build one the kernel lists (its grid is C++'s to refuse at the call); every
+    input's configs one kernel of its op, or our all-reduce then the op's norm on rows;
+    an exact table's input moving nothing quantized, at a built world; every op inputs
+    in each table at every built world (`pick` reads one there)."""
     built = build_info()
-    if set(raw) != set(built.op_names):
-        raise ValueError(
-            f"the tuned table: its ops are {sorted(raw)}, not {built.op_names}"
-        )
-    templates = list(built.templates)
-    configs: list[int] = []
-    inputs: list[int] = []
-    first = 0  # the op's first config, among every op's
-    for name in built.op_names:
+    if set(raw) != set(TUNED_OPS):
+        raise ValueError(f"the tuned table: its ops are {sorted(raw)}, not {TUNED_OPS}")
+    out: Table = {}
+    for name in TUNED_OPS:
         table = raw[name]
         if set(table) != {"inputs", "configs"}:
             raise ValueError(
@@ -843,35 +904,121 @@ def tuned_table(raw: TunedTable, arch: str) -> tuple[list[int], list[int]] | str
             )
         if arch not in table["configs"]:
             return f"{name} is not tuned on {arch}"
-        arch_configs = table["configs"][arch]
-        for i, c in enumerate(arch_configs):
+        configs: list[Forcing] = []
+        for i, c in enumerate(table["configs"][arch]):
+            where = f"the tuned table: {name}.configs.{arch}[{i}]"
             if list(c) != list(_CONFIG_KEYS):
                 raise ValueError(
-                    f"the tuned table: {name}.configs.{arch}[{i}] has keys "
-                    f"{list(c)}, not {list(_CONFIG_KEYS)} (in that order)"
+                    f"{where} has keys {list(c)}, not {list(_CONFIG_KEYS)} "
+                    f"(in that order)"
                 )
-            configs += [
-                templates.index(c["kernel"]),
-                *(c[k] for k in _CONFIG_KEYS[1:-1]),
-                _QUANTIZATIONS.index(c["quantization"]),
-            ]
-        for i, e in enumerate(table["inputs"]):
-            if set(e) != _INPUT_KEYS:
+            forcing: Forcing = tuple(c[k] for k in _CONFIG_KEYS)  # type: ignore[assignment]
+            if not _built(forcing):
                 raise ValueError(
-                    f"the tuned table: {name}.inputs[{i}] has keys {sorted(e)}"
+                    f"{where} ({c['kernel']}): its build is not one it lists"
                 )
-            if not 0 <= e["config"].get(arch, -1) < len(arch_configs):
+            configs.append(forcing)
+        inputs: list[TunedInput] = []
+        for i, e in enumerate(table["inputs"]):
+            where = f"the tuned table: {name}.inputs[{i}]"
+            if set(e) != _INPUT_KEYS:
+                raise ValueError(f"{where} has keys {sorted(e)}")
+            at = e["config"].get(arch)
+            if at is None:
                 return f"{name}.inputs[{i}] has no config on {arch}"
-            inputs += [
-                built.op_names.index(name),
-                _MODES.index(e["mode"]),
-                e["world"],
-                e["hidden"],
-                e["tokens"],
-                first + e["config"][arch],
-            ]
-        first += len(arch_configs)
-    return configs, inputs
+            if not (
+                isinstance(at, list) and at and all(0 <= j < len(configs) for j in at)
+            ):
+                raise ValueError(
+                    f"{where}: {at} names no configs of {name}'s on {arch}"
+                )
+            ran = tuple(configs[j] for j in at)
+            ops = tuple(built.templates[f[0]].op for f in ran)
+            if ops not in ((name,), ("all_reduce", _ROWS.get(name))):
+                raise ValueError(
+                    f"{where}: its configs' kernels are {list(ops)}'s: one of "
+                    f"{name}'s, or our all-reduce then {_ROWS.get(name)}"
+                )
+            if e["mode"] not in _MODES or e["world"] not in built.worlds:
+                raise ValueError(f"{where}: no such table or world built: {e}")
+            if e["hidden"] < 1 or e["tokens"] < 1:
+                raise ValueError(f"{where}: no width or no tokens")
+            if e["mode"] == "exact" and any(f[-1] != "none" for f in ran):
+                raise ValueError(f"{where}: an input of the exact table moves INT4")
+            inputs.append(
+                TunedInput(e["mode"], e["world"], e["hidden"], e["tokens"], ran)
+            )
+        for world in sorted(built.worlds):
+            for mode in _MODES:
+                if not any(p.world == world and p.mode == mode for p in inputs):
+                    raise ValueError(
+                        f"the tuned table: {name}: no input at world {world} in the "
+                        f"{mode} table"
+                    )
+        out[name] = OpTable(tuple(inputs), tuple(configs))
+    return out
+
+
+def _nearest(inputs: Sequence[TunedInput], rows: int, cols: int) -> TunedInput | None:
+    """THE NEAREST of `inputs` to `rows` x `cols`: the nearest width, then the nearest
+    size (rows x width, so a width no input lists reads the nearest width's inputs at
+    the same bytes), the fewer tokens on a tie, else the first listed. None of none."""
+    if not inputs:
+        return None
+    width = min((p.hidden for p in inputs), key=lambda h: abs(h - cols))
+    return min(
+        (p for p in inputs if p.hidden == width),
+        key=lambda p: (abs(p.tokens * p.hidden - rows * cols), p.tokens),
+    )
+
+
+def pick(
+    table: Table, op: Op, mode: str, world: int, rows: int, cols: int
+) -> tuple[Forcing, ...]:
+    """WHAT A PLAIN CALL OF `op` RUNS on `rows` x `cols` at `world` ranks from its table
+    `mode` (exact, or quantized: the communicator's quantization INT4): the configs of
+    its nearest input there (`_nearest`), in order. `tuned_table` holds that every op
+    has an input in each table at every built world."""
+    got = _nearest(
+        [p for p in table[op].inputs if p.world == world and p.mode == mode], rows, cols
+    )
+    assert got is not None, f"{op} has no input at world {world} in the {mode} table"
+    return got.configs
+
+
+def kernel_config(
+    table: Table,
+    world: int,
+    kernel: str,
+    quantization: Quantization,
+    rows: int,
+    cols: int,
+) -> Forcing | None:
+    """KERNEL `kernel`'S OWN CONFIG FOR `rows` x `cols` MOVING `quantization` (a forced
+    launch at the tuned config: gp's kernel lines, the tests): the config of it moving
+    that which its nearest input at `world` runs, in any op's table, else the first
+    such config of the table's; moving INT4 where it has no INT4 config, its exact
+    config moved INT4 (a build it lists). None where it has neither."""
+
+    def of(q: Quantization) -> Forcing | None:
+        def takes(f: Forcing) -> bool:
+            return f[0] == kernel and f[-1] == q and _built(_moved(f, quantization))
+
+        found = [
+            (p, next(f for f in p.configs if takes(f)))
+            for t in table.values()
+            for p in t.inputs
+            if p.world == world and any(takes(f) for f in p.configs)
+        ]
+        near = _nearest([p for p, _ in found], rows, cols)
+        if near is not None:
+            return next(f for p, f in found if p is near)
+        return next((f for t in table.values() for f in t.configs if takes(f)), None)
+
+    got = of(quantization)
+    if got is None and quantization == "int4":
+        got = of("none")
+    return None if got is None else _moved(got, quantization)
 
 
 def open_handle(
@@ -881,20 +1028,16 @@ def open_handle(
     timeout_seconds: float,
     max_rows: int,
     max_cols: int,
-    quantization: Quantization,
     log_mode: LogMode = "errors",
     rccl_ready: int = -1,
-    table: tuple[Sequence[int], Sequence[int]] = ((), ()),
 ) -> int | Error:
     """THE PEER MEMORY OPENED over the process groups named `cpu_group` and
     `device_group`, a collective (C++ gathers every rank's IPC handle over the CPU
     group): the handle, or the Error it was refused for. The one place Python calls
-    C++'s opener, so its arguments are written once. `quantization`: which table of the
-    tuned table's a plain call reads (int4: the quantized one).
-    `log_mode`: what the state log records. `rccl_ready`: whether the device group's
-    RCCL communicator was found set up (`rccl_ready`), logged as an observation.
-    `table`: the arch's tuned table (`tuned_table`), checked by C++ here. An open that
-    fails one of its checks raises, naming it, with the log appended."""
+    C++'s opener, so its arguments are written once. `log_mode`: what the state log
+    records. `rccl_ready`: whether the device group's RCCL communicator was found set
+    up (`rccl_ready`), logged as an observation. An open that fails one of its checks
+    raises, naming it, with the log appended."""
     try:
         handle, err = torch.ops._rocm_C.hip_custom_communicator_open(
             cpu_group,
@@ -903,11 +1046,8 @@ def open_handle(
             timeout_seconds,
             max_rows,
             max_cols,
-            _QUANTIZATIONS.index(quantization),
             _LOG_MODES.index(log_mode),
             rccl_ready,
-            list(table[0]),
-            list(table[1]),
         )
     except RuntimeError as e:
         raise RuntimeError(f"{e}\n{last_log() or 'no log was made'}") from e
@@ -1023,66 +1163,6 @@ _open_communicators: "weakref.WeakSet[HipCustomCommunicator]" = weakref.WeakSet(
 # AN OP'S ANSWER, C++'s wire (`hip_custom_communicator.cu`'s Answer): the Error's
 # number it was refused for, or -1 when it ran, then what ran.
 Answer = list[int]
-# C++'s `Algorithm`, `Direction` and `Quantization`, number for number.
-_QUANTIZATIONS: tuple[Quantization, ...] = ("none", "int4")
-# A FORCING, a whole config point in the essential order (the forced ops' trailing
-# arguments): kernel, grid x y z, block x y z, waves_per_eu, tile m n k, quantization.
-Forcing = tuple[str, int, int, int, int, int, int, int, int, int, int, str]
-
-
-def _forcing(
-    input: torch.Tensor,
-    kernel: str | None,
-    grid_x: int | None,
-    grid_y: int | None,
-    grid_z: int | None,
-    block_x: int | None,
-    block_y: int | None,
-    block_z: int | None,
-    waves_per_eu: int | None,
-    tile_m: int | None,
-    tile_n: int | None,
-    tile_k: int | None,
-    quantization: Quantization | None,
-) -> Forcing | None:
-    """THE FORCING an op's keyword arguments make: None where none is given (a plain
-    call), else the whole config point, the dimensions a kernel may leave out filled at
-    their identity (y and z 1, tile_k 1) and the quantization none; refused,
-    forced_incomplete, where another field is missing."""
-    given = (
-        kernel,
-        grid_x,
-        grid_y,
-        grid_z,
-        block_x,
-        block_y,
-        block_z,
-        waves_per_eu,
-        tile_m,
-        tile_n,
-        tile_k,
-        quantization,
-    )
-    if all(v is None for v in given):
-        return None
-    needed = (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n)
-    if any(v is None for v in needed):
-        raise Refused(Error.forced_incomplete, input)
-    one = lambda v: 1 if v is None else v  # noqa: E731
-    return (
-        kernel,
-        grid_x,
-        one(grid_y),
-        one(grid_z),
-        block_x,
-        one(block_y),  # type: ignore[return-value]
-        one(block_z),
-        waves_per_eu,
-        tile_m,
-        tile_n,
-        one(tile_k),
-        quantization or "none",
-    )
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1235,12 @@ _RECORDED = 64
 _WATCH_S = 0.1
 
 
+@functools.cache
+def _file_table() -> TunedTable:
+    """The tuned table's file, read once a process."""
+    return json.loads(_TABLE.read_text())
+
+
 class HipCustomCommunicator:
     """vLLM's TP all-reduce and its fused ops over our HIP kernels, behind
     CudaCommunicator. One per process group, because peer pointers are group-scoped.
@@ -1205,12 +1291,13 @@ class HipCustomCommunicator:
         fault; None is the device group's own (`collective_timeout_seconds`).
         `max_rows` and `max_cols`: the largest call it serves, which its exchange is
         sized for; None is the server's (`problem_size`). `quantization`: what the
-        calls C++ picks move across the links, from each op's crossover up; None is
-        what the environment asks (`configured_quantization`). `log_mode`: what the
+        plain calls move across the links, from each op's crossover up (their table:
+        the quantized one where INT4); None is what the environment asks
+        (`configured_quantization`). `log_mode`: what the
         state log records (`log()`); None is what the environment asks
-        (`configured_log_mode`). `table`: the tuned table C++ runs from, of the
-        file's shape (the tuner's candidate); None is the file's
-        (`hip_custom_communicator.json`)."""
+        (`configured_log_mode`). `table`: the tuned table its plain calls run from, of
+        the file's shape (the tuner's candidate); None is the file's
+        (`hip_custom_communicator.json`), read once."""
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.device = _as_device(device)
@@ -1242,9 +1329,7 @@ class HipCustomCommunicator:
             configured_quantization() if quantization is None else quantization
         )
         self.log_mode: LogMode = configured_log_mode() if log_mode is None else log_mode
-        self.table: TunedTable = (
-            json.loads(_TABLE.read_text()) if table is None else table
-        )
+        self.table: TunedTable = _file_table() if table is None else table
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
@@ -1270,6 +1355,8 @@ class HipCustomCommunicator:
         self._lock = threading.Lock()
         self._calls: deque[Call] = deque(maxlen=_RECORDED)
         self._launches = 0
+        # EACH PLAIN CALL'S PICK, by op and shape: the table is fixed while it is open.
+        self._picks: dict[tuple[Op, int, int], tuple[Forcing, ...]] = {}
         self._stop_watching = threading.Event()
         self._watchdog = None
         if state is not None:
@@ -1281,42 +1368,48 @@ class HipCustomCommunicator:
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
     # Each op takes its own tensors and values, then, keyword-only, what the tuner and
-    # the tests force: a config point in its essential order (`_forcing`). All None is
-    # a plain call, the table's pick (the model forces none). A forcing gives the
-    # kernel, grid_x, block_x, waves_per_eu, tile_m and tile_n; y and z, tile_k and
-    # the quantization may be left out (1, 1, 1 and none: a forced call runs what it
-    # names, never the communicator's quantization); any other gap is
-    # `forced_incomplete`, refused here: C++ takes every field. A forced call asks no
-    # `should_`: C++ answers it. An op raises Refused with the Error C++ refused it for;
-    # a call its `should_` admitted is never refused.
+    # the tests force: a config point in its essential order. Each op is three steps,
+    # in its own body: its configs (all None: a plain call, the table's pick, `pick`;
+    # else the one forced), then the C++ call, or two (one kernel: the op's entry; two
+    # kernels of ours: our all-reduce, then the op's norm on rows), each recorded. A
+    # forcing gives the kernel, grid_x, block_x, waves_per_eu, tile_m and tile_n; y and
+    # z, tile_k and the quantization may be left out (1, 1, 1 and none: a forced call
+    # runs what it names, never the communicator's quantization); any other gap is
+    # `forced_incomplete`, refused here: C++ takes every field. The norms on rows have
+    # no table: a call of one gives its config. A forced call asks no `should_`: C++
+    # answers it. An op raises Refused with the Error C++ refused it for; a call its
+    # `should_` admitted is never refused.
 
     @final
     def tuned(
+        self, op: Op, rows: int, cols: int, dtype: torch.dtype
+    ) -> tuple[Ran, ...]:
+        """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` RUNS here, in order: its
+        table's pick (`pick`; the same for every `dtype`), one kernel, or our all-reduce
+        then the op's norm on rows. Forcing each whole runs exactly it."""
+        mode = "quantized" if self.quantization == "int4" else "exact"
+        world = self.device_group.size()
+        return tuple(Ran(*f) for f in pick(self._table, op, mode, world, rows, cols))
+
+    @final
+    def kernel_config(
         self,
-        op: Op,
+        kernel: str,
         rows: int,
         cols: int,
         dtype: torch.dtype,
-        kernel: str | None = None,
         quantization: Quantization = "none",
     ) -> "Ran | Error | None":
-        """WHAT THIS COMMUNICATOR LAUNCHES for `op` on `rows` x `cols` of `dtype`, C++'s
-        own answer from its tuned table (`tuned`): with no `kernel`, a plain call's pick
-        from its table; with one, that kernel's config moving `quantization` (its
-        nearest point, a pick or a config). Forcing the answer whole runs exactly it.
-        None where the kernel has no point."""
-        name = next(n for n, d in _DTYPES.items() if d == dtype)
-        if kernel is None:
-            answer = torch.ops._rocm_C.hip_custom_communicator_tuned(
-                self._handle, op, rows, cols, name
-            )
-        else:
-            answer = torch.ops._rocm_C.hip_custom_communicator_tuned_kernel(
-                self._handle, kernel, rows, cols, name, quantization
-            )
-        if not answer:
-            return None
-        return Ran.of(answer) or Error(answer[0])
+        """KERNEL `kernel`'S OWN TUNED CONFIG for `rows` x `cols` moving `quantization`
+        (`kernel_config`; the same for every `dtype`): a forced launch at the tuned
+        config. None where it has none; no_such_template where the build has no such
+        kernel."""
+        if kernel not in build_info().templates:
+            return Error.no_such_template
+        got = kernel_config(
+            self._table, self.device_group.size(), kernel, quantization, rows, cols
+        )
+        return None if got is None else Ran(*got)
 
     @final
     def should_allreduce(self, input: torch.Tensor) -> bool:
@@ -1342,32 +1435,43 @@ class HipCustomCommunicator:
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
         """EVERY all-reduce this backend's kernel can compile for, at any SIZE: size
-        picks among a backend's own paths (hip's in C++), never whether it is ours.
-        Returns the sum."""
+        picks among a backend's own paths (hip's from its table), never whether it is
+        ours. Returns the sum."""
         self._admit(input)
+        given = (kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z)
+        given += (waves_per_eu, tile_m, tile_n, tile_k, quantization)
+        if given == (None,) * len(given):
+            # PLAIN: the table's pick.
+            configs = self._pick("all_reduce", input)
+        elif None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # FORCED BUT NOT WHOLE: C++ takes every field.
+            raise Refused(Error.forced_incomplete, input)
+        else:
+            # FORCED: the kernel named; y and z, tile_k 1, moving nothing if left out.
+            configs = (
+                (
+                    kernel,
+                    grid_x,
+                    1 if grid_y is None else grid_y,
+                    1 if grid_z is None else grid_z,
+                    block_x,
+                    1 if block_y is None else block_y,
+                    1 if block_z is None else block_z,
+                    waves_per_eu,
+                    tile_m,
+                    tile_n,
+                    1 if tile_k is None else tile_k,
+                    quantization or "none",
+                ),
+            )
+        (config,) = configs
         output = torch.empty_like(input)
         if self._warming_up():
             return output
-        answer = self._all_reduce(
-            input,
-            output,
-            _forcing(
-                input,
-                kernel,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            ),
+        answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+            self._handle, input, output, *config
         )
-        self._launched("all_reduce", input, answer, kernel, quantization)
+        self._launched("all_reduce", input, answer, config)
         return output
 
     @final
@@ -1399,34 +1503,58 @@ class HipCustomCommunicator:
         tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> torch.Tensor:
-        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)` in one kernel. Returns
-        the normed sum."""
+        """`vllm.ir.ops.rms_norm(all_reduce(input), weight, eps)`, in one kernel or as
+        two of ours. Returns the normed sum."""
         self._admit(input)
+        given = (kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z)
+        given += (waves_per_eu, tile_m, tile_n, tile_k, quantization)
+        if given == (None,) * len(given):
+            # PLAIN: the table's pick.
+            configs = self._pick("all_reduce_rms_norm", input)
+        elif None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # FORCED BUT NOT WHOLE: C++ takes every field.
+            raise Refused(Error.forced_incomplete, input)
+        else:
+            # FORCED: the kernel named; y and z, tile_k 1, moving nothing if left out.
+            configs = (
+                (
+                    kernel,
+                    grid_x,
+                    1 if grid_y is None else grid_y,
+                    1 if grid_z is None else grid_z,
+                    block_x,
+                    1 if block_y is None else block_y,
+                    1 if block_z is None else block_z,
+                    waves_per_eu,
+                    tile_m,
+                    tile_n,
+                    1 if tile_k is None else tile_k,
+                    quantization or "none",
+                ),
+            )
         output = torch.empty_like(input)
         if self._warming_up():
             return output
-        answer = self._all_reduce_rms_norm(
-            input,
-            weight,
-            output,
-            eps,
-            _forcing(
-                input,
-                kernel,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            ),
-        )
-        self._launched("all_reduce_rms_norm", input, answer, kernel, quantization)
+        if len(configs) == 1:
+            # ONE KERNEL, the fused op.
+            (fused,) = configs
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
+                self._handle, input, weight, output, eps, *fused
+            )
+            self._launched("all_reduce_rms_norm", input, answer, fused)
+        else:
+            # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the norm on
+            # its rows.
+            reduce, norm = configs
+            summed = torch.empty_like(input)
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+                self._handle, input, summed, *reduce
+            )
+            self._launched("all_reduce", input, answer, reduce)
+            answer = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
+                self._handle, summed, weight, output, eps, *norm
+            )
+            self._launched("rms_norm", summed, answer, norm)
         return output
 
     @final
@@ -1459,36 +1587,73 @@ class HipCustomCommunicator:
         tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)` in
-        one kernel. Returns the normed result and the sum plus residual."""
+        """`vllm.ir.ops.fused_add_rms_norm(all_reduce(input), residual, weight, eps)`,
+        in one kernel or as two of ours. Returns the normed result and the sum plus
+        residual."""
         self._admit(input)
+        given = (kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z)
+        given += (waves_per_eu, tile_m, tile_n, tile_k, quantization)
+        if given == (None,) * len(given):
+            # PLAIN: the table's pick.
+            configs = self._pick("all_reduce_add_rms_norm", input)
+        elif None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # FORCED BUT NOT WHOLE: C++ takes every field.
+            raise Refused(Error.forced_incomplete, input)
+        else:
+            # FORCED: the kernel named; y and z, tile_k 1, moving nothing if left out.
+            configs = (
+                (
+                    kernel,
+                    grid_x,
+                    1 if grid_y is None else grid_y,
+                    1 if grid_z is None else grid_z,
+                    block_x,
+                    1 if block_y is None else block_y,
+                    1 if block_z is None else block_z,
+                    waves_per_eu,
+                    tile_m,
+                    tile_n,
+                    1 if tile_k is None else tile_k,
+                    quantization or "none",
+                ),
+            )
         output, residual_output = torch.empty_like(input), torch.empty_like(input)
         if self._warming_up():
             return output, residual_output
-        answer = self._all_reduce_add_rms_norm(
-            input,
-            residual,
-            weight,
-            output,
-            residual_output,
-            eps,
-            _forcing(
+        if len(configs) == 1:
+            # ONE KERNEL, the fused op.
+            (fused,) = configs
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
+                self._handle,
                 input,
-                kernel,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            ),
-        )
-        self._launched("all_reduce_add_rms_norm", input, answer, kernel, quantization)
+                residual,
+                weight,
+                output,
+                residual_output,
+                eps,
+                *fused,
+            )
+            self._launched("all_reduce_add_rms_norm", input, answer, fused)
+        else:
+            # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the add and
+            # norm on its rows.
+            reduce, norm = configs
+            summed = torch.empty_like(input)
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+                self._handle, input, summed, *reduce
+            )
+            self._launched("all_reduce", input, answer, reduce)
+            answer = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
+                self._handle,
+                summed,
+                residual,
+                weight,
+                output,
+                residual_output,
+                eps,
+                *norm,
+            )
+            self._launched("add_rms_norm", summed, answer, norm)
         return output, residual_output
 
     @final
@@ -1525,12 +1690,38 @@ class HipCustomCommunicator:
         tile_k: int | None = None,
         quantization: Quantization | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`attn_res(prefix, all_reduce(input), blocks, ...)` in one kernel, or with no
-        `prefix` the sum starting one. Returns the new prefix and the AttnRes output,
-        each a new tensor: `prefix` is only read. `write_index` >= 0 also stores the new
-        prefix as that block of `blocks`, which must not be one of the `num_blocks`
-        sources the call reads."""
+        """`attn_res(prefix, all_reduce(input), blocks, ...)`, in one kernel or as two
+        of ours, or with no `prefix` the sum starting one. Returns the new prefix and
+        the AttnRes output, each a new tensor: `prefix` is only read. `write_index` >= 0
+        also stores the new prefix as that block of `blocks`, which must not be one of
+        the `num_blocks` sources the call reads."""
         self._admit(input)
+        given = (kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z)
+        given += (waves_per_eu, tile_m, tile_n, tile_k, quantization)
+        if given == (None,) * len(given):
+            # PLAIN: the table's pick.
+            configs = self._pick("all_reduce_add_attn_res_rms_norm", input)
+        elif None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # FORCED BUT NOT WHOLE: C++ takes every field.
+            raise Refused(Error.forced_incomplete, input)
+        else:
+            # FORCED: the kernel named; y and z, tile_k 1, moving nothing if left out.
+            configs = (
+                (
+                    kernel,
+                    grid_x,
+                    1 if grid_y is None else grid_y,
+                    1 if grid_z is None else grid_z,
+                    block_x,
+                    1 if block_y is None else block_y,
+                    1 if block_z is None else block_z,
+                    waves_per_eu,
+                    tile_m,
+                    tile_n,
+                    1 if tile_k is None else tile_k,
+                    quantization or "none",
+                ),
+            )
         prefix_output = torch.empty_like(input)
         output = torch.empty_like(input)
         if self._warming_up():
@@ -1538,7 +1729,212 @@ class HipCustomCommunicator:
         # THE ONE SLOT WRITTEN, a view of `blocks`; the sources read are the first
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        answer = self._all_reduce_add_attn_res_rms_norm(
+        if len(configs) == 1:
+            # ONE KERNEL, the fused op.
+            (fused,) = configs
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
+                self._handle,
+                input,
+                prefix,
+                blocks,
+                norm_weight,
+                qk_weight,
+                output_norm_weight,
+                prefix_output,
+                output,
+                block_output,
+                num_blocks,
+                eps,
+                output_eps,
+                *fused,
+            )
+            self._launched("all_reduce_add_attn_res_rms_norm", input, answer, fused)
+        else:
+            # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then AttnRes on
+            # its rows.
+            reduce, norm = configs
+            summed = torch.empty_like(input)
+            answer = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
+                self._handle, input, summed, *reduce
+            )
+            self._launched("all_reduce", input, answer, reduce)
+            answer = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
+                self._handle,
+                summed,
+                prefix,
+                blocks,
+                norm_weight,
+                qk_weight,
+                output_norm_weight,
+                prefix_output,
+                output,
+                block_output,
+                num_blocks,
+                eps,
+                output_eps,
+                *norm,
+            )
+            self._launched("add_attn_res_rms_norm", summed, answer, norm)
+        return prefix_output, output
+
+    # ---- THE NORMS ON THIS RANK'S ROWS, no peer: the second kernel of an op as two
+    # kernels of ours, a caller's to compose (our all-reduce, then one of these on its
+    # sum). No table: a call gives its config, whole. ----
+
+    @final
+    def rms_norm(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        kernel: str | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        quantization: Quantization | None = None,
+    ) -> torch.Tensor:
+        """`vllm.ir.ops.rms_norm(input, weight, eps)` on this rank's rows, `input` a
+        sum. Returns the normed rows."""
+        self._admit(input)
+        if None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # A NORM ON ROWS HAS NO TABLE: its config is given, whole.
+            raise Refused(Error.forced_incomplete, input)
+        config = (
+            kernel,
+            grid_x,
+            1 if grid_y is None else grid_y,
+            1 if grid_z is None else grid_z,
+            block_x,
+            1 if block_y is None else block_y,
+            1 if block_z is None else block_z,
+            waves_per_eu,
+            tile_m,
+            tile_n,
+            1 if tile_k is None else tile_k,
+            quantization or "none",
+        )
+        output = torch.empty_like(input)
+        if self._warming_up():
+            return output
+        answer = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
+            self._handle, input, weight, output, eps, *config
+        )
+        self._launched("rms_norm", input, answer, config)
+        return output
+
+    @final
+    def add_rms_norm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        kernel: str | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        quantization: Quantization | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`vllm.ir.ops.fused_add_rms_norm(input, residual, weight, eps)` on this rank's
+        rows, `input` a sum. Returns the normed result and the sum plus residual."""
+        self._admit(input)
+        if None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # A NORM ON ROWS HAS NO TABLE: its config is given, whole.
+            raise Refused(Error.forced_incomplete, input)
+        config = (
+            kernel,
+            grid_x,
+            1 if grid_y is None else grid_y,
+            1 if grid_z is None else grid_z,
+            block_x,
+            1 if block_y is None else block_y,
+            1 if block_z is None else block_z,
+            waves_per_eu,
+            tile_m,
+            tile_n,
+            1 if tile_k is None else tile_k,
+            quantization or "none",
+        )
+        output, residual_output = torch.empty_like(input), torch.empty_like(input)
+        if self._warming_up():
+            return output, residual_output
+        answer = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
+            self._handle, input, residual, weight, output, residual_output, eps, *config
+        )
+        self._launched("add_rms_norm", input, answer, config)
+        return output, residual_output
+
+    @final
+    def add_attn_res_rms_norm(
+        self,
+        input: torch.Tensor,
+        prefix: torch.Tensor | None,
+        blocks: torch.Tensor,
+        norm_weight: torch.Tensor,
+        qk_weight: torch.Tensor,
+        output_norm_weight: torch.Tensor | None,
+        num_blocks: int,
+        write_index: int,
+        eps: float,
+        output_eps: float,
+        *,
+        kernel: str | None = None,
+        grid_x: int | None = None,
+        grid_y: int | None = None,
+        grid_z: int | None = None,
+        block_x: int | None = None,
+        block_y: int | None = None,
+        block_z: int | None = None,
+        waves_per_eu: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        quantization: Quantization | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`attn_res(prefix, input, blocks, ...)` on this rank's rows, `input` a sum,
+        its arguments `all_reduce_add_attn_res_rms_norm`'s. Returns the new prefix and
+        the AttnRes output."""
+        self._admit(input)
+        if None in (kernel, grid_x, block_x, waves_per_eu, tile_m, tile_n):
+            # A NORM ON ROWS HAS NO TABLE: its config is given, whole.
+            raise Refused(Error.forced_incomplete, input)
+        config = (
+            kernel,
+            grid_x,
+            1 if grid_y is None else grid_y,
+            1 if grid_z is None else grid_z,
+            block_x,
+            1 if block_y is None else block_y,
+            1 if block_z is None else block_z,
+            waves_per_eu,
+            tile_m,
+            tile_n,
+            1 if tile_k is None else tile_k,
+            quantization or "none",
+        )
+        prefix_output = torch.empty_like(input)
+        output = torch.empty_like(input)
+        if self._warming_up():
+            return prefix_output, output
+        block_output = blocks[:, write_index] if write_index >= 0 else None
+        answer = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
+            self._handle,
             input,
             prefix,
             blocks,
@@ -1551,25 +1947,9 @@ class HipCustomCommunicator:
             num_blocks,
             eps,
             output_eps,
-            _forcing(
-                input,
-                kernel,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            ),
+            *config,
         )
-        self._launched(
-            "all_reduce_add_attn_res_rms_norm", input, answer, kernel, quantization
-        )
+        self._launched("add_attn_res_rms_norm", input, answer, config)
         return prefix_output, output
 
     @final
@@ -1715,22 +2095,30 @@ class HipCustomCommunicator:
 
     @final
     def _launched(
-        self,
-        op: Op,
-        input: torch.Tensor,
-        answer: Answer,
-        kernel: str | None = None,
-        quantization: Quantization | None = None,
+        self, op: Op, input: torch.Tensor, answer: Answer, forcing: Forcing
     ) -> None:
-        """After an op's kernel hook: Refused with the Error's number it answered, or
-        the launch, and what it ran, into the flight recorder."""
+        """After an op's kernel hook, given `forcing`: Refused with the Error's number
+        it answered, or the launch, and what it ran, into the flight recorder."""
         if answer[0] >= 0:
             error = Error(answer[0])
             detail = ""
             if error is Error.quantization_not_supported:
-                detail = f"{quantization} not supported for {kernel}; "
+                detail = f"{forcing[-1]} not supported for {forcing[0]}; "
             raise Refused(error, input, detail)
         self._record(op, input, Ran.of(answer))
+
+    @final
+    def _pick(self, op: Op, input: torch.Tensor) -> tuple[Forcing, ...]:
+        """A PLAIN CALL'S CONFIGS, in order: `pick` on this communicator's table (its
+        quantization's, its world's) at `input`'s rows and width, once a shape."""
+        cols = input.shape[-1] if input.dim() > 0 else 0
+        rows = input.numel() // cols if cols else 0
+        if (op, rows, cols) not in self._picks:
+            mode = "quantized" if self.quantization == "int4" else "exact"
+            self._picks[op, rows, cols] = pick(
+                self._table, op, mode, self.device_group.size(), rows, cols
+            )
+        return self._picks[op, rows, cols]
 
     @final
     def _record(self, op: Op, input: torch.Tensor, ran: Ran | None = None) -> None:
@@ -1771,6 +2159,8 @@ class HipCustomCommunicator:
     # The device wall clock's rate, which the fault record counts its wait in.
     _khz: int = 0
     capacity: Capacity
+    # The tuned table on this device's arch, checked at open (`tuned_table`).
+    _table: Table
     # Whether there is a fault record for the watchdog to read (`_fault`).
     _faults: ClassVar[bool] = True
 
@@ -1780,7 +2170,7 @@ class HipCustomCommunicator:
         Eager, and before any capture: doing this inside a cudagraph capture is not
         recoverable.
         """
-        # THE TUNED TABLE for this device's arch: none, and the communicator is
+        # THE TUNED TABLE for this device's arch, checked: none, and the communicator is
         # disabled, naming why, as on a device it does not support.
         found = supported(self.device, self.device_group.size())
         if isinstance(found, Error):
@@ -1788,6 +2178,7 @@ class HipCustomCommunicator:
         table = tuned_table(self.table, found.arch)
         if isinstance(table, str):
             return table
+        self._table = table
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
         handle = open_handle(
@@ -1797,10 +2188,8 @@ class HipCustomCommunicator:
             self.timeout_seconds,
             self.max_rows,
             self.max_cols,
-            self.quantization,
             self.log_mode,
             rccl_ready(self.device_group, self.device),
-            table,
         )
         if isinstance(handle, Error):
             return handle.name
@@ -1843,124 +2232,6 @@ class HipCustomCommunicator:
                     else "(the CPU group no longer resolves)"
                 )
             )
-
-    def _all_reduce(
-        self,
-        input: torch.Tensor,
-        output: torch.Tensor,
-        forcing: Forcing | None,
-    ) -> Answer:
-        """Sum `input` across the TP ranks into `output`; the Error's number C++ refused
-        the call for, or -1 and what ran (as every kernel hook answers: `Answer`)."""
-        if forcing is None:
-            return torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                self._handle,
-                input,
-                output,
-            )
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_forced(
-            self._handle,
-            input,
-            output,
-            *forcing,
-        )
-
-    def _all_reduce_rms_norm(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        output: torch.Tensor,
-        eps: float,
-        forcing: Forcing | None,
-    ) -> Answer:
-        if forcing is None:
-            return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
-                self._handle,
-                input,
-                weight,
-                output,
-                eps,
-            )
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm_forced(
-            self._handle,
-            input,
-            weight,
-            output,
-            eps,
-            *forcing,
-        )
-
-    def _all_reduce_add_rms_norm(
-        self,
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        output: torch.Tensor,
-        residual_output: torch.Tensor,
-        eps: float,
-        forcing: Forcing | None,
-    ) -> Answer:
-        """The normed result into `output`; the sum plus residual into
-        `residual_output`."""
-        if forcing is None:
-            return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
-                self._handle,
-                input,
-                residual,
-                weight,
-                output,
-                residual_output,
-                eps,
-            )
-        return torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm_forced(
-            self._handle,
-            input,
-            residual,
-            weight,
-            output,
-            residual_output,
-            eps,
-            *forcing,
-        )
-
-    def _all_reduce_add_attn_res_rms_norm(
-        self,
-        input: torch.Tensor,
-        prefix: torch.Tensor | None,
-        blocks: torch.Tensor,
-        norm_weight: torch.Tensor,
-        qk_weight: torch.Tensor,
-        output_norm_weight: torch.Tensor | None,
-        prefix_output: torch.Tensor,
-        output: torch.Tensor,
-        block_output: torch.Tensor | None,
-        num_blocks: int,
-        eps: float,
-        output_eps: float,
-        forcing: Forcing | None,
-    ) -> Answer:
-        tensors = (
-            input,
-            prefix,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight,
-            prefix_output,
-            output,
-            block_output,
-            num_blocks,
-            eps,
-            output_eps,
-        )
-        ops = torch.ops._rocm_C
-        if forcing is None:
-            return ops.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
-                self._handle, *tensors
-            )
-        return ops.hip_custom_communicator_all_reduce_add_attn_res_rms_norm_forced(
-            self._handle, *tensors, *forcing
-        )
 
     def _on_close(self) -> None:
         """Release the peer memory now, collectively (`close`), then the handle; the

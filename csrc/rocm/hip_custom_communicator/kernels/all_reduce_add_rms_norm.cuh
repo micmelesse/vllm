@@ -1381,11 +1381,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // =============================================================================
 // rms_norm_rows, add_rms_norm_rows
 //
-// OUR SEPARATE NORM KERNELS, THE SPLITS' SECOND (STANDARDS 3.2, *We win at the
-// op level*): RMSNorm (and fused_add_rms_norm) on rows already all-reduced. The
-// norm op's split (select.cuh, Template::all_reduce_pull_split_rms_norm and
-// _add_rms_norm) runs the plain all-reduce into this rank's local sums
-// (Handle::sums), then this kernel on them, on its own grid: nothing over the
+// OUR SEPARATE NORM KERNELS, ON ROWS (STANDARDS 3.2, *We win at the
+// op level*): RMSNorm (and fused_add_rms_norm) on rows already all-reduced.
+// Python composes the norm op as two kernels (Template::rms_norm_rows and
+// add_rms_norm_rows): our all-reduce into a tensor of this rank's,
+// then this kernel on it, on its own grid: nothing over the
 // peers. Every row's math and rounding the one-shot's (above): the sum `input`
 // is the all-reduce's, rounded to DTYPE as theirs is, s = float(sum)
 // (+ float(residual), residual_out = DTYPE(s)), out = DTYPE(W(W(s * scale) *

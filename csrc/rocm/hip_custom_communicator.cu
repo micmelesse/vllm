@@ -43,10 +43,10 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-// EACH OP TAKES ITS OWN FORCING LAST, as the API's does: the algorithm
-// and direction of the template it forces, and only the config fields that op's
-// kernels have, its build's quantization last, each none for select's. The
-// model passes none of them; the bench and the tests force with them.
+// EACH OP TAKES ITS CONFIG LAST, every field of it, as the API's does: the kernel by its name,
+// the grid and the block, the waves a EU, the tile, the quantization. Nothing is optional and
+// nothing is picked here: Python fills what a caller leaves out and hands its table's pick the
+// same way.
 
 namespace {
 using ProcessGroupPtr = c10::intrusive_ptr<c10d::ProcessGroup>;
@@ -211,56 +211,13 @@ Answer answer(const std::variant<hip_custom_communicator::Config,
           static_cast<int64_t>(config.quantization)};
 }
 
-// THE TUNED TABLE FROM THE WIRE (types.cuh's TunedTable: its configs, kConfigFields int64 each,
-// and its inputs, kInputFields each, in its orders), checked (config.cuh's `check`): a malformed
-// or unsound file raises, naming its config or input.
-hip_custom_communicator::TunedTable table_from(const std::vector<int64_t>& configs,
-                                               const std::vector<int64_t>& inputs) {
-  using namespace hip_custom_communicator;
-  TORCH_CHECK(configs.size() % kConfigFields == 0 && inputs.size() % kInputFields == 0,
-              "hip_custom_communicator: a config is ", kConfigFields, " fields and an input ",
-              kInputFields, ", not ", configs.size(), " and ", inputs.size(), " fields");
-  TunedTable out;
-  for (size_t at = 0; at < configs.size(); at += kConfigFields) {
-    const int64_t* f = &configs[at];
-    TORCH_CHECK(f[0] >= 0 && f[0] < kNumTemplates, "hip_custom_communicator: config ",
-                at / kConfigFields, " names no kernel this build has");
-    const Template fn = static_cast<Template>(f[0]);
-    const OpType o = op_of(fn);
-    const auto i = [&](int k) { return static_cast<int>(f[k]); };
-    const Dim3 grid{i(1), i(2), i(3)}, block{i(4), i(5), i(6)};
-    const int waves = i(7), tile_m = i(8), tile_n = i(9), tile_k = i(10), q = i(11);
-    BuildConfig b = AllReduceBuildConfig{block, waves, tile_m, tile_n, q};
-    if (o == OpType::all_reduce_rms_norm)
-      b = AllReduceRmsNormBuildConfig{block, waves, tile_m, tile_n, q};
-    if (o == OpType::all_reduce_add_rms_norm)
-      b = AllReduceAddRmsNormBuildConfig{block, waves, tile_m, tile_n, q};
-    if (o == OpType::all_reduce_add_attn_res_rms_norm)
-      b = AllReduceAddAttnResRmsNormBuildConfig{block, waves, tile_m, tile_n, tile_k, q};
-    out.configs.push_back({fn, {b, {grid}}});
-  }
-  for (size_t at = 0; at < inputs.size(); at += kInputFields) {
-    const int64_t* f = &inputs[at];
-    TORCH_CHECK(f[0] >= 0 && f[0] < kNumOps && (f[1] == 0 || f[1] == 1),
-                "hip_custom_communicator: input ", at / kInputFields,
-                " names no op or table this build has");
-    out.inputs.push_back({static_cast<OpType>(f[0]), static_cast<Mode>(f[1]),
-                          static_cast<int>(f[2]), f[3], f[4], static_cast<int>(f[5])});
-  }
-  const std::optional<std::string> bad = check(out);
-  TORCH_CHECK(!bad, "hip_custom_communicator: the config file's ", *bad);
-  return out;
-}
-
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
 // (which carries the handles) and `device_group`, a collective: this rank's
 // symmetric memory, made and owned here, its handle gathered with every rank's,
 // and the peers' opened. `timeout_seconds`: how long a kernel waits on a peer
 // before it reports a fault. `max_rows` and `max_cols`: the largest call it
 // serves (for a model, the server's tokens a batch by its hidden size), from
-// which its exchange is sized (`exchange_sizes`). `quantization`: what its
-// plain calls read, a Quantization: the quantized table where INT4 (config.cuh's
-// `lookup`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
+// which its exchange is sized (`exchange_sizes`). `log_mode`: a LogMode (log.cuh). `rccl_ready`: whether the
 // caller found the device group's RCCL communicator set up (1), not (0), or
 // could not tell (-1), logged as an observation. A torch op cannot return a
 // variant, so it is two optionals and exactly one is set, the handle or the
@@ -269,10 +226,7 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
                                       const std::string& device_group,
                                       int64_t device, double timeout_seconds,
                                       int64_t max_rows, int64_t max_cols,
-                                      int64_t quantization, int64_t log_mode,
-                                      int64_t rccl_ready,
-                                      const std::vector<int64_t>& configs,
-                                      const std::vector<int64_t>& inputs) {
+                                      int64_t log_mode, int64_t rccl_ready) {
   TORCH_CHECK(
       log_mode == 0 || log_mode == 1,
       "a communicator's log mode is errors (0) or everything (1): ", log_mode);
@@ -280,10 +234,6 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
               "the largest call a communicator serves has rows and columns: "
               "max_rows=",
               max_rows, " max_cols=", max_cols);
-  TORCH_CHECK(
-      quantization == hip_custom_communicator::Quantization::none ||
-          quantization == hip_custom_communicator::Quantization::int4,
-      "a communicator's quantization is none (0) or int4 (1): ", quantization);
   const auto refused = [](hip_custom_communicator::Error e) {
     return OpenWire{std::nullopt, static_cast<int64_t>(e)};
   };
@@ -297,17 +247,13 @@ OpenWire hip_custom_communicator_open(const std::string& cpu_group,
       hip_custom_communicator::supported(static_cast<int>(device), world);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&ok))
     return refused(*e);
-  // THE TUNED TABLE, checked before anything is made: a file that cannot be run raises, naming
-  // its config or input.
-  hip_custom_communicator::TunedTable tuned = table_from(configs, inputs);
   const auto sizes =
       hip_custom_communicator::exchange_sizes(max_rows, max_cols, world);
   auto* handle = new hip_custom_communicator::Handle(
       (*pg)->getRank(), world, static_cast<int>(device), gather_over(*pg),
       timeout_seconds, max_rows, max_cols, sizes.staging_bytes,
-      sizes.partials_bytes, static_cast<int>(quantization),
-      static_cast<hip_custom_communicator::LogMode>(log_mode),
-      static_cast<int>(rccl_ready), std::move(tuned));
+      sizes.partials_bytes, static_cast<hip_custom_communicator::LogMode>(log_mode),
+      static_cast<int>(rccl_ready));
   return {reinterpret_cast<fptr_t>(handle), std::nullopt};
 }
 
@@ -383,87 +329,6 @@ BuildInfoWire hip_custom_communicator_build_info() {
           configs,    counts,       op_dtypes,
           op_weights, op_facts};
 }
-
-// THE TUNED KERNEL, select's own pick as a query (config.cuh's `tuned`): for
-// op `op_name` at `rows` x `cols` of `dtype` (C++'s DType name) on `world`
-// ranks, from its list of `quantization`, among the entries of the template
-// `algorithm` and `direction` name (both or neither: neither is every
-// template's, the plain call's pick), what select launches, as an op's Answer
-// says what ran; or [] where that list has no entry of the template.
-namespace {
-// THE QUERY'S OP AND DTYPE, by name.
-hip_custom_communicator::OpType op_named(const std::string& op_name) {
-  using namespace hip_custom_communicator;
-  for (const Op& k : kOps)
-    if (op_name == k.name) return k.type;
-  TORCH_CHECK(false, "hip_custom_communicator: no op ", op_name);
-  return OpType::all_reduce;
-}
-hip_custom_communicator::DType dtype_named(const std::string& dtype) {
-  using namespace hip_custom_communicator;
-  for (const DType k : {DType::f16, DType::bf16, DType::f32})
-    if (dtype == to_string(k)) return k;
-  TORCH_CHECK(false, "hip_custom_communicator: no dtype ", dtype);
-  return DType::bf16;
-}
-// A TUNED QUERY'S ANSWER (`tuned`'s, a pick or a kernel's config, or none).
-std::vector<int64_t> tuned_answer(
-    const std::variant<std::optional<hip_custom_communicator::Chosen>,
-                       hip_custom_communicator::Error>& got);
-}  // namespace
-
-// WHAT A PLAIN CALL OF `op_name` ON `rows` x `cols` OF `dtype` RUNS HERE: the table's pick.
-std::vector<int64_t> hip_custom_communicator_tuned(fptr_t handle_ptr, const std::string& op_name,
-                                                   int64_t rows, int64_t cols,
-                                                   const std::string& dtype) {
-  return tuned_answer(hip_custom_communicator::tuned(handle_of(handle_ptr), op_named(op_name), rows,
-                                                     cols, dtype_named(dtype),
-                                                     hip_custom_communicator::Quantization::none,
-                                                     std::nullopt));
-}
-
-// KERNEL `kernel`'S OWN CONFIG FOR `rows` x `cols` OF `dtype` MOVING `quantization`: its nearest
-// tuned point, a forced launch at the tuned config; none where it has no point.
-std::vector<int64_t> hip_custom_communicator_tuned_kernel(fptr_t handle_ptr,
-                                                          const std::string& kernel, int64_t rows,
-                                                          int64_t cols, const std::string& dtype,
-                                                          const std::string& quantization) {
-  using namespace hip_custom_communicator;
-  const std::optional<Template> fn = template_named(kernel);
-  if (!fn) return refusal(Error::no_such_template);
-  return tuned_answer(tuned(handle_of(handle_ptr), op_of(*fn), rows, cols, dtype_named(dtype),
-                            quantization_from(quantization), fn));
-}
-
-namespace {
-std::vector<int64_t> tuned_answer(
-    const std::variant<std::optional<hip_custom_communicator::Chosen>,
-                       hip_custom_communicator::Error>& got) {
-  using namespace hip_custom_communicator;
-  if (const Error* e = std::get_if<Error>(&got)) return refusal(*e);
-  const std::optional<Chosen>& c = std::get<std::optional<Chosen>>(got);
-  if (!c) return {};
-  return std::visit(
-      [&](const auto& b) -> Answer {
-        int64_t tile_k = 1;  // a kernel with no K: its identity
-        if constexpr (requires { b.tile_k; }) tile_k = b.tile_k;
-        return {-1,
-                static_cast<int64_t>(c->fn),
-                c->config.launch.grid.x,
-                c->config.launch.grid.y,
-                c->config.launch.grid.z,
-                b.block.x,
-                b.block.y,
-                b.block.z,
-                b.waves_per_eu,
-                b.tile_m,
-                b.tile_n,
-                tile_k,
-                static_cast<int64_t>(b.quantization)};
-      },
-      c->config.build);
-}
-}  // namespace
 
 // WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT
 // `world` RANKS HOLDS, for Python's `should`: the box, its exchange's partials
@@ -629,17 +494,9 @@ void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
 }  // namespace
 
 namespace {
-// A CALL'S CONFIG, RESOLVED: the table's pick, or a forced config point, or the Error it is
-// refused for.
+// A CALL'S CONFIG: the kernel by its name and every field of its config point, in the essential
+// order, checked whole (C++'s `forced`), or the Error it is refused for.
 using Picked = std::variant<hip_custom_communicator::Chosen, hip_custom_communicator::Error>;
-// A PLAIN CALL'S: the table's pick for op `o` at `input`'s rows and columns.
-Picked plain(fptr_t handle_ptr, hip_custom_communicator::OpType o, const torch::Tensor& input) {
-  const int64_t cols = input.dim() > 0 ? input.size(-1) : 0;
-  const int64_t rows = cols > 0 ? input.numel() / cols : 0;
-  return hip_custom_communicator::lookup(handle_of(handle_ptr), o, rows, cols);
-}
-// A FORCED CALL'S: the kernel by its name and every field of its config point, in the essential
-// order, checked whole (C++'s `forced`).
 Picked forced_config(hip_custom_communicator::OpType o, const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
@@ -679,12 +536,8 @@ Answer all_reduce_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& o
 }
 }  // namespace
 
-// all_reduce: the table's pick (a plain call), or a whole forced config point.
-Answer hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output) {
-  return all_reduce_with(handle_ptr, input, output,
-      plain(handle_ptr, hip_custom_communicator::OpType::all_reduce, input));
-}
-Answer hip_custom_communicator_all_reduce_forced(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
+// all_reduce: its config point, every field.
+Answer hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
     const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
@@ -747,13 +600,8 @@ Answer all_reduce_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::
 }
 }  // namespace
 
-// all_reduce_rms_norm: the table's pick (a plain call), or a whole forced config point.
+// all_reduce_rms_norm: its config point, every field.
 Answer hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
-    torch::Tensor& output, double eps) {
-  return all_reduce_rms_norm_with(handle_ptr, input, weight, output, eps,
-      plain(handle_ptr, hip_custom_communicator::OpType::all_reduce_rms_norm, input));
-}
-Answer hip_custom_communicator_all_reduce_rms_norm_forced(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps,
     const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
@@ -786,14 +634,8 @@ Answer all_reduce_add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, tor
 }
 }  // namespace
 
-// all_reduce_add_rms_norm: the table's pick (a plain call), or a whole forced config point.
+// all_reduce_add_rms_norm: its config point, every field.
 Answer hip_custom_communicator_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& output,
-    torch::Tensor& residual_output, double eps) {
-  return all_reduce_add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
-      plain(handle_ptr, hip_custom_communicator::OpType::all_reduce_add_rms_norm, input));
-}
-Answer hip_custom_communicator_all_reduce_add_rms_norm_forced(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
     const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
@@ -921,18 +763,8 @@ Answer all_reduce_add_attn_res_rms_norm_with(fptr_t handle_ptr, torch::Tensor& i
 }
 }  // namespace
 
-// all_reduce_add_attn_res_rms_norm: the table's pick (a plain call), or a whole forced config point.
+// all_reduce_add_attn_res_rms_norm: its config point, every field.
 Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(fptr_t handle_ptr, torch::Tensor& input,
-    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
-    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
-    const std::optional<torch::Tensor>& output_norm_weight,
-    torch::Tensor& prefix_output, torch::Tensor& output,
-    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
-    double eps, double output_eps) {
-  return all_reduce_add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
-      plain(handle_ptr, hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, input));
-}
-Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm_forced(fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
     torch::Tensor& norm_weight, torch::Tensor& qk_weight,
     const std::optional<torch::Tensor>& output_norm_weight,
@@ -944,5 +776,126 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm_forced(fptr_t ha
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return all_reduce_add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
       forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+}
+
+namespace {
+Answer rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
+    torch::Tensor& output, double eps,
+    const Picked& k) {
+  norm_tensors(input, nullptr, weight, output, nullptr);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
+    return refusal(*e);
+  const auto got = hip_custom_communicator::rms_norm(
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1),
+      input.size(0), input.size(1), weight.data_ptr(), weight.stride(0),
+      weight.size(0), output.data_ptr(), output.stride(0), output.stride(1),
+      output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
+      static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
+      current_stream());
+  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+}
+}  // namespace
+
+// rms_norm: this rank's rows normed (the second kernel of an op Python composes), its config
+// point, every field.
+Answer hip_custom_communicator_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
+    torch::Tensor& output, double eps,
+    const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
+    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+  return rms_norm_with(handle_ptr, input, weight, output, eps,
+      forced_config(hip_custom_communicator::OpType::rms_norm, kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+}
+
+namespace {
+Answer add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps,
+    const Picked& k) {
+  norm_tensors(input, &residual, weight, output, &residual_output);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
+    return refusal(*e);
+  const auto got = hip_custom_communicator::add_rms_norm(
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1),
+      input.size(0), input.size(1), residual.data_ptr(), residual.stride(0),
+      residual.stride(1), residual.size(0), residual.size(1), weight.data_ptr(),
+      weight.stride(0), weight.size(0), output.data_ptr(), output.stride(0),
+      output.stride(1), output.size(0), output.size(1),
+      residual_output.data_ptr(), residual_output.stride(0),
+      residual_output.stride(1), residual_output.size(0),
+      residual_output.size(1), dtype_of(input), dtype_of(weight),
+      static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
+      current_stream());
+  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+}
+}  // namespace
+
+// add_rms_norm: this rank's rows added and normed (the second kernel of an op Python composes),
+// its config point, every field.
+Answer hip_custom_communicator_add_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& output,
+    torch::Tensor& residual_output, double eps,
+    const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
+    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+  return add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
+      forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+                                    waves_per_eu, tile_m, tile_n, tile_k, quantization));
+}
+
+namespace {
+Answer add_attn_res_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output, torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps,
+    const Picked& k) {
+  attn_res_tensors(input, prefix, blocks, norm_weight, qk_weight,
+                   output_norm_weight, prefix_output, output, block_output,
+                   num_blocks);
+  const Rows old = rows_of(prefix), block = rows_of(block_output);
+  if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
+    return refusal(*e);
+  const auto got = hip_custom_communicator::add_attn_res_rms_norm(
+      handle_of(handle_ptr), input.data_ptr(), input.stride(0), input.stride(1),
+      input.size(0), input.size(1), old.ptr, old.stride_m, old.stride_n,
+      old.size_m, old.size_n, blocks.data_ptr(), blocks.stride(0),
+      blocks.stride(1), blocks.stride(2), blocks.size(0), blocks.size(1),
+      blocks.size(2), norm_weight.data_ptr(), norm_weight.stride(0),
+      norm_weight.size(0), qk_weight.data_ptr(), qk_weight.stride(0),
+      qk_weight.size(0),
+      output_norm_weight ? output_norm_weight->data_ptr() : nullptr,
+      output_norm_weight ? output_norm_weight->stride(0) : 0,
+      output_norm_weight ? output_norm_weight->size(0) : 0,
+      prefix_output.data_ptr(), prefix_output.stride(0),
+      prefix_output.stride(1), prefix_output.size(0), prefix_output.size(1),
+      output.data_ptr(), output.stride(0), output.stride(1), output.size(0),
+      output.size(1), block.ptr, block.stride_m, block.stride_n, block.size_m,
+      block.size_n, dtype_of(input), static_cast<int>(num_blocks),
+      static_cast<float>(eps), static_cast<float>(output_eps),
+      std::get<hip_custom_communicator::Chosen>(k),
+      current_stream());
+  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+}
+}  // namespace
+
+// add_attn_res_rms_norm: AttnRes on this rank's rows (the second kernel of the op Python
+// composes), its config point, every field.
+Answer hip_custom_communicator_add_attn_res_rms_norm(fptr_t handle_ptr, torch::Tensor& input,
+    const std::optional<torch::Tensor>& prefix, torch::Tensor& blocks,
+    torch::Tensor& norm_weight, torch::Tensor& qk_weight,
+    const std::optional<torch::Tensor>& output_norm_weight,
+    torch::Tensor& prefix_output, torch::Tensor& output,
+    const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
+    double eps, double output_eps,
+    const std::string& kernel, int64_t grid_x, int64_t grid_y, int64_t grid_z,
+    int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
+    int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
+  return add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
+      forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }

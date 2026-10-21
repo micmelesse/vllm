@@ -3,7 +3,7 @@
 //
 // ALL-REDUCE THEN ADD, ATTNRES AND RMSNORM: the kernels, one section each (pull
 // one-shot, pull two-shot, push two-shot), then our separate AttnRes kernel
-// (add_attn_res_rms_norm_rows), the split's second. Every one computes AttnRes by
+// (add_attn_res_rms_norm_rows), on rows. Every one computes AttnRes by
 // the one function, attn_res (attn_res.cuh).
 
 #pragma once
@@ -585,12 +585,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // =============================================================================
 // add_attn_res_rms_norm_rows
 //
-// OUR SEPARATE ATTNRES KERNEL, THE SPLIT'S SECOND: Kimi-K3's AttnRes and its
+// OUR SEPARATE ATTNRES KERNEL, ON ROWS: Kimi-K3's AttnRes and its
 // RMSNorm on rows already all-reduced (STANDARDS 3.2, *We win at the op level*:
-// where fusing stops paying, the op runs our all-reduce, then this). The op's
-// split (select.cuh, Template::all_reduce_pull_split_add_attn_res_rms_norm)
-// runs the plain all-reduce into this rank's local sums (Handle::sums), then
-// this kernel on them: AttnRes on its own
+// where fusing stops paying, the op runs our all-reduce, then this). Python
+// composes the op as two kernels (Template::add_attn_res_rms_norm_rows): our
+// all-reduce into a tensor of this rank's, then
+// this kernel on it: AttnRes on its own
 // grid at its own occupancy, not on the communication kernel's (the fused INT4
 // pull ran it at 250 VGPRs, 2 waves a SIMD, and more blocks did not help: 1024
 // slower than 512 at 8192 x 3584; 2026-10-18T13-15-40Z). Every row's math and

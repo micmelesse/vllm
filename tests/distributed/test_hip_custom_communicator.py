@@ -34,6 +34,7 @@ from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.device_communicators.hip_custom_communicator import (
     _TABLE,
     ABANDON_WAIT_S,
+    TUNED_OPS,
     Error,
     FlagState,
     HipCustomCommunicator,
@@ -108,6 +109,8 @@ DUMP_GRACE_S = 5.0
 TERM_GRACE_S = ABANDON_WAIT_S + 5.0
 
 Forced = dict[str, str | int]
+# AN OP AS TWO KERNELS OF OURS, forced: our all-reduce's forcing, then its norm's.
+Composed = tuple[Forced, Forced]
 Tolerance = tuple[float, float]
 F = TypeVar("F", bound=Callable[..., None])
 
@@ -409,9 +412,41 @@ def _make(
 
 
 def _call(
-    comm: HipCustomCommunicator, op: Op, x: torch.Tensor, args: Args, forced: Forced
+    comm: HipCustomCommunicator,
+    op: Op,
+    x: torch.Tensor,
+    args: Args,
+    forced: Forced | Composed,
 ) -> list[torch.Tensor]:
-    """The op's outputs. AttnRes also writes its block into `args.blocks`."""
+    """The op's outputs. AttnRes also writes its block into `args.blocks`. A
+    composition runs our all-reduce, then the op's norm on rows on its sum, each its
+    public op, as a caller composes it."""
+    if isinstance(forced, tuple):
+        summed, rows = comm.all_reduce(x, **forced[0]), forced[1]
+        if op == "all_reduce_rms_norm":
+            assert args.weight is not None
+            return [comm.rms_norm(summed, args.weight, EPS, **rows)]
+        if op == "all_reduce_add_rms_norm":
+            assert args.weight is not None and args.residual is not None
+            return list(
+                comm.add_rms_norm(summed, args.residual, args.weight, EPS, **rows)
+            )
+        assert args.blocks is not None
+        assert args.norm_weight is not None and args.qk_weight is not None
+        prefix, out = comm.add_attn_res_rms_norm(
+            summed,
+            args.prefix,
+            args.blocks,
+            args.norm_weight,
+            args.qk_weight,
+            args.output_norm_weight,
+            args.num_blocks,
+            args.write_index,
+            ATTN_RES_EPS,
+            EPS,
+            **rows,
+        )
+        return [out, prefix, args.blocks]
     if op == "all_reduce":
         return [comm.all_reduce(x, **forced)]
     if op == "all_reduce_rms_norm":
@@ -526,6 +561,14 @@ def _templates(op: Op) -> list[str]:
     return [n for n, t in build_info().templates.items() if t.op == op]
 
 
+# EACH FUSED OP'S NORM ON ROWS, the second kernel of it as two kernels of ours.
+ROWS: dict[Op, Op] = {
+    "all_reduce_rms_norm": "rms_norm",
+    "all_reduce_add_rms_norm": "add_rms_norm",
+    "all_reduce_add_attn_res_rms_norm": "add_attn_res_rms_norm",
+}
+
+
 def _tile_cols(op: Op, hidden: int) -> int:
     """The columns a forced build's tile must hold: the row, where the op's tile
     holds it."""
@@ -541,7 +584,7 @@ def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     bf16 = torch.bfloat16
     with _step(rank, f"all_reduce 1x{HIDDEN} eager"):
         _eager(comm, rank, "all_reduce", 1, HIDDEN, bf16, {}, None, 1)
-    for op in get_args(Op):
+    for op in TUNED_OPS:
         if op != "all_reduce":
             layer = ATTN_RES_LAYERS[0] if "attn_res" in op else None
             with _step(rank, f"{op} 1x{HIDDEN} eager"):
@@ -660,12 +703,18 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
     layers = ATTN_RES_LAYERS if op == "all_reduce_add_attn_res_rms_norm" else (None,)
     for dtype in DTYPES[op]:
         for hidden in WIDTHS[op]:
-            forcings: list[Forced] = [
+            forcings: list[Forced | Composed] = [
                 {},
                 *(
                     forced
                     for t in _templates(op)
                     if (forced := _forced(t, _tile_cols(op, hidden))) is not None
+                ),
+                # AS TWO KERNELS OF OURS: the plain all-reduce, then each norm on rows.
+                *(
+                    ({}, forced)
+                    for t in (_templates(ROWS[op]) if op in ROWS else [])
+                    if (forced := _forced(t, hidden)) is not None
                 ),
             ]
             for layer in layers:
@@ -682,7 +731,7 @@ def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
 
 
 @on_eight_gpus
-@pytest.mark.parametrize("op", get_args(Op))
+@pytest.mark.parametrize("op", TUNED_OPS)
 def test_op_matches_the_ops_it_replaces(op: Op) -> None:
     _on_every_rank(_op_on_rank, op=op)
 
@@ -913,7 +962,7 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
 
 
 def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
-    for op in get_args(Op):
+    for op in TUNED_OPS:
         for template in _templates(op):
             if "two_shot" in template and any(
                 b["quantization"] == "int4"
@@ -1068,10 +1117,9 @@ def test_python_names_match_the_build() -> None:
 
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
-    launch; a two-shot or a split lists each exact build again moving INT4 (a
-    split's: what its all-reduce moves), but the pulls with a row a block (the norms
-    and AttnRes), whose INT4 builds are a group a thread: TILE_N / 32 threads, one
-    row high."""
+    launch; a two-shot lists each exact build again moving INT4, but the pulls with a
+    row a block (the norms and AttnRes), whose INT4 builds are a group a thread:
+    TILE_N / 32 threads, one row high; a norm on rows moves nothing (no peer)."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
@@ -1101,25 +1149,47 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             ), name
         elif name == "all_reduce_pull_two_shot":
             assert not int4, name
-        elif "two_shot" in name or "_split_" in name:
+        elif "two_shot" in name:
             assert [b | {"quantization": "none"} for b in int4] == exact, name
         else:
             assert not int4, name
 
 
 def test_the_tuned_table_is_the_arch_file() -> None:
-    """The arch's tuned table (`hip_custom_communicator.json`) is what open takes:
-    every op's configs, 12 integers each, and its inputs, 6 each, every input's
-    config one of the configs; an arch the table has no configs on has none, named."""
+    """The arch's tuned table (`hip_custom_communicator.json`) checks: every tuned op's
+    inputs, each running one kernel of its op or our all-reduce then its norm on
+    rows, every config a build its kernel lists; an arch the table has no configs on
+    has none, named; an unsound table raises, naming the entry."""
     import vllm._rocm_C  # noqa: F401
 
     raw = json.loads(_TABLE.read_text())
     table = tuned_table(raw, "gfx950")
     assert not isinstance(table, str), table
-    configs, inputs = table
-    assert configs and len(configs) % 12 == 0 and inputs and len(inputs) % 6 == 0
-    assert all(0 <= i < len(configs) // 12 for i in inputs[5::6])
+    assert set(table) == set(TUNED_OPS)
+    built = build_info()
+    for op, t in table.items():
+        assert t.inputs and t.configs, op
+        for p in t.inputs:
+            ops = tuple(built.templates[f[0]].op for f in p.configs)
+            assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, p)
+    assert any(len(p.configs) == 2 for t in table.values() for p in t.inputs)
     assert isinstance(tuned_table(raw, "gfx0"), str)
+    # AN UNSOUND TABLE, named: a build its kernel does not list, an exact input moving
+    # INT4.
+    bad = copy.deepcopy(raw)
+    bad["all_reduce"]["configs"]["gfx950"][0]["tile_n"] = 100
+    with pytest.raises(ValueError, match="all_reduce.configs.gfx950.0.*build"):
+        tuned_table(bad, "gfx950")
+    bad = copy.deepcopy(raw)
+    (exact,) = [p for p in bad["all_reduce"]["inputs"] if p["mode"] == "exact"][:1]
+    int4 = next(
+        i
+        for i, c in enumerate(bad["all_reduce"]["configs"]["gfx950"])
+        if c["quantization"] == "int4"
+    )
+    exact["config"]["gfx950"] = [int4]
+    with pytest.raises(ValueError, match="exact table moves INT4"):
+        tuned_table(bad, "gfx950")
 
 
 # THE HANDED-IN TABLE'S ONE INPUT: the plain all-reduce at the hidden row, a decode
@@ -1131,13 +1201,13 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
     """THE FILE'S TABLE WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED: the exact mode at
     WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file does not
     run there (the file's 1-token pick at that width, a config it already runs on
-    this world); every other input kept, as C++'s check wants an input at every
-    built world. Its config too."""
+    this world); every other input kept, as the check wants an input at every built
+    world. Its config too."""
     raw = json.loads(_TABLE.read_text())
     entry = raw["all_reduce"]
 
     def named(tokens: int) -> int:
-        (index,) = [
+        ((index,),) = [
             p["config"][arch]
             for p in entry["inputs"]
             if (p["mode"], p["world"], p["hidden"], p["tokens"])
@@ -1155,7 +1225,7 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
             HIDDEN,
             _HANDED_TOKENS,
         ):
-            p["config"] = {arch: handed}
+            p["config"] = {arch: [handed]}
     return table, entry["configs"][arch][handed]
 
 
@@ -1165,11 +1235,11 @@ def _is_config(ran: Ran | Error | None, config: dict[str, str | int]) -> bool:
 
 
 def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:
-    """C++'s own answer at the handed-in input is its config, and a plain call there
-    runs exactly it."""
+    """The communicator's pick at the handed-in input is its config, and a plain call
+    there runs exactly it."""
     want = json.loads(config)
     rows, bf16 = _HANDED_TOKENS, torch.bfloat16
-    got = comm.tuned("all_reduce", rows, HIDDEN, bf16)
+    (got,) = comm.tuned("all_reduce", rows, HIDDEN, bf16)
     assert _is_config(got, want), f"rank {rank}: tuned {got}, the table names {want}"
     comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
     ran = comm._calls[-1].ran
@@ -1177,10 +1247,10 @@ def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -
 
 
 @on_eight_gpus
-def test_a_table_handed_in_is_the_one_cpp_runs() -> None:
+def test_a_table_handed_in_is_the_one_it_runs() -> None:
     """A communicator opened with a `table` of the file's shape runs from it, not
     the file: the file's table with one plain all-reduce input re-pointed to a config
-    the file does not run there, and C++'s `tuned` answers that config, which a plain
+    the file does not run there, and its `tuned` answers that config, which a plain
     call runs."""
     # example-based: the decode step the tuner's candidate is checked at (gp tune)
     import vllm._rocm_C  # noqa: F401
@@ -1194,9 +1264,7 @@ def test_a_table_handed_in_is_the_one_cpp_runs() -> None:
 def test_open_refuses_a_group_no_one_registered() -> None:
     import vllm._rocm_C  # noqa: F401
 
-    got = open_handle(
-        "no-such", "no-such", 0, KERNEL_TIMEOUT_S, MAX_TOKENS, HIDDEN, "none"
-    )
+    got = open_handle("no-such", "no-such", 0, KERNEL_TIMEOUT_S, MAX_TOKENS, HIDDEN)
     assert got is Error.no_such_group
 
 
@@ -1222,23 +1290,23 @@ def test_supported_is_the_builds_answer(size: int) -> None:
         ("INT4", "none", "none"),
     ],
 )
-def test_quantization_reaches_the_opener(
+def test_quantization_is_the_given_else_the_environments(
     variable: str,
     given: Quantization | None,
     want: Quantization,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The handle opens at the quantization given, else at what
-    VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION asks; quick reduce's variable
-    does not turn it on."""
+    """A communicator's quantization (the table its plain calls pick from) is the one
+    given, else what VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION asks; quick
+    reduce's variable does not turn it on."""
     import vllm.distributed.device_communicators.hip_custom_communicator as module
 
     monkeypatch.setenv("VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION", variable)
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
-    opened: list[Quantization] = []
+    opened: list[bool] = []
 
     def fake_open_handle(*args: str | int | float) -> Error:
-        opened.append(args[6])
+        opened.append(True)
         return Error.no_such_group
 
     monkeypatch.setattr(module, "open_handle", fake_open_handle)
@@ -1259,5 +1327,5 @@ def test_quantization_reaches_the_opener(
         max_cols=HIDDEN,
         quantization=given,
     )
-    assert opened == [want] and comm.quantization == want
+    assert opened == [True] and comm.quantization == want
     assert comm.disabled

@@ -2,8 +2,9 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // THE HOST SIDE, one file: the state log, the types, the handle (the communicator's state and
-// its open), the configs (the build catalog, the tuned table's lookup, each op's config), and the
-// API (each op checks its call, obtains a complete config, and launches its kernels). The device
+// its open), the configs (the build catalog, each op's config from a whole config point), and the
+// API (each op checks its call and its config, and launches its kernel). No table and no pick:
+// Python's (the tuned table and its lookup), handing C++ every field. The device
 // side is kernels/. Each section below was a file of its own, in this order (their includes).
 
 #pragma once
@@ -858,25 +859,27 @@ enum class Template : int {
   all_reduce_push_two_shot_add_attn_res_rms_norm = 10,
   all_reduce_push_one_shot = 11,
   all_reduce_push_two_shot = 12,
-  all_reduce_pull_split_add_attn_res_rms_norm = 13,
-  all_reduce_pull_split_rms_norm = 14,
-  all_reduce_pull_split_add_rms_norm = 15,
+  add_attn_res_rms_norm_rows = 13,
+  rms_norm_rows = 14,
+  add_rms_norm_rows = 15,
 };
 
-// HOW A CALLER FORCES A TEMPLATE: the algorithm (one-shot reads every peer's
-// whole input; two-shot reduce-scatters then gathers; split launches two
-// kernels of ours, our plain all-reduce into this rank's local sums
-// (Handle::sums), then our separate kernel of the op's epilogue on them) and
-// the direction (common.cuh's `Direction`, which its reduce-scatters take too;
-// a split's all-reduce is the plain all-reduce's tuned pick, a pull).
-enum class Algorithm : int { one_shot = 0, two_shot = 1, split = 2 };
+// WHAT A TEMPLATE IS: the algorithm (one-shot reads every peer's whole input; two-shot
+// reduce-scatters then gathers; rows reads this rank's rows alone, no peer: a norm op's kernel,
+// which Python runs after our all-reduce where the op is faster as two kernels) and the direction
+// (common.cuh's `Direction`, which its reduce-scatters take too).
+enum class Algorithm : int { one_shot = 0, two_shot = 1, rows = 2 };
 
-// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses.
+// WHICH OP the caller asked for: an all-reduce, alone or with what it fuses, or a norm alone on
+// this rank's rows (the second kernel of an op Python composes).
 enum class OpType : int {
   all_reduce = 0,
   all_reduce_rms_norm = 1,
   all_reduce_add_rms_norm = 2,
   all_reduce_add_attn_res_rms_norm = 3,
+  rms_norm = 4,
+  add_rms_norm = 5,
+  add_attn_res_rms_norm = 6,
 };
 
 // A KERNEL'S CONFIG, in two parts and every field always set: its BUILD, what
@@ -987,37 +990,6 @@ constexpr BuildConfig quantized(BuildConfig b, int q) {
   std::visit([q](auto& f) { f.quantization = q; }, b);
   return b;
 }
-
-// THE TUNED TABLE (vllm/.../hip_custom_communicator_configs/<arch>.json, loaded by Python and
-// handed to open, checked there, held by the handle), the file's two lists: the CONFIGS (the
-// config space tuned: a kernel and its build and launch), and the INPUTS (the input points
-// measured: an op's call at a world, width and tokens, in one of its tables, `mode`: the
-// communicator's exact table or its quantized one, every size: exact kernels where quantizing does
-// not pay, INT4 where it does), each naming the config it runs. A call runs its nearest input's
-// config (config.cuh's `lookup`); a config no input names is a kernel's for a call that forces it.
-enum class Mode : int { exact = 0, quantized = 1 };
-struct TunedConfig {
-  Template fn;
-  KernelConfig config;
-};
-struct TunedInput {
-  OpType op;
-  Mode mode;
-  int world;
-  int64_t hidden;
-  int64_t tokens;
-  int config;  // its config, an index into the table's configs
-};
-struct TunedTable {
-  std::vector<TunedInput> inputs;
-  std::vector<TunedConfig> configs;
-};
-// THE TABLE ON THE WIRE from Python, two lists of int64 (`Template` and `OpType` by their enums'
-// numbers, `build_info`'s order): a config's fields, then an input's, in these orders:
-// template, grid x, y, z, block x, y, z, waves_per_eu, tile_m, tile_n, tile_k, quantization
-// (a config point's essential order); and op, mode, world, hidden, tokens, config.
-constexpr int kConfigFields = 12;
-constexpr int kInputFields = 6;
 
 constexpr int elem_bytes(DType d) { return d == DType::f32 ? 4 : 2; }
 // A row of `elems` of `dtype` in 16-byte packs.
@@ -1517,26 +1489,21 @@ class Handle {
   // own timeout, as every other collective on it has. THE EXCHANGE'S SIZES are
   // the caller's too, computed from the largest call it serves, `max_rows` rows
   // of at most `max_cols` columns (config.cuh's `exchange_sizes`): kept, so
-  // what the buffers were sized for can be asked. `quantization`: what the tuned path moves
-  // across the links, a Quantization: its plain calls read the quantized table where INT4.
-  // `device`: the device the communicator was given (open checks it is the
+  // what the buffers were sized for can be asked. `device`: the device the communicator was given (open checks it is the
   // current one). `log_mode`: what the log records (log.cuh). `rccl_ready`:
   // whether the caller found the device group's RCCL communicator set up (1),
   // not (0), or could not tell (-1): observed and logged, never acted on.
   Handle(int rank, int world_size, int device, const Gather& gather,
          double timeout_seconds, int64_t max_rows, int64_t max_cols,
          int64_t staging_bytes, int64_t partials_bytes,
-         int quantization, LogMode log_mode, int rccl_ready,
-         TunedTable table)
-      : table_(std::move(table)),
-        rank_(rank),
+         LogMode log_mode, int rccl_ready)
+      : rank_(rank),
         world_size_(world_size),
         device_(device),
         max_rows_(max_rows),
         max_cols_(max_cols),
         staging_bytes_(staging_bytes),
         partials_bytes_(partials_bytes),
-        quantization_(quantization),
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
         layout_(arena_layout(staging_bytes, partials_bytes,
                              max_rows * static_cast<int64_t>(sizeof(float)),
@@ -1573,7 +1540,7 @@ class Handle {
                       static_cast<uint32_t>(peers.error));
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_sums());
+    add(own, release_epochs());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1626,7 +1593,7 @@ class Handle {
     // (e) Our arena, the slab of input tables and the arena's device array.
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_sums());
+    add(own, release_epochs());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1667,7 +1634,7 @@ class Handle {
     if (finished) {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
-      add(own, release_sums());
+      add(own, release_epochs());
       add(own, release_region_ptr_arrays());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
@@ -1702,20 +1669,6 @@ class Handle {
   // Each region's bytes, what its largest payload in either encoding takes.
   int64_t staging_bytes() const { return staging_bytes_; }
   int64_t partials_bytes() const { return partials_bytes_; }
-  // What the tuned path moves across the links, a Quantization.
-  int quantization() const { return quantization_; }
-  // THE TUNED TABLE this communicator selects from (types.cuh's TunedTable), checked at open,
-  // and the mode its plain calls read: the quantized one where it quantizes.
-  const TunedTable& table() const { return table_; }
-  Mode mode() const { return quantization_ == Quantization::int4 ? Mode::quantized : Mode::exact; }
-  // THIS RANK'S LOCAL SUMS: a split op's all-reduced rows (config.cuh's
-  // Algorithm::split), written by its plain all-reduce and read by its own
-  // epilogue kernel after it on the stream. Never a peer's (not in the arena:
-  // hipMalloc, cacheable), so nothing orders it but the stream. Sized as the
-  // inputs region, which holds any call's whole input (select refuses one it
-  // does not), so it holds any call's sum.
-  void* sums() const { return sums_; }
-  int64_t sums_bytes() const { return staging_bytes_; }
 
   // EVERY RANK'S SIGNALS, a device array of every rank's signals region with
   // its size, the world (written at open, with the others in
@@ -2108,8 +2061,6 @@ class Handle {
     }
     log.phase(OpenPhase::tables_written,
               static_cast<uint32_t>(kInputTableSlots));
-    // THE LOCAL SUMS (`sums`): hipMalloc, cacheable, this rank's alone.
-    HIP_CHECK(hipMalloc(&sums_, static_cast<size_t>(staging_bytes_)));
     // THE STATUS, host-mapped and coherent: the log's first words
     // (log.cuh). A wait that gives up writes its fault with system-scope
     // atomics while the host polls it, and the host sets its `abort`
@@ -2196,9 +2147,8 @@ class Handle {
     }
     return out;
   }
-  // THE LOCAL SUMS AND THE EPOCHS freed (ours, local): with our arena, in
-  // teardown's second half. Idempotent.
-  Arena::Released release_sums() {
+  // THE EPOCHS freed (ours, local): with our arena, in teardown's second half. Idempotent.
+  Arena::Released release_epochs() {
     Arena::Released out;
     if (epochs_ != nullptr) {
       const hipError_t e = hipFree(epochs_);
@@ -2207,14 +2157,6 @@ class Handle {
         out.error = e;
       }
       epochs_ = nullptr;
-    }
-    if (sums_ != nullptr) {
-      const hipError_t e = hipFree(sums_);
-      if (e != hipSuccess) {
-        (void)hipGetLastError();
-        out.error = e;
-      }
-      sums_ = nullptr;
     }
     return out;
   }
@@ -2334,8 +2276,6 @@ class Handle {
     return i;
   }
 
-  // THE TUNED TABLE (table()), first: open checks it before anything is made.
-  TunedTable table_;
   int rank_;
   int world_size_;
   int device_;
@@ -2343,7 +2283,6 @@ class Handle {
   int64_t max_cols_;
   int64_t staging_bytes_;
   int64_t partials_bytes_;
-  int quantization_;
   std::shared_ptr<Log> log_;
   // THE ARENA'S REGIONS (`arena_layout`), fixed at construction.
   ArenaLayout layout_;
@@ -2370,8 +2309,6 @@ class Handle {
   static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
                        kLinesArray = 4, kRegionPtrArrays = 5;
   char** region_ptr_arrays_ = nullptr;
-  // THE LOCAL SUMS (`sums`), staging_bytes_ of them.
-  void* sums_ = nullptr;
   // THE EPOCHS (LINES AND EPOCHS), kEpochsBytes, this rank's alone.
   int32_t* epochs_ = nullptr;
   int64_t next_slot_ = 0;
@@ -2618,28 +2555,26 @@ constexpr BuildConfig kAttnResPullConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3, Quantization::int4},
 };
 
-// OUR SEPARATE NORM KERNELS (the norm splits' second, rms_norm_rows and add_rms_norm_rows): a
-// row a tile, Layout::tile, a block's threads along the row; each as it is and with its
-// all-reduce moving INT4.
-constexpr BuildConfig kRmsNormSplitExactConfigs[] = {
+// OUR SEPARATE NORM KERNELS (rms_norm_rows and add_rms_norm_rows, the second kernel of a norm op
+// Python composes after our all-reduce): a row a tile, Layout::tile, a block's threads along the
+// row. Exact: no peer, nothing crosses a link.
+constexpr BuildConfig kRmsNormRowsConfigs[] = {
     AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
     AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
     AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
     AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
 };
-constexpr auto kRmsNormSplitConfigs = and_int4(kRmsNormSplitExactConfigs);
-constexpr BuildConfig kAddRmsNormSplitExactConfigs[] = {
+constexpr BuildConfig kAddRmsNormRowsConfigs[] = {
     AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
     AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
     AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
     AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
 };
-constexpr auto kAddRmsNormSplitConfigs = and_int4(kAddRmsNormSplitExactConfigs);
-// OUR SEPARATE ATTNRES KERNEL (the split's second, add_attn_res_rms_norm_rows): a row a tile, the
-// fused pull's exact tile (TILE_N a row's packs over the threads, Layout::tile), at Triton's
-// AttnRes program (256 threads, a source a step: the reference's prefill config) and the
-// neighbours a sweep picks among; each as it is and with its all-reduce moving INT4.
-constexpr BuildConfig kAttnResSplitExactConfigs[] = {
+// OUR SEPARATE ATTNRES KERNEL (add_attn_res_rms_norm_rows, the second kernel of AttnRes as Python
+// composes it): a row a tile, the fused pull's exact tile (TILE_N a row's packs over the threads,
+// Layout::tile), at Triton's AttnRes program (256 threads, a source a step: the reference's prefill
+// config) and the neighbours a sweep picks among. Exact, as the norms'.
+constexpr BuildConfig kAttnResRowsConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
     AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 2},
     AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 3},
@@ -2651,7 +2586,6 @@ constexpr BuildConfig kAttnResSplitExactConfigs[] = {
     AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3},
     AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
 };
-constexpr auto kAttnResSplitConfigs = and_int4(kAttnResSplitExactConfigs);
 
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
@@ -2701,17 +2635,15 @@ constexpr TemplateInfo kTemplates[] = {
      OpType::all_reduce, Algorithm::one_shot, true, kAllReducePushOneShotConfigs},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot),
      OpType::all_reduce, Algorithm::two_shot, true, kAllReduceTwoShotConfigs},
-    // THE OP AS TWO KERNELS OF OURS (Algorithm::split; STANDARDS 3.2, *We win at the op level*):
-    // the plain all-reduce, its tuned pick at the build's quantization, into this rank's local
-    // sums (Handle::sums), then our separate AttnRes kernel on them (add_attn_res_rms_norm_rows), on
-    // its own grid at its own occupancy. Its builds are that kernel's.
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_add_attn_res_rms_norm),
-     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::split, false, kAttnResSplitConfigs},
-    // THE NORMS AS TWO KERNELS OF OURS: the plain all-reduce, then our separate norm kernel.
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_rms_norm),
-     OpType::all_reduce_rms_norm, Algorithm::split, false, kRmsNormSplitConfigs},
-    {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_split_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, Algorithm::split, false, kAddRmsNormSplitConfigs},
+    // THE NORMS ON THIS RANK'S ROWS (Algorithm::rows; STANDARDS 3.2, *We win at the op level*):
+    // the second kernel of an op Python composes as two kernels of ours, our all-reduce and then
+    // this, on its own grid at its own occupancy.
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_attn_res_rms_norm_rows),
+     OpType::add_attn_res_rms_norm, Algorithm::rows, false, kAttnResRowsConfigs},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(rms_norm_rows),
+     OpType::rms_norm, Algorithm::rows, false, kRmsNormRowsConfigs},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_rms_norm_rows),
+     OpType::add_rms_norm, Algorithm::rows, false, kAddRmsNormRowsConfigs},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -2729,8 +2661,6 @@ constexpr const TemplateInfo& info(Template k) {
 }
 constexpr const char* to_string(Template k) { return info(k).name; }
 constexpr bool is_two_shot(Template k) { return info(k).algorithm == Algorithm::two_shot; }
-// A SPLIT: two kernels of ours, the plain all-reduce then the op's own (Algorithm::split).
-constexpr bool is_split(Template k) { return info(k).algorithm == Algorithm::split; }
 
 constexpr std::span<const BuildConfig> builds_of(Template k) {
   return info(k).builds;
@@ -2879,9 +2809,9 @@ constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world
 }
 
 // =================================================================================================
-// THE OPS, in OpType's order: each one's name (as Python calls it) and what a plain call of it
-// (nothing forced) must be to run, which `build_info` hands Python's `should`. What each runs at
-// a size is the tuned table's (types.cuh's TunedTable), the handle's.
+// THE OPS, in OpType's order: each one's name (as Python calls it) and what a call of it must be
+// to run, which `build_info` hands Python's `should`. What each runs at a size is Python's (its
+// tuned table), handed whole.
 // =================================================================================================
 
 // A NORM'S WEIGHT, besides its input's dtype: fp32 (by_weight compiles exactly
@@ -2917,6 +2847,9 @@ constexpr Op kOps[] = {
      kBuild.supports.dtypes,
      {},
      true},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(rms_norm), kBuild.supports.dtypes, kNormWeights, true},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_rms_norm), kBuild.supports.dtypes, kNormWeights, true},
+    {HIP_CUSTOM_COMMUNICATOR_NAMED(add_attn_res_rms_norm), kBuild.supports.dtypes, {}, true},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumOps = sizeof(kOps) / sizeof(Op);
@@ -2963,7 +2896,7 @@ constexpr bool slices_columns(Template k) {
 // 1. THE FORCING: a whole config point, every field given (the C++ API takes no optional; what a
 // caller may leave out is Python's to fill): the template, the grid, the block and its waves a EU,
 // the tile, the quantization. A value out of range is its Error; a build the template does not list
-// is the check's to name. An unforced call runs its table's pick (`lookup`).
+// is the check's to name. Every call is forced: Python hands its table's pick the same way.
 // =================================================================================================
 
 // The kernel a call runs: its template and its complete config.
@@ -2994,12 +2927,13 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3
       waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
     return Error::launch_out_of_range;
   if (tile_m < 1 || tile_n < 1 || tile_k < 1) return Error::field_not_positive;
-  const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm;
+  const bool has_k = o == OpType::all_reduce_add_attn_res_rms_norm ||
+                     o == OpType::add_attn_res_rms_norm;
   if (!has_k && tile_k != 1) return Error::field_not_this_templates;
   BuildConfig b = AllReduceBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
-  if (o == OpType::all_reduce_rms_norm)
+  if (o == OpType::all_reduce_rms_norm || o == OpType::rms_norm)
     b = AllReduceRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
-  if (o == OpType::all_reduce_add_rms_norm)
+  if (o == OpType::all_reduce_add_rms_norm || o == OpType::add_rms_norm)
     b = AllReduceAddRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, quantization};
   if (has_k)
     b = AllReduceAddAttnResRmsNormBuildConfig{block, waves_per_eu, tile_m, tile_n, tile_k,
@@ -3008,80 +2942,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3
 }
 
 // =================================================================================================
-// 2. THE LOOKUP: a call runs its nearest tuned input's config (types.cuh's TunedTable: the
-// handle's, from the arch's config file, `check`ed at open). Nothing here is a tuned number: the
-// table's are.
-// =================================================================================================
-
-constexpr int64_t distance(int64_t a, int64_t b) {
-  return a < b ? b - a : a - b;
-}
-
-
-// THE NEAREST INPUT `take` admits (given the input and its config): at the handle's world, the
-// nearest width, then the nearest size (rows x width, so a width no input lists reads the nearest
-// width's inputs at the same bytes), the smaller on a tie. Whether its kernel takes the call is
-// the kernel's to say: a kernel that cannot is refused by its checks, never passed over for
-// another. None where `take` admits no input.
-template <typename TAKE>
-inline const TunedInput* nearest(const Handle& h, TAKE take, int64_t m, int64_t n) {
-  const TunedTable& t = h.table();
-  const auto admitted = [&](const TunedInput& p) {
-    return p.world == h.world_size() && take(p, t.configs[p.config]);
-  };
-  int64_t width = 0;
-  for (const TunedInput& p : t.inputs)
-    if (admitted(p) && (width == 0 || distance(p.hidden, n) < distance(width, n)))
-      width = p.hidden;
-  const TunedInput* best = nullptr;
-  for (const TunedInput& p : t.inputs) {
-    if (p.hidden != width || !admitted(p)) continue;
-    const int64_t d = distance(p.tokens * p.hidden, m * n);
-    const int64_t held = best ? distance(best->tokens * best->hidden, m * n) : 0;
-    if (!best || d < held || (d == held && p.tokens < best->tokens)) best = &p;
-  }
-  return best;
-}
-
-// THE KERNEL A PLAIN CALL RUNS: the config of the nearest input of its communicator's table
-// (`check` holds that every op has inputs at every world and mode it builds).
-inline Chosen lookup(const Handle& h, OpType o, int64_t m, int64_t n) {
-  const Mode mode = h.mode();
-  const TunedInput* p = nearest(h, [&](const TunedInput& p, const TunedConfig&) {
-    return p.op == o && p.mode == mode;
-  }, m, n);
-  const TunedConfig& c = h.table().configs[p->config];
-  return Chosen{c.fn, c.config};
-}
-
-// A KERNEL'S CONFIG FOR A CALL THAT NAMES IT (a forced launch at the tuned config: gp's kernel
-// lines, the tests): the config of kernel `fn` moving `quantization` its nearest input runs, in
-// either table, else the first such config of the table's; moving INT4 where it has no INT4
-// config, its exact config moved INT4 (a build it lists). None where it has neither.
-inline std::optional<Chosen> kernel_config(const Handle& h, Template fn, int quantization,
-                                           int64_t m, int64_t n) {
-  const TunedTable& t = h.table();
-  const auto takes = [&](const TunedConfig& c, int q) {
-    return c.fn == fn && quantization_of(c.config.build) == q &&
-           built(fn, quantized(c.config.build, quantization));
-  };
-  const auto of = [&](int q) -> const TunedConfig* {
-    if (const TunedInput* p = nearest(h, [&](const TunedInput&, const TunedConfig& c) {
-          return takes(c, q);
-        }, m, n))
-      return &t.configs[p->config];
-    for (const TunedConfig& c : t.configs)
-      if (takes(c, q)) return &c;
-    return nullptr;
-  };
-  const TunedConfig* c = of(quantization);
-  if (!c && quantization == Quantization::int4) c = of(Quantization::none);
-  if (!c) return std::nullopt;
-  return Chosen{c->fn, {quantized(c->config.build, quantization), c->config.launch}};
-}
-
-// =================================================================================================
-// 4. THE CHECK: the first Error kernel `fn` at `c` meets on the call here, in
+// 2. THE CHECK: the first Error kernel `fn` at `c` meets on the call here, in
 // this order, or none. Every Error is a capability (a kernel that cannot take
 // the input), never "the unfused ops would be faster". Residency, which needs
 // the compiled kernel, is each select's last check.
@@ -3138,7 +2999,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // INT4 ON A ONE-SHOT, which reads its peers' inputs as they are: named before
   // the build lookup, which lists no such build.
   const bool int4 = quantization_of(c.build) == Quantization::int4;
-  if (int4 && (algorithm_of(fn) == Algorithm::one_shot ||
+  if (int4 && (algorithm_of(fn) == Algorithm::one_shot || algorithm_of(fn) == Algorithm::rows ||
                fn == Template::all_reduce_pull_two_shot))
     return Error::quantization_not_supported;
   // A BUILD THE TEMPLATE DOES NOT LIST, named by what differs: its block, its
@@ -3189,17 +3050,6 @@ constexpr std::optional<Error> weight_refused(OpType o, DType dtype,
   return Error::weight_not_built;
 }
 
-// THE TUNED CONFIG AS A QUERY (`HipCustomCommunicator.tuned`): with no kernel named, what a plain
-// call of `m` rows of `n` in `dtype` runs on this communicator (`lookup`); with kernel `fn` named,
-// its config moving `quantization` (`kernel_config`): a forced launch at the tuned config. None
-// where `fn` has no config.
-inline std::variant<std::optional<Chosen>, Error> tuned(const Handle& h, OpType o, int64_t m,
-                                                        int64_t n, DType dtype, int quantization,
-                                                        std::optional<Template> fn) {
-  if (fn) return kernel_config(h, *fn, quantization, m, n);
-  return std::optional<Chosen>{lookup(h, o, m, n)};
-}
-
 // =================================================================================================
 // EACH OP'S SELECT: the op's launch, everything decided, from the call's
 // primitives and its forcing, or the first Error the call meets. Each in four
@@ -3235,7 +3085,7 @@ enum class Kernel {
   add_attn_res_rms_norm_rows,
 };
 
-struct ConfigFields {
+struct Config {
   Kernel kernel{};
   Algorithm algorithm{};
   Direction direction{};
@@ -3277,13 +3127,6 @@ struct ConfigFields {
   int64_t lines_size_n{};
   int64_t scales_stride_m{};
   int64_t scales_size_m{};
-  int64_t sums_stride_n{};
-};
-
-// A split runs the all-reduce config first, then this config on local sums.
-struct Config : ConfigFields {
-  ConfigFields all_reduce{};
-  bool split = false;
 };
 
 constexpr Kernel kernel_of(Template fn) {
@@ -3314,11 +3157,11 @@ constexpr Kernel kernel_of(Template fn) {
       return Kernel::all_reduce_push_one_shot;
     case Template::all_reduce_push_two_shot:
       return Kernel::all_reduce_push_two_shot;
-    case Template::all_reduce_pull_split_add_attn_res_rms_norm:
+    case Template::add_attn_res_rms_norm_rows:
       return Kernel::add_attn_res_rms_norm_rows;
-    case Template::all_reduce_pull_split_rms_norm:
+    case Template::rms_norm_rows:
       return Kernel::rms_norm_rows;
-    case Template::all_reduce_pull_split_add_rms_norm:
+    case Template::add_rms_norm_rows:
       return Kernel::add_rms_norm_rows;
   }
   throw std::runtime_error("unknown kernel template");
@@ -3498,7 +3341,8 @@ void with_config_build(const Config& config, F& f) {
         });
       };
       if constexpr (op_of(FN) == OpType::all_reduce_rms_norm ||
-                    op_of(FN) == OpType::all_reduce_add_rms_norm)
+                    op_of(FN) == OpType::all_reduce_add_rms_norm ||
+                    op_of(FN) == OpType::rms_norm || op_of(FN) == OpType::add_rms_norm)
         by_weight<T>(config.weight_dtype, config.dtype, weight);
       else weight(type<T>{});
     });
@@ -3559,18 +3403,18 @@ void with_config(const Config& config, F&& f) {
     if (config.kernel ==
         kernel_of(Template::all_reduce_push_two_shot))
       return with_config_build<Template::all_reduce_push_two_shot>(config, f);
-  if constexpr (op_of(Template::all_reduce_pull_split_add_attn_res_rms_norm) == OP)
+  if constexpr (op_of(Template::add_attn_res_rms_norm_rows) == OP)
     if (config.kernel ==
-        kernel_of(Template::all_reduce_pull_split_add_attn_res_rms_norm))
-      return with_config_build<Template::all_reduce_pull_split_add_attn_res_rms_norm>(config, f);
-  if constexpr (op_of(Template::all_reduce_pull_split_rms_norm) == OP)
+        kernel_of(Template::add_attn_res_rms_norm_rows))
+      return with_config_build<Template::add_attn_res_rms_norm_rows>(config, f);
+  if constexpr (op_of(Template::rms_norm_rows) == OP)
     if (config.kernel ==
-        kernel_of(Template::all_reduce_pull_split_rms_norm))
-      return with_config_build<Template::all_reduce_pull_split_rms_norm>(config, f);
-  if constexpr (op_of(Template::all_reduce_pull_split_add_rms_norm) == OP)
+        kernel_of(Template::rms_norm_rows))
+      return with_config_build<Template::rms_norm_rows>(config, f);
+  if constexpr (op_of(Template::add_rms_norm_rows) == OP)
     if (config.kernel ==
-        kernel_of(Template::all_reduce_pull_split_add_rms_norm))
-      return with_config_build<Template::all_reduce_pull_split_add_rms_norm>(config, f);
+        kernel_of(Template::add_rms_norm_rows))
+      return with_config_build<Template::add_rms_norm_rows>(config, f);
   not_built("kernel config");
 }
 
@@ -3773,25 +3617,6 @@ inline std::variant<Config, Error> all_reduce_config(
   return config;
 }
 
-// A SPLIT'S ALL-REDUCE (Algorithm::split): the plain all-reduce's nearest pick moving the split
-// build's `quantization` (from the quantized table moving INT4, the exact one exact), forced
-// whole, into this rank's local
-// sums (Handle::sums), dense rows; its own select checks it (its band, its regions, its
-// residency). The caller's own check holds the sums to the inputs region's size.
-inline std::variant<Config, Error> split_all_reduce_config(
-    const Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
-    int64_t m, int64_t n, DType dtype, int quantization, hipStream_t stream) {
-  const Mode mode = quantization == Quantization::int4 ? Mode::quantized : Mode::exact;
-  const TunedInput* p = nearest(h, [&](const TunedInput& p, const TunedConfig& c) {
-    return p.op == OpType::all_reduce && p.mode == mode &&
-           quantization_of(c.config.build) == quantization;
-  }, m, n);
-  if (!p) return Error::quantization_not_supported;
-  const TunedConfig& r = h.table().configs[p->config];
-  return all_reduce_config(h, input, input_stride_m, input_stride_n, m, n, h.sums(), n, 1, m, n,
-                           dtype, Chosen{r.fn, r.config}, stream);
-}
-
 // all_reduce_rms_norm: out = rms_norm(all_reduce(inp), weight), vLLM's
 // roundings exactly. inp [rows, hidden]; the weight `weight_dtype`, dtype or
 // f32.
@@ -3815,14 +3640,6 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
     return *e;
   const AllReduceRmsNormBuildConfig& r =
       std::get<AllReduceRmsNormBuildConfig>(c.build);
-  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
-  std::optional<Config> all_reduce;
-  if (is_split(fn)) {
-    const std::variant<Config, Error> got = split_all_reduce_config(
-        h, input, input_stride_m, input_stride_n, m, n, dtype, r.quantization, stream);
-    if (const Error* e = std::get_if<Error>(&got)) return *e;
-    all_reduce = std::get<Config>(got);
-  }
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
       n > 0 ? partials_need(fn, m,
@@ -3854,11 +3671,6 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   config.staging_size_n = row_n;
   config.dtype = dtype;
   config.weight_dtype = weight_dtype;
-  config.split = all_reduce.has_value();
-  if (all_reduce) {
-    config.all_reduce = *all_reduce;
-    config.sums_stride_n = 1;
-  }
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
@@ -3870,8 +3682,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) && !resident(h, kernel, config.grid, config.block))
+  if (!resident(h, kernel, config.grid, config.block))
     return Error::grid_not_resident;
   return config;
 }
@@ -3904,14 +3715,6 @@ all_reduce_add_rms_norm_config(
     return *e;
   const AllReduceAddRmsNormBuildConfig& r =
       std::get<AllReduceAddRmsNormBuildConfig>(c.build);
-  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
-  std::optional<Config> all_reduce;
-  if (is_split(fn)) {
-    const std::variant<Config, Error> got = split_all_reduce_config(
-        h, input, input_stride_m, input_stride_n, m, n, dtype, r.quantization, stream);
-    if (const Error* e = std::get_if<Error>(&got)) return *e;
-    all_reduce = std::get<Config>(got);
-  }
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none),
   // at its row stride: the exact pull two-shot's row is its scale's pack then the
   // row (partials_need); the INT4 build's rows are the row alone, its scales in
@@ -3953,11 +3756,6 @@ all_reduce_add_rms_norm_config(
   config.staging_size_n = payload_row(fn, r.quantization, n);
   config.dtype = dtype;
   config.weight_dtype = weight_dtype;
-  config.split = all_reduce.has_value();
-  if (all_reduce) {
-    config.all_reduce = *all_reduce;
-    config.sums_stride_n = 1;
-  }
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
@@ -3970,8 +3768,7 @@ all_reduce_add_rms_norm_config(
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
   if (config.scales_size_m > h.scales_size_m()) return Error::partials_too_small;
-  // A SPLIT'S NORM KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) && !resident(h, kernel, config.grid, config.block))
+  if (!resident(h, kernel, config.grid, config.block))
     return Error::grid_not_resident;
   return config;
 }
@@ -4015,14 +3812,6 @@ all_reduce_add_attn_res_rms_norm_config(
     return *e;
   const AllReduceAddAttnResRmsNormBuildConfig& a =
       std::get<AllReduceAddAttnResRmsNormBuildConfig>(c.build);
-  // THE SPLIT'S ALL-REDUCE (split_all_reduce).
-  std::optional<Config> all_reduce;
-  if (is_split(fn)) {
-    const std::variant<Config, Error> got = split_all_reduce_config(
-        h, input, input_stride_m, input_stride_n, m, n, dtype, a.quantization, stream);
-    if (const Error* e = std::get_if<Error>(&got)) return *e;
-    all_reduce = std::get<Config>(got);
-  }
   const int tm = a.tile_m, tk = a.tile_k;
   // THE PARTIALS'S ROWS, what partials_need sized it for (a one-shot keeps none).
   const int64_t partials_rows =
@@ -4058,11 +3847,6 @@ all_reduce_add_attn_res_rms_norm_config(
   config.staging_size_m = staged_rows(fn, a.quantization, m, world);
   config.staging_size_n = row_n;
   config.dtype = dtype;
-  config.split = all_reduce.has_value();
-  if (all_reduce) {
-    config.all_reduce = *all_reduce;
-    config.sums_stride_n = 1;
-  }
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
@@ -4074,10 +3858,95 @@ all_reduce_add_attn_res_rms_norm_config(
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  // A SPLIT'S ATTNRES KERNEL waits on no peer, so any grid runs: residency is its all-reduce's.
-  if (!is_split(fn) &&
-      !resident(h, kernel, config.grid, config.block, config.shared_memory_bytes))
+  if (!resident(h, kernel, config.grid, config.block, config.shared_memory_bytes))
     return Error::grid_not_resident;
+  return config;
+}
+
+// =================================================================================================
+// THE NORMS ON THIS RANK'S ROWS (Algorithm::rows): an op Python composes as two kernels of ours runs
+// our all-reduce, then one of these on its sum. A norm on rows waits on no peer: its check reads
+// nothing a peer holds (no Handle), and any grid runs.
+// =================================================================================================
+
+// A NORM ON ROWS' CONFIG: the build and grid `k` names, on rows `n` wide of `dtype` (its weight
+// `weight_dtype`), its launch's LDS `shared_memory_bytes`. Its instances are one at every world.
+inline Config rows_config(const Handle& h, const Chosen& k, int64_t n, DType dtype,
+                          DType weight_dtype, int shared_memory_bytes) {
+  const BuildConfig& b = k.config.build;
+  Config config{};
+  config.shared_memory_bytes = shared_memory_bytes;
+  config.kernel = kernel_of(k.fn);
+  config.algorithm = algorithm_of(k.fn);
+  config.direction = direction_of(k.fn);
+  config.world = h.world_size();
+  config.tile_m = tile_m_of(b);
+  config.tile_n = tile_n_of(b);
+  config.tile_k = std::visit([](const auto& f) -> int {
+    if constexpr (requires { f.tile_k; }) return f.tile_k;
+    else return 1;
+  }, b);
+  config.block = block_of(b);
+  config.grid = k.config.launch.grid;
+  config.waves_per_eu = waves_of(b);
+  config.quantization = quantization_of(b);
+  config.dtype = dtype;
+  config.weight_dtype = weight_dtype;
+  // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
+  config.chunked = n > config.tile_n;
+  return config;
+}
+
+// rms_norm: out = rms_norm(inp, weight), vLLM's roundings exactly, on this rank's `m` rows of `n`;
+// the weight `weight_dtype`, dtype or f32.
+inline std::variant<Config, Error> rms_norm_config(const Handle& h, int64_t m, int64_t n,
+                                                   DType dtype, DType weight_dtype,
+                                                   const Chosen& k) {
+  const OpType op = OpType::rms_norm;
+  if (const std::optional<Error> e = refused(nullptr, k.fn, k.config, dtype, m, n,
+                                             weight_refused(op, dtype, weight_dtype), true))
+    return *e;
+  const Config config = rows_config(h, k, n, dtype, weight_dtype, 0);
+  const void* kernel = nullptr;
+  with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
+  if (!kernel) return Error::tile_not_built;
+  return config;
+}
+
+// add_rms_norm: out, residual_out = fused_add_rms_norm(inp, residual, weight), vLLM's roundings
+// exactly, on this rank's `m` rows of `n`.
+inline std::variant<Config, Error> add_rms_norm_config(const Handle& h, int64_t m, int64_t n,
+                                                       DType dtype, DType weight_dtype,
+                                                       const Chosen& k) {
+  const OpType op = OpType::add_rms_norm;
+  if (const std::optional<Error> e = refused(nullptr, k.fn, k.config, dtype, m, n,
+                                             weight_refused(op, dtype, weight_dtype), true))
+    return *e;
+  const Config config = rows_config(h, k, n, dtype, weight_dtype, 0);
+  const void* kernel = nullptr;
+  with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
+  if (!kernel) return Error::tile_not_built;
+  return config;
+}
+
+// add_attn_res_rms_norm: Kimi-K3's AttnRes and its RMSNorm on each of this rank's `m` rows of `n`
+// (all_reduce_add_attn_res_rms_norm's, its input the sum), `num_blocks` sources.
+inline std::variant<Config, Error> add_attn_res_rms_norm_config(const Handle& h, int64_t m,
+                                                                int64_t n, DType dtype,
+                                                                int num_blocks, const Chosen& k) {
+  const OpType op = OpType::add_attn_res_rms_norm;
+  if (const std::optional<Error> e =
+          refused(nullptr, k.fn, k.config, dtype, m, n, std::nullopt, true))
+    return *e;
+  // A ROW WIDER THAN THE TILE keeps its rows' logits in the launch's LDS (attn_res.cuh's
+  // attn_res_wide): [tile_m][num_blocks + 1] floats.
+  const int tile_m = tile_m_of(k.config.build), tile_n = tile_n_of(k.config.build);
+  const Config config = rows_config(
+      h, k, n, dtype, dtype,
+      n > tile_n ? static_cast<int>(tile_m * (num_blocks + 1) * sizeof(float)) : 0);
+  const void* kernel = nullptr;
+  with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
+  if (!kernel) return Error::tile_not_built;
   return config;
 }
 
@@ -4139,9 +4008,7 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
 }
 
 // =================================================================================================
-// WHAT A CALL MAY HOLD, AND THE TABLE'S CHECK: what Python's `should` admits by, and the check
-// open makes of a config file before anything is made (what the compile-time checks held of the
-// tables before the tables became a file).
+// WHAT A CALL MAY HOLD: what Python's `should` admits by.
 // =================================================================================================
 
 // THE MOST BYTES A CALL OF AN OP RUNS ON THESE BUFFERS, whatever its shape: what the inputs holds
@@ -4159,69 +4026,6 @@ constexpr int64_t max_bytes(OpType o, int64_t partials_bytes, int64_t staging_by
   if (per_byte == 0) return staging_bytes;
   const int64_t partials = partials_bytes / per_byte;
   return partials < staging_bytes ? partials : staging_bytes;
-}
-
-// THE CHECK OPEN MAKES OF THE TABLE: the first config or input a call could not run, named, or a
-// table or a kernel left without one; none if the file is sound. Every config a build its kernel
-// lists, its grid in range (the LL push's within its lines' blocks); every input a config of its own
-// op at a built world, an exact table's moving nothing quantized; every op inputs in each table at
-// every built world; every kernel a config for each encoding it builds (an INT4 build's may be an
-// exact config's, moved INT4, where that build is listed).
-inline std::optional<std::string> check(const TunedTable& table) {
-  const auto mode_name = [](Mode m) { return m == Mode::exact ? "exact" : "quantized"; };
-  const std::vector<TunedConfig>& configs = table.configs;
-  for (size_t i = 0; i < configs.size(); ++i) {
-    const TunedConfig& c = configs[i];
-    const auto named = [&](const char* why) {
-      return "config " + std::to_string(i) + " (" + info(c.fn).name + "): " + why;
-    };
-    if (c.config.build.index() != family_of(c.fn) || !built(c.fn, c.config.build))
-      return named("its build is not one its kernel lists");
-    if (!launch_fits(c.config.launch)) return named("its grid is out of range");
-    if (c.fn == Template::all_reduce_push_one_shot &&
-        volume(c.config.launch.grid) > kLineBlocks)
-      return named("the LL push's grid is past its lines' blocks");
-  }
-  for (size_t i = 0; i < table.inputs.size(); ++i) {
-    const TunedInput& p = table.inputs[i];
-    const auto named = [&](const char* why) {
-      return "input " + std::to_string(i) + " (" + op(p.op).name + ", " + mode_name(p.mode) +
-             ", world " + std::to_string(p.world) + ", " + std::to_string(p.hidden) + " wide, " +
-             std::to_string(p.tokens) + " tokens): " + why;
-    };
-    if (p.config < 0 || p.config >= static_cast<int>(configs.size()))
-      return named("it names no config");
-    const TunedConfig& c = configs[p.config];
-    if (op_of(c.fn) != p.op) return named("its config's kernel is another op's");
-    if (!world_built(p.world)) return named("its world is not built");
-    if (p.hidden < 1 || p.tokens < 1) return named("no width or no tokens");
-    if (p.mode == Mode::exact && quantization_of(c.config.build) != Quantization::none)
-      return named("an input of the exact table moves INT4");
-  }
-  for (const Op& o : kOps)
-    for (const int world : kBuild.supports.worlds)
-      for (const Mode mode : {Mode::exact, Mode::quantized}) {
-        bool any = false;
-        for (const TunedInput& p : table.inputs)
-          any |= p.op == o.type && p.world == world && p.mode == mode;
-        if (!any)
-          return std::string(o.name) + ": no input at world " + std::to_string(world) +
-                 " in the " + mode_name(mode) + " table";
-      }
-  for (const TemplateInfo& t : kTemplates)
-    for (const int q : {Quantization::none, Quantization::int4}) {
-      bool builds_it = false;
-      for (const BuildConfig& b : t.builds) builds_it |= quantization_of(b) == q;
-      bool has = false;
-      for (const TunedConfig& c : configs)
-        has |= c.fn == t.fn &&
-               (quantization_of(c.config.build) == q ||
-                (q == Quantization::int4 && built(t.fn, quantized(c.config.build, q))));
-      if (builds_it && !has)
-        return std::string(t.name) + ": no config" +
-               (q == Quantization::int4 ? " moving INT4" : " exact");
-    }
-  return std::nullopt;
 }
 
 }  // namespace hip_custom_communicator
@@ -4376,110 +4180,6 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
       k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
-  if (config.split) {
-    const int64_t sums_stride_n = config.sums_stride_n;
-    const Config reduced{config.all_reduce};
-    with_config<OpType::all_reduce>(reduced, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
-          stream);
-      const InputTable t = reduced.in_place
-          ? h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
-              stream)
-          : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
-      if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m, reduced.partials_stride_n,
-          static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
-          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
-          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
-          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
-          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
-          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization, C.tail>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m,
-          reduced.partials_stride_n, static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.staging_ptr_array(),
-              h.staging_ptr_array_size(), reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    with_config<OpType::all_reduce_rms_norm>(config, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
-          dtype, stream);
-      if constexpr (C.kernel == Kernel::rms_norm_rows) {
-        rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
-            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(h.sums()),
-          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<const W*>(weight), weight_stride_n,
-          static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
-          output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), eps);
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    return config;
-  }
   with_config<OpType::all_reduce_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
@@ -4594,115 +4294,6 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
           eps, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
-  if (config.split) {
-    const int64_t sums_stride_n = config.sums_stride_n;
-    const Config reduced{config.all_reduce};
-    with_config<OpType::all_reduce>(reduced, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
-          stream);
-      const InputTable t = reduced.in_place
-          ? h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
-              stream)
-          : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
-      if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m, reduced.partials_stride_n,
-          static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
-          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
-          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
-          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
-          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
-          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization, C.tail>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m,
-          reduced.partials_stride_n, static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.staging_ptr_array(),
-              h.staging_ptr_array_size(), reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    with_config<OpType::all_reduce_add_rms_norm>(config, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
-          input_size_n, dtype, stream);
-      if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
-        add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
-            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(h.sums()),
-          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<const T*>(residual), residual_stride_m,
-          residual_stride_n, static_cast<int>(residual_size_m),
-          static_cast<int>(residual_size_n), static_cast<const W*>(weight), weight_stride_n,
-          static_cast<int>(weight_size_n), static_cast<T*>(output), output_stride_m,
-          output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), static_cast<T*>(residual_output),
-          residual_output_stride_m, residual_output_stride_n,
-          static_cast<int>(residual_output_size_m),
-          static_cast<int>(residual_output_size_n), eps);
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    return config;
-  }
   with_config<OpType::all_reduce_add_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
@@ -4873,125 +4464,6 @@ all_reduce_add_attn_res_rms_norm(
           dtype, num_blocks, eps, output_eps, k, stream);
   if (const Error* e = std::get_if<Error>(&checked)) return *e;
   const Config config = std::get<Config>(checked);
-  if (config.split) {
-    const int64_t sums_stride_n = config.sums_stride_n;
-    const Config reduced{config.all_reduce};
-    with_config<OpType::all_reduce>(reduced, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
-          stream);
-      const InputTable t = reduced.in_place
-          ? h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
-              stream)
-          : InputTable{nullptr, 0, reduced.staging_stride_m, reduced.staging_stride_n};
-      if constexpr (C.kernel == Kernel::all_reduce_pull_one_shot) {
-        all_reduce_pull_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.signals_ptr_array(), h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_pull_two_shot) {
-        all_reduce_pull_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          reinterpret_cast<const T* const*>(t.ptr_array), t.ptr_array_size,
-          t.stride_m, t.stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m, reduced.partials_stride_n,
-          static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(),
-          h.signals_stride_parity(), h.signals_stride_block(),
-          h.signals_stride_writer(), h.signals_size_parity(),
-          h.signals_size_block(), h.signals_size_writer(), h.status_ptr(),
-          h.status_stride_field(), h.status_size_field(), h.rank(),
-          h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_one_shot) {
-        all_reduce_push_one_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.quantization>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
-          reduced.lines_stride_slot, reduced.lines_stride_m, reduced.lines_stride_n,
-          static_cast<int>(reduced.lines_size_slot), static_cast<int>(reduced.lines_size_m),
-          static_cast<int>(reduced.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
-          h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
-          static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-      if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {
-        all_reduce_push_two_shot<T, C.world, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu,
-            C.contiguous, C.quantization, C.tail>
-            <<<dim3_of(reduced.grid), dim3_of(C.block), reduced.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(input),
-          input_stride_m, input_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<T*>(h.sums()), input_size_n,
-          sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), h.partials_ptr_array(), h.partials_ptr_array_size(),
-          reduced.partials_stride_m,
-          reduced.partials_stride_n, static_cast<int>(reduced.partials_size_m),
-          static_cast<int>(reduced.partials_size_n), h.staging_ptr_array(),
-              h.staging_ptr_array_size(), reduced.staging_stride_m,
-          reduced.staging_stride_n, static_cast<int>(reduced.staging_size_m),
-          static_cast<int>(reduced.staging_size_n), h.signals_ptr_array(),
-              h.signals_ptr_array_size(), h.signals_stride_parity(),
-          h.signals_stride_block(), h.signals_stride_writer(),
-          h.signals_size_parity(), h.signals_size_block(),
-          h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
-          h.status_size_field(), h.rank(), h.timeout_ticks());
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    with_config<OpType::all_reduce_add_attn_res_rms_norm>(config, [&]<Config C>() {
-      using T = typename of_dtype<C.dtype>::t;
-      using W = typename of_dtype<C.weight_dtype>::t;
-      h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
-          input_size_n, dtype, stream);
-      if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
-        add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.block.x, C.waves_per_eu, C.chunked>
-            <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
-          static_cast<const T*>(h.sums()),
-          input_size_n, config.sums_stride_n, static_cast<int>(input_size_m),
-          static_cast<int>(input_size_n), static_cast<const T*>(prefix), prefix_stride_m,
-          prefix_stride_n, static_cast<int>(prefix_size_m),
-          static_cast<int>(prefix_size_n), static_cast<const T*>(blocks), blocks_stride_m,
-          blocks_stride_r, blocks_stride_n, static_cast<int>(blocks_size_m),
-          static_cast<int>(blocks_size_r), static_cast<int>(blocks_size_n),
-          static_cast<const T*>(norm_weight), norm_weight_stride_n,
-          static_cast<int>(norm_weight_size_n), static_cast<const T*>(qk_weight),
-          qk_weight_stride_n, static_cast<int>(qk_weight_size_n),
-          static_cast<const T*>(output_norm_weight), output_norm_weight_stride_n,
-          static_cast<int>(output_norm_weight_size_n), static_cast<T*>(prefix_output),
-          prefix_output_stride_m, prefix_output_stride_n,
-          static_cast<int>(prefix_output_size_m),
-          static_cast<int>(prefix_output_size_n), static_cast<T*>(output), output_stride_m,
-          output_stride_n, static_cast<int>(output_size_m),
-          static_cast<int>(output_size_n), static_cast<T*>(block_output),
-          block_output_stride_m, block_output_stride_n,
-          static_cast<int>(block_output_size_m),
-          static_cast<int>(block_output_size_n), num_blocks, eps,
-          output_eps);
-      }
-    });
-    HIP_CHECK(hipGetLastError());
-    return config;
-  }
   with_config<OpType::all_reduce_add_attn_res_rms_norm>(config, [&]<Config C>() {
     using T = typename of_dtype<C.dtype>::t;
     using W = typename of_dtype<C.weight_dtype>::t;
@@ -5109,6 +4581,166 @@ all_reduce_add_attn_res_rms_norm(
         h.signals_size_writer(), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks(), num_blocks, eps,
         output_eps);
+    }
+  });
+  HIP_CHECK(hipGetLastError());
+  return config;
+}
+
+// =================================================================================================
+// THE NORMS ON THIS RANK'S ROWS: each checks its call and its config, and launches its kernel on
+// the stream after the all-reduce Python ran before it.
+// =================================================================================================
+
+inline std::variant<Config, Error> rms_norm(
+    Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
+    int64_t input_size_m, int64_t input_size_n, const void* weight, int64_t weight_stride_n,
+    int64_t weight_size_n, void* output, int64_t output_stride_m, int64_t output_stride_n,
+    int64_t output_size_m, int64_t output_size_n, DType dtype, DType weight_dtype, float eps,
+    const Chosen& k, hipStream_t stream) {
+  if (const std::optional<Error> e =
+          layout_refused(dtype, {{output_stride_m, output_stride_n},
+                                 {input_stride_m, input_stride_n}}))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+    return *e;
+  std::variant<Config, Error> checked =
+      rms_norm_config(h, input_size_m, input_size_n, dtype, weight_dtype, k);
+  if (const Error* e = std::get_if<Error>(&checked)) return *e;
+  const Config config = std::get<Config>(checked);
+  with_config<OpType::rms_norm>(config, [&]<Config C>() {
+    using T = typename of_dtype<C.dtype>::t;
+    using W = typename of_dtype<C.weight_dtype>::t;
+    h.begin_launch(OpType::rms_norm, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
+        stream);
+    if constexpr (C.kernel == Kernel::rms_norm_rows) {
+      rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const W*>(weight), weight_stride_n, static_cast<int>(weight_size_n),
+        static_cast<T*>(output), output_stride_m, output_stride_n,
+        static_cast<int>(output_size_m), static_cast<int>(output_size_n), eps);
+    }
+  });
+  HIP_CHECK(hipGetLastError());
+  return config;
+}
+
+inline std::variant<Config, Error> add_rms_norm(
+    Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
+    int64_t input_size_m, int64_t input_size_n, const void* residual, int64_t residual_stride_m,
+    int64_t residual_stride_n, int64_t residual_size_m, int64_t residual_size_n,
+    const void* weight, int64_t weight_stride_n, int64_t weight_size_n, void* output,
+    int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    int64_t output_size_n, void* residual_output, int64_t residual_output_stride_m,
+    int64_t residual_output_stride_n, int64_t residual_output_size_m,
+    int64_t residual_output_size_n, DType dtype, DType weight_dtype, float eps,
+    const Chosen& k, hipStream_t stream) {
+  if (const std::optional<Error> e = layout_refused(
+          dtype, {{output_stride_m, output_stride_n},
+                  {residual_output_stride_m, residual_output_stride_n},
+                  {input_stride_m, input_stride_n},
+                  {residual_stride_m, residual_stride_n}}))
+    return *e;
+  if (const std::optional<Error> e =
+          layout_refused(weight_dtype, {{0, weight_stride_n}}))
+    return *e;
+  std::variant<Config, Error> checked =
+      add_rms_norm_config(h, input_size_m, input_size_n, dtype, weight_dtype, k);
+  if (const Error* e = std::get_if<Error>(&checked)) return *e;
+  const Config config = std::get<Config>(checked);
+  with_config<OpType::add_rms_norm>(config, [&]<Config C>() {
+    using T = typename of_dtype<C.dtype>::t;
+    using W = typename of_dtype<C.weight_dtype>::t;
+    h.begin_launch(OpType::add_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n, dtype,
+        stream);
+    if constexpr (C.kernel == Kernel::add_rms_norm_rows) {
+      add_rms_norm_rows<T, W, C.tile_m, C.tile_n, C.block.x, C.waves_per_eu, C.chunked>
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const T*>(residual), residual_stride_m, residual_stride_n,
+        static_cast<int>(residual_size_m), static_cast<int>(residual_size_n),
+        static_cast<const W*>(weight), weight_stride_n, static_cast<int>(weight_size_n),
+        static_cast<T*>(output), output_stride_m, output_stride_n,
+        static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+        static_cast<T*>(residual_output), residual_output_stride_m, residual_output_stride_n,
+        static_cast<int>(residual_output_size_m), static_cast<int>(residual_output_size_n), eps);
+    }
+  });
+  HIP_CHECK(hipGetLastError());
+  return config;
+}
+
+inline std::variant<Config, Error> add_attn_res_rms_norm(
+    Handle& h, const void* input, int64_t input_stride_m, int64_t input_stride_n,
+    int64_t input_size_m, int64_t input_size_n, const void* prefix, int64_t prefix_stride_m,
+    int64_t prefix_stride_n, int64_t prefix_size_m, int64_t prefix_size_n, const void* blocks,
+    int64_t blocks_stride_m, int64_t blocks_stride_r, int64_t blocks_stride_n,
+    int64_t blocks_size_m, int64_t blocks_size_r, int64_t blocks_size_n,
+    const void* norm_weight, int64_t norm_weight_stride_n, int64_t norm_weight_size_n,
+    const void* qk_weight, int64_t qk_weight_stride_n, int64_t qk_weight_size_n,
+    const void* output_norm_weight, int64_t output_norm_weight_stride_n,
+    int64_t output_norm_weight_size_n, void* prefix_output, int64_t prefix_output_stride_m,
+    int64_t prefix_output_stride_n, int64_t prefix_output_size_m, int64_t prefix_output_size_n,
+    void* output, int64_t output_stride_m, int64_t output_stride_n, int64_t output_size_m,
+    int64_t output_size_n, void* block_output, int64_t block_output_stride_m,
+    int64_t block_output_stride_n, int64_t block_output_size_m, int64_t block_output_size_n,
+    DType dtype, int num_blocks, float eps, float output_eps, const Chosen& k,
+    hipStream_t stream) {
+  if (const std::optional<Error> e = layout_refused(
+          dtype, {{input_stride_m, input_stride_n},
+                  {blocks_stride_m, blocks_stride_n},
+                  {blocks_stride_r, blocks_stride_n},
+                  {0, norm_weight_stride_n},
+                  {0, qk_weight_stride_n},
+                  {prefix_output_stride_m, prefix_output_stride_n},
+                  {output_stride_m, output_stride_n}}))
+    return *e;
+  // THE OPTIONAL BUFFERS, checked only when given (all_reduce_add_attn_res_rms_norm's).
+  if (prefix != nullptr)
+    if (const std::optional<Error> e =
+            layout_refused(dtype, {{prefix_stride_m, prefix_stride_n}}))
+      return *e;
+  if (output_norm_weight != nullptr)
+    if (const std::optional<Error> e =
+            layout_refused(dtype, {{0, output_norm_weight_stride_n}}))
+      return *e;
+  if (block_output != nullptr)
+    if (const std::optional<Error> e = layout_refused(
+            dtype, {{block_output_stride_m, block_output_stride_n}}))
+      return *e;
+  std::variant<Config, Error> checked =
+      add_attn_res_rms_norm_config(h, input_size_m, input_size_n, dtype, num_blocks, k);
+  if (const Error* e = std::get_if<Error>(&checked)) return *e;
+  const Config config = std::get<Config>(checked);
+  with_config<OpType::add_attn_res_rms_norm>(config, [&]<Config C>() {
+    using T = typename of_dtype<C.dtype>::t;
+    h.begin_launch(OpType::add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
+        input_size_n, dtype, stream);
+    if constexpr (C.kernel == Kernel::add_attn_res_rms_norm_rows) {
+      add_attn_res_rms_norm_rows<T, C.tile_m, C.tile_n, C.tile_k, C.block.x, C.waves_per_eu,
+          C.chunked>
+          <<<dim3_of(config.grid), dim3_of(C.block), config.shared_memory_bytes, stream>>>(
+        static_cast<const T*>(input), input_stride_m, input_stride_n,
+        static_cast<int>(input_size_m), static_cast<int>(input_size_n),
+        static_cast<const T*>(prefix), prefix_stride_m, prefix_stride_n,
+        static_cast<int>(prefix_size_m), static_cast<int>(prefix_size_n),
+        static_cast<const T*>(blocks), blocks_stride_m, blocks_stride_r, blocks_stride_n,
+        static_cast<int>(blocks_size_m), static_cast<int>(blocks_size_r),
+        static_cast<int>(blocks_size_n), static_cast<const T*>(norm_weight),
+        norm_weight_stride_n, static_cast<int>(norm_weight_size_n),
+        static_cast<const T*>(qk_weight), qk_weight_stride_n, static_cast<int>(qk_weight_size_n),
+        static_cast<const T*>(output_norm_weight), output_norm_weight_stride_n,
+        static_cast<int>(output_norm_weight_size_n), static_cast<T*>(prefix_output),
+        prefix_output_stride_m, prefix_output_stride_n, static_cast<int>(prefix_output_size_m),
+        static_cast<int>(prefix_output_size_n), static_cast<T*>(output), output_stride_m,
+        output_stride_n, static_cast<int>(output_size_m), static_cast<int>(output_size_n),
+        static_cast<T*>(block_output), block_output_stride_m, block_output_stride_n,
+        static_cast<int>(block_output_size_m), static_cast<int>(block_output_size_n), num_blocks,
+        eps, output_eps);
     }
   });
   HIP_CHECK(hipGetLastError());
