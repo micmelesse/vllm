@@ -1132,10 +1132,11 @@ _HANDED_TOKENS = 8
 
 
 def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
-    """THE FILE'S TABLE WITH THE PLAIN ALL-REDUCE'S INPUTS REPLACED BY ONE: the exact
-    mode at WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file
-    does not run there (the file's 1-token pick at that width, a config it already
-    runs on this world). Its config too."""
+    """THE FILE'S TABLE WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED: the exact mode at
+    WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file does not
+    run there (the file's 1-token pick at that width, a config it already runs on
+    this world); every other input kept, as C++'s check wants an input at every
+    built world. Its config too."""
     raw = json.loads(_TABLE.read_text())
     entry = raw["all_reduce"]
 
@@ -1151,15 +1152,14 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
     handed = named(1)
     assert handed != named(_HANDED_TOKENS), "the file runs that config there already"
     table = copy.deepcopy(raw)
-    table["all_reduce"]["inputs"] = [
-        {
-            "mode": "exact",
-            "world": WORLD_SIZE,
-            "hidden": HIDDEN,
-            "tokens": _HANDED_TOKENS,
-            "config": {arch: handed},
-        }
-    ]
+    for p in table["all_reduce"]["inputs"]:
+        if (p["mode"], p["world"], p["hidden"], p["tokens"]) == (
+            "exact",
+            WORLD_SIZE,
+            HIDDEN,
+            _HANDED_TOKENS,
+        ):
+            p["config"] = {arch: handed}
     return table, entry["configs"][arch][handed]
 
 
@@ -1202,8 +1202,9 @@ def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -
 @on_eight_gpus
 def test_a_table_handed_in_is_the_one_cpp_runs() -> None:
     """A communicator opened with a `table` of the file's shape runs from it, not
-    the file: a one-input plain all-reduce table naming a config the file does not
-    run there, and C++'s `tuned` answers that config, which a plain call runs."""
+    the file: the file's table with one plain all-reduce input re-pointed to a config
+    the file does not run there, and C++'s `tuned` answers that config, which a plain
+    call runs."""
     # example-based: the decode step the tuner's candidate is checked at (gp tune)
     import vllm._rocm_C  # noqa: F401
 
