@@ -13,7 +13,7 @@
 #include <limits>
 #include <type_traits>
 
-#include "../hardware.cuh"
+#include "hardware.cuh"
 
 namespace hip_custom_communicator {
 
