@@ -2485,6 +2485,9 @@ constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / el
 // Layout::tile), at Triton's AttnRes program (256 threads, a source a step: the reference's prefill
 // config) and the neighbours a sweep picks among. Exact, as the norms'.
 #include "hip_custom_communicator_builds.inc"
+// EVERY KERNEL INSTANCE IS COMPILED IN ITS BUILD'S OWN FILE (builds.py): declared here, so the
+// launches below instantiate none of them in this file.
+#include "hip_custom_communicator_instances.inc"
 
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {

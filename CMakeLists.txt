@@ -1552,26 +1552,39 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     set(VLLM_HCC_BUILDS_SCRIPT
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator/builds.py)
     set(VLLM_HCC_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/hip_custom_communicator_generated)
+    # A TUNE'S CANDIDATE BUILDS (gp tune exploring its space), compiled beside the table's; a
+    # serving build leaves it empty and compiles exactly the table.
+    set(VLLM_HCC_CANDIDATES "" CACHE FILEPATH "hip_custom_communicator: a tune's candidate configs")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
       ${VLLM_HCC_TABLE} ${VLLM_HCC_BUILDS_SCRIPT})
+    # ITS KERNEL INSTANCES, A FILE A BUILD (builds.py writes them beside the builds, with the
+    # header that keeps the host from instantiating any): compiled in parallel, each cached alone.
+    set(VLLM_HCC_HOST
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator/hip_custom_communicator.cuh)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VLLM_HCC_HOST})
     execute_process(
       COMMAND ${Python_EXECUTABLE} ${VLLM_HCC_BUILDS_SCRIPT} ${VLLM_HCC_TABLE}
         ${VLLM_HCC_GENERATED}/hip_custom_communicator_builds.inc "${VLLM_HCC_ARCHES}"
+        ${VLLM_HCC_HOST} "${VLLM_HCC_CANDIDATES}"
       RESULT_VARIABLE VLLM_HCC_BUILDS_RESULT)
     if(NOT VLLM_HCC_BUILDS_RESULT EQUAL 0)
       message(FATAL_ERROR "hip_custom_communicator: builds.py failed on ${VLLM_HCC_TABLE}")
     endif()
+    file(STRINGS ${VLLM_HCC_GENERATED}/hip_custom_communicator_instances.txt VLLM_HCC_INSTANCE_NAMES)
+    list(TRANSFORM VLLM_HCC_INSTANCE_NAMES PREPEND ${VLLM_HCC_GENERATED}/
+      OUTPUT_VARIABLE VLLM_HCC_INSTANCES)
     set(VLLM_HCC_SRC "csrc/rocm/hip_custom_communicator.cu")
     hipify_sources_target(VLLM_HCC_HIP_SRCS _rocm_C_hcc "${VLLM_HCC_SRC}")
     unset(_VLLM_LAST_HIPIFY_TARGET)
-    add_library(_rocm_C_hcc OBJECT ${VLLM_HCC_HIP_SRCS})
+    add_library(_rocm_C_hcc OBJECT ${VLLM_HCC_HIP_SRCS} ${VLLM_HCC_INSTANCES})
     add_dependencies(_rocm_C_hcc hipify_all)
-    set_source_files_properties(${VLLM_HCC_HIP_SRCS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
+    set_source_files_properties(${VLLM_HCC_HIP_SRCS} ${VLLM_HCC_INSTANCES}
+      PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
     set_target_properties(_rocm_C_hcc PROPERTIES
       ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_HCC_ARCHES}"
       POSITION_INDEPENDENT_CODE ON)
     target_include_directories(_rocm_C_hcc PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc
-      ${VLLM_HCC_GENERATED})
+      ${VLLM_HCC_GENERATED} ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm)
     target_compile_options(_rocm_C_hcc PRIVATE
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>)
     # KERNEL ARGUMENTS PRELOADED into SGPRs (LLVM AMDGPUUsage, "Preloaded Kernel Arguments",
