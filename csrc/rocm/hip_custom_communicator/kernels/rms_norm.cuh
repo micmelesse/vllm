@@ -26,8 +26,7 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2, wide = 3 };
 // (scale's reduce). `layout` is how the thread's packs lie in the row, for the mask of the packs
 // past size_n: Layout::tile (pack k of thread t at t + k * THREADS_PER_BLOCK) or Layout::group_run
 // (a group a thread: its K packs consecutive, at t * K + k); a literal at every call.
-template <int THREADS_PER_BLOCK, typename W, typename T, int ROWS, int K,
-          int P>
+template <int THREADS_PER_BLOCK, int WAVE_SIZE, typename W, typename T, int ROWS, int K, int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
                       float inv_hidden, int size_n, int offs_n, NormPart part,
@@ -56,7 +55,7 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
       for (int m = 0; m < ROWS; ++m) scale[m] = ss[0][m];  // the row's next chunk adds to it
       return;
     }
-    reduce<1, THREADS_PER_BLOCK, ReduceAxis::all>(ss, ss);
+    reduce<1, THREADS_PER_BLOCK, WAVE_SIZE, ReduceAxis::all>(ss, ss);
 #pragma unroll
     for (int m = 0; m < ROWS; ++m) scale[m] = rsqrtf(ss[0][m] * inv_hidden + eps);
   }

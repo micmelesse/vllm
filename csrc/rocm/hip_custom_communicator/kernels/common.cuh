@@ -16,14 +16,10 @@ namespace hip_custom_communicator {
 
 #define DINLINE __device__ __forceinline__
 
-// THE TARGET'S TWO FACTS THE DEVICE CODE HOLDS ITSELF, until the build passes them down (the build as
-// one value, next): a wave's lanes (the in-wave shuffles: reduce's DPP sequence), asserted against
-// the compiler's, and a pack's bytes, the widest load (traits). The host's HARDWARE asserts it agrees.
-constexpr int kWaveSize = 64;
-constexpr int kPackBytes = 16;
-#if defined(__AMDGCN_WAVEFRONT_SIZE)
-static_assert(__AMDGCN_WAVEFRONT_SIZE == kWaveSize, "the compiler's wave is not the kernels'");
-#endif
+// THE TARGET'S FACTS ARE THE HOST'S, handed down as template parameters: WAVE_SIZE, a wave's lanes
+// (the flat walk's whole waves, reduce's wave layout and DPP sequence), and PACK_BYTES, a pack's
+// bytes, the widest load (traits). Every kernel takes both from its launch (the host's HARDWARE and
+// BUILD) and passes them on; the code that relies on the wave asserts it is the compiler's.
 
 // A PACK IN A REGISTER, the unit load and store move and every op sums in.
 template <typename DTYPE, int VEC_SIZE>
@@ -31,11 +27,11 @@ struct __align__(sizeof(DTYPE) * VEC_SIZE) vec {
   DTYPE d[VEC_SIZE];
 };
 
-// A PACK: kPackBytes (above: the widest load, 8 bf16);
-// traits<DTYPE>::N its elements, the P of a thread's registers.
-template <typename DTYPE>
+// A PACK: PACK_BYTES (the host's: the widest load, 8 bf16);
+// traits<DTYPE, PACK_BYTES>::N its elements, the P of a thread's registers.
+template <typename DTYPE, int PACK_BYTES>
 struct traits {
-  static constexpr int N = kPackBytes / sizeof(DTYPE);
+  static constexpr int N = PACK_BYTES / sizeof(DTYPE);
 };
 
 // PEER MEMORY THROUGH GLOBAL INSTRUCTIONS (load, store, and the collectives' inline walks). A
@@ -345,8 +341,8 @@ DINLINE void give_up(uint32_t* status_ptr, int64_t status_stride_field, int stat
 // THE LINE READ'S OWN (Layout::line, above): `rank` this rank (the writer not waited for, and the
 // fault's), `flag` the value every line waited for carries, and the status buffer and limit its
 // poll gives up by; every other layout passes them as their defaults and reads none.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL, typename OUTPUT>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL, typename OUTPUT>
 DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride_slot,
                          int64_t input_stride_m, int64_t input_stride_n, int input_size_slot,
                          int input_size_m, int input_size_n, int clip_m, int clip_n,
@@ -354,6 +350,10 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
                          uint32_t flag = 0, uint32_t* status_ptr = nullptr,
                          int64_t status_stride_field = 0, int status_size_field = 0,
                          uint64_t timeout_ticks = 0) {
+  // THE HANDED WAVE IS THE COMPILER'S: the flat walk's whole waves are the hardware's.
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE, "the compiler's wave is not the one handed");
+#endif
   constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
   constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
   constexpr int kRows = std::extent_v<OUTPUT, kSlots ? 1 : 0>;
@@ -522,7 +522,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
                   "the flat walk reads one exact copy a row of threads");
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(kLanes % kWaveSize == 0, "a rank's copy is whole waves");
+    static_assert(kLanes % WAVE_SIZE == 0, "a rank's copy is whole waves");
     static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     const U* const from = reinterpret_cast<const U*>(input) + int64_t{offs_m} * input_stride_m;
     const int64_t first = int64_t{input_slot} * input_stride_slot;
@@ -850,13 +850,17 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
 // every rank quantizes once, before its loop.
 // THE LINE WRITE'S OWN (Layout::line): `flag`, the value its lines carry; every other layout
 // passes it as its default.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL, typename INPUT>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL, typename INPUT>
 DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                           int64_t output_stride_slot, int64_t output_stride_m,
                           int64_t output_stride_n, int output_size_slot, int output_size_m,
                           int output_size_n, int clip_m, int clip_n, int offs_m, int offs_n,
                           int row_step, uint32_t flag = 0) {
+  // THE HANDED WAVE IS THE COMPILER'S: the flat walk's whole waves are the hardware's.
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE, "the compiler's wave is not the one handed");
+#endif
   constexpr int kRows = std::extent_v<INPUT, 0>;
   constexpr int kPacks = std::extent_v<INPUT, 1>;
   constexpr int kPackElems = std::extent_v<INPUT, 2>;
@@ -933,7 +937,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
                   "the flat walk writes one exact copy a row of threads");
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(kLanes % kWaveSize == 0, "a rank's copy is whole waves");
+    static_assert(kLanes % WAVE_SIZE == 0, "a rank's copy is whole waves");
     static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
     const int64_t first = int64_t{output_slot} * output_stride_slot;
@@ -1128,9 +1132,9 @@ constexpr int all = 0;
 constexpr int m = 1;
 }  // namespace ReduceAxis
 
-// THE BLOCK REDUCTION, one for every case: reduce<TILE_M, THREADS_PER_BLOCK, AXIS>(input,
-// output), a sum (I9: Max had no caller, so there is no operation parameter), every value of
-// [K][P] summed on its own, in fp32. Input and output may be the same array (in place).
+// THE BLOCK REDUCTION, one for every case: reduce<TILE_M, THREADS_PER_BLOCK, WAVE_SIZE,
+// AXIS>(input, output), a sum (I9: Max had no caller, so there is no operation parameter), every
+// value of [K][P] summed on its own, in fp32. Input and output may be the same array (in place).
 //
 // AXIS all: over the whole block (THREADS_PER_BLOCK threads, TILE_M 1), every thread left
 // holding the results. Each wave reduces its values by DPP, then every thread combines the waves'
@@ -1147,9 +1151,14 @@ constexpr int m = 1;
 // the rows in row order, rounded once to U there; the other rows' output is unwritten (rounded
 // after the branch, the sums were phis of fp32 vectors and the LDS reads vectorized differently:
 // ISA 2026-10-15).
-template <int TILE_M, int THREADS_PER_BLOCK, int AXIS, typename T, typename U, int K, int P>
+template <int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int AXIS, typename T, typename U, int K,
+          int P>
 DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   static_assert(AXIS == ReduceAxis::all || AXIS == ReduceAxis::m, "AXIS is all or m");
+  // THE HANDED WAVE IS THE COMPILER'S: the lanes, waves and DPP sequence below are the hardware's.
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+  static_assert(__AMDGCN_WAVEFRONT_SIZE == WAVE_SIZE, "the compiler's wave is not the one handed");
+#endif
   // The block as TILE_M rows of kThreadsN threads.
   constexpr int kThreadsM = TILE_M;
   constexpr int kThreadsN = THREADS_PER_BLOCK / TILE_M;
@@ -1157,10 +1166,10 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
   if constexpr (AXIS == ReduceAxis::all) {
     static_assert(TILE_M == 1, "AXIS all is one row of the block's threads");
     constexpr int kValues = K * P;
-    constexpr int kWaves = (kThreadsN + kWaveSize - 1) / kWaveSize;
+    constexpr int kWaves = (kThreadsN + WAVE_SIZE - 1) / WAVE_SIZE;
     __shared__ float partial[kValues][kWaves];
-    const int lane = threadIdx.x % kWaveSize;
-    const int wave = threadIdx.x / kWaveSize;
+    const int lane = threadIdx.x % WAVE_SIZE;
+    const int wave = threadIdx.x / WAVE_SIZE;
     float v[kValues];
 #pragma unroll
     for (int n = 0; n < kValues; ++n) v[n] = static_cast<float>(input[n / P][n % P]);
@@ -1179,7 +1188,7 @@ DINLINE void reduce(const T (&input)[K][P], U (&output)[K][P]) {
     // 2026-10-04T03-07-41Z). The moved value first: only a VOP2's src0 takes DPP, so (dpp(x), x)
     // fuses each step into one v_add_f32_dpp where (x, dpp(x)) was a v_mov_b32_dpp and an add
     // (ISA 2026-10-04T02-22-41Z).
-    static_assert(kWaveSize == 64, "the DPP sequence is for 64-lane waves");
+    static_assert(WAVE_SIZE == 64, "the DPP sequence is for 64-lane waves");
     const auto bits = [](float x) { return __builtin_bit_cast(int, x); };
     const auto real = [](int x) { return __builtin_bit_cast(float, x); };
     constexpr int kIdentity = 0;  // 0.0f's bits, the sum's identity
@@ -1655,8 +1664,9 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
 // with a barrier). The four are one read and one write (read_buffer, write_buffer, below), so a
 // peer access compiles as a local one does; only which copies differs.
 //
-// A THREAD'S REGISTERS `U v[kRows][kPacks][kPackElems]` (a pack, kPackElems elements: 16 bytes of
-// the kernel's dtype), the layout from the tile's rows TILE_M and the block's THREADS_PER_BLOCK:
+// A THREAD'S REGISTERS `U v[kRows][kPacks][kPackElems]` (a pack, kPackElems elements: the kernel's
+// PACK_BYTES of its dtype), the layout from the tile's rows TILE_M and the block's THREADS_PER_BLOCK
+// (of WAVE_SIZE-lane waves, the kernel's, handed on to the two bodies):
 // kThreadsM = TILE_M / kRows rows of threads, kThreadsN = THREADS_PER_BLOCK / kThreadsM threads a
 // row; thread t holds rows offs_m + (t / kThreadsN + i * kThreadsM) * row_step and packs
 // offs_n / kPackElems + t % kThreadsN + k * kThreadsN; stride_n must be 1. One round trip; a row past
@@ -1705,8 +1715,8 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
 
 // LOAD: this rank's buffer (entry input_rank) into a thread's registers. Layout::line's poll
 // takes its flag, the status and the limit (read_buffer's line read); no other layout reads them.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL = false, typename PTR, typename OUTPUT>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
@@ -1719,7 +1729,7 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
                                 ? entries[0]
                                 : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
-  internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+  internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
       input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
       input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
       flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
@@ -1739,8 +1749,8 @@ DINLINE T* load(T* const* x_ptr_array, int x_ptr_array_size, int x_rank) {
 
 // RECV: rank input_rank's buffer (a peer's, over the fabric; the rank may differ by lane) into a
 // thread's registers. A one-entry array (`&entry, 1`, an entry loaded earlier) is that entry.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL = false, typename PTR, typename OUTPUT>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL = false, typename PTR, typename OUTPUT>
 DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int input_rank,
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
@@ -1748,25 +1758,25 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
   const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(input_rank);
   if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
         input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
         row_step);
   else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         internal::ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
         input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
         clip_n, output, offs_m, offs_n, row_step);
   else
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         internal::lane_ptr_array_at<void, WORLD>(entries, input_ptr_array_size, input_rank),
         input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
         input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
 }
 
 // STORE: a thread's registers into this rank's buffer (entry output_rank).
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL = false, typename INPUT, typename PTR>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                    int output_rank, int output_slot, int64_t output_stride_slot,
                    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
@@ -1776,7 +1786,7 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
   void* const output = __builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1
                            ? entries[0]
                            : internal::ptr_array_at(entries, output_ptr_array_size, output_rank);
-  internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+  internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
       input, output, output_slot, output_stride_slot, output_stride_m, output_stride_n,
       output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
 }
@@ -1784,8 +1794,8 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
 // SEND: a thread's registers into rank output_rank's buffer (a peer's, over the fabric; the rank
 // may differ by lane). Posted: the next ordered barrier's release completes and publishes it
 // (BARRIER); a Layout::line send carries `flag` in its lines and needs no barrier.
-template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int QUANTIZATION, Layout LAYOUT,
-          bool TAIL = false, typename INPUT, typename PTR>
+template <int WORLD, int TILE_M, int THREADS_PER_BLOCK, int WAVE_SIZE, int QUANTIZATION,
+          Layout LAYOUT, bool TAIL = false, typename INPUT, typename PTR>
 DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_ptr_array_size,
                   int output_rank, int output_slot, int64_t output_stride_slot,
                   int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
@@ -1794,12 +1804,12 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
   const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
   const int first = __builtin_amdgcn_readfirstlane(output_rank);
   if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
         output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
         output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
   else
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, QUANTIZATION, LAYOUT, TAIL>(
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
         input,
         internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
         output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
