@@ -749,7 +749,7 @@ def test_op_matches_the_ops_it_replaces(op: Op) -> None:
 # --------------------------------------------------------------------------------
 
 INT4_GROUP = 32
-INT4_SHAPES = ((1, LATENT), (16, HIDDEN), (2048, HIDDEN))
+INT4_SHAPES = ((1, LATENT), (16, HIDDEN), (96, HIDDEN), (2048, HIDDEN))
 # Near every element as the emulation computes it, the rest a quantization step
 # off. INT4's own error against the exact op is the format's, judged end to end
 # (the gsm8k gate), not here: a kernel is right when it computes what the format
