@@ -89,7 +89,7 @@ typedef __attribute__((address_space(1))) u32x4 global_u32x4;
 // enum's reads `(hip_custom_communicator::Quantization)1`, which the ISA tools cut at the
 // parenthesis, so a kernel's two builds were one file.
 namespace Quantization {
-constexpr int none = 0;
+constexpr int exact = 0;
 constexpr int int4 = 1;
 }  // namespace Quantization
 
@@ -371,7 +371,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
   using V = vec<U, kPackElems>;
   // Slot c of the buffer, as its elements (none) or its bytes (int4).
-  using E = std::conditional_t<QUANTIZATION == Quantization::none, const U, const uint8_t>;
+  using E = std::conditional_t<QUANTIZATION == Quantization::exact, const U, const uint8_t>;
   const auto base = [&](int c) -> E* {
     const int slot = kSlots ? (input_slot + c) % WORLD : input_slot;
     if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (slot < 0 || slot >= input_size_slot)) __builtin_trap();
@@ -411,7 +411,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // THE LINE READ: every writer's lines of the tile at once (two a pack), then the check, again
     // until every line waited for carries the flag. A lane leaves the loop once its own are all
     // there; a lane past the clip waits for none.
-    static_assert(QUANTIZATION == Quantization::none && kSlots && kCopies == WORLD,
+    static_assert(QUANTIZATION == Quantization::exact && kSlots && kCopies == WORLD,
                   "a line read is every writer's exact copy");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     constexpr int kLines = sizeof(V) / kLinePayloadBytes;
@@ -518,7 +518,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
         }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
-    static_assert(QUANTIZATION == Quantization::none && !kSlots && kRows == 1,
+    static_assert(QUANTIZATION == Quantization::exact && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
@@ -569,7 +569,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // 2026-10-20T20-15-38Z).
     const int at = TAIL ? min(g, static_cast<int>(int4_groups(clip_n)) - 1)
                         : min(g, clip_n / kInt4Group - 1);
-    if constexpr (QUANTIZATION == Quantization::none) {
+    if constexpr (QUANTIZATION == Quantization::exact) {
       // ONE COPY, exact: its group's packs. Its scheduling is the caller's (the int4 push keeps two
       // ranks' groups in flight: reduce_scatter.cuh).
       static_assert(!kSlots, "an exact group is one copy");
@@ -688,7 +688,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
       asm volatile("" ::: "memory");
       __builtin_amdgcn_sched_barrier(0);
     }
-  } else if constexpr (QUANTIZATION == Quantization::none && !kSlots) {
+  } else if constexpr (QUANTIZATION == Quantization::exact && !kSlots) {
     const V* at = reinterpret_cast<const V*>(base(0));
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
@@ -752,7 +752,7 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // 2026-10-03T21-00-27Z). It waits for nothing: a loop of calls has every call's loads out.
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
-  } else if constexpr (QUANTIZATION == Quantization::none) {
+  } else if constexpr (QUANTIZATION == Quantization::exact) {
     const U* at_copy[kCopies];
 #pragma unroll
     for (int c = 0; c < kCopies; ++c) at_copy[c] = base(c);
@@ -871,7 +871,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   static_assert(kThreadsM * kRows == TILE_M, "a tile is whole rows a thread");
   static_assert(kThreadsM * kThreadsN == THREADS_PER_BLOCK, "the layout is the block");
   using V = vec<U, kPackElems>;
-  using E = std::conditional_t<QUANTIZATION == Quantization::none, U, uint8_t>;
+  using E = std::conditional_t<QUANTIZATION == Quantization::exact, U, uint8_t>;
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && (output_slot < 0 || output_slot >= output_size_slot)) __builtin_trap();
   [[maybe_unused]] E* const at_copy = reinterpret_cast<E*>(output) + output_slot * output_stride_slot;
   const int tid = static_cast<int>(threadIdx.x);
@@ -898,7 +898,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // registers were rebuilt after the join, which waited for every store before (s_waitcnt
     // vmcnt(0)): a send's remote stores ran one at a time, 40k of 60k cycles a wave (ATT
     // 2026-10-19T04-09-17Z, 1 x 7168).
-    static_assert(QUANTIZATION == Quantization::none, "a line carries exact payload");
+    static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
     // A PACK IS ONE OR TWO LINES: the registers' pack, 8 bytes (aiter's packet) or 16.
     constexpr int kLines = sizeof(V) / kLinePayloadBytes;
     static_assert(sizeof(V) % kLinePayloadBytes == 0 && kLines >= 1 && kLines <= 2 &&
@@ -929,7 +929,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     }
   } else if constexpr (LAYOUT != Layout::tile && !kGroup) {
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
-    static_assert(QUANTIZATION == Quantization::none && kRows == 1,
+    static_assert(QUANTIZATION == Quantization::exact && kRows == 1,
                   "the flat walk writes one exact copy a row of threads");
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
@@ -960,7 +960,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
   } else if constexpr (kGroup) {
     static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
     const int g = offs_n / kInt4Group + tid % kThreadsN;
-    if constexpr (QUANTIZATION == Quantization::none) {
+    if constexpr (QUANTIZATION == Quantization::exact) {
       if constexpr (TAIL) {
         // EXACT: the group's packs at their place, a short last group's inside the clip.
         if (g >= int4_groups(clip_n)) return;
@@ -1044,7 +1044,7 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
         *(global_f16*)(reinterpret_cast<char*>(scales) + scale_at) = static_cast<__fp16>(scale);
       }
     }
-  } else if constexpr (QUANTIZATION == Quantization::none) {
+  } else if constexpr (QUANTIZATION == Quantization::exact) {
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
       if (row_at(i) >= clip_m) continue;

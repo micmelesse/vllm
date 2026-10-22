@@ -757,7 +757,7 @@ constexpr const char* to_string(Error e) {
     case Error::not_contiguous:
       return "not_contiguous: the input is not contiguous";
     case Error::not_two_d:
-      return "not_two_d: a fused op takes a 2-D input";
+      return "not_two_d: an op takes a 2-D input, [rows, cols]";
     case Error::dtype_not_built:
       return "dtype_not_built: only float16 and bfloat16 are built";
     case Error::world_not_built:
@@ -830,7 +830,7 @@ constexpr const char* to_string(Error e) {
       return "forced_incomplete: a forced call gives every field of its config "
              "or none (Python's refusal: C++ takes every field)";
     case Error::no_such_quantization:
-      return "no_such_quantization: the quantization is none or int4";
+      return "no_such_quantization: the quantization is exact or int4";
     case Error::quantization_not_supported:
       return "quantization_not_supported: INT4 is not supported for the selected "
              "kernel";
@@ -918,7 +918,7 @@ struct AllReduceBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  int quantization = Quantization::none;  // a Quantization
+  int quantization = Quantization::exact;  // a Quantization
   bool operator==(const AllReduceBuildConfig&) const = default;
 };
 // all_reduce_rms_norm.
@@ -927,7 +927,7 @@ struct AllReduceRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  int quantization = Quantization::none;  // a Quantization
+  int quantization = Quantization::exact;  // a Quantization
   bool operator==(const AllReduceRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_rms_norm.
@@ -936,7 +936,7 @@ struct AllReduceAddRmsNormBuildConfig {
   int waves_per_eu;
   int tile_m;
   int tile_n;
-  int quantization = Quantization::none;  // a Quantization
+  int quantization = Quantization::exact;  // a Quantization
   bool operator==(const AllReduceAddRmsNormBuildConfig&) const = default;
 };
 // all_reduce_add_attn_res_rms_norm: TILE_K sources a step.
@@ -946,7 +946,7 @@ struct AllReduceAddAttnResRmsNormBuildConfig {
   int tile_m;
   int tile_n;
   int tile_k;
-  int quantization = Quantization::none;  // a Quantization
+  int quantization = Quantization::exact;  // a Quantization
   bool operator==(const AllReduceAddAttnResRmsNormBuildConfig&) const = default;
 };
 using BuildConfig =
@@ -1155,8 +1155,8 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // send, ATT 2026-10-19T04-09-17Z). The lines start zeroed with the arena (no line
 // carries epoch 0, the first is 1); both are written only by that kernel. THE CAP: aiter's LL serves at most 128 KiB a call
 // (kLLPocSlotCapPk, 16384 packets) and refuses more; ours takes any size, a pass of a
-// tile a block, so its cap is the grid's, kLineBlocks blocks (config.cuh cuts the grid to
-// it): 128 blocks of 1024 elements, 256 KiB in one pass. 8 MiB at eight ranks.
+// tile a block, so its cap is the grid's, kLineBlocks blocks (a grid past it is refused,
+// launch_out_of_range): 128 blocks of 1024 elements, 256 KiB in one pass. 8 MiB at eight ranks.
 constexpr int kLineBlocks = 128;
 constexpr int64_t kLineSlotBytes = 2048;  // a block's tile's payload, at most
 constexpr int64_t lines_bytes(int world) {
@@ -2348,7 +2348,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
       &attrs, reinterpret_cast<const void*>(
                   all_reduce_pull_one_shot<
                       c10::BFloat16, 2, 1, kWaveSize * traits<c10::BFloat16>::N,
-                      kWaveSize, 1, Quantization::none>));
+                      kWaveSize, 1, Quantization::exact>));
   (void)hipGetLastError();
   HIP_CHECK(hipSetDevice(was));
   if (found != hipSuccess) return Error::device_not_built;
@@ -2838,7 +2838,7 @@ constexpr Op kOps[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce),
      kBuild.supports.dtypes,
      {},
-     false},
+     true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_rms_norm),
      kBuild.supports.dtypes, kNormWeights, true},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_add_rms_norm),
@@ -2914,12 +2914,12 @@ inline std::optional<Template> template_named(std::string_view name) {
 
 // THE FORCED CONFIG of op `o`: template `fn` (its op's), the grid and the block (x alone, every
 // kernel's one dimension: y and z 1) of whole waves up to the build's maximum, waves a EU the CU
-// holds, the tile positive (tile_k 1 where the kernel has no K), the quantization none or int4.
+// holds, the tile positive (tile_k 1 where the kernel has no K), the quantization exact or int4.
 inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3 block,
                                           int waves_per_eu, int tile_m, int tile_n, int tile_k,
                                           int quantization) {
   if (op_of(fn) != o) return Error::no_such_template;
-  if (quantization != Quantization::none && quantization != Quantization::int4)
+  if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
   if (!x_alone(block) || !x_alone(grid) || block.x < kWaveSize ||
       block.x > kBuild.kernels.max_threads || block.x % kWaveSize != 0 || grid.x < 1 ||
@@ -3494,25 +3494,21 @@ inline std::variant<Config, Error> all_reduce_config(
                 n = input_size_n;  // the problem's shape: the input's
   const int world = h.world_size();
   const Template fn = k.fn;
-  KernelConfig c = k.config;
+  const KernelConfig& c = k.config;
   const AllReduceBuildConfig& a = std::get<AllReduceBuildConfig>(c.build);
   // IN PLACE: the exact pull, every rank's input read where its table says.
   const bool in_place = direction_of(fn) == Direction::pull &&
-                        a.quantization == Quantization::none;
+                        a.quantization == Quantization::exact;
   // THE LINES: the pushed one-shot pushes into its own inbox (handle.cuh's LINES), a tile a
-  // block a pass, nothing staged. ITS GRID, a rule on the launch as the other ops' cut: at most
-  // its tiles (a wider grid is idle blocks) and the lines' blocks (each block its own slots).
+  // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
+  // lines' blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
+  // epoch as it was.
   const bool lines = fn == Template::all_reduce_push_one_shot;
-  if (lines) {
-    const int64_t tiles = (m + a.tile_m - 1) / a.tile_m * ((n + a.tile_n - 1) / a.tile_n);
-    int& blocks = c.launch.grid.x;  // the LL push indexes x alone
-    if (tiles < blocks) blocks = static_cast<int>(tiles > 0 ? tiles : 1);
-    if (blocks > kLineBlocks) blocks = kLineBlocks;
-  }
+  if (lines && volume(c.launch.grid) > kLineBlocks) return Error::launch_out_of_range;
   // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
   // the whole input). INT4 pushes its input's shares quantized, whole,
   // instead.
-  const bool in_passes = a.quantization == Quantization::none;
+  const bool in_passes = a.quantization == Quantization::exact;
   // THE BAND: the rows a pass, what the inbox (the inputs region) holds in
   // WORLD slots. The one-shot's slot is the band's rows, [WORLD * band, n];
   // the two-shot's is one rank's share of the band (the flat walk's, whole
@@ -3606,7 +3602,7 @@ inline std::variant<Config, Error> all_reduce_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
-      config.quantization == Quantization::none;
+      config.quantization == Quantization::exact;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
   config.tail = config.quantization == Quantization::int4 && int4_tail(fn, m, n, world);
   const void* kernel = nullptr;
@@ -3674,7 +3670,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
-      config.quantization == Quantization::none;
+      config.quantization == Quantization::exact;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   config.chunked = n > config.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
@@ -3720,7 +3716,7 @@ all_reduce_add_rms_norm_config(
   // row (partials_need); the INT4 build's rows are the row alone, its scales in
   // the scales region.
   const bool scale_slot = fn == Template::all_reduce_pull_two_shot_add_rms_norm &&
-                          r.quantization == Quantization::none;
+                          r.quantization == Quantization::exact;
   const int64_t slot = scale_slot ? kScaleSlotPacks * kBuild.memory.pack_bytes / elem_bytes(dtype) : 0;
   const int64_t partials_stride_m = payload_row(fn, r.quantization, n) + slot;
   const int64_t partials_rows =
@@ -3759,7 +3755,7 @@ all_reduce_add_rms_norm_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
-      config.quantization == Quantization::none;
+      config.quantization == Quantization::exact;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   config.chunked = n > config.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
@@ -3850,7 +3846,7 @@ all_reduce_add_attn_res_rms_norm_config(
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
   config.in_place = config.direction == Direction::pull &&
-      config.quantization == Quantization::none;
+      config.quantization == Quantization::exact;
   // A ROW WIDER THAN THE TILE runs the build's CHUNKED instance.
   config.chunked = n > config.tile_n;
   // AN INT4 ROW WITH A TAIL runs the build's TAIL instance (int4_tail).
@@ -4185,7 +4181,7 @@ inline std::variant<Config, Error> all_reduce_rms_norm(
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_rms_norm, kernel_pointer<C>(), input_size_m, input_size_n,
         dtype, stream);
-    const InputTable t = config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::exact
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
@@ -4299,7 +4295,7 @@ inline std::variant<Config, Error> all_reduce_add_rms_norm(
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_add_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
-    const InputTable t = config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::exact
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);
@@ -4469,7 +4465,7 @@ all_reduce_add_attn_res_rms_norm(
     using W = typename of_dtype<C.weight_dtype>::t;
     h.begin_launch(OpType::all_reduce_add_attn_res_rms_norm, kernel_pointer<C>(), input_size_m,
         input_size_n, dtype, stream);
-    const InputTable t = config.quantization != Quantization::none
+    const InputTable t = config.quantization != Quantization::exact
         ? InputTable{nullptr, 0, config.staging_stride_m, config.staging_stride_n}
         : h.input_table(input, input_stride_m, input_size_m, input_size_n, elem_bytes(dtype),
             stream);

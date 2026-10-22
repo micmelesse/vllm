@@ -128,8 +128,8 @@ hip_custom_communicator::DType dtype_of(const torch::Tensor& t) {
 // THE CONFIG ACROSS THE BOUNDARY, every field required (optionality is Python's): a name to its
 // enum (another name is the caller's mistake, raised), and a field narrowed to an int.
 int quantization_from(const std::string& s) {
-  if (s == "none") return hip_custom_communicator::Quantization::none;
-  TORCH_CHECK(s == "int4", "hip_custom_communicator: quantization is none or int4");
+  if (s == "exact") return hip_custom_communicator::Quantization::exact;
+  TORCH_CHECK(s == "int4", "hip_custom_communicator: quantization is exact or int4");
   return hip_custom_communicator::Quantization::int4;
 }
 int narrowed(int64_t v) {
@@ -181,34 +181,15 @@ using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
                Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
                Names, std::vector<int64_t>>;
-// AN OP'S ANSWER, primitive ints: [the Error's number it was refused for, or -1
-// when it ran; then, when it ran, WHAT RAN, for the flight recorder: its template
-// (build_info's index), then its config point in the essential order: grid x, y,
-// z, block x, y, z, waves_per_eu, tile_m, tile_n, tile_k (1 where the kernel has
-// no K), quantization (common.cuh's Quantization)].
-using Answer = std::vector<int64_t>;
-Answer refusal(hip_custom_communicator::Error e) {
-  return {static_cast<int64_t>(e)};
-}
+// AN OP'S ANSWER: -1 when it ran, else the Error's number it was refused for. What
+// ran is what Python passed: C++ runs the config it is given, or refuses it.
+using Answer = int64_t;
+Answer refusal(hip_custom_communicator::Error e) { return static_cast<int64_t>(e); }
 Answer answer(const std::variant<hip_custom_communicator::Config,
-                                 hip_custom_communicator::Error>& got,
-              hip_custom_communicator::Template fn) {
+                                 hip_custom_communicator::Error>& got) {
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&got))
     return refusal(*e);
-  const auto& config = std::get<hip_custom_communicator::Config>(got);
-  return {-1,
-          static_cast<int64_t>(fn),
-          config.grid.x,
-          config.grid.y,
-          config.grid.z,
-          config.block.x,
-          config.block.y,
-          config.block.z,
-          config.waves_per_eu,
-          config.tile_m,
-          config.tile_n,
-          config.tile_k,
-          static_cast<int64_t>(config.quantization)};
+  return -1;
 }
 
 // THE COMMUNICATOR OPENED on `device` over the process groups named `cpu_group`
@@ -532,7 +513,7 @@ Answer all_reduce_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& o
       output_rows->size(0), output_rows->size(1), dtype_of(input),
       std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -596,7 +577,7 @@ Answer all_reduce_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::
       output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -630,7 +611,7 @@ Answer all_reduce_add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, tor
       residual_output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -759,7 +740,7 @@ Answer all_reduce_add_attn_res_rms_norm_with(fptr_t handle_ptr, torch::Tensor& i
       static_cast<float>(eps), static_cast<float>(output_eps),
       std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -793,7 +774,7 @@ Answer rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& wei
       output.size(0), output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -828,7 +809,7 @@ Answer add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor&
       residual_output.size(1), dtype_of(input), dtype_of(weight),
       static_cast<float>(eps), std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 
@@ -879,7 +860,7 @@ Answer add_attn_res_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input,
       static_cast<float>(eps), static_cast<float>(output_eps),
       std::get<hip_custom_communicator::Chosen>(k),
       current_stream());
-  return answer(got, std::get<hip_custom_communicator::Chosen>(k).fn);
+  return answer(got);
 }
 }  // namespace
 

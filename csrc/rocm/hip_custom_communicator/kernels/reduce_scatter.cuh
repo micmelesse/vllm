@@ -143,7 +143,7 @@ DINLINE void reduce_scatter(
       if (TAIL ? len != 0 : len / kInt4Group != 0)  // a late rank's empty share (wave-uniform)
         for (int g0 = g_first; g0 < g_end; g0 += kRankLanes) {
           DTYPE x[1][kInt4GroupPacks][kPackElems];
-          load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
+          load<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::exact, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
               input_size_n, input_size_m, len, x, offs_m, g0 * kInt4Group, 1);
           // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
@@ -210,10 +210,10 @@ DINLINE void reduce_scatter(
           const int len = share_len(r);
           if (len == 0) continue;
           DTYPE part[1][kPacks][kPackElems];
-          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
+          load<WORLD, 1, THREADS_PER_BLOCK, Quantization::exact, kInput, TAIL>(
               &input_ptr, 1, 0, r, slice, input_stride_m, input_stride_n, WORLD, input_size_m,
               input_size_n, input_size_m, len, part, offs_m, chunk * TILE_N, 1);
-          send<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::run>(
+          send<WORLD, 1, THREADS_PER_BLOCK, Quantization::exact, Layout::run>(
               part, staging_ptr_array, staging_ptr_array_size, r, rank, staging_stride_m,
               staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, len, 0,
               chunk * TILE_N, 1);
@@ -239,18 +239,18 @@ DINLINE void reduce_scatter(
         for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
           DTYPE got[1][kPacks][kPackElems];
           if constexpr (DIRECTION == Direction::push)
-            load<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, Layout::run>(
+            load<WORLD, 1, THREADS_PER_BLOCK, Quantization::exact, Layout::run>(
                 staging_ptr_array, staging_ptr_array_size, rank, w, staging_stride_m,
                 staging_stride_m, staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, len,
                 got, 0, chunk * TILE_N, 1);
           else
-            recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kInput, TAIL>(
+            recv<WORLD, 1, THREADS_PER_BLOCK, Quantization::exact, kInput, TAIL>(
                 &input_entry, 1, 0, rank, slice, input_ptr_array_stride_m,
                 input_ptr_array_stride_n, WORLD, input_size_m, input_size_n, input_size_m, len, got,
                 offs_m, chunk * TILE_N, 1);
           DTYPE rounded[1][kPacks][kPackElems];
           reduce<WORLD, THREADS_PER_BLOCK, ReduceAxis::m>(got[0], rounded[0]);
-          store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0,
+          store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::exact, Layout::tile>(rounded, &partials_entry, 1, 0, 0, 0,
                                    0, 1, 1, 1, len, 1, len, 0, chunk * TILE_N, 1);
         }
       }
@@ -286,7 +286,7 @@ DINLINE void reduce_scatter(
           DTYPE x[kTiles][TILE_M][1][kPackElems];
 #pragma unroll
           for (int s = 0; s < kTiles; ++s)
-            load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
+            load<WORLD, TILE_M, THREADS_PER_BLOCK, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1,
                              input_size_m, input_size_n, input_size_m, input_size_n, x[s],
                              (t + s * static_cast<int>(gridDim.x)) * TILE_M, c, 1);
 #pragma unroll
@@ -314,7 +314,7 @@ DINLINE void reduce_scatter(
             const int r = (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
             DTYPE got[1][1][kPackElems];
             if constexpr (!kInt4)
-              recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
+              recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::exact, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, end, got, row, c, 0);
             else
               recv<WORLD, WORLD, THREADS_PER_BLOCK, QUANTIZATION, Layout::tile, TAIL>(staging_ptr_array, staging_ptr_array_size, r, 0, 0, staging_stride_m, staging_stride_n, 1, staging_size_m, staging_size_n, input_size_m, end, got, row, c, 0);
             // 3. Summed over the rows (the ranks), in row order, through LDS, rounded once.
@@ -341,7 +341,7 @@ DINLINE void reduce_scatter(
             if constexpr (!kInt4) {
               DTYPE peers[WORLD][1][1][kPackElems];
               for (int r = 0; r < WORLD; ++r)
-                recv<WORLD, kThreadsM, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, offs_n + size_n, peers[r], row, c, static_cast<int>(gridDim.x));
+                recv<WORLD, kThreadsM, THREADS_PER_BLOCK, Quantization::exact, Layout::tile>(input_ptr_array, input_ptr_array_size, r, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, offs_n + size_n, peers[r], row, c, static_cast<int>(gridDim.x));
               // Summed in rank order in fp32, so every rank's sum agrees bitwise, rounded once.
 #pragma unroll
               for (int j = 0; j < kPackElems; ++j) {

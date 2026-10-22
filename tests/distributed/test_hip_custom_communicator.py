@@ -43,17 +43,15 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Op,
     Open,
     Quantization,
-    Ran,
-    Refused,
     Supported,
     TunedTable,
     Where,
     abandon_open,
     build_info,
+    check_table,
     last_log,
     open_handle,
     supported,
-    tuned_table,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.platforms import current_platform
@@ -225,7 +223,7 @@ def _rank_main(
                 # VLLM_ROCM_HIP_CUSTOM_COMMUNICATOR_QUANTIZATION=INT4, and a call past
                 # the crossover would then be checked, lossy, against the exact
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
-                quantization="none",
+                quantization="exact",
                 table=table,
             )
         _COMM = comm
@@ -531,7 +529,7 @@ def _should(comm: HipCustomCommunicator, op: Op, x: torch.Tensor, args: Args) ->
 
 
 def _forced(
-    template: str, cols: int = 0, quantization: Quantization = "none"
+    template: str, cols: int = 0, quantization: Quantization = "exact"
 ) -> Forced | None:
     """`template` forced whole: the kernel by its name, its first build moving
     `quantization` whose tile holds `cols` columns, and a fixed grid. None when no
@@ -550,11 +548,16 @@ def _forced(
 
 
 def _forced_whole(
-    template: str, cols: int = 0, quantization: Quantization = "none"
+    template: str, cols: int = 0, quantization: Quantization = "exact"
 ) -> Forced:
     forced = _forced(template, cols, quantization)
     assert forced is not None, f"{template} has no {quantization} build for {cols}"
     return forced
+
+
+def _error_of(e: RuntimeError) -> Error:
+    """THE ERROR a refusal names: its message's first word."""
+    return Error[str(e).split(":")[0]]
 
 
 def _templates(op: Op) -> list[str]:
@@ -641,7 +644,7 @@ def _eager(
         assert _should(comm, op, x, args), f"{where}: not admitted"
     try:
         got = _call(comm, op, x, args.clone(), forced)
-    except Refused as no:
+    except RuntimeError as no:
         assert forced, f"{where}: a plain call was refused: {no}"
         _assert_clean(comm, where)
         return False
@@ -938,26 +941,22 @@ def _int4_case(
             ("blocks", got_blocks, want_blocks, INT4_LANDED_TOLERANCE),
         ]
     _assert_clean(comm, where)
-    ran = comm._calls[-1].ran
-    assert ran is not None and ran.quantization == "int4", f"{where}: ran {ran}"
-    assert "_two_shot" in ran.kernel, f"{where}: ran {ran}"
     for name, a, b, tolerance in checks:
         _int4_verdict(f"{where} {name}", a, b, tolerance)
 
 
 def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
     """A call that does not ask for INT4 moves the input as it is: a plain call on
-    a communicator whose quantization is none (the default), and a forced
-    two-shot whose forcing leaves its quantization out."""
+    a communicator whose quantization is exact (the default), whose table's pick moves
+    nothing quantized, and a forced exact two-shot."""
     forced = _forced_whole("all_reduce_pull_two_shot")
-    del forced["quantization"]
+    ((*_, quantization),) = comm.tuned("all_reduce", 2048, HIDDEN)
+    assert quantization == "exact" and forced["quantization"] == "exact"
     for name, forcing in (("plain", {}), ("forced", forced)):
         x = _randn((2048, HIDDEN), torch.bfloat16, 77 * WORLD_SIZE + rank)
         summed = _sum(x, comm)
         got = comm.all_reduce(x, **forcing)
         _assert_clean(comm, name)
-        ran = comm._calls[-1].ran
-        assert ran is not None and ran.quantization == "none", f"{name}: ran {ran}"
         _assert_close(name, [got], [summed], [_tolerance(x.dtype, normed=False)])
 
 
@@ -995,8 +994,8 @@ def _refused(
     try:
         call()
         error = None
-    except Refused as no:
-        error = no.error
+    except RuntimeError as no:
+        error = _error_of(no)
     _assert_clean(comm, where)
     _eager(comm, rank, "all_reduce", 16, HIDDEN, torch.bfloat16, {}, None, 99)
     return error
@@ -1039,7 +1038,7 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     assert error is Error.weight_not_built, error
 
     # Out of capacity: one row wider than the staging, which no pass holds.
-    wide = torch.ones(comm.capacity.staging_bytes, dtype=bf16, device=comm.device)
+    wide = torch.ones((1, comm.capacity.staging_bytes), dtype=bf16, device=comm.device)
     for shot in ("all_reduce_pull_one_shot", "all_reduce_pull_two_shot"):
         forced = _forced_whole(shot)
         error = _refused(comm, rank, shot, partial(comm.all_reduce, wide, **forced))
@@ -1053,9 +1052,9 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     summed = _sum(big, comm)
     try:
         got = _call(comm, op, big, args.clone(), {})
-    except Refused as no:
+    except RuntimeError as no:
         assert not admitted, f"an admitted call was refused: {no}"
-        assert no.error in (Error.partials_too_small, Error.inputs_too_small), no
+        assert _error_of(no) in (Error.partials_too_small, Error.inputs_too_small), no
     else:
         _assert_close("past the box", got, *_reference(op, summed, args))
     _assert_clean(comm, "past the box")
@@ -1139,7 +1138,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
                 name,
                 b,
             )
-        exact = [b for b in t.builds if b["quantization"] == "none"]
+        exact = [b for b in t.builds if b["quantization"] == "exact"]
         int4 = [b for b in t.builds if b["quantization"] == "int4"]
         assert exact, name
         if name.startswith("all_reduce_pull_two_shot_") and int4:
@@ -1150,7 +1149,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         elif name == "all_reduce_pull_two_shot":
             assert not int4, name
         elif "two_shot" in name:
-            assert [b | {"quantization": "none"} for b in int4] == exact, name
+            assert [b | {"quantization": "exact"} for b in int4] == exact, name
         else:
             assert not int4, name
 
@@ -1163,33 +1162,39 @@ def test_the_tuned_table_is_the_arch_file() -> None:
     import vllm._rocm_C  # noqa: F401
 
     raw = json.loads(_TABLE.read_text())
-    table = tuned_table(raw, "gfx950")
-    assert not isinstance(table, str), table
-    assert set(table) == set(TUNED_OPS)
+    assert check_table(raw, "gfx950") is None
+    assert set(raw) == set(TUNED_OPS)
     built = build_info()
-    for op, t in table.items():
-        assert t.inputs and t.configs, op
-        for p in t.inputs:
-            ops = tuple(built.templates[f[0]].op for f in p.configs)
+    for op, t in raw.items():
+        configs = t["configs"]["gfx950"]
+        assert t["inputs"] and configs, op
+        for p in t["inputs"]:
+            ops = tuple(
+                built.templates[configs[j]["kernel"]].op for j in p["config"]["gfx950"]
+            )
             assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, p)
-    assert any(len(p.configs) == 2 for t in table.values() for p in t.inputs)
-    assert isinstance(tuned_table(raw, "gfx0"), str)
+    assert any(
+        len(p["config"]["gfx950"]) == 2 for t in raw.values() for p in t["inputs"]
+    )
+    assert isinstance(check_table(raw, "gfx0"), str)
     # AN UNSOUND TABLE, named: a build its kernel does not list, an exact input moving
     # INT4.
     bad = copy.deepcopy(raw)
     bad["all_reduce"]["configs"]["gfx950"][0]["tile_n"] = 100
-    with pytest.raises(ValueError, match="all_reduce.configs.gfx950.0.*build"):
-        tuned_table(bad, "gfx950")
+    with pytest.raises(ValueError, match="all_reduce.configs.gfx950.0.*no build"):
+        check_table(bad, "gfx950")
     bad = copy.deepcopy(raw)
-    (exact,) = [p for p in bad["all_reduce"]["inputs"] if p["mode"] == "exact"][:1]
+    (exact,) = [p for p in bad["all_reduce"]["inputs"] if p["quantization"] == "exact"][
+        :1
+    ]
     int4 = next(
         i
         for i, c in enumerate(bad["all_reduce"]["configs"]["gfx950"])
         if c["quantization"] == "int4"
     )
     exact["config"]["gfx950"] = [int4]
-    with pytest.raises(ValueError, match="exact table moves INT4"):
-        tuned_table(bad, "gfx950")
+    with pytest.raises(ValueError, match="an exact input moves INT4"):
+        check_table(bad, "gfx950")
 
 
 # THE HANDED-IN TABLE'S ONE INPUT: the plain all-reduce at the hidden row, a decode
@@ -1198,7 +1203,7 @@ _HANDED_TOKENS = 8
 
 
 def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
-    """THE FILE'S TABLE WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED: the exact mode at
+    """THE FILE'S TABLE WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED: the exact inputs at
     WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file does not
     run there (the file's 1-token pick at that width, a config it already runs on
     this world); every other input kept, as the check wants an input at every built
@@ -1210,7 +1215,7 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
         ((index,),) = [
             p["config"][arch]
             for p in entry["inputs"]
-            if (p["mode"], p["world"], p["hidden"], p["tokens"])
+            if (p["quantization"], p["world"], p["hidden"], p["tokens"])
             == ("exact", WORLD_SIZE, HIDDEN, tokens)
         ]
         return index
@@ -1219,7 +1224,7 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
     assert handed != named(_HANDED_TOKENS), "the file runs that config there already"
     table = copy.deepcopy(raw)
     for p in table["all_reduce"]["inputs"]:
-        if (p["mode"], p["world"], p["hidden"], p["tokens"]) == (
+        if (p["quantization"], p["world"], p["hidden"], p["tokens"]) == (
             "exact",
             WORLD_SIZE,
             HIDDEN,
@@ -1229,21 +1234,15 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
     return table, entry["configs"][arch][handed]
 
 
-def _is_config(ran: Ran | Error | None, config: dict[str, str | int]) -> bool:
-    """`ran` is `config`: every field of its config point."""
-    return isinstance(ran, Ran) and all(getattr(ran, f) == v for f, v in config.items())
-
-
 def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:
     """The communicator's pick at the handed-in input is its config, and a plain call
-    there runs exactly it."""
-    want = json.loads(config)
+    there runs."""
+    want = tuple(json.loads(config).values())
     rows, bf16 = _HANDED_TOKENS, torch.bfloat16
-    (got,) = comm.tuned("all_reduce", rows, HIDDEN, bf16)
-    assert _is_config(got, want), f"rank {rank}: tuned {got}, the table names {want}"
+    (got,) = comm.tuned("all_reduce", rows, HIDDEN)
+    assert got == want, f"rank {rank}: tuned {got}, the table names {want}"
     comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
-    ran = comm._calls[-1].ran
-    assert ran == got, f"rank {rank}: ran {ran}, tuned {got}"
+    _assert_clean(comm, "the handed-in table")
 
 
 @on_eight_gpus
@@ -1284,10 +1283,10 @@ def test_supported_is_the_builds_answer(size: int) -> None:
 @pytest.mark.parametrize(
     ("variable", "given", "want"),
     [
-        ("NONE", None, "none"),
+        ("NONE", None, "exact"),
         ("INT4", None, "int4"),
         ("NONE", "int4", "int4"),
-        ("INT4", "none", "none"),
+        ("INT4", "exact", "exact"),
     ],
 )
 def test_quantization_is_the_given_else_the_environments(

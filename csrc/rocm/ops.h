@@ -119,9 +119,9 @@ hip_custom_communicator_build_info();
 // tuned table): its config point last in the essential order (the kernel by name, the grid, the
 // block and its waves a EU, the tile, the quantization "none" or "int4"). The norms on rows are
 // the second kernel of an op Python composes after our all-reduce. Each returns the Error's
-// number it was refused for, or -1 and what ran (hip_custom_communicator.cu's Answer).
+// number it was refused for, or -1 when it ran (hip_custom_communicator.cu's Answer).
 
-std::vector<int64_t> hip_custom_communicator_all_reduce(
+int64_t hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& output,
     const std::string& kernel,
@@ -136,7 +136,7 @@ std::vector<int64_t> hip_custom_communicator_all_reduce(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
+int64_t hip_custom_communicator_all_reduce_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& weight,
     torch::Tensor& output,
@@ -153,7 +153,7 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_rms_norm(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
+int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& residual,
     torch::Tensor& weight,
@@ -172,7 +172,7 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_rms_norm(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
+int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
     torch::Tensor& blocks,
@@ -197,7 +197,7 @@ std::vector<int64_t> hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_rms_norm(
+int64_t hip_custom_communicator_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& weight,
     torch::Tensor& output,
@@ -214,7 +214,7 @@ std::vector<int64_t> hip_custom_communicator_rms_norm(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_add_rms_norm(
+int64_t hip_custom_communicator_add_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& residual,
     torch::Tensor& weight,
@@ -233,7 +233,7 @@ std::vector<int64_t> hip_custom_communicator_add_rms_norm(
     int64_t tile_n,
     int64_t tile_k,
     const std::string& quantization);
-std::vector<int64_t> hip_custom_communicator_add_attn_res_rms_norm(
+int64_t hip_custom_communicator_add_attn_res_rms_norm(
     fptr_t handle_ptr, torch::Tensor& input,
     const std::optional<torch::Tensor>& prefix,
     torch::Tensor& blocks,

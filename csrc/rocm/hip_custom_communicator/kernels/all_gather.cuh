@@ -74,7 +74,7 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
 #pragma unroll
         for (int k = 0; k < kInt4GroupPacks; ++k)
           dequantize(words[0][k][0], __builtin_bit_cast(float, words[0][k][1]), x[0][k]);
-        store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, kOutput, TAIL>(
+        store<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::exact, kOutput, TAIL>(
             x, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
             output_size_m, output_size_n, 1, end, 0, g0 * kInt4Group, 1);
       }
@@ -92,10 +92,10 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, a row of threads a rank, in one round trip.
-        recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::none, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
+        recv<WORLD, WORLD, THREADS_PER_BLOCK, Quantization::exact, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
                        slice, got, 0, chunk * TILE_N, 0);
         // 2. Stored where rank r's share goes, its first `len` elements.
-        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::none, kOutput, TAIL>(
+        store<WORLD, 1, THREADS_PER_BLOCK, Quantization::exact, kOutput, TAIL>(
             got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
             output_size_m, output_size_n, 1, share_len(r), 0, chunk * TILE_N, 1);
       }
