@@ -122,7 +122,21 @@
         {"kernel": "all_reduce_push_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
         {"kernel": "all_reduce_push_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 128, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 1024, "tile_k": 1, "quantization": "exact"},
         {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 1024, "tile_k": 1, "quantization": "exact"},
-        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 2048, "tile_k": 1, "quantization": "exact"}
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 2048, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 2, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 3, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 1024, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 1024, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_one_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 1024, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 128, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 1024, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 2048, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 128, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 1024, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 2048, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 64, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 512, "tile_k": 1, "quantization": "int4"},
+        {"kernel": "all_reduce_push_two_shot", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 1024, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 2048, "tile_k": 1, "quantization": "int4"}
       ]
     }
   },
