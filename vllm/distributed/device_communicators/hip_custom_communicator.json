@@ -280,7 +280,8 @@
         {"kernel": "all_reduce_push_two_shot_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "int4"},
         {"kernel": "all_reduce_push_two_shot_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 16384, "tile_k": 1, "quantization": "int4"},
         {"kernel": "rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 4096, "tile_k": 1, "quantization": "exact"},
-        {"kernel": "rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"}
+        {"kernel": "rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 128, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "int4"}
       ]
     }
   },
@@ -438,7 +439,8 @@
         {"kernel": "all_reduce_push_two_shot_add_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "int4"},
         {"kernel": "all_reduce_push_two_shot_add_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 16384, "tile_k": 1, "quantization": "int4"},
         {"kernel": "add_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 4096, "tile_k": 1, "quantization": "exact"},
-        {"kernel": "add_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"}
+        {"kernel": "add_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot_add_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 128, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "int4"}
       ]
     }
   },
@@ -606,7 +608,8 @@
         {"kernel": "add_attn_res_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 2, "tile_n": 4096, "tile_k": 1, "quantization": "exact"},
         {"kernel": "add_attn_res_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 2, "quantization": "exact"},
         {"kernel": "add_attn_res_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 256, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 3, "quantization": "exact"},
-        {"kernel": "add_attn_res_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"}
+        {"kernel": "add_attn_res_rms_norm_rows", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 512, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "exact"},
+        {"kernel": "all_reduce_pull_two_shot_add_attn_res_rms_norm", "grid_x": 16, "grid_y": 1, "grid_z": 1, "block_x": 128, "block_y": 1, "block_z": 1, "waves_per_eu": 1, "tile_m": 1, "tile_n": 8192, "tile_k": 1, "quantization": "int4"}
       ]
     }
   }

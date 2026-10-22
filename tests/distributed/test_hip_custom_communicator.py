@@ -795,7 +795,7 @@ def _int4_sum(terms: Sequence[torch.Tensor], owner: torch.Tensor) -> torch.Tenso
 
 def _int4_owner(op: Op, template: str, shape: tuple[int, int]) -> torch.Tensor:
     """Which rank sums each element: the plain two-shot's flat share, the AttnRes
-    pull's row slice (its INT4 build a group a thread, each owner's rows summed from
+    pull's row slice (its INT4 build whole groups a thread, each owner's rows summed from
     its inbox), or rank order (the push kernels and the pull norms)."""
     rows, hidden = shape
     if op == "all_reduce":
@@ -1117,8 +1117,9 @@ def test_python_names_match_the_build() -> None:
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template names one of the ops and lists builds, each with a tile and no
     launch; a two-shot lists each exact build again moving INT4, but the pulls with a
-    row a block (the norms and AttnRes), whose INT4 builds are a group a thread:
-    TILE_N / 32 threads, one row high; a norm on rows moves nothing (no peer)."""
+    row a block (the norms and AttnRes), whose INT4 builds are whole groups a thread:
+    TILE_N a multiple of 32 * THREADS, one row high; a norm on rows moves nothing (no
+    peer)."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
@@ -1143,7 +1144,7 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         assert exact, name
         if name.startswith("all_reduce_pull_two_shot_") and int4:
             assert all(
-                b["block_x"] * INT4_GROUP == b["tile_n"] and b["tile_m"] == 1
+                b["tile_n"] % (b["block_x"] * INT4_GROUP) == 0 and b["tile_m"] == 1
                 for b in int4
             ), name
         elif name == "all_reduce_pull_two_shot":

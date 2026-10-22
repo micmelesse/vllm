@@ -2373,7 +2373,7 @@ inline std::variant<Supported, Error> supported(int device, int world) {
 namespace hip_custom_communicator {
 
 // AN INT4 ROW WITH A TAIL, the INT4 two-shots' TAIL instance: the flat walk (the plain push
-// two-shot) where the band is not whole groups; a group-a-thread pulled norm where a row is not;
+// two-shot) where the band is not whole groups; a groups-a-thread pulled norm where a row is not;
 // a column two-shot where a row is not whole groups for every rank.
 constexpr bool int4_tail(Template k, int64_t m, int64_t n, int world) {
   if (k == Template::all_reduce_push_two_shot) return m * n % kInt4Group != 0;
@@ -2437,8 +2437,8 @@ constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / el
 //
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
 // against 81.0 and 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
-// INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32 threads
-// (kRmsNormInt4Kernels).
+// INT4 WHOLE GROUPS A THREAD (the kernel's INT4 body): a block a row's chunk of TILE_N columns,
+// TILE_N / (32 * THREADS) groups a thread (a multiple of 32 * THREADS, any block).
 //
 // Not swept: rms_norm's.
 //
@@ -2447,7 +2447,7 @@ constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / el
 //
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us
 // at 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
-// INT4 a group a thread, as rms_norm's.
+// INT4 whole groups a thread, as rms_norm's.
 //
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got
 // slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096 tokens, with 100 ->
@@ -2688,24 +2688,25 @@ constexpr bool push_one_shot_tiles_fit() {
 static_assert(push_one_shot_tiles_fit(),
               "a pushed one-shot tile wider than its unfenced slot");
 
-// THE PULLED NORMS' INT4 IS A GROUP A THREAD (their INT4 body, all_reduce_add_rms_norm.cuh):
-// TILE_N / 32 threads, a block one row's groups.
-constexpr bool int4_group_a_thread(Template k) {
+// THE PULLED NORMS' INT4 IS WHOLE GROUPS A THREAD, A ROW SLICE A RANK (their INT4 body,
+// all_reduce_add_rms_norm.cuh): a block a row, TILE_N / (32 * THREADS) groups a thread; the tile
+// does not size the payload (a row's whole groups, below), so any build of theirs sizes alike.
+constexpr bool int4_groups_a_thread(Template k) {
   return k == Template::all_reduce_pull_two_shot_rms_norm ||
          k == Template::all_reduce_pull_two_shot_add_rms_norm ||
          k == Template::all_reduce_pull_two_shot_add_attn_res_rms_norm;
 }
-// A ROW OF THE STAGING AND PARTIALS AS A KERNEL VIEWS IT: n, or a group-a-thread INT4 norm's
+// A ROW OF THE STAGING AND PARTIALS AS A KERNEL VIEWS IT: n, or a groups-a-thread INT4 norm's
 // payload row, whole groups (its kernels' n_pad: every row's groups start on a group).
 constexpr int64_t payload_row(Template k, int quantization, int64_t n) {
-  return int4_group_a_thread(k) && quantization == Quantization::int4
+  return int4_groups_a_thread(k) && quantization == Quantization::int4
              ? (n + kInt4Group - 1) / kInt4Group * kInt4Group
              : n;
 }
-// THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a group-a-thread
+// THE STAGING'S ROWS AS A KERNEL VIEWS IT: the input's m, or a groups-a-thread
 // INT4 norm's inbox, WORLD slots of an owner's ceil(m / WORLD) rows.
 constexpr int64_t staged_rows(Template k, int quantization, int64_t m, int world) {
-  return int4_group_a_thread(k) && quantization == Quantization::int4
+  return int4_groups_a_thread(k) && quantization == Quantization::int4
              ? world * ((m + world - 1) / world)
              : m;
 }
@@ -2925,9 +2926,9 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
                   h->staging_bytes())
     return Error::staging_too_small;
   const int64_t partials = partials_need(fn, m, packs, world);
-  if (int4 && (flat                       ? int4_payload_bytes(1, share)
-               : int4_group_a_thread(fn) ? int4_payload_bytes((m + world - 1) / world, row)
-                                         : int4_payload_bytes(1, partials / elem_bytes(dtype))) >
+  if (int4 && (flat                        ? int4_payload_bytes(1, share)
+               : int4_groups_a_thread(fn) ? int4_payload_bytes((m + world - 1) / world, row)
+                                          : int4_payload_bytes(1, partials / elem_bytes(dtype))) >
                   h->partials_bytes())
     return Error::partials_too_small;
   if (!in_passes && partials > h->partials_bytes())

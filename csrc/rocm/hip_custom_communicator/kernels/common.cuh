@@ -202,13 +202,15 @@ typedef __attribute__((address_space(1))) __fp16 global_f16;
 //     and a 32-bit byte offset a pack); flat: strided, a pack's row and column divided out
 //     (element_at). Registers U[1][kPacks][kPackElems].
 //   group_run, group_flat: THE INT4 FLAT WALK: the block TILE_M rows of kThreadsN threads (one row,
-//     or WORLD rows a copy each: the caller's rank or slot a lane), A GROUP A THREAD (thread t's group
-//     offs_n / kInt4Group + t % kThreadsN, its kInt4GroupPacks packs consecutive, so a thread
-//     quantizes alone),
+//     or WORLD rows a copy each: the caller's rank or slot a lane), WHOLE GROUPS A THREAD (thread
+//     t's group j offs_n / kInt4Group + t % kThreadsN + j * kThreadsN, its kInt4GroupPacks packs
+//     consecutive, so a thread quantizes alone: register pack k is the row's pack offs_n /
+//     kPackElems + ((k / kInt4GroupPacks) * kThreadsN + t) * kInt4GroupPacks + k % kInt4GroupPacks,
+//     t * kInt4GroupPacks + k at one group a thread),
 //     slots and run / flat as above. An INT4 payload is dense (group_run): an element's word at
 //     element / 2 bytes, its group's scale at element / kInt4Group from the scales' start. Registers
-//     U[1][kInt4GroupPacks][kPackElems] (raw: U[1][kInt4GroupPacks][2]; with a slot dimension,
-//     every slot's).
+//     U[1][G * kInt4GroupPacks][kPackElems], G groups a thread (raw: U[1][G * kInt4GroupPacks][2];
+//     with a slot dimension, every slot's).
 //   line: THE FLAG IN THE LINE (NCCL's LL; aiter's `ar_ll_gfx9` LLPackedMsg): the tile's threads
 //     and places, but the buffer holds every 8 bytes of payload in a 16-byte LINE, (4 bytes of
 //     data, the flag, 4 bytes of data, the flag), stored by one 16-byte store, so a reader that
@@ -558,7 +560,8 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     asm volatile("" ::: "memory");
     __builtin_amdgcn_sched_barrier(0);
   } else if constexpr (kGroup) {
-    static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
+    static_assert(kRows == 1 && kPacks == kInt4GroupPacks,
+                  "a group a thread here: several are load's, recv's, store's and send's loop");
     // A UNIFORM BASE PLUS A 32-BIT BYTE OFFSET, the offset opaque so the address is built at its
     // load (saddr), not hoisted and held as a 64-bit vector address.
     const int g = offs_n / kInt4Group + tid % kThreadsN;
@@ -962,7 +965,8 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
       *(global_u32x4*)(p) = raw;
     }
   } else if constexpr (kGroup) {
-    static_assert(kRows == 1 && kPacks == kInt4GroupPacks, "a group a thread");
+    static_assert(kRows == 1 && kPacks == kInt4GroupPacks,
+                  "a group a thread here: several are load's, recv's, store's and send's loop");
     const int g = offs_n / kInt4Group + tid % kThreadsN;
     if constexpr (QUANTIZATION == Quantization::exact) {
       if constexpr (TAIL) {
@@ -1549,7 +1553,12 @@ DINLINE void dequantize(uint32_t word, float scale, U (&output)[P]) {
 // v_dot2_f32_bf16 IS GFX950'S (dot12-insts), the one arch built (CMakeLists.txt).
 template <typename DTYPE, int SLOTS, int K, int P>
 DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2], float (&sum)[1][K][P]) {
-  const auto scale_of = [&](int w) { return __builtin_bit_cast(float, words[w][0][0][1]); };
+  // Slot w's scale of pack k's group (every pack of a group carries it: its first's read; one
+  // group a thread, pack 0's, the index a constant as it always was).
+  const auto scale_of = [&](int w, int k) {
+    if constexpr (K == kInt4GroupPacks) return __builtin_bit_cast(float, words[w][0][0][1]);
+    else return __builtin_bit_cast(float, words[w][0][k / kInt4GroupPacks * kInt4GroupPacks][1]);
+  };
 #pragma unroll
   for (int k = 0; k < K; ++k) {
 #pragma unroll
@@ -1560,8 +1569,8 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2], float (&sum)[1]
 #pragma unroll
       for (; w + 1 < SLOTS; w += 2) {
         float a[P], b[P];
-        dequantize(words[w][0][k][0], scale_of(w), a);
-        dequantize(words[w + 1][0][k][0], scale_of(w + 1), b);
+        dequantize(words[w][0][k][0], scale_of(w, k), a);
+        dequantize(words[w + 1][0][k][0], scale_of(w + 1, k), b);
 #pragma unroll
         for (int j = 0; j < P; ++j)
           sum[0][k][j] = __builtin_amdgcn_fdot2_f32_bf16(
@@ -1576,7 +1585,7 @@ DINLINE void dequantize(const uint32_t (&words)[SLOTS][1][K][2], float (&sum)[1]
 #pragma unroll
     for (; w < SLOTS; ++w) {
       float a[P];
-      dequantize(words[w][0][k][0], scale_of(w), a);
+      dequantize(words[w][0][k][0], scale_of(w, k), a);
 #pragma unroll
       for (int j = 0; j < P; ++j) sum[0][k][j] += static_cast<float>(static_cast<DTYPE>(a[j]));
 #pragma unroll
@@ -1657,6 +1666,27 @@ DINLINE void quantize(const T (&input)[THREAD_PACKS][P], uint32_t (&words)[THREA
   for (int k = 0; k < THREAD_PACKS; ++k) words[k] = word(x[k], inv);
 }
 
+// QUANTIZE A THREAD'S GROUPS (Layout::group_run's registers, several groups a thread), each by
+// itself (its scale its own 32 values'), into the raw payload send and store take: [0] a pack's
+// word, [1] its group's scale as fp32 bits. (One group a thread, the kernels call the form above
+// directly: through this one the TAIL builds scheduled differently, ISA 2026-10-22.)
+template <typename T, int K, int P>
+DINLINE void quantize(const T (&input)[1][K][P], uint32_t (&payload)[1][K][2]) {
+  static_assert(K % kInt4GroupPacks == 0, "a thread holds whole groups");
+#pragma unroll
+  for (int jg = 0; jg < K / kInt4GroupPacks; ++jg) {
+    uint32_t words[kInt4GroupPacks];
+    float scale;
+    quantize(reinterpret_cast<const T(&)[kInt4GroupPacks][P]>(input[0][jg * kInt4GroupPacks]),
+             words, scale);
+#pragma unroll
+    for (int k = 0; k < kInt4GroupPacks; ++k) {
+      payload[0][jg * kInt4GroupPacks + k][0] = words[k];
+      payload[0][jg * kInt4GroupPacks + k][1] = __builtin_bit_cast(uint32_t, scale);
+    }
+  }
+}
+
 // =================================================================================================
 // LOAD, STORE, SEND AND RECV: A THREAD'S REGISTERS FROM AND TO A BUFFER. load and store touch
 // this rank's own buffers only; send writes into peers' buffers and recv reads from them (SEND AND
@@ -1724,15 +1754,50 @@ DINLINE void load(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
                   uint32_t flag = 0, uint32_t* status_ptr = nullptr,
                   int64_t status_stride_field = 0, int status_size_field = 0,
                   uint64_t timeout_ticks = 0) {
-  // The entries as plain pointers (a kernel's own pointer is __restrict__).
-  const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-  const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
-                                ? entries[0]
-                                : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
-  internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-      input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
-      input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
-      flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
+  // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
+  // thread): a call a group, group j of thread t the row's group offs_n / kInt4Group + t %
+  // kThreadsN + j * kThreadsN, its registers from pack j * kInt4GroupPacks. One group a thread is
+  // the body below as it always was (the same instructions: the loop is not compiled in).
+  constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
+  constexpr int kPacks = std::extent_v<OUTPUT, kSlots ? 2 : 1>;
+  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
+                kPacks != kInt4GroupPacks) {
+    static_assert(kPacks % kInt4GroupPacks == 0, "a thread holds whole groups");
+    constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
+    constexpr int kPackElems = std::extent_v<OUTPUT, kSlots ? 3 : 2>;
+    using U = std::remove_all_extents_t<OUTPUT>;
+    using Group = std::conditional_t<kSlots, U[kCopies][1][kInt4GroupPacks][kPackElems],
+                                     U[1][kInt4GroupPacks][kPackElems]>;
+#pragma unroll
+    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
+      Group group;
+      load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          input_ptr_array, input_ptr_array_size, input_rank, input_slot, input_stride_slot,
+          input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
+          clip_n, group, offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
+          row_step, flag, status_ptr, status_stride_field,
+          status_size_field, timeout_ticks);
+#pragma unroll
+      for (int c = 0; c < kCopies; ++c)
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+          for (int j = 0; j < kPackElems; ++j) {
+            if constexpr (kSlots) output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
+            else output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
+          }
+    }
+  } else {
+    // The entries as plain pointers (a kernel's own pointer is __restrict__).
+    const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    const void* const input = __builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1
+                                  ? entries[0]
+                                  : internal::ptr_array_at(entries, input_ptr_array_size, input_rank);
+    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+        input, input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
+        input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step, input_rank,
+        flag, status_ptr, status_stride_field, status_size_field, timeout_ticks);
+  }
 }
 
 // LOAD, AN ENTRY: entry x_rank of this rank's device array of pointers (a table, written by the
@@ -1755,23 +1820,57 @@ DINLINE void recv(PTR const* input_ptr_array, int input_ptr_array_size, int inpu
                   int input_slot, int64_t input_stride_slot, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_slot, int input_size_m, int input_size_n,
                   int clip_m, int clip_n, OUTPUT& output, int offs_m, int offs_n, int row_step) {
-  const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
-  const int first = __builtin_amdgcn_readfirstlane(input_rank);
-  if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-        entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
-        input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
-        row_step);
-  else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-        internal::ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
-        input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
-        clip_n, output, offs_m, offs_n, row_step);
-  else
-    internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-        internal::lane_ptr_array_at<void, WORLD>(entries, input_ptr_array_size, input_rank),
-        input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
-        input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
+  // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
+  // thread): a call a group, group j of thread t the row's group offs_n / kInt4Group + t %
+  // kThreadsN + j * kThreadsN, its registers from pack j * kInt4GroupPacks. One group a thread is
+  // the body below as it always was (the same instructions: the loop is not compiled in).
+  constexpr bool kSlots = std::rank_v<OUTPUT> == 4;
+  constexpr int kPacks = std::extent_v<OUTPUT, kSlots ? 2 : 1>;
+  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
+                kPacks != kInt4GroupPacks) {
+    static_assert(kPacks % kInt4GroupPacks == 0, "a thread holds whole groups");
+    constexpr int kCopies = kSlots ? std::extent_v<OUTPUT, 0> : 1;
+    constexpr int kPackElems = std::extent_v<OUTPUT, kSlots ? 3 : 2>;
+    using U = std::remove_all_extents_t<OUTPUT>;
+    using Group = std::conditional_t<kSlots, U[kCopies][1][kInt4GroupPacks][kPackElems],
+                                     U[1][kInt4GroupPacks][kPackElems]>;
+#pragma unroll
+    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
+      Group group;
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          input_ptr_array, input_ptr_array_size, input_rank, input_slot, input_stride_slot,
+          input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
+          clip_n, group, offs_m, offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group,
+          row_step);
+#pragma unroll
+      for (int c = 0; c < kCopies; ++c)
+#pragma unroll
+        for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+          for (int j = 0; j < kPackElems; ++j) {
+            if constexpr (kSlots) output[c][0][jg * kInt4GroupPacks + k][j] = group[c][0][k][j];
+            else output[0][jg * kInt4GroupPacks + k][j] = group[0][k][j];
+          }
+    }
+  } else {
+    const auto* const entries = (decltype(+input_ptr_array[0]) const*)input_ptr_array;
+    const int first = __builtin_amdgcn_readfirstlane(input_rank);
+    if (__builtin_constant_p(input_ptr_array_size) && input_ptr_array_size == 1)
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          entries[0], input_slot, input_stride_slot, input_stride_m, input_stride_n,
+          input_size_slot, input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n,
+          row_step);
+    else if (__builtin_amdgcn_ballot_w64(input_rank != first) == 0)
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          internal::ptr_array_at(entries, input_ptr_array_size, first), input_slot, input_stride_slot,
+          input_stride_m, input_stride_n, input_size_slot, input_size_m, input_size_n, clip_m,
+          clip_n, output, offs_m, offs_n, row_step);
+    else
+      internal::read_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          internal::lane_ptr_array_at<void, WORLD>(entries, input_ptr_array_size, input_rank),
+          input_slot, input_stride_slot, input_stride_m, input_stride_n, input_size_slot,
+          input_size_m, input_size_n, clip_m, clip_n, output, offs_m, offs_n, row_step);
+  }
 }
 
 // STORE: a thread's registers into this rank's buffer (entry output_rank).
@@ -1782,13 +1881,39 @@ DINLINE void store(const INPUT& input, PTR const* output_ptr_array, int output_p
                    int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
                    int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
                    int offs_n, int row_step) {
-  const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
-  void* const output = __builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1
-                           ? entries[0]
-                           : internal::ptr_array_at(entries, output_ptr_array_size, output_rank);
-  internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-      input, output, output_slot, output_stride_slot, output_stride_m, output_stride_n,
-      output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
+  // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
+  // thread): a call a group, group j of thread t the row's group offs_n / kInt4Group + t %
+  // kThreadsN + j * kThreadsN, its registers from pack j * kInt4GroupPacks. One group a thread is
+  // the body below as it always was (the same instructions: the loop is not compiled in).
+  constexpr int kPacks = std::extent_v<INPUT, 1>;
+  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
+                kPacks != kInt4GroupPacks) {
+    static_assert(std::extent_v<INPUT, 0> == 1 && kPacks % kInt4GroupPacks == 0,
+                  "a thread holds whole groups");
+    constexpr int kPackElems = std::extent_v<INPUT, 2>;
+    using U = std::remove_all_extents_t<INPUT>;
+#pragma unroll
+    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
+      U group[1][kInt4GroupPacks][kPackElems];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < kPackElems; ++j) group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
+      store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          group, output_ptr_array, output_ptr_array_size, output_rank, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
+          output_size_n, clip_m, clip_n, offs_m,
+          offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group, row_step);
+    }
+  } else {
+    const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
+    void* const output = __builtin_constant_p(output_ptr_array_size) && output_ptr_array_size == 1
+                             ? entries[0]
+                             : internal::ptr_array_at(entries, output_ptr_array_size, output_rank);
+    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+        input, output, output_slot, output_stride_slot, output_stride_m, output_stride_n,
+        output_size_slot, output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step);
+  }
 }
 
 // SEND: a thread's registers into rank output_rank's buffer (a peer's, over the fabric; the rank
@@ -1801,19 +1926,45 @@ DINLINE void send(const INPUT& input, PTR const* output_ptr_array, int output_pt
                   int64_t output_stride_m, int64_t output_stride_n, int output_size_slot,
                   int output_size_m, int output_size_n, int clip_m, int clip_n, int offs_m,
                   int offs_n, int row_step, uint32_t flag = 0) {
-  const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
-  const int first = __builtin_amdgcn_readfirstlane(output_rank);
-  if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-        input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
-        output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
-        output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
-  else
-    internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
-        input,
-        internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
-        output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
-        output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
+  // SEVERAL INT4 GROUPS A THREAD (Layout::group_run / group_flat, G * kInt4GroupPacks packs a
+  // thread): a call a group, group j of thread t the row's group offs_n / kInt4Group + t %
+  // kThreadsN + j * kThreadsN, its registers from pack j * kInt4GroupPacks. One group a thread is
+  // the body below as it always was (the same instructions: the loop is not compiled in).
+  constexpr int kPacks = std::extent_v<INPUT, 1>;
+  if constexpr ((LAYOUT == Layout::group_run || LAYOUT == Layout::group_flat) &&
+                kPacks != kInt4GroupPacks) {
+    static_assert(std::extent_v<INPUT, 0> == 1 && kPacks % kInt4GroupPacks == 0,
+                  "a thread holds whole groups");
+    constexpr int kPackElems = std::extent_v<INPUT, 2>;
+    using U = std::remove_all_extents_t<INPUT>;
+#pragma unroll
+    for (int jg = 0; jg < kPacks / kInt4GroupPacks; ++jg) {
+      U group[1][kInt4GroupPacks][kPackElems];
+#pragma unroll
+      for (int k = 0; k < kInt4GroupPacks; ++k)
+#pragma unroll
+        for (int j = 0; j < kPackElems; ++j) group[0][k][j] = input[0][jg * kInt4GroupPacks + k][j];
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          group, output_ptr_array, output_ptr_array_size, output_rank, output_slot,
+          output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
+          output_size_n, clip_m, clip_n, offs_m,
+          offs_n + jg * (THREADS_PER_BLOCK / TILE_M) * kInt4Group, row_step, flag);
+    }
+  } else {
+    const auto* const entries = (decltype(+output_ptr_array[0]) const*)output_ptr_array;
+    const int first = __builtin_amdgcn_readfirstlane(output_rank);
+    if (__builtin_amdgcn_ballot_w64(output_rank != first) == 0)
+      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          input, internal::ptr_array_at(entries, output_ptr_array_size, first), output_slot,
+          output_stride_slot, output_stride_m, output_stride_n, output_size_slot, output_size_m,
+          output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
+    else
+      internal::write_buffer<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, QUANTIZATION, LAYOUT, TAIL>(
+          input,
+          internal::lane_ptr_array_at<void, WORLD>(entries, output_ptr_array_size, output_rank),
+          output_slot, output_stride_slot, output_stride_m, output_stride_n, output_size_slot,
+          output_size_m, output_size_n, clip_m, clip_n, offs_m, offs_n, row_step, flag);
+  }
 }
 
 

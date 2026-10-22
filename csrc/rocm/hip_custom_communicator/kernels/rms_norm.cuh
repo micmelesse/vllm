@@ -25,7 +25,8 @@ enum class NormPart : int { scale = 0, apply = 1, row = 2, wide = 3 };
 // The variance is of `input` before any further rounding. A block's threads call it together
 // (scale's reduce). `layout` is how the thread's packs lie in the row, for the mask of the packs
 // past size_n: Layout::tile (pack k of thread t at t + k * THREADS_PER_BLOCK) or Layout::group_run
-// (a group a thread: its K packs consecutive, at t * K + k); a literal at every call.
+// (whole groups a thread, group j of thread t the row's t + j * THREADS_PER_BLOCK, its
+// kInt4GroupPacks packs consecutive: common.cuh's Layout); a literal at every call.
 template <int THREADS_PER_BLOCK, int WAVE_SIZE, typename W, typename T, int ROWS, int K, int P>
 DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
                       const W (&weight)[1][K][P], T (&output)[ROWS][K][P], float eps,
@@ -45,8 +46,10 @@ DINLINE void rms_norm(const float (&input)[ROWS][K][P], float (&scale)[ROWS],
 #pragma unroll
         for (int j = 0; j < P; ++j) ss_k = fmaf(input[m][k][j], input[m][k][j], ss_k);
         const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
-        const int n = layout == Layout::tile ? offs_n / P + t + k * THREADS_PER_BLOCK
-                                             : offs_n / P + t * K + k;
+        const int n = layout == Layout::tile
+                          ? offs_n / P + t + k * THREADS_PER_BLOCK
+                          : offs_n / P + ((k / kInt4GroupPacks) * THREADS_PER_BLOCK + t) *
+                                             kInt4GroupPacks + k % kInt4GroupPacks;
         ss[0][m] += (n < size_n / P ? 1.0f : 0.0f) * ss_k;
       }
     }

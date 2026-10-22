@@ -116,7 +116,10 @@ def arguments(host: str) -> dict[str, str]:
 
 def lays_out(kernel: str, b: tuple, world: int) -> bool:
     """Whether a plain all-reduce build lays out whole (the host's one_shot_lays_out and
-    two_shot_lays_out, at a 16-bit dtype); every other kernel's builds do."""
+    two_shot_lays_out, at a 16-bit dtype); every other kernel's builds do, but for an INT4
+    pulled norm or AttnRes whose tile is not whole groups a thread (TILE_N a multiple of
+    32 * THREADS), which its kernel's static_assert refuses by name (a thread quantizes
+    whole groups alone)."""
     block, _, _, _, tile_m, tile_n, _, _ = b
     if kernel == "all_reduce_push_one_shot":
         nl = LINE_PAYLOAD_BYTES // 2

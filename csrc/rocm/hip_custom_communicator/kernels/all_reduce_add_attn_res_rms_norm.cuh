@@ -163,10 +163,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION), one body
 // each: none (THE EXACT BUILD, in the kernel) reads every rank's input in
 // place, a column slice a rank; int4 (THE INT4 BUILD, below) pushes it
-// quantized, a group a thread, a row slice a rank.
+// quantized, whole groups a thread, a row slice a rank.
 
-// THE INT4 BUILD, A GROUP A THREAD (TILE_N = kInt4Group * THREADS_PER_BLOCK: a block's threads are
-// one row's groups, thread t group t), the pulled norms' INT4 shape (all_reduce_add_rms_norm.cuh)
+// THE INT4 BUILD, WHOLE GROUPS A THREAD (TILE_N = kGroups * kInt4Group * THREADS_PER_BLOCK: a
+// block's threads are a chunk's groups, thread t groups t, t + THREADS_PER_BLOCK, ..., each its
+// own), the pulled norms' INT4 shape (all_reduce_add_rms_norm.cuh)
 // with AttnRes in place of the norm: the column split's INT4 read a 4-byte word and a 2-byte scale
 // a pack (as many requests as the exact build for a quarter of the bytes) and summed through LDS,
 // 762.5 against exact 643.1 us at 8192 x 7168 (2026-10-16T03-50-18Z).
@@ -177,7 +178,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 //      words (dequantize's slot form), left INT4 in this rank's partials.
 //   3. THE GATHER AND ATTNRES: every owner's rows out of its partials, decoded into DTYPE (the sum
 //      every rank's AttnRes starts from, as the column split's gather lands it), then AttnRes on
-//      each, a group a thread, by every rank (its two outputs are never gathered).
+//      each, its groups a thread, by every rank (its two outputs are never gathered).
 // THE WORK IS UNITS, a row l of the owners of one class (owner % classes), the class's unit
 // u = class * slice_m + l, block u % gridDim.x's in all three phases, so a block reads after a
 // barrier only what its twins wrote before it. classes: the most of 1, 2, 4 .. WORLD with
@@ -230,7 +231,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(TILE_M == 1, "the INT4 build is a row a block");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     static_assert(kPackElems * kInt4GroupPacks == kInt4Group, "a pack is a word of its group");
-    static_assert(TILE_N == kInt4Group * THREADS_PER_BLOCK, "a group a thread: the block one row's groups");
+    // A THREAD LOOPS OVER ITS GROUPS (common.cuh's group_run: group j of thread t is the row's
+    // t + j * THREADS_PER_BLOCK), kGroups of them, so the tile and the block are two fields: one
+    // group a thread is the loop of one, the code it was.
+    constexpr int kGroups = TILE_N / (kInt4Group * THREADS_PER_BLOCK);
+    constexpr int kThreadPacks = kGroups * kInt4GroupPacks;
+    // REAL: a thread quantizes its groups alone (a group's scale is its own 32 values' largest),
+    // so it holds whole groups, the same number in every thread (its registers are compiled); a
+    // tile narrower than a group a thread would leave threads none (a group split over lanes is
+    // another layout, not this body's).
+    static_assert(kGroups >= 1 && kGroups * kInt4Group * THREADS_PER_BLOCK == TILE_N,
+                  "the INT4 tile is whole groups a thread: TILE_N a multiple of 32 * THREADS");
     const int n = input_size_n;
     // A PAYLOAD ROW IS WHOLE GROUPS (its last group's packs past n nobody's), so every row's
     // groups start on a group of its slot.
@@ -255,19 +266,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     // 1. THE PUSH, owners rotated (rank + w), a row of each a step, two owners' rows in flight.
     // Owner r's row l, its groups from column col (a TILE_N chunk: one, unless the row is wider).
     const auto push = [&](int l, int r, int col) {
-      DTYPE x[1][kInt4GroupPacks][kPackElems];
+      DTYPE x[1][kThreadPacks][kPackElems];
       load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::group_run, TAIL>(
           &input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, n,
           input_size_m, n, x, r * slice_m + l, col, 1);
-      // QUANTIZED ONCE, by this thread alone (its group), then sent as the payload.
-      uint32_t words[kInt4GroupPacks];
-      float scale;
-      quantize(x[0], words, scale);
-      uint32_t payload[1][kInt4GroupPacks][2];
+      // QUANTIZED ONCE, by this thread alone (each of its groups), then sent as the payload. One
+      // group as it always was (through quantize's group form the TAIL builds scheduled
+      // differently: ISA 2026-10-22).
+      uint32_t payload[1][kThreadPacks][2];
+      if constexpr (kGroups == 1) {
+        uint32_t words[kInt4GroupPacks];
+        float scale;
+        quantize(x[0], words, scale);
 #pragma unroll
-      for (int k = 0; k < kInt4GroupPacks; ++k) {
-        payload[0][k][0] = words[k];
-        payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
+        for (int k = 0; k < kInt4GroupPacks; ++k) {
+          payload[0][k][0] = words[k];
+          payload[0][k][1] = __builtin_bit_cast(uint32_t, scale);
+        }
+      } else {
+        quantize(x, payload);
       }
       send<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::group_run, TAIL>(
           payload, staging_ptr_array, staging_ptr_array_size, r, rank, slice, staging_stride_m,
@@ -305,12 +322,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       if ((rank & mask) != c || l >= rows_of(rank)) continue;
       // The row's groups from column col: one chunk, or a CHUNKED row's every chunk.
       const auto sum = [&](int col) {
-        uint32_t got[WORLD][1][kInt4GroupPacks][2];
+        uint32_t got[WORLD][1][kThreadPacks][2];
         load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::group_run, TAIL>(
             staging_ptr_array, staging_ptr_array_size, rank, rank, slice, staging_stride_m,
             staging_stride_n, WORLD, staging_size_m, staging_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, got, 0,
             l * n_pad + col, 1);
-        float summed[1][kInt4GroupPacks][kPackElems];
+        float summed[1][kThreadPacks][kPackElems];
         dequantize<DTYPE>(got, summed);
         store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::group_run, TAIL>(
             summed, partials_ptr_array, partials_ptr_array_size, rank, 0, 0, partials_stride_m,
@@ -338,18 +355,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         const int owner = (rank + v) % WORLD;
         if ((owner & mask) != c || l >= rows_of(owner)) continue;
         // Owner's row l from column col, decoded.
-        const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kInt4GroupPacks][kPackElems]) {
-          uint32_t raw[1][kInt4GroupPacks][2];
+        const auto sum_chunk = [&](int col, DTYPE (&sum)[1][kThreadPacks][kPackElems]) {
+          uint32_t raw[1][kThreadPacks][2];
           recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::group_run, TAIL>(
               partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
               partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, raw, 0,
               l * n_pad + col, 1);
 #pragma unroll
-          for (int k = 0; k < kInt4GroupPacks; ++k)
+          for (int k = 0; k < kThreadPacks; ++k)
             dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
         };
         if constexpr (CHUNKED) {  // a row wider than the tile (attn_res.cuh's sum_chunk)
-          DTYPE unread[1][kInt4GroupPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
+          DTYPE unread[1][kThreadPacks][kPackElems];  // a wide row's sum is sum_chunk's, by chunk
           attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, Layout::group_run, TAIL>(
               unread, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,
               blocks_stride_r, blocks_stride_n, norm_weight_ptr, norm_weight_stride_n,
@@ -361,13 +378,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
               TILE_N);
           continue;
         }
-        uint32_t raw[1][kInt4GroupPacks][2];
+        uint32_t raw[1][kThreadPacks][2];
         recv<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::int4, Layout::group_run, TAIL>(
             partials_ptr_array, partials_ptr_array_size, owner, 0, 0, partials_stride_m,
             partials_stride_n, 1, partials_size_m, partials_size_n, 1, TAIL ? l * n_pad + n : (l + 1) * n, raw, 0, l * n_pad, 1);
-        DTYPE sum[1][kInt4GroupPacks][kPackElems];
+        DTYPE sum[1][kThreadPacks][kPackElems];
 #pragma unroll
-        for (int k = 0; k < kInt4GroupPacks; ++k)
+        for (int k = 0; k < kThreadPacks; ++k)
           dequantize(raw[0][k][0], __builtin_bit_cast(float, raw[0][k][1]), sum[0][k]);
         attn_res<TILE_K, THREADS_PER_BLOCK, WAVE_SIZE, Layout::group_run, TAIL>(
             sum, prefix_ptr, prefix_stride_m, prefix_stride_n, blocks_ptr, blocks_stride_m,

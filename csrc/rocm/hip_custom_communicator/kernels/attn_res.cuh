@@ -37,8 +37,8 @@ namespace hip_custom_communicator {
 // memory. A row past input_size_m (the last tile's) reads row input_size_m - 1
 // and writes nothing, so every thread still reaches every reduction.
 // LAYOUT: how the thread's packs lie in the row, every access's (common.cuh's Layout): tile (pack
-// k of thread t at t + k * THREADS_PER_BLOCK, the exact kernels'), or group_run (a group a thread,
-// its K packs consecutive at t * K + k, the INT4 pull's: its sum lands a group a thread).
+// k of thread t at t + k * THREADS_PER_BLOCK, the exact kernels'), or group_run (whole groups a
+// thread, its group j the row's t + j * THREADS_PER_BLOCK, the INT4 pull's: common.cuh's Layout).
 // A ROW WIDER THAN THE TILE (`sum_chunk` given, `sum` unread): attn_res's math over the row's
 // chunks of `tile_n` columns (the tile's, K * P * THREADS_PER_BLOCK, from column 0), the block's
 // ROWS rows at offs_m (offs_n unused), in passes, each over every chunk:
@@ -76,7 +76,9 @@ DINLINE void attn_res(
     const int n_all = input_size_n;
     [[maybe_unused]] const auto pack_at = [&](int k, int c) {
       const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
-      return LAYOUT == Layout::tile ? c / P + t + k * THREADS_PER_BLOCK : c / P + t * K + k;
+      return LAYOUT == Layout::tile ? c / P + t + k * THREADS_PER_BLOCK
+                                    : c / P + ((k / kInt4GroupPacks) * THREADS_PER_BLOCK + t) *
+                                                    kInt4GroupPacks + k % kInt4GroupPacks;
     };
     // A. THE NEW PREFIX, chunk by chunk, stored (and the block written) before any source is read.
     for (int c = 0; c < n_all; c += tile_n) {
@@ -242,7 +244,9 @@ DINLINE void attn_res(
     // Pack k's column in packs, LAYOUT's: the mask of the packs past input_size_n.
     [[maybe_unused]] const auto pack_at = [&](int k) {
       const int t = static_cast<int>(threadIdx.x) % THREADS_PER_BLOCK;
-      return LAYOUT == Layout::tile ? offs_n / P + t + k * THREADS_PER_BLOCK : offs_n / P + t * K + k;
+      return LAYOUT == Layout::tile ? offs_n / P + t + k * THREADS_PER_BLOCK
+                                    : offs_n / P + ((k / kInt4GroupPacks) * THREADS_PER_BLOCK + t) *
+                                                    kInt4GroupPacks + k % kInt4GroupPacks;
     };
     // The new prefix: the sum over the ranks added to the old one, rounded once
     // to DTYPE; the old prefix loaded whole before anything is stored.
