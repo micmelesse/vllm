@@ -115,11 +115,14 @@ def arguments(host: str) -> dict[str, str]:
 
 
 def lays_out(kernel: str, b: tuple, world: int) -> bool:
-    """Whether a plain all-reduce build lays out whole (the host's one_shot_lays_out and
-    two_shot_lays_out, at a 16-bit dtype); every other kernel's builds do, but for an INT4
-    pulled norm or AttnRes whose tile is not whole groups a thread (TILE_N a multiple of
-    32 * THREADS), which its kernel's static_assert refuses by name (a thread quantizes
-    whole groups alone)."""
+    """Whether a plain all-reduce build lays out (the host's one_shot_lays_out and
+    two_shot_lays_out, at a 16-bit dtype, whose comment says why each rule is forced):
+    any block walks any tile of whole packs (a step's packs past the tile masked, a
+    rank's lanes part of a wave where the block is narrow); a two-shot's tile has no
+    rows (the flat walk) and its block is WORLD rows of threads. Every other kernel's
+    builds do, but for an INT4 pulled norm or AttnRes whose tile is not whole groups a
+    thread (TILE_N a multiple of 32 * THREADS), which its kernel's static_assert refuses
+    by name (a thread quantizes whole groups alone)."""
     block, _, _, _, tile_m, tile_n, _, _ = b
     if kernel == "all_reduce_push_one_shot":
         nl = LINE_PAYLOAD_BYTES // 2
@@ -128,13 +131,8 @@ def lays_out(kernel: str, b: tuple, world: int) -> bool:
     else:
         return True
     if "one_shot" in kernel:
-        return block % tile_m == 0 and tile_n % (nl * (block // tile_m)) == 0
-    return (
-        tile_m == 1
-        and block % world == 0
-        and (block // world) % WAVE_SIZE == 0
-        and tile_n % (nl * (block // world)) == 0
-    )
+        return tile_n % nl == 0
+    return tile_m == 1 and block % world == 0 and tile_n % nl == 0
 
 
 def instances(kernel: str, args: str, b: tuple) -> list[str]:

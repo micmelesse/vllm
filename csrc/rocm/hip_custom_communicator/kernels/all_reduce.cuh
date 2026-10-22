@@ -52,7 +52,14 @@ namespace hip_custom_communicator {
 
 // THE BUFFER AS [m, n], every rank's at the table's strides (input_stride_m,
 // input_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
-// the tiles row-major.
+// the tiles row-major. ANY BUILD WALKS ITS TILE (the dense map, STANDARDS 3.2):
+// TILE_M rows of threads a row each where they divide the block, else one row of
+// threads looping over the rows; a row of threads' packs in kPacks steps, the
+// last step's packs past the tile MASKED where the row of threads is not a
+// divisor of the tile (a thread past it loads the tile's last pack and stores
+// nothing: the clips are the tile's). The one rule left: the tile is whole packs
+// (a pack is one aligned 16-byte access; a tile edge inside one would split it
+// between two blocks).
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
           int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
@@ -68,11 +75,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
   static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
-  constexpr int kThreadsM = TILE_M;
-  constexpr int kThreadsN = THREADS_PER_BLOCK / TILE_M;
+  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
   constexpr int kRows = TILE_M / kThreadsM;
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
-  constexpr int kPacks = TILE_N / (kPackElems * kThreadsN);
+  static_assert(TILE_N % kPackElems == 0, "a tile is whole packs");
+  constexpr int kPacks = (TILE_N + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
+  // A ROW OF THREADS AS WIDE AS THE TILE IN WHOLE STEPS, else the last step masked at the tile.
+  constexpr bool kWhole = kPacks * kPackElems * kThreadsN == TILE_N;
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
   // 0. Every rank's input entry, read before the barrier (load's entry form: the table is fixed
@@ -89,10 +99,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
       rank, timeout_ticks, Until::started, 0);
   // 2. Every rank's input, in rank order, through the table, summed.
   for (int t = blockIdx.x; t < tiles; t += gridDim.x) {
+    // The columns this tile clips at: the input's, or the tile's end where a step is masked.
+    const int clip_n = kWhole ? input_size_n : min(input_size_n, t % tiles_n * TILE_N + TILE_N);
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
     // same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];
@@ -107,7 +119,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
           for (int r = 1; r < WORLD; ++r) acc += static_cast<float>(peers[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
   }
   // 3. Every peer is done reading this rank's input: the launch may end and
   // the input be overwritten.
@@ -230,14 +242,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
   static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
-  constexpr int kThreadsM = TILE_M;
-  constexpr int kThreadsN = THREADS_PER_BLOCK / TILE_M;
+  // THE TILE'S WALK, the pulled one-shot's (its section): rows of threads where they divide the
+  // block, the last step's packs past the tile masked (a lane past it loads, and so sends, the
+  // tile's last pack: the same bytes its owner sends; its sum is stored nowhere).
+  constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
+  constexpr int kThreadsN = THREADS_PER_BLOCK / kThreadsM;
   // A THREAD'S PACK IS ONE LINE'S PAYLOAD, 8 bytes (aiter's packet): a block's stores spread over
   // twice the waves of a 16-byte pack, half the stores a wave (16 stores a wave at 128 threads
   // were ~9k cycles of issue stalls, ATT 2026-10-19T04-50-53Z).
   constexpr int kPackElems = kLinePayloadBytes / static_cast<int>(sizeof(DTYPE));
   constexpr int kRows = TILE_M / kThreadsM;
-  constexpr int kPacks = TILE_N / (kPackElems * kThreadsN);
+  static_assert(TILE_N % kPackElems == 0, "a tile is whole packs");
+  constexpr int kPacks = (TILE_N + kPackElems * kThreadsN - 1) / (kPackElems * kThreadsN);
+  constexpr bool kWhole = kPacks * kPackElems * kThreadsN == TILE_N;
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
   const int blocks = unfenced_size_m / (2 * TILE_M);  // the inbox's: [bank, block] tiles of rows
@@ -268,8 +285,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    seven peers as (rank + i) % WORLD read from the first lane still compiled both of send's
     //    paths and a scalar load of each peer's entry before its store: 863 -> 1535 instructions,
     //    the stores 57 apart (ISA, d7da3439da).
+    // The input's columns this tile clips at: the input's, or the tile's end where a step is
+    // masked (so a lane past the tile holds its owner's pack).
+    const int input_clip_n = kWhole ? input_size_n : offs_n + clip_n;
     DTYPE mine[kRows][kPacks][kPackElems];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, mine, offs_m, offs_n, 1);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_ptr, 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, mine, offs_m, offs_n, 1);
     // This pass's epoch (the last + 1, never 0) and this block's row of the inbox in its bank.
     const uint32_t before =
         ran ? epoch : __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(last[0][0][0]));
@@ -297,7 +317,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
             acc += static_cast<float>(r == rank ? mine[i][k][j] : peers[r][i][k][j]);
           rounded[i][k][j] = static_cast<DTYPE>(acc);
         }
-    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_size_n, offs_m, offs_n, 1);
+    store<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(rounded, &output_ptr, 1, 0, 0, 0, output_stride_m, output_stride_n, 1, input_size_m, input_size_n, input_size_m, input_clip_n, offs_m, offs_n, 1);
     // 4. The block is done with this pass's bank before any of its threads sends the next pass
     //    (the bank argument above), and, the last pass, every wave has read the epoch (step 0).
     __syncthreads();
@@ -332,7 +352,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // common.cuh's flat walk cuts it as [R, 1, M*N], each rank's share one
 // contiguous range of the elements, for long runs (its comment says why and
 // what it serves badly), a TILE_N chunk a step (TILE_M is the build's, 1:
-// select's two_shot_lays_out). CONTIGUOUS: the input's and the output's rows
+// select's two_shot_lays_out; any block and tile of whole packs walk it, the
+// collectives' flat walk says how). CONTIGUOUS: the input's and the output's rows
 // are back to back, the instance the host picks from their strides.
 // QUANTIZATION: what crosses the links (common.cuh's QUANTIZATION); with int4
 // each share is quantized by this rank, from its own input, and pushed into the share's rank's inbox INT4 payload at this rank's slot

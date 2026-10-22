@@ -54,11 +54,11 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
       const int per_block = (groups_all + grid - 1) / grid;
       const int g_first = static_cast<int>(blockIdx.x) * per_block;
       const int g_end = min(g_first + per_block, groups_all);
-      // A RANK A ROW OF THREADS (kRankLanes, whole waves, rotated rank + w), as reduce_scatter's
-      // push: every rank's group in flight at once and each thread decoding one.
+      // A RANK A ROW OF THREADS (kRankLanes, rotated rank + w; part of a wave, its rank a lane's
+      // own: recv picks each lane's), as reduce_scatter's push: every rank's group in flight at
+      // once and each thread decoding one.
       constexpr int kRankLanes = THREADS_PER_BLOCK / WORLD;
-      static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK && kRankLanes % WAVE_SIZE == 0,
-                    "a rank's groups are whole waves");
+      static_assert(kRankLanes * WORLD == THREADS_PER_BLOCK, "a block is a row of threads a rank");
       const int r = (rank + static_cast<int>(threadIdx.x) / kRankLanes) % WORLD;
       const int end = TAIL ? min(g_end * kInt4Group, share_len(r))
                            : min(g_end, share_len(r) / kInt4Group) * kInt4Group;
@@ -81,23 +81,30 @@ DINLINE void all_gather(char* const* partials_ptr_array, int partials_ptr_array_
     } else {
       constexpr Layout kOutput = CONTIGUOUS ? Layout::run : Layout::flat;
       constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
-      constexpr int kPacks = TILE_N / (kPackElems * kLanes);
+      static_assert(TILE_N % kPackElems == 0, "a chunk is whole packs");
+      constexpr int kPacks = (TILE_N + kPackElems * kLanes - 1) / (kPackElems * kLanes);
       static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-      static_assert(kLanes % WAVE_SIZE == 0, "a rank's copy is whole waves");
+      // reduce_scatter's walk: whole waves a rank, else a lane's own rank; whole steps a chunk,
+      // else the last masked at the chunk's end.
+      constexpr bool kWaves = kLanes % WAVE_SIZE == 0;
+      constexpr bool kWhole = kPacks * kPackElems * kLanes == TILE_N;
       const int chunks = (slice + TILE_N - 1) / TILE_N;
       // A ROW OF THREADS' RANK, whole waves, so read from the first lane: recv then takes its
       // scalar path alone (from a lane's value it kept the per-lane select too, WORLD - 1 rank
       // compares whose masks spilled to a VGPR in the plain two-shot: ISA 2026-10-19T03-16-52Z).
-      const int r = __builtin_amdgcn_readfirstlane((rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD);
+      // Part of a wave, a lane's own (recv's per-lane select).
+      const int r = kWaves ? __builtin_amdgcn_readfirstlane((rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD)
+                           : (rank + static_cast<int>(threadIdx.x) / kLanes) % WORLD;
       for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
         DTYPE got[1][kPacks][kPackElems];
         // 1. Rank r's summed chunk, a row of threads a rank, in one round trip.
         recv<WORLD, WORLD, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(partials_ptr_array, partials_ptr_array_size, r, 0, 0, 0, 1, 1, 1, slice, 1,
-                       slice, got, 0, chunk * TILE_N, 0);
-        // 2. Stored where rank r's share goes, its first `len` elements.
+                       kWhole ? slice : min(slice, chunk * TILE_N + TILE_N), got, 0, chunk * TILE_N, 0);
+        // 2. Stored where rank r's share goes, its first `len` elements (the chunk's, masked).
         store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, kOutput, TAIL>(
             got, &output_ptr, 1, 0, r, slice, output_stride_m, output_stride_n, WORLD,
-            output_size_m, output_size_n, 1, share_len(r), 0, chunk * TILE_N, 1);
+            output_size_m, output_size_n, 1,
+            kWhole ? share_len(r) : min(share_len(r), chunk * TILE_N + TILE_N), 0, chunk * TILE_N, 1);
       }
     }
   } else {

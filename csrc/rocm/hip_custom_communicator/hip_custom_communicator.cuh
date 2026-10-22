@@ -2660,22 +2660,35 @@ inline bool resident(const Handle& h, const void* kernel, const Dim3& grid,
 // EACH OP'S KERNELS.
 // =================================================================================================
 
-// THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT WHOLE at `world` ranks and `nl`
-// elements a pack, which its dispatch instantiates and nothing else: the
-// one-shot's TILE_M rows a THREADS / TILE_M-thread row each across TILE_N; the
-// two-shot's [R, 1, TILE_N] chunk, a rank's THREADS / world threads a group
-// each across it (common.cuh's COLLECTIVES: the flat walk). Every tuned entry
-// must lay out, or select would refuse it at run time (tile_not_built): checked
-// here, at compile time.
+// THE PLAIN ALL-REDUCE'S BUILDS THAT LAY OUT at `world` ranks and `nl` elements
+// a pack, which its dispatch instantiates and nothing else (builds.py's
+// lays_out, the same rules): ANY BLOCK WALKS ANY TILE OF WHOLE PACKS (the dense
+// map, STANDARDS 3.2: a refusal the math or the hardware forces, never the
+// walk's convenience). The one-shot's tile in rows of threads (one row looping
+// over the rows where TILE_M does not divide the block), a row of threads' packs
+// in steps, the last masked at the tile (kernels/all_reduce.cuh); the two-shot's
+// [R, 1, TILE_N] chunk, a rank's THREADS / world threads (part of a wave: a
+// lane's own rank) in steps, the last masked at the chunk (the flat walk,
+// reduce_scatter.cuh). WHAT IS LEFT, EACH FORCED:
+//  - TILE_N WHOLE PACKS: a pack is one aligned 16-byte access (the pushed
+//    one-shot's an 8-byte line payload); a tile edge inside a pack splits it
+//    between two blocks' tiles (a row is whole packs: row_not_packs).
+//  - THE TWO-SHOT'S TILE_M 1: the flat walk numbers the band's elements
+//    row-major, so a chunk is TILE_N elements and has no rows; a TILE_M names a
+//    walk the kernel does not have.
+//  - THE TWO-SHOT'S BLOCK WORLD ROWS OF THREADS (a rank's copy a row, summed over
+//    the rows through LDS): every block is whole 64-lane waves
+//    (launch_out_of_range) and every built world divides 64, so it refuses no
+//    launchable block at a built world.
+// Every tuned entry must lay out, or select would refuse it at run time
+// (tile_not_built): checked here, at compile time.
 constexpr bool one_shot_lays_out(const AllReduceBuildConfig& c, int nl) {
-  return c.block.x % c.tile_m == 0 &&
-         c.tile_n % (nl * (c.block.x / c.tile_m)) == 0;
+  return c.tile_n % nl == 0;
 }
 constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
                                  int nl) {
   return world > 0 && c.tile_m == 1 && c.block.x % world == 0 &&
-         (c.block.x / world) % kTarget.wave_size == 0 &&
-         c.tile_n % (nl * (c.block.x / world)) == 0;
+         c.tile_n % nl == 0;
 }
 // EVERY PUSHED ONE-SHOT BUILD'S TILE FITS AN UNFENCED SLOT (THE UNFENCED REGION) at
 // every built dtype.

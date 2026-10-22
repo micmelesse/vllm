@@ -522,9 +522,9 @@ DINLINE void read_buffer(const void* input, int input_slot, int64_t input_stride
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
     static_assert(QUANTIZATION == Quantization::exact && !kSlots && kRows == 1,
                   "the flat walk reads one exact copy a row of threads");
+    // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(kLanes % WAVE_SIZE == 0, "a rank's copy is whole waves");
     static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     const U* const from = reinterpret_cast<const U*>(input) + int64_t{offs_m} * input_stride_m;
     const int64_t first = int64_t{input_slot} * input_stride_slot;
@@ -938,9 +938,9 @@ DINLINE void write_buffer(const INPUT& input, void* output, int output_slot,
     // THE FLAT WALK, a pack strided by kLanes, one copy (its rank and slot the row of threads').
     static_assert(QUANTIZATION == Quantization::exact && kRows == 1,
                   "the flat walk writes one exact copy a row of threads");
+    // A RANK'S COPY kLanes threads: whole waves (a scalar base) or part of one (a lane's own).
     constexpr int kLanes = THREADS_PER_BLOCK / WORLD;
     static_assert(kLanes * WORLD == THREADS_PER_BLOCK, "a block is a group of threads a rank");
-    static_assert(kLanes % WAVE_SIZE == 0, "a rank's copy is whole waves");
     static_assert(sizeof(V) == sizeof(u32x4), "a pack is one 16-byte global access");
     U* const to = reinterpret_cast<U*>(output) + int64_t{offs_m} * output_stride_m;
     const int64_t first = int64_t{output_slot} * output_stride_slot;
