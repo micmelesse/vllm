@@ -715,7 +715,7 @@ enum class Error : int {
   block_not_a_wave_per_peer = 9,
   partials_too_small = 10,
   grid_not_resident = 11,
-  inputs_too_small = 12,
+  staging_too_small = 12,
   device_not_built = 13,
   device_not_tuned = 14,
   weight_not_built = 15,
@@ -739,7 +739,7 @@ enum class Error : int {
   row_not_int4_groups = 32,  // retired: every INT4 kernel takes a row of whole packs, its last
                              // group short
   quantized_too_small = 33,  // retired: INT4 is an encoding inside the
-                             // regions (inputs_too_small, partials_too_small)
+                             // regions (staging_too_small, partials_too_small)
 };
 constexpr int kNumErrors = 34;
 
@@ -773,9 +773,9 @@ constexpr const char* to_string(Error e) {
     case Error::grid_not_resident:
       return "grid_not_resident: the grid exceeds the blocks the GPU holds "
              "resident";
-    case Error::inputs_too_small:
-      return "inputs_too_small: the input this kernel publishes whole, exact "
-             "or INT4, exceeds the inputs";
+    case Error::staging_too_small:
+      return "staging_too_small: the input this kernel publishes whole, exact "
+             "or INT4, exceeds the staging";
     case Error::device_not_built:
       return "device_not_built: this build holds no code for the device";
     case Error::device_not_tuned:
@@ -2923,7 +2923,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   if (int4 && (flat ? int4_payload_bytes(1, world * share)
                     : int4_payload_bytes(staged_rows(fn, Quantization::int4, m, world), row)) >
                   h->staging_bytes())
-    return Error::inputs_too_small;
+    return Error::staging_too_small;
   const int64_t partials = partials_need(fn, m, packs, world);
   if (int4 && (flat                       ? int4_payload_bytes(1, share)
                : int4_group_a_thread(fn) ? int4_payload_bytes((m + world - 1) / world, row)
@@ -2939,7 +2939,7 @@ inline std::optional<Error> refused(const Handle* h, Template fn,
   // all-reduce: pushed).
   const int64_t bytes = m * n * elem_bytes(dtype);
   if (!in_passes && bytes > h->staging_bytes())
-    return Error::inputs_too_small;
+    return Error::staging_too_small;
   return std::nullopt;
 }
 
@@ -3454,7 +3454,7 @@ inline std::variant<Config, Error> all_reduce_config(
     return *e;
   if (in_place && is_two_shot(fn) && band < 1)
     return Error::partials_too_small;
-  if (in_passes && band < 1) return Error::inputs_too_small;
+  if (in_passes && band < 1) return Error::staging_too_small;
   // AN EAGER IN-PLACE CALL'S INPUT IS COPIED WHOLE into the inputs region
   // (its table, handle.cuh's INPUT TABLES); a captured one is read where it
   // is, registered at capture exit.
@@ -3463,7 +3463,7 @@ inline std::variant<Config, Error> all_reduce_config(
     HIP_CHECK(hipStreamIsCapturing(stream, &capture));
     if (capture != hipStreamCaptureStatusActive &&
         m * n * elem_bytes(dtype) > h.staging_bytes())
-      return Error::inputs_too_small;
+      return Error::staging_too_small;
   }
   Config config{};
   config.shared_memory_bytes = 0;

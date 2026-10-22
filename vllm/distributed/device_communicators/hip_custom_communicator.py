@@ -107,7 +107,7 @@ class Error(IntEnum):
     block_not_a_wave_per_peer = 9
     partials_too_small = 10
     grid_not_resident = 11
-    inputs_too_small = 12
+    staging_too_small = 12
     device_not_built = 13
     device_not_tuned = 14
     weight_not_built = 15
