@@ -20,8 +20,8 @@
 // it, into the peers' receive areas (the INBOX: [writer slot, ...]); each rank
 // sums the WORLD slots of its inbox LOCALLY. Nothing is copied in first.
 // all_reduce_push_one_shot (decode; forced until a tuned entry names it)
-// pushes LINES, the flag in the data, into its own inbox region (handle.cuh's
-// LINES) and takes no barrier (its section says why the inbox is safe to
+// pushes LINES, the flag in the data, into its own inbox in the unfenced
+// region (the host's) and takes no barrier (its section says why the inbox is safe to
 // reuse). all_reduce_push_two_shot (forced only) pushes into the staging, a
 // band of rows a pass, and sums after an ordered barrier; the int4 two-shot
 // pushes its shares quantized. THE STAGING INBOX IS REUSED, launch after launch
@@ -187,8 +187,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // THE BUFFER AS [m, n] AT ITS STRIDES, a work item a TILE_M x TILE_N tile, the
 // grid striding over the tiles row-major: A TILE A BLOCK A PASS. THE INBOX
 // (`lines`), [writer, row, n] in payload elements, TILE_M rows one block's tile
-// in one bank: from row (bank * blocks + block) * TILE_M, blocks = lines_size_m /
-// (2 * TILE_M) (handle.cuh's LINES; the grid is at most that, select's; the
+// in one bank: from row (bank * blocks + block) * TILE_M, blocks = unfenced_size_m /
+// (2 * TILE_M) (the host's unfenced region; the grid is at most that, select's; the
 // builds are a row, so a block's row is the same bytes at every build), the
 // row's pitch fixed whatever the build. EACH BLOCK HAS ITS OWN ROWS, so a line is
 // only ever written with one block's epochs, whatever the grids of the calls
@@ -222,11 +222,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int64_t input_stride_n, int input_size_m, int input_size_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        char* const* __restrict__ lines_ptr_array, int lines_ptr_array_size,
-        int64_t lines_stride_slot, int64_t lines_stride_m, int64_t lines_stride_n,
-        int lines_size_slot, int lines_size_m, int lines_size_n,
-        int32_t* __restrict__ epochs_ptr, int64_t epochs_stride_block, int64_t epochs_stride_n, int epochs_size_block,
-        int epochs_size_n,
+        char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
+        int64_t unfenced_stride_slot, int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+        int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+        int32_t* __restrict__ unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
+        int unfenced_epochs_size_n,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
   static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
@@ -240,16 +240,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   constexpr int kPacks = TILE_N / (kPackElems * kThreadsN);
   const int tiles_n = (input_size_n + TILE_N - 1) / TILE_N;
   const int tiles = (input_size_m + TILE_M - 1) / TILE_M * tiles_n;
-  const int blocks = lines_size_m / (2 * TILE_M);  // the inbox's: [bank, block] tiles of rows
+  const int blocks = unfenced_size_m / (2 * TILE_M);  // the inbox's: [bank, block] tiles of rows
   if (HIP_CUSTOM_COMMUNICATOR_DEBUG && static_cast<int>(gridDim.x) > blocks) __builtin_trap();
   // 0. THIS BLOCK'S LAST EPOCH, every thread's (one 16-byte line, the same for all). The epochs
-  //    are this rank's alone, so a pointer of their own (`&epochs_ptr, 1`): through a device
+  //    are this rank's alone, so a pointer of their own (`&unfenced_epochs_ptr, 1`): through a device
   //    array each launch began with a cold scalar load before the epoch's (ATT
   //    2026-10-19T04-50-53Z: ~5k cycles of lgkmcnt waits before the first send).
   int32_t last[1][1][traits<int32_t, PACK_BYTES>::N];
   load<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
-      &epochs_ptr, 1, 0, 0, 0, epochs_stride_block, epochs_stride_n,
-      1, epochs_size_block, epochs_size_n, epochs_size_block, epochs_size_n, last, blockIdx.x, 0,
+      &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block, unfenced_epochs_stride_n,
+      1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n, last, blockIdx.x, 0,
       1);
   // The epoch is read (a wait for that load) only once the first tile's load is issued, so the two
   // round trips overlap (ATT 2026-10-19T05-22-25Z: ~1.2k cycles a wave waited for the epoch alone).
@@ -278,10 +278,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     const int row = (static_cast<int>(epoch & 1u) * blocks + static_cast<int>(blockIdx.x)) * TILE_M;
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(mine, lines_ptr_array, lines_ptr_array_size, r, rank, lines_stride_slot, lines_stride_m, lines_stride_n, lines_size_slot, lines_size_m, lines_size_n, row + clip_m, clip_n, row, 0, 1, epoch);
+      send<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(mine, unfenced_ptr_array, unfenced_ptr_array_size, r, rank, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + clip_m, clip_n, row, 0, 1, epoch);
     // 2. Every peer's tile out of this rank's inbox, polled until its lines carry the epoch.
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
-    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(lines_ptr_array, lines_ptr_array_size, rank, 0, lines_stride_slot, lines_stride_m, lines_stride_n, lines_size_slot, lines_size_m, lines_size_n, row + clip_m, clip_n, peers, row, 0, 1, epoch, status_ptr, status_stride_field, status_size_field, timeout_ticks);
+    load<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::line>(unfenced_ptr_array, unfenced_ptr_array_size, rank, 0, unfenced_stride_slot, unfenced_stride_m, unfenced_stride_n, unfenced_size_slot, unfenced_size_m, unfenced_size_n, row + clip_m, clip_n, peers, row, 0, 1, epoch, status_ptr, status_stride_field, status_size_field, timeout_ticks);
     // 3. Summed in rank order in fp32 (this rank's own from its input), rounded to DTYPE once:
     //    every rank sums the same copies in the same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];
@@ -306,8 +306,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
   int32_t next[1][1][traits<int32_t, PACK_BYTES>::N] = {
       {{ran ? static_cast<int32_t>(epoch) : last[0][0][0]}}};
   store<WORLD, 1, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(
-      next, &epochs_ptr, 1, 0, 0, 0, epochs_stride_block,
-      epochs_stride_n, 1, epochs_size_block, epochs_size_n, epochs_size_block, epochs_size_n,
+      next, &unfenced_epochs_ptr, 1, 0, 0, 0, unfenced_epochs_stride_block,
+      unfenced_epochs_stride_n, 1, unfenced_epochs_size_block, unfenced_epochs_size_n, unfenced_epochs_size_block, unfenced_epochs_size_n,
       blockIdx.x, 0, 1);
 }
 

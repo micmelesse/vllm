@@ -180,7 +180,7 @@ using OpenWire = std::tuple<std::optional<int64_t>, std::optional<int64_t>>;
 using BuildInfoWire =
     std::tuple<Names, std::vector<int64_t>, int64_t, Names, Names, Names, Names,
                Names, Names, std::vector<int64_t>, std::vector<int64_t>, Names,
-               Names, std::vector<int64_t>>;
+               Names, std::vector<int64_t>, int64_t>;
 // AN OP'S ANSWER: -1 when it ran, else the Error's number it was refused for. What
 // ran is what Python passed: C++ runs the config it is given, or refuses it.
 using Answer = int64_t;
@@ -308,7 +308,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
           ops,        errors,       where_names,
           templates,  template_ops, fields,
           configs,    counts,       op_dtypes,
-          op_weights, op_facts};
+          op_weights, op_facts,   kUnfencedBlocks};
 }
 
 // WHAT A COMMUNICATOR SERVING `max_rows` ROWS OF AT MOST `max_cols` COLUMNS AT

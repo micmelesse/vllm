@@ -1138,28 +1138,29 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // after its first barrier, and its launch ends only after every peer's last
 // read (INPUT TABLES).
 //
-// LINES AND EPOCHS, the pushed one-shot's own (kernels/all_reduce.cuh: the flag in the
-// line, no barrier), one more region after the partials:
-//   lines      the INBOX peers push lines into: [writer, bank * block] rows of a block's
-//              tile, kLineSlotBytes of payload a row, each payload byte two in lines
-//              (common.cuh's Layout::line), two banks: world * 2 * kLineBlocks rows.
-//              Its own region, never another kernel's: a stale line another kernel left
-//              could carry an epoch's value.
+// THE UNFENCED REGION AND ITS EPOCHS: memory no barrier fences, each write carrying its own
+// flag (the pushed one-shot's: kernels/all_reduce.cuh, the flag in the line), one more
+// region after the partials:
+//   unfenced   the INBOX peers push lines into: [writer, bank * block] rows of a block's
+//              tile, kUnfencedSlotBytes of payload a row, each payload byte two in lines
+//              (common.cuh's Layout::line), two banks: world * 2 * kUnfencedBlocks rows.
+//              Its own region, never a fenced kernel's: a stale word a fenced kernel left
+//              could carry an epoch's value, and the reader would take it for data.
 // THE EPOCHS are not a region: each block's last epoch, a 16-byte pack a block (its
-// word at column 0), kLineBlocks of them, read only by their own rank, so CACHED
+// word at column 0), kUnfencedBlocks of them, read only by their own rank, so CACHED
 // rank-local memory (hipMalloc, zeroed at open; aiter's block_flags): from the
 // uncached arena each launch began with an uncached load (~2k cycles before any
 // send, ATT 2026-10-19T04-09-17Z). The lines start zeroed with the arena (no line
 // carries epoch 0, the first is 1); both are written only by that kernel. THE CAP: aiter's LL serves at most 128 KiB a call
 // (kLLPocSlotCapPk, 16384 packets) and refuses more; ours takes any size, a pass of a
-// tile a block, so its cap is the grid's, kLineBlocks blocks (a grid past it is refused,
+// tile a block, so its cap is the grid's, kUnfencedBlocks blocks (a grid past it is refused,
 // launch_out_of_range): 128 blocks of 1024 elements, 256 KiB in one pass. 8 MiB at eight ranks.
-constexpr int kLineBlocks = 128;
-constexpr int64_t kLineSlotBytes = 2048;  // a block's tile's payload, at most
-constexpr int64_t lines_bytes(int world) {
-  return 2 * int64_t{kLineBlocks} * world * kLineSlotBytes * (kLineBytes / kLinePayloadBytes);
+constexpr int kUnfencedBlocks = 128;
+constexpr int64_t kUnfencedSlotBytes = 2048;  // a block's tile's payload, at most
+constexpr int64_t unfenced_bytes(int world) {
+  return 2 * int64_t{kUnfencedBlocks} * world * kUnfencedSlotBytes * (kLineBytes / kLinePayloadBytes);
 }
-constexpr int64_t kEpochsBytes = int64_t{kLineBlocks} * kBuild.memory.pack_bytes;
+constexpr int64_t kUnfencedEpochsBytes = int64_t{kUnfencedBlocks} * kBuild.memory.pack_bytes;
 
 constexpr int64_t kRegionAlign = 4096;
 constexpr int64_t region_aligned(int64_t bytes) {
@@ -1170,18 +1171,18 @@ struct ArenaLayout {
   int64_t staging = 0;
   int64_t partials = 0;
   int64_t scales = 0;  // inside the partials, at their end
-  int64_t lines = 0;
+  int64_t unfenced = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
 };
 inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
-                                int64_t scales_bytes, int64_t lines_bytes) {
+                                int64_t scales_bytes, int64_t unfenced_bytes) {
   ArenaLayout l;
   l.signals = 0;
   l.staging = l.signals + kSignalsRegionBytes;
   l.partials = l.staging + region_aligned(staging_bytes);
   l.scales = l.partials + partials_bytes;  // whole packs: the floats aligned
-  l.lines = l.partials + region_aligned(partials_bytes + scales_bytes);
-  l.end = l.lines + region_aligned(lines_bytes);
+  l.unfenced = l.partials + region_aligned(partials_bytes + scales_bytes);
+  l.end = l.unfenced + region_aligned(unfenced_bytes);
   return l;
 }
 
@@ -1504,7 +1505,7 @@ class Handle {
         log_(std::make_shared<Log>(log_mode, rank, world_size, device)),
         layout_(arena_layout(staging_bytes, partials_bytes,
                              max_rows * static_cast<int64_t>(sizeof(float)),
-                             lines_bytes(world_size))) {
+                             unfenced_bytes(world_size))) {
     // THE LOG FIRST, and kept as the process's last (log.cuh's `last_log`):
     // an open that fails or hangs is read there.
     set_last_log(log_);
@@ -1537,7 +1538,7 @@ class Handle {
                       static_cast<uint32_t>(peers.error));
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_epochs());
+    add(own, release_unfenced_epochs());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, false, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1590,7 +1591,7 @@ class Handle {
     // (e) Our arena, the slab of input tables and the arena's device array.
     Arena::Released own = arena_->release_own();
     add(own, release_tables());
-    add(own, release_epochs());
+    add(own, release_unfenced_epochs());
     add(own, release_region_ptr_arrays());
     log_->close_phase(ClosePhase::released, true, own.freed, 0,
                       static_cast<uint32_t>(own.error));
@@ -1631,7 +1632,7 @@ class Handle {
     if (finished) {
       Arena::Released own = arena_->release_own();
       add(own, release_tables());
-      add(own, release_epochs());
+      add(own, release_unfenced_epochs());
       add(own, release_region_ptr_arrays());
       log_->close_phase(ClosePhase::released, false, own.freed, 0,
                         static_cast<uint32_t>(own.error));
@@ -1697,19 +1698,19 @@ class Handle {
   }
   int scales_ptr_array_size() const { return world_size_; }
   int64_t scales_size_m() const { return max_rows_; }
-  // EVERY RANK'S LINES (the pushed one-shot's inbox), a device array of every rank's address of
+  // EVERY RANK'S UNFENCED REGION (the pushed one-shot's inbox of lines), a device array of every rank's address of
   // that region with its size, the world, as [writer, row, n] (config.cuh's); and THIS RANK'S EPOCHS
   // (its per-block counters, read only here), their own pointer, as [block, n], a pack of int32 a
-  // block (LINES AND EPOCHS, above).
-  char* const* lines_ptr_array() const { return region_ptr_arrays_ + kLinesArray * kMaxRanks; }
-  int lines_ptr_array_size() const { return world_size_; }
-  int32_t* epochs_ptr() const { return epochs_; }
-  static constexpr int64_t epochs_stride_block() {
+  // block (THE UNFENCED REGION AND ITS EPOCHS, above).
+  char* const* unfenced_ptr_array() const { return region_ptr_arrays_ + kUnfencedArray * kMaxRanks; }
+  int unfenced_ptr_array_size() const { return world_size_; }
+  int32_t* unfenced_epochs_ptr() const { return unfenced_epochs_; }
+  static constexpr int64_t unfenced_epochs_stride_block() {
     return kBuild.memory.pack_bytes / int64_t{sizeof(int32_t)};
   }
-  static constexpr int64_t epochs_stride_n() { return 1; }
-  static constexpr int64_t epochs_size_block() { return kLineBlocks; }
-  static constexpr int64_t epochs_size_n() { return epochs_stride_block(); }
+  static constexpr int64_t unfenced_epochs_stride_n() { return 1; }
+  static constexpr int64_t unfenced_epochs_size_block() { return kUnfencedBlocks; }
+  static constexpr int64_t unfenced_epochs_size_n() { return unfenced_epochs_stride_block(); }
   // The synchronization state: every rank's signal block and how long a wait
   // may last before it gives up. Each rank's signals, [2, kMaxBlocks,
   // kMaxRanks] (parity, block, writer) at signals_ptr_array()[r]: the
@@ -2031,11 +2032,11 @@ class Handle {
         at[kStagingArray * kMaxRanks + r] = base + layout_.staging;
         at[kPartialsArray * kMaxRanks + r] = base + layout_.partials;
         at[kScalesArray * kMaxRanks + r] = base + layout_.scales;
-        at[kLinesArray * kMaxRanks + r] = base + layout_.lines;
+        at[kUnfencedArray * kMaxRanks + r] = base + layout_.unfenced;
       }
       // THE EPOCHS: this rank's own hipMalloc (no peer reads them; a pointer of their own).
-      HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&epochs_), static_cast<size_t>(kEpochsBytes)));
-      HIP_CHECK(hipMemset(epochs_, 0, static_cast<size_t>(kEpochsBytes)));
+      HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&unfenced_epochs_), static_cast<size_t>(kUnfencedEpochsBytes)));
+      HIP_CHECK(hipMemset(unfenced_epochs_, 0, static_cast<size_t>(kUnfencedEpochsBytes)));
       // Zero before any launch on the caller's streams, which do not wait for the null stream.
       HIP_CHECK(hipDeviceSynchronize());
       HIP_CHECK(hipMemcpy(region_ptr_arrays_, at.data(),
@@ -2146,15 +2147,15 @@ class Handle {
     return out;
   }
   // THE EPOCHS freed (ours, local): with our arena, in teardown's second half. Idempotent.
-  Arena::Released release_epochs() {
+  Arena::Released release_unfenced_epochs() {
     Arena::Released out;
-    if (epochs_ != nullptr) {
-      const hipError_t e = hipFree(epochs_);
+    if (unfenced_epochs_ != nullptr) {
+      const hipError_t e = hipFree(unfenced_epochs_);
       if (e != hipSuccess) {
         (void)hipGetLastError();
         out.error = e;
       }
-      epochs_ = nullptr;
+      unfenced_epochs_ = nullptr;
     }
     return out;
   }
@@ -2305,10 +2306,10 @@ class Handle {
   // The regions' device arrays, kRegionPtrArrays of kMaxRanks entries, in one
   // allocation: the signals, the inputs, the partials.
   static constexpr int kSignalsArray = 0, kStagingArray = 1, kPartialsArray = 2, kScalesArray = 3,
-                       kLinesArray = 4, kRegionPtrArrays = 5;
+                       kUnfencedArray = 4, kRegionPtrArrays = 5;
   char** region_ptr_arrays_ = nullptr;
-  // THE EPOCHS (LINES AND EPOCHS), kEpochsBytes, this rank's alone.
-  int32_t* epochs_ = nullptr;
+  // THE EPOCHS (THE UNFENCED REGION AND ITS EPOCHS), kUnfencedEpochsBytes, this rank's alone.
+  int32_t* unfenced_epochs_ = nullptr;
   int64_t next_slot_ = 0;
   std::vector<const void*> pending_;
   std::vector<void**> pending_slots_;
@@ -2424,7 +2425,7 @@ constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / el
 // thread; aiter's ar_ll_gfx9 runs 256 threads of one 8-byte packet each, 1024
 // elements a block (7 blocks at 7168), which {128, 1, 1, 1024} matches block for
 // block at a 16-byte pack a thread. Every build's tile fits a lines slot
-// (handle.cuh's kLineSlotBytes, checked below). Not swept yet.
+// (handle.cuh's kUnfencedSlotBytes, checked below). Not swept yet.
 //
 // The plain two-shot: 512 threads divided into whole waves per peer. The
 // eight-rank tile is 512 elements; four and two ranks need 1024 and 2048
@@ -2673,16 +2674,16 @@ constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
          (c.block.x / world) % kTarget.wave_size == 0 &&
          c.tile_n % (nl * (c.block.x / world)) == 0;
 }
-// EVERY PUSHED ONE-SHOT BUILD'S TILE FITS A LINES SLOT (handle.cuh's LINES) at
+// EVERY PUSHED ONE-SHOT BUILD'S TILE FITS AN UNFENCED SLOT (THE UNFENCED REGION) at
 // every built dtype.
 constexpr bool push_one_shot_tiles_fit() {
   for (const BuildConfig& b : kBuilds_all_reduce_push_one_shot)
     for (const DType d : kBuild.supports.dtypes)
-      if (tile_m_of(b) != 1 || tile_n_of(b) * elem_bytes(d) > kLineSlotBytes) return false;
+      if (tile_m_of(b) != 1 || tile_n_of(b) * elem_bytes(d) > kUnfencedSlotBytes) return false;
   return true;
 }
 static_assert(push_one_shot_tiles_fit(),
-              "a pushed one-shot tile wider than its lines slot");
+              "a pushed one-shot tile wider than its unfenced slot");
 
 // THE PULLED NORMS' INT4 IS A GROUP A THREAD (their INT4 body, all_reduce_add_rms_norm.cuh):
 // TILE_N / 32 threads, a block one row's groups.
@@ -3015,14 +3016,14 @@ struct Config {
   int64_t staging_stride_n{};
   int64_t staging_size_m{};
   int64_t staging_size_n{};
-  // THE PUSHED ONE-SHOT'S LINES INBOX, [slot, m, n] in payload elements (kernels/all_reduce.cuh;
-  // handle.cuh's LINES): zeros for every other kernel.
-  int64_t lines_stride_slot{};
-  int64_t lines_stride_m{};
-  int64_t lines_stride_n{};
-  int64_t lines_size_slot{};
-  int64_t lines_size_m{};
-  int64_t lines_size_n{};
+  // THE PUSHED ONE-SHOT'S INBOX IN THE UNFENCED REGION, [slot, m, n] in payload elements
+  // (kernels/all_reduce.cuh; THE UNFENCED REGION): zeros for every other kernel.
+  int64_t unfenced_stride_slot{};
+  int64_t unfenced_stride_m{};
+  int64_t unfenced_stride_n{};
+  int64_t unfenced_size_slot{};
+  int64_t unfenced_size_m{};
+  int64_t unfenced_size_n{};
   int64_t scales_stride_m{};
   int64_t scales_size_m{};
   // THE MACHINE, the host's facts and no call's (HARDWARE, BUILD): a wave's lanes and a pack's
@@ -3405,12 +3406,12 @@ inline std::variant<Config, Error> all_reduce_config(
   // IN PLACE: the exact pull, every rank's input read where its table says.
   const bool in_place = direction_of(fn) == Direction::pull &&
                         a.quantization == Quantization::exact;
-  // THE LINES: the pushed one-shot pushes into its own inbox (handle.cuh's LINES), a tile a
+  // THE UNFENCED REGION: the pushed one-shot pushes lines into its own inbox there, a tile a
   // block a pass, nothing staged. ITS GRID IS THE ONE GIVEN: a block its own slots, so at most the
-  // lines' blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
+  // unfenced region's blocks (more is refused, never cut); a block past the tiles has no pass, and leaves its
   // epoch as it was.
-  const bool lines = fn == Template::all_reduce_push_one_shot;
-  if (lines && volume(c.launch.grid) > kLineBlocks) return Error::launch_out_of_range;
+  const bool unfenced = fn == Template::all_reduce_push_one_shot;
+  if (unfenced && volume(c.launch.grid) > kUnfencedBlocks) return Error::launch_out_of_range;
   // IN PASSES (none): a band of rows a pass (the in-place one-shot's one band,
   // the whole input). INT4 pushes its input's shares quantized, whole,
   // instead.
@@ -3429,7 +3430,7 @@ inline std::variant<Config, Error> all_reduce_config(
     return (rows * packs + world - 1) / world;
   };
   int64_t band = 0;
-  if ((in_place && !is_two_shot(fn)) || lines) {
+  if ((in_place && !is_two_shot(fn)) || unfenced) {
     band = m;  // nothing staged: one pass (the lines' passes are the kernel's)
   } else if (in_place) {
     // THE IN-PLACE TWO-SHOT'S BAND: what the partials hold, a row of its
@@ -3481,29 +3482,29 @@ inline std::variant<Config, Error> all_reduce_config(
   config.partials_stride_n = 1;
   config.partials_size_m = int4_flat ? 1 : in_passes ? rows : m;
   config.partials_size_n = int4_flat ? share : slice_bytes / elem_bytes(dtype);
-  config.staging_stride_m = in_place || lines                ? 0
+  config.staging_stride_m = in_place || unfenced                ? 0
                          : int4_flat                       ? world * share
                          : !in_passes || !is_two_shot(fn) ? n
                              : slot_packs(rows) * pack / elem_bytes(dtype);
-  config.staging_stride_n = in_place || lines ? 0 : 1;
-  config.staging_size_m = in_place || lines ? 0
+  config.staging_stride_n = in_place || unfenced ? 0 : 1;
+  config.staging_size_m = in_place || unfenced ? 0
                        : int4_flat ? 1
                        : !in_passes ? m
                        : is_two_shot(fn) ? world
                                          : world * rows;
-  config.staging_size_n = in_place || lines                ? 0
+  config.staging_size_n = in_place || unfenced                ? 0
                        : int4_flat                       ? world * share
                        : !in_passes || !is_two_shot(fn) ? n
                            : slot_packs(rows) * pack / elem_bytes(dtype);
-  // THE LINES: [writer, row, n] payload elements, 2 * kLineBlocks rows (bank, block) of
-  // kLineSlotBytes of payload each whatever the build (so a block's row is the same bytes at
+  // THE UNFENCED REGION: [writer, row, n] payload elements, 2 * kUnfencedBlocks rows (bank, block) of
+  // kUnfencedSlotBytes of payload each whatever the build (so a block's row is the same bytes at
   // every build), a writer's rows contiguous.
-  config.lines_stride_slot = lines ? 2 * kLineBlocks * (kLineSlotBytes / elem_bytes(dtype)) : 0;
-  config.lines_stride_m = lines ? kLineSlotBytes / elem_bytes(dtype) : 0;
-  config.lines_stride_n = lines ? 1 : 0;
-  config.lines_size_slot = lines ? world : 0;
-  config.lines_size_m = lines ? 2 * kLineBlocks : 0;
-  config.lines_size_n = lines ? kLineSlotBytes / elem_bytes(dtype) : 0;
+  config.unfenced_stride_slot = unfenced ? 2 * kUnfencedBlocks * (kUnfencedSlotBytes / elem_bytes(dtype)) : 0;
+  config.unfenced_stride_m = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
+  config.unfenced_stride_n = unfenced ? 1 : 0;
+  config.unfenced_size_slot = unfenced ? world : 0;
+  config.unfenced_size_m = unfenced ? 2 * kUnfencedBlocks : 0;
+  config.unfenced_size_n = unfenced ? kUnfencedSlotBytes / elem_bytes(dtype) : 0;
   config.dtype = dtype;
   config.contiguous = input_stride_m == n * input_stride_n &&
       output_stride_m == n * output_stride_n;
@@ -3902,7 +3903,7 @@ constexpr ExchangeSizes exchange_sizes(int64_t max_rows, int64_t max_cols,
     // WORLD slots of a row each covers its WORLD shares of one row rounded up
     // to whole packs. The in-place pull's eager copy is the input whole,
     // above. (The pushed one-shot's inbox is its own region, handle.cuh's
-    // LINES.)
+    // UNFENCED REGION.)
     const int64_t one_row_each = world * max_cols * elem_bytes(d);
     if (one_row_each > staging) staging = one_row_each;
   }
@@ -4021,12 +4022,12 @@ inline std::variant<Config, Error> all_reduce(
         input_stride_m, input_stride_n, static_cast<int>(input_size_m),
         static_cast<int>(input_size_n), static_cast<T*>(output), output_stride_m,
         output_stride_n, static_cast<int>(output_size_m),
-        static_cast<int>(output_size_n), h.lines_ptr_array(), h.lines_ptr_array_size(),
-        config.lines_stride_slot, config.lines_stride_m, config.lines_stride_n,
-        static_cast<int>(config.lines_size_slot), static_cast<int>(config.lines_size_m),
-        static_cast<int>(config.lines_size_n), h.epochs_ptr(), h.epochs_stride_block(),
-        h.epochs_stride_n(), static_cast<int>(h.epochs_size_block()),
-        static_cast<int>(h.epochs_size_n()), h.status_ptr(), h.status_stride_field(),
+        static_cast<int>(output_size_n), h.unfenced_ptr_array(), h.unfenced_ptr_array_size(),
+        config.unfenced_stride_slot, config.unfenced_stride_m, config.unfenced_stride_n,
+        static_cast<int>(config.unfenced_size_slot), static_cast<int>(config.unfenced_size_m),
+        static_cast<int>(config.unfenced_size_n), h.unfenced_epochs_ptr(), h.unfenced_epochs_stride_block(),
+        h.unfenced_epochs_stride_n(), static_cast<int>(h.unfenced_epochs_size_block()),
+        static_cast<int>(h.unfenced_epochs_size_n()), h.status_ptr(), h.status_stride_field(),
         h.status_size_field(), h.rank(), h.timeout_ticks());
     }
     if constexpr (C.kernel == Kernel::all_reduce_push_two_shot) {

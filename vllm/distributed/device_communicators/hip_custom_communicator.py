@@ -650,6 +650,8 @@ class BuildInfo:
     templates: dict[str, TemplateBuild]
     # Each op by name, in C++'s `Op` order: its plain call.
     ops: dict[str, OpRecord]
+    # The pushed one-shot's most blocks: a block's own slots in the unfenced region.
+    unfenced_blocks: int
 
 
 @functools.cache
@@ -670,6 +672,7 @@ def build_info() -> BuildInfo:
         op_dtypes,
         op_weights,
         op_facts,
+        unfenced_blocks,
     ) = torch.ops._rocm_C.hip_custom_communicator_build_info()
     templates: dict[str, TemplateBuild] = {}
     at, width = 0, len(fields)
@@ -704,6 +707,7 @@ def build_info() -> BuildInfo:
         tuple(where_names),
         templates,
         records,
+        unfenced_blocks,
     )
 
 
