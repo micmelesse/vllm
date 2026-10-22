@@ -1552,11 +1552,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     set(VLLM_HCC_BUILDS_SCRIPT
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator/builds.py)
     set(VLLM_HCC_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/hip_custom_communicator_generated)
-    # A TUNE'S CANDIDATE BUILDS (gp tune exploring its space), compiled beside the table's; a
-    # serving build leaves it empty and compiles exactly the table.
-    set(VLLM_HCC_CANDIDATES "" CACHE FILEPATH "hip_custom_communicator: a tune's candidate configs")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-      ${VLLM_HCC_TABLE} ${VLLM_HCC_BUILDS_SCRIPT} ${VLLM_HCC_CANDIDATES})
+      ${VLLM_HCC_TABLE} ${VLLM_HCC_BUILDS_SCRIPT})
     # ITS KERNEL INSTANCES, A FILE A BUILD (builds.py writes them beside the builds, with the
     # header that keeps the host from instantiating any): compiled in parallel, each cached alone.
     set(VLLM_HCC_HOST
@@ -1565,7 +1562,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     execute_process(
       COMMAND ${Python_EXECUTABLE} ${VLLM_HCC_BUILDS_SCRIPT} ${VLLM_HCC_TABLE}
         ${VLLM_HCC_GENERATED}/hip_custom_communicator_builds.inc "${VLLM_HCC_ARCHES}"
-        ${VLLM_HCC_HOST} "${VLLM_HCC_CANDIDATES}"
+        ${VLLM_HCC_HOST}
       RESULT_VARIABLE VLLM_HCC_BUILDS_RESULT)
     if(NOT VLLM_HCC_BUILDS_RESULT EQUAL 0)
       message(FATAL_ERROR "hip_custom_communicator: builds.py failed on ${VLLM_HCC_TABLE}")
