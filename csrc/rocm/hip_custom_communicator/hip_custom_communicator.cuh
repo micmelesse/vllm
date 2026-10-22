@@ -909,7 +909,7 @@ constexpr bool x_alone(const Dim3& d) { return d.y == 1 && d.z == 1; }
 // nothing), and the tile, TILE_M rows x TILE_N columns in elements; TILE_K is
 // the reduced dimension a step (AttnRes's sources a step); `quantization`, what
 // crosses the links (common.cuh's QUANTIZATION): a two-shot's build is listed
-// as it is and moving INT4 (select's `and_int4`), forced like any field or
+// as it is and moving INT4 (two configs of the table), forced like any field or
 // named by a tuned point. One type an op, so a config
 // cannot cross ops, though three hold the same fields. all_reduce: a tile a
 // work item, the grid striding over the buffer's.
@@ -2405,123 +2405,61 @@ constexpr int64_t int4_flat_share(int64_t m, int64_t n, int world) {
 // policy. The sweeps cited beside a list set its builds and the grids its tuned
 // kernels carry.
 
-// A TWO-SHOT TEMPLATE'S BUILDS: each listed build as it is, then the same
-// moving INT4 (common.cuh's QUANTIZATION), forced as any build is or taken by
-// a tuned config (the quantized table's INT4 configs). A one-shot
-// moves its input as it is.
-template <size_t N>
-constexpr std::array<BuildConfig, 2 * N> and_int4(
-    const BuildConfig (&exact)[N]) {
-  std::array<BuildConfig, 2 * N> all{};
-  for (size_t i = 0; i < N; ++i) {
-    all[i] = exact[i];
-    all[N + i] = quantized(exact[i], Quantization::int4);
-  }
-  return all;
-}
+// THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
+// builds lay out at that many elements a thread.
+constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / elem_bytes; }
 
+// THE BUILDS, GENERATED FROM THE TUNED TABLE (builds.py, at configure): each kernel's,
+// `kBuilds_<kernel>`, the build half of every config the table lists. A two-shot's INT4
+// build is a config moving int4, listed as any other. WHY THE TABLE HOLDS THESE BUILDS, the
+// sweeps that chose them (the lists they were, kept as their history):
+//
 // The norms: one-shot, the push two-shot (a column split), the pull two-shot (a
 // row split). Not swept: select cuts it to the rows, so it matters only past 16
 // rows. The plain one-shot: a tile a row high, a group a thread wide, at each
 // block size a launch may take. The grid is the size's (kAllReduceKernels,
 // which picks among these).
-constexpr BuildConfig kAllReduceOneShotConfigs[] = {
-    AllReduceBuildConfig{{64, 1, 1}, 1, 1, 512},
-    AllReduceBuildConfig{{128, 1, 1}, 1, 1, 1024},
-    AllReduceBuildConfig{{256, 1, 1}, 1, 1, 2048},
-    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 4096},
-};
+//
 // THE PUSHED ONE-SHOT (the flag in the line): a tile a row high, a pack a
 // thread; aiter's ar_ll_gfx9 runs 256 threads of one 8-byte packet each, 1024
 // elements a block (7 blocks at 7168), which {128, 1, 1, 1024} matches block for
 // block at a 16-byte pack a thread. Every build's tile fits a lines slot
 // (handle.cuh's kLineSlotBytes, checked below). Not swept yet.
-constexpr BuildConfig kAllReducePushOneShotConfigs[] = {
-    AllReduceBuildConfig{{64, 1, 1}, 1, 1, 512},
-    AllReduceBuildConfig{{128, 1, 1}, 1, 1, 1024},
-    AllReduceBuildConfig{{256, 1, 1}, 1, 1, 1024},
-};
-// THE PUSHED ONE-SHOT'S PACK: a line's payload (kernels/all_reduce.cuh), so its
-// builds lay out at that many elements a thread.
-constexpr int push_one_shot_pack(int elem_bytes) { return kLinePayloadBytes / elem_bytes; }
+//
 // The plain two-shot: 512 threads divided into whole waves per peer. The
 // eight-rank tile is 512 elements; four and two ranks need 1024 and 2048
 // elements respectively so every lane owns a complete pack. Keep the tuned
 // eight-rank build first; fallback picks use the smallest valid tile below.
-constexpr BuildConfig kAllReduceTwoShotExactConfigs[] = {
-    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 512},
-    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 1024},
-    AllReduceBuildConfig{{512, 1, 1}, 1, 1, 2048},
-};
-constexpr auto kAllReduceTwoShotConfigs = and_int4(kAllReduceTwoShotExactConfigs);
-constexpr BuildConfig kRmsNormOneShotConfigs[] = {
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
-};
+//
 // 256 the best of 48-256 at 192-256 tokens (15.17 and 18.04 against 15.55
 // and 18.11 at 128; 2026-10-01T03-26-44Z); a row a block below that.
-constexpr BuildConfig kRmsNormPushExactConfigs[] = {
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
-};
-constexpr auto kRmsNormPushConfigs = and_int4(kRmsNormPushExactConfigs);
+//
 // Pipelined, 48 the best of 36-96 at 2048-4096 tokens (79.3 and 145.4
 // against 81.0 and 147.6 at 36), within 0.8 of 36 below (2026-10-01T02-59-52Z).
 // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32 threads
 // (kRmsNormInt4Kernels).
-constexpr BuildConfig kRmsNormPullConfigs[] = {
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, Quantization::int4},
-    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, Quantization::int4},
-};
+//
 // Not swept: rms_norm's.
-constexpr BuildConfig kAddRmsNormOneShotConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
-};
+//
 // 256 the best of 48-256 at 192 tokens (15.48 against 16.75 at 128;
 // 2026-10-01T03-26-44Z).
-constexpr BuildConfig kAddRmsNormPushExactConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 16384},
-};
-constexpr auto kAddRmsNormPushConfigs = and_int4(kAddRmsNormPushExactConfigs);
+//
 // 48 the best of 36-96 at every size from 512 to 4096 tokens (80.6 and 149.7 us
 // at 2048 and 4096 against 84.3 and 154.7 at 36; 2026-10-01T02-59-52Z).
 // INT4 a group a thread, as rms_norm's.
-constexpr BuildConfig kAddRmsNormPullConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, Quantization::int4},
-    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, Quantization::int4},
-};
-
+//
 // AttnRes, one source a step (TILE_K): at 4 (Triton's tile) the row got
 // slower, 6.48 -> 8.16 us a row and 147.5 -> 171.0 at 4096 tokens, with 100 ->
 // 166 VGPRs (stamps 2026-10-01T06-26-55Z against 04-15-48Z). The one-shot's
 // grid not swept: the norms'.
-constexpr BuildConfig kAttnResOneShotConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
-};
+//
 // 256 the best of 32-256 at 256-1024 tokens (34.58, 70.78, 143.98
 // against 39.93, 83.15, 159.33 at 128), a row a block below that
 // (2026-10-01T03-57-23Z). 256 threads a block: Triton's program for AttnRes,
 // and more blocks resident at once (AttnRes from local memory took 192.8 /
 // 109.6 / 86.0 us on 192 / 384 / 512 blocks, stamps 2026-10-02T20-36-56Z); its
 // grid not swept yet.
-constexpr BuildConfig kAttnResPushExactConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
-};
-constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
+//
 // The column split wants a wide grid (AttnRes is compute a row): at 7168, 192
 // is within about 5% of the best of 16-256 from 512 to 4096 tokens; 4096 at
 // 447.2 us against 1160.7 at the 36 it had (2026-10-01T22-56-58Z,
@@ -2536,56 +2474,16 @@ constexpr auto kAttnResPushConfigs = and_int4(kAttnResPushExactConfigs);
 // returns is a config field the kernel reads.
 // 256 threads as the push's, its grid doubled (not swept yet). TILE_M 2 and 4
 // are no longer built: they lost at every grid, and 4 spilled 25-30 VGPRs.
-constexpr BuildConfig kAttnResPullConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 2, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 4},
-    // INT4 A GROUP A THREAD (the kernel's INT4 body): a block one row's groups, TILE_N / 32
-    // threads, a row a tile (kAttnResInt4Kernels).
-    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 3, Quantization::int4},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3, Quantization::int4},
-};
-
+//
 // OUR SEPARATE NORM KERNELS (rms_norm_rows and add_rms_norm_rows, the second kernel of a norm op
 // Python composes after our all-reduce): a row a tile, Layout::tile, a block's threads along the
 // row. Exact: no peer, nothing crosses a link.
-constexpr BuildConfig kRmsNormRowsConfigs[] = {
-    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
-    AllReduceRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-};
-constexpr BuildConfig kAddRmsNormRowsConfigs[] = {
-    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096},
-    AllReduceAddRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192},
-    AllReduceAddRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192},
-};
+//
 // OUR SEPARATE ATTNRES KERNEL (add_attn_res_rms_norm_rows, the second kernel of AttnRes as Python
 // composes it): a row a tile, the fused pull's exact tile (TILE_N a row's packs over the threads,
 // Layout::tile), at Triton's AttnRes program (256 threads, a source a step: the reference's prefill
 // config) and the neighbours a sweep picks among. Exact, as the norms'.
-constexpr BuildConfig kAttnResRowsConfigs[] = {
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 4096, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{128, 1, 1}, 1, 1, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 2, 4096, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 1},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 2},
-    AllReduceAddAttnResRmsNormBuildConfig{{256, 1, 1}, 1, 1, 8192, 3},
-    AllReduceAddAttnResRmsNormBuildConfig{{512, 1, 1}, 1, 1, 8192, 1},
-};
+#include "hip_custom_communicator_builds.inc"
 
 // What each template is, in Template's order: its op, its shot, and its builds.
 struct TemplateInfo {
@@ -2603,47 +2501,47 @@ struct TemplateInfo {
 
 constexpr TemplateInfo kTemplates[] = {
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot),
-     OpType::all_reduce, Algorithm::one_shot, false, kAllReduceOneShotConfigs},
+     OpType::all_reduce, Algorithm::one_shot, false, kBuilds_all_reduce_pull_one_shot},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot),
-     OpType::all_reduce, Algorithm::two_shot, false, kAllReduceTwoShotExactConfigs},
+     OpType::all_reduce, Algorithm::two_shot, false, kBuilds_all_reduce_pull_two_shot},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot_rms_norm),
-     OpType::all_reduce_rms_norm, Algorithm::one_shot, false, kRmsNormOneShotConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::one_shot, false, kBuilds_all_reduce_pull_one_shot_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot_rms_norm),
-     OpType::all_reduce_rms_norm, Algorithm::two_shot, false, kRmsNormPullConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::two_shot, false, kBuilds_all_reduce_pull_two_shot_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_one_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, Algorithm::one_shot, false, kAddRmsNormOneShotConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::one_shot, false, kBuilds_all_reduce_pull_one_shot_add_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_pull_two_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, false, kAddRmsNormPullConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, false, kBuilds_all_reduce_pull_two_shot_add_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_pull_one_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, Algorithm::one_shot, false,
-     kAttnResOneShotConfigs},
+     kBuilds_all_reduce_pull_one_shot_add_attn_res_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_pull_two_shot_add_attn_res_rms_norm),
      OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, false,
-     kAttnResPullConfigs},
+     kBuilds_all_reduce_pull_two_shot_add_attn_res_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot_rms_norm),
-     OpType::all_reduce_rms_norm, Algorithm::two_shot, true, kRmsNormPushConfigs},
+     OpType::all_reduce_rms_norm, Algorithm::two_shot, true, kBuilds_all_reduce_push_two_shot_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot_add_rms_norm),
-     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, true, kAddRmsNormPushConfigs},
+     OpType::all_reduce_add_rms_norm, Algorithm::two_shot, true, kBuilds_all_reduce_push_two_shot_add_rms_norm},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(
          all_reduce_push_two_shot_add_attn_res_rms_norm),
-     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, true, kAttnResPushConfigs},
+     OpType::all_reduce_add_attn_res_rms_norm, Algorithm::two_shot, true, kBuilds_all_reduce_push_two_shot_add_attn_res_rms_norm},
     // Plain push supports exact and INT4 (the one-shot exact only: the flag in the line, its own
     // builds); plain pull supports exact only.
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_one_shot),
-     OpType::all_reduce, Algorithm::one_shot, true, kAllReducePushOneShotConfigs},
+     OpType::all_reduce, Algorithm::one_shot, true, kBuilds_all_reduce_push_one_shot},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(all_reduce_push_two_shot),
-     OpType::all_reduce, Algorithm::two_shot, true, kAllReduceTwoShotConfigs},
+     OpType::all_reduce, Algorithm::two_shot, true, kBuilds_all_reduce_push_two_shot},
     // THE NORMS ON THIS RANK'S ROWS (Algorithm::rows; STANDARDS 3.2, *We win at the op level*):
     // the second kernel of an op Python composes as two kernels of ours, our all-reduce and then
     // this, on its own grid at its own occupancy.
     {HIP_CUSTOM_COMMUNICATOR_NAMED(add_attn_res_rms_norm_rows),
-     OpType::add_attn_res_rms_norm, Algorithm::rows, false, kAttnResRowsConfigs},
+     OpType::add_attn_res_rms_norm, Algorithm::rows, false, kBuilds_add_attn_res_rms_norm_rows},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(rms_norm_rows),
-     OpType::rms_norm, Algorithm::rows, false, kRmsNormRowsConfigs},
+     OpType::rms_norm, Algorithm::rows, false, kBuilds_rms_norm_rows},
     {HIP_CUSTOM_COMMUNICATOR_NAMED(add_rms_norm_rows),
-     OpType::add_rms_norm, Algorithm::rows, false, kAddRmsNormRowsConfigs},
+     OpType::add_rms_norm, Algorithm::rows, false, kBuilds_add_rms_norm_rows},
 };
 #undef HIP_CUSTOM_COMMUNICATOR_NAMED
 constexpr int kNumTemplates = sizeof(kTemplates) / sizeof(TemplateInfo);
@@ -2778,7 +2676,7 @@ constexpr bool two_shot_lays_out(const AllReduceBuildConfig& c, int world,
 // EVERY PUSHED ONE-SHOT BUILD'S TILE FITS A LINES SLOT (handle.cuh's LINES) at
 // every built dtype.
 constexpr bool push_one_shot_tiles_fit() {
-  for (const BuildConfig& b : kAllReducePushOneShotConfigs)
+  for (const BuildConfig& b : kBuilds_all_reduce_push_one_shot)
     for (const DType d : kBuild.supports.dtypes)
       if (tile_m_of(b) != 1 || tile_n_of(b) * elem_bytes(d) > kLineSlotBytes) return false;
   return true;

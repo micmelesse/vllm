@@ -1544,6 +1544,23 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   list(FILTER VLLM_HCC_ARCHES INCLUDE REGEX "gfx950")
   if(VLLM_HCC_ARCHES)
     message(STATUS "Building hip_custom_communicator for archs: ${VLLM_HCC_ARCHES}")
+    # ITS BUILDS ARE THE TUNED TABLE'S CONFIGS: builds.py writes the build half of every config the
+    # table lists on these archs, which the host file includes; editing the table reconfigures.
+    # Generated at configure as Machete's and Marlin's kernel instances are (above).
+    set(VLLM_HCC_TABLE
+      ${CMAKE_CURRENT_SOURCE_DIR}/vllm/distributed/device_communicators/hip_custom_communicator.json)
+    set(VLLM_HCC_BUILDS_SCRIPT
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/rocm/hip_custom_communicator/builds.py)
+    set(VLLM_HCC_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/hip_custom_communicator_generated)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${VLLM_HCC_TABLE} ${VLLM_HCC_BUILDS_SCRIPT})
+    execute_process(
+      COMMAND ${Python_EXECUTABLE} ${VLLM_HCC_BUILDS_SCRIPT} ${VLLM_HCC_TABLE}
+        ${VLLM_HCC_GENERATED}/hip_custom_communicator_builds.inc "${VLLM_HCC_ARCHES}"
+      RESULT_VARIABLE VLLM_HCC_BUILDS_RESULT)
+    if(NOT VLLM_HCC_BUILDS_RESULT EQUAL 0)
+      message(FATAL_ERROR "hip_custom_communicator: builds.py failed on ${VLLM_HCC_TABLE}")
+    endif()
     set(VLLM_HCC_SRC "csrc/rocm/hip_custom_communicator.cu")
     hipify_sources_target(VLLM_HCC_HIP_SRCS _rocm_C_hcc "${VLLM_HCC_SRC}")
     unset(_VLLM_LAST_HIPIFY_TARGET)
@@ -1553,7 +1570,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     set_target_properties(_rocm_C_hcc PROPERTIES
       ${VLLM_GPU_LANG}_ARCHITECTURES "${VLLM_HCC_ARCHES}"
       POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(_rocm_C_hcc PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+    target_include_directories(_rocm_C_hcc PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/csrc
+      ${VLLM_HCC_GENERATED})
     target_compile_options(_rocm_C_hcc PRIVATE
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>)
     # KERNEL ARGUMENTS PRELOADED into SGPRs (LLVM AMDGPUUsage, "Preloaded Kernel Arguments",

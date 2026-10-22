@@ -1154,6 +1154,25 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
             assert not int4, name
 
 
+def test_the_builds_are_the_tables_configs() -> None:
+    """What the build compiled is the build half of every config the tuned table
+    lists on gfx950, each kernel's in the order the file first names them (builds.py,
+    at configure): no build without a config, no config without its build."""
+    import vllm._rocm_C  # noqa: F401
+
+    raw = json.loads(_TABLE.read_text())
+    fields = ("block_x", "block_y", "block_z", "waves_per_eu")
+    fields += ("tile_m", "tile_n", "tile_k", "quantization")
+    want: dict[str, list[dict[str, int | str]]] = {}
+    for op in raw.values():
+        for c in op["configs"]["gfx950"]:
+            b = {f: c[f] for f in fields}
+            if b not in want.setdefault(c["kernel"], []):
+                want[c["kernel"]].append(b)
+    got = {name: list(t.builds) for name, t in build_info().templates.items()}
+    assert got == want
+
+
 def test_the_tuned_table_is_the_arch_file() -> None:
     """The arch's tuned table (`hip_custom_communicator.json`) checks: every tuned op's
     inputs, each running one kernel of its op or our all-reduce then its norm on
