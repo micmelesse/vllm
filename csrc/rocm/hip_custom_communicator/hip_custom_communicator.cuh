@@ -168,23 +168,6 @@ constexpr int kMaxResidentBlocks = resident_waves(kTarget);
 // plus one. Beyond it there is no load path, only a network collective.
 constexpr int kMaxPeers = kTarget.xgmi_links + 1;
 
-// THE MACHINE MODEL: what the device holds, from its `Hardware`.
-
-// Vector registers a thread may use when a block of `threads` must fit on one
-// CU (a kernel's
-// __launch_bounds__(threads, 1)): its SIMD's file shared by the waves the block
-// puts there, and at most the architectural and accumulation registers
-// together.
-constexpr int vgprs_per_thread(const Hardware& hw, int threads) {
-  const int waves = (threads + hw.wave_size - 1) / hw.wave_size;
-  const int waves_on_simd = (waves + hw.simds_per_cu - 1) / hw.simds_per_cu;
-  const int64_t per_lane =
-      hw.vgpr_file_bytes / hw.simds_per_cu / hw.wave_size / 4;
-  const int64_t v = per_lane / waves_on_simd;
-  const int64_t cap = hw.arch_vgprs + hw.acc_vgprs;
-  return static_cast<int>(v < cap ? v : cap);
-}
-
 
 // =================================================================================================
 // BUILD
@@ -223,13 +206,8 @@ struct BuildInfo {
   struct Memory {
     int pack_bytes;  // a pack: the unit every kernel loads, sums and stores in
   };
-  struct Kernels {
-    int max_threads;  // the widest block, and every kernel's __launch_bounds__
-    int max_waves;    // its waves
-  };
   Supports supports;
   Memory memory;
-  Kernels kernels;
 };
 
 constexpr BuildInfo derive(const Hardware& hw) {
@@ -245,16 +223,11 @@ constexpr BuildInfo derive(const Hardware& hw) {
   // THE EXCHANGE (partials and inputs) IS NOT HERE: it is sized at open from
   // the largest call the communicator serves (config.cuh's `exchange_sizes`),
   // never a constant.
-
-  BuildInfo::Kernels& b = info.kernels;
-
-  // THE WIDEST BLOCK WHOSE THREADS KEEP EVERY ARCHITECTURAL REGISTER. A bound
-  // is a register trade: at 1024 threads a gfx950 thread gets 128 and the row
-  // kernels spill (AttnRes at 2 packs; ISA 2026-09-29T23-48-40Z).
-  b.max_threads = hw.wave_size;
-  for (int t = hw.wave_size; t <= hw.max_workgroup; t += hw.wave_size)
-    if (vgprs_per_thread(hw, t) >= hw.arch_vgprs) b.max_threads = t;
-  b.max_waves = b.max_threads / hw.wave_size;
+  // THE BLOCK IS NOT HERE EITHER: a build's block is its config's, any the device
+  // launches (the forcing's range, max_workgroup). A wide block is a register
+  // trade (at 1024 threads a gfx950 thread gets 128 and the row kernels spill:
+  // AttnRes at 2 packs, ISA 2026-09-29T23-48-40Z), which the tune measures; it
+  // is no refusal (STANDARDS 3.2).
 
   return info;
 }
@@ -279,9 +252,6 @@ constexpr bool world_built(int world) {
   return built_in(kBuild.supports.worlds, world);
 }
 
-static_assert(kBuild.kernels.max_threads <= kTarget.max_workgroup &&
-                  kBuild.kernels.max_threads % kTarget.wave_size == 0,
-              "the block limit must be whole waves the device can launch");
 
 
 // THE PEERS' LIMITS, for the layouts host and device share (the signal block, handle.cuh): at
@@ -803,9 +773,10 @@ constexpr const char* to_string(Error e) {
       return "tile_not_built: no build of the template has that TILE_M or "
              "TILE_N";
     case Error::launch_out_of_range:
-      return "launch_out_of_range: the block is whole waves up to the build's "
-             "maximum and the grid at least 1 and at most the resident maximum, "
-             "each over the dimensions its kernel indexes (x alone: y and z 1)";
+      return "launch_out_of_range: the block is whole waves up to the device's "
+             "workgroup and the grid at least 1 and at most the resident maximum "
+             "(the pushed one-shot's, its unfenced region's blocks), each over the "
+             "dimensions its kernel indexes (x alone: y and z 1)";
     case Error::field_not_positive:
       return "field_not_positive: a forced config field is positive";
     case Error::field_not_this_templates:
@@ -2829,8 +2800,11 @@ inline std::optional<Template> template_named(std::string_view name) {
 }
 
 // THE FORCED CONFIG of op `o`: template `fn` (its op's), the grid and the block (x alone, every
-// kernel's one dimension: y and z 1) of whole waves up to the build's maximum, waves a EU the CU
-// holds, the tile positive (tile_k 1 where the kernel has no K), the quantization exact or int4.
+// kernel's one dimension: y and z 1) of whole waves up to the device's workgroup (the hardware's
+// limit; a wider block's register trade is the tune's to measure), the grid at most the blocks
+// the signals have slots for (every block the device holds resident: whether this kernel's are is
+// grid_not_resident), waves a EU the CU holds, the tile positive (tile_k 1 where the kernel has
+// no K), the quantization exact or int4. Each limit is the hardware's (STANDARDS 3.2).
 inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3 block,
                                           int waves_per_eu, int tile_m, int tile_n, int tile_k,
                                           int quantization) {
@@ -2838,7 +2812,7 @@ inline std::variant<Chosen, Error> forced(OpType o, Template fn, Dim3 grid, Dim3
   if (quantization != Quantization::exact && quantization != Quantization::int4)
     return Error::no_such_quantization;
   if (!x_alone(block) || !x_alone(grid) || block.x < kTarget.wave_size ||
-      block.x > kBuild.kernels.max_threads || block.x % kTarget.wave_size != 0 || grid.x < 1 ||
+      block.x > kTarget.max_workgroup || block.x % kTarget.wave_size != 0 || grid.x < 1 ||
       grid.x > kMaxBlocks || waves_per_eu < 1 ||
       waves_per_eu > kTarget.max_waves_per_cu / kTarget.simds_per_cu)
     return Error::launch_out_of_range;
