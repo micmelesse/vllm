@@ -1108,9 +1108,11 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 //                                         the pushed all-reduce's inbox
 //   partials   staging end                what this rank publishes of its
 //                                         reduced slice for the all-gather
-//                                         (two-shot only)
-//   scales     partials end               the add-RMS-norm pull two-shot's row
-//                                         scales, a float a row (max_rows)
+//                                         (two-shot only), then, at its end, the
+//                                         add-RMS-norm pull two-shot's INT4 row
+//                                         scales, a float a row (max_rows): a
+//                                         view of the partials (`scales`), fenced
+//                                         as they are
 //
 // Rank r's region is at its arena's base (wherever its IPC opening put it)
 // plus the region's offset, written into the region's device array at open. INT4 IS AN ENCODING, NOT A
@@ -1142,7 +1144,7 @@ constexpr unsigned kArenaMallocFlags = hipDeviceMallocUncached;
 // read (INPUT TABLES).
 //
 // LINES AND EPOCHS, the pushed one-shot's own (kernels/all_reduce.cuh: the flag in the
-// line, no barrier), two more regions after the scales:
+// line, no barrier), one more region after the partials:
 //   lines      the INBOX peers push lines into: [writer, bank * block] rows of a block's
 //              tile, kLineSlotBytes of payload a row, each payload byte two in lines
 //              (common.cuh's Layout::line), two banks: world * 2 * kLineBlocks rows.
@@ -1172,7 +1174,7 @@ struct ArenaLayout {
   int64_t signals = 0;
   int64_t staging = 0;
   int64_t partials = 0;
-  int64_t scales = 0;
+  int64_t scales = 0;  // inside the partials, at their end
   int64_t lines = 0;
   int64_t end = 0;  // the bytes the regions use: the arena's size
 };
@@ -1182,8 +1184,8 @@ inline ArenaLayout arena_layout(int64_t staging_bytes, int64_t partials_bytes,
   l.signals = 0;
   l.staging = l.signals + kSignalsRegionBytes;
   l.partials = l.staging + region_aligned(staging_bytes);
-  l.scales = l.partials + region_aligned(partials_bytes);
-  l.lines = l.scales + region_aligned(scales_bytes);
+  l.scales = l.partials + partials_bytes;  // whole packs: the floats aligned
+  l.lines = l.partials + region_aligned(partials_bytes + scales_bytes);
   l.end = l.lines + region_aligned(lines_bytes);
   return l;
 }
@@ -1692,8 +1694,9 @@ class Handle {
   }
   int partials_ptr_array_size() const { return world_size_; }
   // EVERY RANK'S ROW SCALES (the add-RMS-norm pull two-shot's ADD_RESIDUAL: a float a row it owns,
-  // which its peers read while gathering), [max_rows] floats a rank, its own region: a device array
-  // of every rank's address of it with its size, the world.
+  // which its peers read while gathering), [max_rows] floats a rank at the partials' end (a view of
+  // that region, past what `partials_bytes` counts): a device array of every rank's address of it
+  // with its size, the world.
   float* const* scales_ptr_array() const {
     return reinterpret_cast<float* const*>(region_ptr_arrays_ + kScalesArray * kMaxRanks);
   }
