@@ -2,21 +2,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """THE BUILDS, FROM THE TUNED TABLE: what the compile instantiates is the build half
-of every config the table lists on the archs built (its kernel, block, waves, tile and
-quantization; the grid is the launch's, never compiled), each kernel's builds in the
-order the file first names them. CMake runs this at configure (the table and this file
+of every config the table lists on the archs built (its kernel, algorithm, direction,
+block, waves, tile and quantization; the grid is the launch's, never compiled), each
+kernel's builds in the order the file first names them. The table is the format
+`FORMAT` names (`hip_custom_communicator.tuned_map` 0.2: a config's `kernel` its op's
+one kernel, `algorithm` and `direction` the variant of it). CMake runs this at configure (the table and this file
 are configure dependencies), and the host file includes what it writes: one
 `constexpr BuildConfig` array a template, `kBuilds_<kernel>`. A config of the table is
 then always a build, and a build is always in the table. The pattern is vLLM's own:
 Machete's `generate.py` and Marlin's `generate_kernels.py` write their kernel instances
 at configure the same way (CMakeLists.txt).
 
-    python3 builds.py <hip_custom_communicator.json> <out.inc> <arch>[;<arch>...]
-        <host.cuh>
+    python3 builds.py <hip_custom_communicator.json> <out.inc> <arch>[;<arch>...] <host.cuh>
 
 A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input names, which gp's tune adds
 on its own copy of the table and prunes when it writes. A file NAMES ITS BUILD
-(`hip_custom_communicator_<kernel>__<block>_w<waves>_t<tile>_<q>.hip`; the manifest
+(`hip_custom_communicator_<kernel>_<algorithm>_<direction>__<block>_w<waves>_t<tile>_<q>.hip`;
+the manifest
 `hip_custom_communicator_instances.json` says each file's builds: every build whose
 instances it holds), so a rebuild with other candidates recompiles only the new ones,
 and a candidate the compiler refuses (a kernel's static_assert) is found by its file.
@@ -27,8 +29,12 @@ import re
 import sys
 from pathlib import Path
 
+# THE TABLE'S FORMAT AND VERSION (the communicator checks the same).
+FORMAT = {"format": "hip_custom_communicator.tuned_map", "version": "0.2"}
 # A BUILD'S FIELDS, in the table's order.
 FIELDS = (
+    "algorithm",
+    "direction",
     "block_x",
     "block_y",
     "block_z",
@@ -39,23 +45,41 @@ FIELDS = (
     "quantization",
 )
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
+ALGORITHMS = {"one_shot": "Algorithm::one_shot", "two_shot": "Algorithm::two_shot",
+              "rows": "Algorithm::rows"}
+DIRECTIONS = {"pull": "Direction::pull", "push": "Direction::push"}
+
+
+# EACH KERNEL'S BuildConfig (a fused op's, or its norm's: one type an op family).
+FAMILIES = {
+    "all_reduce": "AllReduceBuildConfig",
+    "all_reduce_rms_norm": "AllReduceRmsNormBuildConfig",
+    "rms_norm_rows": "AllReduceRmsNormBuildConfig",
+    "all_reduce_add_rms_norm": "AllReduceAddRmsNormBuildConfig",
+    "add_rms_norm_rows": "AllReduceAddRmsNormBuildConfig",
+    "all_reduce_add_attn_res_rms_norm": "AllReduceAddAttnResRmsNormBuildConfig",
+    "add_attn_res_rms_norm_rows": "AllReduceAddAttnResRmsNormBuildConfig",
+}
 
 
 def family(kernel: str) -> str:
     """The op's BuildConfig a kernel's builds are (a fused op's, or its norm's)."""
-    if kernel.endswith(("add_attn_res_rms_norm", "add_attn_res_rms_norm_rows")):
-        return "AllReduceAddAttnResRmsNormBuildConfig"
-    if kernel.endswith(("add_rms_norm", "add_rms_norm_rows")):
-        return "AllReduceAddRmsNormBuildConfig"
-    if kernel.endswith(("rms_norm", "rms_norm_rows")):
-        return "AllReduceRmsNormBuildConfig"
-    return "AllReduceBuildConfig"
+    return FAMILIES[kernel]
+
+
+def ops(table: dict) -> list[dict]:
+    """The table's ops, its format checked."""
+    if {k: table.get(k) for k in FORMAT} != FORMAT:
+        raise SystemExit(
+            f"the tuned table is not {FORMAT}: {({k: table.get(k) for k in FORMAT})}"
+        )
+    return [v for k, v in table.items() if k not in FORMAT]
 
 
 def builds(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
     """Each kernel's builds, deduplicated, in the order the file first names them."""
     out: dict[str, list[tuple]] = {}
-    for op in table.values():
+    for op in ops(table):
         for arch in archs:
             for c in op["configs"].get(arch, []):
                 b = tuple(c[f] for f in FIELDS)
@@ -65,8 +89,9 @@ def builds(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
 
 
 def literal(kernel: str, b: tuple) -> str:
-    bx, by, bz, waves, tm, tn, tk, q = b
-    fields = [f"{{{bx}, {by}, {bz}}}", str(waves), str(tm), str(tn)]
+    algorithm, direction, bx, by, bz, waves, tm, tn, tk, q = b
+    fields = [ALGORITHMS[algorithm], DIRECTIONS[direction]]
+    fields += [f"{{{bx}, {by}, {bz}}}", str(waves), str(tm), str(tn)]
     if family(kernel) == "AllReduceAddAttnResRmsNormBuildConfig":
         fields.append(str(tk))
     elif tk != 1:
@@ -84,12 +109,9 @@ WORLDS = (2, 4, 8)
 LINE_PAYLOAD_BYTES = (
     8  # the pushed one-shot's pack: a line's payload (common.cuh's kLinePayloadBytes)
 )
-PLAIN = (
-    "all_reduce_pull_one_shot",
-    "all_reduce_pull_two_shot",
-    "all_reduce_push_one_shot",
-    "all_reduce_push_two_shot",
-)
+# THE ALGORITHMS AND DIRECTIONS as the template arguments (common.cuh's ints) name them.
+ALGORITHM_VALUES = {"one_shot": 0, "two_shot": 1, "rows": 2}
+DIRECTION_VALUES = {"pull": 0, "push": 1}
 HEADERS = (
     "kernels/all_reduce.cuh",
     "kernels/all_reduce_add_attn_res_rms_norm.cuh",
@@ -104,13 +126,24 @@ def arguments(host: str) -> dict[str, str]:
     body = body[: body.index("\n}\n")]
     out = {}
     for m in re.finditer(
-        r"C\.kernel == Kernel::(\w+)\)\s*return reinterpret_cast<const void\*>\(\s*"
+        r"C\.kernel == Template::(\w+)\)\s*return reinterpret_cast<const void\*>\(\s*"
         r"(\w+)<(.*?)>\);",
         body,
         re.S,
     ):
         assert m.group(1) == m.group(2), m.group(0)
         out[m.group(1)] = " ".join(m.group(3).split())
+    return out
+
+
+def variants(host: str) -> dict[str, list[tuple[str, str]]]:
+    """Each kernel's variants as the host lists them (`kVariants_<kernel>`: the algorithm
+    and direction pairs its op file has a body for), by kernel."""
+    out = {}
+    for m in re.finditer(r"constexpr Variant kVariants_(\w+)\[\] = \{(.*?)\};", host, re.S):
+        out[m.group(1)] = re.findall(
+            r"\{Algorithm::(\w+), Direction::(\w+)\}", m.group(2)
+        )
     return out
 
 
@@ -123,14 +156,14 @@ def lays_out(kernel: str, b: tuple, world: int) -> bool:
     builds do, but for an INT4 pulled norm or AttnRes whose tile is not whole groups a
     thread (TILE_N a multiple of 32 * THREADS), which its kernel's static_assert refuses
     by name (a thread quantizes whole groups alone)."""
-    block, _, _, _, tile_m, tile_n, _, _ = b
-    if kernel == "all_reduce_push_one_shot":
-        nl = LINE_PAYLOAD_BYTES // 2
-    elif kernel in PLAIN:
-        nl = PACK_BYTES // 2
-    else:
+    algorithm, direction, block, _, _, _, tile_m, tile_n, _, _ = b
+    if kernel != "all_reduce":
         return True
-    if "one_shot" in kernel:
+    if (algorithm, direction) == ("one_shot", "push"):
+        nl = LINE_PAYLOAD_BYTES // 2
+    else:
+        nl = PACK_BYTES // 2
+    if algorithm == "one_shot":
         return tile_n % nl == 0
     return tile_m == 1 and block % world == 0 and tile_n % nl == 0
 
@@ -140,22 +173,25 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
     each dtype and world, the weight's dtype where a norm takes one, contiguous or not
     (the plain two-shots), chunked or not (every kernel but the plain all-reduce's),
     with a tail or not (an INT4 two-shot); one that does not lay out has none."""
-    block, _, _, waves, tile_m, tile_n, tile_k, q = b
-    two_shot = "two_shot" in kernel
+    algorithm, direction, block, _, _, waves, tile_m, tile_n, tile_k, q = b
+    two_shot = algorithm == "two_shot"
+    plain = kernel == "all_reduce"
     out: list[str] = []
     for _, t in DTYPES:
         for world in WORLDS:
             if not lays_out(kernel, b, world):
                 continue
-            weighted = (
-                kernel.endswith(("rms_norm", "rms_norm_rows"))
-                and "attn_res" not in kernel
+            weighted = kernel in (
+                "all_reduce_rms_norm",
+                "rms_norm_rows",
+                "all_reduce_add_rms_norm",
+                "add_rms_norm_rows",
             )
             for w in (t, "float") if weighted else (t,):
                 for contiguous in (
-                    ("true", "false") if kernel in PLAIN and two_shot else ("false",)
+                    ("true", "false") if plain and two_shot else ("false",)
                 ):
-                    for chunked in ("false",) if kernel in PLAIN else ("true", "false"):
+                    for chunked in ("false",) if plain else ("true", "false"):
                         for tail in (
                             ("true", "false")
                             if q == "int4" and two_shot
@@ -173,6 +209,8 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                                 "C.pack_bytes": str(PACK_BYTES),
                                 "C.waves_per_eu": str(waves),
                                 "C.quantization": "1" if q == "int4" else "0",
+                                "C.algorithm": str(ALGORITHM_VALUES[algorithm]),
+                                "C.direction": str(DIRECTION_VALUES[direction]),
                                 "C.contiguous": contiguous,
                                 "C.chunked": chunked,
                                 "C.tail": tail,
@@ -185,10 +223,17 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
 
 def main() -> None:
     table_path, out_path, arch_list = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
-    host = Path(sys.argv[4]).read_text() if len(sys.argv) > 4 else None
+    host = Path(sys.argv[4]).read_text()
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
     table = json.loads(Path(table_path).read_text())
     every = builds(table, archs)
+    # EVERY BUILD ONE OF ITS KERNEL'S VARIANTS (the host's kVariants_<kernel>; its own
+    # static_assert says the same at compile time, this says it naming the config).
+    has = variants(host)
+    for kernel, bs in every.items():
+        for b in bs:
+            if kernel not in has or tuple(b[:2]) not in has[kernel]:
+                raise SystemExit(f"{kernel} has no {b[0]} {b[1]} variant: {b}")
     text = [
         "// GENERATED by csrc/rocm/hip_custom_communicator/builds.py from the tuned",
         f"// table (hip_custom_communicator.json) on {', '.join(archs)}: every",
@@ -201,8 +246,6 @@ def main() -> None:
         text += [literal(kernel, b) for b in bs]
         text += ["};", ""]
     write(out_path, "\n".join(text))
-    if host is None:
-        return
     # THE INSTANCES, ONE FILE A BUILD (compiled in parallel, cached each), and the
     # header the host includes so that it instantiates none itself: each declared
     # `extern template` by its own type.
@@ -210,8 +253,8 @@ def main() -> None:
     out_dir = out_path.parent
     declared = [
         "// GENERATED by builds.py: every kernel instance, compiled in its build's own",
-        "// file (hip_custom_communicator_<kernel>__<build>.hip); declared here so the host",
-        "// instantiates none.",
+        "// file (hip_custom_communicator_<kernel>_<algorithm>_<direction>__<build>.hip);",
+        "// declared here so the host instantiates none.",
         f"static_assert(kTarget.wave_size == {WAVE_SIZE} && "
         f"kBuild.memory.pack_bytes == "
         f"{PACK_BYTES}, \"builds.py's wave and pack are not the host's\");",
@@ -221,6 +264,11 @@ def main() -> None:
         "static_assert(kBuild.supports.dtypes == std::array<DType, 2>{"
         + ", ".join(f"DType::{d}" for d, _ in DTYPES)
         + "}, \"builds.py's dtypes are not the host's\");",
+        "static_assert("
+        + " && ".join(f"Algorithm::{a} == {v}" for a, v in ALGORITHM_VALUES.items())
+        + " && "
+        + " && ".join(f"Direction::{d} == {v}" for d, v in DIRECTION_VALUES.items())
+        + ", \"builds.py's algorithms and directions are not common.cuh's\");",
         "",
     ]
     files = []
@@ -267,9 +315,9 @@ def main() -> None:
 
 def file_of(kernel: str, b: tuple) -> str:
     """The file a build's instances are compiled in, named by the build."""
-    bx, by, bz, waves, tm, tn, tk, q = b
+    algorithm, direction, bx, by, bz, waves, tm, tn, tk, q = b
     return (
-        f"hip_custom_communicator_{kernel}__{bx}x{by}x{bz}_w{waves}"
+        f"hip_custom_communicator_{kernel}_{algorithm}_{direction}__{bx}x{by}x{bz}_w{waves}"
         f"_t{tm}x{tn}x{tk}_{q}.hip"
     )
 

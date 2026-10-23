@@ -117,8 +117,9 @@ std::tuple<std::vector<std::string>, std::vector<int64_t>, int64_t,
 hip_custom_communicator_build_info();
 
 // Each op once, every argument required (optionality is Python's, and so is the pick: Python's
-// tuned table): its config point last in the essential order (the kernel by name, the grid, the
-// block and its waves a EU, the tile, the quantization "none" or "int4"). The norms on rows are
+// tuned table): its config point last in the essential order (the kernel by name, its algorithm
+// "one_shot", "two_shot" or "rows" and direction "pull" or "push", the grid, the block and its
+// waves a EU, the tile, the quantization "exact" or "int4"). The norms on rows are
 // the second kernel of an op Python composes after our all-reduce. Each returns the Error's
 // number it was refused for, or -1 when it ran (hip_custom_communicator.cu's Answer).
 
@@ -126,6 +127,8 @@ int64_t hip_custom_communicator_all_reduce(
     fptr_t handle_ptr, torch::Tensor& input,
     torch::Tensor& output,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -143,6 +146,8 @@ int64_t hip_custom_communicator_all_reduce_rms_norm(
     torch::Tensor& output,
     double eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -162,6 +167,8 @@ int64_t hip_custom_communicator_all_reduce_add_rms_norm(
     torch::Tensor& residual_output,
     double eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -187,6 +194,8 @@ int64_t hip_custom_communicator_all_reduce_add_attn_res_rms_norm(
     double eps,
     double output_eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -204,6 +213,8 @@ int64_t hip_custom_communicator_rms_norm(
     torch::Tensor& output,
     double eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -223,6 +234,8 @@ int64_t hip_custom_communicator_add_rms_norm(
     torch::Tensor& residual_output,
     double eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
@@ -248,6 +261,8 @@ int64_t hip_custom_communicator_add_attn_res_rms_norm(
     double eps,
     double output_eps,
     const std::string& kernel,
+    const std::string& algorithm,
+    const std::string& direction,
     int64_t grid_x,
     int64_t grid_y,
     int64_t grid_z,
