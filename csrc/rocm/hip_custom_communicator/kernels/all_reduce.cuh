@@ -50,8 +50,8 @@ namespace hip_custom_communicator {
 // loop: nothing is staged, so any size runs in one pass.
 // =============================================================================
 
-// THE BUFFER AS [m, n], every rank's at the table's strides (input_stride_m,
-// input_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
+// THE BUFFER AS [m, n], every rank's at the table's strides (input_ptr_array_stride_m,
+// input_ptr_array_stride_n), a work item a TILE_M x TILE_N tile, the grid striding over
 // the tiles row-major. ANY BUILD WALKS ITS TILE (the dense map, STANDARDS 3.2):
 // TILE_M rows of threads a row each where they divide the block, else one row of
 // threads looping over the rows; a row of threads' packs in kPacks steps, the
@@ -64,11 +64,22 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLO
           int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_one_shot(
-        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+        int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
-        uint32_t* const* signals_ptr_array, int signals_ptr_array_size,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
+        int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+        char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
+        int64_t unfenced_stride_slot, int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+        int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+        int32_t* __restrict__ unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
+        int unfenced_epochs_size_n,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
         int signals_size_block, int signals_size_writer,
@@ -104,7 +115,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     DTYPE peers[WORLD][kRows][kPacks][kPackElems];
 #pragma unroll
     for (int r = 0; r < WORLD; ++r)
-      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_stride_m, input_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
+      recv<WORLD, TILE_M, THREADS_PER_BLOCK, WAVE_SIZE, Quantization::exact, Layout::tile>(&input_entries[r], 1, 0, 0, 0, input_ptr_array_stride_m, input_ptr_array_stride_n, 1, input_size_m, input_size_n, input_size_m, clip_n, peers[r], t / tiles_n * TILE_M, t % tiles_n * TILE_N, 1);
     // Summed in rank order in fp32, rounded to DTYPE once: every rank sums the same copies in the
     // same order, so every rank's sums agree bitwise.
     DTYPE rounded[kRows][kPacks][kPackElems];
@@ -147,12 +158,21 @@ template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLO
           int PACK_BYTES, int WAVES_PER_EU, bool CONTIGUOUS, int QUANTIZATION>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_pull_two_shot(
-        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size, int64_t input_stride_m,
+        const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+        int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
         char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+        char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
+        int64_t unfenced_stride_slot, int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+        int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+        int32_t* __restrict__ unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
+        int unfenced_epochs_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
@@ -170,7 +190,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     //    reading this band of this rank's input.
     reduce_scatter<WORLD, TILE_M, TILE_N, THREADS_PER_BLOCK, WAVE_SIZE, PACK_BYTES, Quantization::exact, CONTIGUOUS, Walk::flat, Accumulate::lds, Direction::pull, Until::started, false>(
         static_cast<const DTYPE*>(nullptr), 0, 1, band, input_size_n, input_ptr_array,
-        input_ptr_array_size, input_stride_m, input_stride_n, nullptr, 0, 0, 1, 0, 0,
+        input_ptr_array_size, input_ptr_array_stride_m, input_ptr_array_stride_n, nullptr, 0, 0, 1, 0, 0,
         partials_ptr_array, partials_ptr_array_size, partials_stride_m, partials_stride_n,
         partials_size_m, partials_size_n, signals_ptr_array, signals_ptr_array_size, signals_stride_parity, signals_stride_block,
         signals_stride_writer, signals_size_parity, signals_size_block,
@@ -232,13 +252,23 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_one_shot(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+        int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
+        char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
+        int64_t partials_stride_n, int partials_size_m, int partials_size_n,
+        char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
+        int64_t staging_stride_n, int staging_size_m, int staging_size_n,
         char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
         int64_t unfenced_stride_slot, int64_t unfenced_stride_m, int64_t unfenced_stride_n,
         int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
         int32_t* __restrict__ unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
         int unfenced_epochs_size_n,
+        uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
+        int64_t signals_stride_parity, int64_t signals_stride_block,
+        int64_t signals_stride_writer, int signals_size_parity,
+        int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
   static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
@@ -374,12 +404,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_push_two_shot(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
         int64_t input_stride_n, int input_size_m, int input_size_n,
+        const DTYPE* const* __restrict__ input_ptr_array, int input_ptr_array_size,
+        int64_t input_ptr_array_stride_m, int64_t input_ptr_array_stride_n,
         DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
         int64_t output_stride_n, int output_size_m, int output_size_n,
         char* const* __restrict__ partials_ptr_array, int partials_ptr_array_size, int64_t partials_stride_m,
         int64_t partials_stride_n, int partials_size_m, int partials_size_n,
         char* const* __restrict__ staging_ptr_array, int staging_ptr_array_size, int64_t staging_stride_m,
         int64_t staging_stride_n, int staging_size_m, int staging_size_n,
+        char* const* __restrict__ unfenced_ptr_array, int unfenced_ptr_array_size,
+        int64_t unfenced_stride_slot, int64_t unfenced_stride_m, int64_t unfenced_stride_n,
+        int unfenced_size_slot, int unfenced_size_m, int unfenced_size_n,
+        int32_t* __restrict__ unfenced_epochs_ptr, int64_t unfenced_epochs_stride_block, int64_t unfenced_epochs_stride_n, int unfenced_epochs_size_block,
+        int unfenced_epochs_size_n,
         uint32_t* const* __restrict__ signals_ptr_array, int signals_ptr_array_size,
         int64_t signals_stride_parity, int64_t signals_stride_block,
         int64_t signals_stride_writer, int signals_size_parity,
