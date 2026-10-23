@@ -6,7 +6,14 @@ of every config the table lists on the archs built (its kernel, algorithm, direc
 block, waves, tile and quantization; the grid is the launch's, never compiled), each
 kernel's builds in the order the file first names them. The table is the format
 `FORMAT` names (`hip_custom_communicator.tuned_map` 0.2: a config's `kernel` its op's
-one kernel, `algorithm` and `direction` the variant of it). CMake runs this at configure (the table and this file
+one kernel, `algorithm` and `direction` the variant of it). EVERY VARIANT OF A SHAPE
+(Michael, October 23): for every build shape the table holds of a kernel (its block,
+waves, tile and quantization: all a build is but its algorithm and direction), the
+kernel is built at every variant it has (the host's `kVariants_<kernel>`) that takes
+that shape (`takes`: a refusal the kernel's math or the hardware forces, which the
+communicator refuses by name at a call), the table's own builds first and in its
+order. So a tune's prune, which drops every config no input names, can drop a shape
+but never a variant of one: every path a call can be forced to take stays compiled. CMake runs this at configure (the table and this file
 are configure dependencies), and the host file includes what it writes: one
 `constexpr BuildConfig` array a template, `kBuilds_<kernel>`. A config of the table is
 then always a build, and a build is always in the table. The pattern is vLLM's own:
@@ -76,8 +83,9 @@ def ops(table: dict) -> list[dict]:
     return [v for k, v in table.items() if k not in FORMAT]
 
 
-def builds(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
-    """Each kernel's builds, deduplicated, in the order the file first names them."""
+def named(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
+    """Each kernel's builds the table names, deduplicated, in the order the file first
+    names them."""
     out: dict[str, list[tuple]] = {}
     for op in ops(table):
         for arch in archs:
@@ -85,6 +93,47 @@ def builds(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
                 b = tuple(c[f] for f in FIELDS)
                 if b not in out.setdefault(c["kernel"], []):
                     out[c["kernel"]].append(b)
+    return out
+
+
+def takes(kernel: str, b: tuple) -> bool:
+    """WHETHER `kernel`'S VARIANT TAKES THE SHAPE: no where the kernel refuses it by
+    construction, as the communicator refuses a call of it by name. INT4 is a two-shot's
+    and not the plain pull's (`quantization_not_supported`: a one-shot reads its peers'
+    inputs as they are); the pushed one-shot's tile is a row that fits its unfenced
+    slot (`push_one_shot_tiles_fit`); a pulled fused two-shot's INT4 tile is whole groups
+    a thread, a row high (its kernel's static_asserts: holes (a) and (b) of the task
+    list); a plain build lays out at some built world (`lays_out`)."""
+    algorithm, direction, block, _, _, _, tile_m, tile_n, _, q = b
+    if q == "int4" and (
+        algorithm != "two_shot" or (kernel == "all_reduce" and direction == "pull")
+    ):
+        return False
+    if kernel == "all_reduce" and (algorithm, direction) == ("one_shot", "push"):
+        if tile_m != 1 or tile_n * 2 > UNFENCED_SLOT_BYTES:
+            return False
+    if (
+        q == "int4"
+        and kernel in FUSED
+        and (algorithm, direction) == ("two_shot", "pull")
+        and (tile_n % (INT4_GROUP * block) != 0 or tile_m != 1)
+    ):
+        return False
+    return any(lays_out(kernel, b, world) for world in WORLDS)
+
+
+def builds(table: dict, archs: list[str], has: dict[str, list[tuple[str, str]]]
+           ) -> dict[str, list[tuple]]:
+    """Each kernel's builds: the table's, in its order, then every variant `has` lists of
+    every shape the table holds of the kernel, where the variant takes it (`takes`)."""
+    out = named(table, archs)
+    for kernel, bs in out.items():
+        shapes = list(dict.fromkeys(b[2:] for b in bs))
+        for shape in shapes:
+            for variant in has[kernel]:
+                b = (*variant, *shape)
+                if b not in bs and takes(kernel, b):
+                    bs.append(b)
     return out
 
 
@@ -109,6 +158,9 @@ WORLDS = (2, 4, 8)
 LINE_PAYLOAD_BYTES = (
     8  # the pushed one-shot's pack: a line's payload (common.cuh's kLinePayloadBytes)
 )
+UNFENCED_SLOT_BYTES = 2048  # a pushed one-shot block's tile, at most (kUnfencedSlotBytes)
+INT4_GROUP = 32  # an INT4 group's elements (common.cuh's kInt4Group)
+FUSED = ("all_reduce_rms_norm", "all_reduce_add_rms_norm", "all_reduce_add_attn_res_rms_norm")
 # THE ALGORITHMS AND DIRECTIONS as the template arguments (common.cuh's ints) name them.
 ALGORITHM_VALUES = {"one_shot": 0, "two_shot": 1, "rows": 2}
 DIRECTION_VALUES = {"pull": 0, "push": 1}
@@ -226,14 +278,15 @@ def main() -> None:
     host = Path(sys.argv[4]).read_text()
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
     table = json.loads(Path(table_path).read_text())
-    every = builds(table, archs)
-    # EVERY BUILD ONE OF ITS KERNEL'S VARIANTS (the host's kVariants_<kernel>; its own
-    # static_assert says the same at compile time, this says it naming the config).
+    # EVERY BUILD THE TABLE NAMES ONE OF ITS KERNEL'S VARIANTS (the host's
+    # kVariants_<kernel>; its own static_assert says the same at compile time, this says
+    # it naming the config).
     has = variants(host)
-    for kernel, bs in every.items():
+    for kernel, bs in named(table, archs).items():
         for b in bs:
             if kernel not in has or tuple(b[:2]) not in has[kernel]:
                 raise SystemExit(f"{kernel} has no {b[0]} {b[1]} variant: {b}")
+    every = builds(table, archs, has)
     text = [
         "// GENERATED by csrc/rocm/hip_custom_communicator/builds.py from the tuned",
         f"// table (hip_custom_communicator.json) on {', '.join(archs)}: every",
@@ -269,6 +322,8 @@ def main() -> None:
         + " && "
         + " && ".join(f"Direction::{d} == {v}" for d, v in DIRECTION_VALUES.items())
         + ", \"builds.py's algorithms and directions are not common.cuh's\");",
+        f"static_assert(kUnfencedSlotBytes == {UNFENCED_SLOT_BYTES} && kInt4Group == "
+        f"{INT4_GROUP}, \"builds.py's unfenced slot and INT4 group are not the host's\");",
         "",
     ]
     files = []
