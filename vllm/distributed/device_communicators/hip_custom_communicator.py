@@ -14,8 +14,7 @@ The caller names an op and Python looks its kernels up in the tuned table
 where it pays): one kernel or, where the op is faster as two kernels of ours, our
 all-reduce and then the op's norm on this rank's rows (`rms_norm`, `add_rms_norm`,
 `add_attn_res_rms_norm`, each a public op). The keyword arguments an op takes after its
-own (a config in its essential order: the kernel by name, its algorithm and direction,
-the grid, the block and its waves a EU, the tile, the quantization) are the one way to
+own (a config in its essential order: the kernel by name, its algorithm, the grid, the block and its waves a EU, the tile, the quantization) are the one way to
 force one, for the tuner and
 the tests: every one or none. C++ takes every field of every call, checks the config,
 and answers -1 or the Error it refused it for: it holds no table and picks nothing.
@@ -90,13 +89,11 @@ _ROWS: Mapping[Op, Op] = {
 # values, or INT4. A communicator's setting for its plain calls, and a config's field.
 Quantization = Literal["exact", "int4"]
 _QUANTIZATIONS: tuple[Quantization, ...] = ("exact", "int4")
-# THE VARIANT OF AN OP'S ONE KERNEL a config runs, C++'s `Algorithm` and `Direction` by
-# name (number for number): a one-shot, a two-shot, or a norm on this rank's rows;
-# pulled or pushed (a norm on rows pulls from no one: `pull`). A config's fields.
-Algorithm = Literal["one_shot", "two_shot", "rows"]
-_ALGORITHMS: tuple[Algorithm, ...] = ("one_shot", "two_shot", "rows")
-Direction = Literal["pull", "push"]
-_DIRECTIONS: tuple[Direction, ...] = ("pull", "push")
+# WHICH BODY OF AN OP'S ONE KERNEL a config runs, C++'s `Algorithm` by name (number for
+# number): a one-shot or a two-shot, pulled or pushed, or a norm on this rank's rows. Exactly
+# the ones that exist. A config's field.
+Algorithm = Literal["one_shot_pull", "one_shot_push", "two_shot_pull", "two_shot_push", "rows"]
+_ALGORITHMS: tuple[Algorithm, ...] = get_args(Algorithm)
 
 
 class Error(IntEnum):
@@ -623,7 +620,7 @@ _DTYPES: Mapping[str, torch.dtype] = {
 class TemplateBuild:
     """One C++ template as built (an op's one kernel): its op, and the builds dispatch
     instantiates (its catalog list), each its fields by name as a forcing passes them
-    (algorithm, direction, block_x, block_y, block_z, waves_per_eu, its tile and its
+    (algorithm, block_x, block_y, block_z, waves_per_eu, its tile and its
     quantization; never the launch, which a forced call gives itself)."""
 
     op: str
@@ -688,10 +685,7 @@ def build_info() -> BuildInfo:
         builds: list[dict[str, int | str]] = []
         for _ in range(count):
             given = dict(zip(fields, flat[at : at + width]))
-            variant = {
-                "algorithm": _ALGORITHMS[given.pop("algorithm")],
-                "direction": _DIRECTIONS[given.pop("direction")],
-            }
+            variant = {"algorithm": _ALGORITHMS[given.pop("algorithm")]}
             q = _QUANTIZATIONS[given.pop("quantization")]
             fields_set = {f: v for f, v in given.items() if v != 0}
             builds.append(variant | fields_set | {"quantization": q})
@@ -813,27 +807,26 @@ class Supported:
 # every arch: the communicator's quantization they were tuned at, world, width and
 # tokens), each naming on each arch the configs a plain call of it launches, in order
 # (one kernel, or our all-reduce then the op's norm on rows), by index; and its
-# `configs` on each arch (the config space tuned there: a kernel, its algorithm and
-# direction, its grid, block, waves, tile and what it moves). Read once, checked at open (`check_table`); a call
+# `configs` on each arch (the config space tuned there: a kernel, its algorithm, its grid,
+# block, waves, tile and what it moves). Read once, checked at open (`check_table`); a call
 # launches its nearest input's configs (`get_nearest_configs`). Every tuned number is
 # here, none in C++. A communicator opened with a `table` of the file's shape runs
 # that one instead (the tuner's candidate).
 _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
-# THE TABLE'S FORMAT: 0.2, a config's kernel its op's one kernel and the variant of it
-# its `algorithm` and `direction` (0.1, unmarked, named one kernel a variant).
+# THE TABLE'S FORMAT: 0.2, a config's kernel its op's one kernel and which of its bodies
+# its `algorithm` (0.1, unmarked, named a kernel a body).
 _TABLE_FORMAT = {"format": "hip_custom_communicator.tuned_map", "version": "0.2"}
 # THE TUNED TABLE AS THE FILE HOLDS IT, parsed: its format, then each op's `inputs`
 # and `configs`.
 TunedTable = dict[str, Any]
 _INPUT_KEYS = frozenset({"quantization", "world", "hidden", "tokens", "config"})
-# A CONFIG POINT'S FIELDS, in their order (C++'s arguments'): the kernel, its algorithm
-# and direction, its grid, its block and the block's waves a EU (__launch_bounds__), its
+# A CONFIG POINT'S FIELDS, in their order (C++'s arguments'): the kernel, its algorithm,
+# its grid, its block and the block's waves a EU (__launch_bounds__), its
 # tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
 # op carries each; all but the kernel and the grid are its build.
 _CONFIG_KEYS = (
     "kernel",
     "algorithm",
-    "direction",
     "grid_x",
     "grid_y",
     "grid_z",
@@ -853,7 +846,7 @@ def check_table(raw: TunedTable, arch: str) -> str | None:
     where every op's plain call runs from it, else why not (an op not tuned on the arch,
     an input with no config there). A table that is not sound raises, naming the entry:
     its format not `_TABLE_FORMAT`'s; every config a kernel the build has, its build
-    (its algorithm and direction among it) one the kernel lists (its grid is
+    (its algorithm among it) one the kernel lists (its grid is
     C++'s to refuse at the call); every input's configs one kernel of its op, or our
     all-reduce then the op's norm on rows; an exact input moving nothing quantized, at
     a built world; every op inputs at each quantization at every built world (the
@@ -933,7 +926,6 @@ def check_table(raw: TunedTable, arch: str) -> str | None:
 def is_config_given(
     kernel: str | None,
     algorithm: Algorithm | None,
-    direction: Direction | None,
     grid_x: int | None,
     grid_y: int | None,
     grid_z: int | None,
@@ -949,7 +941,7 @@ def is_config_given(
     """WHETHER AN OP'S CONFIG IS GIVEN IN ITS ARGUMENTS: every one given (True), or
     none (False: a plain call, the table's pick). Some but not all is no config,
     refused, forced_incomplete: C++ takes every field."""
-    given = (kernel, algorithm, direction, grid_x, grid_y, grid_z)
+    given = (kernel, algorithm, grid_x, grid_y, grid_z)
     given += (block_x, block_y, block_z, waves_per_eu, tile_m, tile_n, tile_k)
     given += (quantization,)
     if None not in given:
@@ -957,8 +949,8 @@ def is_config_given(
     if given == (None,) * len(given):
         return False
     raise RuntimeError(
-        "forced_incomplete: a forced call gives kernel, algorithm, direction, grid x y "
-        "z, block x y z, waves_per_eu, tile m n k and quantization"
+        "forced_incomplete: a forced call gives kernel, algorithm, grid x y z, block x "
+        "y z, waves_per_eu, tile m n k and quantization"
     )
 
 
@@ -995,19 +987,18 @@ def get_kernel_config(
     cols: int,
     kernel: str,
     algorithm: Algorithm,
-    direction: Direction,
     quantization: Quantization,
     world: int,
     arch: str,
 ) -> tuple[Any, ...] | None:
-    """KERNEL `kernel`'S OWN CONFIG AT `algorithm` AND `direction` FOR `rows` x `cols`
+    """KERNEL `kernel`'S OWN CONFIG AT `algorithm` FOR `rows` x `cols`
     MOVING `quantization` (a forced launch at the tuned config: gp's kernel lines, the
     tests): the config of it moving that which its nearest input at `world` launches,
     in any op's table, else the first such config of the table's; moving INT4 where it
     has no INT4 config, its exact config moved INT4 (a build it lists). None where it
     has neither."""
     builds = build_info().templates[kernel].builds
-    variant = {"kernel": kernel, "algorithm": algorithm, "direction": direction}
+    variant = {"kernel": kernel, "algorithm": algorithm}
 
     def takes(c: dict[str, Any], moving: Quantization) -> bool:
         build = {k: c[k] for k in _CONFIG_KEYS if k != "kernel" and k[:5] != "grid_"}
@@ -1348,20 +1339,17 @@ class HipCustomCommunicator:
         self,
         kernel: str,
         algorithm: Algorithm,
-        direction: Direction,
         rows: int,
         cols: int,
         quantization: Quantization = "exact",
     ) -> tuple[Any, ...] | None:
-        """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` and `direction` for `rows`
-        x `cols` moving `quantization` (`get_kernel_config`), or None."""
+        """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` for `rows` x `cols` moving `quantization` (`get_kernel_config`), or None."""
         return get_kernel_config(
             self.table,
             rows,
             cols,
             kernel,
             algorithm,
-            direction,
             quantization,
             self.device_group.size(),
             self.arch,
@@ -1379,7 +1367,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1413,7 +1400,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -1442,7 +1428,6 @@ class HipCustomCommunicator:
                 (
                     kernel,
                     algorithm,
-                    direction,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -1499,7 +1484,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1534,7 +1518,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -1563,7 +1546,6 @@ class HipCustomCommunicator:
                 (
                     kernel,
                     algorithm,
-                    direction,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -1638,7 +1620,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1674,7 +1655,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -1703,7 +1683,6 @@ class HipCustomCommunicator:
                 (
                     kernel,
                     algorithm,
-                    direction,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -1798,7 +1777,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1836,7 +1814,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -1865,7 +1842,6 @@ class HipCustomCommunicator:
                 (
                     kernel,
                     algorithm,
-                    direction,
                     grid_x,
                     grid_y,
                     grid_z,
@@ -1964,7 +1940,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -1997,7 +1972,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -2026,7 +2000,6 @@ class HipCustomCommunicator:
             (
                 kernel,
                 algorithm,
-                direction,
                 grid_x,
                 grid_y,
                 grid_z,
@@ -2060,7 +2033,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2094,7 +2066,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -2123,7 +2094,6 @@ class HipCustomCommunicator:
             (
                 kernel,
                 algorithm,
-                direction,
                 grid_x,
                 grid_y,
                 grid_z,
@@ -2163,7 +2133,6 @@ class HipCustomCommunicator:
         *,
         kernel: str | None = None,
         algorithm: Algorithm | None = None,
-        direction: Direction | None = None,
         grid_x: int | None = None,
         grid_y: int | None = None,
         grid_z: int | None = None,
@@ -2197,7 +2166,6 @@ class HipCustomCommunicator:
         config_given = is_config_given(
             kernel,
             algorithm,
-            direction,
             grid_x,
             grid_y,
             grid_z,
@@ -2226,7 +2194,6 @@ class HipCustomCommunicator:
             (
                 kernel,
                 algorithm,
-                direction,
                 grid_x,
                 grid_y,
                 grid_z,

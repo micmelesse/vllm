@@ -15,8 +15,8 @@ namespace hip_custom_communicator {
 // THE COLLECTIVES (reduce_scatter here, all_gather in all_gather.cuh, which walks the same
 // walk): one tested and tuned way to do each, which the kernels call rather than write again
 // (the fused AttnRes pull's own reduce-scatter took 1.6x the plain two-shot's cycles for its
-// bytes, thread traces 2026-10-04T21-03-09Z and 21-26-11Z). Their vocabulary (Walk, Accumulate)
-// is theirs, here; Direction is common.cuh's, a kernel's DIRECTION too.
+// bytes, thread traces 2026-10-04T21-03-09Z and 21-26-11Z). Their vocabulary (Direction, Walk,
+// Accumulate) is theirs, here; types.cuh's forcing names Direction too.
 
 // THE LOADS ARE THE COMMUNICATION: a rank's pointer points into its memory,
 // opened in this process over IPC (handle.cuh), so loading reads it over the links; the sum
@@ -59,9 +59,10 @@ namespace hip_custom_communicator {
 // instructions (pull), 926 -> 1394 (push), 3269 -> 5439 (int4) (ISA
 // 2026-10-18T00-20-45Z).
 
-// WHICH WAY A REDUCE-SCATTER'S SUM GOES, its DIRECTION (common.cuh's, a kernel's too): pull, this
-// rank reads its peers and keeps the sum in its partials; push, the sum is stored in every rank's
+// WHICH WAY A REDUCE-SCATTER'S SUM GOES, and a caller's forcing (types.cuh): pull, this rank
+// reads its peers and keeps the sum in its partials; push, the sum is stored in every rank's
 // (itself too), so after the sync each rank holds the whole sum locally.
+enum class Direction : int { pull = 0, push = 1 };
 // HOW reduce_scatter AND all_gather WALK THE DATA (reduce_scatter.cuh, all_gather.cuh): flat, the
 // elements numbered row-major and a rank's share a contiguous range (above); rows, a rank's columns
 // of every row. And where reduce_scatter sums a rank's copies: through LDS or in registers.
@@ -97,7 +98,7 @@ enum class Accumulate : int { lds = 0, registers = 1 };
 // rank's partials, pull in this rank's. none reads every rank's input in place; int4 every rank's
 // staged INT4 payload, an INT4 payload's layout from its own buffer's sizes.
 template <int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE, int PACK_BYTES,
-          int QUANTIZATION, bool CONTIGUOUS, Walk WALK, Accumulate ACCUMULATE, int DIRECTION,
+          int QUANTIZATION, bool CONTIGUOUS, Walk WALK, Accumulate ACCUMULATE, Direction DIRECTION,
           Until UNTIL, bool TAIL, typename DTYPE>
 DINLINE void reduce_scatter(
     const DTYPE* input_ptr, int64_t input_stride_m, int64_t input_stride_n, int input_size_m,

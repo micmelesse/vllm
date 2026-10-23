@@ -90,23 +90,20 @@ constexpr int int4 = 1;
 }  // namespace Quantization
 
 // =================================================================================================
-// THE ALGORITHM AND THE DIRECTION: what an op's one kernel is built to do, its ALGORITHM and
-// DIRECTION template parameters (each op file's `if constexpr` over them), the host's config fields
-// of the same names. Template ints, as QUANTIZATION is (a kernel's demangled name reads numbers).
-// ALGORITHM: a one-shot reads every peer's whole input; a two-shot reduce-scatters, then gathers;
-// rows reads this rank's rows alone, no peer (a norm op's kernel, which Python runs after our
-// all-reduce). DIRECTION: a rank pulls what it needs from its peers, or its peers push it in (the
-// reduce-scatters take it too, reduce_scatter.cuh); a kernel on rows pulls from no one, `pull`.
+// THE ALGORITHM: what an op's one kernel is built to do, its ALGORITHM template parameter (each op
+// file's `if constexpr` over it), the host's config field of the same name; exactly the variants
+// that exist. A one-shot reads every peer's whole input; a two-shot reduce-scatters, then gathers;
+// each pulled (a rank reads what it needs from its peers) or pushed (its peers store it in); rows
+// reads this rank's rows alone, no peer (a norm op's kernel, which Python runs after our
+// all-reduce). A template int, as QUANTIZATION is (a kernel's demangled name reads numbers).
 // =================================================================================================
 namespace Algorithm {
-constexpr int one_shot = 0;
-constexpr int two_shot = 1;
-constexpr int rows = 2;
+constexpr int one_shot_pull = 0;
+constexpr int one_shot_push = 1;
+constexpr int two_shot_pull = 2;
+constexpr int two_shot_push = 3;
+constexpr int rows = 4;
 }  // namespace Algorithm
-namespace Direction {
-constexpr int pull = 0;
-constexpr int push = 1;
-}  // namespace Direction
 
 constexpr int kInt4Group = 32;           // elements a group
 constexpr int kInt4GroupPacks = 4;       // a pack is a word of its group's values

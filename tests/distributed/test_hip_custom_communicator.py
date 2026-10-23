@@ -36,7 +36,6 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     ABANDON_WAIT_S,
     TUNED_OPS,
     Algorithm,
-    Direction,
     Error,
     FlagState,
     HipCustomCommunicator,
@@ -109,9 +108,8 @@ DUMP_GRACE_S = 5.0
 TERM_GRACE_S = ABANDON_WAIT_S + 5.0
 
 Forced = dict[str, str | int]
-# A VARIANT OF AN OP'S ONE KERNEL: the kernel, its algorithm and its direction (a
-# config's first three fields).
-Variant = tuple[str, Algorithm, Direction]
+# AN OP'S ONE KERNEL AT ONE OF ITS ALGORITHMS (a config's first two fields).
+Variant = tuple[str, Algorithm]
 # AN OP AS TWO KERNELS OF OURS, forced: our all-reduce's forcing, then its norm's.
 Composed = tuple[Forced, Forced]
 Tolerance = tuple[float, float]
@@ -537,14 +535,14 @@ def _forced(
     variant: Variant, cols: int = 0, quantization: Quantization = "exact"
 ) -> Forced | None:
     """`variant` forced whole: the kernel by its name, its first build at the variant's
-    algorithm and direction moving `quantization` whose tile holds `cols` columns, and
-    a fixed grid. None when no build's tile holds them."""
-    kernel, algorithm, direction = variant
+    algorithm moving `quantization` whose tile holds `cols` columns, and a fixed grid.
+    None when no build's tile holds them."""
+    kernel, algorithm = variant
     build = next(
         (
             b
             for b in build_info().templates[kernel].builds
-            if (b["algorithm"], b["direction"]) == (algorithm, direction)
+            if b["algorithm"] == algorithm
             and b["quantization"] == quantization
             and int(b["tile_n"]) >= cols
         ),
@@ -572,7 +570,7 @@ def _variants(op: Op) -> list[Variant]:
     """Every variant of `op`'s kernel the build has, in its builds' order."""
     return list(
         dict.fromkeys(
-            (name, b["algorithm"], b["direction"])
+            (name, b["algorithm"])
             for name, t in build_info().templates.items()
             if t.op == op
             for b in t.builds
@@ -817,7 +815,7 @@ def _int4_owner(op: Op, variant: Variant, shape: tuple[int, int]) -> torch.Tenso
     if op == "all_reduce":
         flat = torch.arange(rows * hidden).reshape(rows, hidden)
         return flat // (rows * hidden // WORLD_SIZE)
-    if variant[1:] == ("two_shot", "pull") and "attn_res" in op:
+    if variant[1] == "two_shot_pull" and "attn_res" in op:
         slice_m = -(-rows // WORLD_SIZE)
         return (torch.arange(rows) // slice_m).unsqueeze(1).expand(rows, hidden)
     return torch.zeros(rows, hidden, dtype=torch.long)
@@ -858,7 +856,7 @@ def _int4_case(
     total = _int4_sum(landed, _int4_owner(op, variant, shape))
     summed = _int4_landed(total, dtype)
     pull_norm = (
-        variant[1:] == ("two_shot", "pull")
+        variant[1] == "two_shot_pull"
         and "rms_norm" in op
         and "attn_res" not in op
     )
@@ -965,7 +963,7 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
     """A call that does not ask for INT4 moves the input as it is: a plain call on
     a communicator whose quantization is exact (the default), whose table's pick moves
     nothing quantized, and a forced exact two-shot."""
-    forced = _forced_whole(("all_reduce", "two_shot", "pull"))
+    forced = _forced_whole(("all_reduce", "two_shot_pull"))
     ((*_, quantization),) = comm.tuned("all_reduce", 2048, HIDDEN)
     assert quantization == "exact" and forced["quantization"] == "exact"
     for name, forcing in (("plain", {}), ("forced", forced)):
@@ -979,10 +977,9 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
 def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     for op in TUNED_OPS:
         for variant in _variants(op):
-            kernel, algorithm, direction = variant
-            if algorithm == "two_shot" and any(
-                (b["algorithm"], b["direction"], b["quantization"])
-                == (algorithm, direction, "int4")
+            kernel, algorithm = variant
+            if any(
+                (b["algorithm"], b["quantization"]) == (algorithm, "int4")
                 for b in build_info().templates[kernel].builds
             ):
                 for shape in INT4_SHAPES:
@@ -1025,7 +1022,7 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     # A two-shot row with fewer 16-byte packs than ranks runs (the late ranks'
     # slices empty), as the plain call does.
     narrow = _randn((16, 8), bf16, rank)
-    two_shot = _forced_whole(("all_reduce", "two_shot", "pull"))
+    two_shot = _forced_whole(("all_reduce", "two_shot_pull"))
     error = _refused(
         comm, rank, "narrow row", lambda: comm.all_reduce(narrow, **two_shot)
     )
@@ -1057,8 +1054,8 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
 
     # Out of capacity: one row wider than the staging, which no pass holds.
     wide = torch.ones((1, comm.capacity.staging_bytes), dtype=bf16, device=comm.device)
-    for shot in ("one_shot", "two_shot"):
-        forced = _forced_whole(("all_reduce", shot, "pull"))
+    for shot in ("one_shot_pull", "two_shot_pull"):
+        forced = _forced_whole(("all_reduce", shot))
         error = _refused(comm, rank, shot, partial(comm.all_reduce, wide, **forced))
         assert error is Error.staging_too_small, (shot, error)
 
@@ -1134,10 +1131,10 @@ def test_python_names_match_the_build() -> None:
 
 def test_build_info_lists_every_template_with_its_builds() -> None:
     """Each template (an op's one kernel) names one of the ops, one template an op, and
-    lists builds, each a variant of it (an algorithm and a direction), a tile and no
-    launch; INT4 only on a two-shot and not the plain pull, the fused pulls' INT4 builds
-    whole groups a thread (TILE_N a multiple of 32 * THREADS, one row high); a norm on
-    rows its one variant, rows, moving nothing (no peer)."""
+    lists builds, each at one of its algorithms, a tile and no launch; INT4 only on a
+    two-shot and not the plain pull, the fused pulls' INT4 builds whole groups a thread
+    (TILE_N a multiple of 32 * THREADS, one row high); a norm on rows its one algorithm,
+    rows, moving nothing (no peer)."""
     import vllm._rocm_C  # noqa: F401
 
     built = build_info()
@@ -1147,7 +1144,6 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         assert t.op in built.op_names, name
         for b in t.builds:
             assert b["algorithm"] in get_args(Algorithm), (name, b)
-            assert b["direction"] in get_args(Direction), (name, b)
             assert (b["algorithm"] == "rows") == (t.op not in TUNED_OPS), (name, b)
             assert b["block_x"] > 0 and (b["block_y"], b["block_z"]) == (1, 1), (
                 name,
@@ -1164,63 +1160,58 @@ def test_build_info_lists_every_template_with_its_builds() -> None:
         for b in t.builds:
             if b["quantization"] != "int4":
                 continue
-            assert b["algorithm"] == "two_shot", (name, b)
-            if b["direction"] == "pull":
+            assert b["algorithm"] in ("two_shot_pull", "two_shot_push"), (name, b)
+            if b["algorithm"] == "two_shot_pull":
                 assert name != "all_reduce", (name, b)
                 assert b["tile_n"] % (b["block_x"] * INT4_GROUP) == 0, (name, b)
                 assert b["tile_m"] == 1, (name, b)
 
 
-# EACH KERNEL'S VARIANTS, the algorithm and direction pairs its op file has a body for,
-# in its order (the host's kVariants_<kernel>).
-_FUSED_VARIANTS = (("one_shot", "pull"), ("two_shot", "pull"), ("two_shot", "push"))
-VARIANTS: dict[str, tuple[tuple[str, str], ...]] = {
-    "all_reduce": (
-        ("one_shot", "pull"),
-        ("two_shot", "pull"),
-        ("one_shot", "push"),
-        ("two_shot", "push"),
-    ),
-    "all_reduce_rms_norm": _FUSED_VARIANTS,
-    "all_reduce_add_rms_norm": _FUSED_VARIANTS,
-    "all_reduce_add_attn_res_rms_norm": _FUSED_VARIANTS,
-    "rms_norm_rows": (("rows", "pull"),),
-    "add_rms_norm_rows": (("rows", "pull"),),
-    "add_attn_res_rms_norm_rows": (("rows", "pull"),),
+# EACH KERNEL'S ALGORITHMS, the bodies its op file has, in its order (the host's
+# kAlgorithms_<kernel>).
+_FUSED_ALGORITHMS = ("one_shot_pull", "two_shot_pull", "two_shot_push")
+ALGORITHMS: dict[str, tuple[str, ...]] = {
+    "all_reduce": ("one_shot_pull", "two_shot_pull", "one_shot_push", "two_shot_push"),
+    "all_reduce_rms_norm": _FUSED_ALGORITHMS,
+    "all_reduce_add_rms_norm": _FUSED_ALGORITHMS,
+    "all_reduce_add_attn_res_rms_norm": _FUSED_ALGORITHMS,
+    "rms_norm_rows": ("rows",),
+    "add_rms_norm_rows": ("rows",),
+    "add_attn_res_rms_norm_rows": ("rows",),
 }
 
 
 def _takes(kernel: str, b: dict[str, int | str]) -> bool:
-    """Whether `kernel`'s variant at build `b` is one it builds: INT4 a two-shot's and
+    """Whether `kernel` at build `b`'s algorithm is one it builds: INT4 a two-shot's and
     not the plain pull's (a one-shot reads its peers' inputs as they are); the pushed
     one-shot a row no wider than its unfenced slot (2048 bytes of 16-bit elements); a
     fused pull's INT4 whole groups a thread, a row high; a plain two-shot a row high (the
     flat walk)."""
-    variant = (b["algorithm"], b["direction"])
-    if b["quantization"] == "int4" and (
-        b["algorithm"] != "two_shot" or (kernel == "all_reduce" and b["direction"] == "pull")
+    algorithm = b["algorithm"]
+    if b["quantization"] == "int4" and not (
+        algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
     ):
         return False
-    if kernel == "all_reduce" and variant == ("one_shot", "push"):
+    if kernel == "all_reduce" and algorithm == "one_shot_push":
         return b["tile_m"] == 1 and int(b["tile_n"]) * 2 <= 2048
-    if kernel == "all_reduce" and b["algorithm"] == "two_shot":
+    if kernel == "all_reduce" and algorithm in ("two_shot_pull", "two_shot_push"):
         return b["tile_m"] == 1
-    if b["quantization"] == "int4" and variant == ("two_shot", "pull"):
+    if b["quantization"] == "int4" and algorithm == "two_shot_pull":
         return int(b["tile_n"]) % (int(b["block_x"]) * INT4_GROUP) == 0 and b["tile_m"] == 1
     return True
 
 
-def test_the_builds_are_every_variant_of_the_tables_shapes() -> None:
+def test_the_builds_are_every_algorithm_of_the_tables_shapes() -> None:
     """What the build compiled is the build half of every config the tuned table
-    lists on gfx950, each kernel's in the order the file first names them, then every
-    variant of the kernel at every shape the table holds of it (its block, waves, tile
-    and quantization) that the variant takes (builds.py, at configure): no build
-    without a shape of the table, no config without its build, no variant of a shape
-    left out, so a pruned table never drops a path a call can be forced to take."""
+    lists on gfx950, each kernel's in the order the file first names them, then the
+    kernel at every algorithm it has at every shape the table holds of it (its block,
+    waves, tile and quantization) that the algorithm takes (builds.py, at configure): no
+    build without a shape of the table, no config without its build, no algorithm of a
+    shape left out, so a pruned table never drops a path a call can be forced to take."""
     import vllm._rocm_C  # noqa: F401
 
     raw = json.loads(_TABLE.read_text())
-    variant = ("algorithm", "direction")
+    variant = ("algorithm",)
     shape = ("block_x", "block_y", "block_z", "waves_per_eu")
     shape += ("tile_m", "tile_n", "tile_k", "quantization")
     want: dict[str, list[dict[str, int | str]]] = {}
@@ -1232,8 +1223,8 @@ def test_the_builds_are_every_variant_of_the_tables_shapes() -> None:
     for kernel, bs in want.items():
         shapes = list(dict.fromkeys(tuple(b[f] for f in shape) for b in bs))
         for s in shapes:
-            for v in VARIANTS[kernel]:
-                b = dict(zip(variant + shape, v + s))
+            for a in ALGORITHMS[kernel]:
+                b = dict(zip(variant + shape, (a, *s)))
                 if b not in bs and _takes(kernel, b):
                     bs.append(b)
     got = {name: list(t.builds) for name, t in build_info().templates.items()}

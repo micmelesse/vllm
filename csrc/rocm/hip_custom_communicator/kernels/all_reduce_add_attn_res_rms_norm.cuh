@@ -98,14 +98,14 @@ namespace hip_custom_communicator {
 // partials' INT4 payload.
 
 // =============================================================================
-// all_reduce_add_attn_res_rms_norm: THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM, ONE KERNEL: its ALGORITHM and DIRECTION (common.cuh's
-// Algorithm and Direction) are template parameters, and each pair it is built for
-// (pull one-shot, pull two-shot, push two-shot) is its own body under `if constexpr`, as its
-// section above says. A pair it has no body for does not compile.
+// all_reduce_add_attn_res_rms_norm: THE ALL-REDUCE THEN ATTNRES AND ITS RMSNORM, ONE KERNEL: its ALGORITHM (common.cuh's Algorithm) is a
+// template parameter, and each algorithm it is built for (pull one-shot, pull two-shot, push two-shot) is its own
+// body under `if constexpr`, as its section above says. An algorithm it has no body for does not
+// compile.
 // =============================================================================
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int TILE_K, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION, int ALGORITHM,
-          int DIRECTION, bool CHUNKED, bool TAIL>
+          bool CHUNKED, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce_add_attn_res_rms_norm(
         const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
@@ -142,7 +142,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks, int num_blocks,
         float eps, float output_eps) {
-  if constexpr (ALGORITHM == Algorithm::one_shot && DIRECTION == Direction::pull) {
+  if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot_add_attn_res_rms_norm, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
@@ -223,7 +223,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks, Until::read, 1);
-  } else if constexpr (ALGORITHM == Algorithm::two_shot && DIRECTION == Direction::pull) {
+  } else if constexpr (ALGORITHM == Algorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot_add_attn_res_rms_norm, above).
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
@@ -476,8 +476,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     }
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot_add_attn_res_rms_norm, above).
-    static_assert(ALGORITHM == Algorithm::two_shot && DIRECTION == Direction::push,
-                  "all_reduce_add_attn_res_rms_norm: no body for this algorithm and direction");
+    static_assert(ALGORITHM == Algorithm::two_shot_push,
+                  "all_reduce_add_attn_res_rms_norm: no body for this algorithm");
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
     // THE INT4 PAYLOADS are inside the staging and the partials (common.cuh's

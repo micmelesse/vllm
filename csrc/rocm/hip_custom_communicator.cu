@@ -44,7 +44,7 @@ using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
 // EACH OP TAKES ITS CONFIG LAST, every field of it, as the API's does: the kernel by its name, its
-// algorithm and direction, the grid and the block, the waves a EU, the tile, the quantization. Nothing is optional and
+// algorithm, the grid and the block, the waves a EU, the tile, the quantization. Nothing is optional and
 // nothing is picked here: Python fills what a caller leaves out and hands its table's pick the
 // same way.
 
@@ -133,15 +133,14 @@ int quantization_from(const std::string& s) {
   return hip_custom_communicator::Quantization::int4;
 }
 int algorithm_from(const std::string& s) {
-  if (s == "one_shot") return hip_custom_communicator::Algorithm::one_shot;
-  if (s == "two_shot") return hip_custom_communicator::Algorithm::two_shot;
-  TORCH_CHECK(s == "rows", "hip_custom_communicator: algorithm is one_shot, two_shot or rows");
-  return hip_custom_communicator::Algorithm::rows;
-}
-int direction_from(const std::string& s) {
-  if (s == "pull") return hip_custom_communicator::Direction::pull;
-  TORCH_CHECK(s == "push", "hip_custom_communicator: direction is pull or push");
-  return hip_custom_communicator::Direction::push;
+  namespace algorithm = hip_custom_communicator::Algorithm;
+  if (s == "one_shot_pull") return algorithm::one_shot_pull;
+  if (s == "one_shot_push") return algorithm::one_shot_push;
+  if (s == "two_shot_pull") return algorithm::two_shot_pull;
+  if (s == "two_shot_push") return algorithm::two_shot_push;
+  TORCH_CHECK(s == "rows", "hip_custom_communicator: algorithm is one_shot_pull, one_shot_push, "
+              "two_shot_pull, two_shot_push or rows");
+  return algorithm::rows;
 }
 int narrowed(int64_t v) {
   TORCH_CHECK(v >= std::numeric_limits<int>::min() && v <= std::numeric_limits<int>::max(),
@@ -281,11 +280,11 @@ BuildInfoWire hip_custom_communicator_build_info() {
   // Each template's op, and its builds (what dispatch instantiates: the tuner's
   // search space, each one a forcing can name), flat: a build's fields in
   // `fields`' order, 0 where its op's BuildConfig has none (every field it has
-  // is set), its algorithm, direction and quantization their enums' numbers; its
+  // is set), its algorithm and quantization their numbers; its
   // block a field a dimension. The launch is not a build's: a forced call gives
   // its own grid.
-  const Names fields = {"algorithm", "direction", "tile_m",       "tile_n",      "tile_k",
-                        "block_x",   "block_y",   "block_z",      "waves_per_eu", "quantization"};
+  const Names fields = {"algorithm", "tile_m",  "tile_n",       "tile_k",
+                        "block_x",   "block_y", "block_z",      "waves_per_eu", "quantization"};
   Names templates, template_ops;
   std::vector<int64_t> configs, counts;
   for (const TemplateInfo& t : kTemplates) {
@@ -297,7 +296,7 @@ BuildInfoWire hip_custom_communicator_build_info() {
             int64_t k = 1;  // a kernel with no K: its identity
             if constexpr (requires { f.tile_k; }) k = f.tile_k;
             configs.insert(configs.end(),
-                           {f.algorithm, f.direction, f.tile_m, f.tile_n, k, f.block.x,
+                           {f.algorithm, f.tile_m, f.tile_n, k, f.block.x,
                             f.block.y, f.block.z, f.waves_per_eu, f.quantization});
           },
           b);
@@ -487,18 +486,17 @@ void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
 }  // namespace
 
 namespace {
-// A CALL'S CONFIG: the kernel by its name, its algorithm and direction, and every field of its
-// config point, in the essential order, checked whole (C++'s `forced`), or the Error it is refused
-// for.
+// A CALL'S CONFIG: the kernel by its name, its algorithm, and every field of its config point, in
+// the essential order, checked whole (C++'s `forced`), or the Error it is refused for.
 using Picked = std::variant<hip_custom_communicator::Chosen, hip_custom_communicator::Error>;
 Picked forced_config(hip_custom_communicator::OpType o, const std::string& kernel,
-    const std::string& algorithm, const std::string& direction, int64_t grid_x, int64_t grid_y,
+    const std::string& algorithm, int64_t grid_x, int64_t grid_y,
     int64_t grid_z, int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   using namespace hip_custom_communicator;
   const std::optional<Template> fn = template_named(kernel);
   if (!fn) return Error::no_such_template;
-  return forced(o, *fn, algorithm_from(algorithm), direction_from(direction),
+  return forced(o, *fn, algorithm_from(algorithm),
                 Dim3{narrowed(grid_x), narrowed(grid_y), narrowed(grid_z)},
                 Dim3{narrowed(block_x), narrowed(block_y), narrowed(block_z)},
                 narrowed(waves_per_eu), narrowed(tile_m), narrowed(tile_n), narrowed(tile_k),
@@ -534,12 +532,12 @@ Answer all_reduce_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& o
 
 // all_reduce: its config point, every field.
 Answer hip_custom_communicator_all_reduce(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& output,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return all_reduce_with(handle_ptr, input, output,
-      forced_config(hip_custom_communicator::OpType::all_reduce, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::all_reduce, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -600,12 +598,12 @@ Answer all_reduce_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::
 // all_reduce_rms_norm: its config point, every field.
 Answer hip_custom_communicator_all_reduce_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return all_reduce_rms_norm_with(handle_ptr, input, weight, output, eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::all_reduce_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -636,12 +634,12 @@ Answer all_reduce_add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, tor
 Answer hip_custom_communicator_all_reduce_add_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return all_reduce_add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_add_rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::all_reduce_add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -770,12 +768,12 @@ Answer hip_custom_communicator_all_reduce_add_attn_res_rms_norm(fptr_t handle_pt
     torch::Tensor& prefix_output, torch::Tensor& output,
     const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
     double eps, double output_eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return all_reduce_add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
-      forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::all_reduce_add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -801,12 +799,12 @@ Answer rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& wei
 // point, every field.
 Answer hip_custom_communicator_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return rms_norm_with(handle_ptr, input, weight, output, eps,
-      forced_config(hip_custom_communicator::OpType::rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -838,12 +836,12 @@ Answer add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor&
 Answer hip_custom_communicator_add_rms_norm(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return add_rms_norm_with(handle_ptr, input, residual, weight, output, residual_output, eps,
-      forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::add_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }
 
@@ -894,11 +892,11 @@ Answer hip_custom_communicator_add_attn_res_rms_norm(fptr_t handle_ptr, torch::T
     torch::Tensor& prefix_output, torch::Tensor& output,
     const std::optional<torch::Tensor>& block_output, int64_t num_blocks,
     double eps, double output_eps,
-    const std::string& kernel, const std::string& algorithm, const std::string& direction,
+    const std::string& kernel, const std::string& algorithm,
     int64_t grid_x, int64_t grid_y, int64_t grid_z,
     int64_t block_x, int64_t block_y, int64_t block_z, int64_t waves_per_eu,
     int64_t tile_m, int64_t tile_n, int64_t tile_k, const std::string& quantization) {
   return add_attn_res_rms_norm_with(handle_ptr, input, prefix, blocks, norm_weight, qk_weight, output_norm_weight, prefix_output, output, block_output, num_blocks, eps, output_eps,
-      forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, algorithm, direction, grid_x, grid_y, grid_z, block_x, block_y, block_z,
+      forced_config(hip_custom_communicator::OpType::add_attn_res_rms_norm, kernel, algorithm, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                                     waves_per_eu, tile_m, tile_n, tile_k, quantization));
 }

@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """THE BUILDS, FROM THE TUNED TABLE: what the compile instantiates is the build half
-of every config the table lists on the archs built (its kernel, algorithm, direction,
-block, waves, tile and quantization; the grid is the launch's, never compiled), each
-kernel's builds in the order the file first names them. The table is the format
-`FORMAT` names (`hip_custom_communicator.tuned_map` 0.2: a config's `kernel` its op's
-one kernel, `algorithm` and `direction` the variant of it). EVERY VARIANT OF A SHAPE
-(Michael, October 23): for every build shape the table holds of a kernel (its block,
-waves, tile and quantization: all a build is but its algorithm and direction), the
-kernel is built at every variant it has (the host's `kVariants_<kernel>`) that takes
-that shape (`takes`: a refusal the kernel's math or the hardware forces, which the
-communicator refuses by name at a call), the table's own builds first and in its
-order. So a tune's prune, which drops every config no input names, can drop a shape
-but never a variant of one: every path a call can be forced to take stays compiled. CMake runs this at configure (the table and this file
+of every config the table lists on the archs built (its kernel, algorithm, block,
+waves, tile and quantization; the grid is the launch's, never compiled), each kernel's
+builds in the order the file first names them. The table is the format `FORMAT` names
+(`hip_custom_communicator.tuned_map` 0.2: a config's `kernel` its op's one kernel, its
+`algorithm` which of the kernel's bodies: `one_shot_pull`, `one_shot_push`,
+`two_shot_pull`, `two_shot_push` or `rows`). EVERY ALGORITHM OF A SHAPE (Michael,
+October 23): for every build shape the table holds of a kernel (its block, waves, tile
+and quantization: all a build is but its algorithm), the kernel is built at every
+algorithm it has (the host's `kAlgorithms_<kernel>`) that takes that shape (`takes`: a
+refusal the kernel's math or the hardware forces, which the communicator refuses by
+name at a call), the table's own builds first and in its order. So a tune's prune,
+which drops every config no input names, can drop a shape but never an algorithm of
+one: every path a call can be forced to take stays compiled. CMake runs this at
+configure (the table and this file
 are configure dependencies), and the host file includes what it writes: one
 `constexpr BuildConfig` array a template, `kBuilds_<kernel>`. A config of the table is
 then always a build, and a build is always in the table. The pattern is vLLM's own:
@@ -24,7 +26,7 @@ at configure the same way (CMakeLists.txt).
 
 A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input names, which gp's tune adds
 on its own copy of the table and prunes when it writes. A file NAMES ITS BUILD
-(`hip_custom_communicator_<kernel>_<algorithm>_<direction>__<block>_w<waves>_t<tile>_<q>.hip`;
+(`hip_custom_communicator_<kernel>_<algorithm>__<block>_w<waves>_t<tile>_<q>.hip`;
 the manifest
 `hip_custom_communicator_instances.json` says each file's builds: every build whose
 instances it holds), so a rebuild with other candidates recompiles only the new ones,
@@ -41,7 +43,6 @@ FORMAT = {"format": "hip_custom_communicator.tuned_map", "version": "0.2"}
 # A BUILD'S FIELDS, in the table's order.
 FIELDS = (
     "algorithm",
-    "direction",
     "block_x",
     "block_y",
     "block_z",
@@ -52,9 +53,9 @@ FIELDS = (
     "quantization",
 )
 QUANTIZATIONS = {"exact": "Quantization::exact", "int4": "Quantization::int4"}
-ALGORITHMS = {"one_shot": "Algorithm::one_shot", "two_shot": "Algorithm::two_shot",
-              "rows": "Algorithm::rows"}
-DIRECTIONS = {"pull": "Direction::pull", "push": "Direction::push"}
+# THE ALGORITHMS, as common.cuh names them and numbers them (its template ints).
+ALGORITHM_VALUES = {"one_shot_pull": 0, "one_shot_push": 1, "two_shot_pull": 2,
+                    "two_shot_push": 3, "rows": 4}
 
 
 # EACH KERNEL'S BuildConfig (a fused op's, or its norm's: one type an op family).
@@ -97,49 +98,48 @@ def named(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
 
 
 def takes(kernel: str, b: tuple) -> bool:
-    """WHETHER `kernel`'S VARIANT TAKES THE SHAPE: no where the kernel refuses it by
+    """WHETHER `kernel` AT ITS ALGORITHM TAKES THE SHAPE: no where the kernel refuses it by
     construction, as the communicator refuses a call of it by name. INT4 is a two-shot's
     and not the plain pull's (`quantization_not_supported`: a one-shot reads its peers'
     inputs as they are); the pushed one-shot's tile is a row that fits its unfenced
     slot (`push_one_shot_tiles_fit`); a pulled fused two-shot's INT4 tile is whole groups
     a thread, a row high (its kernel's static_asserts: holes (a) and (b) of the task
     list); a plain build lays out at some built world (`lays_out`)."""
-    algorithm, direction, block, _, _, _, tile_m, tile_n, _, q = b
-    if q == "int4" and (
-        algorithm != "two_shot" or (kernel == "all_reduce" and direction == "pull")
+    algorithm, block, _, _, _, tile_m, tile_n, _, q = b
+    if q == "int4" and not (
+        algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
     ):
         return False
-    if kernel == "all_reduce" and (algorithm, direction) == ("one_shot", "push"):
+    if kernel == "all_reduce" and algorithm == "one_shot_push":
         if tile_m != 1 or tile_n * 2 > UNFENCED_SLOT_BYTES:
             return False
     if (
         q == "int4"
         and kernel in FUSED
-        and (algorithm, direction) == ("two_shot", "pull")
+        and algorithm == "two_shot_pull"
         and (tile_n % (INT4_GROUP * block) != 0 or tile_m != 1)
     ):
         return False
     return any(lays_out(kernel, b, world) for world in WORLDS)
 
 
-def builds(table: dict, archs: list[str], has: dict[str, list[tuple[str, str]]]
-           ) -> dict[str, list[tuple]]:
-    """Each kernel's builds: the table's, in its order, then every variant `has` lists of
-    every shape the table holds of the kernel, where the variant takes it (`takes`)."""
+def builds(table: dict, archs: list[str], has: dict[str, list[str]]) -> dict[str, list[tuple]]:
+    """Each kernel's builds: the table's, in its order, then every algorithm `has` lists
+    of every shape the table holds of the kernel, where the algorithm takes it (`takes`)."""
     out = named(table, archs)
     for kernel, bs in out.items():
-        shapes = list(dict.fromkeys(b[2:] for b in bs))
+        shapes = list(dict.fromkeys(b[1:] for b in bs))
         for shape in shapes:
-            for variant in has[kernel]:
-                b = (*variant, *shape)
+            for algorithm in has[kernel]:
+                b = (algorithm, *shape)
                 if b not in bs and takes(kernel, b):
                     bs.append(b)
     return out
 
 
 def literal(kernel: str, b: tuple) -> str:
-    algorithm, direction, bx, by, bz, waves, tm, tn, tk, q = b
-    fields = [ALGORITHMS[algorithm], DIRECTIONS[direction]]
+    algorithm, bx, by, bz, waves, tm, tn, tk, q = b
+    fields = [f"Algorithm::{algorithm}"]
     fields += [f"{{{bx}, {by}, {bz}}}", str(waves), str(tm), str(tn)]
     if family(kernel) == "AllReduceAddAttnResRmsNormBuildConfig":
         fields.append(str(tk))
@@ -161,9 +161,6 @@ LINE_PAYLOAD_BYTES = (
 UNFENCED_SLOT_BYTES = 2048  # a pushed one-shot block's tile, at most (kUnfencedSlotBytes)
 INT4_GROUP = 32  # an INT4 group's elements (common.cuh's kInt4Group)
 FUSED = ("all_reduce_rms_norm", "all_reduce_add_rms_norm", "all_reduce_add_attn_res_rms_norm")
-# THE ALGORITHMS AND DIRECTIONS as the template arguments (common.cuh's ints) name them.
-ALGORITHM_VALUES = {"one_shot": 0, "two_shot": 1, "rows": 2}
-DIRECTION_VALUES = {"pull": 0, "push": 1}
 HEADERS = (
     "kernels/all_reduce.cuh",
     "kernels/all_reduce_add_attn_res_rms_norm.cuh",
@@ -188,14 +185,12 @@ def arguments(host: str) -> dict[str, str]:
     return out
 
 
-def variants(host: str) -> dict[str, list[tuple[str, str]]]:
-    """Each kernel's variants as the host lists them (`kVariants_<kernel>`: the algorithm
-    and direction pairs its op file has a body for), by kernel."""
+def algorithms(host: str) -> dict[str, list[str]]:
+    """Each kernel's algorithms as the host lists them (`kAlgorithms_<kernel>`: the bodies its
+    op file has), by kernel."""
     out = {}
-    for m in re.finditer(r"constexpr Variant kVariants_(\w+)\[\] = \{(.*?)\};", host, re.S):
-        out[m.group(1)] = re.findall(
-            r"\{Algorithm::(\w+), Direction::(\w+)\}", m.group(2)
-        )
+    for m in re.finditer(r"constexpr int kAlgorithms_(\w+)\[\] = \{(.*?)\};", host, re.S):
+        out[m.group(1)] = re.findall(r"Algorithm::(\w+)", m.group(2))
     return out
 
 
@@ -208,14 +203,14 @@ def lays_out(kernel: str, b: tuple, world: int) -> bool:
     builds do, but for an INT4 pulled norm or AttnRes whose tile is not whole groups a
     thread (TILE_N a multiple of 32 * THREADS), which its kernel's static_assert refuses
     by name (a thread quantizes whole groups alone)."""
-    algorithm, direction, block, _, _, _, tile_m, tile_n, _, _ = b
+    algorithm, block, _, _, _, tile_m, tile_n, _, _ = b
     if kernel != "all_reduce":
         return True
-    if (algorithm, direction) == ("one_shot", "push"):
+    if algorithm == "one_shot_push":
         nl = LINE_PAYLOAD_BYTES // 2
     else:
         nl = PACK_BYTES // 2
-    if algorithm == "one_shot":
+    if algorithm in ("one_shot_pull", "one_shot_push"):
         return tile_n % nl == 0
     return tile_m == 1 and block % world == 0 and tile_n % nl == 0
 
@@ -225,8 +220,8 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
     each dtype and world, the weight's dtype where a norm takes one, contiguous or not
     (the plain two-shots), chunked or not (every kernel but the plain all-reduce's),
     with a tail or not (an INT4 two-shot); one that does not lay out has none."""
-    algorithm, direction, block, _, _, waves, tile_m, tile_n, tile_k, q = b
-    two_shot = algorithm == "two_shot"
+    algorithm, block, _, _, waves, tile_m, tile_n, tile_k, q = b
+    two_shot = algorithm in ("two_shot_pull", "two_shot_push")
     plain = kernel == "all_reduce"
     out: list[str] = []
     for _, t in DTYPES:
@@ -262,7 +257,6 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
                                 "C.waves_per_eu": str(waves),
                                 "C.quantization": "1" if q == "int4" else "0",
                                 "C.algorithm": str(ALGORITHM_VALUES[algorithm]),
-                                "C.direction": str(DIRECTION_VALUES[direction]),
                                 "C.contiguous": contiguous,
                                 "C.chunked": chunked,
                                 "C.tail": tail,
@@ -278,14 +272,14 @@ def main() -> None:
     host = Path(sys.argv[4]).read_text()
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
     table = json.loads(Path(table_path).read_text())
-    # EVERY BUILD THE TABLE NAMES ONE OF ITS KERNEL'S VARIANTS (the host's
-    # kVariants_<kernel>; its own static_assert says the same at compile time, this says
+    # EVERY BUILD THE TABLE NAMES AT ONE OF ITS KERNEL'S ALGORITHMS (the host's
+    # kAlgorithms_<kernel>; its own static_assert says the same at compile time, this says
     # it naming the config).
-    has = variants(host)
+    has = algorithms(host)
     for kernel, bs in named(table, archs).items():
         for b in bs:
-            if kernel not in has or tuple(b[:2]) not in has[kernel]:
-                raise SystemExit(f"{kernel} has no {b[0]} {b[1]} variant: {b}")
+            if kernel not in has or b[0] not in has[kernel]:
+                raise SystemExit(f"{kernel} has no {b[0]} algorithm: {b}")
     every = builds(table, archs, has)
     text = [
         "// GENERATED by csrc/rocm/hip_custom_communicator/builds.py from the tuned",
@@ -306,7 +300,7 @@ def main() -> None:
     out_dir = out_path.parent
     declared = [
         "// GENERATED by builds.py: every kernel instance, compiled in its build's own",
-        "// file (hip_custom_communicator_<kernel>_<algorithm>_<direction>__<build>.hip);",
+        "// file (hip_custom_communicator_<kernel>_<algorithm>__<build>.hip);",
         "// declared here so the host instantiates none.",
         f"static_assert(kTarget.wave_size == {WAVE_SIZE} && "
         f"kBuild.memory.pack_bytes == "
@@ -319,9 +313,7 @@ def main() -> None:
         + "}, \"builds.py's dtypes are not the host's\");",
         "static_assert("
         + " && ".join(f"Algorithm::{a} == {v}" for a, v in ALGORITHM_VALUES.items())
-        + " && "
-        + " && ".join(f"Direction::{d} == {v}" for d, v in DIRECTION_VALUES.items())
-        + ", \"builds.py's algorithms and directions are not common.cuh's\");",
+        + ", \"builds.py's algorithms are not common.cuh's\");",
         f"static_assert(kUnfencedSlotBytes == {UNFENCED_SLOT_BYTES} && kInt4Group == "
         f"{INT4_GROUP}, \"builds.py's unfenced slot and INT4 group are not the host's\");",
         "",
@@ -370,9 +362,9 @@ def main() -> None:
 
 def file_of(kernel: str, b: tuple) -> str:
     """The file a build's instances are compiled in, named by the build."""
-    algorithm, direction, bx, by, bz, waves, tm, tn, tk, q = b
+    algorithm, bx, by, bz, waves, tm, tn, tk, q = b
     return (
-        f"hip_custom_communicator_{kernel}_{algorithm}_{direction}__{bx}x{by}x{bz}_w{waves}"
+        f"hip_custom_communicator_{kernel}_{algorithm}__{bx}x{by}x{bz}_w{waves}"
         f"_t{tm}x{tn}x{tk}_{q}.hip"
     )
 

@@ -160,13 +160,13 @@ namespace hip_custom_communicator {
 // THAT RANK'S SAME BLOCK SUMS, so a peers barrier makes them visible.
 
 // =============================================================================
-// all_reduce: THE PLAIN ALL-REDUCE, ONE KERNEL: its ALGORITHM and DIRECTION (common.cuh's
-// Algorithm and Direction) are template parameters, and each pair it is built for
-// (pull one-shot, pull two-shot, push one-shot, push two-shot) is its own body under `if constexpr`, as its
-// section above says. A pair it has no body for does not compile.
+// all_reduce: THE PLAIN ALL-REDUCE, ONE KERNEL: its ALGORITHM (common.cuh's Algorithm) is a
+// template parameter, and each algorithm it is built for (pull one-shot, pull two-shot, push one-shot, push two-shot) is its own
+// body under `if constexpr`, as its section above says. An algorithm it has no body for does not
+// compile.
 // =============================================================================
 template <typename DTYPE, int WORLD, int TILE_M, int TILE_N, int THREADS_PER_BLOCK, int WAVE_SIZE,
-          int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION, int ALGORITHM, int DIRECTION,
+          int PACK_BYTES, int WAVES_PER_EU, int QUANTIZATION, int ALGORITHM,
           bool CONTIGUOUS, bool TAIL>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     all_reduce(
@@ -191,7 +191,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         int signals_size_block, int signals_size_writer,
         uint32_t* __restrict__ status_ptr, int64_t status_stride_field,
         int status_size_field, int rank, uint64_t timeout_ticks) {
-  if constexpr (ALGORITHM == Algorithm::one_shot && DIRECTION == Direction::pull) {
+  if constexpr (ALGORITHM == Algorithm::one_shot_pull) {
     // PULL ONE-SHOT (all_reduce_pull_one_shot, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kThreadsM = THREADS_PER_BLOCK % TILE_M == 0 ? TILE_M : 1;
@@ -247,7 +247,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         signals_stride_writer, signals_size_parity, signals_size_block,
         signals_size_writer, status_ptr, status_stride_field, status_size_field,
         rank, timeout_ticks, Until::read, 1);
-  } else if constexpr (ALGORITHM == Algorithm::two_shot && DIRECTION == Direction::pull) {
+  } else if constexpr (ALGORITHM == Algorithm::two_shot_pull) {
     // PULL TWO-SHOT (all_reduce_pull_two_shot, above).
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     for (int r0 = 0; r0 < input_size_m; r0 += partials_size_m) {
@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                         partials_stride_n, partials_size_m, partials_size_n, band_output,
                         output_stride_m, output_stride_n, band, input_size_n, 0, 0, 0, rank);
     }
-  } else if constexpr (ALGORITHM == Algorithm::one_shot && DIRECTION == Direction::push) {
+  } else if constexpr (ALGORITHM == Algorithm::one_shot_push) {
     // PUSH ONE-SHOT (all_reduce_push_one_shot, above).
     static_assert(QUANTIZATION == Quantization::exact, "a line carries exact payload");
     // THE TILE'S WALK, the pulled one-shot's (its section): rows of threads where they divide the
@@ -364,8 +364,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
         blockIdx.x, 0, 1);
   } else {
     // PUSH TWO-SHOT (all_reduce_push_two_shot, above).
-    static_assert(ALGORITHM == Algorithm::two_shot && DIRECTION == Direction::push,
-                  "all_reduce: no body for this algorithm and direction");
+    static_assert(ALGORITHM == Algorithm::two_shot_push,
+                  "all_reduce: no body for this algorithm");
     static_assert(QUANTIZATION == Quantization::exact || QUANTIZATION == Quantization::int4,
                   "unsupported quantization");
     if constexpr (QUANTIZATION == Quantization::int4) {
