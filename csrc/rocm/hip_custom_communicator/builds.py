@@ -153,8 +153,8 @@ def literal(kernel: str, b: tuple) -> str:
 # the generated header asserts them equal, so a change there fails the compile naming
 # this file.
 WAVE_SIZE, PACK_BYTES = 64, 16
-DTYPES = (("f16", "c10::Half"), ("bf16", "c10::BFloat16"))
-WORLDS = (2, 4, 8)
+DTYPES = (("bf16", "c10::BFloat16"),)   # EXPLORE: bf16 alone (the host's kBuild.supports)
+WORLDS = (8,)   # EXPLORE: world 8 alone (the host's kBuild.supports)
 LINE_PAYLOAD_BYTES = (
     8  # the pushed one-shot's pack: a line's payload (common.cuh's kLinePayloadBytes)
 )
@@ -305,10 +305,10 @@ def main() -> None:
         f"static_assert(kTarget.wave_size == {WAVE_SIZE} && "
         f"kBuild.memory.pack_bytes == "
         f"{PACK_BYTES}, \"builds.py's wave and pack are not the host's\");",
-        "static_assert(kBuild.supports.worlds == std::array<int, 3>{"
+        f"static_assert(kBuild.supports.worlds == std::array<int, {len(WORLDS)}>{{"
         + ", ".join(map(str, WORLDS))
         + "}, \"builds.py's worlds are not the host's\");",
-        "static_assert(kBuild.supports.dtypes == std::array<DType, 2>{"
+        f"static_assert(kBuild.supports.dtypes == std::array<DType, {len(DTYPES)}>{{"
         + ", ".join(f"DType::{d}" for d, _ in DTYPES)
         + "}, \"builds.py's dtypes are not the host's\");",
         "static_assert("

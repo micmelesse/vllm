@@ -199,9 +199,9 @@ constexpr const char* to_string(DType d) {
 // (`build_info`).
 struct BuildInfo {
   struct Supports {
-    std::array<DType, 2>
+    std::array<DType, 1>
         dtypes;  // a call's; dispatch instantiates exactly these
-    std::array<int, 3> worlds;
+    std::array<int, 1> worlds;
   };
   struct Memory {
     int pack_bytes;  // a pack: the unit every kernel loads, sums and stores in
@@ -214,7 +214,10 @@ constexpr BuildInfo derive(const Hardware& hw) {
   BuildInfo info{};
   // WHAT IS COMPILED, one list each: dispatch instantiates exactly these, check
   // refuses the rest.
-  info.supports = {{DType::f16, DType::bf16}, {2, 4, 8}};
+  // EXPLORE (the coarse tune's build only): bf16 at world 8, what the tune calls; the full lists
+  // (f16 and bf16, worlds 2, 4 and 8) put the coarse space's 27,000 instances past the 2 GiB a
+  // shared library's code can span (ld.lld: relocation R_X86_64_PC32 out of range).
+  info.supports = {{DType::bf16}, {8}};
 
   BuildInfo::Memory& m = info.memory;
   // A PACK IS THE WIDEST LOAD, as in vLLM's and aiter's custom all-reduce and
