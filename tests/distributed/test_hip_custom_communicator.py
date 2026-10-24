@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from multiprocessing.queues import Queue
-from typing import TypeAlias, TypeVar, get_args
+from typing import TypeAlias, TypeVar, cast, get_args
 
 import pytest
 import torch
@@ -36,6 +36,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     ABANDON_WAIT_S,
     TUNED_OPS,
     Algorithm,
+    Config,
     Error,
     FlagState,
     HipCustomCommunicator,
@@ -107,11 +108,26 @@ SMOKE_PROCESS_TIMEOUT_S = 240
 DUMP_GRACE_S = 5.0
 TERM_GRACE_S = ABANDON_WAIT_S + 5.0
 
-Forced = dict[str, str | int]
-# AN OP'S ONE KERNEL AT ONE OF ITS ALGORITHMS (a config's first two fields).
-Variant = tuple[str, Algorithm]
-# AN OP AS TWO KERNELS OF OURS, forced: our all-reduce's forcing, then its norm's.
-Composed = tuple[Forced, Forced]
+
+@dataclass(frozen=True)
+class Variant:
+    """AN OP'S ONE KERNEL AT ONE OF ITS ALGORITHMS (a config's kernel and algorithm)."""
+
+    kernel: str
+    algorithm: Algorithm
+
+
+@dataclass(frozen=True)
+class Composed:
+    """AN OP AS TWO KERNELS OF OURS: our plain all-reduce (its own pick), then the op's
+    norm on rows forced at `norm_config`."""
+
+    norm_config: Config
+
+
+# WHAT A CALL IS FORCED TO: nothing (None: a plain call, the communicator's pick), one
+# kernel's config, or two kernels of ours.
+Forcing: TypeAlias = Config | Composed | None
 Tolerance = tuple[float, float]
 F = TypeVar("F", bound=Callable[..., None])
 
@@ -187,8 +203,7 @@ def _step(rank: int, name: str) -> Iterator[None]:
 def _rank_main(
     rank: int,
     port: int,
-    target: Callable[..., None],
-    kwargs: dict[str, str],
+    target: Callable[[HipCustomCommunicator, int], None],
     failures: "Queue[str]",
     kernel_timeout_s: float,
     log_mode: LogMode,
@@ -232,7 +247,7 @@ def _rank_main(
         _COMM = comm
         try:
             assert not comm.disabled, f"rank {rank}: open: disabled: {comm.state}"
-            target(comm, rank, **kwargs)
+            target(comm, rank)
         finally:
             _COMM = None
             comm.close()
@@ -244,14 +259,14 @@ def _rank_main(
 
 
 def _on_every_rank(
-    target: Callable[..., None],
+    target: Callable[[HipCustomCommunicator, int], None],
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
     table: TunedTable | None = None,
-    **kwargs: str,
 ) -> None:
-    """`target(comm, rank, **kwargs)` on WORLD_SIZE spawned ranks, each holding a
+    """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
+    by name first, `partial`), each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
     tuned table `table` (None: the file's). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
@@ -262,8 +277,16 @@ def _on_every_rank(
     port = get_open_port()
     procs = [
         ctx.Process(
-            target=_rank_main,
-            args=(r, port, target, kwargs, failures, kernel_timeout_s, log_mode, table),
+            target=partial(
+                _rank_main,
+                rank=r,
+                port=port,
+                target=target,
+                failures=failures,
+                kernel_timeout_s=kernel_timeout_s,
+                log_mode=log_mode,
+                table=table,
+            )
         )
         for r in range(WORLD_SIZE)
     ]
@@ -344,6 +367,10 @@ def _randn(shape: tuple[int, ...], dtype: torch.dtype, seed: int) -> torch.Tenso
     return torch.randn(shape, generator=g, device=device).to(dtype)
 
 
+def _cloned(t: torch.Tensor | None) -> torch.Tensor | None:
+    return None if t is None else t.clone()
+
+
 @dataclass(frozen=True)
 class Args:
     """An op's arguments besides its input, the same on every rank."""
@@ -367,13 +394,25 @@ class Args:
 
     def rows(self, n: int) -> "Args":
         """The first `n` rows of every per-token argument."""
-        per_token = ("residual", "prefix", "blocks")
         return replace(
-            self, **{k: v[:n] for k, v in self.tensors().items() if k in per_token}
+            self,
+            residual=None if self.residual is None else self.residual[:n],
+            prefix=None if self.prefix is None else self.prefix[:n],
+            blocks=None if self.blocks is None else self.blocks[:n],
         )
 
     def clone(self) -> "Args":
-        return replace(self, **{k: v.clone() for k, v in self.tensors().items()})
+        return Args(
+            weight=_cloned(self.weight),
+            residual=_cloned(self.residual),
+            prefix=_cloned(self.prefix),
+            blocks=_cloned(self.blocks),
+            norm_weight=_cloned(self.norm_weight),
+            qk_weight=_cloned(self.qk_weight),
+            output_norm_weight=_cloned(self.output_norm_weight),
+            num_blocks=self.num_blocks,
+            write_index=self.write_index,
+        )
 
     def copy_(self, other: "Args") -> None:
         for k, v in self.tensors().items():
@@ -417,25 +456,102 @@ def _call(
     op: Op,
     x: torch.Tensor,
     args: Args,
-    forced: Forced | Composed,
+    forcing: Forcing,
 ) -> list[torch.Tensor]:
     """The op's outputs. AttnRes also writes its block into `args.blocks`. A
     composition runs our all-reduce, then the op's norm on rows on its sum, each its
-    public op, as a caller composes it."""
-    if isinstance(forced, tuple):
-        summed, rows = comm.all_reduce(x, **forced[0]), forced[1]
+    public op, as a caller composes it. A forced call hands the op each field of its
+    config by name."""
+    if isinstance(forcing, Composed):
+        summed, norm_config = comm.all_reduce(x), forcing.norm_config
         if op == "all_reduce_rms_norm":
             assert args.weight is not None
-            return [comm.rms_norm(summed, args.weight, EPS, **rows)]
+            return [
+                comm.rms_norm(
+                    input=summed,
+                    weight=args.weight,
+                    eps=EPS,
+                    kernel=norm_config.kernel,
+                    algorithm=norm_config.algorithm,
+                    grid_x=norm_config.grid_x,
+                    grid_y=norm_config.grid_y,
+                    grid_z=norm_config.grid_z,
+                    block_x=norm_config.block_x,
+                    block_y=norm_config.block_y,
+                    block_z=norm_config.block_z,
+                    waves_per_eu=norm_config.waves_per_eu,
+                    tile_m=norm_config.tile_m,
+                    tile_n=norm_config.tile_n,
+                    tile_k=norm_config.tile_k,
+                    quantization=norm_config.quantization,
+                )
+            ]
         if op == "all_reduce_add_rms_norm":
             assert args.weight is not None and args.residual is not None
             return list(
-                comm.add_rms_norm(summed, args.residual, args.weight, EPS, **rows)
+                comm.add_rms_norm(
+                    input=summed,
+                    residual=args.residual,
+                    weight=args.weight,
+                    eps=EPS,
+                    kernel=norm_config.kernel,
+                    algorithm=norm_config.algorithm,
+                    grid_x=norm_config.grid_x,
+                    grid_y=norm_config.grid_y,
+                    grid_z=norm_config.grid_z,
+                    block_x=norm_config.block_x,
+                    block_y=norm_config.block_y,
+                    block_z=norm_config.block_z,
+                    waves_per_eu=norm_config.waves_per_eu,
+                    tile_m=norm_config.tile_m,
+                    tile_n=norm_config.tile_n,
+                    tile_k=norm_config.tile_k,
+                    quantization=norm_config.quantization,
+                )
             )
         assert args.blocks is not None
         assert args.norm_weight is not None and args.qk_weight is not None
         prefix, out = comm.add_attn_res_rms_norm(
-            summed,
+            input=summed,
+            prefix=args.prefix,
+            blocks=args.blocks,
+            norm_weight=args.norm_weight,
+            qk_weight=args.qk_weight,
+            output_norm_weight=args.output_norm_weight,
+            num_blocks=args.num_blocks,
+            write_index=args.write_index,
+            eps=ATTN_RES_EPS,
+            output_eps=EPS,
+            kernel=norm_config.kernel,
+            algorithm=norm_config.algorithm,
+            grid_x=norm_config.grid_x,
+            grid_y=norm_config.grid_y,
+            grid_z=norm_config.grid_z,
+            block_x=norm_config.block_x,
+            block_y=norm_config.block_y,
+            block_z=norm_config.block_z,
+            waves_per_eu=norm_config.waves_per_eu,
+            tile_m=norm_config.tile_m,
+            tile_n=norm_config.tile_n,
+            tile_k=norm_config.tile_k,
+            quantization=norm_config.quantization,
+        )
+        return [out, prefix, args.blocks]
+    if forcing is None:
+        if op == "all_reduce":
+            return [comm.all_reduce(x)]
+        if op == "all_reduce_rms_norm":
+            assert args.weight is not None
+            return [comm.all_reduce_rms_norm(x, args.weight, EPS)]
+        if op == "all_reduce_add_rms_norm":
+            assert args.weight is not None and args.residual is not None
+            return list(
+                comm.all_reduce_add_rms_norm(x, args.residual, args.weight, EPS)
+            )
+        assert args.blocks is not None
+        assert args.norm_weight is not None and args.qk_weight is not None
+        prefix, out = comm.all_reduce_add_attn_res_rms_norm(
+            x,
             args.prefix,
             args.blocks,
             args.norm_weight,
@@ -445,33 +561,99 @@ def _call(
             args.write_index,
             ATTN_RES_EPS,
             EPS,
-            **rows,
         )
         return [out, prefix, args.blocks]
+    config = forcing
     if op == "all_reduce":
-        return [comm.all_reduce(x, **forced)]
+        return [
+            comm.all_reduce(
+                input=x,
+                kernel=config.kernel,
+                algorithm=config.algorithm,
+                grid_x=config.grid_x,
+                grid_y=config.grid_y,
+                grid_z=config.grid_z,
+                block_x=config.block_x,
+                block_y=config.block_y,
+                block_z=config.block_z,
+                waves_per_eu=config.waves_per_eu,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                tile_k=config.tile_k,
+                quantization=config.quantization,
+            )
+        ]
     if op == "all_reduce_rms_norm":
         assert args.weight is not None
-        return [comm.all_reduce_rms_norm(x, args.weight, EPS, **forced)]
+        return [
+            comm.all_reduce_rms_norm(
+                input=x,
+                weight=args.weight,
+                eps=EPS,
+                kernel=config.kernel,
+                algorithm=config.algorithm,
+                grid_x=config.grid_x,
+                grid_y=config.grid_y,
+                grid_z=config.grid_z,
+                block_x=config.block_x,
+                block_y=config.block_y,
+                block_z=config.block_z,
+                waves_per_eu=config.waves_per_eu,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                tile_k=config.tile_k,
+                quantization=config.quantization,
+            )
+        ]
     if op == "all_reduce_add_rms_norm":
         assert args.weight is not None and args.residual is not None
         return list(
-            comm.all_reduce_add_rms_norm(x, args.residual, args.weight, EPS, **forced)
+            comm.all_reduce_add_rms_norm(
+                input=x,
+                residual=args.residual,
+                weight=args.weight,
+                eps=EPS,
+                kernel=config.kernel,
+                algorithm=config.algorithm,
+                grid_x=config.grid_x,
+                grid_y=config.grid_y,
+                grid_z=config.grid_z,
+                block_x=config.block_x,
+                block_y=config.block_y,
+                block_z=config.block_z,
+                waves_per_eu=config.waves_per_eu,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                tile_k=config.tile_k,
+                quantization=config.quantization,
+            )
         )
     assert args.blocks is not None
     assert args.norm_weight is not None and args.qk_weight is not None
     prefix, out = comm.all_reduce_add_attn_res_rms_norm(
-        x,
-        args.prefix,
-        args.blocks,
-        args.norm_weight,
-        args.qk_weight,
-        args.output_norm_weight,
-        args.num_blocks,
-        args.write_index,
-        ATTN_RES_EPS,
-        EPS,
-        **forced,
+        input=x,
+        prefix=args.prefix,
+        blocks=args.blocks,
+        norm_weight=args.norm_weight,
+        qk_weight=args.qk_weight,
+        output_norm_weight=args.output_norm_weight,
+        num_blocks=args.num_blocks,
+        write_index=args.write_index,
+        eps=ATTN_RES_EPS,
+        output_eps=EPS,
+        kernel=config.kernel,
+        algorithm=config.algorithm,
+        grid_x=config.grid_x,
+        grid_y=config.grid_y,
+        grid_z=config.grid_z,
+        block_x=config.block_x,
+        block_y=config.block_y,
+        block_z=config.block_z,
+        waves_per_eu=config.waves_per_eu,
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        tile_k=config.tile_k,
+        quantization=config.quantization,
     )
     return [out, prefix, args.blocks]
 
@@ -533,16 +715,15 @@ def _should(comm: HipCustomCommunicator, op: Op, x: torch.Tensor, args: Args) ->
 
 def _forced(
     variant: Variant, cols: int = 0, quantization: Quantization = "exact"
-) -> Forced | None:
+) -> Config | None:
     """`variant` forced whole: the kernel by its name, its first build at the variant's
     algorithm moving `quantization` whose tile holds `cols` columns, and a fixed grid.
     None when no build's tile holds them."""
-    kernel, algorithm = variant
     build = next(
         (
             b
-            for b in build_info().templates[kernel].builds
-            if b["algorithm"] == algorithm
+            for b in build_info().templates[variant.kernel].builds
+            if b["algorithm"] == variant.algorithm
             and b["quantization"] == quantization
             and int(b["tile_n"]) >= cols
         ),
@@ -550,15 +731,31 @@ def _forced(
     )
     if build is None:
         return None
-    return {"kernel": kernel, "grid_x": 16, "grid_y": 1, "grid_z": 1, **build}
+    return Config(
+        kernel=variant.kernel,
+        algorithm=variant.algorithm,
+        grid_x=16,
+        grid_y=1,
+        grid_z=1,
+        block_x=int(build["block_x"]),
+        block_y=int(build["block_y"]),
+        block_z=int(build["block_z"]),
+        waves_per_eu=int(build["waves_per_eu"]),
+        tile_m=int(build["tile_m"]),
+        tile_n=int(build["tile_n"]),
+        tile_k=int(build["tile_k"]),
+        quantization=quantization,
+    )
 
 
 def _forced_whole(
     variant: Variant, cols: int = 0, quantization: Quantization = "exact"
-) -> Forced:
-    forced = _forced(variant, cols, quantization)
-    assert forced is not None, f"{variant} has no {quantization} build for {cols}"
-    return forced
+) -> Config:
+    forced_config = _forced(variant, cols, quantization)
+    assert forced_config is not None, (
+        f"{variant} has no {quantization} build for {cols}"
+    )
+    return forced_config
 
 
 def _error_of(e: RuntimeError) -> Error:
@@ -570,7 +767,10 @@ def _variants(op: Op) -> list[Variant]:
     """Every variant of `op`'s kernel the build has, in its builds' order."""
     return list(
         dict.fromkeys(
-            (name, b["algorithm"])
+            Variant(
+                kernel=name,
+                algorithm=cast(Algorithm, b["algorithm"]),
+            )
             for name, t in build_info().templates.items()
             if t.op == op
             for b in t.builds
@@ -600,16 +800,16 @@ def _tile_cols(op: Op, hidden: int) -> int:
 def _smoke_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     bf16 = torch.bfloat16
     with _step(rank, f"all_reduce 1x{HIDDEN} eager"):
-        _eager(comm, rank, "all_reduce", 1, HIDDEN, bf16, {}, None, 1)
+        _eager(comm, rank, "all_reduce", 1, HIDDEN, bf16, None, None, 1)
     for op in TUNED_OPS:
         if op != "all_reduce":
             layer = ATTN_RES_LAYERS[0] if "attn_res" in op else None
             with _step(rank, f"{op} 1x{HIDDEN} eager"):
-                _eager(comm, rank, op, 1, HIDDEN, bf16, {}, layer, 2)
+                _eager(comm, rank, op, 1, HIDDEN, bf16, None, layer, 2)
     with _step(rank, f"all_reduce 2048x{HIDDEN} eager"):
-        _eager(comm, rank, "all_reduce", 2048, HIDDEN, bf16, {}, None, 3)
+        _eager(comm, rank, "all_reduce", 2048, HIDDEN, bf16, None, None, 3)
     with _step(rank, f"all_reduce 1x{HIDDEN} graph capture and replay"):
-        _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, {}, None)
+        _graphs(comm, rank, "all_reduce", (1,), HIDDEN, bf16, None, None)
     with _step(rank, "the capture's inputs registered, the eager inputs copied"):
         log = comm.log()
         assert log is not None
@@ -645,25 +845,31 @@ def _eager(
     rows: int,
     hidden: int,
     dtype: torch.dtype,
-    forced: Forced,
+    forcing: Forcing,
     layer: AttnResLayer | None,
     seed: int,
 ) -> bool:
     """One eager call against the reference. False when the forced kernel refused
     it; a plain call the communicator admits must run."""
-    where = f"{op} {rows}x{hidden} {dtype} forced={forced or None} eager"
+    where = f"{op} {rows}x{hidden} {dtype} forced={forcing} eager"
     x, args = _make(op, rows, hidden, dtype, seed, rank, layer)
     summed = _sum(x, comm)
-    if not forced:
+    if forcing is None:
         assert _should(comm, op, x, args), f"{where}: not admitted"
     try:
-        got = _call(comm, op, x, args.clone(), forced)
+        got = _call(comm, op, x, args.clone(), forcing)
     except RuntimeError as no:
-        assert forced, f"{where}: a plain call was refused: {no}"
+        assert forcing is not None, f"{where}: a plain call was refused: {no}"
         _assert_clean(comm, where)
         return False
     _assert_clean(comm, where)
-    _assert_close(where, got, *_reference(op, summed, args))
+    want, tolerances = _reference(op, summed, args)
+    _assert_close(
+        where=where,
+        got=got,
+        want=want,
+        tolerances=tolerances,
+    )
     return True
 
 
@@ -674,13 +880,13 @@ def _graphs(
     tokens: Sequence[int],
     hidden: int,
     dtype: torch.dtype,
-    forced: Forced,
+    forcing: Forcing,
     layer: AttnResLayer | None,
 ) -> None:
     """As vLLM captures: GRAPH_LAYERS calls a graph, every capture size warmed up
     and captured under one capture, each reading a prefix of the same static
     buffers; replayed with fresh inputs, an eager call between replays."""
-    where = f"{op} {hidden} {dtype} forced={forced or None} graph"
+    where = f"{op} {hidden} {dtype} forced={forcing} graph"
     statics = [
         _make(op, max(tokens), hidden, dtype, 1000 + i, rank, layer)
         for i in range(GRAPH_LAYERS)
@@ -690,11 +896,11 @@ def _graphs(
     with comm.capture():
         for t in tokens:
             for x, args in statics:  # the warmup, which launches nothing
-                _call(comm, op, x[:t], args.rows(t), forced)
+                _call(comm, op, x[:t], args.rows(t), forcing)
             graphs[t] = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graphs[t]):
                 outs[t] = [
-                    _call(comm, op, x[:t], args.rows(t), forced) for x, args in statics
+                    _call(comm, op, x[:t], args.rows(t), forcing) for x, args in statics
                 ]
     for replay in range(GRAPH_REPLAYS):
         for t in tokens:
@@ -707,50 +913,52 @@ def _graphs(
                 args.rows(t).copy_(fresh_args)
             graphs[t].replay()
             for i, (fresh_x, fresh_args) in enumerate(fresh):
+                want, tolerances = _reference(op, _sum(fresh_x, comm), fresh_args)
                 _assert_close(
-                    f"{where} {t} tokens, layer {i}, replay {replay}",
-                    outs[t][i],
-                    *_reference(op, _sum(fresh_x, comm), fresh_args),
+                    where=f"{where} {t} tokens, layer {i}, replay {replay}",
+                    got=outs[t][i],
+                    want=want,
+                    tolerances=tolerances,
                 )
             _assert_clean(comm, f"{where} {t} tokens, replay {replay}")
-        _eager(comm, rank, op, tokens[0], hidden, dtype, forced, layer, 3000 + replay)
+        _eager(comm, rank, op, tokens[0], hidden, dtype, forcing, layer, 3000 + replay)
 
 
 def _op_on_rank(comm: HipCustomCommunicator, rank: int, op: Op) -> None:
     layers = ATTN_RES_LAYERS if op == "all_reduce_add_attn_res_rms_norm" else (None,)
     for dtype in DTYPES[op]:
         for hidden in WIDTHS[op]:
-            forcings: list[Forced | Composed] = [
-                {},
+            forcings: list[Forcing] = [
+                None,
                 *(
-                    forced
+                    forced_config
                     for t in _variants(op)
-                    if (forced := _forced(t, _tile_cols(op, hidden))) is not None
+                    if (forced_config := _forced(t, _tile_cols(op, hidden))) is not None
                 ),
                 # AS TWO KERNELS OF OURS: the plain all-reduce, then each norm on rows.
                 *(
-                    ({}, forced)
+                    Composed(norm_config=norm_config)
                     for t in (_variants(ROWS[op]) if op in ROWS else [])
-                    if (forced := _forced(t, hidden)) is not None
+                    if (norm_config := _forced(t, hidden)) is not None
                 ),
             ]
             for layer in layers:
-                for forced in forcings:
+                for forcing in forcings:
                     ran = [
                         t
                         for t in TOKENS
-                        if _eager(comm, rank, op, t, hidden, dtype, forced, layer, t)
+                        if _eager(comm, rank, op, t, hidden, dtype, forcing, layer, t)
                     ]
                     if ran:
-                        _graphs(comm, rank, op, ran, hidden, dtype, forced, layer)
+                        _graphs(comm, rank, op, ran, hidden, dtype, forcing, layer)
                     elif rank == 0:
-                        print(f"{op} {hidden} {dtype} {forced}: refused at every size")
+                        print(f"{op} {hidden} {dtype} {forcing}: refused at every size")
 
 
 @on_eight_gpus
 @pytest.mark.parametrize("op", TUNED_OPS)
 def test_op_matches_the_ops_it_replaces(op: Op) -> None:
-    _on_every_rank(_op_on_rank, op=op)
+    _on_every_rank(target=partial(_op_on_rank, op=op))
 
 
 # --------------------------------------------------------------------------------
@@ -782,7 +990,7 @@ def _int4_input(rank: int, k: int, shape: tuple[int, ...]) -> torch.Tensor:
 def _int4_round_trip(x: torch.Tensor) -> torch.Tensor:
     """Through quick reduce's INT4 and back, in fp32: each group's scale its largest
     magnitude / 7 rounded to fp16, each value the nearest of -8..7 times it."""
-    groups = x.float().reshape(*x.shape[:-1], -1, INT4_GROUP)
+    groups = x.float().reshape(tuple(x.shape[:-1]) + (-1, INT4_GROUP))
     amax = groups.abs().amax(dim=-1, keepdim=True)
     scale = (
         torch.clamp(amax * torch.tensor(1.0 / 7.0, dtype=torch.float32), max=65504.0)
@@ -815,7 +1023,7 @@ def _int4_owner(op: Op, variant: Variant, shape: tuple[int, int]) -> torch.Tenso
     if op == "all_reduce":
         flat = torch.arange(rows * hidden).reshape(rows, hidden)
         return flat // (rows * hidden // WORLD_SIZE)
-    if variant[1] == "two_shot_pull" and "attn_res" in op:
+    if variant.algorithm == "two_shot_pull" and "attn_res" in op:
         slice_m = -(-rows // WORLD_SIZE)
         return (torch.arange(rows) // slice_m).unsqueeze(1).expand(rows, hidden)
     return torch.zeros(rows, hidden, dtype=torch.long)
@@ -856,23 +1064,36 @@ def _int4_case(
     total = _int4_sum(landed, _int4_owner(op, variant, shape))
     summed = _int4_landed(total, dtype)
     pull_norm = (
-        variant[1] == "two_shot_pull"
+        variant.algorithm == "two_shot_pull"
         and "rms_norm" in op
         and "attn_res" not in op
     )
-    forced = _forced_whole(variant, _tile_cols(op, hidden), "int4")
+    forced_config = _forced_whole(variant, _tile_cols(op, hidden), "int4")
     mine = inputs[rank].to(device)
     normed = _tolerance(dtype, normed=True)
     checks: list[tuple[str, torch.Tensor, torch.Tensor, Tolerance]]
     if op == "all_reduce":
-        got = comm.all_reduce(mine, **forced)
+        (got,) = _call(
+            comm=comm,
+            op=op,
+            x=mine,
+            args=Args(),
+            forcing=forced_config,
+        )
         checks = [("out", got, summed, INT4_LANDED_TOLERANCE)]
     elif op in ("all_reduce_rms_norm", "all_reduce_add_rms_norm"):
         residual = _int4_input(WORLD_SIZE, 1, shape)
         weight = _int4_input(WORLD_SIZE + 1, 2, (hidden,))
         if op == "all_reduce_add_rms_norm":
-            got, got_residual = comm.all_reduce_add_rms_norm(
-                mine, residual.to(device), weight.to(device), EPS, **forced
+            got, got_residual = _call(
+                comm=comm,
+                op=op,
+                x=mine,
+                args=Args(
+                    weight=weight.to(device),
+                    residual=residual.to(device),
+                ),
+                forcing=forced_config,
             )
             if pull_norm:
                 # A row split: the owner adds the residual to the unquantized sum
@@ -891,7 +1112,13 @@ def _int4_case(
                 ("residual", got_residual, want_residual, INT4_LANDED_TOLERANCE),
             ]
         else:
-            got = comm.all_reduce_rms_norm(mine, weight.to(device), EPS, **forced)
+            (got,) = _call(
+                comm=comm,
+                op=op,
+                x=mine,
+                args=Args(weight=weight.to(device)),
+                forcing=forced_config,
+            )
             if pull_norm:
                 # The owner norms the unquantized sum; the normed row crosses.
                 want = _int4_landed(
@@ -936,18 +1163,20 @@ def _int4_case(
 
         want, want_prefix, want_blocks = reference(summed)
         got_blocks = blocks.to(device).clone()
-        got_prefix, got = comm.all_reduce_add_attn_res_rms_norm(
-            mine,
-            None,
-            got_blocks,
-            norm_w,
-            qk_w,
-            out_w,
-            num_blocks,
-            write_index,
-            ATTN_RES_EPS,
-            EPS,
-            **forced,
+        got, got_prefix, _ = _call(
+            comm=comm,
+            op=op,
+            x=mine,
+            args=Args(
+                prefix=None,
+                blocks=got_blocks,
+                norm_weight=norm_w,
+                qk_weight=qk_w,
+                output_norm_weight=out_w,
+                num_blocks=num_blocks,
+                write_index=write_index,
+            ),
+            forcing=forced_config,
         )
         checks = [
             ("out", got, want, normed),
@@ -963,13 +1192,29 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
     """A call that does not ask for INT4 moves the input as it is: a plain call on
     a communicator whose quantization is exact (the default), whose table's pick moves
     nothing quantized, and a forced exact two-shot."""
-    forced = _forced_whole(("all_reduce", "two_shot_pull"))
+    forced_config = _forced_whole(
+        Variant(
+            kernel="all_reduce",
+            algorithm="two_shot_pull",
+        )
+    )
     (tuned_config,) = comm.tuned("all_reduce", 2048, HIDDEN)
-    assert tuned_config.quantization == "exact" and forced["quantization"] == "exact"
-    for name, forcing in (("plain", {}), ("forced", forced)):
+    assert tuned_config.quantization == "exact"
+    assert forced_config.quantization == "exact"
+    forcings: tuple[tuple[str, Forcing], ...] = (
+        ("plain", None),
+        ("forced", forced_config),
+    )
+    for name, forcing in forcings:
         x = _randn((2048, HIDDEN), torch.bfloat16, 77 * WORLD_SIZE + rank)
         summed = _sum(x, comm)
-        got = comm.all_reduce(x, **forcing)
+        (got,) = _call(
+            comm=comm,
+            op="all_reduce",
+            x=x,
+            args=Args(),
+            forcing=forcing,
+        )
         _assert_clean(comm, name)
         _assert_close(name, [got], [summed], [_tolerance(x.dtype, normed=False)])
 
@@ -977,10 +1222,9 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
 def _int4_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     for op in TUNED_OPS:
         for variant in _variants(op):
-            kernel, algorithm = variant
             if any(
-                (b["algorithm"], b["quantization"]) == (algorithm, "int4")
-                for b in build_info().templates[kernel].builds
+                b["algorithm"] == variant.algorithm and b["quantization"] == "int4"
+                for b in build_info().templates[variant.kernel].builds
             ):
                 for shape in INT4_SHAPES:
                     _int4_case(comm, rank, op, variant, shape)
@@ -998,7 +1242,9 @@ def test_int4_two_shot_matches_the_format_it_moves() -> None:
 # What it refuses, and that a refused call leaves it working.
 # --------------------------------------------------------------------------------
 
-Outputs: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+Outputs: TypeAlias = (
+    torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor]
+)
 
 
 def _refused(
@@ -1012,7 +1258,7 @@ def _refused(
     except RuntimeError as no:
         error = _error_of(no)
     _assert_clean(comm, where)
-    _eager(comm, rank, "all_reduce", 16, HIDDEN, torch.bfloat16, {}, None, 99)
+    _eager(comm, rank, "all_reduce", 16, HIDDEN, torch.bfloat16, None, None, 99)
     return error
 
 
@@ -1022,12 +1268,27 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     # A two-shot row with fewer 16-byte packs than ranks runs (the late ranks'
     # slices empty), as the plain call does.
     narrow = _randn((16, 8), bf16, rank)
-    two_shot = _forced_whole(("all_reduce", "two_shot_pull"))
+    two_shot_config = _forced_whole(
+        Variant(
+            kernel="all_reduce",
+            algorithm="two_shot_pull",
+        )
+    )
     error = _refused(
-        comm, rank, "narrow row", lambda: comm.all_reduce(narrow, **two_shot)
+        comm,
+        rank,
+        "narrow row",
+        partial(
+            _call,
+            comm=comm,
+            op="all_reduce",
+            x=narrow,
+            args=Args(),
+            forcing=two_shot_config,
+        ),
     )
     assert error is None, error
-    _eager(comm, rank, "all_reduce", 16, 8, bf16, {}, None, 5)
+    _eager(comm, rank, "all_reduce", 16, 8, bf16, None, None, 5)
 
     # An input whose innermost stride is not 1: declined, and refused if called.
     strided = _randn((16, 2 * HIDDEN), bf16, rank)[:, ::2]
@@ -1054,9 +1315,27 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
 
     # Out of capacity: one row wider than the staging, which no pass holds.
     wide = torch.ones((1, comm.capacity.staging_bytes), dtype=bf16, device=comm.device)
-    for shot in ("one_shot_pull", "two_shot_pull"):
-        forced = _forced_whole(("all_reduce", shot))
-        error = _refused(comm, rank, shot, partial(comm.all_reduce, wide, **forced))
+    shots: tuple[Algorithm, ...] = ("one_shot_pull", "two_shot_pull")
+    for shot in shots:
+        forced_config = _forced_whole(
+            Variant(
+                kernel="all_reduce",
+                algorithm=shot,
+            ),
+        )
+        error = _refused(
+            comm,
+            rank,
+            shot,
+            partial(
+                _call,
+                comm=comm,
+                op="all_reduce",
+                x=wide,
+                args=Args(),
+                forcing=forced_config,
+            ),
+        )
         assert error is Error.staging_too_small, (shot, error)
 
     # Out of capacity: past the rows the exchange was sized for, a fused call the
@@ -1066,12 +1345,18 @@ def _refusals_on_rank(comm: HipCustomCommunicator, rank: int) -> None:
     admitted = _should(comm, op, big, args)
     summed = _sum(big, comm)
     try:
-        got = _call(comm, op, big, args.clone(), {})
+        got = _call(comm, op, big, args.clone(), None)
     except RuntimeError as no:
         assert not admitted, f"an admitted call was refused: {no}"
         assert _error_of(no) in (Error.partials_too_small, Error.staging_too_small), no
     else:
-        _assert_close("past the box", got, *_reference(op, summed, args))
+        want, tolerances = _reference(op, summed, args)
+        _assert_close(
+            where="past the box",
+            got=got,
+            want=want,
+            tolerances=tolerances,
+        )
     _assert_clean(comm, "past the box")
 
 
@@ -1221,10 +1506,14 @@ def test_the_builds_are_every_algorithm_of_the_tables_shapes() -> None:
             if b not in want.setdefault(c["kernel"], []):
                 want[c["kernel"]].append(b)
     for kernel, bs in want.items():
-        shapes = list(dict.fromkeys(tuple(b[f] for f in shape) for b in bs))
+        shapes: list[dict[str, int | str]] = []
+        for b in bs:
+            s = {f: b[f] for f in shape}
+            if s not in shapes:
+                shapes.append(s)
         for s in shapes:
             for a in ALGORITHMS[kernel]:
-                b = dict(zip(variant + shape, (a, *s)))
+                b = {"algorithm": a} | s
                 if b not in bs and _takes(kernel, b):
                     bs.append(b)
     got = {name: list(t.builds) for name, t in build_info().templates.items()}
@@ -1337,7 +1626,10 @@ def test_a_table_handed_in_is_the_one_it_runs() -> None:
     found = supported(torch.device("cuda:0"), WORLD_SIZE)
     assert not isinstance(found, Error), found
     table, config = _one_input_table(found.arch)
-    _on_every_rank(_handed_table_on_rank, table=table, config=json.dumps(config))
+    _on_every_rank(
+        target=partial(_handed_table_on_rank, config=json.dumps(config)),
+        table=table,
+    )
 
 
 def test_open_refuses_a_group_no_one_registered() -> None:
