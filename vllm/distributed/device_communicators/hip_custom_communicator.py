@@ -41,7 +41,7 @@ import warnings
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from pathlib import Path
 from types import FrameType
@@ -841,6 +841,48 @@ _CONFIG_KEYS = (
 )
 
 
+@dataclass(frozen=True)
+class Config:
+    """ONE KERNEL'S CONFIG, a field each (`_CONFIG_KEYS`, C++'s arguments, in their
+    order): the kernel, its algorithm, its grid, its block and the block's waves a EU,
+    its tile, what it moves. Every op's C++ call is handed each field by name, a line
+    each, never a tuple or a dict unpacked: a field one side lacks is an error naming it
+    (STANDARDS 3)."""
+
+    kernel: str
+    algorithm: Algorithm
+    grid_x: int
+    grid_y: int
+    grid_z: int
+    block_x: int
+    block_y: int
+    block_z: int
+    waves_per_eu: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    quantization: Quantization
+
+
+def _config(c: Mapping[str, Any]) -> Config:
+    """A table's config record (a field a key, `_CONFIG_KEYS`) as a `Config`."""
+    return Config(
+        kernel=c["kernel"],
+        algorithm=c["algorithm"],
+        grid_x=c["grid_x"],
+        grid_y=c["grid_y"],
+        grid_z=c["grid_z"],
+        block_x=c["block_x"],
+        block_y=c["block_y"],
+        block_z=c["block_z"],
+        waves_per_eu=c["waves_per_eu"],
+        tile_m=c["tile_m"],
+        tile_n=c["tile_n"],
+        tile_k=c["tile_k"],
+        quantization=c["quantization"],
+    )
+
+
 def check_table(raw: TunedTable, arch: str) -> str | None:
     """THE TUNED TABLE `raw` (the file's, or one handed in at open) ON `arch`: None
     where every op's plain call runs from it, else why not (an op not tuned on the arch,
@@ -923,7 +965,7 @@ def check_table(raw: TunedTable, arch: str) -> str | None:
     return None
 
 
-def is_config_given(
+def get_given_config(
     kernel: str | None,
     algorithm: Algorithm | None,
     grid_x: int | None,
@@ -937,17 +979,56 @@ def is_config_given(
     tile_n: int | None,
     tile_k: int | None,
     quantization: Quantization | None,
-) -> bool:
-    """WHETHER AN OP'S CONFIG IS GIVEN IN ITS ARGUMENTS: every one given (True), or
-    none (False: a plain call, the table's pick). Some but not all is no config,
-    refused, forced_incomplete: C++ takes every field."""
-    given = (kernel, algorithm, grid_x, grid_y, grid_z)
-    given += (block_x, block_y, block_z, waves_per_eu, tile_m, tile_n, tile_k)
-    given += (quantization,)
-    if None not in given:
-        return True
-    if given == (None,) * len(given):
-        return False
+) -> Config | None:
+    """AN OP'S CONFIG AS GIVEN IN ITS ARGUMENTS: every field given (the config), or none
+    (None: a plain call, the table's pick). Some but not all is no config, refused,
+    forced_incomplete: C++ takes every field."""
+    if (
+        kernel is not None
+        and algorithm is not None
+        and grid_x is not None
+        and grid_y is not None
+        and grid_z is not None
+        and block_x is not None
+        and block_y is not None
+        and block_z is not None
+        and waves_per_eu is not None
+        and tile_m is not None
+        and tile_n is not None
+        and tile_k is not None
+        and quantization is not None
+    ):
+        return Config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
+        )
+    if (
+        kernel is None
+        and algorithm is None
+        and grid_x is None
+        and grid_y is None
+        and grid_z is None
+        and block_x is None
+        and block_y is None
+        and block_z is None
+        and waves_per_eu is None
+        and tile_m is None
+        and tile_n is None
+        and tile_k is None
+        and quantization is None
+    ):
+        return None
     raise RuntimeError(
         "forced_incomplete: a forced call gives kernel, algorithm, grid x y z, block x "
         "y z, waves_per_eu, tile m n k and quantization"
@@ -961,7 +1042,7 @@ def get_nearest_configs(
     quantization: Quantization,
     world: int,
     arch: str,
-) -> list[tuple[Any, ...]]:
+) -> list[Config]:
     """WHAT A PLAIN CALL OF AN OP LAUNCHES on `rows` x `cols`, from its `table` (the
     file's entry for the op): the configs the nearest input tuned at `quantization` and
     `world` names on `arch`, in the order they launch, each its fields in the essential
@@ -978,7 +1059,7 @@ def get_nearest_configs(
         key=lambda p: (abs(p["tokens"] * p["hidden"] - rows * cols), p["tokens"]),
     )
     configs = [table["configs"][arch][at] for at in nearest["config"][arch]]
-    return [tuple(c[k] for k in _CONFIG_KEYS) for c in configs]
+    return [_config(c) for c in configs]
 
 
 def get_kernel_config(
@@ -990,7 +1071,7 @@ def get_kernel_config(
     quantization: Quantization,
     world: int,
     arch: str,
-) -> tuple[Any, ...] | None:
+) -> Config | None:
     """KERNEL `kernel`'S OWN CONFIG AT `algorithm` FOR `rows` x `cols`
     MOVING `quantization` (a forced launch at the tuned config: gp's kernel lines, the
     tests): the config of it moving that which its nearest input at `world` launches,
@@ -1036,7 +1117,7 @@ def get_kernel_config(
                 None,
             )  # fmt: skip
         if c is not None:
-            return tuple(c[k] for k in _CONFIG_KEYS[:-1]) + (quantization,)
+            return replace(_config(c), quantization=quantization)
     return None
 
 
@@ -1314,7 +1395,7 @@ class HipCustomCommunicator:
     # PLAIN call (nothing forced) runs, read from the build's record of the op, with no
     # C++ call -- as vLLM's `should_custom_ar` is. A caller asks it, then calls the op.
     # Each op takes its own tensors and values, then, keyword-only, what the tuner and
-    # the tests force: a config, every field given or none (`is_config_given`). None
+    # the tests force: a config, every field given or none (`get_given_config`). None
     # is a plain call: the table's nearest input's configs (`get_nearest_configs`), one
     # kernel, or our all-reduce then the op's norm on rows. The norms on rows have no
     # table: a call of one gives its config. A forced call asks no `should_`: C++
@@ -1322,7 +1403,7 @@ class HipCustomCommunicator:
     # call its `should_` admitted is never refused.
 
     @final
-    def tuned(self, op: Op, rows: int, cols: int) -> list[tuple[Any, ...]]:
+    def tuned(self, op: Op, rows: int, cols: int) -> list[Config]:
         """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order: its
         table's nearest input's configs (`get_nearest_configs`)."""
         return get_nearest_configs(
@@ -1342,7 +1423,7 @@ class HipCustomCommunicator:
         rows: int,
         cols: int,
         quantization: Quantization = "exact",
-    ) -> tuple[Any, ...] | None:
+    ) -> Config | None:
         """KERNEL `kernel`'S OWN TUNED CONFIG at `algorithm` for `rows` x `cols` moving `quantization` (`get_kernel_config`), or None."""
         return get_kernel_config(
             self.table,
@@ -1397,20 +1478,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1423,24 +1504,8 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
-        if config_given:
-            configs = [
-                (
-                    kernel,
-                    algorithm,
-                    grid_x,
-                    grid_y,
-                    grid_z,
-                    block_x,
-                    block_y,
-                    block_z,
-                    waves_per_eu,
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                    quantization,
-                )
-            ]
+        if given_config is not None:
+            configs = [given_config]
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
@@ -1456,7 +1521,22 @@ class HipCustomCommunicator:
         match configs:
             case [config]:
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                    self._handle, input, output, *config
+                    handle_ptr=self._handle,
+                    input=input,
+                    output=output,
+                    kernel=config.kernel,
+                    algorithm=config.algorithm,
+                    grid_x=config.grid_x,
+                    grid_y=config.grid_y,
+                    grid_z=config.grid_z,
+                    block_x=config.block_x,
+                    block_y=config.block_y,
+                    block_z=config.block_z,
+                    waves_per_eu=config.waves_per_eu,
+                    tile_m=config.tile_m,
+                    tile_n=config.tile_n,
+                    tile_k=config.tile_k,
+                    quantization=config.quantization,
                 )
                 if error != -1:
                     raise RuntimeError(
@@ -1515,20 +1595,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1541,24 +1621,8 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
-        if config_given:
-            configs = [
-                (
-                    kernel,
-                    algorithm,
-                    grid_x,
-                    grid_y,
-                    grid_z,
-                    block_x,
-                    block_y,
-                    block_z,
-                    waves_per_eu,
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                    quantization,
-                )
-            ]
+        if given_config is not None:
+            configs = [given_config]
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
@@ -1572,29 +1636,82 @@ class HipCustomCommunicator:
         logger.debug("all_reduce_rms_norm launches %s", configs)
 
         match configs:
-            case [fused]:
+            case [fused_config]:
                 # ONE KERNEL, the fused op.
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_rms_norm(
-                    self._handle, input, weight, output, eps, *fused
+                    handle_ptr=self._handle,
+                    input=input,
+                    weight=weight,
+                    output=output,
+                    eps=eps,
+                    kernel=fused_config.kernel,
+                    algorithm=fused_config.algorithm,
+                    grid_x=fused_config.grid_x,
+                    grid_y=fused_config.grid_y,
+                    grid_z=fused_config.grid_z,
+                    block_x=fused_config.block_x,
+                    block_y=fused_config.block_y,
+                    block_z=fused_config.block_z,
+                    waves_per_eu=fused_config.waves_per_eu,
+                    tile_m=fused_config.tile_m,
+                    tile_n=fused_config.tile_n,
+                    tile_k=fused_config.tile_k,
+                    quantization=fused_config.quantization,
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {fused} on {input.shape}")
-            case [reduce, norm]:
+                    raise RuntimeError(
+                        f"{Error(error).name}: {fused_config} on {input.shape}"
+                    )
+            case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
                 # norm on its rows.
                 summed = torch.empty_like(input)
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                    self._handle, input, summed, *reduce
+                    handle_ptr=self._handle,
+                    input=input,
+                    output=summed,
+                    kernel=reduce_config.kernel,
+                    algorithm=reduce_config.algorithm,
+                    grid_x=reduce_config.grid_x,
+                    grid_y=reduce_config.grid_y,
+                    grid_z=reduce_config.grid_z,
+                    block_x=reduce_config.block_x,
+                    block_y=reduce_config.block_y,
+                    block_z=reduce_config.block_z,
+                    waves_per_eu=reduce_config.waves_per_eu,
+                    tile_m=reduce_config.tile_m,
+                    tile_n=reduce_config.tile_n,
+                    tile_k=reduce_config.tile_k,
+                    quantization=reduce_config.quantization,
                 )
                 if error != -1:
                     raise RuntimeError(
-                        f"{Error(error).name}: {reduce} on {input.shape}"
+                        f"{Error(error).name}: {reduce_config} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
-                    self._handle, summed, weight, output, eps, *norm
+                    handle_ptr=self._handle,
+                    input=summed,
+                    weight=weight,
+                    output=output,
+                    eps=eps,
+                    kernel=norm_config.kernel,
+                    algorithm=norm_config.algorithm,
+                    grid_x=norm_config.grid_x,
+                    grid_y=norm_config.grid_y,
+                    grid_z=norm_config.grid_z,
+                    block_x=norm_config.block_x,
+                    block_y=norm_config.block_y,
+                    block_z=norm_config.block_z,
+                    waves_per_eu=norm_config.waves_per_eu,
+                    tile_m=norm_config.tile_m,
+                    tile_n=norm_config.tile_n,
+                    tile_k=norm_config.tile_k,
+                    quantization=norm_config.quantization,
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {norm} on {input.shape}")
+                    raise RuntimeError(
+                        f"{Error(error).name}: {norm_config} on {input.shape}"
+                    )
             case _:
                 raise RuntimeError(
                     f"no_such_template: all_reduce_rms_norm launches {configs}"
@@ -1652,20 +1769,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1678,24 +1795,8 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
-        if config_given:
-            configs = [
-                (
-                    kernel,
-                    algorithm,
-                    grid_x,
-                    grid_y,
-                    grid_z,
-                    block_x,
-                    block_y,
-                    block_z,
-                    waves_per_eu,
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                    quantization,
-                )
-            ]
+        if given_config is not None:
+            configs = [given_config]
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
@@ -1709,45 +1810,88 @@ class HipCustomCommunicator:
         logger.debug("all_reduce_add_rms_norm launches %s", configs)
 
         match configs:
-            case [fused]:
+            case [fused_config]:
                 # ONE KERNEL, the fused op.
                 error = (
                     torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_rms_norm(
-                        self._handle,
-                        input,
-                        residual,
-                        weight,
-                        output,
-                        residual_output,
-                        eps,
-                        *fused,
+                        handle_ptr=self._handle,
+                        input=input,
+                        residual=residual,
+                        weight=weight,
+                        output=output,
+                        residual_output=residual_output,
+                        eps=eps,
+                        kernel=fused_config.kernel,
+                        algorithm=fused_config.algorithm,
+                        grid_x=fused_config.grid_x,
+                        grid_y=fused_config.grid_y,
+                        grid_z=fused_config.grid_z,
+                        block_x=fused_config.block_x,
+                        block_y=fused_config.block_y,
+                        block_z=fused_config.block_z,
+                        waves_per_eu=fused_config.waves_per_eu,
+                        tile_m=fused_config.tile_m,
+                        tile_n=fused_config.tile_n,
+                        tile_k=fused_config.tile_k,
+                        quantization=fused_config.quantization,
                     )
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {fused} on {input.shape}")
-            case [reduce, norm]:
+                    raise RuntimeError(
+                        f"{Error(error).name}: {fused_config} on {input.shape}"
+                    )
+            case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
                 # add and norm on its rows.
                 summed = torch.empty_like(input)
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                    self._handle, input, summed, *reduce
+                    handle_ptr=self._handle,
+                    input=input,
+                    output=summed,
+                    kernel=reduce_config.kernel,
+                    algorithm=reduce_config.algorithm,
+                    grid_x=reduce_config.grid_x,
+                    grid_y=reduce_config.grid_y,
+                    grid_z=reduce_config.grid_z,
+                    block_x=reduce_config.block_x,
+                    block_y=reduce_config.block_y,
+                    block_z=reduce_config.block_z,
+                    waves_per_eu=reduce_config.waves_per_eu,
+                    tile_m=reduce_config.tile_m,
+                    tile_n=reduce_config.tile_n,
+                    tile_k=reduce_config.tile_k,
+                    quantization=reduce_config.quantization,
                 )
                 if error != -1:
                     raise RuntimeError(
-                        f"{Error(error).name}: {reduce} on {input.shape}"
+                        f"{Error(error).name}: {reduce_config} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
-                    self._handle,
-                    summed,
-                    residual,
-                    weight,
-                    output,
-                    residual_output,
-                    eps,
-                    *norm,
+                    handle_ptr=self._handle,
+                    input=summed,
+                    residual=residual,
+                    weight=weight,
+                    output=output,
+                    residual_output=residual_output,
+                    eps=eps,
+                    kernel=norm_config.kernel,
+                    algorithm=norm_config.algorithm,
+                    grid_x=norm_config.grid_x,
+                    grid_y=norm_config.grid_y,
+                    grid_z=norm_config.grid_z,
+                    block_x=norm_config.block_x,
+                    block_y=norm_config.block_y,
+                    block_z=norm_config.block_z,
+                    waves_per_eu=norm_config.waves_per_eu,
+                    tile_m=norm_config.tile_m,
+                    tile_n=norm_config.tile_n,
+                    tile_k=norm_config.tile_k,
+                    quantization=norm_config.quantization,
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {norm} on {input.shape}")
+                    raise RuntimeError(
+                        f"{Error(error).name}: {norm_config} on {input.shape}"
+                    )
             case _:
                 raise RuntimeError(
                     f"no_such_template: all_reduce_add_rms_norm launches {configs}"
@@ -1811,20 +1955,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1837,24 +1981,8 @@ class HipCustomCommunicator:
 
         # THE KERNELS IT LAUNCHES, in order: the config given, else the table's nearest
         # input's (`get_nearest_configs`).
-        if config_given:
-            configs = [
-                (
-                    kernel,
-                    algorithm,
-                    grid_x,
-                    grid_y,
-                    grid_z,
-                    block_x,
-                    block_y,
-                    block_z,
-                    waves_per_eu,
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                    quantization,
-                )
-            ]
+        if given_config is not None:
+            configs = [given_config]
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
@@ -1871,55 +1999,98 @@ class HipCustomCommunicator:
         # `num_blocks`, so the two never overlap (C++ refuses a call where they do).
         block_output = blocks[:, write_index] if write_index >= 0 else None
         match configs:
-            case [fused]:
+            case [fused_config]:
                 # ONE KERNEL, the fused op.
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce_add_attn_res_rms_norm(  # noqa: E501
-                    self._handle,
-                    input,
-                    prefix,
-                    blocks,
-                    norm_weight,
-                    qk_weight,
-                    output_norm_weight,
-                    prefix_output,
-                    output,
-                    block_output,
-                    num_blocks,
-                    eps,
-                    output_eps,
-                    *fused,
+                    handle_ptr=self._handle,
+                    input=input,
+                    prefix=prefix,
+                    blocks=blocks,
+                    norm_weight=norm_weight,
+                    qk_weight=qk_weight,
+                    output_norm_weight=output_norm_weight,
+                    prefix_output=prefix_output,
+                    output=output,
+                    block_output=block_output,
+                    num_blocks=num_blocks,
+                    eps=eps,
+                    output_eps=output_eps,
+                    kernel=fused_config.kernel,
+                    algorithm=fused_config.algorithm,
+                    grid_x=fused_config.grid_x,
+                    grid_y=fused_config.grid_y,
+                    grid_z=fused_config.grid_z,
+                    block_x=fused_config.block_x,
+                    block_y=fused_config.block_y,
+                    block_z=fused_config.block_z,
+                    waves_per_eu=fused_config.waves_per_eu,
+                    tile_m=fused_config.tile_m,
+                    tile_n=fused_config.tile_n,
+                    tile_k=fused_config.tile_k,
+                    quantization=fused_config.quantization,
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {fused} on {input.shape}")
-            case [reduce, norm]:
+                    raise RuntimeError(
+                        f"{Error(error).name}: {fused_config} on {input.shape}"
+                    )
+            case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then
                 # AttnRes on its rows.
                 summed = torch.empty_like(input)
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
-                    self._handle, input, summed, *reduce
+                    handle_ptr=self._handle,
+                    input=input,
+                    output=summed,
+                    kernel=reduce_config.kernel,
+                    algorithm=reduce_config.algorithm,
+                    grid_x=reduce_config.grid_x,
+                    grid_y=reduce_config.grid_y,
+                    grid_z=reduce_config.grid_z,
+                    block_x=reduce_config.block_x,
+                    block_y=reduce_config.block_y,
+                    block_z=reduce_config.block_z,
+                    waves_per_eu=reduce_config.waves_per_eu,
+                    tile_m=reduce_config.tile_m,
+                    tile_n=reduce_config.tile_n,
+                    tile_k=reduce_config.tile_k,
+                    quantization=reduce_config.quantization,
                 )
                 if error != -1:
                     raise RuntimeError(
-                        f"{Error(error).name}: {reduce} on {input.shape}"
+                        f"{Error(error).name}: {reduce_config} on {input.shape}"
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
-                    self._handle,
-                    summed,
-                    prefix,
-                    blocks,
-                    norm_weight,
-                    qk_weight,
-                    output_norm_weight,
-                    prefix_output,
-                    output,
-                    block_output,
-                    num_blocks,
-                    eps,
-                    output_eps,
-                    *norm,
+                    handle_ptr=self._handle,
+                    input=summed,
+                    prefix=prefix,
+                    blocks=blocks,
+                    norm_weight=norm_weight,
+                    qk_weight=qk_weight,
+                    output_norm_weight=output_norm_weight,
+                    prefix_output=prefix_output,
+                    output=output,
+                    block_output=block_output,
+                    num_blocks=num_blocks,
+                    eps=eps,
+                    output_eps=output_eps,
+                    kernel=norm_config.kernel,
+                    algorithm=norm_config.algorithm,
+                    grid_x=norm_config.grid_x,
+                    grid_y=norm_config.grid_y,
+                    grid_z=norm_config.grid_z,
+                    block_x=norm_config.block_x,
+                    block_y=norm_config.block_y,
+                    block_z=norm_config.block_z,
+                    waves_per_eu=norm_config.waves_per_eu,
+                    tile_m=norm_config.tile_m,
+                    tile_n=norm_config.tile_n,
+                    tile_k=norm_config.tile_k,
+                    quantization=norm_config.quantization,
                 )
                 if error != -1:
-                    raise RuntimeError(f"{Error(error).name}: {norm} on {input.shape}")
+                    raise RuntimeError(
+                        f"{Error(error).name}: {norm_config} on {input.shape}"
+                    )
             case _:
                 raise RuntimeError(
                     f"no_such_template: all_reduce_add_attn_res_rms_norm launches "
@@ -1969,20 +2140,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -1994,30 +2165,30 @@ class HipCustomCommunicator:
             return output
 
         # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if not config_given:
+        if given_config is None:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
-        configs = [
-            (
-                kernel,
-                algorithm,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            )
-        ]
-        logger.debug("rms_norm launches %s", configs)
+        config = given_config
+        logger.debug("rms_norm launches %s", config)
 
-        (config,) = configs
         error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
-            self._handle, input, weight, output, eps, *config
+            handle_ptr=self._handle,
+            input=input,
+            weight=weight,
+            output=output,
+            eps=eps,
+            kernel=config.kernel,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            tile_k=config.tile_k,
+            quantization=config.quantization,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -2063,20 +2234,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2088,30 +2259,32 @@ class HipCustomCommunicator:
             return output, residual_output
 
         # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if not config_given:
+        if given_config is None:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
-        configs = [
-            (
-                kernel,
-                algorithm,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            )
-        ]
-        logger.debug("add_rms_norm launches %s", configs)
+        config = given_config
+        logger.debug("add_rms_norm launches %s", config)
 
-        (config,) = configs
         error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
-            self._handle, input, residual, weight, output, residual_output, eps, *config
+            handle_ptr=self._handle,
+            input=input,
+            residual=residual,
+            weight=weight,
+            output=output,
+            residual_output=residual_output,
+            eps=eps,
+            kernel=config.kernel,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            tile_k=config.tile_k,
+            quantization=config.quantization,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")
@@ -2163,20 +2336,20 @@ class HipCustomCommunicator:
             raise RuntimeError(f"disabled: {type(self).__name__} runs no call")
         if input.dim() != 2:
             raise RuntimeError(f"not_two_d: [rows, cols], not {input.shape}")
-        config_given = is_config_given(
-            kernel,
-            algorithm,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            waves_per_eu,
-            tile_m,
-            tile_n,
-            tile_k,
-            quantization,
+        given_config = get_given_config(
+            kernel=kernel,
+            algorithm=algorithm,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            block_x=block_x,
+            block_y=block_y,
+            block_z=block_z,
+            waves_per_eu=waves_per_eu,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            quantization=quantization,
         )
 
         # A CAPTURE'S WARMUP: vLLM discards its outputs, so nothing launches.
@@ -2188,44 +2361,39 @@ class HipCustomCommunicator:
             return prefix_output, output
 
         # THE KERNEL IT LAUNCHES: the config given (a norm on rows has no table).
-        if not config_given:
+        if given_config is None:
             raise RuntimeError("forced_incomplete: a norm on rows takes its config")
-        configs = [
-            (
-                kernel,
-                algorithm,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                waves_per_eu,
-                tile_m,
-                tile_n,
-                tile_k,
-                quantization,
-            )
-        ]
-        logger.debug("add_attn_res_rms_norm launches %s", configs)
+        config = given_config
+        logger.debug("add_attn_res_rms_norm launches %s", config)
 
         block_output = blocks[:, write_index] if write_index >= 0 else None
-        (config,) = configs
         error = torch.ops._rocm_C.hip_custom_communicator_add_attn_res_rms_norm(
-            self._handle,
-            input,
-            prefix,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight,
-            prefix_output,
-            output,
-            block_output,
-            num_blocks,
-            eps,
-            output_eps,
-            *config,
+            handle_ptr=self._handle,
+            input=input,
+            prefix=prefix,
+            blocks=blocks,
+            norm_weight=norm_weight,
+            qk_weight=qk_weight,
+            output_norm_weight=output_norm_weight,
+            prefix_output=prefix_output,
+            output=output,
+            block_output=block_output,
+            num_blocks=num_blocks,
+            eps=eps,
+            output_eps=output_eps,
+            kernel=config.kernel,
+            algorithm=config.algorithm,
+            grid_x=config.grid_x,
+            grid_y=config.grid_y,
+            grid_z=config.grid_z,
+            block_x=config.block_x,
+            block_y=config.block_y,
+            block_z=config.block_z,
+            waves_per_eu=config.waves_per_eu,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            tile_k=config.tile_k,
+            quantization=config.quantization,
         )
         if error != -1:
             raise RuntimeError(f"{Error(error).name}: {config} on {input.shape}")

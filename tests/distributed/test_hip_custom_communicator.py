@@ -21,7 +21,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from multiprocessing.queues import Queue
 from typing import TypeAlias, TypeVar, get_args
@@ -964,8 +964,8 @@ def _unquantized_case(comm: HipCustomCommunicator, rank: int) -> None:
     a communicator whose quantization is exact (the default), whose table's pick moves
     nothing quantized, and a forced exact two-shot."""
     forced = _forced_whole(("all_reduce", "two_shot_pull"))
-    ((*_, quantization),) = comm.tuned("all_reduce", 2048, HIDDEN)
-    assert quantization == "exact" and forced["quantization"] == "exact"
+    (tuned_config,) = comm.tuned("all_reduce", 2048, HIDDEN)
+    assert tuned_config.quantization == "exact" and forced["quantization"] == "exact"
     for name, forcing in (("plain", {}), ("forced", forced)):
         x = _randn((2048, HIDDEN), torch.bfloat16, 77 * WORLD_SIZE + rank)
         summed = _sum(x, comm)
@@ -1315,10 +1315,12 @@ def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
 def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:
     """The communicator's pick at the handed-in input is its config, and a plain call
     there runs."""
-    want = tuple(json.loads(config).values())
+    want = json.loads(config)
     rows, bf16 = _HANDED_TOKENS, torch.bfloat16
-    (got,) = comm.tuned("all_reduce", rows, HIDDEN)
-    assert got == want, f"rank {rank}: tuned {got}, the table names {want}"
+    (tuned_config,) = comm.tuned("all_reduce", rows, HIDDEN)
+    assert asdict(tuned_config) == want, (
+        f"rank {rank}: tuned {tuned_config}, the table names {want}"
+    )
     comm.all_reduce(_randn((rows, HIDDEN), bf16, rank))
     _assert_clean(comm, "the handed-in table")
 
