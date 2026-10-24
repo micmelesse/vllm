@@ -134,6 +134,9 @@ class Error(IntEnum):
     quantization_not_supported = 31
     row_not_int4_groups = 32
     quantized_too_small = 33  # retired: INT4 lies inside staging and partials
+    block_too_large = 34
+    lds_too_large = 35
+    scratch_too_large = 36
 
 
 class Where(IntEnum):

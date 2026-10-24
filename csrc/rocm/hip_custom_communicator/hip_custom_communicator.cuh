@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -156,7 +157,7 @@ constexpr int kMaxComputeUnits = kTarget.compute_units;
 // THE MOST BLOCKS RESIDENT AT ONCE ON THE TARGET: every CU full of
 // one-wave blocks, so the peers' signal block never rules out a grid. Whether
 // one kernel's grid is resident is its occupancy, which only the compiled
-// kernel knows (HIP's occupancy API, Handle::resident_blocks, checked by
+// kernel knows (HIP's occupancy API, Handle::check_kernel, checked by
 // select).
 constexpr int resident_waves(const Hardware& hw) {
   return hw.compute_units * hw.max_waves_per_cu;
@@ -710,8 +711,11 @@ enum class Error : int {
                              // group short
   quantized_too_small = 33,  // retired: INT4 is an encoding inside the
                              // regions (staging_too_small, partials_too_small)
+  block_too_large = 34,
+  lds_too_large = 35,
+  scratch_too_large = 36,
 };
-constexpr int kNumErrors = 34;
+constexpr int kNumErrors = 37;
 
 constexpr const char* to_string(Error e) {
   switch (e) {
@@ -804,6 +808,16 @@ constexpr const char* to_string(Error e) {
              "rank";
     case Error::quantized_too_small:
       return "quantized_too_small: retired";
+    case Error::block_too_large:
+      return "block_too_large: the block has more threads than the compiled kernel "
+             "takes (its launch bounds, hipFuncGetAttributes' maxThreadsPerBlock)";
+    case Error::lds_too_large:
+      return "lds_too_large: the compiled kernel's LDS and the launch's dynamic LDS "
+             "together are more than the device gives a block";
+    case Error::scratch_too_large:
+      return "scratch_too_large: the compiled kernel's scratch, its bytes a lane for "
+             "every wave slot of the device, is more than one hardware queue's share "
+             "of the device's scratch (hipExtLimitScratchMax over GPU_MAX_HW_QUEUES)";
   }
   return "unknown";
 }
@@ -1881,25 +1895,70 @@ class Handle {
                      uint32_t{1}, __ATOMIC_RELEASE);
   }
 
-  // THE MOST BLOCKS OF `kernel`, `threads` A BLOCK, RESIDENT AT ONCE ON THIS
-  // DEVICE: the textbook query, HIP's occupancy API (CUDA's
-  // cudaOccupancyMaxActiveBlocksPerMultiprocessor), blocks a CU from the
-  // compiled kernel's registers, LDS and the CU's wave slots, times the
-  // device's CUs. A peer barrier spins until the same block on every peer
-  // arrives, so a grid past it can hang (select refuses it,
-  // grid_not_resident). Asked once per kernel, block size and dynamic LDS (a
-  // wide AttnRes row's logits), then cached.
-  int resident_blocks(const void* kernel, int threads, int shared_bytes = 0) const {
+  // WHY `kernel` CANNOT LAUNCH HERE, `grid` blocks of `block` threads and `shared_bytes` of dynamic
+  // LDS (a wide AttnRes row's logits), if it cannot: every check of a launch, in one place, what
+  // the compiled kernel asks (hipFuncGetAttributes, HIP's occupancy API) against what this device
+  // gives.
+  //  - block_too_large: more threads than the kernel takes (its launch bounds).
+  //  - lds_too_large: its LDS and the launch's dynamic LDS, past the device's a block.
+  //  - scratch_too_large: ROCr gives a dispatch scratch for the whole device, its bytes a lane
+  //    times every wave slot (the CUs times the waves a CU holds); a hardware queue keeps the most
+  //    it was ever given; and the process's queues share one budget, hipExtLimitScratchMax
+  //    (gfx950: 32 GiB). So a kernel whose dispatch takes more than one queue's share (HIP's
+  //    GPU_MAX_HW_QUEUES, the queues its streams are spread over, 4 unless set) is refused:
+  //    within it, no history of earlier kernels on any queue leaves it short. Measured on n11,
+  //    2026-10-24, one process: one queue ran 32 KiB a lane and not 64 (the 64's 34.37 GB just
+  //    past the budget's 34.36); at 16 KiB a lane the fourth queue failed, at 24 KiB the third.
+  //  - grid_not_resident, where the kernel waits on its peers (`waits_on_peers`; a norm on rows
+  //    waits on none, and any grid runs): more blocks than the device holds at once, the
+  //    textbook query (CUDA's cudaOccupancyMaxActiveBlocksPerMultiprocessor: blocks a CU from
+  //    the kernel's registers, LDS and the CU's wave slots) times the CUs. A peer barrier spins
+  //    until the same block on every peer arrives, so a grid past it can hang.
+  // HIP refuses the first two at the launch; the scratch only when the dispatch runs, aborting
+  // the queue and the process with it (the tune's crashes, 2026-10-24: AttnRes at 64 threads,
+  // tile 4x16384x4, 21 KiB a lane); the grid never (it hangs). Asked once per kernel, block size
+  // and dynamic LDS, then cached; the grid compared each call.
+  std::optional<Error> check_kernel(const void* kernel, const Dim3& grid, const Dim3& block,
+                                    int shared_bytes, bool waits_on_peers) const {
+    const int threads = static_cast<int>(volume(block));
     const std::tuple<const void*, int, int> key{kernel, threads, shared_bytes};
-    if (const auto it = resident_.find(key); it != resident_.end())
-      return it->second;
-    int per_cu = 0;
-    HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel,
-                                                           threads, shared_bytes));
-    int cus = 0;
-    HIP_CHECK(hipDeviceGetAttribute(
-        &cus, hipDeviceAttributeMultiprocessorCount, device_));
-    return resident_[key] = per_cu * cus;
+    auto it = checked_.find(key);
+    if (it == checked_.end()) {
+      hipFuncAttributes f;
+      HIP_CHECK(hipFuncGetAttributes(&f, kernel));
+      int lds = 0, cus = 0, threads_a_cu = 0, wave = 0;
+      HIP_CHECK(hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device_));
+      HIP_CHECK(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device_));
+      HIP_CHECK(hipDeviceGetAttribute(&threads_a_cu,
+                                      hipDeviceAttributeMaxThreadsPerMultiProcessor, device_));
+      HIP_CHECK(hipDeviceGetAttribute(&wave, hipDeviceAttributeWarpSize, device_));
+      size_t budget = 0;  // the current device's: this one's, for the query
+      int was = 0;
+      HIP_CHECK(hipGetDevice(&was));
+      HIP_CHECK(hipSetDevice(device_));
+      HIP_CHECK(hipDeviceGetLimit(&budget, hipExtLimitScratchMax));
+      HIP_CHECK(hipSetDevice(was));
+      const char* set = std::getenv("GPU_MAX_HW_QUEUES");
+      const int64_t queues = set && std::atoi(set) > 0 ? std::atoi(set) : 4;
+      const int64_t scratch = static_cast<int64_t>(f.localSizeBytes) * wave * cus *
+                              (threads_a_cu / wave);
+      const std::optional<Error> refused =
+          threads > f.maxThreadsPerBlock ? std::optional<Error>(Error::block_too_large)
+          : static_cast<int64_t>(f.sharedSizeBytes) + shared_bytes > lds
+              ? std::optional<Error>(Error::lds_too_large)
+          : scratch * queues > static_cast<int64_t>(budget)
+              ? std::optional<Error>(Error::scratch_too_large)
+              : std::nullopt;
+      int per_cu = 0;  // asked of a kernel that launches alone
+      if (!refused)
+        HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, kernel, threads,
+                                                               shared_bytes));
+      it = checked_.emplace(key, std::pair{refused, int64_t{per_cu} * cus}).first;
+    }
+    const auto& [refused, resident] = it->second;
+    if (refused) return refused;
+    if (waits_on_peers && volume(grid) > resident) return Error::grid_not_resident;
+    return std::nullopt;
   }
 
  private:
@@ -2276,7 +2335,10 @@ class Handle {
   uint32_t* status_ = nullptr;
   uint32_t* device_status_ = nullptr;
   uint64_t timeout_ticks_ = 0;
-  mutable std::map<std::tuple<const void*, int, int>, int> resident_;
+  // check_kernel's, by kernel, block size and dynamic LDS: why it cannot launch at all (if it
+  // cannot), and the most of its blocks resident at once.
+  mutable std::map<std::tuple<const void*, int, int>, std::pair<std::optional<Error>, int64_t>>
+      checked_;
   // THE INPUT TABLES (INPUT TABLES): the slab, the next free slot, the
   // captured launches awaiting registration (input, slot), and every peer
   // allocation opened for one, by its IPC handle's bytes.
@@ -2626,11 +2688,6 @@ static_assert(one_template_an_op(), "an op has two templates");
 // template parameter here; one that was not built raises.
 // =================================================================================================
 
-inline bool resident(const Handle& h, const void* kernel, const Dim3& grid,
-                     const Dim3& block, int shared_bytes = 0) {
-  return volume(grid) <=
-         h.resident_blocks(kernel, static_cast<int>(volume(block)), shared_bytes);
-}
 
 // =================================================================================================
 // EACH OP'S KERNELS.
@@ -3344,8 +3401,9 @@ inline std::variant<Config, Error> all_reduce_config(
   const void* kernel = nullptr;
   with_config<OpType::all_reduce>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  if (!resident(h, kernel, config.grid, config.block))
-    return Error::grid_not_resident;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, true))
+    return *e;
   return config;
 }
 
@@ -3414,8 +3472,9 @@ inline std::variant<Config, Error> all_reduce_rms_norm_config(
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  if (!resident(h, kernel, config.grid, config.block))
-    return Error::grid_not_resident;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, true))
+    return *e;
   return config;
 }
 
@@ -3501,8 +3560,9 @@ all_reduce_add_rms_norm_config(
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
   if (config.scales_size_m > h.scales_size_m()) return Error::partials_too_small;
-  if (!resident(h, kernel, config.grid, config.block))
-    return Error::grid_not_resident;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, true))
+    return *e;
   return config;
 }
 
@@ -3591,8 +3651,9 @@ all_reduce_add_attn_res_rms_norm_config(
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
-  if (!resident(h, kernel, config.grid, config.block, config.shared_memory_bytes))
-    return Error::grid_not_resident;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, true))
+    return *e;
   return config;
 }
 
@@ -3642,6 +3703,9 @@ inline std::variant<Config, Error> rms_norm_config(const Handle& h, int64_t m, i
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, false))
+    return *e;
   return config;
 }
 
@@ -3658,6 +3722,9 @@ inline std::variant<Config, Error> add_rms_norm_config(const Handle& h, int64_t 
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, false))
+    return *e;
   return config;
 }
 
@@ -3679,6 +3746,9 @@ inline std::variant<Config, Error> add_attn_res_rms_norm_config(const Handle& h,
   const void* kernel = nullptr;
   with_config<op>(config, [&]<Config C>() { kernel = kernel_pointer<C>(); });
   if (!kernel) return Error::tile_not_built;
+  if (const std::optional<Error> e = h.check_kernel(kernel, config.grid, config.block,
+                                                     config.shared_memory_bytes, false))
+    return *e;
   return config;
 }
 
