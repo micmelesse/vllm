@@ -23,7 +23,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -815,9 +814,9 @@ constexpr const char* to_string(Error e) {
       return "lds_too_large: the compiled kernel's LDS and the launch's dynamic LDS "
              "together are more than the device gives a block";
     case Error::scratch_too_large:
-      return "scratch_too_large: the compiled kernel's scratch, its bytes a lane for "
-             "every wave slot of the device, is more than one hardware queue's share "
-             "of the device's scratch (hipExtLimitScratchMax over GPU_MAX_HW_QUEUES)";
+      return "scratch_too_large: the compiled kernel's scratch a lane is more than "
+             "the device's scratch (hipExtLimitScratchMax) over its every lane, by "
+             "kScratchShares (gfx950: 4 KiB a lane)";
   }
   return "unknown";
 }
@@ -1468,6 +1467,21 @@ struct InputTable {
   int64_t stride_n;
 };
 
+// THE SCRATCH A KERNEL MAY ASK, as a share of the device's: the device's scratch
+// (hipExtLimitScratchMax) over its every lane, by this. A dispatch that asks too much fails only
+// when it runs, aborting its queue and the process with it (the tune's crashes, 2026-10-24); HIP
+// refuses nothing at the launch. ROCr gives a dispatch scratch for every wave slot of the device,
+// a hardware queue keeps the most it was ever given, and the process's queues share the budget
+// (measured on n11, one process: one queue ran 32 KiB a lane, not 64 -- the budget over every
+// lane; at 16 KiB a lane the fourth queue failed, at 24 KiB the third). How many queues a process
+// holds HIP does not say (a gd worker's held more than four: AttnRes at 14-16 KiB a lane still
+// crashed), so the share is a margin, not a count: 16 queues at a full dispatch each before the
+// budget runs out, past HIP's pools (four queues a stream priority, three priorities). At gfx950,
+// 4 KiB a lane: the crashes spilled 14-25 KiB; the tuned table's build spills at most 1.8 KiB
+// (all_reduce_rms_norm at 8192 a tile, 128 threads); of the coarse build's 6,974 kernels about
+// 400 heavy spillers are refused.
+constexpr int64_t kScratchShares = 16;
+
 class Handle {
  public:
   // OPENED on every rank together: this rank's arena allocated (the signals,
@@ -1901,14 +1915,9 @@ class Handle {
   // gives.
   //  - block_too_large: more threads than the kernel takes (its launch bounds).
   //  - lds_too_large: its LDS and the launch's dynamic LDS, past the device's a block.
-  //  - scratch_too_large: ROCr gives a dispatch scratch for the whole device, its bytes a lane
-  //    times every wave slot (the CUs times the waves a CU holds); a hardware queue keeps the most
-  //    it was ever given; and the process's queues share one budget, hipExtLimitScratchMax
-  //    (gfx950: 32 GiB). So a kernel whose dispatch takes more than one queue's share (HIP's
-  //    GPU_MAX_HW_QUEUES, the queues its streams are spread over, 4 unless set) is refused:
-  //    within it, no history of earlier kernels on any queue leaves it short. Measured on n11,
-  //    2026-10-24, one process: one queue ran 32 KiB a lane and not 64 (the 64's 34.37 GB just
-  //    past the budget's 34.36); at 16 KiB a lane the fourth queue failed, at 24 KiB the third.
+  //  - scratch_too_large: its scratch a lane past the device's scratch over its every lane (the
+  //    CUs times the waves a CU holds times a wave's lanes), by kScratchShares (gfx950: 32 GiB
+  //    over 256 x 32 x 64 lanes, 64 KiB a lane; by 16, 4 KiB). See kScratchShares.
   //  - grid_not_resident, where the kernel waits on its peers (`waits_on_peers`; a norm on rows
   //    waits on none, and any grid runs): more blocks than the device holds at once, the
   //    textbook query (CUDA's cudaOccupancyMaxActiveBlocksPerMultiprocessor: blocks a CU from
@@ -1926,27 +1935,24 @@ class Handle {
     if (it == checked_.end()) {
       hipFuncAttributes f;
       HIP_CHECK(hipFuncGetAttributes(&f, kernel));
-      int lds = 0, cus = 0, threads_a_cu = 0, wave = 0;
+      int lds = 0, cus = 0, threads_a_cu = 0;
       HIP_CHECK(hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device_));
       HIP_CHECK(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device_));
       HIP_CHECK(hipDeviceGetAttribute(&threads_a_cu,
                                       hipDeviceAttributeMaxThreadsPerMultiProcessor, device_));
-      HIP_CHECK(hipDeviceGetAttribute(&wave, hipDeviceAttributeWarpSize, device_));
       size_t budget = 0;  // the current device's: this one's, for the query
       int was = 0;
       HIP_CHECK(hipGetDevice(&was));
       HIP_CHECK(hipSetDevice(device_));
       HIP_CHECK(hipDeviceGetLimit(&budget, hipExtLimitScratchMax));
       HIP_CHECK(hipSetDevice(was));
-      const char* set = std::getenv("GPU_MAX_HW_QUEUES");
-      const int64_t queues = set && std::atoi(set) > 0 ? std::atoi(set) : 4;
-      const int64_t scratch = static_cast<int64_t>(f.localSizeBytes) * wave * cus *
-                              (threads_a_cu / wave);
+      const int64_t lanes = static_cast<int64_t>(cus) * threads_a_cu;  // every wave slot's lanes
+      const int64_t scratch_a_lane = static_cast<int64_t>(budget) / lanes / kScratchShares;
       const std::optional<Error> refused =
           threads > f.maxThreadsPerBlock ? std::optional<Error>(Error::block_too_large)
           : static_cast<int64_t>(f.sharedSizeBytes) + shared_bytes > lds
               ? std::optional<Error>(Error::lds_too_large)
-          : scratch * queues > static_cast<int64_t>(budget)
+          : static_cast<int64_t>(f.localSizeBytes) > scratch_a_lane
               ? std::optional<Error>(Error::scratch_too_large)
               : std::nullopt;
       int per_cu = 0;  // asked of a kernel that launches alone
