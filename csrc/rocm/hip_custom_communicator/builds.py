@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""THE BUILDS, FROM THE TUNED TABLE: what the compile instantiates is the build half
-of every config the table lists on the archs built (its kernel, algorithm, block,
-waves, tile and quantization; the grid is the launch's, never compiled), each kernel's
-builds in the order the file first names them. The table is the format `FORMAT` names
-(`hip_custom_communicator.tuned_map` 0.2: a config's `kernel` its op's one kernel, its
-`algorithm` which of the kernel's bodies: `one_shot_pull`, `one_shot_push`,
-`two_shot_pull`, `two_shot_push` or `rows`). EVERY ALGORITHM OF A SHAPE (Michael,
+"""THE BUILDS, FROM THE TUNED TABLES: what the compile instantiates is the build half
+of every config the tables of the archs built list (`hip_custom_communicator.json`, a
+table an arch, each gd's `TunedTable`: its `configs`, each its op, its `kernel` the op's
+one kernel, its `algorithm` which of the kernel's bodies: `one_shot_pull`,
+`one_shot_push`, `two_shot_pull`, `two_shot_push` or `rows`, its block, waves, tile and
+quantization; the grid is the launch's, never compiled), each kernel's builds in the
+order the tables first name them. EVERY ALGORITHM OF A SHAPE (Michael,
 October 23): for every build shape the table holds of a kernel (its block, waves, tile
 and quantization: all a build is but its algorithm), the kernel is built at every
 algorithm it has (the host's `kAlgorithms_<kernel>`) that takes that shape (`takes`: a
@@ -24,8 +24,8 @@ at configure the same way (CMakeLists.txt).
 
     python3 builds.py <hip_custom_communicator.json> <out.inc> <arch>[;<arch>...] <host.cuh>
 
-A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input names, which gp's tune adds
-on its own copy of the table and prunes when it writes. A file NAMES ITS BUILD
+A TUNE'S CANDIDATES ARE THE TABLE'S TOO: configs no input picks, which a tune adds on
+its own copy of the table; gd's tune prunes them when it writes. A file NAMES ITS BUILD
 (`hip_custom_communicator_<kernel>_<algorithm>__<block>_w<waves>_t<tile>_<q>.hip`;
 the manifest
 `hip_custom_communicator_instances.json` says each file's builds: every build whose
@@ -38,8 +38,6 @@ import re
 import sys
 from pathlib import Path
 
-# THE TABLE'S FORMAT AND VERSION (the communicator checks the same).
-FORMAT = {"format": "hip_custom_communicator.tuned_map", "version": "0.2"}
 # A BUILD'S FIELDS, in the table's order.
 FIELDS = (
     "algorithm",
@@ -75,25 +73,21 @@ def family(kernel: str) -> str:
     return FAMILIES[kernel]
 
 
-def ops(table: dict) -> list[dict]:
-    """The table's ops, its format checked."""
-    if {k: table.get(k) for k in FORMAT} != FORMAT:
-        raise SystemExit(
-            f"the tuned table is not {FORMAT}: {({k: table.get(k) for k in FORMAT})}"
-        )
-    return [v for k, v in table.items() if k not in FORMAT]
+def tables(path: Path, archs: list[str]) -> list[dict]:
+    """The tuned table of each arch built that has one, in the archs' order."""
+    file = json.loads(path.read_text())
+    return [file[arch] for arch in archs if arch in file]
 
 
-def named(table: dict, archs: list[str]) -> dict[str, list[tuple]]:
-    """Each kernel's builds the table names, deduplicated, in the order the file first
-    names them."""
+def named(tables: list[dict]) -> dict[str, list[tuple]]:
+    """Each kernel's builds the tables' configs name, deduplicated, in the order the tables
+    first name them."""
     out: dict[str, list[tuple]] = {}
-    for op in ops(table):
-        for arch in archs:
-            for c in op["configs"].get(arch, []):
-                b = tuple(c[f] for f in FIELDS)
-                if b not in out.setdefault(c["kernel"], []):
-                    out[c["kernel"]].append(b)
+    for table in tables:
+        for c in table["configs"]:
+            b = tuple(c[f] for f in FIELDS)
+            if b not in out.setdefault(c["kernel"], []):
+                out[c["kernel"]].append(b)
     return out
 
 
@@ -123,10 +117,10 @@ def takes(kernel: str, b: tuple) -> bool:
     return any(lays_out(kernel, b, world) for world in WORLDS)
 
 
-def builds(table: dict, archs: list[str], has: dict[str, list[str]]) -> dict[str, list[tuple]]:
-    """Each kernel's builds: the table's, in its order, then every algorithm `has` lists
-    of every shape the table holds of the kernel, where the algorithm takes it (`takes`)."""
-    out = named(table, archs)
+def builds(tables: list[dict], has: dict[str, list[str]]) -> dict[str, list[tuple]]:
+    """Each kernel's builds: the tables', in their order, then every algorithm `has` lists
+    of every shape the tables hold of the kernel, where the algorithm takes it (`takes`)."""
+    out = named(tables)
     for kernel, bs in out.items():
         shapes = list(dict.fromkeys(b[1:] for b in bs))
         for shape in shapes:
@@ -268,22 +262,22 @@ def instances(kernel: str, args: str, b: tuple) -> list[str]:
 
 
 def main() -> None:
-    table_path, out_path, arch_list = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+    table_path, out_path, arch_list = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
     host = Path(sys.argv[4]).read_text()
     archs = [a for a in arch_list.replace(",", ";").split(";") if a]
-    table = json.loads(Path(table_path).read_text())
+    found = tables(table_path, archs)
     # EVERY BUILD THE TABLE NAMES AT ONE OF ITS KERNEL'S ALGORITHMS (the host's
     # kAlgorithms_<kernel>; its own static_assert says the same at compile time, this says
     # it naming the config).
     has = algorithms(host)
-    for kernel, bs in named(table, archs).items():
+    for kernel, bs in named(found).items():
         for b in bs:
             if kernel not in has or b[0] not in has[kernel]:
                 raise SystemExit(f"{kernel} has no {b[0]} algorithm: {b}")
-    every = builds(table, archs, has)
+    every = builds(found, has)
     text = [
         "// GENERATED by csrc/rocm/hip_custom_communicator/builds.py from the tuned",
-        f"// table (hip_custom_communicator.json) on {', '.join(archs)}: every",
+        f"// tables (hip_custom_communicator.json) on {', '.join(archs)}: every",
         "// config's build. Do not edit; edit the table's configs (a config no input",
         "// names is a candidate the tuner searches).",
         "",

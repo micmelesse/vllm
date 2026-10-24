@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
 from multiprocessing.queues import Queue
-from typing import TypeAlias, TypeVar, cast, get_args
+from typing import Any, TypeAlias, TypeVar, cast, get_args
 
 import pytest
 import torch
@@ -46,7 +46,7 @@ from vllm.distributed.device_communicators.hip_custom_communicator import (
     Open,
     Quantization,
     Supported,
-    TunedTable,
+    TunedTables,
     Where,
     abandon_open,
     build_info,
@@ -207,7 +207,7 @@ def _rank_main(
     failures: "Queue[str]",
     kernel_timeout_s: float,
     log_mode: LogMode,
-    table: TunedTable | None,
+    tables: TunedTables | None,
 ) -> None:
     global _COMM
     # SIGUSR1 AND SIGTERM TO THE DUMPER ONLY: blocked here before any thread starts
@@ -242,7 +242,7 @@ def _rank_main(
                 # the crossover would then be checked, lossy, against the exact
                 # tolerance (the e2e smoke of 2026-10-17). INT4 is tested by asking.
                 quantization="exact",
-                table=table,
+                tables=tables,
             )
         _COMM = comm
         try:
@@ -263,12 +263,12 @@ def _on_every_rank(
     process_timeout_s: float = PROCESS_TIMEOUT_S,
     kernel_timeout_s: float = KERNEL_TIMEOUT_S,
     log_mode: LogMode = "errors",
-    table: TunedTable | None = None,
+    tables: TunedTables | None = None,
 ) -> None:
     """`target(comm, rank)` on WORLD_SIZE spawned ranks (a target taking more is bound
     by name first, `partial`), each holding a
     communicator sized for Kimi-K3's largest call, its state log in `log_mode`, its
-    tuned table `table` (None: the file's). A
+    tuned tables `tables` (None: the file's). A
     rank still running at the deadline is told to print its state log (SIGUSR1),
     given DUMP_GRACE_S, told to tear its communicator down alone (SIGTERM), given
     TERM_GRACE_S, then killed."""
@@ -285,7 +285,7 @@ def _on_every_rank(
                 failures=failures,
                 kernel_timeout_s=kernel_timeout_s,
                 log_mode=log_mode,
-                table=table,
+                tables=tables,
             )
         )
         for r in range(WORLD_SIZE)
@@ -1487,24 +1487,23 @@ def _takes(kernel: str, b: dict[str, int | str]) -> bool:
 
 
 def test_the_builds_are_every_algorithm_of_the_tables_shapes() -> None:
-    """What the build compiled is the build half of every config the tuned table
-    lists on gfx950, each kernel's in the order the file first names them, then the
-    kernel at every algorithm it has at every shape the table holds of it (its block,
-    waves, tile and quantization) that the algorithm takes (builds.py, at configure): no
-    build without a shape of the table, no config without its build, no algorithm of a
-    shape left out, so a pruned table never drops a path a call can be forced to take."""
+    """What the build compiled is the build half of every config the tuned table lists
+    on gfx950, each kernel's in the order the table first names them, then the kernel
+    at every algorithm it has at every shape the table holds of it (its block, waves,
+    tile and quantization) that the algorithm takes (builds.py, at configure): no build
+    without a shape of the table, no config without its build, no algorithm of a shape
+    left out, so a pruned table never drops a path a call can be forced to take."""
     import vllm._rocm_C  # noqa: F401
 
-    raw = json.loads(_TABLE.read_text())
+    table = json.loads(_TABLE.read_text())["gfx950"]
     variant = ("algorithm",)
     shape = ("block_x", "block_y", "block_z", "waves_per_eu")
     shape += ("tile_m", "tile_n", "tile_k", "quantization")
     want: dict[str, list[dict[str, int | str]]] = {}
-    for op in TUNED_OPS:
-        for c in raw[op]["configs"]["gfx950"]:
-            b = {f: c[f] for f in variant + shape}
-            if b not in want.setdefault(c["kernel"], []):
-                want[c["kernel"]].append(b)
+    for c in table["configs"]:
+        b = {f: c[f] for f in variant + shape}
+        if b not in want.setdefault(c["kernel"], []):
+            want[c["kernel"]].append(b)
     for kernel, bs in want.items():
         shapes: list[dict[str, int | str]] = []
         for b in bs:
@@ -1520,48 +1519,37 @@ def test_the_builds_are_every_algorithm_of_the_tables_shapes() -> None:
     assert got == want
 
 
-def test_the_tuned_table_is_the_arch_file() -> None:
-    """The arch's tuned table (`hip_custom_communicator.json`) checks: every tuned op's
-    inputs, each running one kernel of its op or our all-reduce then its norm on
-    rows, every config a build its kernel lists; an arch the table has no configs on
-    has none, named; an unsound table raises, naming the entry."""
+def test_the_tuned_table_checks() -> None:
+    """gfx950's tuned table (`hip_custom_communicator.json`, a table an arch) checks:
+    every pick one kernel of its input's op or our all-reduce then its norm on rows
+    (a split among them), every config a build its kernel lists; an unsound table
+    raises, naming the entry."""
     import vllm._rocm_C  # noqa: F401
 
-    raw = json.loads(_TABLE.read_text())
-    assert check_table(raw, "gfx950") is None
-    assert set(raw) == {"format", "version", *TUNED_OPS}
+    table = json.loads(_TABLE.read_text())["gfx950"]
+    check_table(table)
     built = build_info()
-    for op in TUNED_OPS:
-        t = raw[op]
-        configs = t["configs"]["gfx950"]
-        assert t["inputs"] and configs, op
-        for p in t["inputs"]:
-            ops = tuple(
-                built.templates[configs[j]["kernel"]].op for j in p["config"]["gfx950"]
-            )
-            assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, p)
-    assert any(
-        len(p["config"]["gfx950"]) == 2 for op in TUNED_OPS for p in raw[op]["inputs"]
-    )
-    assert isinstance(check_table(raw, "gfx0"), str)
+    for k in table["picks"]:
+        op = table["inputs"][k["input"]]["op"].removeprefix("hip_custom_communicator.")
+        kernels = [table["configs"][j]["kernel"] for j in k["configs"]]
+        ops = tuple(built.templates[kernel].op for kernel in kernels)
+        assert ops in ((op,), ("all_reduce", ROWS.get(op))), (op, k)
+    assert any(len(k["configs"]) == 2 for k in table["picks"])
     # AN UNSOUND TABLE, named: a build its kernel does not list, an exact input moving
     # INT4.
-    bad = copy.deepcopy(raw)
-    bad["all_reduce"]["configs"]["gfx950"][0]["tile_n"] = 100
-    with pytest.raises(ValueError, match="all_reduce.configs.gfx950.0.*no build"):
-        check_table(bad, "gfx950")
-    bad = copy.deepcopy(raw)
-    (exact,) = [p for p in bad["all_reduce"]["inputs"] if p["quantization"] == "exact"][
-        :1
-    ]
-    int4 = next(
-        i
-        for i, c in enumerate(bad["all_reduce"]["configs"]["gfx950"])
-        if c["quantization"] == "int4"
+    bad = copy.deepcopy(table)
+    bad["configs"][0]["tile_n"] = 100
+    with pytest.raises(ValueError, match=r"configs\[0\].*no build"):
+        check_table(bad)
+    bad = copy.deepcopy(table)
+    exact = next(
+        k for k in bad["picks"] if bad["inputs"][k["input"]]["mode"] == "exact"
     )
-    exact["config"]["gfx950"] = [int4]
+    exact["configs"] = [
+        next(i for i, c in enumerate(bad["configs"]) if c["quantization"] == "int4")
+    ]
     with pytest.raises(ValueError, match="an exact input moves INT4"):
-        check_table(bad, "gfx950")
+        check_table(bad)
 
 
 # THE HANDED-IN TABLE'S ONE INPUT: the plain all-reduce at the hidden row, a decode
@@ -1569,36 +1557,30 @@ def test_the_tuned_table_is_the_arch_file() -> None:
 _HANDED_TOKENS = 8
 
 
-def _one_input_table(arch: str) -> tuple[TunedTable, dict[str, str | int]]:
-    """THE FILE'S TABLE WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED: the exact inputs at
-    WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, naming a config the file does not
-    run there (the file's 1-token pick at that width, a config it already runs on
-    this world); every other input kept, as the check wants an input at every built
-    world. Its config too."""
-    raw = json.loads(_TABLE.read_text())
-    entry = raw["all_reduce"]
+def _one_input_tables(arch: str) -> tuple[TunedTables, dict[str, str | int]]:
+    """THE FILE'S TABLES WITH ONE PLAIN ALL-REDUCE INPUT RE-POINTED on `arch`: the exact
+    input at WORLD_SIZE, the hidden row, `_HANDED_TOKENS`, picking a config the file
+    does not run there (the file's 1-token pick at that width, a config it already runs
+    on this world); every other pick kept, as the check wants one at every built world.
+    Its config too (its fields, the op's)."""
+    tables = json.loads(_TABLE.read_text())
+    table = tables[arch]
 
-    def named(tokens: int) -> int:
-        ((index,),) = [
-            p["config"][arch]
-            for p in entry["inputs"]
-            if (p["quantization"], p["world"], p["hidden"], p["tokens"])
-            == ("exact", WORLD_SIZE, HIDDEN, tokens)
+    def pick(tokens: int) -> dict[str, Any]:
+        want = {"op": "hip_custom_communicator.all_reduce", "mode": "exact",
+                "world": WORLD_SIZE, "hidden": HIDDEN, "tokens": tokens}  # fmt: skip
+        (k,) = [
+            k
+            for k in table["picks"]
+            if {f: table["inputs"][k["input"]][f] for f in want} == want
         ]
-        return index
+        return k
 
-    handed = named(1)
-    assert handed != named(_HANDED_TOKENS), "the file runs that config there already"
-    table = copy.deepcopy(raw)
-    for p in table["all_reduce"]["inputs"]:
-        if (p["quantization"], p["world"], p["hidden"], p["tokens"]) == (
-            "exact",
-            WORLD_SIZE,
-            HIDDEN,
-            _HANDED_TOKENS,
-        ):
-            p["config"] = {arch: [handed]}
-    return table, entry["configs"][arch][handed]
+    (handed,) = pick(1)["configs"]
+    assert pick(_HANDED_TOKENS)["configs"] != [handed], "the file runs it there already"
+    pick(_HANDED_TOKENS)["configs"] = [handed]
+    config = {k: v for k, v in table["configs"][handed].items() if k != "op"}
+    return tables, config
 
 
 def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -> None:
@@ -1615,20 +1597,20 @@ def _handed_table_on_rank(comm: HipCustomCommunicator, rank: int, config: str) -
 
 
 @on_eight_gpus
-def test_a_table_handed_in_is_the_one_it_runs() -> None:
-    """A communicator opened with a `table` of the file's shape runs from it, not
-    the file: the file's table with one plain all-reduce input re-pointed to a config
-    the file does not run there, and its `tuned` answers that config, which a plain
-    call runs."""
-    # example-based: the decode step the tuner's candidate is checked at (gp tune)
+def test_tables_handed_in_are_the_ones_it_runs() -> None:
+    """A communicator opened with `tables` of the file's shape runs from them, not the
+    file: the file's tables with one plain all-reduce input re-pointed to a config the
+    file does not run there, and its `tuned` answers that config, which a plain call
+    runs."""
+    # example-based: the decode step the tuner's candidate is checked at
     import vllm._rocm_C  # noqa: F401
 
     found = supported(torch.device("cuda:0"), WORLD_SIZE)
     assert not isinstance(found, Error), found
-    table, config = _one_input_table(found.arch)
+    tables, config = _one_input_tables(found.arch)
     _on_every_rank(
         target=partial(_handed_table_on_rank, config=json.dumps(config)),
-        table=table,
+        tables=tables,
     )
 
 

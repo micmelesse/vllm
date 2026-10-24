@@ -805,24 +805,28 @@ class Supported:
     arch: str
 
 
-# THE TUNED TABLE (`hip_custom_communicator.json`, written by `gp bench tune`), its
-# format and version (`_TABLE_FORMAT`), then each op's two lists: its `inputs` (the input points measured, the workload's, the same on
-# every arch: the communicator's quantization they were tuned at, world, width and
-# tokens), each naming on each arch the configs a plain call of it launches, in order
-# (one kernel, or our all-reduce then the op's norm on rows), by index; and its
-# `configs` on each arch (the config space tuned there: a kernel, its algorithm, its grid,
-# block, waves, tile and what it moves). Read once, checked at open (`check_table`); a call
-# launches its nearest input's configs (`get_nearest_configs`). Every tuned number is
-# here, none in C++. A communicator opened with a `table` of the file's shape runs
-# that one instead (the tuner's candidate).
+# THE TUNED TABLES (`hip_custom_communicator.json`, beside this file, written by gd's
+# tune: gd's `TunedTables`), a table an arch, each tuned on its own: its `inputs` (the
+# input points tuned: the op, qualified `hip_custom_communicator.<op>`, the
+# communicator's mode, `exact` or `quantized`, the world, the width, the tokens and the
+# op's own arguments, which the lookup does not read), its `configs` (each its op and
+# its fields: what the build compiles there) and its `picks` (an input's index, and its
+# configs' in the order a plain call launches them: the op's one kernel, or our
+# all-reduce then the op's norm on rows). No format or version: it changes with this
+# file, in one commit. Read once, the arch's table checked at open (`check_table`); a
+# plain call launches its nearest input's pick (`get_nearest_configs`). Every tuned
+# number is here, none in C++. A communicator opened with `tables` of the file's shape
+# runs those instead (the tuner's candidate).
 _TABLE = Path(__file__).with_name("hip_custom_communicator.json")
-# THE TABLE'S FORMAT: 0.2, a config's kernel its op's one kernel and which of its bodies
-# its `algorithm` (0.1, unmarked, named a kernel a body).
-_TABLE_FORMAT = {"format": "hip_custom_communicator.tuned_map", "version": "0.2"}
-# THE TUNED TABLE AS THE FILE HOLDS IT, parsed: its format, then each op's `inputs`
-# and `configs`.
+_TABLE_KEYS = ("inputs", "configs", "picks")
+# AN ARCH'S TUNED TABLE AS THE FILE HOLDS IT, parsed: its three lists; and the file, a
+# table an arch.
 TunedTable = dict[str, Any]
-_INPUT_KEYS = frozenset({"quantization", "world", "hidden", "tokens", "config"})
+TunedTables = dict[str, TunedTable]
+# AN OP AS THE TABLE NAMES IT, and the communicator's quantization as the table's input
+# names it (the mode the communicator was opened in).
+_QUALIFIED = "hip_custom_communicator."
+_MODES: Mapping[Quantization, str] = {"exact": "exact", "int4": "quantized"}
 # A CONFIG POINT'S FIELDS, in their order (C++'s arguments'): the kernel, its algorithm,
 # its grid, its block and the block's waves a EU (__launch_bounds__), its
 # tile (tile_k 1 where the kernel has no K), then what it moves. Every config of every
@@ -868,7 +872,8 @@ class Config:
 
 
 def _config(c: Mapping[str, Any]) -> Config:
-    """A table's config record (a field a key, `_CONFIG_KEYS`) as a `Config`."""
+    """A table's config record (its op, then a field a key, `_CONFIG_KEYS`) as a
+    `Config`."""
     return Config(
         kernel=c["kernel"],
         algorithm=c["algorithm"],
@@ -886,86 +891,81 @@ def _config(c: Mapping[str, Any]) -> Config:
     )
 
 
-def check_table(raw: TunedTable, arch: str) -> str | None:
-    """THE TUNED TABLE `raw` (the file's, or one handed in at open) ON `arch`: None
-    where every op's plain call runs from it, else why not (an op not tuned on the arch,
-    an input with no config there). A table that is not sound raises, naming the entry:
-    its format not `_TABLE_FORMAT`'s; every config a kernel the build has, its build
-    (its algorithm among it) one the kernel lists (its grid is
-    C++'s to refuse at the call); every input's configs one kernel of its op, or our
-    all-reduce then the op's norm on rows; an exact input moving nothing quantized, at
-    a built world; every op inputs at each quantization at every built world (the
-    lookup reads one there)."""
+def check_table(raw: TunedTable) -> None:
+    """THE TUNED TABLE `raw` (the arch's file, or one handed in at open), checked: one
+    that is not sound raises, naming the entry. Its keys `_TABLE_KEYS`; every config its
+    op's (qualified) and every field `_CONFIG_KEYS` names in that order, a kernel the
+    build has at a build it lists (its grid is C++'s to refuse at the call); every input
+    one of `TUNED_OPS`, in a mode, at a built world, with a width and tokens; every pick
+    one input's, its configs one kernel of the input's op, or our all-reduce then the
+    op's norm on rows, an exact input's moving nothing quantized; every tuned op an
+    input in each mode at every built world (the lookup reads one there)."""
     built = build_info()
-    marked = {k: raw.get(k) for k in _TABLE_FORMAT}
-    if marked != _TABLE_FORMAT:
-        raise ValueError(f"the tuned table is {marked}, not {_TABLE_FORMAT}")
-    if set(raw) - set(_TABLE_FORMAT) != set(TUNED_OPS):
+    if list(raw) != list(_TABLE_KEYS):
         raise ValueError(
-            f"the tuned table: its ops are {sorted(set(raw) - set(_TABLE_FORMAT))}, "
-            f"not {TUNED_OPS}"
+            f"the tuned table's keys are {list(raw)}, not {list(_TABLE_KEYS)}"
         )
-    for name in TUNED_OPS:
-        table = raw[name]
-        if set(table) != {"inputs", "configs"}:
+    configs, inputs = raw["configs"], raw["inputs"]
+    ops_of_configs = []
+    for i, c in enumerate(configs):
+        where = f"the tuned table: configs[{i}]"
+        if list(c) != ["op", *_CONFIG_KEYS]:
+            raise ValueError(f"{where} has keys {list(c)}, not {['op', *_CONFIG_KEYS]}")
+        template = built.templates.get(c["kernel"])
+        build = {k: c[k] for k in _CONFIG_KEYS if k != "kernel" and k[:5] != "grid_"}
+        if template is None or build not in template.builds:
+            raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
+        if c["op"] != _QUALIFIED + template.op:
             raise ValueError(
-                f"the tuned table: {name} is not an op's table: {sorted(table)}"
+                f"{where}: {c['kernel']} is {template.op}'s, not {c['op']}'s"
             )
-        if arch not in table["configs"]:
-            return f"{name} is not tuned on {arch}"
-        configs = table["configs"][arch]
-        for i, c in enumerate(configs):
-            where = f"the tuned table: {name}.configs.{arch}[{i}]"
-            if list(c) != list(_CONFIG_KEYS):
-                raise ValueError(
-                    f"{where} has keys {list(c)}, not {list(_CONFIG_KEYS)} "
-                    f"(in that order)"
-                )
-            template = built.templates.get(c["kernel"])
-            build = {k: c[k] for k in _CONFIG_KEYS if k != "kernel" and k[:5] != "grid_"}
-            if template is None or build not in template.builds:
-                raise ValueError(f"{where} ({c['kernel']}): no build of it lists this")
-        for i, e in enumerate(table["inputs"]):
-            where = f"the tuned table: {name}.inputs[{i}]"
-            if set(e) != _INPUT_KEYS:
-                raise ValueError(f"{where} has keys {sorted(e)}")
-            at = e["config"].get(arch)
-            if at is None:
-                return f"{name}.inputs[{i}] has no config on {arch}"
-            if not (
-                isinstance(at, list) and at and all(0 <= j < len(configs) for j in at)
-            ):
-                raise ValueError(
-                    f"{where}: {at} names no configs of {name}'s on {arch}"
-                )
-            ops = [built.templates[configs[j]["kernel"]].op for j in at]
-            if ops not in ([name], ["all_reduce", _ROWS.get(name)]):
-                raise ValueError(
-                    f"{where}: its configs' kernels are {ops}'s: one of {name}'s, "
-                    f"or our all-reduce then {_ROWS.get(name)}"
-                )
-            if (
-                e["quantization"] not in _QUANTIZATIONS
-                or e["world"] not in built.worlds
-            ):
-                raise ValueError(f"{where}: no such quantization or world built: {e}")
-            if e["hidden"] < 1 or e["tokens"] < 1:
-                raise ValueError(f"{where}: no width or no tokens")
-            if e["quantization"] == "exact" and any(
-                configs[j]["quantization"] != "exact" for j in at
-            ):
-                raise ValueError(f"{where}: an exact input moves INT4")
+        ops_of_configs.append(template.op)
+    for i, e in enumerate(inputs):
+        where = f"the tuned table: inputs[{i}]"
+        name = str(e.get("op", ""))
+        if not name.startswith(_QUALIFIED) or name[len(_QUALIFIED) :] not in TUNED_OPS:
+            raise ValueError(f"{where}: {name} is no tuned op of the communicator's")
+        if e.get("mode") not in _MODES.values() or e.get("world") not in built.worlds:
+            raise ValueError(f"{where}: no such mode or world built: {e}")
+        if e.get("hidden", 0) < 1 or e.get("tokens", 0) < 1:
+            raise ValueError(f"{where}: no width or no tokens")
+    picked = set()
+    for i, k in enumerate(raw["picks"]):
+        where = f"the tuned table: picks[{i}]"
+        at = k.get("configs")
+        if not (
+            isinstance(k.get("input"), int)
+            and 0 <= k["input"] < len(inputs)
+            and k["input"] not in picked
+            and isinstance(at, list)
+            and at
+            and all(isinstance(j, int) and 0 <= j < len(configs) for j in at)
+        ):
+            raise ValueError(f"{where}: {k} names no one input's configs")
+        picked.add(k["input"])
+        e = inputs[k["input"]]
+        name = e["op"].removeprefix(_QUALIFIED)
+        ops = [ops_of_configs[j] for j in at]
+        if ops not in ([name], ["all_reduce", _ROWS.get(name)]):
+            raise ValueError(
+                f"{where}: its configs are {ops}'s: one of {name}'s, or our all-reduce "
+                f"then {_ROWS.get(name)}"
+            )
+        moved = {configs[j]["quantization"] for j in at}
+        if e["mode"] == "exact" and moved != {"exact"}:
+            raise ValueError(f"{where}: an exact input moves INT4")
+    for name in TUNED_OPS:
         for world in sorted(built.worlds):
-            for quantization in _QUANTIZATIONS:
+            for mode in _MODES.values():
                 if not any(
-                    e["world"] == world and e["quantization"] == quantization
-                    for e in table["inputs"]
+                    inputs[k["input"]]["op"] == _QUALIFIED + name
+                    and inputs[k["input"]]["world"] == world
+                    and inputs[k["input"]]["mode"] == mode
+                    for k in raw["picks"]
                 ):
                     raise ValueError(
-                        f"the tuned table: {name}: no input at world {world} moving "
-                        f"{quantization}"
+                        f"the tuned table: {name}: no pick at world {world}, {mode}"
                     )
-    return None
 
 
 def get_given_config(
@@ -1039,30 +1039,36 @@ def get_given_config(
 
 
 def get_nearest_configs(
-    table: dict[str, Any],
+    table: TunedTable,
+    op: Op,
     rows: int,
     cols: int,
     quantization: Quantization,
     world: int,
-    arch: str,
 ) -> list[Config]:
-    """WHAT A PLAIN CALL OF AN OP LAUNCHES on `rows` x `cols`, from its `table` (the
-    file's entry for the op): the configs the nearest input tuned at `quantization` and
-    `world` names on `arch`, in the order they launch, each its fields in the essential
-    order (C++'s arguments'). The nearest width, then the nearest size (rows x width),
-    the fewer tokens on a tie."""
-    inputs = [
-        p
-        for p in table["inputs"]
-        if p["quantization"] == quantization and p["world"] == world
+    """WHAT A PLAIN CALL OF `op` LAUNCHES on `rows` x `cols`, from the arch's `table`:
+    the pick of the nearest input of `op` tuned in the communicator's mode
+    (`quantization`) at `world`, its configs in the order they launch. The nearest
+    width, then the nearest size (rows x width), the fewer tokens on a tie."""
+    inputs = table["inputs"]
+    picks = [
+        k
+        for k in table["picks"]
+        if inputs[k["input"]]["op"] == _QUALIFIED + op
+        and inputs[k["input"]]["mode"] == _MODES[quantization]
+        and inputs[k["input"]]["world"] == world
     ]
-    width = min((p["hidden"] for p in inputs), key=lambda h: abs(h - cols))
-    nearest = min(
-        (p for p in inputs if p["hidden"] == width),
-        key=lambda p: (abs(p["tokens"] * p["hidden"] - rows * cols), p["tokens"]),
+    width = min(
+        (inputs[k["input"]]["hidden"] for k in picks), key=lambda h: abs(h - cols)
     )
-    configs = [table["configs"][arch][at] for at in nearest["config"][arch]]
-    return [_config(c) for c in configs]
+    nearest = min(
+        (k for k in picks if inputs[k["input"]]["hidden"] == width),
+        key=lambda k: (
+            abs(inputs[k["input"]]["tokens"] * width - rows * cols),
+            inputs[k["input"]]["tokens"],
+        ),
+    )
+    return [_config(table["configs"][j]) for j in nearest["configs"]]
 
 
 def get_kernel_config(
@@ -1073,12 +1079,11 @@ def get_kernel_config(
     algorithm: Algorithm,
     quantization: Quantization,
     world: int,
-    arch: str,
 ) -> Config | None:
     """KERNEL `kernel`'S OWN CONFIG AT `algorithm` FOR `rows` x `cols`
     MOVING `quantization` (a forced launch at the tuned config: gp's kernel lines, the
     tests): the config of it moving that which its nearest input at `world` launches,
-    in any op's table, else the first such config of the table's; moving INT4 where it
+    of any op, else the first such config of the table's; moving INT4 where it
     has no INT4 config, its exact config moved INT4 (a build it lists). None where it
     has neither."""
     builds = build_info().templates[kernel].builds
@@ -1096,14 +1101,13 @@ def get_kernel_config(
         (quantization, "exact") if quantization == "int4" else (quantization,)
     ):
         found = []
-        for name in TUNED_OPS:
-            configs = raw[name]["configs"][arch]
-            for p in raw[name]["inputs"]:
-                if p["world"] == world:
-                    c = next((configs[j] for j in p["config"][arch]
-                              if takes(configs[j], moving)), None)  # fmt: skip
-                    if c is not None:
-                        found.append((p, c))
+        for k in raw["picks"]:
+            p = raw["inputs"][k["input"]]
+            if p["world"] == world:
+                c = next((raw["configs"][j] for j in k["configs"]
+                          if takes(raw["configs"][j], moving)), None)  # fmt: skip
+                if c is not None:
+                    found.append((p, c))
         if found:
             width = min((p["hidden"] for p, _ in found), key=lambda h: abs(h - cols))
             _, c = min(
@@ -1114,11 +1118,7 @@ def get_kernel_config(
                 ),
             )
         else:
-            c = next(
-                (c for name in TUNED_OPS for c in raw[name]["configs"][arch]
-                 if takes(c, moving)),
-                None,
-            )  # fmt: skip
+            c = next((c for c in raw["configs"] if takes(c, moving)), None)
         if c is not None:
             return replace(_config(c), quantization=quantization)
     return None
@@ -1269,8 +1269,8 @@ _WATCH_S = 0.1
 
 
 @functools.cache
-def _file_table() -> TunedTable:
-    """The tuned table's file, read once a process."""
+def _file_tables() -> TunedTables:
+    """The tuned tables' file, read once a process."""
     return json.loads(_TABLE.read_text())
 
 
@@ -1317,7 +1317,7 @@ class HipCustomCommunicator:
         max_cols: int | None = None,
         quantization: Quantization | None = None,
         log_mode: LogMode | None = None,
-        table: TunedTable | None = None,
+        tables: TunedTables | None = None,
     ) -> None:
         """Keep the groups and the device, then `_open`, which checks the backend's
         availability. Unavailability is not an error: the caller checks `.disabled`.
@@ -1329,8 +1329,8 @@ class HipCustomCommunicator:
         the quantized one where INT4); None is what the environment asks
         (`configured_quantization`). `log_mode`: what the
         state log records (`log()`); None is what the environment asks
-        (`configured_log_mode`). `table`: the tuned table its plain calls run from, of
-        the file's shape (the tuner's candidate); None is the file's
+        (`configured_log_mode`). `tables`: the tuned tables its plain calls run from
+        (the arch's), of the file's shape (the tuner's candidate); None is the file's
         (`hip_custom_communicator.json`), read once."""
         self.cpu_group = cpu_group
         self.device_group = device_group
@@ -1363,7 +1363,7 @@ class HipCustomCommunicator:
             configured_quantization() if quantization is None else quantization
         )
         self.log_mode: LogMode = configured_log_mode() if log_mode is None else log_mode
-        self.table: TunedTable = _file_table() if table is None else table
+        self._given_tables = tables
         self.capacity = capacity_of(max_rows, max_cols, device_group.size())
         self._own_fields()
         why = self._open()
@@ -1410,12 +1410,12 @@ class HipCustomCommunicator:
         """WHAT A PLAIN CALL OF `op` ON `rows` x `cols` LAUNCHES here, in order: its
         table's nearest input's configs (`get_nearest_configs`)."""
         return get_nearest_configs(
-            self.table[op],
+            self.table,
+            op,
             rows,
             cols,
             self.quantization,
             self.device_group.size(),
-            self.arch,
         )
 
     @final
@@ -1436,7 +1436,6 @@ class HipCustomCommunicator:
             algorithm,
             quantization,
             self.device_group.size(),
-            self.arch,
         )
 
     @final
@@ -1512,12 +1511,12 @@ class HipCustomCommunicator:
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
-                self.table["all_reduce"],
+                self.table,
+                "all_reduce",
                 rows,
                 cols,
                 self.quantization,
                 self.device_group.size(),
-                self.arch,
             )
         logger.debug("all_reduce launches %s", configs)
 
@@ -1629,12 +1628,12 @@ class HipCustomCommunicator:
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
-                self.table["all_reduce_rms_norm"],
+                self.table,
+                "all_reduce_rms_norm",
                 rows,
                 cols,
                 self.quantization,
                 self.device_group.size(),
-                self.arch,
             )
         logger.debug("all_reduce_rms_norm launches %s", configs)
 
@@ -1803,12 +1802,12 @@ class HipCustomCommunicator:
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
-                self.table["all_reduce_add_rms_norm"],
+                self.table,
+                "all_reduce_add_rms_norm",
                 rows,
                 cols,
                 self.quantization,
                 self.device_group.size(),
-                self.arch,
             )
         logger.debug("all_reduce_add_rms_norm launches %s", configs)
 
@@ -1989,12 +1988,12 @@ class HipCustomCommunicator:
         else:
             rows, cols = input.shape
             configs = get_nearest_configs(
-                self.table["all_reduce_add_attn_res_rms_norm"],
+                self.table,
+                "all_reduce_add_attn_res_rms_norm",
                 rows,
                 cols,
                 self.quantization,
                 self.device_group.size(),
-                self.arch,
             )
         logger.debug("all_reduce_add_attn_res_rms_norm launches %s", configs)
 
@@ -2539,8 +2538,13 @@ class HipCustomCommunicator:
     # The device wall clock's rate, which the fault record counts its wait in.
     _khz: int = 0
     capacity: Capacity
-    # The device's arch, the table's configs' key.
+    # The device's arch, whose tuned table the communicator runs.
     arch: str
+    # The tuned tables handed in at construction (the tuner's candidate), or None: the
+    # file's.
+    _given_tables: TunedTables | None
+    # The tuned table the plain calls look up, set at open.
+    table: TunedTable
     # Whether there is a fault record for the watchdog to read (`_fault`).
     _faults: ClassVar[bool] = True
 
@@ -2555,9 +2559,12 @@ class HipCustomCommunicator:
         found = supported(self.device, self.device_group.size())
         if isinstance(found, Error):
             return found.name
-        why = check_table(self.table, found.arch)
-        if why is not None:
-            return why
+        tables = _file_tables() if self._given_tables is None else self._given_tables
+        table = tables.get(found.arch)
+        if table is None:
+            return f"no tuned table on {found.arch}"
+        check_table(table)
+        self.table = table
         self.arch = found.arch
         # THE PEER MEMORY, made, sized and owned by C++, which checks the groups and the
         # device and gathers every rank's IPC handle over the CPU group (a collective).
