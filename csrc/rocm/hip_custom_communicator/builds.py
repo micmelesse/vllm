@@ -74,9 +74,30 @@ def family(kernel: str) -> str:
 
 
 def tables(path: Path, archs: list[str]) -> list[dict]:
-    """The tuned table of each arch built that has one, in the archs' order."""
+    """The tuned table of each arch built that has one, in the archs' order, each its
+    candidates its kernel cannot take left out (`buildable`)."""
     file = json.loads(path.read_text())
-    return [file[arch] for arch in archs if arch in file]
+    return [buildable(file[arch], arch) for arch in archs if arch in file]
+
+
+def buildable(table: dict, arch: str) -> dict:
+    """THE TABLE AS THE BUILD TAKES IT: a candidate (a config no pick names: a tune's, `gd
+    tune --dry-run`'s) whose kernel cannot take its build (`takes`) is left out and counted, so
+    a space may name any combination; a picked config the kernel cannot take is no build, and
+    stops the configure, naming it."""
+    picked = {j for k in table["picks"] for j in k["configs"]}
+    kept, left = [], 0
+    for at, c in enumerate(table["configs"]):
+        b = tuple(c[f] for f in FIELDS)
+        if takes(c["kernel"], b):
+            kept.append(c)
+        elif at in picked:
+            raise SystemExit(f"{arch} configs[{at}]: {c['kernel']} cannot take {b}")
+        else:
+            left += 1
+    if left:
+        print(f"builds.py: {arch}: {left} candidate(s) no kernel takes, left out")
+    return {**table, "configs": kept}
 
 
 def named(tables: list[dict]) -> dict[str, list[tuple]]:
