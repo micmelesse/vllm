@@ -1391,16 +1391,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 // float(w))) (rms_norm.cuh).
 // =============================================================================
 
+// IN PLACE: an output may be its input itself (the split's sum, normed over its own rows:
+// STANDARDS 3.5), every element written by the thread that read it, after it read it; so the
+// rows' pointers are not __restrict__ (an alias the compiler was promised away is undefined).
 // A TILE OF TILE_M ROWS a work item, the grid striding over them; the weight
 // loaded once, every tile's. Each kernel written out whole (STANDARDS 3.2: an op
 // file has no shared body).
 template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    rms_norm_rows(const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+    rms_norm_rows(const DTYPE* input_ptr, int64_t input_stride_m,
                   int64_t input_stride_n, int input_size_m, int input_size_n,
                   const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
-                  int weight_size_n, DTYPE* __restrict__ output_ptr, int64_t output_stride_m,
+                  int weight_size_n, DTYPE* output_ptr, int64_t output_stride_m,
                   int64_t output_stride_n, int output_size_m, int output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   // A PASS COVERS TILE_N ROUNDED UP TO WHOLE PACKS A THREAD (kSpan columns): any tile at any block,
@@ -1482,14 +1485,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
 template <typename DTYPE, typename WEIGHT_DTYPE, int TILE_M, int TILE_N, int THREADS_PER_BLOCK,
           int WAVE_SIZE, int PACK_BYTES, int WAVES_PER_EU, bool CHUNKED>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
-    add_rms_norm_rows(const DTYPE* __restrict__ input_ptr, int64_t input_stride_m,
+    add_rms_norm_rows(const DTYPE* input_ptr, int64_t input_stride_m,
                       int64_t input_stride_n, int input_size_m, int input_size_n,
-                      const DTYPE* __restrict__ residual_ptr, int64_t residual_stride_m,
+                      const DTYPE* residual_ptr, int64_t residual_stride_m,
                       int64_t residual_stride_n, int residual_size_m, int residual_size_n,
                       const WEIGHT_DTYPE* __restrict__ weight_ptr, int64_t weight_stride_n,
-                      int weight_size_n, DTYPE* __restrict__ output_ptr,
+                      int weight_size_n, DTYPE* output_ptr,
                       int64_t output_stride_m, int64_t output_stride_n, int output_size_m,
-                      int output_size_n, DTYPE* __restrict__ residual_output_ptr,
+                      int output_size_n, DTYPE* residual_output_ptr,
                       int64_t residual_output_stride_m, int64_t residual_output_stride_n,
                       int residual_output_size_m, int residual_output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;

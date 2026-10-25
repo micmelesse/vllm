@@ -474,15 +474,26 @@ bool overlap(const Span& a, const Span& b) {
   };
   return meets(at, a.width, bt) || meets(bt, b.width, at);
 }
+// THE SAME TENSOR EXACTLY: one start, one shape, one set of strides.
+bool same_tensor(const torch::Tensor& a, const torch::Tensor& b) {
+  return a.data_ptr() == b.data_ptr() && a.sizes() == b.sizes() && a.strides() == b.strides();
+}
+// AN OUTPUT MAY BE AN INPUT ITSELF (`in_place`) only where the kernel is correct with that exact
+// alias: the norms on rows, whose every element is written by the thread that read it, after it
+// read it (STANDARDS 3.5: in place is the caller's explicit choice). A partial overlap never is.
 void refuse_overlap(std::initializer_list<const torch::Tensor*> inputs,
-                    std::initializer_list<const torch::Tensor*> outputs) {
+                    std::initializer_list<const torch::Tensor*> outputs,
+                    bool in_place = false) {
   for (const torch::Tensor* i : inputs)
     for (const torch::Tensor* o : outputs) {
       if (i == nullptr || o == nullptr || i->numel() == 0 || o->numel() == 0)
         continue;
+      if (in_place && same_tensor(*i, *o)) continue;
       TORCH_CHECK(
           !overlap(span_of(*i), span_of(*o)),
-          "an input and an output share memory; pass a separate output");
+          in_place ? "an input and an output share memory, not as the same tensor; pass it "
+                     "whole or a separate output"
+                   : "an input and an output share memory; pass a separate output");
     }
 }
 }  // namespace
@@ -551,7 +562,7 @@ namespace {
 // (its dtype is select's to refuse).
 void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
                   const torch::Tensor& weight, const torch::Tensor& output,
-                  const torch::Tensor* residual_output) {
+                  const torch::Tensor* residual_output, bool in_place) {
   check_device({&input, &weight, &output});
   TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]; got ",
               input.dim(), "-D");
@@ -577,7 +588,8 @@ void norm_tensors(const torch::Tensor& input, const torch::Tensor* residual,
                     residual_output->scalar_type() == input.scalar_type(),
                 "every tensor must share input's dtype");
   }
-  refuse_overlap({&input, residual, &weight}, {&output, residual_output});
+  refuse_overlap({&input, residual}, {&output, residual_output}, in_place);
+  refuse_overlap({&weight}, {&output, residual_output});
 }
 }  // namespace
 
@@ -585,7 +597,7 @@ namespace {
 Answer all_reduce_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps,
     const Picked& k) {
-  norm_tensors(input, nullptr, weight, output, nullptr);
+  norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/false);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
     return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce_rms_norm(
@@ -617,7 +629,7 @@ Answer all_reduce_add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, tor
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
     const Picked& k) {
-  norm_tensors(input, &residual, weight, output, &residual_output);
+  norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/false);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
     return refusal(*e);
   const auto got = hip_custom_communicator::all_reduce_add_rms_norm(
@@ -788,7 +800,7 @@ namespace {
 Answer rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor& weight,
     torch::Tensor& output, double eps,
     const Picked& k) {
-  norm_tensors(input, nullptr, weight, output, nullptr);
+  norm_tensors(input, nullptr, weight, output, nullptr, /*in_place=*/true);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
     return refusal(*e);
   const auto got = hip_custom_communicator::rms_norm(
@@ -821,7 +833,7 @@ Answer add_rms_norm_with(fptr_t handle_ptr, torch::Tensor& input, torch::Tensor&
     torch::Tensor& weight, torch::Tensor& output,
     torch::Tensor& residual_output, double eps,
     const Picked& k) {
-  norm_tensors(input, &residual, weight, output, &residual_output);
+  norm_tensors(input, &residual, weight, output, &residual_output, /*in_place=*/true);
   if (const auto* e = std::get_if<hip_custom_communicator::Error>(&k))
     return refusal(*e);
   const auto got = hip_custom_communicator::add_rms_norm(

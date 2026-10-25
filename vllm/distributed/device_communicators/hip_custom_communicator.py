@@ -1819,12 +1819,12 @@ class HipCustomCommunicator:
                     )
             case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
-                # norm on its rows.
-                summed = torch.empty_like(input)
+                # norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the norm writes
+                # its rows over them in place (STANDARDS 3.5), no tensor of its own.
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     handle_ptr=self._handle,
                     input=input,
-                    output=summed,
+                    output=output,
                     kernel=reduce_config.kernel,
                     algorithm=reduce_config.algorithm,
                     grid_x=reduce_config.grid_x,
@@ -1846,7 +1846,7 @@ class HipCustomCommunicator:
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_rms_norm(
                     handle_ptr=self._handle,
-                    input=summed,
+                    input=output,
                     weight=weight,
                     output=output,
                     eps=eps,
@@ -2011,12 +2011,12 @@ class HipCustomCommunicator:
                     )
             case [reduce_config, norm_config]:
                 # TWO KERNELS OF OURS: our all-reduce into this rank's sum, then the
-                # add and norm on its rows.
-                summed = torch.empty_like(input)
+                # add and norm on its rows. THE SUM IS THE OUTPUT ITSELF (ours, fresh): the norm writes
+                # its rows over them in place (STANDARDS 3.5), no tensor of its own.
                 error = torch.ops._rocm_C.hip_custom_communicator_all_reduce(
                     handle_ptr=self._handle,
                     input=input,
-                    output=summed,
+                    output=output,
                     kernel=reduce_config.kernel,
                     algorithm=reduce_config.algorithm,
                     grid_x=reduce_config.grid_x,
@@ -2038,7 +2038,7 @@ class HipCustomCommunicator:
                     )
                 error = torch.ops._rocm_C.hip_custom_communicator_add_rms_norm(
                     handle_ptr=self._handle,
-                    input=summed,
+                    input=output,
                     residual=residual,
                     weight=weight,
                     output=output,
