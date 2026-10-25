@@ -119,7 +119,8 @@ def takes(kernel: str, b: tuple) -> bool:
     inputs as they are); the pushed one-shot's tile is a row that fits its unfenced
     slot (`push_one_shot_tiles_fit`); a pulled fused two-shot's INT4 tile is whole groups
     a thread, a row high (its kernel's static_asserts: holes (a) and (b) of the task
-    list); a plain build lays out at some built world (`lays_out`)."""
+    list); every other kernel's tile is whole packs a thread (`PACK_ELEMS`); a plain build
+    lays out at some built world (`lays_out`)."""
     algorithm, block, _, _, _, tile_m, tile_n, _, q = b
     if q == "int4" and not (
         algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
@@ -134,6 +135,12 @@ def takes(kernel: str, b: tuple) -> bool:
         and algorithm == "two_shot_pull"
         and (tile_n % (INT4_GROUP * block) != 0 or tile_m != 1)
     ):
+        return False
+    # A NORM'S TILE IS WHOLE PACKS A THREAD (16 bytes a pack, 8 elements of a 2-byte dtype):
+    # every kernel but the plain all-reduce steps its chunks by TILE_N with TILE_N / (8 x block)
+    # packs a thread (its static_asserts), so a tile no whole number of them fills would skip its
+    # remainder; 768 or 896 threads at a 4096 tile did not compile (2026-10-25T16-27-26Z).
+    if kernel != "all_reduce" and tile_n % (PACK_ELEMS * block) != 0:
         return False
     return any(lays_out(kernel, b, world) for world in WORLDS)
 
@@ -175,6 +182,9 @@ LINE_PAYLOAD_BYTES = (
 )
 UNFENCED_SLOT_BYTES = 2048  # a pushed one-shot block's tile, at most (kUnfencedSlotBytes)
 INT4_GROUP = 32  # an INT4 group's elements (common.cuh's kInt4Group)
+# A PACK'S ELEMENTS at the narrowest dtype built (16 bytes of a 2-byte one): a norm's tile is
+# whole packs a thread (`takes`).
+PACK_ELEMS = 8
 FUSED = ("all_reduce_rms_norm", "all_reduce_add_rms_norm", "all_reduce_add_attn_res_rms_norm")
 HEADERS = (
     "kernels/all_reduce.cuh",

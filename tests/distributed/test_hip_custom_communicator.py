@@ -1479,8 +1479,11 @@ def _takes(kernel: str, b: dict[str, int | str]) -> bool:
     not the plain pull's (a one-shot reads its peers' inputs as they are); the pushed
     one-shot a row no wider than its unfenced slot (2048 bytes of 16-bit elements); a
     fused pull's INT4 whole groups a thread, a row high; a plain two-shot a row high (the
-    flat walk)."""
+    flat walk); every other kernel's tile whole 16-byte packs a thread (8 elements of a
+    2-byte dtype: a remainder would be skipped, its static_asserts)."""
     algorithm = b["algorithm"]
+    if kernel != "all_reduce" and int(b["tile_n"]) % (8 * int(b["block_x"])) != 0:
+        return False
     if b["quantization"] == "int4" and not (
         algorithm == "two_shot_push" or (algorithm == "two_shot_pull" and kernel != "all_reduce")
     ):

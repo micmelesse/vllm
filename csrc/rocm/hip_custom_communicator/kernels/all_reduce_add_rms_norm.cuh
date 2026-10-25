@@ -106,6 +106,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                  "a tile is whole packs a thread");
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
     // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -205,6 +209,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if constexpr (QUANTIZATION == Quantization::exact) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
       constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+      // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+      // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+      static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                    "a tile is whole packs a thread");
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       const int slice_m = (input_size_m + WORLD - 1) / WORLD;
       constexpr int kScaleSlot = 0;
@@ -552,6 +560,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "unsupported quantization");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                  "a tile is whole packs a thread");
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     // 1-3. none: nothing staged, every rank's input read in place where the input table says.
     // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
@@ -678,6 +690,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     static_assert(QUANTIZATION == Quantization::exact, "this kernel supports only exact transfers");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                  "a tile is whole packs a thread");
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
 
     // 1. Wait until every peer has launched: its input, the caller's tensor (a
@@ -801,6 +817,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
     if constexpr (QUANTIZATION == Quantization::exact) {
       constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
       constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+      // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+      // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+      static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                    "a tile is whole packs a thread");
       const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
       const int slice_m = (input_size_m + WORLD - 1) / WORLD;
       constexpr int kScaleSlot = kPackElems;
@@ -1245,6 +1265,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   "unsupported quantization");
     constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
     constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+    // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+    // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+    static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                  "a tile is whole packs a thread");
     const float inv_hidden = 1.0f / static_cast<float>(input_size_n);
     // 1-3. none: nothing staged, every rank's input read in place where the input table says.
     // int4: this rank's input QUANTIZED into its staging's INT4 payload, the rows this block's twin
@@ -1374,6 +1398,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                   int64_t output_stride_n, int output_size_m, int output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+  // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+  // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+  static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                "a tile is whole packs a thread");
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
@@ -1460,6 +1488,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, WAVES_PER_EU)
                       int residual_output_size_m, int residual_output_size_n, float eps) {
   constexpr int kPackElems = traits<DTYPE, PACK_BYTES>::N;
   constexpr int kPacks = TILE_N / (kPackElems * THREADS_PER_BLOCK);
+  // A TILE IS WHOLE PACKS A THREAD: the chunks step by TILE_N, so a remainder no thread holds
+  // would be skipped, the call wrong and still timed (builds.py's `takes` builds none).
+  static_assert(kPacks >= 1 && kPacks * kPackElems * THREADS_PER_BLOCK == TILE_N,
+                "a tile is whole packs a thread");
   const int m = input_size_m, n = input_size_n;
   const float inv_hidden = 1.0f / static_cast<float>(n);
   WEIGHT_DTYPE w[1][kPacks][kPackElems];
